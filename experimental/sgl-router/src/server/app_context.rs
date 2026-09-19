@@ -3,15 +3,15 @@
 
 use crate::config::Config;
 
-use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
-use crate::policies::engine_load::EngineLoadTable;
-use crate::policies::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
+use crate::state::kv_events::{BlockSizeOracle, KvIndexMetrics};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -36,23 +36,23 @@ pub struct AppContext {
     pub bucket_selector: Arc<BucketSelector>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
-    pub active_load: Arc<ActiveLoadRegistry>,
+    pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
     /// active-load registry, policy-specific counters, and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
-    pub engine_load: Arc<EngineLoadTable>,
+    pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
     /// Indexer), where those series would all be a structural zero — see
-    /// [`crate::policies::kv_events::KvEventIndex::metrics_source`].
+    /// [`crate::state::kv_events::KvEventIndex::metrics_source`].
     pub kv_metrics: Option<KvIndexMetrics>,
     /// Open HTTP exchanges, on every route. What axum's graceful shutdown
-    /// is actually waiting on during the drain — `active_load` sees only the
+    /// is actually waiting on during the drain — `router_inflight_load` sees only the
     /// proxied subset.
     pub inflight_http: Arc<InflightHttp>,
     readiness: AtomicU8,
@@ -66,34 +66,34 @@ impl AppContext {
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
     ) -> Self {
-        Self::with_active_load(
+        Self::with_router_inflight_load(
             config,
             tokenizers,
             proxy,
             registry,
             policies,
-            ActiveLoadRegistry::with_defaults(),
+            RouterInflightLoadRegistry::with_defaults(),
         )
     }
 
-    /// Construct an [`AppContext`] with an explicit [`ActiveLoadRegistry`].
+    /// Construct an [`AppContext`] with an explicit [`RouterInflightLoadRegistry`].
     /// Production wires the default (5-minute timeout, SystemTimeClock)
     /// via [`Self::new`]; tests that exercise the janitor pass a registry
     /// built with a `MockClock`.
-    pub fn with_active_load(
+    pub fn with_router_inflight_load(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
         proxy: Arc<Proxy>,
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
-        active_load: Arc<ActiveLoadRegistry>,
+        router_inflight_load: Arc<RouterInflightLoadRegistry>,
     ) -> Self {
         let metrics = MetricsRegistry::new();
         // Wire the per-worker active-load gauge so `sgl_router_active_load`
         // mirrors the live counter on every register / drop / sweep.
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
-        active_load.attach_metrics(Arc::clone(&metrics));
+        router_inflight_load.attach_metrics(Arc::clone(&metrics));
         // The metrics registry is built after the policy registry, so attach
         // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
@@ -105,13 +105,13 @@ impl AppContext {
             registry,
             policies,
             bucket_selector,
-            active_load,
+            router_inflight_load,
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
-            engine_load: EngineLoadTable::new(),
+            engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
@@ -186,20 +186,20 @@ impl AppContext {
                     },
                 ),
                 proxy: crate::config::ProxyConfig::default(),
-                active_load: crate::config::ActiveLoadConfig::default(),
+                router_inflight_load: crate::config::InflightLoadConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             bucket_selector: Arc::new(BucketSelector::new(None)),
-            active_load: ActiveLoadRegistry::with_defaults(),
+            router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
-            engine_load: EngineLoadTable::new(),
+            engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }

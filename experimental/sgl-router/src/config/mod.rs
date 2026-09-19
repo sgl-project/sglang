@@ -236,7 +236,7 @@ mod tests {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 

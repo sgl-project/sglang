@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::policies::admission::compare_prefill_pressure;
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use rand::Rng;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ impl Policy for PowerOfTwoChoicesPolicy {
 
 pub(crate) fn select_with_snapshot(
     workers: &[Arc<Worker>],
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
 ) -> Option<Arc<Worker>> {
     match workers.len() {
         0 => None,
@@ -73,7 +73,7 @@ pub(crate) fn select_with_snapshot(
 fn select_lower_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
 ) -> Arc<Worker> {
     ordered_pair_with_snapshot(left, right, snapshot).0
 }
@@ -89,7 +89,7 @@ fn ordered_pair(
 fn ordered_pair_with_snapshot(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    snapshot: Option<&EngineLoadSnapshot>,
+    snapshot: Option<&EngineReportedLoadSnapshot>,
 ) -> (Arc<Worker>, Arc<Worker>) {
     if compare_prefill_pressure(left, right, snapshot).is_gt() {
         (Arc::clone(right), Arc::clone(left))

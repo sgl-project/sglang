@@ -10,7 +10,7 @@
 //! aggregate and falls back to Router-local load when it is unavailable.
 //!
 //! Load is a *gauge*, not a delta: last value wins, no sequence/replay
-//! semantics. Entries older than [`EngineLoadTable::freshness`] are ignored.
+//! semantics. Entries older than [`EngineReportedLoadTable::freshness`] are ignored.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -58,12 +58,12 @@ pub struct LoadStat {
     pub native_cache: Option<NativeCacheRankLoad>,
 }
 
-/// Engine load for one worker captured at a fixed point in time.
+/// Engine-reported request and KV counters for one worker, summed across DP ranks.
 ///
 /// The four #34608 fields are summed across DP ranks. `captured_at` retains
 /// the oldest rank timestamp so later local dispatches can be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineWorkerLoad {
+pub struct EngineReportedWorkerLoad {
     pub num_running_reqs: u64,
     pub num_waiting_reqs: u64,
     pub num_tokens: u64,
@@ -71,12 +71,14 @@ pub struct EngineWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// Complete ZMQ monitor aggregate used by native Cache-Aware.
+/// Engine-reported per-worker scheduling load: capacity, queue pressure, and prefill estimates.
+///
+/// Shared by cache-aware, power-of-two, session-aware, and decode selection and admission.
 ///
 /// Prefill throughput and queue time require two monotonic samples from every
 /// DP rank. Initial samples and counter resets leave both values unavailable.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NativeCacheWorkerLoad {
+pub struct EngineReportedSchedulingLoad {
     pub num_running_reqs: u64,
     pub num_waiting_reqs: u64,
     pub num_waiting_uncached_tokens: u64,
@@ -89,19 +91,19 @@ pub struct NativeCacheWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// Immutable engine load view captured once at request ingress.
+/// Immutable fleet-wide view of engine-reported load, captured once at request ingress.
 ///
 /// Keys are worker URLs used for dispatch. Missing, stale, or rank-incomplete
 /// workers are omitted and must use Router-local active load.
 #[derive(Debug, Clone, Default)]
-pub struct EngineLoadSnapshot {
+pub struct EngineReportedLoadSnapshot {
     pub version: u64,
-    workers: HashMap<String, EngineWorkerLoad>,
-    native_cache_workers: HashMap<String, NativeCacheWorkerLoad>,
+    workers: HashMap<String, EngineReportedWorkerLoad>,
+    native_cache_workers: HashMap<String, EngineReportedSchedulingLoad>,
 }
 
-impl EngineLoadSnapshot {
-    pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineWorkerLoad> {
+impl EngineReportedLoadSnapshot {
+    pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineReportedWorkerLoad> {
         self.workers.get(worker_url)
     }
 
@@ -136,13 +138,13 @@ impl EngineLoadSnapshot {
     pub fn fresh_native_cache_load_for_url(
         &self,
         worker_url: &str,
-    ) -> Option<&NativeCacheWorkerLoad> {
+    ) -> Option<&EngineReportedSchedulingLoad> {
         self.native_cache_workers.get(worker_url)
     }
 
     /// Builds a view from worker data that already passed freshness and rank checks.
-    /// Production requests should use [`EngineLoadTable::capture_snapshot`].
-    pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
+    /// Production requests should use [`EngineReportedLoadTable::capture_snapshot`].
+    pub fn from_workers(version: u64, workers: HashMap<String, EngineReportedWorkerLoad>) -> Self {
         Self {
             version,
             workers,
@@ -151,17 +153,17 @@ impl EngineLoadSnapshot {
     }
 
     /// Builds a test snapshot from complete native monitor data.
-    /// Production requests must use [`EngineLoadTable::capture_snapshot`].
+    /// Production requests must use [`EngineReportedLoadTable::capture_snapshot`].
     pub fn from_native_cache_workers(
         version: u64,
-        workers: HashMap<String, NativeCacheWorkerLoad>,
+        workers: HashMap<String, EngineReportedSchedulingLoad>,
     ) -> Self {
         let basic = workers
             .iter()
             .map(|(url, load)| {
                 (
                     url.clone(),
-                    EngineWorkerLoad {
+                    EngineReportedWorkerLoad {
                         num_running_reqs: load.num_running_reqs,
                         num_waiting_reqs: load.num_waiting_reqs,
                         num_tokens: load.num_used_tokens,
@@ -292,7 +294,7 @@ type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
 /// Per-`(worker_url, dp_rank)` engine-reported load, written by the load
 /// subscriber pump and captured once at request ingress.
 #[derive(Debug)]
-pub struct EngineLoadTable {
+pub struct EngineReportedLoadTable {
     by_rank: DashMap<(String, u32), LoadEntry>,
     /// Per-rank publishers the worker advertised. A worker is usable only
     /// when every advertised rank has a fresh value; accepting a partial
@@ -302,7 +304,7 @@ pub struct EngineLoadTable {
     version: AtomicU64,
 }
 
-impl EngineLoadTable {
+impl EngineReportedLoadTable {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             by_rank: DashMap::new(),
@@ -364,7 +366,7 @@ impl EngineLoadTable {
     /// look misleadingly idle and draw *more* traffic.) Callers that never
     /// registered expected ranks retain the all-known-ranks rule. The oldest
     /// timestamp represents the freshness of the complete aggregate.
-    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineWorkerLoad> {
+    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineReportedWorkerLoad> {
         // url -> rank -> (reported load, fresh, timestamp).
         let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
         for entry in self.by_rank.iter() {
@@ -412,7 +414,7 @@ impl EngineLoadTable {
                 oldest_at.map(|captured_at| {
                     (
                         url,
-                        EngineWorkerLoad {
+                        EngineReportedWorkerLoad {
                             num_running_reqs,
                             num_waiting_reqs,
                             num_tokens,
@@ -432,7 +434,7 @@ impl EngineLoadTable {
     fn fresh_native_cache_worker_loads(
         &self,
         now: Instant,
-    ) -> HashMap<String, NativeCacheWorkerLoad> {
+    ) -> HashMap<String, EngineReportedSchedulingLoad> {
         let mut observed: HashMap<String, NativeWorkerObservations> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
@@ -521,7 +523,7 @@ impl EngineLoadTable {
                 oldest_at.map(|captured_at| {
                     (
                         url,
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs,
                             num_waiting_reqs,
                             num_waiting_uncached_tokens,
@@ -540,8 +542,8 @@ impl EngineLoadTable {
     }
 
     /// Captures one immutable view for all routing decisions in a request.
-    pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
-        EngineLoadSnapshot {
+    pub fn capture_snapshot(&self, now: Instant) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
             workers: self.fresh_worker_loads(now),
             native_cache_workers: self.fresh_native_cache_worker_loads(now),
@@ -635,7 +637,7 @@ mod tests {
 
     #[test]
     fn sums_queue_depth_across_ranks() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         let now = Instant::now();
         t.set("http://w:30000", 0, load(5, 1), now);
         t.set("http://w:30000", 1, load(3, 2), now);
@@ -647,7 +649,7 @@ mod tests {
 
     #[test]
     fn stale_entries_are_dropped_from_snapshot() {
-        let t = EngineLoadTable::with_freshness(Duration::from_millis(10));
+        let t = EngineReportedLoadTable::with_freshness(Duration::from_millis(10));
         let old = Instant::now();
         t.set("http://w:30000", 0, load(9, 9), old);
         // A read far in the future sees the entry as stale -> worker absent.
@@ -660,7 +662,7 @@ mod tests {
 
     #[test]
     fn forget_worker_clears_all_ranks() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         let now = Instant::now();
         t.set("http://w:30000", 0, load(1, 0), now);
         t.set("http://w:30000", 1, load(1, 0), now);
@@ -677,7 +679,7 @@ mod tests {
     /// router-side counter instead of looking misleadingly idle.
     #[test]
     fn partial_freshness_excludes_worker() {
-        let t = EngineLoadTable::with_freshness(Duration::from_secs(5));
+        let t = EngineReportedLoadTable::with_freshness(Duration::from_secs(5));
         let now = Instant::now();
         let stale = now - Duration::from_secs(3600);
         t.set("http://w:30000", 0, load(5, 1), now); // fresh
@@ -692,7 +694,7 @@ mod tests {
 
     #[test]
     fn missing_expected_rank_excludes_worker() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         let now = Instant::now();
         t.mark_expected_rank("http://w:30000", 0);
         t.mark_expected_rank("http://w:30000", 1);
@@ -712,7 +714,7 @@ mod tests {
 
     #[test]
     fn capture_snapshot_uses_the_earliest_rank_timestamp() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         let earlier = Instant::now() - Duration::from_secs(2);
         let later = earlier + Duration::from_secs(1);
         t.set("http://w:30000", 0, load(5, 1), later);
@@ -726,7 +728,7 @@ mod tests {
 
     #[test]
     fn expected_count_tracks_marked_workers_and_forget() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         assert_eq!(t.expected_count(), 0);
         t.mark_expected_rank("http://w:30000", 0);
         t.mark_expected_rank("http://w:30000", 1); // same worker
@@ -738,7 +740,7 @@ mod tests {
 
     #[test]
     fn complete_v3_semantic_samples_derive_prefill_queue_time() {
-        let t = EngineLoadTable::new();
+        let t = EngineReportedLoadTable::new();
         let first = Instant::now();
         let second = first + Duration::from_secs(2);
         let mut old = load(2, 3);
