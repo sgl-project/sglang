@@ -21,7 +21,6 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_shared_experts_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -585,7 +584,7 @@ class KimiK3MoE(nn.Module):
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
         elif self._shared_experts_tp_comm:
             group = (
-                get_shared_experts_tp_group()
+                parallel.shared_experts_tp_group
                 if requested_shared_tp is not None
                 else parallel.attn_tp_group
             )

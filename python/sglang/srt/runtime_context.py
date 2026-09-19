@@ -218,6 +218,7 @@ _LIVE_READS: dict = {
     "moe_tp_group": "get_moe_tp_group",
     "attn_tp_group": "get_attn_tp_group",
     "attn_cp_group": "get_attn_cp_group",
+    "shared_experts_tp_group": "get_shared_experts_tp_group",
     "dcp_group": "get_dcp_group",
 }
 
@@ -485,7 +486,7 @@ _UNREADABLE = object()
 def _validate_parallel(parallel, source: str) -> None:
     """Fail on a topology that cannot describe a real process layout.
 
-    The three identities hold unconditionally: a width and a rank are both
+    Every identity holds unconditionally: a width and a rank are both
     plausible small integers whichever way they are wrong, so an inconsistent
     set is not caught by anything downstream -- it surfaces as a hang or a
     wrong answer in a collective, far from the write. Stating one leaf without
@@ -528,6 +529,34 @@ def _validate_parallel(parallel, source: str) -> None:
             problems.append(
                 "tp_size == attn_tp_size * attn_dp_size * attn_cp_size\n"
                 f"  {tp_size} != {a_tp} * {a_dp} * {a_cp} (= {a_tp * a_dp * a_cp})"
+            )
+
+    moe_terms = ("tp_size", "moe_ep_size", "moe_dp_size", "moe_tp_size")
+    tp_size, m_ep, m_dp, m_tp = (read(n) for n in moe_terms)
+    if _UNREADABLE not in (tp_size, m_ep, m_dp, m_tp):
+        if tp_size != m_ep * m_dp * m_tp:
+            problems.append(
+                "tp_size == moe_ep_size * moe_dp_size * moe_tp_size\n"
+                f"  {tp_size} != {m_ep} * {m_dp} * {m_tp} (= {m_ep * m_dp * m_tp})"
+            )
+
+    layout_terms = (
+        "tp_rank",
+        "attn_dp_rank",
+        "attn_cp_rank",
+        "attn_tp_rank",
+        "attn_cp_size",
+        "attn_tp_size",
+    )
+    tp_rank, r_dp, r_cp, r_tp, w_cp, w_tp = (read(n) for n in layout_terms)
+    if _UNREADABLE not in (tp_rank, r_dp, r_cp, r_tp, w_cp, w_tp):
+        laid_out = (r_dp * w_cp + r_cp) * w_tp + r_tp
+        if tp_rank != laid_out:
+            problems.append(
+                "tp_rank == (attn_dp_rank * attn_cp_size + attn_cp_rank)"
+                " * attn_tp_size + attn_tp_rank\n"
+                f"  {tp_rank} != ({r_dp} * {w_cp} + {r_cp})"
+                f" * {w_tp} + {r_tp} (= {laid_out})"
             )
 
     for size_name, group_name in _WIDTH_AND_GROUP:

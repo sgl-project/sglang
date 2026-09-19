@@ -1915,10 +1915,10 @@ class TestDerivedWidths(_IsolatedOverrides):
             str(caught.exception),
         )
 
-        with get_parallel().override(tp_size=2, attn_tp_size=2):
+        with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
             self.assertEqual(get_parallel().tp_size, 2)
             self.assertEqual(get_parallel().attn_tp_size, 2)
-        with get_parallel().override(attn_tp_size=4, tp_size=4):
+        with get_parallel().override(attn_tp_size=4, tp_size=4, moe_tp_size=4):
             self.assertEqual(get_parallel().attn_tp_size, 4)
 
     def test_an_unstated_topology_still_fails(self):
@@ -2296,6 +2296,76 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
         )
 
 
+class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
+    """`parallel_state`'s getters are the definition, not a second spelling.
+
+    Business code asks `get_parallel()`; a call that goes straight to the getter
+    is a read the context cannot redirect, which is what a scope needs it to be
+    able to do. The package that defines them is exempt -- a read there would
+    go through the context back into itself -- and so is `multimodal_gen`, which
+    has its own parallel state.
+    """
+
+    #: Not topology. `get_self_pp_group` builds the single-rank group a draft
+    #: pipeline scope installs, so there is nothing for the context to answer
+    #: with until the scope has installed it.
+    ALLOWED = {
+        "get_self_pp_group",
+        "get_default_distributed_backend",
+        "get_mooncake_transfer_engine",
+    }
+
+    def _accessors(self):
+        """Derived from the source, not listed here: a guard whose subject set
+        is written by hand stops watching whatever gets added next."""
+        from sglang.srt.distributed import parallel_state as parallel_state_module
+
+        source = _pathlib.Path(parallel_state_module.__file__).read_text().splitlines()
+        return {
+            line[len("def ") : line.index("(")]
+            for line in source
+            if line.startswith("def get_") or line.startswith("def is_")
+        }
+
+    def _callers(self, name):
+        import re
+
+        from sglang.srt.distributed import parallel_state as parallel_state_module
+
+        root = _pathlib.Path(parallel_state_module.__file__).parents[2]
+        pattern = re.compile(rf"(?<![.\w]){re.escape(name)}\(")
+        hits = []
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
+                continue
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if line.lstrip().startswith(("def ", "#")):
+                    continue
+                if pattern.search(line):
+                    hits.append(f"{rel}:{number}")
+        return hits
+
+    def test_no_business_code_calls_them(self):
+        offenders = {}
+        for name in sorted(self._accessors() - self.ALLOWED):
+            callers = self._callers(name)
+            if callers:
+                offenders[name] = callers
+        self.assertEqual(
+            offenders,
+            {},
+            "read these through get_parallel() instead, or say here why the "
+            "context cannot answer them",
+        )
+
+    def test_the_guard_would_notice_a_caller(self):
+        """The subject set is derived, so this checks the search finds a real
+        call rather than that the list happens to be empty: `get_self_pp_group`
+        is exempt and does have one caller."""
+        self.assertTrue(self._callers("get_self_pp_group"))
+
+
 class TestTheTopologyIdentities(CustomTestCase):
     """One set of identities, checked wherever the layout is written.
 
@@ -2346,6 +2416,47 @@ class TestTheTopologyIdentities(CustomTestCase):
             with get_parallel().override(tp_rank=4, tp_size=4):
                 pass
         self.assertIn("0 <= tp_rank < tp_size", str(caught.exception))
+
+    def test_a_moe_width_that_does_not_factor_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_size=4, moe_ep_size=1, moe_dp_size=1, moe_tp_size=3
+            ):
+                pass
+        message = str(caught.exception)
+        self.assertIn("moe_ep_size * moe_dp_size * moe_tp_size", message)
+        self.assertIn("4 != 1 * 1 * 3", message)
+
+    def test_a_rank_the_attention_layout_cannot_produce_is_refused(self):
+        """`tp_rank` is not free of the attention ranks: the layout derives one
+        from the other, so a set that does not satisfy it places this process
+        in two different seats at once."""
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_rank=0,
+                attn_dp_rank=1,
+                attn_cp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_size=1,
+                attn_tp_size=2,
+            ):
+                pass
+        self.assertIn("attn_tp_size + attn_tp_rank", str(caught.exception))
+
+    def test_the_published_ranks_satisfy_the_layout(self):
+        """The quiet direction for the same identity: publish derives the
+        attention ranks from `tp_rank` through that very equation, so a
+        published process always sits in one seat."""
+        self._publish_square()
+        parallel = get_parallel()
+        self.assertEqual(
+            parallel.tp_rank,
+            (parallel.attn_dp_rank * parallel.attn_cp_size + parallel.attn_cp_rank)
+            * parallel.attn_tp_size
+            + parallel.attn_tp_rank,
+        )
 
     def test_a_refused_write_leaves_nothing_behind(self):
         """The scope never opened, so the value it tried to state must not be

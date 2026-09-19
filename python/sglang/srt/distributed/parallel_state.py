@@ -3068,10 +3068,11 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     target's attention-TP group, which is already the TP width divided by the
     attention-DP and attention-CP factors -- so the draft running on it has
     neither: its attention identity is the group itself, one replica, one
-    context shard. Stating all of it keeps
-    ``tp_size == attn_tp_size * attn_dp_size * attn_cp_size`` true inside the
-    scope; leaving the names on the target's answers is what lets a draft read
-    report a replica count the draft does not have.
+    context shard, and no expert dimension either -- the one worker that runs a
+    MoE draft declines this scope for exactly that reason. Stating all of it
+    keeps the width identities true inside the scope; leaving the names on the
+    target's answers is what lets a draft read report a replica count, or an
+    expert group, that the draft does not have.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
@@ -3096,6 +3097,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
             attn_cp_size=1,
             attn_cp_rank=0,
             dp_size=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_ep_group=None,
+            moe_dp_size=1,
+            moe_tp_size=tp_group.world_size,
+            moe_tp_rank=tp_group.rank_in_group,
         ):
             yield
     finally:
