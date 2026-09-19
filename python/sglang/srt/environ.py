@@ -771,6 +771,21 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
+    # L2 admission, so the two tiers hold different pages. Python tree core only.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
+    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
+    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
+    # Hybrid models: anchor the L3 prefetch at the deepest host-backed Full-KV node;
+    # the all-components match stops at the last Mamba state and re-asks L3 for L2 pages.
+    SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV = EnvBool(False)
+    # Exclusive tiering: also write a node's Mamba state to L3 right after its
+    # host backup completes, not only when its KV is host-evicted.
+    SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
+    # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

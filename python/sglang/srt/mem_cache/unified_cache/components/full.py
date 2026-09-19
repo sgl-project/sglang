@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Sequence
 
 import torch
 
@@ -231,6 +231,24 @@ class FullComponent(TreeComponent):
         self._evict_device_heap = []
         self._evict_device_last_node = None
 
+    def _host_eviction_walk(
+        self, parent_ready: Callable[[UnifiedTreeNode, UnifiedTreeNode], bool]
+    ) -> Iterator[UnifiedTreeNode]:
+        """Yield host leaves coldest-first. After each yield a parent is pushed
+        when ``parent_ready(child, parent)`` says it has become a host leaf."""
+        self._ensure_eviction_strategy()
+        heap = [
+            (self.session_ref_eviction_strategy(n), n)
+            for n in self.tree_core.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        while heap:
+            _, x = heapq.heappop(heap)
+            yield x
+            p = x.parent
+            if p is not None and parent_ready(x, p):
+                heapq.heappush(heap, (self.session_ref_eviction_strategy(p), p))
+
     def drive_host_eviction(
         self,
         num_tokens: int,
@@ -239,26 +257,37 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
-        self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
-        heapq.heapify(heap)
         ct = self.component_type
-        while tracker[ct] < num_tokens and heap:
-            _, x = heapq.heappop(heap)
-            if x not in self.tree_core.evictable_host_leaves:
+        leaves = self.tree_core.evictable_host_leaves
+        for x in self._host_eviction_walk(lambda _child, p: p in leaves):
+            if tracker[ct] >= num_tokens:
+                break
+            if x not in leaves:
                 continue
             self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
-            if (
-                x.parent is not None
-                and x.parent in self.tree_core.evictable_host_leaves
-            ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
-                )
+
+    def peek_host_eviction_candidates(
+        self, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """drive_host_eviction's order without the eviction: a parent joins the
+        heap once every child has been taken, mirroring the leaf cascade."""
+        tc = self.tree_core
+        children_left: dict[UnifiedTreeNode, int] = {}
+
+        def parent_ready(child: UnifiedTreeNode, p: UnifiedTreeNode) -> bool:
+            left = children_left.get(p, len(p.children)) - 1
+            children_left[p] = left
+            return left == 0 and tc._is_host_leaf(p, ignore_children=True)
+
+        out: list[tuple[NodeId, int, Optional[list[str]]]] = []
+        covered = 0
+        for x in self._host_eviction_walk(parent_ready):
+            if covered >= num_tokens:
+                break
+            n = len(x.key)
+            out.append((x.id, n, x.hash_value))
+            covered += n
+        return out
 
     def acquire_component_lock(
         self,
