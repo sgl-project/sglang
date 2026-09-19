@@ -3,7 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
+from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_load_back_jit_kernel,
+    can_use_write_back_jit_kernel,
+    transfer_hicache_one_layer_mla_page_unified_lf,
+    transfer_hicache_one_layer_page_unified_lf,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -14,7 +19,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -494,6 +499,288 @@ def test_hicache_page_first_staged_write_back_mha_staged_only_alignment() -> Non
 
 def test_hicache_page_first_staged_write_back_mla_staged_only_alignment() -> None:
     _run_page_first_staged_write_back_mla("page_first", 72, 65)
+
+
+# ---------------------------------------------------------------------------
+# page_unified load-back (host -> device), HiCacheKernel::run_one_page_unified
+#
+# Unlike the cases above, these drive the op directly rather than through a host
+# pool: the layout has no pool wrapper yet. The reference is built by plain
+# PyTorch indexing of the host tensor rather than by re-deriving the kernel's
+# offsets, and the payload is seeded noise rather than a counter -- a counter is
+# periodic in the layer stride, so a layer mix-up would compare equal.
+# ---------------------------------------------------------------------------
+
+PAGE_UNIFIED_NUM_PAGES = 8
+PAGE_UNIFIED_SENTINEL = 255
+# Repeats a source page and is unordered; reading the same host token into two
+# device slots is a real prefix-sharing case.
+PAGE_UNIFIED_SRC_PATTERN = [5, 0, 3, 5, 1, 2, 4, 3]
+
+
+def _page_unified_host_pages(shape, seed):
+    """Pinned host pages of exactly representable noise."""
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(0, 128, shape, generator=generator, dtype=torch.int32)
+
+
+def _page_unified_index_pairs(token_count, host_tokens, device_tokens):
+    """Host token ids (repeats allowed, unordered) paired with distinct device ids.
+
+    Device ids must be distinct: two items writing the same device slot would
+    make the expected result depend on which block happens to land last.
+    """
+    src_ids = [i % host_tokens for i in PAGE_UNIFIED_SRC_PATTERN[:token_count]]
+    dst_ids = list(reversed(range(token_count)))
+    assert token_count <= device_tokens
+    return src_ids, dst_ids
+
+
+@pytest.mark.parametrize(
+    "groups,layers,page_size,heads_per_group,dim",
+    [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("token_count", [0, 1, 8])
+def test_page_unified_load_back(
+    groups, layers, page_size, heads_per_group, dim, dtype, index_dtype, token_count
+):
+    heads = groups * heads_per_group
+    host_tokens = PAGE_UNIFIED_NUM_PAGES * page_size
+    device_tokens = host_tokens + page_size
+    src = (
+        _page_unified_host_pages(
+            (
+                PAGE_UNIFIED_NUM_PAGES,
+                groups,
+                layers,
+                2,
+                page_size,
+                heads_per_group,
+                dim,
+            ),
+            1234,
+        )
+        .to(dtype)
+        .pin_memory()
+    )
+    src_ids, dst_ids = _page_unified_index_pairs(
+        token_count, host_tokens, device_tokens
+    )
+
+    src_pages = torch.tensor(src_ids, dtype=index_dtype, device=DEVICE)
+    dst_pages = torch.tensor(dst_ids, dtype=index_dtype, device=DEVICE)
+    k_dst = torch.full(
+        (device_tokens, heads, dim), PAGE_UNIFIED_SENTINEL, dtype=dtype, device=DEVICE
+    )
+    v_dst = torch.full_like(k_dst, PAGE_UNIFIED_SENTINEL)
+
+    # Every layer is loaded separately: the layer stride is the axis a wrong
+    # permutation is most likely to get wrong, and only sweeping it catches that.
+    for layer_id in range(layers):
+        k_dst.fill_(PAGE_UNIFIED_SENTINEL)
+        v_dst.fill_(PAGE_UNIFIED_SENTINEL)
+        expected_k = torch.full_like(k_dst.cpu(), PAGE_UNIFIED_SENTINEL)
+        expected_v = torch.full_like(expected_k, PAGE_UNIFIED_SENTINEL)
+        for src_token, dst_token in zip(src_ids, dst_ids):
+            page, token = divmod(src_token, page_size)
+            for group in range(groups):
+                head_slice = slice(
+                    group * heads_per_group, (group + 1) * heads_per_group
+                )
+                expected_k[dst_token, head_slice] = src[page, group, layer_id, 0, token]
+                expected_v[dst_token, head_slice] = src[page, group, layer_id, 1, token]
+
+        transfer_hicache_one_layer_page_unified_lf(
+            k_dst, v_dst, src, src_pages, dst_pages, layer_id
+        )
+        torch.cuda.synchronize()
+        # Compare every element, including rows that should retain the sentinel.
+        assert torch.equal(k_dst.cpu(), expected_k)
+        assert torch.equal(v_dst.cpu(), expected_v)
+
+
+@pytest.mark.parametrize(
+    "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("token_count", [0, 1, 8])
+def test_page_unified_mla_load_back(
+    layers, page_size, dim, dtype, index_dtype, token_count
+):
+    host_tokens = PAGE_UNIFIED_NUM_PAGES * page_size
+    device_tokens = host_tokens + page_size
+    src = (
+        _page_unified_host_pages((PAGE_UNIFIED_NUM_PAGES, layers, page_size, dim), 5678)
+        .to(dtype)
+        .pin_memory()
+    )
+    src_ids, dst_ids = _page_unified_index_pairs(
+        token_count, host_tokens, device_tokens
+    )
+
+    src_pages = torch.tensor(src_ids, dtype=index_dtype, device=DEVICE)
+    dst_pages = torch.tensor(dst_ids, dtype=index_dtype, device=DEVICE)
+    dst = torch.full(
+        (device_tokens, 1, dim), PAGE_UNIFIED_SENTINEL, dtype=dtype, device=DEVICE
+    )
+
+    for layer_id in range(layers):
+        dst.fill_(PAGE_UNIFIED_SENTINEL)
+        expected = torch.full_like(dst.cpu(), PAGE_UNIFIED_SENTINEL)
+        for src_token, dst_token in zip(src_ids, dst_ids):
+            page, token = divmod(src_token, page_size)
+            expected[dst_token, 0] = src[page, layer_id, token]
+
+        transfer_hicache_one_layer_mla_page_unified_lf(
+            dst, src, src_pages, dst_pages, layer_id
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(dst.cpu(), expected)
+
+
+def test_page_unified_load_back_non_default_stream():
+    """All work must land on the caller's stream, including the host reads."""
+    groups, layers, page_size, heads_per_group, dim = 2, 3, 8, 2, 64
+    heads = groups * heads_per_group
+    src = (
+        _page_unified_host_pages(
+            (
+                PAGE_UNIFIED_NUM_PAGES,
+                groups,
+                layers,
+                2,
+                page_size,
+                heads_per_group,
+                dim,
+            ),
+            99,
+        )
+        .to(torch.bfloat16)
+        .pin_memory()
+    )
+    src_ids = list(range(0, PAGE_UNIFIED_NUM_PAGES * page_size, 3))
+    dst_ids = list(range(len(src_ids)))
+    layer_id = layers - 1
+
+    expected_k = torch.full(
+        (len(dst_ids), heads, dim), PAGE_UNIFIED_SENTINEL, dtype=torch.bfloat16
+    )
+    expected_v = torch.full_like(expected_k, PAGE_UNIFIED_SENTINEL)
+    for src_token, dst_token in zip(src_ids, dst_ids):
+        page, token = divmod(src_token, page_size)
+        for group in range(groups):
+            head_slice = slice(group * heads_per_group, (group + 1) * heads_per_group)
+            expected_k[dst_token, head_slice] = src[page, group, layer_id, 0, token]
+            expected_v[dst_token, head_slice] = src[page, group, layer_id, 1, token]
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        src_pages = torch.tensor(src_ids, dtype=torch.int64, device=DEVICE)
+        dst_pages = torch.tensor(dst_ids, dtype=torch.int64, device=DEVICE)
+        k_dst = torch.full(
+            (len(dst_ids), heads, dim),
+            PAGE_UNIFIED_SENTINEL,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        v_dst = torch.full_like(k_dst, PAGE_UNIFIED_SENTINEL)
+        transfer_hicache_one_layer_page_unified_lf(
+            k_dst, v_dst, src, src_pages, dst_pages, layer_id
+        )
+    stream.synchronize()
+    assert torch.equal(k_dst.cpu(), expected_k)
+    assert torch.equal(v_dst.cpu(), expected_v)
+
+
+# The C++ launcher also checks the page and device-row byte sizes against the
+# compiled kElementSize, for callers that reach the module directly. Those are
+# unreachable here by construction: the entry points derive every geometry
+# argument from the tensor shapes they are handed.
+@pytest.mark.parametrize(
+    "invalid,match",
+    [
+        ("rank", "Expected \\(page"),
+        ("kv_axis", "K/V dimension"),
+        ("group_alignment", "16-byte aligned"),
+        ("noncontiguous", "must be contiguous"),
+        ("layer_id", "layer id out of range"),
+        ("device_heads", "device row byte size mismatch"),
+        ("index_length", "indices length"),
+    ],
+)
+def test_page_unified_load_back_invalid_input(invalid, match):
+    groups, layers, page_size, heads_per_group, dim = 2, 3, 4, 1, 16
+    shape = [PAGE_UNIFIED_NUM_PAGES, groups, layers, 2, page_size, heads_per_group, dim]
+    if invalid == "kv_axis":
+        shape[3] = 3
+    elif invalid == "group_alignment":
+        shape[6] = 7
+    elif invalid == "rank":
+        shape.pop()
+    src = torch.zeros(shape, dtype=torch.float16).pin_memory()
+    if invalid == "noncontiguous":
+        src = src.transpose(1, 2).contiguous().transpose(1, 2)
+
+    heads = groups * heads_per_group
+    if invalid == "device_heads":
+        heads += 1
+    k_dst = torch.zeros((8, heads, dim), dtype=torch.float16, device=DEVICE)
+    v_dst = torch.zeros_like(k_dst)
+    src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    if invalid == "index_length":
+        dst_pages = dst_pages[:1]
+    layer_id = layers if invalid == "layer_id" else 0
+
+    # TVM FFI uses its own exception type for C++ RuntimeCheck failures.
+    with pytest.raises(Exception, match=match):
+        transfer_hicache_one_layer_page_unified_lf(
+            k_dst, v_dst, src, src_pages, dst_pages, layer_id
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid,match",
+    [
+        ("rank", "Expected MLA"),
+        ("dimension", "must be positive"),
+        ("alignment", "16-byte aligned"),
+        ("layer_id", "layer id out of range"),
+    ],
+)
+def test_page_unified_mla_load_back_invalid_input(invalid, match):
+    layers, page_size, dim = 3, 4, 16
+    if invalid == "dimension":
+        dim = 0
+    elif invalid == "alignment":
+        dim = 7
+    src = torch.zeros(
+        (PAGE_UNIFIED_NUM_PAGES, layers, page_size, dim), dtype=torch.float16
+    )
+    if dim > 0:
+        src = src.pin_memory()
+    if invalid == "rank":
+        src = src.unsqueeze(1)
+    dst = torch.zeros((8, 1, max(dim, 1)), dtype=torch.float16, device=DEVICE)
+    src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    layer_id = layers if invalid == "layer_id" else 0
+
+    with pytest.raises(Exception, match=match):
+        transfer_hicache_one_layer_mla_page_unified_lf(
+            dst, src, src_pages, dst_pages, layer_id
+        )
+
+
+@pytest.mark.parametrize("group_bytes,expected", [(0, False), (8, False), (256, True)])
+def test_can_use_page_unified_load_back_jit_kernel(group_bytes, expected):
+    """The probe owns the alignment precondition and compiles the specialisation."""
+    assert (
+        can_use_page_unified_load_back_jit_kernel(group_bytes=group_bytes) is expected
+    )
 
 
 if __name__ == "__main__":
