@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import torch
@@ -137,20 +138,18 @@ class StagingBuffer:
         self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None and not pool_already_active:
-            with torch.cuda.use_mem_pool(custom_mem_pool):
-                self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "custom_mem_pool (cuMemCreate)"
-        elif pool_already_active:
-            # The caller already holds ``torch.cuda.use_mem_pool(custom_mem_pool)``.
-            # Re-entering it per buffer makes the CUDA caching allocator release and
-            # re-acquire the same pool id repeatedly, which can trip
-            # "use_count > 0 INTERNAL ASSERT FAILED" in CUDACachingAllocator.
+        pool_ctx = (
+            torch.cuda.use_mem_pool(custom_mem_pool)
+            if custom_mem_pool is not None and not pool_already_active
+            else nullcontext()
+        )
+        with pool_ctx:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "custom_mem_pool (cuMemCreate, caller-held ctx)"
-        else:
-            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "cudaMalloc"
+        alloc_method = (
+            "custom_mem_pool (cuMemCreate)"
+            if custom_mem_pool is not None
+            else "cudaMalloc"
+        )
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(

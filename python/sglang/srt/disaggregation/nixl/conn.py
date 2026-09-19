@@ -3030,19 +3030,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.update_status(room, KVPoll.WaitingForInput)
 
         def bootstrap_thread_guarded():
-            # Without this the thread dies silently: the rank stops accepting
-            # decode KV registrations and the only symptom is every request
-            # timing out in KVPoll.Bootstrapping minutes later, with a message
-            # that points at the decode side.
             try:
                 bootstrap_thread()
-            except BaseException:
-                logger.error(
-                    "prefill bootstrap_thread died on engine_rank=%s; this rank can "
-                    "no longer receive KV indices from decode and every request "
-                    "routed to it will stall until the KVPoll.Bootstrapping timeout.",
-                    getattr(self.kv_args, "engine_rank", "?"),
-                    exc_info=True,
+            except Exception:
+                logger.exception(
+                    "prefill bootstrap_thread died on engine_rank=%s; requests to "
+                    "this rank will time out in KVPoll.Bootstrapping",
+                    self.kv_args.engine_rank,
                 )
                 raise
 
