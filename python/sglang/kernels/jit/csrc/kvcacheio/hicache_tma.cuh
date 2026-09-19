@@ -29,6 +29,7 @@
 
 #include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <dlpack/dlpack.h>
 
@@ -217,8 +218,8 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
       if (chunk + gridDim.x < num_chunks) next = prefetch(chunk + gridDim.x);
 
       // A run: every row sits at first + r (whole pages in order), on either side.
-      const T first = __shfl_sync(kFullMask, cur.src[0], 0);
-      const T first_dst = __shfl_sync(kFullMask, cur.dst[0], 0);
+      const T first = __shfl_sync(warp::kFullMask, cur.src[0], 0);
+      const T first_dst = __shfl_sync(warp::kFullMask, cur.dst[0], 0);
       bool run = true, run_dst = true;
 #pragma unroll
       for (uint32_t k = 0; k < kHicacheTmaRowsPerLane; ++k) {
@@ -226,8 +227,8 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
         run &= r >= c.rows || cur.src[k] == first + static_cast<T>(r);
         run_dst &= r >= c.rows || cur.dst[k] == first_dst + static_cast<T>(r);
       }
-      run = __all_sync(kFullMask, run);
-      run_dst = __all_sync(kFullMask, run_dst);
+      run = __all_sync(warp::kFullMask, run);
+      run_dst = __all_sync(warp::kFullMask, run_dst);
       const bool contiguous = run && p.src_stride == p.row_bytes;
       const bool boxed = run && !contiguous && p.has_src_map;
 
