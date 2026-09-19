@@ -146,7 +146,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             model_runner.device,
             model_runner.gpu_id,
             get_parallel().world_group.rank_in_group,
-            get_parallel().world_group.world_size,
+            get_parallel().launch_world_size,
             get_parallel().world_group.cpu_group,
         )
 

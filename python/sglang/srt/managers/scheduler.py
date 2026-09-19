@@ -5665,7 +5665,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = get_parallel().max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_world_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
