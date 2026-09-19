@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -56,6 +58,9 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -75,6 +80,8 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        # Rate-limit for the graceful-skip WARNING (see _report_mamba_slot_exhausted).
+        self._last_exhaust_report_ts = 0.0
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -486,29 +493,42 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one mamba pool slot, evicting if necessary.
+
+        Returns None if the pool is exhausted AND eviction cannot reclaim a
+        slot. Callers in the *optional* caching/donation paths must treat None
+        as "skip caching this prefix" instead of failing the request (the state
+        is recomputed on the next request).
+        """
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+        if slot is None:
+            self._report_mamba_slot_exhausted("bf16")
         return slot
 
     @property
     def int8_ckpt_pool(self):
         return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
 
-    def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
+    def _alloc_int8_ckpt_slot(self) -> Optional[torch.Tensor]:
         slot = self.int8_ckpt_pool.alloc(1)
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.int8_ckpt_pool.alloc(1)
-            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
+        if slot is None:
+            self._report_mamba_slot_exhausted("int8")
         return slot
 
-    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> Optional[torch.Tensor]:
         ckpt_slot = self._alloc_int8_ckpt_slot()
+        if ckpt_slot is None:
+            # int8 pool exhausted and eviction could not reclaim: skip the
+            # checkpoint (None propagates to the caller, which must skip the
+            # cache/donation instead of storing invalid indices).
+            return None
         self.int8_ckpt_pool.store_from_active(
             self.cache.req_to_token_pool.mamba_pool,
             active_slots.view(-1),
@@ -521,6 +541,75 @@ class MambaComponent(TreeComponent):
             self.int8_ckpt_pool.free(mamba_value)
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
+
+    def _report_mamba_slot_exhausted(self, pool: str) -> None:
+        """Rate-limited WARNING + counter when a mamba slot allocation fails.
+
+        This is the graceful-degradation safety net for the optional
+        caching/donation paths: a slot could not be allocated because the pool
+        is exhausted AND eviction could not reclaim one (e.g. every tree state
+        is transiently locked by an in-flight hicache write-through). The
+        request is NOT failed; the prefix is just not cached for that turn.
+        """
+        now = time.monotonic()
+        if now - self._last_exhaust_report_ts >= 5.0:
+            self._last_exhaust_report_ts = now
+            logger.warning(
+                "mamba cache donation skipped: %s pool exhausted and eviction "
+                "could not reclaim a slot; prefix caching degraded for this request",
+                pool,
+            )
+        mc = getattr(self.cache, "metrics_collector", None)
+        if mc is not None:
+            try:
+                mc.increment_mamba_cache_skip(pool)
+            except Exception:  # noqa: BLE001 - metrics must never break serving
+                pass
+
+    def _donate_state_for_unfinished_req(self, req: Req) -> Optional[torch.Tensor]:
+        """Donate the request's tracked mamba state to the radix cache.
+
+        Returns the donated slot(s) on success, or None if the pool is
+        exhausted and eviction could not reclaim a slot. On None the caller
+        should skip caching this prefix (safe: the state is recomputed on the
+        next request), NOT fail the request.
+        """
+        if self.int8_ckpt_pool is not None:
+            if self.cache.enable_mamba_extra_buffer:
+                new_slot = self._alloc_mamba_slot()
+                if new_slot is None:
+                    return None
+                src_active = (
+                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                        req, new_slot
+                    )
+                )
+                mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                # `new_slot` stays as the request's tracking slot (it may keep
+                # running); only the replaced old slot is released. If the int8
+                # commit failed (None), src_active must still be returned to the
+                # pool, never leaked.
+                self.cache.req_to_token_pool.mamba_allocator.free(src_active)
+                return mamba_value_donated  # may be None (int8 pool exhausted)
+            return self._commit_int8_checkpoint(req.kv.mamba_pool_idx.view(-1))
+        if self.cache.enable_mamba_extra_buffer:
+            new_slot = self._alloc_mamba_slot()
+            if new_slot is None:
+                return None
+            return self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                req, new_slot
+            )
+        mamba_value_donated = self._alloc_mamba_slot()
+        if mamba_value_donated is None:
+            return None
+        # mamba_pool is a pure PHYSICAL store; translate both slot ids
+        # virtual->physical (identity for the non-unified memory pool) first.
+        translate = self.cache.req_to_token_pool.translate_mamba_indices
+        self.cache.req_to_token_pool.mamba_pool.copy_from(
+            translate(req.kv.mamba_pool_idx.unsqueeze(0)),
+            translate(mamba_value_donated),
+        )
+        return mamba_value_donated
 
     def prepare_for_caching_req(
         self,
@@ -560,44 +649,27 @@ class MambaComponent(TreeComponent):
             else:
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
             if self.int8_ckpt_pool is not None:
-                insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
+                mamba_value = self._commit_int8_checkpoint(active_value)
+                if mamba_value is None:
+                    # int8 checkpoint pool exhausted and eviction could not
+                    # reclaim: skip caching this finished prefix (safe: the
+                    # effective_cache_len=0 finished path is already exercised
+                    # when a request has no tracked mamba state).
+                    return 0
+                insert_params.mamba_value = mamba_value
             else:
                 insert_params.mamba_value = active_value
             return cache_len
         else:
             if cache_len is None:
                 return 0
-            # Donate the mamba index to the radix cache instead of copying.
-            if self.int8_ckpt_pool is not None:
-                if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
-                    src_active = (
-                        self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
-                            req, new_slot
-                        )
-                    )
-                    mamba_value_donated = self._commit_int8_checkpoint(src_active)
-                    self.cache.req_to_token_pool.mamba_allocator.free(src_active)
-                else:
-                    mamba_value_donated = self._commit_int8_checkpoint(
-                        req.kv.mamba_pool_idx.view(-1)
-                    )
-            elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
-                mamba_value_donated = (
-                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
-                        req, new_slot
-                    )
-                )
-            else:
-                mamba_value_donated = self._alloc_mamba_slot()
-                # mamba_pool is a pure PHYSICAL store; translate both slot ids
-                # virtual->physical (identity for the non-unified memory pool) first.
-                translate = self.cache.req_to_token_pool.translate_mamba_indices
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    translate(req.kv.mamba_pool_idx.unsqueeze(0)),
-                    translate(mamba_value_donated),
-                )
+            mamba_value_donated = self._donate_state_for_unfinished_req(req)
+            if mamba_value_donated is None:
+                # Pool exhausted and eviction could not reclaim a slot: skip
+                # caching this prefix for this turn (safe degradation; the
+                # state is recomputed on the next request). The caller turns
+                # this into effective_cache_len=0 and runs its no-cache path.
+                return 0
             insert_params.mamba_value = mamba_value_donated
             return cache_len
 
