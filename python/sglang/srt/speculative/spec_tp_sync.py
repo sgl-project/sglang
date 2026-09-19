@@ -36,6 +36,8 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_SAMPLE = 14
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
+    # 17 is kept open for a future sampled-draft sync site.
+    DFLASH_DRAFT_GREEDY = 18  # greedy draft proposal (block minus anchor) from the selector / vocab-parallel head
 
     @property
     def slug(self) -> str:

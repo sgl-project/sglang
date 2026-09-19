@@ -2164,6 +2164,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._warned_sampling_fallback = True
 
+    def _sync_greedy_draft(
+        self, draft_next: torch.Tensor, sampling_info
+    ) -> torch.Tensor:
+        # Domino, plain (no selector), and all-greedy proposals are rank-local
+        # argmax; peers take rank 0's rows. The sampled selector block (T>0)
+        # is not covered by this site.
+        if self._is_domino or self.selector is None or _is_all_greedy(sampling_info):
+            return self._tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next)
+        if not self._selector_sampling_enabled:
+            # Selector sampling is disabled on this device, so every proposal
+            # is a rank-local argmax regardless of the requested top_k: sync
+            # the whole tensor the same way as an all-greedy batch.
+            return self._tp_sync.sync(
+                SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next.clone()
+            )
+        # Mixed selector batch: greedy rows are still a rank-local argmax over
+        # the selector lattice, so broadcast rank 0's proposal and take only
+        # those rows. Sampled rows keep their rank-local draws; the future
+        # sampled-draft site (17) covers them.
+        greedy_mask = resolve_greedy_mask(
+            bs=draft_next.shape[0],
+            sampling_info=sampling_info,
+            device=draft_next.device,
+        )
+        if not greedy_mask.any():
+            return draft_next
+        synced = self._tp_sync.sync(
+            SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next.clone()
+        )
+        return torch.where(greedy_mask.unsqueeze(-1), synced, draft_next)
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -2573,6 +2604,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     ),
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
+
+        draft_next = self._sync_greedy_draft(draft_next, batch.sampling_info)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
