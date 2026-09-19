@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_sm90_supported
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -109,6 +109,25 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     if q_scale is not None:
         q = q / q_scale
     return q.to(torch.float8_e4m3fn)
+
+
+def _native_q8kv8_decode_contract(
+    *,
+    is_npu: bool,
+    is_sm90: bool,
+    fp8_attn_gemm: bool,
+    main_pool_dtype: torch.dtype,
+    block_size_k: int,
+    page_size: int,
+) -> bool:
+    return (
+        not is_npu
+        and is_sm90
+        and not fp8_attn_gemm
+        and main_pool_dtype == torch.float8_e4m3fn
+        and block_size_k == 128
+        and page_size == block_size_k
+    )
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -243,6 +262,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._msa_cg: dict[int, tuple] = {}
 
         self.page_size = self.kv_pool.page_size
+        _native_q8kv8_requested = (
+            envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_DECODE.get()
+        )
+        _native_q8kv8_contract_ok = _native_q8kv8_decode_contract(
+            is_npu=self.is_npu,
+            is_sm90=is_sm90_supported(),
+            fp8_attn_gemm=self.fp8_attn_gemm,
+            main_pool_dtype=self.kv_pool.main_pool.dtype,
+            block_size_k=self.block_size_k,
+            page_size=self.page_size,
+        )
+        if _native_q8kv8_requested and not _native_q8kv8_contract_ok:
+            raise RuntimeError(
+                "SGL native Q8KV8 decode requires SM90, FP8 E4M3 main KV, "
+                "page_size=block_size_k=128, and the full FP8 attention-GEMM "
+                "mode to be disabled"
+            )
+        self.use_sgl_native_q8kv8_decode = (
+            _native_q8kv8_requested and _native_q8kv8_contract_ok
+        )
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
@@ -320,7 +359,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"main_attn={'native_q8kv8_decode' if self.use_sgl_native_q8kv8_decode else ('MSA' if self.use_msa else 'triton')}, "
             f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
@@ -1735,6 +1774,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_scale=layer.idx_v_scale_float,
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
+                use_sgl_native_q8kv8_decode=self.use_sgl_native_q8kv8_decode,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

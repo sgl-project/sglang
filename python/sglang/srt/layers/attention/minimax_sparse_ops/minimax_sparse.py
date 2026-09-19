@@ -255,6 +255,7 @@ def minimax_sparse_decode(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     topk_out: Optional[torch.Tensor] = None,
+    use_sgl_native_q8kv8_decode: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -319,9 +320,32 @@ def minimax_sparse_decode(
                     f"reduced top-k shape {tuple(topk_idx.shape)}"
                 )
             topk_out.copy_(topk_idx)
-        # Step 3: Sparse attention using topk index (main head). The MSA path
-        # only replaces this step; keep the Triton path when sink is present.
-        if use_msa and sink is None:
+        # Step 3 only: the indexer and top-k reduction above remain Triton.
+        if use_sgl_native_q8kv8_decode:
+            if sink is not None:
+                raise RuntimeError(
+                    "SGL native Q8KV8 decode does not support an attention sink"
+                )
+            from sglang.kernels.ops.attention.minimax_sparse.decode.sgl_native_q8kv8 import (
+                sgl_native_q8kv8_sparse_decode,
+            )
+
+            o = sgl_native_q8kv8_sparse_decode(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                seq_lens=seq_lens,
+                topk_idx=topk_idx,
+                block_size_k=block_size_k,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        elif use_msa and sink is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
 
             try:
