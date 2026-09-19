@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
+    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -203,6 +204,53 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
     # XPU platforms backends
+    # intel_xpu is the faster backend for ordinary XPU serving, so this rejection
+    # is a real cost -- but two independent gaps make DCP on it silently wrong
+    # rather than merely slow, and neither is fixable from this repo:
+    #   1. xpu_backend.py has no DCP path at all (no sharded KV index build, no
+    #      partial + LSE decode return, no extend prefix merge), so each rank
+    #      would attend over its 1/dcp_size shard as if it were the whole context.
+    #   2. The merge weights each rank's partial by its log-sum-exp, and the
+    #      kernels cannot supply one: flash_attn_with_kvcache accepts
+    #      return_softmax_lse but never writes it, flash_attn_varlen_func likewise,
+    #      and flash_mla_decode has no LSE output. Emitting it is an sgl-kernel-xpu
+    #      change. Measured on sgl_kernel 0.1.8 (GQA 8q/2kv, D=128, page_size 64)
+    #      against a float32 reference of 5.19..5.70: zeros at num_splits 0 and 1,
+    #      uninitialized -25.7..+11.9 at num_splits 4, while the attention output
+    #      itself is correct to 0.0021 -- so a DCP merge would be weighted by zero
+    #      or by garbage and nothing would fail loudly.
+    # Both prefill and decode are checked: the extend-with-prefix path merges by
+    # LSE too, so an intel_xpu prefill under DCP is wrong for the same reasons.
+    if cfg.dcp_size > 1 and "intel_xpu" in attention_backends_of(
+        resolved_view(server_args)
+    ):
+        raise ValueError(
+            "--dcp-size > 1 is not supported with the intel_xpu attention "
+            "backend: it has no DCP implementation, and its kernels return no "
+            "softmax LSE for the DCP cross-rank merge (flash_attn_with_kvcache "
+            "leaves it zero-filled, flash_mla_decode has none), so results "
+            "would be silently wrong rather than slow. Enabling it needs an "
+            "sgl-kernel-xpu change to emit the LSE. Use --attention-backend "
+            "triton for decode context parallelism on Intel XPU."
+        )
+
+    # MLA + DCP has no write path on the Triton backend: MLATokenToKVPool takes a
+    # widened loc and only set_mla_kv_buffer resolves the owner rule, but both the
+    # Triton decode write and DeepSeek's MHA prefill write go through the
+    # combined-row set_kv_buffer, which asserts under DCP. The unified pool is the
+    # only thing declaring the loc resolved, and it rejects triton under DCP in
+    # favour of the CUDA-only paged MLA backends. Scoped to XPU because that is
+    # where it is unavoidable -- DCP there must use triton (above), so an MLA model
+    # has nowhere to go, whereas on CUDA the operator can pick flashinfer.
+    if cfg.dcp_size > 1 and get_platform().is_xpu and use_mla_backend(server_args):
+        raise ValueError(
+            "--dcp-size > 1 is not supported for MLA models on Intel XPU. DCP on "
+            "XPU requires --attention-backend triton, and the Triton MLA KV write "
+            "goes through the combined-row MLATokenToKVPool.set_kv_buffer, which "
+            "has no DCP owner-rule-aware kernel. Run MLA models without "
+            "--dcp-size, or use an MHA/GQA model for DCP."
+        )
+
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
 

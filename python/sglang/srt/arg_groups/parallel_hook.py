@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
@@ -193,6 +193,86 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+    validate_dcp_kv_head_replication(server_args)
+
+
+def dcp_kv_head_replication_error(
+    model_config: Any, *, tp_size: int, dcp_size: int, is_mla: bool
+) -> Optional[str]:
+    """Why ``dcp_size`` is unsafe for this model's qkv sharding, or None if it is.
+
+    DCP shards the KV cache by token position, not by head, so every rank of a
+    DCP group has to hold the *same* KV heads: the group all-gathers Q and each
+    rank attends the gathered heads against its own position shard. That is why
+    ``get_num_kv_heads(tp, dcp)`` -- which sizes the KV pool and the attention
+    backend's ``num_kv_head`` -- divides by ``tp // dcp`` rather than ``tp``. The
+    attention module has to shard the qkv projection the same way, by passing
+    ``kv_tp_rank``/``kv_tp_size`` to QKVParallelLinear, and only Qwen3.5 does;
+    every other GQA model divides by the full ``tp_size``.
+
+    The disagreement is silent rather than loud, which is what makes it worth a
+    startup check. ``masked_set_kv_buffer_kernel`` strides the destination by
+    ``loc * H * D`` with ``H`` taken from ``cache_k.shape[1]`` -- the *model's*
+    head count -- so against a wider buffer every token is written at a fraction
+    of its correct address and the upper KV heads are never written at all.
+    Prefill and the first token come out right; every decode step after that is
+    garbage. Measured on Llama-3.1-8B at tp=4/dcp=2 (model builds 2 KV heads per
+    rank, pool allocates 4): GSM8K 0.0, output like 'apoculculculcul...'.
+    """
+    from sglang.srt.configs.model_config import is_qwen3_5
+
+    if dcp_size <= 1:
+        return None
+    # MLA keeps a single latent "KV head" whatever tp/dcp are, so the two counts
+    # cannot diverge, and its write path carries its own DCP guards.
+    if is_mla or is_qwen3_5(model_config.hf_config):
+        return None
+
+    dcp_kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
+    plain_kv_heads = model_config.get_num_kv_heads(tp_size)
+    if dcp_kv_heads == plain_kv_heads:
+        # The floors coincide (total_num_kv_heads <= tp // dcp, so both land on
+        # one head per rank): plain TP sharding already replicates within the
+        # group, so the model needs no DCP awareness.
+        return None
+
+    highest_safe = max(1, tp_size // model_config.get_total_num_kv_heads())
+    return (
+        f"--dcp-size {dcp_size} is not supported for "
+        f"{model_config.hf_config.architectures[0]} at --tp-size {tp_size}. "
+        "DCP requires each rank of a DCP group to hold the same KV heads, so "
+        f"the KV cache and the attention backend are built for {dcp_kv_heads} KV "
+        "heads per rank (total_num_kv_heads // (tp_size // dcp_size)), but this "
+        "model's attention shards the qkv projection by tp_size alone and "
+        f"produces {plain_kv_heads}. The KV write strides by the model's head "
+        "count, so the mismatch corrupts the cache silently instead of raising: "
+        "prefill is correct and every decode token after the first is garbage. "
+        "Supporting this model needs its attention module to pass "
+        "kv_tp_rank/kv_tp_size to QKVParallelLinear the way "
+        f"sglang/srt/models/qwen3_5.py does. Until then use --dcp-size "
+        f"{highest_safe} or lower for this model, an MLA model, or a Qwen3.5 model."
+    )
+
+
+def validate_dcp_kv_head_replication(server_args: Any) -> None:
+    """Refuse GQA models whose qkv projection does not replicate KV per DCP group."""
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size <= 1:
+        return
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return
+
+    from sglang.srt.arg_groups.overrides import use_mla_backend
+
+    message = dcp_kv_head_replication_error(
+        model_config_of(server_args),
+        tp_size=cfg.tp_size,
+        dcp_size=cfg.dcp_size,
+        is_mla=use_mla_backend(server_args),
+    )
+    if message is not None:
+        raise ValueError(message)
 
 
 def handle_data_parallelism(server_args: Any):

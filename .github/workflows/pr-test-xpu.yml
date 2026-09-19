@@ -64,6 +64,8 @@ jobs:
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
               - "test/registered/attention/test_deterministic.py"
+              - "test/registered/dcp/test_trtllm_mla_family_dcp_metadata.py"
+              - "test/registered/kernels/test_dcp_lse_combine.py"
               - "test/registered/lora/test_moe_lora_info.py"
               - "test/registered/lora/test_virtual_experts_kernels.py"
               - "test/registered/unit/sampling/test_sampling_params.py"
