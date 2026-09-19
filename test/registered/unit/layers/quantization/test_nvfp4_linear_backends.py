@@ -2,18 +2,20 @@
 
 Real layer path (ColumnParallelLinear -> weight_loader -> weight processing
 -> forward) per SM100 backend vs a dequantized-reference matmul; a merged
-two-shard case guards the per-partition scale gathering of fused layers.
+two-shard case guards the per-partition scale gathering of fused layers, and
+an online case guards the per-token activation scales of `nvfp4_online`.
 """
 
 import unittest
 from unittest import mock
 
 import torch
-from flashinfer import fp4_quantize
+from flashinfer import SfLayout, fp4_quantize, nvfp4_quantize
 
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.nvfp4_online import NVFP4_MAX, NvFp4OnlineConfig
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -42,6 +44,13 @@ SHAPES = [
 ]
 
 ACT_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+
+# The online path has no padding step, so K must already suit the FP4 GEMM.
+ONLINE_SHAPES = [
+    (64, 256, 512),
+    (5, 160, 512),
+    (128, 1024, 1024),
+]
 
 
 def _make_quantized_layer(n: int, k: int):
@@ -116,6 +125,35 @@ def _make_merged_layer(n_half: int, k: int):
     return layer, torch.cat(dequants, dim=0)
 
 
+def _make_online_layer(n: int, k: int):
+    """BF16 checkpoint weights, converted to NVFP4 at load time."""
+    layer = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), n, k)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+    load_linear_weights(layer, weight=w)
+    return layer
+
+
+def _online_reference(layer, x: torch.Tensor) -> torch.Tensor:
+    """Matmul of the same NVFP4 values the layer holds, dequantized in fp32."""
+    x_q, x_sf, per_token_scale = nvfp4_quantize(
+        x,
+        torch.full((1,), 1.0 / NVFP4_MAX, dtype=torch.float32, device=x.device),
+        sfLayout=SfLayout.layout_128x4,
+        per_token_activation=True,
+        backend="cute-dsl",
+    )
+    x_dequant = dequantize_nvfp4_to_dtype(
+        x_q, x_sf, (1.0 / per_token_scale).reshape(-1, 1), torch.float32
+    )
+    w_dequant = dequantize_nvfp4_to_dtype(
+        layer.weight.data,
+        layer.weight_scale.data,
+        1.0 / layer.weight_scale_2.data,
+        torch.float32,
+    )
+    return x_dequant @ w_dequant.T
+
+
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 dense GEMM backends require SM100+")
 class TestNvFp4LinearBackends(CustomTestCase):
     @classmethod
@@ -157,6 +195,34 @@ class TestNvFp4LinearBackends(CustomTestCase):
             x = torch.randn((16, 512), device="cuda", dtype=torch.bfloat16) / 10
             out, _ = layer(x)
             self._assert_matches(layer, x, out, w_dequant)
+
+    def test_online_per_token_activation_scale(self):
+        """`nvfp4_online` gives each activation row its own dequant scale, so
+        the GEMM alpha is a vector. Reusing one row's scale for the batch --
+        a scalar alpha, or a per-row alpha read at the wrong coordinate --
+        rescales every other row by the ratio of their amaxes, which the
+        decade-spread rows below turn into a large per-row error."""
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp4_utils,
+            "FP4_GEMM_RUNNER_BACKEND",
+            Fp4GemmRunnerBackend("flashinfer_cutedsl"),
+        ):
+            for m, n, k in ONLINE_SHAPES:
+                with self.subTest(shape=(m, n, k)):
+                    layer = _make_online_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+
+                    decades = torch.logspace(-2, 2, m, device="cuda")
+                    x = (torch.randn((m, k), device="cuda") / 10 * decades[:, None]).to(
+                        torch.bfloat16
+                    )
+                    out, _ = layer(x)
+
+                    ref = _online_reference(layer, x)
+                    assert_output_close(self, out, ref)
+                    row_err = (out.float() - ref).norm(dim=1) / ref.norm(dim=1)
+                    self.assertLess(row_err.max().item(), 0.02)
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
