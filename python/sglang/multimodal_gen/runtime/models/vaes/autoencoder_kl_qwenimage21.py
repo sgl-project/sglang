@@ -5,6 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import dup_up3d_add
+from sglang.kernels.ops.diffusion.norm.channel_rmsnorm_preserve_reduction import (
+    can_use_channel_rmsnorm,
+    channel_rmsnorm_preserve_reduction,
+)
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_rank,
@@ -23,6 +29,10 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+_CHANNEL_RMSNORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 VAE channel RMSNorm")
 
 
 def get_activation(name):
@@ -164,11 +174,25 @@ class QwenImage21RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
+        fused = None
+        if (
+            self.channel_first
+            and isinstance(self.bias, (int, float))
+            and self.bias == 0
+            and can_use_channel_rmsnorm(x, self.gamma)
+            and _CHANNEL_RMSNORM_FUSION.can_attempt_once()
+        ):
+            fused = channel_rmsnorm_preserve_reduction(x, self.gamma, self.scale)
+            if _CHANNEL_RMSNORM_FUSION.verified:
+                return fused
         normalized = F.normalize(
             x if x.dtype == torch.float64 else x.float(),
             dim=1 if self.channel_first else -1,
         ).to(x.dtype)
-        return normalized * self.scale * self.gamma + self.bias
+        out = normalized * self.scale * self.gamma + self.bias
+        if fused is not None:
+            return _CHANNEL_RMSNORM_FUSION.accept_or_fallback(fused, out, logger=logger)
+        return out
 
 
 class QwenImage21Upsample(nn.Upsample):
@@ -344,7 +368,7 @@ class QwenImage21ResidualDownBlock(nn.Module):
             self.downsampler = None
 
     def forward(self, x, feat_cache=None, feat_idx=None):
-        x_copy = x.clone()
+        x_copy = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.downsampler is not None:
@@ -460,12 +484,29 @@ class QwenImage21ResidualUpBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
-        x_copy = x.clone()
+        x_copy = x
         for resnet in self.resnets:
             x = resnet(x)
         if self.upsampler is not None:
             x = self.upsampler(x)
         if self.avg_shortcut is not None:
+            shortcut = self.avg_shortcut
+            if (
+                type(shortcut) is QwenImage21DupUp3D
+                and x.is_cuda
+                and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and not torch.compiler.is_compiling()
+            ):
+                fused = dup_up3d_add(
+                    x,
+                    x_copy,
+                    shortcut.factor_t,
+                    shortcut.factor_s,
+                    shortcut.repeats,
+                    first_chunk,
+                )
+                if fused is not None:
+                    return fused
             x = x + self.avg_shortcut(x_copy, first_chunk=first_chunk)
         return x
 
