@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
@@ -112,12 +112,26 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
                 async move {
-                    // Load base tokenizer
-                    let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
-                        &source,
-                        chat_template.as_deref(),
-                    )
+                    // HuggingFace tokenizer loading involves both async network I/O (download)
+                    // and CPU-bound blocking work (tokenizer.json parsing via HfTokenizer::from_file).
+                    // Running this on a tokio worker thread would block it for seconds and starve
+                    // other tasks (including /health). Use spawn_blocking so the tokio thread pool
+                    // is not held during the blocking parse phase.
+                    let base_tokenizer = tokio::task::spawn_blocking(move || {
+                        // create_tokenizer_async_with_chat_template mixes async network I/O
+                        // (HuggingFace download) with blocking CPU work (HfTokenizer::from_file
+                        // JSON parsing). Running it on a tokio worker thread would block the
+                        // thread and starve other tasks (including /health). Offload the whole
+                        // call to the blocking thread pool and drive the async parts via block_on.
+                        tokio::runtime::Handle::current().block_on(
+                            factory::create_tokenizer_async_with_chat_template(
+                                &source,
+                                chat_template.as_deref(),
+                            ),
+                        )
+                    })
                     .await
+                    .map_err(|e| format!("Failed to load tokenizer (task join error): {}", e))?
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
 
                     // Wrap with caching layer if configured
@@ -181,7 +195,15 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 Ok(StepResult::Success)
             }
             Err(e) => {
-                error!("Failed to load tokenizer '{}': {}", name, e);
+                // is_retryable() returns true, so wfaas will retry this step automatically.
+                // Use warn rather than error to avoid alarming operators on transient failures
+                // (e.g. network blip, missing HF token). An error is only logged on the final
+                // attempt, which the workflow engine handles by failing the workflow.
+                // Note: /v1/tokenize and gRPC routing depend on this tokenizer being loaded.
+                warn!(
+                    "Tokenizer '{}' not yet available, retrying (cause: {})",
+                    name, e
+                );
                 Err(WorkflowError::StepFailed {
                     step_id: StepId::new("load_tokenizer"),
                     message: e.to_string(),
