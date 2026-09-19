@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//! Buckets define service constraints; their role groups own membership and policy.
+//! Each stage selects independently and may choose a different bucket.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -30,7 +33,6 @@ impl<'a> SelectionRequest<'a> {
 pub struct TokenLimits {
     pub min: Option<u64>,
     pub max: Option<u64>,
-    pub context: Option<u64>,
 }
 
 impl TokenLimits {
@@ -39,36 +41,64 @@ impl TokenLimits {
             Stage::Plain | Stage::Prefill => Some(request.input_tokens),
             Stage::Decode => request.expected_peak_tokens,
         };
-        self.context
-            .is_none_or(|max| tokens.unwrap_or(request.input_tokens) <= max)
-            && match tokens {
-                Some(tokens) => {
-                    self.min.is_none_or(|min| tokens >= min)
-                        && self.max.is_none_or(|max| tokens <= max)
-                }
-                None => self.min.is_none() && self.max.is_none(),
+        match tokens {
+            Some(tokens) => {
+                self.min.is_none_or(|min| tokens >= min) && self.max.is_none_or(|max| tokens <= max)
             }
+            None => self.min.is_none() && self.max.is_none(),
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct Bucket {
-    pub id: String,
+pub struct EngineGroup {
+    /// Lower ranks are tried first within this role's SLO preference tier.
     pub rank: u32,
-    /// `None` means every engine in the pool.
+    /// `None` includes all registered engines matching the request's model and role.
     pub worker_ids: Option<HashSet<WorkerId>>,
     /// Input range for plain/prefill; peak sequence range for decode.
     pub limits: TokenLimits,
-    pub ttft_ms: Option<u64>,
-    pub tokens_per_second: Option<f64>,
     pub policy: Arc<dyn Policy>,
 }
 
-impl Bucket {
+impl EngineGroup {
+    /// A catch-all group with the supplied policy.
+    pub fn new(policy: Arc<dyn Policy>) -> Self {
+        Self {
+            rank: 0,
+            worker_ids: None,
+            limits: TokenLimits::default(),
+            policy,
+        }
+    }
+
     fn contains(&self, engine: &Worker) -> bool {
         self.worker_ids
             .as_ref()
             .is_none_or(|ids| ids.contains(&engine.id))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Bucket {
+    pub id: String,
+    /// Shared capacity: input length for plain/prefill, peak sequence for decode
+    /// (or input length when the output budget is unknown).
+    pub max_context_tokens: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_second: Option<f64>,
+    pub plain: Option<EngineGroup>,
+    pub prefill: Option<EngineGroup>,
+    pub decode: Option<EngineGroup>,
+}
+
+impl Bucket {
+    fn group(&self, stage: Stage) -> Option<&EngineGroup> {
+        match stage {
+            Stage::Plain => self.plain.as_ref(),
+            Stage::Prefill => self.prefill.as_ref(),
+            Stage::Decode => self.decode.as_ref(),
+        }
     }
 
     fn matches_slo(&self, request: &SelectionRequest<'_>) -> bool {
@@ -93,49 +123,6 @@ pub enum SloPreference {
 }
 
 #[derive(Debug)]
-pub struct Pool {
-    pub buckets: Vec<Bucket>,
-    pub slo: SloPreference,
-}
-
-impl Pool {
-    /// One catch-all bucket for a pool without configured buckets.
-    pub fn implicit(policy: Arc<dyn Policy>) -> Self {
-        Self {
-            buckets: vec![Bucket {
-                id: "default".into(),
-                rank: 0,
-                worker_ids: None,
-                limits: TokenLimits::default(),
-                ttft_ms: None,
-                tokens_per_second: None,
-                policy,
-            }],
-            slo: SloPreference::Disabled,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Pools {
-    Plain(Pool),
-    Disaggregated { prefill: Pool, decode: Pool },
-}
-
-impl Pools {
-    fn for_stage(&self, stage: Stage) -> Result<&Pool, PickError> {
-        match (self, stage) {
-            (Self::Plain(pool), Stage::Plain) => Ok(pool),
-            (Self::Disaggregated { prefill, .. }, Stage::Prefill) => Ok(prefill),
-            (Self::Disaggregated { decode, .. }, Stage::Decode) => Ok(decode),
-            _ => Err(PickError::InvalidConfiguration(
-                "stage does not belong to deployment".into(),
-            )),
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct ResolvedGroup<'a> {
     pub bucket: &'a str,
     pub engines: Vec<Arc<Worker>>,
@@ -144,15 +131,20 @@ pub struct ResolvedGroup<'a> {
 
 pub struct BucketResolver {
     pub workers: Arc<WorkerRegistry>,
-    pub pools: Pools,
+    pub buckets: Vec<Bucket>,
+    /// TTFT ordering for plain and prefill selection.
+    pub prefill_slo: SloPreference,
+    pub decode_slo: SloPreference,
     pub fallback_on_rejection: bool,
 }
 
 impl BucketResolver {
-    pub fn new(workers: Arc<WorkerRegistry>, pools: Pools) -> Self {
+    pub fn new(workers: Arc<WorkerRegistry>, buckets: Vec<Bucket>) -> Self {
         Self {
             workers,
-            pools,
+            buckets,
+            prefill_slo: SloPreference::Disabled,
+            decode_slo: SloPreference::Disabled,
             fallback_on_rejection: true,
         }
     }
@@ -173,7 +165,13 @@ impl BucketResolver {
                 "invalid request size or SLO".into(),
             ));
         }
-        let pool = self.pools.for_stage(pick.stage)?;
+        let (context_tokens, slo) = match pick.stage {
+            Stage::Plain | Stage::Prefill => (pick.input_tokens, self.prefill_slo),
+            Stage::Decode => (
+                pick.expected_peak_tokens.unwrap_or(pick.input_tokens),
+                self.decode_slo,
+            ),
+        };
         let mut engines: Vec<_> = self
             .workers
             .healthy_workers_for(pick.model)
@@ -182,31 +180,37 @@ impl BucketResolver {
             .collect();
         // Stable order so cursor-based policies see a consistent candidate list.
         engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        let mut buckets: Vec<_> = pool
+        let mut groups: Vec<_> = self
             .buckets
             .iter()
-            .filter(|bucket| bucket.limits.fits(pick))
+            .filter(|bucket| {
+                bucket
+                    .max_context_tokens
+                    .is_none_or(|max| context_tokens <= max)
+            })
+            .filter_map(|bucket| bucket.group(pick.stage).map(|group| (bucket, group)))
+            .filter(|(_, group)| group.limits.fits(pick))
             .collect();
-        buckets.sort_by_key(|bucket| {
-            let demoted = match pool.slo {
+        groups.sort_by_key(|(bucket, group)| {
+            let demoted = match slo {
                 SloPreference::Disabled => false,
                 SloPreference::SloFirst => !bucket.matches_slo(request),
                 SloPreference::BestEffort => bucket.matches_slo(request),
             };
-            (demoted, bucket.rank, &bucket.id)
+            (demoted, group.rank, &bucket.id)
         });
-        Ok(buckets
+        Ok(groups
             .into_iter()
-            .filter_map(|bucket| {
+            .filter_map(|(bucket, group)| {
                 let members: Vec<_> = engines
                     .iter()
-                    .filter(|engine| bucket.contains(engine))
+                    .filter(|engine| group.contains(engine))
                     .cloned()
                     .collect();
                 (!members.is_empty()).then_some(ResolvedGroup {
                     bucket: &bucket.id,
                     engines: members,
-                    policy: bucket.policy.as_ref(),
+                    policy: group.policy.as_ref(),
                 })
             })
             .collect())
