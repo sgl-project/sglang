@@ -47,6 +47,24 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def deployment_attn_dp_size() -> int:
+    """Attention-DP replicas in the deployment, which no draft scope narrows.
+
+    A draft runs on one attention-DP replica and its scope says so, but the
+    metadata a draft gathers is shaped by the replicas it gathers *with* --
+    the target's. Those come from the configuration, which the scope leaves
+    alone, so this answers the same number inside the scope and outside it.
+    """
+    parallel = get_parallel()
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=parallel.tp_size,
+        attn_cp_size=parallel.attn_cp_size,
+        dp_size=parallel.dp_size,
+        enable_dp_attention=parallel.enable_dp_attention,
+    )
+    return attn_dp_size
+
+
 def dp_gather_width() -> int:
     """How many replicas the DP sync gathers over.
 
