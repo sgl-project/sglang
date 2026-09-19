@@ -215,6 +215,30 @@ async fn v1_rerank(
         .await
 }
 
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<crate::routers::native_messages::NativeMessagesRequest>,
+) -> Response {
+    use crate::protocols::common::GenerationRequest;
+    state
+        .router
+        .route_messages(Some(&headers), &body, body.get_model())
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<crate::routers::native_messages::NativeMessagesRequest>,
+) -> Response {
+    use crate::protocols::common::GenerationRequest;
+    state
+        .router
+        .route_messages_count_tokens(Some(&headers), &body, body.get_model())
+        .await
+}
+
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -546,6 +570,8 @@ pub fn build_app(
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
