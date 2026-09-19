@@ -76,10 +76,11 @@ def _jit_hicache_staged_module(
 
 
 # TMA staging ring per CTA: 32 KB stages x 6 keeps the host loads in flight
-# under a 4-block launch; 8 store warps drain a stage faster than it fills.
+# under a 4-block launch; smaller stages make the loader's per-chunk cost the
+# limit. 4 store warps drain a strided-destination stage faster than it fills.
 TMA_STAGE_BYTES = 32 * 1024
 TMA_NUM_STAGES = 6
-TMA_STORE_WARPS = 8
+TMA_STORE_WARPS = 4
 
 
 @cache_once

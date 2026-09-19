@@ -310,15 +310,13 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
 
       ptx::mbar_wait_parity(&smem.full[s], (it / kNumStages) & 1);
       if (smem.dst_run[s]) {
-        // Contiguous span: warp 0 bulk-stores the first half (two in flight,
-        // releasing the previous bulk stage once its smem read is done) and the
-        // other store warps stream the second half with vector stores, so the
-        // TMA engine and the LSU share the SM's write port.
-        uint4* d0 = static_cast<uint4*>(pointer::offset(dst_base, dst_idx[0] * p.dst_stride));
-        const uint32_t split = kStoreWarps > 1 ? n_units / 2 : n_units;
+        // Contiguous span: one bulk store from store warp 0 runs at the SM's write
+        // port; it releases the previous bulk stage once that stage's smem read is
+        // done, keeping two stores in flight. The other store warps have nothing
+        // to read and release the stage right away.
         if (tid < kWarpThreads) {
           if (lane == 0) {
-            ptx::bulk_s2g(d0, stage, split * 16);
+            ptx::bulk_s2g(pointer::offset(dst_base, dst_idx[0] * p.dst_stride), stage, n_units * 16);
             ptx::bulk_commit_group();
             if (bulk_pending != kNoStage) {
               ptx::bulk_wait_group_read_one();
@@ -326,24 +324,8 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
             }
           }
           bulk_pending = s;
-        } else {
-          constexpr uint32_t kGenericThreads = (kStoreWarps - 1) * kWarpThreads;
-          const uint32_t gtid = tid - kWarpThreads;
-          const uint32_t n_gen = n_units - split;
-          const uint32_t n_gen_full = n_gen - n_gen % (kGenericThreads * kUnroll);
-          for (uint32_t u0 = gtid; u0 < n_gen_full; u0 += kGenericThreads * kUnroll) {
-            uint4 v[kUnroll];
-#pragma unroll
-            for (uint32_t k = 0; k < kUnroll; ++k)
-              v[k] = stage[split + u0 + k * kGenericThreads];
-#pragma unroll
-            for (uint32_t k = 0; k < kUnroll; ++k)
-              __stcs(d0 + split + u0 + k * kGenericThreads, v[k]);
-          }
-          for (uint32_t u = n_gen_full + gtid; u < n_gen; u += kGenericThreads)
-            __stcs(d0 + split + u, stage[split + u]);
-          __syncwarp();
-          if (lane == 0) ptx::mbar_arrive(&smem.empty[s]);
+        } else if (lane == 0) {
+          ptx::mbar_arrive(&smem.empty[s]);
         }
         continue;
       }
