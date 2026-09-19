@@ -1441,6 +1441,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
+                out_cache_loc_id_space="kernel",
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
                 input_embeds=(
@@ -1781,6 +1782,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         static_forward_batch = ForwardBatch(
             forward_mode=pcg_forward_mode,
+            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,

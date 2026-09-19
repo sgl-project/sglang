@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.layout.page_major import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1302,11 +1303,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, head_dim
+        k_cache = paged_kv_view(
+            k_cache, self.page_size, layer.tp_k_head_num, head_dim
         ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, head_dim
+        v_cache = paged_kv_view(
+            v_cache, self.page_size, layer.tp_v_head_num, head_dim
         ).permute(0, 2, 1, 3)
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
@@ -1458,7 +1459,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_batch(
+                        forward_batch,
+                        cache_loc,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1574,7 +1579,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc.for_batch(
+                            forward_batch,
+                            cache_loc,
+                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        ),
                         k,
                         v,
                         *self._kv_write_scales(layer),
@@ -1617,11 +1626,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
             else:
-                k_cache = k_cache_raw.view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                k_cache = paged_kv_view(
+                    k_cache_raw, self.page_size, layer.tp_k_head_num, layer.head_dim
                 )
-                v_cache = v_cache_raw.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                v_cache = paged_kv_view(
+                    v_cache_raw, self.page_size, layer.tp_v_head_num, layer.head_dim
                 )
 
             kv_cache = (k_cache, v_cache)

@@ -292,7 +292,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
-        kernel_page_multiplier: Optional[int] = None,
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
@@ -316,13 +315,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.entry_bytes = spec.entry_bytes()
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Kernel-facing page-stride scale, from the spec that owns the layout;
-        # `kernel_page_multiplier=` overrides it only for tests.
-        self.kernel_page_multiplier = (
-            spec.blocks_per_page()
-            if kernel_page_multiplier is None
-            else kernel_page_multiplier
-        )
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
         self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
@@ -990,75 +982,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Translate token-granular virtual ids to physical ids.
+        """Virtual token ids -> physical token ids, which under the token-major
+        views ARE the kernel-facing ids:
+
+            kernel_id(t) = v2p[t // ps] * ps + t % ps
 
         Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
         `KVIndexTranslator.translate_dcp_read_ids` hands down), so this works on
-        `pool_page_size`. ``out=`` writes in-place into a caller-owned buffer,
-        required under cuda-graph capture: the captured graph records the gather
-        against a fixed ``data_ptr``.
+        `pool_page_size`. An unmapped, out-of-range or negative id resolves to
+        0, the page-0 sink every kernel skips. ``out=`` writes in-place into a
+        caller-owned buffer, required under cuda-graph capture: the captured
+        graph records the gather against a fixed ``data_ptr``. int64 out; a
+        consumer whose kernel ABI wants int32 narrows where it fills that
+        buffer.
         """
-        if out is not None:
-            assert out.dtype == torch.int64, (
-                f"translate_kv_loc: out= dtype must be int64 (matches v2p), "
-                f"got {out.dtype}"
-            )
-            assert out.shape == virt_tokens.shape, (
-                f"translate_kv_loc: out= shape {tuple(out.shape)} must match "
-                f"virt_tokens shape {tuple(virt_tokens.shape)}"
-            )
         with record_function("MultiEndedAlloc.translate_kv_loc"):
-            return self._translate_kv_loc_impl(virt_tokens, out)
-
-    def _translate_kv_loc_impl(
-        self,
-        virt_tokens: torch.Tensor,
-        out: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        # Tombstone-safety clamp: a tombstoned v2p entry (-1) must not reach
-        # `k_buffer[-1]` (illegal access under captured graph replay). Clamping to
-        # 0 routes it to physical slot 0, reserved sink space holding no real data.
-        ps = self.pool_page_size
-        if ps == 1:
-            if out is not None:
-                # `index_select(out=out)` forbids index/out aliasing, but the
-                # canonical caller passes `out=kv_indices` in place.
-                tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-                tmp = torch.clamp_min(tmp, 0)
-                out.copy_(tmp)
-                return out
-            result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-            return torch.clamp_min(result, 0)
-        # ps > 1: page math. `virt_pages`/`offsets` are fresh, so they
-        # cannot alias `out` -- `index_select(out=out)` is safe.
-        virt_pages = virt_tokens // ps
-        offsets = virt_tokens % ps
-        if out is not None:
-            torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
-            out.mul_(ps)
-            out.add_(offsets)
-            out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
-            return out
-        phys_pages = self.virtual_to_physical[virt_pages]
-        result = phys_pages * ps + offsets
-        return torch.clamp_min(result, 0)
-
-    def translate_kv_loc_for_kernel(
-        self,
-        virt_tokens: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Virtual token ids -> kernel-facing ids:
-
-            kernel_id(t) = (t // ps) * (ps * kernel_page_multiplier) + t % ps
-
-        Internal machinery (compaction, in-flight write sets) MUST keep using
-        `translate_kv_loc`: kernel-facing ids are for kernels only. Tombstones (-1)
-        clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
-        kernel ABI wants int32 narrows where it fills that buffer.
-        """
-        with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
             return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
 
     def _translate_loc_fused(
@@ -1071,22 +1009,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """One launch for the read and write conversions alike; see
-        `write_loc_to_kernel_ids`."""
-        if out is not None:
-            assert out.dtype == torch.int64, (
-                f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
-                f"got {out.dtype}"
-            )
-            if out_width is None:
-                assert out.shape == loc.shape, (
-                    f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
-                    f"match virt_tokens shape {tuple(loc.shape)}"
-                )
+        `write_loc_to_kernel_ids`, which owns the `out=` dtype and shape
+        contract for both."""
         return write_loc_to_kernel_ids(
             loc=loc,
             v2p=self.virtual_to_physical,
             page_size=self.pool_page_size,
-            stride=self.pool_page_size * self.kernel_page_multiplier,
+            stride=self.pool_page_size,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,
