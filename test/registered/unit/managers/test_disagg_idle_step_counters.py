@@ -50,14 +50,6 @@ def load_mlx_scheduler_module():
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.enterContext(
-            get_parallel().override(
-                pp_rank=0, pp_size=1, attn_tp_rank=0, attn_cp_rank=0
-            )
-        )
-
     @parameterized.expand(
         [
             (
@@ -286,7 +278,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
-        with self.assertRaises(StopIteration):
+        with (
+            get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+            self.assertRaises(StopIteration),
+        ):
             event_loop(scheduler)
 
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
@@ -317,6 +312,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
@@ -365,6 +361,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
+        scheduler.ps.pp_size = 2
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
