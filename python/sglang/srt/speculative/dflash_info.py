@@ -66,9 +66,8 @@ class DFlashVerifyInput(SpecInput):
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. GPU keeps the original pre-planning path. NPU leaves
-        attention/graph metadata initialization to ModelRunner because DP/EP
-        padding can still change the compressor's runtime shapes.
+        method is called. CUDA graph metadata is pre-planned here; eager and
+        NPU forwards plan in ModelRunner after final batch preparation.
         """
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
@@ -119,10 +118,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            verify_forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
 
         return verify_forward_batch, can_run_cuda_graph
 
