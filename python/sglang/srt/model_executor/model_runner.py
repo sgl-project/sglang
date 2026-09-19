@@ -37,7 +37,6 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -322,7 +321,6 @@ class ModelRunner:
         model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         server_args: ServerArgs,
         is_draft_worker: bool = False,
@@ -339,7 +337,6 @@ class ModelRunner:
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
         self.gpu_id = gpu_id
-        self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -740,7 +737,6 @@ class ModelRunner:
         self.eplb_manager = (
             EPLBManager(
                 model_config=self.model_config,
-                ps=self.ps,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_expert_backup_client=lambda: self.expert_backup_client,
@@ -1167,7 +1163,6 @@ class ModelRunner:
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
-            ps=self.ps,
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
@@ -1189,6 +1184,10 @@ class ModelRunner:
         self.pp_size = parallel.pp_size
         self.attn_cp_rank = parallel.attn_cp_rank
         self.attn_cp_size = parallel.attn_cp_size
+        self.attn_dcp_rank = parallel.attn_dcp_rank
+        self.attn_dcp_size = parallel.attn_dcp_size
+        self.moe_ep_size = parallel.moe_ep_size
+        self.dp_rank = parallel.dp_rank
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)

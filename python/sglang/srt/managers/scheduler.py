@@ -104,12 +104,10 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -515,38 +513,6 @@ class Scheduler(
         self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
-
-        # Distributed rank info
-        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-            compute_dp_attention_world_info(
-                get_parallel().enable_dp_attention,
-                tp_rank,
-                get_parallel().tp_size,
-                get_parallel().dp_size,
-                get_parallel().attn_cp_size,
-            )
-        )
-        self.ps = ParallelState(
-            tp_rank=tp_rank,
-            tp_size=get_parallel().tp_size,
-            pp_rank=pp_rank,
-            pp_size=get_parallel().pp_size,
-            dp_rank=dp_rank,
-            dp_size=get_parallel().dp_size,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=get_parallel().attn_cp_size,
-            attn_dcp_rank=tp_rank % get_parallel().dcp_size,
-            attn_dcp_size=get_parallel().dcp_size,
-            attn_dp_rank=attn_dp_rank,
-            attn_dp_size=attn_dp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=get_parallel().ep_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_dp_size=get_parallel().moe_dp_size,
-            gpu_id=gpu_id,
-        )
 
         # Init model configs
         self.init_model_config()
@@ -1010,7 +976,6 @@ class Scheduler(
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=get_device().gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
         )
 
@@ -1048,7 +1013,6 @@ class Scheduler(
         draft_worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=get_device().gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
@@ -2239,7 +2203,6 @@ class Scheduler(
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
-            ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
@@ -2360,7 +2323,6 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             offload_tags=self.weight_updater.offload_tags,
-            ps=self.ps,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
@@ -2447,7 +2409,6 @@ class Scheduler(
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
-            ps=self.ps,
             server_args=self.server_args,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
@@ -2490,7 +2451,6 @@ class Scheduler(
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
-            ps=self.ps,
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,

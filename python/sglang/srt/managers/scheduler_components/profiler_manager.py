@@ -58,7 +58,6 @@ class SchedulerProfilerManager:
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
-                ps=self.ps,
                 cpu_group=self.dp_tp_cpu_group,
             )
             return

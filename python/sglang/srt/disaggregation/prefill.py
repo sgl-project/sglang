@@ -87,6 +87,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
@@ -212,7 +213,7 @@ class PrefillBootstrapQueue:
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
@@ -226,7 +227,7 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = (
             self.scheduler.rust_server.http_port
             if self.scheduler.rust_server is not None
@@ -303,7 +304,7 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = get_disagg().disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.gpu_id = get_device().gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(

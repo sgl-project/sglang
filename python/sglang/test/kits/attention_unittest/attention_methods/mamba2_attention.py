@@ -26,7 +26,6 @@ from sglang.srt.configs.mamba_utils import (  # noqa: E402
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch  # noqa: E402
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import (  # noqa: E402
     ATTENTION_BACKENDS,
 )
@@ -325,7 +324,6 @@ class MockMamba2ModelRunner(ModelRunner):
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
         self.gpu_id = 0
-        self.ps = ParallelState.trivial()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size

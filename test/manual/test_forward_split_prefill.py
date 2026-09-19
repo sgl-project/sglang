@@ -15,7 +15,6 @@ import torch
 
 from sglang.benchmark.one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
@@ -65,7 +64,6 @@ class TestForwardSplitPrefill(CustomTestCase):
             model_config=cls.model_config,
             mem_fraction_static=cls.server_args.mem_fraction_static,
             gpu_id=0,
-            ps=ParallelState.trivial(tp_size=cls.tp_size),
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
         )

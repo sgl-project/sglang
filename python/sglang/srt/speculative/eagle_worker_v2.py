@@ -1,14 +1,12 @@
 import contextlib
 import logging
 import time
-from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -238,7 +236,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -247,7 +244,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
 
@@ -282,8 +278,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -1281,7 +1275,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -1292,7 +1285,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = get_spec().speculative_eagle_topk
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        self.ps = ps
         self.gpu_id = gpu_id
         self.device = get_device().device
         self._target_worker = target_worker
@@ -1308,7 +1300,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             EagleDraftWorker(
                 server_args,
                 gpu_id,
-                ps,
                 nccl_port,
                 target_worker,
             )
