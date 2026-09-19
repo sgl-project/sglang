@@ -99,6 +99,7 @@ def get_top_logprobs_raw(
     no_copy_to_cpu: bool = False,
 ):
     max_k = max(top_logprobs_nums)
+    max_k = min(max_k, logprobs.size(-1))
     values, indices = logprobs.topk(max_k, dim=-1)
     if not no_copy_to_cpu:
         values = values.tolist()
@@ -223,6 +224,7 @@ def get_top_logprobs_chunk(
     """
     # Empty chunks still walk the slice to emit placeholder entries.
     max_k = max(top_k_nums)
+    max_k = min(max_k, logprobs.size(1))
     if log_normalizer is not None:
         row_max, row_log_sum = log_normalizer
         if precomputed_topk is not None:
