@@ -324,12 +324,21 @@ class SchedulerLifecycle:
             if child_id not in self._prefilled and req.time_stats.prefill_finished_time:
                 self._emit(req, "prefill")
                 self._prefilled.add(child_id)
+            beam = getattr(req, "beam_group", None)
             if (
                 (child_id in self._retired or req.finished())
                 and not req.kv.holds_kv
                 and not req.kv.holds_mamba
                 and req.inflight_middle_chunks <= 0
                 and req.metadata_buffer_index == -1
+                and (
+                    beam is None
+                    or (
+                        beam.retired
+                        and beam.member_rows is None
+                        and not beam.pending_orphans
+                    )
+                )
             ):
                 self._emit(req, "terminal")
                 del self._requests[child_id]

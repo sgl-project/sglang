@@ -186,6 +186,18 @@ class TestSchedulerLifecycle(unittest.TestCase):
         tracker.poll()
         self.assertEqual(len(events), 1)
         req.inflight_middle_chunks = 0
+        # Beam members have no Req of their own. Leader cleanup cannot release
+        # the group's booking while member rows or staged orphan KV remain.
+        req.beam_group = SimpleNamespace(
+            retired=False, member_rows=object(), pending_orphans=[object()]
+        )
+        for field, value in [("retired", True), ("member_rows", None)]:
+            tracker.poll()
+            self.assertEqual(len(events), 1)
+            setattr(req.beam_group, field, value)
+        tracker.poll()
+        self.assertEqual(len(events), 1)
+        req.beam_group.pending_orphans.clear()
         tracker.poll()
         tracker.poll()
         self.assertEqual(events, [("child", "prefill"), ("child", "terminal")])
