@@ -296,8 +296,26 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            packed_dcp = (
+                getattr(model_runner.attn_backend, "dcp_packed_kv_layout", None)
+                is not None
+            )
+            prepare_packed_prefix = (
+                not model_runner.is_draft_worker
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            if (
+                model_runner.is_draft_worker
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                forward_batch.attn_dcp_metadata = None
+            if (
+                model_runner.ps.attn_dcp_size > 1
+                and not model_runner.is_draft_worker
+                and (not packed_dcp or prepare_packed_prefix)
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (

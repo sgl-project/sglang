@@ -724,8 +724,13 @@ def flashinfer_sparse_mla_forward(
     qk_rope_head_dim: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
-) -> torch.Tensor:
-    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run SM120 sparse MLA, optionally returning FlashInfer's per-row/head LSE.
+
+    Output has shape [tokens, heads, kv_lora_rank]. When requested, LSE is
+    passed through unchanged so callers can merge rank-local attention states.
+    """
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
@@ -746,5 +751,9 @@ def flashinfer_sparse_mla_forward(
         bmm2_scale=1.0,
         kv_scale_format="arbitrary_fp32",
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        return_lse=return_lse,
     )
+    if return_lse:
+        output, lse = result
+        return output.squeeze(1), lse
     return result.squeeze(1)
