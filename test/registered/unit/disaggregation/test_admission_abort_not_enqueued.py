@@ -272,6 +272,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
+            request_lifecycle=None,
             waiting_queue=[],
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),

@@ -165,6 +165,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    RequestLifecycleOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -206,6 +207,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.request_lifecycle import SchedulerLifecycle
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -444,6 +446,7 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    request_lifecycle: Optional[SchedulerLifecycle] = None
 
     def __init__(
         self,
@@ -2092,6 +2095,8 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        if self.request_lifecycle is not None:
+            self.request_lifecycle.poll()
         local_reqs = []
         if (
             get_parallel().pp_rank == 0
@@ -2492,6 +2497,8 @@ class Scheduler(
         )
 
     def init_output_streamer(self) -> None:
+        self.request_lifecycle = SchedulerLifecycle(self._emit_lifecycle)
+        self.ipc_channels.send_to_tokenizer.on_abort = self.request_lifecycle.retire
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
@@ -2502,6 +2509,18 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             rust_server=self.rust_server,
+        )
+
+    def _emit_lifecycle(self, req, phase: str) -> None:
+        self.ipc_channels.send_to_tokenizer.send_output(
+            RequestLifecycleOutput(
+                child_id=req.lifecycle_id,
+                dp_rank=self.ps.attn_dp_rank
+                if get_parallel().enable_dp_attention
+                else (self.ps.dp_rank or 0),
+                phase=phase,
+            ),
+            req,
         )
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
@@ -2837,6 +2856,7 @@ class Scheduler(
                 extra_key=recv_req.extra_key,
                 cache_salt=recv_req.cache_salt,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                lifecycle_id=recv_req.lifecycle_id,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
@@ -2915,6 +2935,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                lifecycle_id=recv_req.lifecycle_id,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -3266,6 +3287,8 @@ class Scheduler(
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if self.request_lifecycle is not None:
+            self.request_lifecycle.register(req)
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:
@@ -5399,7 +5422,7 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req):
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5410,7 +5433,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -5453,7 +5476,7 @@ class Scheduler(
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
+                recv_req.abort_all, recv_req.rid, lifecycle_id=recv_req.lifecycle_id
             ):
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -5473,7 +5496,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req)
 
@@ -5484,7 +5507,7 @@ class Scheduler(
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -5492,7 +5515,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if get_parallel().pp_size > 1:
@@ -5500,7 +5523,7 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
@@ -5522,7 +5545,7 @@ class Scheduler(
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                    if recv_req.matches(decode_req):
                         retraction_discard(
                             decode_req,
                             self.tree_cache,
@@ -5537,9 +5560,7 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if not req.finished() and recv_req.matches(req):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.

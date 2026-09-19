@@ -850,6 +850,15 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            "request_lifecycle": (
+                {
+                    "version": 1,
+                    "incarnation": _global_state.tokenizer_manager.request_lifecycle.incarnation,
+                    "header_overrides": envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+                }
+                if _global_state.tokenizer_manager.request_lifecycle is not None
+                else None
+            ),
         }
     )
 
@@ -913,43 +922,154 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
         return [x for result in results for x in result.response]
 
 
-# fastapi implicitly converts json in the request to obj (dataclass)
-@app.api_route(
-    "/generate",
-    methods=["POST", "PUT"],
-    response_class=SGLangORJSONResponse,
-)
+def _get_request_lifecycle(request: Request):
+    registry = _global_state.tokenizer_manager.request_lifecycle
+    if registry is None:
+        raise HTTPException(404, "request lifecycle is disabled")
+    if request.headers.get("x-sglang-worker-incarnation") != registry.incarnation:
+        raise HTTPException(409, "worker incarnation changed")
+    return registry
+
+
+@app.get("/request_lifecycle/{attempt_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def request_lifecycle_snapshot(
+    attempt_id: str, request: Request, after: int = -1
+):
+    registry = _get_request_lifecycle(request)
+    try:
+        return await registry.wait(attempt_id, after)
+    except KeyError:
+        raise HTTPException(404, "unknown attempt") from None
+
+
+@dataclasses.dataclass
+class LifecycleControl:
+    action: str
+    lease_seconds: float = 30
+
+
+@app.post("/request_lifecycle/{attempt_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def request_lifecycle_control(
+    attempt_id: str, obj: LifecycleControl, request: Request
+):
+    registry = _get_request_lifecycle(request)
+    try:
+        if obj.action == "renew":
+            registry.renew(attempt_id, obj.lease_seconds)
+        elif obj.action == "cancel":
+            _global_state.tokenizer_manager.cancel_lifecycle(attempt_id)
+        elif obj.action == "acknowledge":
+            registry.acknowledge(attempt_id)
+            return Response(status_code=204)
+        else:
+            raise ValueError("action must be renew, cancel or acknowledge")
+        return registry.snapshot(attempt_id)
+    except KeyError:
+        raise HTTPException(404, "unknown attempt") from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+async def _generate_with_lifecycle(obj: GenerateReqInput, request: Request):
+    manager = _global_state.tokenizer_manager
+    attempt_id = getattr(obj, "_lifecycle_attempt_id", None)
+    generator = manager.generate_request(obj, request)
+    complete = False
+    if attempt_id is not None:
+        manager._lifecycle_tasks[attempt_id] = asyncio.current_task()
+    try:
+        async for result in generator:
+            if not obj.stream:
+                complete = True
+            yield result
+        complete = True
+    except asyncio.CancelledError:
+        if attempt_id is not None and manager.request_lifecycle.is_cancelled(
+            attempt_id
+        ):
+            raise ValueError("Generation attempt cancelled before dispatch") from None
+        raise
+    finally:
+        try:
+            await generator.aclose()
+        finally:
+            if attempt_id is not None:
+                manager._lifecycle_tasks.pop(attempt_id, None)
+                # Accounting can finish and be acknowledged before a slow
+                # reader consumes the last native response bytes.
+                if attempt_id in manager.request_lifecycle:
+                    if not complete:
+                        manager.cancel_lifecycle(attempt_id)
+                    manager.request_lifecycle.seal(attempt_id)
+
+
+class NativeGenerateRoute(APIRoute):
+    def get_route_handler(self):
+        native_handler = super().get_route_handler()
+
+        async def handle(request: Request):
+            attempt_id = request.headers.get("x-sglang-attempt-id")
+            if attempt_id is None:
+                return await native_handler(request)
+            manager = _global_state.tokenizer_manager
+            registry = _get_request_lifecycle(request)
+            try:
+                registry.claim(attempt_id, manager.disaggregation_mode.value)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            manager.auto_create_handle_loop()
+            request.state.lifecycle_attempt_id = attempt_id
+            request.state.lifecycle_handed_off = False
+            try:
+                return await native_handler(request)
+            finally:
+                # Body/JSON validation runs inside native_handler, before the
+                # endpoint is called. Such rejection executes no engine work.
+                if not request.state.lifecycle_handed_off and attempt_id in registry:
+                    registry.seal(attempt_id)
+
+        return handle
+
+
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    attempt_id = getattr(request.state, "lifecycle_attempt_id", None)
+    if attempt_id is not None:
+        obj._lifecycle_attempt_id = attempt_id
+        request.state.lifecycle_handed_off = True
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            generator = _generate_with_lifecycle(obj, request)
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
-            except ValueError as e:
-                # A client disconnect also surfaces here. It's a client-side
-                # cancellation, not a server error or bad input -- log it and
-                # stop (the request was already aborted upstream) instead of
-                # emitting a 400.
-                if request is not None and await request.is_disconnected():
-                    logger.info(f"[http_server] Client disconnected: {e}")
-                    return
-                out = {
-                    "error": {
-                        "message": str(e),
-                        "type": "invalid_request_error",
-                        "code": getattr(e, "status_code", 400),
-                        "retryable": False,
+                try:
+                    async for out in generator:
+                        yield b"data: " + dumps_json(out) + b"\n\n"
+                except ValueError as e:
+                    # A client disconnect also surfaces here. It's a client-side
+                    # cancellation, not a server error or bad input -- log it and
+                    # stop (the request was already aborted upstream) instead of
+                    # emitting a 400.
+                    if request is not None and await request.is_disconnected():
+                        logger.info(f"[http_server] Client disconnected: {e}")
+                        return
+                    out = {
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": getattr(e, "status_code", 400),
+                            "retryable": False,
+                        }
                     }
-                }
-                logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + dumps_json(out) + b"\n\n"
-            yield b"data: [DONE]\n\n"
+                    logger.error(f"[http_server] Error: {e}")
+                    yield b"data: " + dumps_json(out) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+            finally:
+                await generator.aclose()
 
         return StreamingResponse(
             stream_results(),
@@ -958,13 +1078,24 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
-            return orjson_response(ret)
+            generator = _generate_with_lifecycle(obj, request)
+            try:
+                ret = await generator.__anext__()
+                return orjson_response(ret)
+            finally:
+                await generator.aclose()
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+app.router.add_api_route(
+    "/generate",
+    generate_request,
+    methods=["POST", "PUT"],
+    response_class=SGLangORJSONResponse,
+    route_class_override=NativeGenerateRoute,
+)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

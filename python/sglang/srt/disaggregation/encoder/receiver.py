@@ -2037,7 +2037,7 @@ class MMReceiverBase(ABC):
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not recv_req.matches(waiting_req.recv_req):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
@@ -2545,6 +2545,7 @@ class MMReceiverBase(ABC):
             extra_key=recv_req.extra_key,
             cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
+            lifecycle_id=recv_req.lifecycle_id,
             dllm_config=self.scheduler.dllm_config,
         )
         req.tokenizer = self.scheduler.tokenizer

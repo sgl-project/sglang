@@ -1078,6 +1078,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
+    # Private child identity for the optional native HTTP lifecycle contract.
+    lifecycle_id: Optional[str] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 
@@ -2074,11 +2077,25 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    # Exact internal child identity. Native rid prefix semantics remain the
+    # default for existing callers; lifecycle cancellation never uses prefixes.
+    lifecycle_id: Optional[str] = None
+
+    def matches(self, req) -> bool:
+        if self.lifecycle_id is not None:
+            return getattr(req, "lifecycle_id", None) == self.lifecycle_id
+        return self.abort_all or req.rid.startswith(self.rid)
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+class RequestLifecycleOutput(BaseReq, kw_only=True):
+    child_id: str
+    dp_rank: int
+    phase: Literal["prefill", "terminal"]
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
