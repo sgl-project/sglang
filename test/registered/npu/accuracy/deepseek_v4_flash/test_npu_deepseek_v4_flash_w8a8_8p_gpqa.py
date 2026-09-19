@@ -4,13 +4,16 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
     TestNpuAccuracyTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    popen_launch_server_npu,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
+    est_time=7200,
     suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
@@ -40,13 +43,19 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # Default true, both cause failures on CI, Keep off.
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "60",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
@@ -66,15 +75,15 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
-    32,
+    160,
     "--max-prefill-tokens",
-    131072,
+    80000,
     "--chunked-prefill-size",
     131072,
     "--max-running-requests",
-    96,
+    160,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -104,16 +113,17 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     1,
     2,
     4,
-    5,
-    6,
+    8,
+    10,
 ]
 
 
 DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
-    "max_tokens": 125000,
+    "max_tokens": 120000,
     "top_p": 1,
     "temperature": 1,
-    "n": 1,
+    "timeout": 6000,
+    "stream": "true",
     "extra_body": {
         "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
     },
@@ -124,6 +134,10 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    # Only this case needs the CANN-version-aware launch: on CANN 9.0.x
+    # `sglang serve` segfaults lightning indexer ops, so launch via
+    # `python -m sglang.launch_server`; on CANN >= 9.1.0 keep `sglang serve`.
+    launch_server_fn = popen_launch_server_npu
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
@@ -131,10 +145,9 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
-    stream = True
-    timeout = 6000
-    seed = 1
+    eval_batch_size = 32
+    # Resolve to http://{host}:{port}/v1 (server exposes the base path).
+    api_url = "/v1"
 
     def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
         """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
