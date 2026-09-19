@@ -750,7 +750,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+            shape_mismatch = dst_val.shape != src_val.shape
+            assert not shape_mismatch or field_name in self._CP_GLOBAL_FIELDS, (
+                f"Only CP-global replay metadata may use a shorter live prefix, "
+                f"got {field_name=} {src_val.shape=} {dst_val.shape=}"
+            )
+            _copy_tensor_allowing_storage_alias(
+                dst_val, src_val, pad_value=0 if shape_mismatch else None
+            )
 
         # These fields are safe to replace because captured kernels only need
         # the current per-replay objects, or the field is produced inside the
@@ -1000,6 +1007,27 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
+
+
+def _copy_tensor_allowing_storage_alias(
+    dst: torch.Tensor, src: torch.Tensor, *, pad_value: Optional[int] = None
+) -> None:
+    """Copy replay metadata while preserving capture-stable destination addresses."""
+    if dst is src:
+        return
+    if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        src = src.clone()
+    if dst.shape == src.shape:
+        dst.copy_(src)
+        return
+    assert (
+        pad_value is not None
+        and dst.ndim == src.ndim
+        and dst.shape[0] >= src.shape[0]
+        and dst.shape[1:] == src.shape[1:]
+    ), f"Cannot copy replay metadata from {src.shape=} to {dst.shape=}"
+    dst.fill_(pad_value)
+    dst[: src.shape[0]].copy_(src)
 
 
 @dataclass
@@ -1580,9 +1608,22 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return (
+        """Whether ratio-1/2 prefill has static compressor/indexer metadata."""
+        supported = (
             bool(self.low_ratios) and _has_dense_fp4_indexer() and _is_sm100_or_newer()
         )
+        if not supported:
+            return False
+        if get_parallel().attn_cp_size == 1:
+            return True
+        max_seq_len = _prefill_graph_max_seq_len()
+        if max_seq_len is None:
+            return False
+        cfg = self.model_runner.model_config.hf_text_config
+        candidate_window = int(getattr(cfg, "candidate_topk_blocks", 0)) * int(
+            getattr(cfg, "candidate_block_size", 0)
+        )
+        return not candidate_window or max_seq_len <= candidate_window
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -2650,10 +2691,34 @@ class DeepseekV4AttnBackend(
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
-                self._source_projection_buffers(
-                    forward_batch.out_cache_loc.shape[0], ratio
-                )
+                if dsa_use_prefill_cp(forward_batch):
+                    self._cp_indexer_projection_buffers(
+                        forward_batch._cp_positions.shape[0], ratio
+                    )
+                else:
+                    self._source_projection_buffers(
+                        forward_batch.out_cache_loc.shape[0], ratio
+                    )
         return self.forward_metadata
+
+    def _cp_indexer_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
+        """Capture-stable local Q/weight rows for the CP paged indexer."""
+        sets = getattr(self, "_cp_indexer_proj_bufs", None)
+        if sets is None:
+            sets = self._cp_indexer_proj_bufs = {}
+        key = (ratio, num_tokens)
+        if key not in sets:
+            cfg = self.model_runner.model_config.hf_text_config
+            heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
+            sets[key] = {
+                "q": torch.zeros(
+                    num_tokens, heads, dim, dtype=torch.bfloat16, device=self.device
+                ),
+                "w": torch.zeros(
+                    num_tokens, heads, dtype=torch.bfloat16, device=self.device
+                ),
+            }
+        return sets[key]
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2799,6 +2864,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
@@ -2814,6 +2880,7 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                precomputed_x_global=precomputed_x_global,
             )
             return
         meta = self.forward_metadata
@@ -2852,30 +2919,64 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
-        if tail is not None:
-            q_lens_cpu = tail.local_lens_cpu
-            req_global, pos_global = tail.req_global, tail.pos_global
-        else:
-            q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
-                get_parallel().attn_cp_rank,
-                get_parallel().attn_cp_size,
-            )
-            req_global = token_req_indices(forward_batch, num_tokens=total)
-            pos_global = forward_batch.positions[:total].to(torch.int64)
-        num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
+            x_global = precomputed_x_global
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
+            if self._low_ratio_in_prefill_graph():
+                # CP allgather returns the capture bucket in global token order.
+                # The core's cache locations are global/bucket-sized even though
+                # its attention positions were reindexed to rank-local rows.
+                # Replay refreshes these tensors and fills padding locations
+                # with zero, so padded C1/C2 writes target only the dummy slot.
+                assert tail is None, "bounded SWA replay cannot enter prefill BCG"
+                core = self.forward_metadata.core_metadata
+                bucket = core.raw_out_loc.shape[0]
+                req_global = self.forward_metadata.low_ratio_req_indices
+                assert req_global is not None and req_global.shape[0] >= bucket
+                assert x_global.shape[0] >= bucket
+                assert forward_batch.positions.shape[0] >= bucket
+                req_global = req_global[:bucket]
+                pos_global = forward_batch.positions[:bucket].to(torch.int64)
+                x_global = x_global[:bucket]
+            else:
+                total = int(cp_meta.total_seq_lens)
+                if tail is not None:
+                    req_global, pos_global = tail.req_global, tail.pos_global
+                else:
+                    req_global = token_req_indices(forward_batch, num_tokens=total)
+                    pos_global = forward_batch.positions[:total].to(torch.int64)
+                x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
+            # Captured CP prepare projects Q/W on its sources stream and calls
+            # the paged indexer after the join, rather than this dense path.
+            assert not self._low_ratio_in_prefill_graph()
+            if tail is not None:
+                q_lens_cpu = tail.local_lens_cpu
+            else:
+                q_lens_cpu = interleave_rows_per_request(
+                    _as_int_list(forward_batch.extend_seq_lens_cpu),
+                    get_parallel().attn_cp_rank,
+                    get_parallel().attn_cp_size,
+                )
+            num_local = sum(q_lens_cpu)
             self._low_ratio_index_topk_dense(
                 layer,
                 x[:num_local],

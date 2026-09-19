@@ -57,7 +57,7 @@ from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -515,6 +515,7 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        precomputed_kv_score: Optional[torch.Tensor] = None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
@@ -533,6 +534,7 @@ class C4IndexerBackendMixin:
             forward_batch=forward_batch,
             layer_id=c4_indexer.layer_id,
             compressor=c4_indexer.compressor,
+            precomputed_kv_score=precomputed_kv_score,
         )
 
         # The weight projection is small and fast; compute it on its own
@@ -560,6 +562,7 @@ class C4IndexerBackendMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
+        precomputed_kv_score: Optional[torch.Tensor] = None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
@@ -572,6 +575,7 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 layer_id=c4_indexer.layer_id,
                 compressor=c4_indexer.compressor,
+                precomputed_kv_score=precomputed_kv_score,
             )
         return q, weights
 
@@ -743,6 +747,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        precomputed_kv_score: Optional[torch.Tensor] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -781,6 +786,7 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 alt_streams=alt_streams,
                 q_lora_ready=q_lora_ready,
+                precomputed_kv_score=precomputed_kv_score,
             )
         else:
             assert q_lora_ready is None
@@ -791,6 +797,7 @@ class C4IndexerBackendMixin:
                 positions=positions,
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
+                precomputed_kv_score=precomputed_kv_score,
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
@@ -1172,7 +1179,11 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        precomputed_kv_score: Optional[torch.Tensor] = None,
     ) -> None:
+        kwargs = {}
+        if precomputed_kv_score is not None:
+            kwargs["precomputed_kv_score"] = precomputed_kv_score
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1182,4 +1193,5 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            **kwargs,
         )
