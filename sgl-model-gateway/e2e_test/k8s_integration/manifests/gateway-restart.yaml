@@ -34,6 +34,8 @@ spec:
             - "--selector"
             - "app=fake-worker"
             - "lifecycle=restart"
+            - "--service-discovery-resync-secs"
+            - "10"
             - "--service-discovery-port"
             - "8000"
             - "--service-discovery-namespace"
