@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.activation import relu2
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
@@ -554,7 +554,7 @@ class Cosmos3DenseMLP(nn.Module):
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
-            up = relu2(up)
+            up = relu2(up, fast_math=False)
         else:
             up = F.relu(up)
             up = up * up

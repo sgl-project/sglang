@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.ops.activation import relu2
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     _apply_qwen3_qk_norm_rope_pack_kv,
@@ -28,7 +28,7 @@ def benchmark(case, provider):
     tokens = int(tokens)
     if operation == "relu2":
         x = create_random(1, tokens, 9216)
-        fn = eager_relu2 if provider == "eager" else relu2
+        fn = eager_relu2 if provider == "eager" else lambda x: relu2(x, fast_math=False)
         return marker.do_bench(fn, input_args=(x,))
 
     qkv = create_random(1, tokens, 32, 128)

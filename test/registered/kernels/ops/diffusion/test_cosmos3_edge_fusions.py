@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.multimodal_gen.runtime.models.dits.cosmos3video as cosmos3
-from sglang.kernels.ops.activation import relu2
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     _apply_qwen3_qk_norm_rope_pack_kv,
@@ -89,6 +89,15 @@ def test_edge_relu2_all_finite_bfloat16_encodings():
         actual = _activation_only_mlp()(values)
     fused.assert_called_once()
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    mlp = _activation_only_mlp()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = mlp(values)
+    values.neg_()
+    graph.replay()
+    expected = F.relu(values)
+    expected = expected * expected
+    assert torch.equal(replayed.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("tokens", [400, 8190])
