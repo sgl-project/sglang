@@ -192,11 +192,13 @@ class MMLUSanityMixin:
 class GSM8KMixin:
     """Mixin for GSM8K evaluation.
 
-    Backend is selectable via ``gsm8k_backend`` (default ``"run_eval"``: OpenAI
-    completion API, 5-shot; or ``"sgl_eval"``: sgl-eval chat + boxed/sympy grader,
-    skipped if sgl-eval is not installed). The canonical threshold/count knobs are
-    ``gsm8k_score_threshold`` / ``gsm8k_num_examples``; the legacy
-    ``gsm8k_accuracy_thres`` / ``gsm8k_num_questions`` are still honored.
+    Backend is selectable via ``gsm8k_backend`` (default ``"run_eval"``; or
+    ``"sgl_eval"``: sgl-eval chat + boxed/sympy grader, skipped if sgl-eval is
+    not installed). The run_eval backend keeps its historical completion API,
+    5-shot, 512-token defaults unless a model test overrides them. The canonical
+    threshold/count knobs are ``gsm8k_score_threshold`` /
+    ``gsm8k_num_examples``; the legacy ``gsm8k_accuracy_thres`` /
+    ``gsm8k_num_questions`` are still honored.
 
     Required attributes on the test class:
         base_url: str
@@ -214,8 +216,10 @@ class GSM8KMixin:
     gsm8k_num_threads: int = 128
     gsm8k_num_shots: int = 5  # run_eval backend only
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
+    gsm8k_api: str = "completion"  # run_eval backend only
     gsm8k_thinking: bool = False  # sgl_eval backend
-    gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
+    gsm8k_max_tokens: Optional[int] = None  # None preserves each backend's default
+    gsm8k_reasoning_effort: Optional[str] = None
     gsm8k_n_repeats: int = 1  # sgl_eval backend
     # None keeps run_eval's greedy default; set both to route the run through
     # the sampling path.
@@ -241,6 +245,7 @@ class GSM8KMixin:
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
+                reasoning_effort=self.gsm8k_reasoning_effort,
                 max_tokens=self.gsm8k_max_tokens,
                 accept_length_thres=self.gsm8k_accept_length_thres,
             )
@@ -252,9 +257,12 @@ class GSM8KMixin:
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 accept_length_thres=self.gsm8k_accept_length_thres,
-                api="completion",
-                max_tokens=512,
+                api=self.gsm8k_api,
+                max_tokens=(
+                    512 if self.gsm8k_max_tokens is None else self.gsm8k_max_tokens
+                ),
                 num_shots=self.gsm8k_num_shots,
+                reasoning_effort=self.gsm8k_reasoning_effort,
                 temperature=self.gsm8k_temperature,
                 top_p=self.gsm8k_top_p,
             )

@@ -75,6 +75,20 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         args = self._run_gsm8k_default(0.95, gsm8k_accuracy_thres=0.5)
         self.assertEqual(args.eval_name, "gsm8k")
         self.assertEqual(args.api, "completion")
+        self.assertEqual(args.max_tokens, 512)
+        self.assertEqual(args.num_shots, 5)
+
+    def test_run_eval_contract_can_be_overridden(self):
+        args = self._run_gsm8k_default(
+            0.98,
+            gsm8k_score_threshold=0.97,
+            gsm8k_api="chat",
+            gsm8k_max_tokens=2048,
+            gsm8k_reasoning_effort="max",
+        )
+        self.assertEqual(args.api, "chat")
+        self.assertEqual(args.max_tokens, 2048)
+        self.assertEqual(args.reasoning_effort, "max")
 
     def test_legacy_accuracy_thres_alias_gates_score(self):
         # Canonical gsm8k_score_threshold left unset (NaN) -> the legacy
