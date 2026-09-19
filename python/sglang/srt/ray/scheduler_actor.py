@@ -85,7 +85,6 @@ class SchedulerActor:
 
         # This actor takes the place of run_scheduler_process, which is where
         # a forked scheduler publishes.
-        server_args.gpu_id = actual_gpu_id
         publish(
             server_args,
             role="scheduler",
@@ -94,6 +93,7 @@ class SchedulerActor:
                     server_args, tp_rank=tp_rank, pp_rank=pp_rank
                 ),
                 dp_rank=dp_rank,
+                gpu_id=actual_gpu_id,
             ),
         )
 
@@ -125,12 +125,8 @@ class SchedulerActor:
         self.scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=actual_gpu_id,
             tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
             dp_rank=dp_rank,
         )
 

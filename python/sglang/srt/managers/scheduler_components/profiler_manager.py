@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
-    ps: Any
     dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
 

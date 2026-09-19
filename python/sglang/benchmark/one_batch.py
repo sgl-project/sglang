@@ -686,14 +686,12 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    # With the placement this process was spawned with, so a rank read here
-    # does not need a process group -- the same bundle the runner is handed.
-    server_args.gpu_id = gpu_id
     publish(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
         ),
     )
 
@@ -898,14 +896,14 @@ def latency_test(
     tp_rank,
 ):
     cfg = resolving_view(server_args)
-    server_args.gpu_id = gpu_id
     # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
     # a spawned child arrives with nothing published.
     publish(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
         ),
     )
     initialize_moe_config()
