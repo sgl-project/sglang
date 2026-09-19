@@ -179,7 +179,10 @@ def _get_stage_from_forward_mode(forward_mode: ForwardMode):
         return "prefill"
     elif forward_mode.is_decode():
         return "decode"
-    elif forward_mode.is_idle():
+    elif forward_mode.is_idle() or forward_mode.is_prebuilt():
+        # PREBUILT is the disaggregated-decode placeholder for requests whose
+        # KV just arrived; it never enters a model forward, so it is not a
+        # profile stage (mirrors SchedulerProfilerManager._profile_batch_predicate).
         return None
     else:
         raise RuntimeError(f"unsupported profile stage: {forward_mode=}")
