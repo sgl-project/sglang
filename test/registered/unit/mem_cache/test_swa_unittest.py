@@ -343,12 +343,6 @@ class TestSWA(unittest.TestCase):
         )
 
 
-# Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.
-# Splits a freshly-inserted leaf at the (page-aligned) sliding-window
-# boundary so a future inc_lock_ref protects only ~sliding_window_size SWA
-# tokens instead of the whole chunked-prefill chain.
-
-
 class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
     """Minimal single-pool allocator: no SWA peer, so the whole range dies
     together whatever the floor says."""
