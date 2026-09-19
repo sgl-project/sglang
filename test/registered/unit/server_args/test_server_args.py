@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
@@ -67,9 +68,8 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import (
-    check_two_batch_overlap,
-)
+from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -2391,6 +2391,63 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                 args = self._make_args(max_context_size)
                 with self.assertRaisesRegex(ValueError, expected_error):
                     finalize_cuda_graph_prefill_max_context(args)
+
+
+class TestTRTLLMMLAKVCacheDtypeValidation(CustomTestCase):
+    def _args(self, kv_cache_dtype, *, prefill="trtllm_mla", decode="fa3"):
+        args = ServerArgs(
+            model_path="dummy",
+            prefill_attention_backend=prefill,
+            decode_attention_backend=decode,
+            kv_cache_dtype=kv_cache_dtype,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE)
+            ),
+        )
+        args._cuda_graph_config_locked = set()
+        args._model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MLA,
+            context_len=4096,
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(
+                architectures=["TestMultimodalForConditionalGeneration"],
+                dual_chunk_attention_config=None,
+            ),
+            is_encoder_decoder=False,
+            is_multimodal=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            is_piecewise_cuda_graph_disabled_model=False,
+        )
+        return args
+
+    @override_platform(is_blackwell=True, is_sm100=True)
+    def test_split_prefill_backend_rejects_fp8_e5m2(self):
+        args = self._args("fp8_e5m2")
+        with self.assertRaisesRegex(ValueError, "fp8_e5m2"):
+            handle_attention_backend_compatibility(args)
+
+    @override_platform(is_blackwell=True, is_sm100=True)
+    def test_current_fp4_spellings_take_safe_graph_route(self):
+        with patch(
+            "sglang.srt.layers.attention.trtllm_mla_backend.is_sm100_supported",
+            return_value=True,
+        ):
+            for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+                with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                    args = self._args(kv_cache_dtype)
+                    handle_attention_backend_compatibility(args)
+                    apply_cuda_graph_compatibility(args)
+                    self.assertEqual(
+                        resolution_result(args, "cuda_graph_config").prefill.backend,
+                        Backend.DISABLED,
+                    )
+
+    @override_platform(is_blackwell=True, is_sm100=True)
+    def test_trtllm_mla_validator_rejects_deprecated_fp4_spelling(self):
+        args = self._args("fp4_e2m1")
+        with self.assertRaisesRegex(ValueError, "only supports.*got fp4_e2m1"):
+            handle_attention_backend_compatibility(args)
 
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
