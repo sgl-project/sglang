@@ -999,6 +999,9 @@ class MambaPool:
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
+        self._clear_state_slots(indices)
+
+    def _clear_state_slots(self, indices: torch.Tensor) -> None:
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
@@ -1046,6 +1049,15 @@ class MambaPool:
                 f"(write_pos==0), got {src_wp.tolist()} for src "
                 f"{src_indices.tolist()}"
             )
+        self._copy_state_slots(src_indices, dst_indices)
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[dst_indices] = 0
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_indices, dst_indices)
+
+    def _copy_state_slots(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
@@ -1067,10 +1079,6 @@ class MambaPool:
             self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
                 :, src_indices
             ]
-        if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
-        for sibling in self._slot_siblings:
-            sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1101,15 +1109,18 @@ class MambaPool:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
+        self._load_state_slots(conv_cpu, temporal_cpu, indices)
+        if siblings_cpu is not None:
+            for sibling, data in zip(self._slot_siblings, siblings_cpu):
+                sibling.load_cpu_slots(data, indices)
+        current_platform.synchronize()
+
+    def _load_state_slots(self, conv_cpu, temporal_cpu, indices) -> None:
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
-        if siblings_cpu is not None:
-            for sibling, data in zip(self._slot_siblings, siblings_cpu):
-                sibling.load_cpu_slots(data, indices)
-        current_platform.synchronize()
 
     _NON_TRANSFER_STATE_FIELDS = frozenset(
         {
@@ -1302,7 +1313,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
-        self.mamba_pool = self.mamba_pool_cls(
+        mamba_pool_cls = self.mamba_pool_cls
+        if current_platform.is_out_of_tree():
+            mamba_pool_cls = current_platform.get_mamba_pool_cls() or mamba_pool_cls
+        self.mamba_pool = mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,

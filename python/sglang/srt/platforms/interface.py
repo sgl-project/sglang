@@ -80,6 +80,10 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def get_mamba_pool_cls(self) -> Optional[type]:
+        """Return an out-of-tree Mamba pool class, or None for the default."""
+        return None
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 

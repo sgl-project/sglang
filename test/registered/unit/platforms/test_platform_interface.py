@@ -210,6 +210,9 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_mamba_pool_defaults_to_builtin(self):
+        self.assertIsNone(SRTPlatform().get_mamba_pool_cls())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
