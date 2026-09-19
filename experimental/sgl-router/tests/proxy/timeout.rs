@@ -17,7 +17,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -72,9 +71,8 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
     });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry));
     let app = build_router(ctx);
 
     let req = Request::builder()

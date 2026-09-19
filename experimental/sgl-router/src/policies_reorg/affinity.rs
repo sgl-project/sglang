@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
+use crate::server::metrics::{MetricsRegistry, StickyOutcome};
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 
@@ -27,7 +28,7 @@ impl AffinityKind {
 
     fn hit(self) -> &'static str {
         match self {
-            Self::Session => "session_hit",
+            Self::Session => "session_primary",
             Self::Sticky => "sticky_hit",
         }
     }
@@ -43,9 +44,16 @@ pub struct AffinityPolicy {
     /// Keys span buckets instead of being scoped to the current one.
     pub global: bool,
     pub fallback: Arc<dyn Policy>,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 impl AffinityPolicy {
+    fn record(&self, outcome: StickyOutcome) {
+        if self.kind == AffinityKind::Sticky {
+            self.metrics.record_sticky(outcome);
+        }
+    }
+
     async fn pick_async(
         &self,
         engines: &[Arc<Worker>],
@@ -56,6 +64,9 @@ impl AffinityPolicy {
             AffinityKind::Session => request.session_key,
             AffinityKind::Sticky => request.routing_key,
         };
+        if value.is_none() && !hit_required {
+            self.record(StickyOutcome::NoRoutingKey);
+        }
         let key = value
             .filter(|_| request.affinity_enabled)
             .map(|value| request.affinity_key(self.kind.name(), self.global, value));
@@ -67,10 +78,13 @@ impl AffinityPolicy {
         };
         if let Some(bound) = self.store.bound(&key, engines) {
             return match self.admission.check.check(bound, request)? {
-                Decision::Allow => Ok(Pick {
-                    engine: bound.clone(),
-                    reason: self.kind.hit(),
-                }),
+                Decision::Allow => {
+                    self.record(StickyOutcome::Hit);
+                    Ok(Pick {
+                        engine: bound.clone(),
+                        reason: self.kind.hit(),
+                    })
+                }
                 Decision::Reject(reason) if hit_required => {
                     Err(PickError::AdmissionRejected(Rejection {
                         engine: bound.id.clone(),
@@ -92,14 +106,21 @@ impl AffinityPolicy {
         }
         let admitted = self.admission.admit(engines, request)?;
         let pick = self.fallback.pick(&admitted, request).await?;
+        let remap = self.store.contains(&key);
         let engine = self.store.bind(key, &pick.engine, &admitted).clone();
-        self.admission.verify(
+        let pick = self.admission.verify(
             Pick {
                 engine,
-                reason: "bound",
+                reason: if remap { "remap" } else { "assigned" },
             },
             request,
-        )
+        )?;
+        self.record(if remap {
+            StickyOutcome::Remap
+        } else {
+            StickyOutcome::Assigned
+        });
+        Ok(pick)
     }
 
     async fn delegate(
@@ -143,6 +164,7 @@ mod tests {
             store: AffinityStore::new(Duration::from_secs(60)),
             global: false,
             fallback: Arc::new(RoundRobinPolicy::default()),
+            metrics: MetricsRegistry::new(),
         }
     }
 
@@ -155,11 +177,11 @@ mod tests {
         let first = pick_as(&policy, &fleet, Some("s"), PickMode::Normal)
             .await
             .unwrap();
-        assert_eq!(first.reason, "bound");
+        assert_eq!(first.reason, "assigned");
         let again = pick_as(&policy, &fleet, Some("s"), PickMode::Normal)
             .await
             .unwrap();
-        assert!(again.engine.id == first.engine.id && again.reason == "session_hit");
+        assert!(again.engine.id == first.engine.id && again.reason == "session_primary");
     }
 
     #[tokio::test]

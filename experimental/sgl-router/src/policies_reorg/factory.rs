@@ -4,6 +4,7 @@
 //! Builds the prefill and decode pools from `ModelConfig`: one policy
 //! instance per bucket, with the admission the legacy path applied implicitly.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
@@ -14,6 +15,7 @@ use crate::config::{
     SessionAffinityMode, SloBucketPolicy, StickyFallbackKind,
 };
 use crate::discovery::WorkerId;
+use crate::server::metrics::MetricsRegistry;
 use crate::state::{AffinityStore, PrefixSource};
 
 use super::admission::{
@@ -27,6 +29,7 @@ use super::{least_load, power_of_two, random, round_robin, Policy};
 pub struct Dependencies {
     pub affinity: Arc<AffinityStore>,
     pub prefix: Option<Arc<PrefixSource>>,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
@@ -42,7 +45,7 @@ pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
             .map(|spec| bucket(spec, model, default, deps))
             .collect::<Result<Vec<_>>>()?;
         if buckets.is_empty() {
-            let admission = admission(default, model, stage, None);
+            let admission = admission(default, model, stage, HashMap::new());
             return Ok(Pool::implicit(build_policy(
                 default, admission, model, deps,
             )?));
@@ -67,10 +70,24 @@ pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
         || (model.policy == PolicyKind::SessionAware
             && session_mode != SessionAffinityMode::Bucket);
     if global && config.is_some() {
-        let admission = admission(model.policy, model, BucketStage::Prefill, None);
+        // The whole-pool probe keeps every engine's own bucket budget.
+        let budgets = prefill
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.pending_prefill_budgets())
+            .collect();
+        let admission = admission(model.policy, model, BucketStage::Prefill, budgets);
         prefill.affinity = Some(build_policy(model.policy, admission, model, deps)?);
         prefill.preserve_global_binding = session_mode == SessionAffinityMode::GlobalPreserve;
     }
+    let kinds = || {
+        std::iter::once(model.policy).chain(
+            config
+                .into_iter()
+                .flat_map(|c| &c.buckets)
+                .filter_map(|spec| spec.policy),
+        )
+    };
     Ok(Pools {
         prefill,
         decode: pool(
@@ -78,6 +95,8 @@ pub fn build_pools(model: &ModelConfig, deps: &Dependencies) -> Result<Pools> {
             PolicyKind::PowerOfTwo,
             config.map_or(SloBucketPolicy::Disabled, |c| c.tps_slo_policy),
         )?,
+        needs_request_tokens: kinds().any(|kind| kind == PolicyKind::CacheAware),
+        needs_dispatch_timestamps: kinds().any(|kind| kind == PolicyKind::LoadBased),
     })
 }
 
@@ -92,7 +111,16 @@ fn bucket(
         BucketStage::Prefill => (spec.min_extend_tokens, spec.max_extend_tokens),
         BucketStage::Decode => (spec.min_sequence_tokens, spec.max_sequence_tokens),
     };
-    let admission = admission(kind, model, spec.stage, spec.max_pending_prefill_tokens);
+    let budgets = spec
+        .max_pending_prefill_tokens
+        .into_iter()
+        .flat_map(|budget| {
+            spec.worker_ids
+                .iter()
+                .map(move |id| (WorkerId(id.clone()), budget))
+        })
+        .collect();
+    let admission = admission(kind, model, spec.stage, budgets);
     Ok(Bucket {
         id: spec.id.clone(),
         rank: spec.rank,
@@ -105,6 +133,7 @@ fn bucket(
         ttft_ms: spec.ttft_p95_at_capacity_ms,
         tokens_per_second: spec.tps_p05_at_capacity,
         policy: build_policy(kind, admission, model, deps)?,
+        pending_prefill_budget: spec.max_pending_prefill_tokens,
     })
 }
 
@@ -121,6 +150,7 @@ pub fn build_policy(
             store: deps.affinity.clone(),
             global,
             fallback,
+            metrics: deps.metrics.clone(),
         })
     };
     Ok(match kind {
@@ -140,6 +170,7 @@ pub fn build_policy(
                 .ok_or_else(|| anyhow!("--policy cache_aware needs a prefix source"))?,
             admission,
             config: model.affinity.clone().unwrap_or_default(),
+            metrics: deps.metrics.clone(),
         }),
         PolicyKind::Sticky => {
             let fallback = match model.sticky.as_ref().map(|s| s.fallback_policy) {
@@ -169,7 +200,7 @@ fn admission(
     kind: PolicyKind,
     model: &ModelConfig,
     stage: BucketStage,
-    pending_prefill_budget: Option<u64>,
+    pending_prefill_budgets: HashMap<WorkerId, u64>,
 ) -> Admission {
     let mut checks: Vec<Arc<dyn EngineAdmission>> = Vec::new();
     if matches!(
@@ -177,8 +208,8 @@ fn admission(
         PolicyKind::PowerOfTwo | PolicyKind::SessionAware | PolicyKind::CacheAware
     ) {
         checks.push(Arc::new(Capacity));
-        if let (BucketStage::Prefill, Some(budget)) = (stage, pending_prefill_budget) {
-            checks.push(Arc::new(PendingPrefill(budget)));
+        if stage == BucketStage::Prefill && !pending_prefill_budgets.is_empty() {
+            checks.push(Arc::new(PendingPrefill(pending_prefill_budgets)));
         }
     }
     let overloaded = model
@@ -209,6 +240,7 @@ mod tests {
         Dependencies {
             affinity: AffinityStore::new(Duration::from_secs(60)),
             prefix: None,
+            metrics: MetricsRegistry::new(),
         }
     }
 
@@ -273,7 +305,7 @@ mod tests {
         assert!(
             kinds[0].starts_with("RoundRobinPolicy") && kinds[1].starts_with("PowerOfTwoPolicy")
         );
-        assert!(kinds[1].contains("PendingPrefill(1024)") && !kinds[0].contains("Capacity"));
+        assert!(kinds[1].contains("PendingPrefill") && !kinds[0].contains("Capacity"));
         assert_eq!(pools.prefill.slo, SloPreference::SloFirst);
         assert!(pools.prefill.affinity.is_none());
         assert_eq!(pools.prefill.buckets[0].limits.max, Some(4096));

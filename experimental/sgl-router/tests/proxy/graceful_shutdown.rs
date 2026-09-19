@@ -29,7 +29,6 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -81,9 +80,8 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             bootstrap_port: None,
         })
         .expect("test worker accepted");
-    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    let ctx = AppContext::new(cfg, tokenizers, proxy, registry, policies);
+    let ctx = AppContext::new(cfg, tokenizers, proxy, registry);
     ctx.mark_ready();
     Arc::new(ctx)
 }

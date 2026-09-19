@@ -9,13 +9,14 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
+use sgl_router::state::active_load::ActiveLoadRegistry;
+use sgl_router::state::kv_events::{
+    compute_block_hashes, BlockSizeOracle, KvEventIndex, KvWorkerId,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use tower::ServiceExt;
@@ -47,7 +48,11 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     let hashes = compute_block_hashes(&tokens.ids, 1);
     assert!(!hashes.is_empty());
 
-    let tree = Arc::new(HashTree::new());
+    let oracle = BlockSizeOracle::new();
+    oracle.try_set(1).unwrap();
+    let kv_index =
+        KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+    let tree = kv_index.tree();
     tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
     let registry = Arc::new(WorkerRegistry::default());
     for url in [&cached.url, &uncached.url] {
@@ -61,18 +66,16 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
             })
             .unwrap();
     }
-    let oracle = BlockSizeOracle::new();
-    oracle.try_set(1).unwrap();
-    let policies = Arc::new(build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap());
-    let mut ctx = AppContext::new(
+    let ctx = AppContext::with_engine_state(
         cfg,
         tokenizers,
         Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
         registry,
-        policies,
-    );
-    ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(tree, Arc::clone(&oracle)));
-    ctx.block_size_oracle = oracle;
+        ActiveLoadRegistry::with_defaults(),
+        Some(kv_index),
+        None,
+    )
+    .unwrap();
 
     let response = build_router(Arc::new(ctx))
         .oneshot(

@@ -62,9 +62,20 @@ pub struct Bucket {
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
     pub policy: Arc<dyn Policy>,
+    /// Waiting-prefill budget its members carry into the affinity group.
+    pub pending_prefill_budget: Option<u64>,
 }
 
 impl Bucket {
+    pub fn pending_prefill_budgets(&self) -> impl Iterator<Item = (WorkerId, u64)> + '_ {
+        self.pending_prefill_budget.into_iter().flat_map(|budget| {
+            self.worker_ids
+                .iter()
+                .flatten()
+                .map(move |id| (id.clone(), budget))
+        })
+    }
+
     fn contains(&self, engine: &Worker) -> bool {
         self.worker_ids
             .as_ref()
@@ -114,6 +125,7 @@ impl Pool {
                 ttft_ms: None,
                 tokens_per_second: None,
                 policy,
+                pending_prefill_budget: None,
             }],
             ..Default::default()
         }
@@ -121,17 +133,21 @@ impl Pool {
 }
 
 /// The prefill pool also serves plain requests; a plain deployment never asks for decode.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Pools {
     pub prefill: Pool,
     pub decode: Pool,
+    /// Some attached policy reads token ids (cache-aware).
+    pub needs_request_tokens: bool,
+    /// Some attached policy corrects reports with dispatch timestamps (least-load).
+    pub needs_dispatch_timestamps: bool,
 }
 
 impl Pools {
     pub fn plain(pool: Pool) -> Self {
         Self {
             prefill: pool,
-            decode: Pool::default(),
+            ..Default::default()
         }
     }
 

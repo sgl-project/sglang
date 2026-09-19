@@ -18,12 +18,12 @@ use sgl_kv_indexer::{
 };
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
+use sgl_router::state::active_load::ActiveLoadRegistry;
+use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, KvEventIndex};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -103,24 +103,24 @@ async fn external_indexer_routes_to_the_cached_worker() {
     }
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
-    let policies =
-        Arc::new(build_registry(&cfg, Arc::new(HashTree::new()), Arc::clone(&oracle)).unwrap());
-    let mut ctx = AppContext::new(
+    let prefix_index = GrpcPrefixIndex::new(PrefixIndexConfig {
+        endpoint,
+        query_deadline: Duration::from_secs(1),
+        max_inflight: 4,
+    })
+    .unwrap();
+    let kv_index =
+        KvEventIndex::new_metadata_only_with_http_and_oracle(reqwest::Client::new(), oracle);
+    let ctx = AppContext::with_engine_state(
         cfg,
         tokenizers,
         Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
         registry,
-        policies,
-    );
-    ctx.prefix_index = Some(Arc::new(
-        GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint,
-            query_deadline: Duration::from_secs(1),
-            max_inflight: 4,
-        })
-        .unwrap(),
-    ));
-    ctx.block_size_oracle = oracle;
+        ActiveLoadRegistry::with_defaults(),
+        Some(kv_index),
+        Some(Arc::new(prefix_index)),
+    )
+    .unwrap();
 
     let app = build_router(Arc::new(ctx));
     let response = app

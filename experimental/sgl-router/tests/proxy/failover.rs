@@ -5,7 +5,6 @@ use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::*;
 use sgl_router::discovery::{spawn_discovery, ModelId};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -58,7 +57,6 @@ async fn failover_when_one_worker_dies() {
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
 
     let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
     let _mgr = tokio::spawn(manager::run_with_config(
@@ -89,13 +87,7 @@ async fn failover_when_one_worker_dies() {
     );
 
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    let ctx = Arc::new(AppContext::new(
-        cfg,
-        tokenizers,
-        proxy,
-        registry.clone(),
-        policies,
-    ));
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry.clone()));
     ctx.mark_ready();
     let app = build_router(ctx);
 

@@ -4,7 +4,6 @@
 pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
-pub mod decode;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
@@ -13,7 +12,6 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
-pub mod selection;
 pub mod session_aware;
 pub mod sticky;
 

@@ -7,10 +7,6 @@ use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
     state::{
@@ -72,14 +68,6 @@ async fn main() -> Result<()> {
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
-    let routing_policies = Arc::new(
-        build_policy_registry(
-            &config,
-            engine_state.tree(),
-            engine_state.block_size_oracle(),
-        )
-        .context("build policy registry")?,
-    );
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -99,7 +87,6 @@ async fn main() -> Result<()> {
         &config,
         tokenizers,
         worker_registry,
-        routing_policies,
         local_inflight_requests,
         &engine_state,
         external_kv_indexer_client,
@@ -262,41 +249,27 @@ fn build_app_context(
     config: &Config,
     tokenizers: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
-    routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<ActiveLoadRegistry>,
-    engine_state: &KvEventIndex,
+    engine_state: &Arc<KvEventIndex>,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
-    let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
             .context("build proxy client")?,
     );
-
-    let mut app_context = AppContext::with_active_load(
+    let app_context = AppContext::with_engine_state(
         config.clone(),
         tokenizers,
         proxy,
         worker_registry,
-        routing_policies,
         local_inflight_requests,
-    );
-    app_context.prefix_index = external_kv_indexer_client;
-    app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
-        && config
-            .model
-            .cache_aware
-            .as_ref()
-            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
-    app_context.block_size_oracle = block_size_oracle;
-    app_context.engine_load = engine_state.engine_load();
-    app_context.kv_metrics = engine_state.metrics_source();
+        Some(Arc::clone(engine_state)),
+        external_kv_indexer_client,
+    )
+    .context("build selection policies")?;
     Ok(Arc::new(app_context))
 }
 
-/// How serving ended; `inflight_drain_secs` is `None` when the server stopped
-/// without ever reaching the in-flight drain.
 struct ServeOutcome {
     result: Result<()>,
     inflight_drain_secs: Option<u64>,

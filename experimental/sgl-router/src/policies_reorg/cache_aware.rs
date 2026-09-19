@@ -13,6 +13,7 @@ use futures::future::BoxFuture;
 
 use crate::config::AffinityConfig;
 use crate::policies::admission::FreshLoadLookup;
+use crate::server::metrics::{CacheAwareDecision, MetricsRegistry};
 use crate::state::engine_load::EngineLoadSnapshot;
 use crate::state::prefix::{PrefixLookup, PrefixSource};
 use crate::workers::Worker;
@@ -25,6 +26,7 @@ pub struct CacheAwarePolicy {
     pub source: Arc<PrefixSource>,
     pub admission: Admission,
     pub config: AffinityConfig,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +82,8 @@ impl CacheAwarePolicy {
         }
         let mut admitted = Vec::new();
         let mut rejections = Vec::new();
+        self.metrics
+            .record_cache_admission_evaluations(evaluated.len() as u64);
         for candidate in evaluated {
             match self.admission.check.check(candidate.engine, request)? {
                 Decision::Allow => admitted.push(candidate),
@@ -89,10 +93,14 @@ impl CacheAwarePolicy {
                 }),
             }
         }
+        self.metrics
+            .record_cache_admission_rejections(rejections.len() as u64);
         if let Some(winner) = self.tournament(&admitted, snapshot) {
+            self.metrics
+                .record_cache_aware_decision(&request.model.0, CacheAwareDecision::CacheHit);
             return Ok(Pick {
                 engine: winner.engine.clone(),
-                reason: "cache_hit",
+                reason: "cache_candidate",
             });
         }
         if let Some(pinned) = self.saturation_pin(&gated, engines, request)? {
@@ -107,6 +115,13 @@ impl CacheAwarePolicy {
                 false => PickError::NoAdmissibleEngine(rejections),
             });
         }
+        let decision = match (gated.is_empty(), fleet_all_queued) {
+            (true, _) => CacheAwareDecision::CacheMiss,
+            (false, true) => CacheAwareDecision::AllQueued,
+            (false, false) => CacheAwareDecision::CacheWorkerQueued,
+        };
+        self.metrics
+            .record_cache_aware_decision(&request.model.0, decision);
         let admitted = self.admission.admit(engines, request)?;
         let preferred: Vec<_> = admitted.iter().filter(|e| unqueued(e)).cloned().collect();
         let pool = if preferred.is_empty() {
@@ -120,7 +135,7 @@ impl CacheAwarePolicy {
         self.admission.verify(
             Pick {
                 engine,
-                reason: "cache_miss",
+                reason: "no_cache_candidate",
             },
             request,
         )
@@ -347,6 +362,7 @@ mod tests {
                 cache_affinity_min_matched_tokens: Some(16),
                 ..AffinityConfig::default()
             },
+            metrics: MetricsRegistry::new(),
         }
     }
 
@@ -375,11 +391,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(hit.engine.id.0 == "a" && hit.reason == "cache_hit");
+        assert!(hit.engine.id.0 == "a" && hit.reason == "cache_candidate");
         let miss = policy(vec![]);
         assert_eq!(
             pick(&miss, &fleet, PickMode::Normal).await.unwrap().reason,
-            "cache_miss"
+            "no_cache_candidate"
         );
         assert!(matches!(
             pick(&miss, &fleet, PickMode::HitRequired).await,

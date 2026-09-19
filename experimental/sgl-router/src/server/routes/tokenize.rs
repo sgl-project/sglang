@@ -142,13 +142,11 @@ mod tests {
             crate::proxy::Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy"),
         );
         let worker_registry = Arc::new(crate::workers::WorkerRegistry::default());
-        let policies = Arc::new(crate::policies::PolicyRegistry::default());
         Arc::new(AppContext::new(
             cfg,
             Arc::new(registry),
             proxy,
             worker_registry,
-            policies,
         ))
     }
 

@@ -44,7 +44,7 @@ impl PreparedChatRequest {
         let needs_tokens = should_tokenize_request(
             ctx.tokenizers.has_chat_formatter(&model.0),
             policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
+            ctx.config.model.bucket_config.is_some(),
         );
         // Parse the full body only when rendering or routing needs tokens.
         let parsed_body = needs_tokens

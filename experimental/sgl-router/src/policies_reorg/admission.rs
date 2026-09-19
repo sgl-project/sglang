@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+
+use crate::discovery::WorkerId;
 
 use crate::workers::Worker;
 
@@ -56,13 +59,17 @@ impl EngineAdmission for Capacity {
     }
 }
 
-/// Waiting uncached tokens plus this request's input must fit the bucket
-/// budget; admits without a fresh native sample.
+/// Waiting uncached tokens plus this request's input must fit the engine's
+/// bucket budget; engines without a budget and engines without a fresh
+/// native sample are admitted.
 #[derive(Debug)]
-pub struct PendingPrefill(pub u64);
+pub struct PendingPrefill(pub HashMap<WorkerId, u64>);
 
 impl EngineAdmission for PendingPrefill {
     fn check(&self, engine: &Worker, request: &PickRequest<'_>) -> Result<Decision, PickError> {
+        let Some(budget) = self.0.get(&engine.id) else {
+            return Ok(Decision::Allow);
+        };
         let fits = request
             .load
             .snapshot()
@@ -70,7 +77,7 @@ impl EngineAdmission for PendingPrefill {
             .is_none_or(|load| {
                 load.num_waiting_uncached_tokens
                     .saturating_add(request.input_tokens)
-                    <= self.0
+                    <= *budget
             });
         Ok(Decision::from(fits, "pending_prefill_budget"))
     }

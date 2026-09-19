@@ -12,6 +12,7 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::affinity::{AffinityKind, AffinityPolicy};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use sgl_router::server::metrics::MetricsRegistry;
 use sgl_router::state::engine_load::EngineLoadTable;
 use sgl_router::state::{AffinityStore, LoadView};
 use sgl_router::workers::{Worker, WorkerRegistry};
@@ -114,6 +115,7 @@ fn bucket(id: &str, rank: u32, members: &[&str], policy: Arc<dyn Policy>) -> Buc
         ttft_ms: None,
         tokens_per_second: None,
         policy,
+        pending_prefill_budget: None,
     }
 }
 
@@ -145,6 +147,7 @@ async fn pools_isolate_model_health_and_stage() {
         Pools {
             prefill: implicit(),
             decode: implicit(),
+            ..Default::default()
         },
     );
     for (stage, id) in [(Stage::Prefill, "p"), (Stage::Decode, "d")] {
@@ -217,6 +220,7 @@ fn decode_unknown_output_uses_only_unbounded_sequence_ranges() {
         Pools {
             prefill: implicit(),
             decode: pool(vec![bounded, catch_all]),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -359,6 +363,7 @@ async fn affinity_group_is_probed_first_and_preserve_keeps_a_stranded_binding() 
             store: store.clone(),
             global: true,
             fallback: Arc::new(TestPolicy::default()),
+            metrics: MetricsRegistry::new(),
         })
     };
     let mut small = bucket("small", 0, &["a"], session());
@@ -374,7 +379,7 @@ async fn affinity_group_is_probed_first_and_preserve_keeps_a_stranded_binding() 
     // "small" now fits first, but the affinity group returns the bound engine.
     request.pick.input_tokens = 3;
     let pick = resolver.pick(&request).await.unwrap();
-    assert!(pick.engine.id.0 == "b" && pick.reason == "session_hit");
+    assert!(pick.engine.id.0 == "b" && pick.reason == "session_primary");
     // The bound engine leaves: later buckets serve without rebinding.
     resolver.workers.remove(&WorkerId("b".into()));
     let pick = resolver.pick(&request).await.unwrap();

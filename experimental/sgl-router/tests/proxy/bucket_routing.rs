@@ -16,11 +16,12 @@ use sgl_router::config::{
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::active_load::ActiveLoadRegistry;
 use sgl_router::state::engine_load::{LoadStat, NativeCacheRankLoad};
+use sgl_router::state::kv_events::{BlockSizeOracle, KvEventIndex};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,7 +52,16 @@ fn build_app_context(
     bucket_config: BucketConfig,
     policy: PolicyKind,
     affinity: Option<AffinityConfig>,
+    prefix_index: Option<Arc<dyn PrefixIndex>>,
 ) -> AppContext {
+    let cache_aware = prefix_index.is_some().then(|| CacheAwareConfig {
+        prefix_provider: CachePrefixProvider::Indexer,
+        kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
+            url: "http://fake-indexer".into(),
+            query_timeout_ms: 100,
+            query_max_inflight: 32,
+        }),
+    });
     let config = Config {
         server: ServerConfig {
             host: "0".into(),
@@ -66,7 +76,7 @@ fn build_app_context(
             decode_policy: Default::default(),
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
-            cache_aware: None,
+            cache_aware,
             sticky: None,
             affinity,
             fused: None,
@@ -84,9 +94,21 @@ fn build_app_context(
     for spec in specs {
         let _ = registry.add(spec);
     }
-    let policies = Arc::new(build_registry_with_defaults(&config).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    AppContext::new(config, tokenizers, proxy, registry, policies)
+    let oracle = BlockSizeOracle::new();
+    oracle.try_set(1).unwrap();
+    let kv_index =
+        KvEventIndex::new_metadata_only_with_http_and_oracle(reqwest::Client::new(), oracle);
+    AppContext::with_engine_state(
+        config,
+        tokenizers,
+        proxy,
+        registry,
+        ActiveLoadRegistry::with_defaults(),
+        Some(kv_index),
+        prefix_index,
+    )
+    .unwrap()
 }
 
 fn build_ctx(
@@ -95,7 +117,13 @@ fn build_ctx(
     policy: PolicyKind,
     affinity: Option<AffinityConfig>,
 ) -> Arc<AppContext> {
-    Arc::new(build_app_context(specs, bucket_config, policy, affinity))
+    Arc::new(build_app_context(
+        specs,
+        bucket_config,
+        policy,
+        affinity,
+        None,
+    ))
 }
 
 struct FakePrefixIndex {
@@ -195,19 +223,13 @@ fn build_cache_ctx_with_affinity(
     prefix_index: Arc<dyn PrefixIndex>,
     affinity: AffinityConfig,
 ) -> Arc<AppContext> {
-    let mut context =
-        build_app_context(specs, bucket_config, PolicyKind::CacheAware, Some(affinity));
-    context.config.model.cache_aware = Some(CacheAwareConfig {
-        prefix_provider: CachePrefixProvider::Indexer,
-        kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
-            url: "http://fake-indexer".into(),
-            query_timeout_ms: 100,
-            query_max_inflight: 32,
-        }),
-    });
-    context.prefix_index = Some(prefix_index);
-    context.block_size_oracle.try_set(1).unwrap();
-    Arc::new(context)
+    Arc::new(build_app_context(
+        specs,
+        bucket_config,
+        PolicyKind::CacheAware,
+        Some(affinity),
+        Some(prefix_index),
+    ))
 }
 
 fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
@@ -888,10 +910,14 @@ async fn cache_candidate_respects_its_bucket_pending_prefill_budget() {
         cached.captured.lock().unwrap().last_body.is_none(),
         "a cache holder beyond its Bucket pending-prefill budget must not receive the request"
     );
-    assert!(ctx
-        .metrics
-        .render()
-        .contains("sgl_router_cache_admission_rejected_total 1"));
+    // The affinity group and the holder's own bucket each evaluate admission.
+    let metrics = ctx.metrics.render();
+    let rejected = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("sgl_router_cache_admission_rejected_total "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(rejected >= 1, "{metrics}");
 }
 
 #[tokio::test]
