@@ -127,9 +127,54 @@ def parse_random_image_resolution(
     return (min_width, min_height), (max_width, max_height)
 
 
+def resolve_image_placeholder(processor) -> Optional[str]:
+    """Return the model's own image placeholder string, or None if undiscoverable.
+
+    A processor may expose no chat template yet still know which token marks an
+    image, either as a string (``image_token``) or as an id (``image_token_id``).
+    """
+    token = getattr(processor, "image_token", None)
+    if isinstance(token, str) and token:
+        return token
+
+    token_id = getattr(processor, "image_token_id", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if token_id is None or tokenizer is None:
+        return None
+    try:
+        decoded = tokenizer.decode([token_id])
+    except Exception:  # noqa: BLE001 - unknown tokenizer; use the generic tag instead
+        return None
+    return decoded or None
+
+
+def render_with_tokenizer_template(processor, content) -> Optional[str]:
+    """Render one user turn with the processor's tokenizer template, or None.
+
+    Used when the processor itself exposes no chat template but its tokenizer
+    does, which happens for checkpoints shipping ``chat_template.jinja``.
+    """
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None or not getattr(tokenizer, "chat_template", None):
+        return None
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except Exception:  # noqa: BLE001 - template may reject this content shape
+        return None
+
+
 def create_mm_data_row(
     text_prompt, images: list, images_base64, output_len, processor, backend
 ):
+    # Set when the fallback renders both prompts with the tokenizer's template, so
+    # the text-only length below is measured the same way as prompt_len. Mixing the
+    # two (templated prompt_len, bare text_prompt_len) would fold the role
+    # scaffolding into vision_prompt_len.
+    text_only_fallback = None
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -147,12 +192,48 @@ def create_mm_data_row(
         )
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-        print(f"Error applying chat template: {e}, fallback to <image> tag")
-        # Some tokenizers do not support list content; fall back to a placeholder in the text
-        if type(processor).__name__ == "MiniCPMOProcessor":
-            prompt_str = f"(<image>./</image>){text_prompt}"
-        else:
-            prompt_str = f"<image>{text_prompt}"
+        print(f"Error applying chat template: {e}, falling back")
+        # A processor can lack a chat template while its tokenizer still carries the
+        # model's own one (some checkpoints ship chat_template.jinja, which the
+        # tokenizer picks up but a remote-code processor may not). Prefer that: it
+        # emits the model's real placeholder, once per image, plus the role
+        # scaffolding, so prompt_len stays comparable to what the server tokenizes.
+        placeholder = resolve_image_placeholder(processor)
+        text_only_fallback = render_with_tokenizer_template(processor, text_prompt)
+        prompt_str = (
+            None
+            if text_only_fallback is None
+            else render_with_tokenizer_template(processor, content_items)
+        )
+        # A template with no branch for image content renders the list as text and
+        # returns normally, so a non-None result is not evidence that placeholders
+        # were emitted; without this check that path would silently reproduce the
+        # undercount. Reject only on a verifiable shortfall:
+        #  - no resolvable placeholder means the render cannot be checked, but the
+        #    hand-built prompt could not be spelled correctly either, so keep the
+        #    render rather than discard a possibly-correct one for a certainly-generic
+        #    one;
+        #  - more placeholders than images is fine, since a template may expand one
+        #    image into per-tile placeholders.
+        if (
+            prompt_str is not None
+            and placeholder is not None
+            and prompt_str.count(placeholder) < len(images_base64)
+        ):
+            prompt_str = None
+        if prompt_str is None:
+            # No usable template: hand-build a prompt instead. The placeholder must be
+            # the one this model actually recognises, and there must be one per image,
+            # because the processor only expands vision tokens for placeholders it
+            # finds; a generic or missing tag silently yields a text-only prompt_len
+            # and collapses vision_prompt_len to a couple of tokens.
+            text_only_fallback = None
+            if type(processor).__name__ == "MiniCPMOProcessor":
+                prompt_str = f"(<image>./</image>){text_prompt}"
+            else:
+                prompt_str = (placeholder or "<image>") * len(
+                    images_base64
+                ) + text_prompt
 
     # Calculate total tokens (text + vision)
     if type(processor).__name__ in ("KimiK25Processor", "KimiK3Processor"):
@@ -185,12 +266,17 @@ def create_mm_data_row(
 
     # Calculate text-only tokens
     try:
-        # Create text-only version of the prompt
-        text_only_prompt = processor.apply_chat_template(
-            [{"role": "user", "content": text_prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+        # Create text-only version of the prompt. When the fallback above rendered
+        # prompt_str with the tokenizer's template, reuse that same rendering here so
+        # both lengths include identical scaffolding and their difference is purely
+        # vision tokens.
+        text_only_prompt = text_only_fallback
+        if text_only_prompt is None:
+            text_only_prompt = processor.apply_chat_template(
+                [{"role": "user", "content": text_prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
         text_prompt_len = processor(
             text=[text_only_prompt],
             padding=False,
