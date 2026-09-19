@@ -16,12 +16,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=480, stage="extra-b", runner_config="2-gpu-large")
 
-MTP_ARGS = """
---trust-remote-code --speculative-algorithm NEXTN --speculative-num-steps 3
---speculative-eagle-topk 1 --speculative-num-draft-tokens 4
---mamba-radix-cache-strategy extra_buffer --mamba-track-interval 128
---reasoning-parser qwen3 --mem-fraction-static 0.7
-""".split()  # noqa: SIM905
+MTP_ARGS = "--trust-remote-code --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-radix-cache-strategy extra_buffer --mamba-track-interval 128 --reasoning-parser qwen3 --mem-fraction-static 0.7".split()  # noqa: SIM905
 
 
 class TestPPSpecHybridGDN(CustomTestCase):
