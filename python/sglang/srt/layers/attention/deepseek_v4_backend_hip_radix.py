@@ -539,6 +539,7 @@ class DeepseekV4HipRadixBackend(
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
+    supports_prefill_cuda_graph_max_context_size: bool = True
     # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
@@ -1281,11 +1282,19 @@ class DeepseekV4HipRadixBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
-        max_seq_len = (
-            max_seq_len_override
-            if max_seq_len_override is not None
-            else int(seq_lens_cpu.max().item())
-        )
+        if max_seq_len_override is None:
+            max_seq_len_override = forward_batch.max_seq_len_override
+        if max_seq_len_override is not None:
+            max_seq_len = max_seq_len_override
+            if len(seq_lens_cpu) > 0:
+                actual_max_seq_len = int(seq_lens_cpu.max().item())
+                if actual_max_seq_len > max_seq_len:
+                    raise ValueError(
+                        "Prefill CUDA graph max context size is smaller than the "
+                        f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+                    )
+        else:
+            max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
@@ -1359,9 +1368,10 @@ class DeepseekV4HipRadixBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         self.init_forward_metadata_in_graph(forward_batch)
@@ -1379,9 +1389,10 @@ class DeepseekV4HipRadixBackend(
         replay_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
+        max_seq_len = replay_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         replay_metadata = self._build_forward_metadata(
             replay_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         self.forward_metadata = replay_metadata
