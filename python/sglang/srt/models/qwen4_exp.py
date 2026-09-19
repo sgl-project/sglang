@@ -14,7 +14,7 @@ from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -853,7 +853,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         allocation_context = nullcontext()
         if self.tp_size > 1:
             allocation_context = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with allocation_context, torch.inference_mode(False):
             # The gather kernel emits bf16 rows regardless of the table dtype.
@@ -1377,7 +1377,7 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -1396,11 +1396,11 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if should_use_dp_reduce_scatterv():
-                get_tp_group().reduce_scatterv(
+                get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
