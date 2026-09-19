@@ -2046,9 +2046,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
         try:
-            from sglang.srt.distributed import get_world_group
+            from sglang.srt.runtime_context import get_parallel
 
-            group = get_world_group()
+            group = get_parallel().world_group
             if group.world_size <= 1:
                 return local_sig
             all_sigs = group.all_gather_object(local_sig)
@@ -2068,20 +2068,20 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            g = get_world_group()
+            g = get_parallel().world_group
             return g.rank_in_group, g.world_size
         except (AssertionError, AttributeError):
             return 0, 1
 
     @staticmethod
     def _world_barrier() -> None:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            get_world_group().barrier()
+            get_parallel().world_group.barrier()
         except (AssertionError, AttributeError):
             pass
 

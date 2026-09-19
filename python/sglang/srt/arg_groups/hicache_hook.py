@@ -69,16 +69,23 @@ def handle_hicache_ratio_default(server_args: Any):
 
     A decode server keeps the ratio unset here: kv_cache_builder resolves
     it against the retraction-backup backend (1.0 for host_pool, else 2.0).
+
+    An explicit --hicache-ratio or --hicache-size is honored as given, so it
+    resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    fraction = cfg.hicache_host_memory_fraction
+    if fraction is not None and not 0 < fraction <= 1:
+        raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")
+    fields = {}
     if cfg.hicache_ratio is None and cfg.disaggregation_mode != "decode":
-        declare_resolution(
-            server_args,
-            "_handle_hicache_ratio_default",
-            hicache_ratio=(
-                1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
-            ),
+        fields["hicache_ratio"] = (
+            1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
         )
+    if cfg.hicache_ratio is not None or cfg.hicache_size > 0:
+        fields["hicache_host_memory_fraction"] = None
+    if fields:
+        declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
