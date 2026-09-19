@@ -842,7 +842,7 @@ class Scheduler(
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
-                self.ps.dp_size,
+                get_parallel().dp_size,
                 dp_rank,
                 publish_interval=get_observability().load_snapshot_publish_interval,
             )
@@ -1422,7 +1422,7 @@ class Scheduler(
                 )
             else:
                 self.prefill_delayer = PrefillDelayer(
-                    dp_size=self.ps.dp_size,
+                    dp_size=get_parallel().dp_size,
                     attn_tp_size=get_parallel().attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
