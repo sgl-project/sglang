@@ -717,7 +717,7 @@ class KimiK3MoE(nn.Module):
         # regular parameters on other devices avoids a large transient copy
         # during post-load processing and leaves their native kernels in
         # control of weight layout.
-        if _is_npu:
+        if not get_platform().is_cuda:
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
