@@ -103,17 +103,28 @@ def init_dcp_pack_buffers(
     kv_item_lens = kv_args.kv_item_lens
     if kv_args.num_draft_entries > 0:
         kv_item_lens = kv_item_lens[: len(kv_item_lens) - kv_args.num_draft_entries]
-    # size = dcp_size x max_tokens x sum(per-layer token bytes). Every rank
-    # gets a full max_tokens region because how a chunk's tokens map onto DCP
-    # ranks depends on their positions -- in the worst case a whole chunk lands
-    # on one rank, and try_pack_dcp_src's fits() check is written against that
-    # worst-case offset. Sizing a rank at max_tokens / dcp_size instead assumes
-    # a uniform split that fits() never assumes, so any pack larger than that
-    # share fails and silently falls back to per-token RDMA.
+    # size = dcp_size x max_tokens x sum(per-layer token bytes): every DCP
+    # rank's region holds max_tokens, not its 1/dcp_size share.
     #
-    # This costs dcp_size x the old footprint. Measured on Kimi-K3 (61 MLA
-    # layers, max_tokens=16,384, dcp_size=8): 1,728 MiB/buffer, 6.75 GiB for 4
-    # queues, of which a typical long-context pack uses ~31%.
+    # build_dcp_token_transfer_plan shards a chunk round-robin, so rank r packs
+    # only num_kv_tokens / dcp_size tokens -- but it packs them at offset
+    # r * rank_stride, so the highest rank starts 1 - 1/dcp_size into the buffer
+    # and fits() leaves it just rank_stride bytes. Per-rank capacity is
+    # rank_stride / per-token bytes regardless of how the split looks.
+    #
+    # The old sizing pinned that capacity to ceil(max_tokens / dcp_size), which
+    # holds only while num_kv_tokens <= max_tokens. That fails as soon as
+    # prefill hits its own prefix cache and decode does not: the cached prefix
+    # then ships as one transfer chunk that no prefill forward chunk ever
+    # bounded, the highest rank overflows, and the pack silently falls back to
+    # per-token RDMA.
+    #
+    # Partial fix. It lifts the threshold from a 16,384-token shared prefix to
+    # 131,072 (max_tokens=16,384, dcp_size=8, both measured); a longer shared
+    # prefix still overflows the highest rank. It costs dcp_size x the old
+    # footprint -- 1,728 MiB/buffer, 6.75 GiB for 4 queues on Kimi-K3 -- and a
+    # rank only ever touches its own region, so most of that is headroom for
+    # topologies where one prefill rank serves several DCP ranks.
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )

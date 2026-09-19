@@ -189,8 +189,12 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
 
 class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_a_full_max_tokens_region_per_dcp_rank(self):
-        # Each rank packs the FULL token range, so the buffer is
-        # dcp_size * max_tokens * per-token bytes -- not max_tokens / dcp_size.
+        # A rank packs only its 1/dcp_size share, but it packs at offset
+        # rank * rank_stride, so the highest rank is left just rank_stride
+        # bytes. Per-rank capacity is therefore rank_stride / per-token, and
+        # num_kv_tokens is not bounded by max_tokens (a prefix cached on
+        # prefill but missing on decode ships as one unbounded chunk). Size
+        # each region for max_tokens, not max_tokens / dcp_size.
         self.assertEqual(
             dcp_pack_buffer_bytes(
                 [64 * 16, 64 * 16],
@@ -204,10 +208,12 @@ class TestDcpPackBufferBytes(CustomTestCase):
     def test_rank_region_holds_a_full_chunk(self):
         """The invariant try_pack_dcp_src.fits() depends on.
 
-        `_pack_source_for_dcp_rank` slices the buffer as
-        `rank_stride = size // dcp_size` and each rank packs all `n` tokens of
-        the chunk, so a rank's stride must cover max_tokens * per-token bytes.
-        Undersizing it makes fits() fail and silently degrade to per-token RDMA.
+        `_pack_dcp_rank_once` packs rank r at `offset = r * rank_stride` where
+        `rank_stride = size // dcp_size`, so fits() leaves the highest rank
+        exactly one stride. A rank's stride must therefore cover the largest
+        pack it can ever see. Undersizing it makes fits() fail on that rank
+        alone and silently degrade to per-token RDMA -- which is why rank 0
+        looks healthy while the top rank regresses.
         """
         item_lens = [64 * 16, 64 * 16]
         per_token = sum(x // 64 for x in item_lens)
@@ -221,10 +227,29 @@ class TestDcpPackBufferBytes(CustomTestCase):
                     rank_stride,
                     max_tokens * per_token,
                     f"dcp_size={dcp_size} max_tokens={max_tokens}: rank region "
-                    f"{rank_stride} B cannot hold a full chunk "
-                    f"({max_tokens * per_token} B) -- fits() would fail and "
-                    f"fall back to per-token RDMA",
+                    f"{rank_stride} B is below the max_tokens pack "
+                    f"({max_tokens * per_token} B) -- fits() would fail on the "
+                    f"highest rank and fall back to per-token RDMA",
                 )
+
+    def test_documents_the_supported_prefix_threshold(self):
+        """This sizing raises a threshold; it does not remove one.
+
+        A transfer chunk of `num_kv_tokens` shards to `num_kv_tokens /
+        dcp_size` per rank, so the highest rank overflows once
+        `num_kv_tokens > dcp_size * (rank_stride / per-token bytes)`. Pinning
+        the number here means a future change to the formula has to restate
+        what it now supports, instead of silently moving the cliff.
+        """
+        item_lens = [64 * 16, 64 * 16]
+        per_token = sum(x // 64 for x in item_lens)
+        max_tokens, dcp_size = 16384, 8
+        size = dcp_pack_buffer_bytes(
+            item_lens, page_size=64, max_tokens=max_tokens, dcp_size=dcp_size
+        )
+        supported = dcp_size * ((size // dcp_size) // per_token)
+        # Was ceil(max_tokens / dcp_size) * dcp_size == 16,384 before this fix.
+        self.assertEqual(supported, 131072)
 
     def test_rejects_invalid_item_lens(self):
         with self.assertRaisesRegex(ValueError, "at least one page"):
