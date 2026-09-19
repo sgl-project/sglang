@@ -9,6 +9,8 @@ import time
 import unittest
 import urllib.request
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -23,13 +25,13 @@ register_cuda_ci(est_time=231, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=450, suite="stage-b-test-2-gpu-large-amd")
 
 
-def _query_loads(base_url, retries=5, interval=2.0):
+def _query_loads(base_url, retries=5, interval=2.0, is_ready=None):
     url = f"{base_url}/v1/loads"
     for attempt in range(retries):
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = json.loads(resp.read())
-            if data.get("loads"):
+            if data.get("loads") and (is_ready is None or is_ready(data)):
                 return data
         except Exception:
             pass
@@ -60,6 +62,57 @@ def _launch_and_check(test_case, other_args=None, env=None, expected_dp_size=1):
         test_case.assertEqual(dp_ranks, list(range(expected_dp_size)))
         for load in loads:
             test_case.assertGreater(load["max_total_num_tokens"], 0)
+
+        if expected_dp_size == 1:
+            # Flush waits for idle without resetting cumulative counters.
+            # Wait for its idle snapshot to exclude startup work from the delta.
+            before_flush = time.time()
+            requests.post(
+                DEFAULT_URL_FOR_TEST + "/flush_cache?timeout=30", timeout=35
+            ).raise_for_status()
+            before = _query_loads(
+                DEFAULT_URL_FOR_TEST,
+                is_ready=lambda data: (
+                    data["loads"][0]["timestamp"] >= before_flush
+                    and data["loads"][0]["num_running_reqs"] == 0
+                    and data["loads"][0]["num_waiting_reqs"] == 0
+                ),
+            )["loads"][0]
+            test_case.assertGreaterEqual(before["timestamp"], before_flush)
+            test_case.assertEqual(before["num_running_reqs"], 0)
+            test_case.assertEqual(before["num_waiting_reqs"], 0)
+
+            input_ids = [42] * 64
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "input_ids": input_ids,
+                    "sampling_params": {"max_new_tokens": 1, "ignore_eos": True},
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            meta = response.json()["meta_info"]
+            test_case.assertEqual(meta["prompt_tokens"], len(input_ids))
+            test_case.assertEqual(meta["cached_tokens"], 0)
+            test_case.assertEqual(meta["completion_tokens"], 1)
+
+            # No later request should be needed to account for this completion.
+            # Snapshots are asynchronous; return the last one on poll timeout so
+            # a missing update fails with the actual counter values.
+            expected_tokens = before["total_prefill_uncached_tokens"] + len(input_ids)
+            after = _query_loads(
+                DEFAULT_URL_FOR_TEST,
+                is_ready=lambda data: (
+                    data["loads"][0]["total_prefill_uncached_tokens"] >= expected_tokens
+                ),
+            )["loads"][0]
+            test_case.assertEqual(
+                after["total_prefill_uncached_tokens"], expected_tokens
+            )
+            test_case.assertGreater(
+                after["total_prefill_busy_us"], before["total_prefill_busy_us"]
+            )
     finally:
         kill_process_tree(process.pid)
 
