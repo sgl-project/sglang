@@ -122,6 +122,23 @@ class TestRequestLifecycle(unittest.IsolatedAsyncioTestCase):
             registry.add_children(self.attempt, ["a", "b"])
         self.assertEqual(registry.snapshot(self.attempt)["children"], [])
 
+    def test_acknowledgement_reclaims_capacity_without_allowing_replay(self):
+        registry = RequestLifecycle(max_attempts=1, max_total_children=1)
+        registry.claim(self.attempt, "decode")
+        child = registry.add_child(self.attempt, "rid")
+        registry.dispatched(child)
+        registry.seal(self.attempt)
+        with self.assertRaises(ValueError):
+            registry.acknowledge(self.attempt)
+        registry.scheduler_event(child, 0, "terminal")
+        registry.acknowledge(self.attempt)
+        registry.acknowledge(self.attempt)
+        with self.assertRaises(ValueError):
+            registry.claim(self.attempt, "decode")
+        other = uuid.uuid4().hex
+        registry.claim(other, "decode")
+        registry.add_child(other, "rid")
+
 
 class TestSchedulerLifecycle(unittest.TestCase):
     def test_unary_prefill_and_deferred_cleanup_without_any_response_output(self):

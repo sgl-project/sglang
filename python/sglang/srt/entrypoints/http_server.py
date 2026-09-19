@@ -957,8 +957,11 @@ async def request_lifecycle_control(
             registry.renew(attempt_id, obj.lease_seconds)
         elif obj.action == "cancel":
             _global_state.tokenizer_manager.cancel_lifecycle(attempt_id)
+        elif obj.action == "acknowledge":
+            registry.acknowledge(attempt_id)
+            return Response(status_code=204)
         else:
-            raise ValueError("action must be renew or cancel")
+            raise ValueError("action must be renew, cancel or acknowledge")
         return registry.snapshot(attempt_id)
     except KeyError:
         raise HTTPException(404, "unknown attempt") from None

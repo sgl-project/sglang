@@ -21,6 +21,7 @@ from lost notifications without inspecting generation responses.
 import asyncio
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Literal
@@ -57,6 +58,7 @@ class RequestLifecycle:
         max_attempts: int = 16384,
         max_children: int = 4096,
         max_total_children: int = 65536,
+        max_tombstones: int = 1000000,
         retention_seconds: float = 300,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -66,6 +68,9 @@ class RequestLifecycle:
         self._max_attempts = max_attempts
         self._max_children = max_children
         self._max_total_children = max_total_children
+        self._max_tombstones = max_tombstones
+        self._tombstones: set[str] = set()
+        self._finished: deque[tuple[float, str]] = deque()
         self._retention_seconds = retention_seconds
         self._clock = clock
 
@@ -76,9 +81,12 @@ class RequestLifecycle:
             raise ValueError("attempt_id must be a canonical UUID hex string")
         self._validate_lease(lease_seconds)
         self.prune()
-        if attempt_id in self._attempts:
+        if attempt_id in self._attempts or attempt_id in self._tombstones:
             raise ValueError("attempt_id has already been claimed")
-        if len(self._attempts) >= self._max_attempts:
+        if (
+            len(self._attempts) >= self._max_attempts
+            or len(self._tombstones) >= self._max_tombstones
+        ):
             raise ValueError("request lifecycle capacity exceeded")
         self._attempts[attempt_id] = Attempt(
             attempt_id, stage, self._clock() + lease_seconds
@@ -219,14 +227,24 @@ class RequestLifecycle:
 
     def prune(self) -> None:
         now = self._clock()
-        for attempt_id, attempt in list(self._attempts.items()):
-            if (
-                attempt.finished_at is not None
-                and now - attempt.finished_at >= self._retention_seconds
-            ):
-                for child_id in attempt.children:
-                    del self._children[child_id]
-                del self._attempts[attempt_id]
+        while self._finished and now - self._finished[0][0] >= self._retention_seconds:
+            _, attempt_id = self._finished.popleft()
+            self._tombstones.discard(attempt_id)
+            self._remove(attempt_id)
+
+    def acknowledge(self, attempt_id: str) -> None:
+        """The coordinator persisted terminal state and released its reservations."""
+        if attempt_id not in self._tombstones:
+            if attempt_id in self._attempts:
+                raise ValueError("cannot acknowledge an unfinished attempt")
+            raise KeyError(attempt_id)
+        self._remove(attempt_id)
+
+    def _remove(self, attempt_id: str) -> None:
+        attempt = self._attempts.pop(attempt_id, None)
+        if attempt is not None:
+            for child_id in attempt.children:
+                del self._children[child_id]
 
     def _expire(self, attempt: Attempt) -> None:
         if (
@@ -244,6 +262,8 @@ class RequestLifecycle:
             and all(child.terminal for child in attempt.children.values())
         ):
             attempt.finished_at = self._clock()
+            self._tombstones.add(attempt.attempt_id)
+            self._finished.append((attempt.finished_at, attempt.attempt_id))
         attempt.changed.set()
         attempt.changed = asyncio.Event()
 

@@ -165,7 +165,7 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
-    RequestLifecycleEvent,
+    RequestLifecycleOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -2508,7 +2508,7 @@ class Scheduler(
 
     def _emit_lifecycle(self, req, phase: str) -> None:
         self.ipc_channels.send_to_tokenizer.send_output(
-            RequestLifecycleEvent(
+            RequestLifecycleOutput(
                 child_id=req.lifecycle_id,
                 dp_rank=self.ps.attn_dp_rank
                 if get_parallel().enable_dp_attention

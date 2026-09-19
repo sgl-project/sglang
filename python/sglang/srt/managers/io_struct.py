@@ -2091,7 +2091,7 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
-class RequestLifecycleEvent(BaseReq, kw_only=True):
+class RequestLifecycleOutput(BaseReq, kw_only=True):
     child_id: str
     dp_rank: int
     phase: Literal["prefill", "terminal"]
