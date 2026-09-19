@@ -15,6 +15,7 @@ Covers:
 
 import asyncio
 import unittest
+from array import array
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
@@ -468,6 +469,11 @@ class _DummyAsyncCM:
         return False
 
 
+class _TokenizedGenerateObj:
+    def __init__(self, input_ids):
+        self.input_ids = array("q", input_ids)
+
+
 def _make_tm_for_generate(case) -> TokenizerManager:
     """Augment the mocked TokenizerManager with what generate_request needs."""
     tm = _make_tokenizer_manager(case)
@@ -495,6 +501,8 @@ def _make_generate_obj(rid, is_single):
     obj.external_trace_header = None
     obj.bootstrap_room = None
     obj.max_thinking_tokens = None
+    obj.lora_path = None
+    obj.lora_id = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -801,6 +809,100 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestTokenizeRequestWithoutGeneration(CustomTestCase):
+    def test_single_request_returns_ids_without_dispatch_and_cleans_state(self):
+        tm = _make_tm_for_generate(self)
+        rid = "single_tokenize"
+        obj = _make_generate_obj(rid, is_single=True)
+        tm._tokenize_one_request = AsyncMock(
+            return_value=_TokenizedGenerateObj([7, 8, 9])
+        )
+        tm._send_one_request = Mock()
+        tm._send_batch_request = Mock()
+
+        token_ids = asyncio.run(tm.tokenize_request(obj))
+
+        self.assertEqual(token_ids, [7, 8, 9])
+        tm._tokenize_one_request.assert_awaited_once_with(obj)
+        tm._send_one_request.assert_not_called()
+        tm._send_batch_request.assert_not_called()
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_lora_reference_is_released_after_tokenization(self):
+        tm = _make_tm_for_generate(self)
+        tm.enable_lora = True
+        tm.lora_registry = MagicMock()
+        tm.lora_registry.release = AsyncMock()
+        rid = "lora_tokenize"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.lora_path = "adapter"
+        obj.lora_id = "adapter-id"
+        tm._tokenize_one_request = AsyncMock(
+            return_value=_TokenizedGenerateObj([7, 8, 9])
+        )
+
+        token_ids = asyncio.run(tm.tokenize_request(obj))
+
+        self.assertEqual(token_ids, [7, 8, 9])
+        tm.lora_registry.release.assert_awaited_once_with("adapter-id")
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_batch_request_returns_ids_without_dispatch_and_cleans_state(self):
+        tm = _make_tm_for_generate(self)
+        rids = ["batch_tokenize_0", "batch_tokenize_1"]
+        obj = _make_generate_obj(list(rids), is_single=False)
+        obj.batch_size = len(rids)
+        sub_objs = []
+        for rid in rids:
+            sub_obj = _make_generate_obj(rid, is_single=True)
+            sub_objs.append(sub_obj)
+        obj.__getitem__.side_effect = lambda i: sub_objs[i]
+        tm._should_use_batch_tokenization = Mock(return_value=False)
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=[
+                _TokenizedGenerateObj([1, 2]),
+                _TokenizedGenerateObj([3, 4, 5]),
+            ]
+        )
+        tm._send_one_request = Mock()
+        tm._send_batch_request = Mock()
+
+        token_ids = asyncio.run(tm.tokenize_request(obj))
+
+        self.assertEqual(token_ids, [[1, 2], [3, 4, 5]])
+        self.assertEqual(tm._tokenize_one_request.await_count, 2)
+        tm._send_one_request.assert_not_called()
+        tm._send_batch_request.assert_not_called()
+        for rid in rids:
+            self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_batch_request_uses_batch_tokenization_without_dispatch(self):
+        tm = _make_tm_for_generate(self)
+        rids = ["batch_encode_tokenize_0", "batch_encode_tokenize_1"]
+        obj = _make_generate_obj(list(rids), is_single=False)
+        obj.batch_size = len(rids)
+        tm._should_use_batch_tokenization = Mock(return_value=True)
+        tm._batch_tokenize_and_process = AsyncMock(
+            return_value=[
+                _TokenizedGenerateObj([10, 11]),
+                _TokenizedGenerateObj([12]),
+            ]
+        )
+        tm._tokenize_one_request = AsyncMock()
+        tm._send_one_request = Mock()
+        tm._send_batch_request = Mock()
+
+        token_ids = asyncio.run(tm.tokenize_request(obj))
+
+        self.assertEqual(token_ids, [[10, 11], [12]])
+        tm._batch_tokenize_and_process.assert_awaited_once_with(len(rids), obj)
+        tm._tokenize_one_request.assert_not_called()
+        tm._send_one_request.assert_not_called()
+        tm._send_batch_request.assert_not_called()
+        for rid in rids:
+            self.assertNotIn(rid, tm.rid_to_state)
 
 
 if __name__ == "__main__":
