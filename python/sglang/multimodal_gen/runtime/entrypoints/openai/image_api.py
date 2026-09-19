@@ -430,7 +430,8 @@ async def edits(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
-    # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
+    # Resolve images from either `image` or `image[]`.
+    # The OpenAI SDK sends `image[]` when a list is provided.
     images = image or image_array
     urls = url or url_array
 

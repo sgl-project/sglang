@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from PIL import Image
+
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -13,14 +15,18 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
+    MIN_INPUT_MAX_PIXELS,
     RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",
     "prompt_path",
+    "image_path",
     "height",
     "width",
     "num_inference_steps",
@@ -45,12 +51,15 @@ class SenseNovaU1SamplingParams(SamplingParams):
     fps: int = 1
     num_inference_steps: int = 50
     guidance_scale: float = 4.0
+    img_cfg_scale: float = 1.0
     cfg_norm: str = DEFAULT_CFG_NORM
     timestep_shift: float = DEFAULT_TIMESTEP_SHIFT
     enable_timestep_shift: bool = DEFAULT_ENABLE_TIMESTEP_SHIFT
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    input_max_pixels: int | None = None
+    do_resize: bool = True
     negative_prompt: None = field(default=None, init=False)
 
     @classmethod
@@ -70,6 +79,29 @@ class SenseNovaU1SamplingParams(SamplingParams):
         if isinstance(self.cfg_interval, list):
             self.cfg_interval = tuple(float(x) for x in self.cfg_interval)
         super().__post_init__()
+
+    def _adjust(self, server_args) -> None:
+        super()._adjust(server_args)
+        if self.image_path is None:
+            return
+        if has_sensenova_u1_explicit_size(getattr(self, "_explicit_fields", ())):
+            return
+
+        if isinstance(self.image_path, list):
+            if not self.image_path:
+                return
+            image_path = self.image_path[0]
+        else:
+            image_path = self.image_path
+
+        try:
+            image = Image.open(image_path)
+        except (OSError, TypeError, ValueError):
+            return
+        with image:
+            self.width, self.height = resolve_sensenova_u1_edit_auto_size(
+                image.width, image.height
+            )
 
     def _validate(self) -> None:
         super()._validate()
@@ -91,6 +123,17 @@ class SenseNovaU1SamplingParams(SamplingParams):
                 f"cfg_norm must be one of {SENSENOVA_U1_CFG_NORM_CHOICES}, "
                 f"got {self.cfg_norm!r}"
             )
+        if self.img_cfg_scale < 0:
+            raise ValueError(
+                f"img_cfg_scale must be non-negative, got {self.img_cfg_scale!r}"
+            )
+        if self.input_max_pixels is not None and (
+            self.input_max_pixels < MIN_INPUT_MAX_PIXELS
+        ):
+            raise ValueError(
+                "input_max_pixels must be at least "
+                f"{MIN_INPUT_MAX_PIXELS}, got {self.input_max_pixels!r}"
+            )
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
         start, end = self.cfg_interval
@@ -108,5 +151,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_interval": tuple(self.cfg_interval),
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
+            "img_cfg_scale": self.img_cfg_scale,
+            "input_max_pixels": self.input_max_pixels,
+            "do_resize": self.do_resize,
         }
         return extra
