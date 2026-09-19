@@ -36,7 +36,14 @@ def load_model_and_tokenizer(
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
+
     device = get_local_torch_device()
     current_platform.set_device(device)
-    model = model.to(device)
+
+    use_layerwise_offload = bool(
+        getattr(server_args, "dit_layerwise_offload", False)
+    )
+    if not use_layerwise_offload:
+        model = model.to(device)
+
     return {"model": model, "tokenizer": tokenizer}
