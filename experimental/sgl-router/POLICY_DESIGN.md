@@ -222,24 +222,35 @@ no HTTP body, bucket resolver, state handles, snapshots, or backend configuratio
 Admission evaluates acceptance. It does not rank engines, choose replacements,
 change buckets, or mutate affinity.
 
-| Check | Acceptance rule |
+| Admission name | Acceptance rule |
 | --- | --- |
-| `AllowAll` | Add no acceptance constraint |
-| `CapacityAdmission` | Projected running requests and KV tokens fit reported capacity |
-| `PendingPrefillAdmission` | Waiting uncached tokens plus incoming uncached work fit the budget |
-| `InFlightLimitAdmission` | Router-local in-flight requests are below the limit |
-| `QueueLimitAdmission` | Engine-reported waiting requests are below the limit |
-| `AllOfAdmission` | Every attached check allows the request |
+| `allow_all` | Add no acceptance constraint |
+| `running_plus_kv_capacity` | Running requests plus one and total KV tokens plus the request footprint fit configured limits |
 
-`EngineAdmission::check(engine, request, load)` checks one engine and returns
+`AdmissionConfig` is an enum tagged by `name`, with only the relevant limits on
+each variant. Capacity requires `max_running_requests` and `max_kv_tokens`:
+
+```json
+{"name":"running_plus_kv_capacity","max_running_requests":64,"max_kv_tokens":100000}
+```
+
+These are absolute per-engine caps, aggregated across DP ranks; they do not
+default to the limits reported by the engine. Zero caps reject known usage that
+cannot fit the incoming request. Missing or unrelated configuration fields are
+rejected during deserialization. Pending-prefill budgets and router-local
+in-flight limits remain follow-ups; there is no generic composition tree.
+
+`EngineAdmission::check(engine, request, state)` checks one engine and returns
 `Allow`, `Reject(reason)`, or an error for invalid inputs. Policies attach the
 checker directly as `Arc<dyn EngineAdmission>`. There is no placement setting,
 filtering wrapper, or before/after API; each policy decides where checking
-belongs in its selection algorithm. The `load` argument is an
-`Option<&EngineWorkerLoad>` retained by the policy for this engine, including
-request counts, token usage, capacity, and the report timestamp. `None` means
-no usable observation, never zero load; each check defines its missing-data
-behavior. Other required state handles belong to the checker.
+belongs in its selection algorithm. `AdmissionState` contains optional running
+request and total KV-token measurements from the selected engine's snapshot.
+The snapshot adapter reads running requests from the basic report and total KV
+footprint from the native report; it never substitutes basic occupied-token
+usage for total KV footprint. `None` means no usable measurement, never zero.
+Capacity checks each available measurement and allows missing measurements.
+Other required state handles belong to the checker.
 
 Power-of-two first selects an engine, then calls admission exactly once on that
 engine. A rejection returns `AdmissionRejected` to the bucket loop; it does not
@@ -263,11 +274,13 @@ Decode capacity uses the expected peak sequence length when available, including
 on a cache hit. Power-of-two retains the selected engine's load record from
 selection and passes it to admission without another snapshot. A single candidate
 still has its load read for admission, even though selection needs no comparison.
-Neither the bucket nor HTTP handler supplies observations. Concrete load-aware
-acceptance rules and additional cache-specific admission signals remain follow-up
-work. Synchronous checks do not fetch telemetry over the network themselves.
+Neither the bucket nor HTTP handler supplies observations. Capacity uses the
+expected peak sequence length when known, otherwise input tokens, and rejects
+overflow. Running and KV failures have distinct rejection reasons. Additional
+cache-specific admission signals remain follow-up work. Synchronous checks do
+not fetch telemetry over the network themselves.
 
-`AllowAll` is the default for new explicit policy attachments. It leaves health,
+`AdmissionConfig::AllowAll` is the default for new explicit policy attachments. It leaves health,
 role, membership, and policy preferences in force. Migrated configurations must
 retain their existing capacity and configured budget checks; see compatibility
 below. Each check defines its missing-data behavior. Unknown load is not zero;
@@ -275,7 +288,7 @@ the existing capacity and pending-prefill checks allow requests without a fresh,
 complete native report.
 
 The cache policy's `worker_queue_limit` is a **soft preference**, not
-`QueueLimitAdmission`. Saturation handling can reconsider a queued engine, but
+a hard admission constraint. Saturation handling can reconsider a queued engine, but
 cannot bypass attached hard admission.
 
 Admission checks observe capacity; they do not reserve it. Concurrent requests
@@ -420,12 +433,12 @@ buckets:
           worker_ids: [P1, P2]
           policy:
             type: cache_aware
-            admission: {type: capacity}
+            admission: {name: running_plus_kv_capacity, max_running_requests: 64, max_kv_tokens: 1048576}
         decode:
           worker_ids: [D1, D2]
           policy:
             type: power_of_two
-            admission: {type: capacity}
+            admission: {name: running_plus_kv_capacity, max_running_requests: 64, max_kv_tokens: 1048576}
 
   - id: long-context
     rank: 20
@@ -437,12 +450,12 @@ buckets:
           worker_ids: [P3, P4]
           policy:
             type: cache_aware
-            admission: {type: capacity}
+            admission: {name: running_plus_kv_capacity, max_running_requests: 64, max_kv_tokens: 1048576}
         decode:
           worker_ids: [D3, D4]
           policy:
             type: power_of_two
-            admission: {type: capacity}
+            admission: {name: running_plus_kv_capacity, max_running_requests: 64, max_kv_tokens: 1048576}
 ```
 
 A request with 4k input tokens and a 16k expected peak cannot fit the short
@@ -546,7 +559,8 @@ Implemented here:
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, per-engine `EngineAdmission::check`,
-  and `AllowAll`. Power-of-two samples two distinct engines, compares stage pressure,
+  and named `AdmissionConfig` variants for allowing all requests or checking
+  running/KV capacity against explicit limits. Power-of-two samples two distinct engines, compares stage pressure,
   and checks its selected engine with no replacement on rejection.
 - Policy-owned load dependency and local observations. Power-of-two passes the
   selected engine's load record directly to admission, without another snapshot.
@@ -557,12 +571,12 @@ Implemented here:
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
 
-Follow-up order: concrete admission (#40271), then bucket SLO ordering
-in a separate PR, followed by remaining policies and production configuration.
+Follow-up work includes bucket SLO ordering, remaining policies and admission
+limits, and production configuration.
 
 Not yet implemented in the reorg path:
 
-- Other concrete policies and capacity/in-flight admission checks.
+- Other concrete policies and pending-prefill/in-flight admission limits.
 - SLO estimates, targets, and bucket preference ordering.
 - CLI/configuration parsing, validation, and model-specific construction.
   The YAML above is illustrative; reorg resolvers are installed in code.
