@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Select one bucket by request length, then select engines from its groups.
+//! Order buckets by request length; each bucket owns the groups used to pick engines.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -128,22 +128,24 @@ impl BucketResolver {
         Self { buckets }
     }
 
-    /// Choose the smallest compatible input capacity, then rank and ID.
-    /// Engine availability or admission failure never changes this choice.
+    /// Return all length-compatible buckets, ordered by input capacity, rank, and ID.
+    /// The caller tries their groups in order until a complete engine selection succeeds.
     pub fn resolve(
         &self,
         input_tokens: u64,
         expected_peak_tokens: Option<u64>,
-    ) -> Result<&Bucket, PickError> {
+    ) -> Result<Vec<&Bucket>, PickError> {
         if expected_peak_tokens.is_some_and(|tokens| tokens < input_tokens) {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
             ));
         }
-        self.buckets
+        let mut buckets: Vec<_> = self
+            .buckets
             .iter()
             .filter(|bucket| bucket.fits(input_tokens, expected_peak_tokens))
-            .min_by_key(|bucket| (bucket.input_capacity(), bucket.rank, &bucket.id))
-            .ok_or(PickError::NoMatchingBucket)
+            .collect();
+        buckets.sort_by_key(|bucket| (bucket.input_capacity(), bucket.rank, &bucket.id));
+        Ok(buckets)
     }
 }

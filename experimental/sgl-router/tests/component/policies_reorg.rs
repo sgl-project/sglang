@@ -146,7 +146,7 @@ async fn groups_isolate_model_health_stage_and_membership() {
 }
 
 #[test]
-fn resolve_chooses_smallest_length_fit_then_rank_and_id() {
+fn resolve_orders_all_length_fits_by_capacity_rank_and_id() {
     let policy = Arc::new(TestPolicy::default());
     let mut z = bucket("z", Some(20), policy.clone());
     z.rank = 1;
@@ -164,11 +164,19 @@ fn resolve_chooses_smallest_length_fit_then_rank_and_id() {
         a,
         min,
     ]);
-    assert_eq!(resolver.resolve(10, None).unwrap().id, "a");
-    assert_eq!(resolver.resolve(11, None).unwrap().id, "min");
-    assert_eq!(resolver.resolve(15, None).unwrap().id, "min");
-    assert_eq!(resolver.resolve(20, None).unwrap().id, "a");
-    assert_eq!(resolver.resolve(21, None).unwrap().id, "catch-all");
+    assert_eq!(
+        resolver
+            .resolve(10, None)
+            .unwrap()
+            .iter()
+            .map(|bucket| bucket.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z", "later", "catch-all"]
+    );
+    assert_eq!(resolver.resolve(11, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(15, None).unwrap()[0].id, "min");
+    assert_eq!(resolver.resolve(20, None).unwrap()[0].id, "a");
+    assert_eq!(resolver.resolve(21, None).unwrap()[0].id, "catch-all");
 }
 
 #[test]
@@ -179,25 +187,19 @@ fn context_capacity_checks_peak_when_known_and_input_otherwise() {
     let mut long = bucket("long", None, policy);
     long.max_context_tokens = Some(30);
     let resolver = BucketResolver::new(vec![long, short]);
-    assert_eq!(resolver.resolve(10, None).unwrap().id, "short");
-    assert_eq!(resolver.resolve(10, Some(20)).unwrap().id, "short");
-    assert_eq!(resolver.resolve(10, Some(21)).unwrap().id, "long");
-    assert!(matches!(
-        resolver.resolve(10, Some(31)),
-        Err(PickError::NoMatchingBucket)
-    ));
-    assert!(matches!(
-        resolver.resolve(31, None),
-        Err(PickError::NoMatchingBucket)
-    ));
+    assert_eq!(resolver.resolve(10, None).unwrap()[0].id, "short");
+    assert_eq!(resolver.resolve(10, Some(20)).unwrap()[0].id, "short");
+    assert_eq!(resolver.resolve(10, Some(21)).unwrap()[0].id, "long");
+    assert!(resolver.resolve(10, Some(31)).unwrap().is_empty());
+    assert!(resolver.resolve(31, None).unwrap().is_empty());
     assert!(matches!(
         resolver.resolve(10, Some(9)),
         Err(PickError::InvalidSignal(_))
     ));
-    assert!(matches!(
-        BucketResolver::default().resolve(1, None),
-        Err(PickError::NoMatchingBucket)
-    ));
+    assert!(BucketResolver::default()
+        .resolve(1, None)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -216,7 +218,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
             decode: group(&["d2", "p", "other"], decode_policy.clone()),
         },
     )]);
-    let bucket = resolver.resolve(10, Some(20)).unwrap();
+    let bucket = resolver.resolve(10, Some(20)).unwrap()[0];
     let BucketGroups::Pd { prefill, decode } = &bucket.groups else {
         panic!("expected PD")
     };
@@ -239,7 +241,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
 }
 
 #[tokio::test]
-async fn unavailable_selected_bucket_does_not_change_resolution() {
+async fn resolver_includes_empty_groups_without_invoking_policies() {
     let table = EngineLoadTable::new();
     let load = LoadView::new(&table);
     let workers = registry();
@@ -254,8 +256,15 @@ async fn unavailable_selected_bucket_does_not_change_resolution() {
         max: Some(10),
     };
     let resolver = BucketResolver::new(vec![empty, bucket("available", Some(20), policy.clone())]);
-    let bucket = resolver.resolve(10, None).unwrap();
-    assert_eq!(bucket.id, "empty");
+    let buckets = resolver.resolve(10, None).unwrap();
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|bucket| bucket.id.as_str())
+            .collect::<Vec<_>>(),
+        ["empty", "available"]
+    );
+    let bucket = buckets[0];
     let BucketGroups::Plain(group) = &bucket.groups else {
         panic!("expected plain")
     };

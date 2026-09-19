@@ -6,6 +6,7 @@ use crate::common::mock_worker::MockWorker;
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::policies::PolicyRegistry;
+use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
 use sgl_router::server::app_context::ChatRouting;
 use std::sync::Mutex;
@@ -15,6 +16,9 @@ type PickCall = (String, Stage, u64, Option<u64>);
 #[derive(Debug, Default)]
 struct FirstPolicy {
     calls: Mutex<Vec<PickCall>>,
+    admission: Admission,
+    miss: bool,
+    invalid: bool,
 }
 
 impl Policy for FirstPolicy {
@@ -30,12 +34,41 @@ impl Policy for FirstPolicy {
                 request.input_tokens,
                 request.expected_peak_tokens,
             ));
-            Ok(Pick {
-                engine: engines[0].clone(),
-                reason: "first",
-            })
+            if self.invalid {
+                return Err(PickError::InvalidSignal("invalid policy input".into()));
+            }
+            if self.miss {
+                return Err(PickError::NoCandidates);
+            }
+            let engines = self.admission.before(engines, request)?;
+            self.admission.after(
+                Pick {
+                    engine: engines[0].clone(),
+                    reason: "first",
+                },
+                request,
+            )
         })
     }
+}
+
+#[derive(Debug)]
+struct RejectAll;
+
+impl EngineAdmission for RejectAll {
+    fn check(&self, _: &Worker, _: &PickRequest<'_>) -> Result<Decision, PickError> {
+        Ok(Decision::Reject("full".into()))
+    }
+}
+
+fn rejecting_policy(placement: Placement) -> Arc<FirstPolicy> {
+    Arc::new(FirstPolicy {
+        admission: Admission {
+            check: Arc::new(RejectAll),
+            placement,
+        },
+        ..Default::default()
+    })
 }
 
 fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
@@ -183,7 +216,7 @@ async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
 }
 
 #[tokio::test]
-async fn missing_decode_does_not_use_another_bucket_or_dispatch_prefill() {
+async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     let prefill = MockWorker::start(vec![]).await;
     let decode = MockWorker::start(vec![]).await;
     let policy = Arc::new(FirstPolicy::default());
@@ -199,7 +232,7 @@ async fn missing_decode_does_not_use_another_bucket_or_dispatch_prefill() {
         "other",
         BucketGroups::Pd {
             prefill: group("p", policy.clone()),
-            decode: group("d", policy.clone()),
+            decode: group("also-missing", policy.clone()),
         },
     );
     let ctx = context(
@@ -220,7 +253,7 @@ async fn missing_decode_does_not_use_another_bucket_or_dispatch_prefill() {
     );
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(policy.calls.lock().unwrap().len(), 1);
+    assert_eq!(policy.calls.lock().unwrap().len(), 2);
     assert_eq!(ctx.active_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
@@ -288,4 +321,189 @@ async fn reorg_route_keeps_chat_body_limit() {
         app.oneshot(request).await.unwrap().status(),
         StatusCode::PAYLOAD_TOO_LARGE
     );
+}
+
+#[tokio::test]
+async fn plain_fallback_skips_empty_missed_and_rejected_buckets_then_stops_on_success() {
+    for placement in [Placement::BeforeSelection, Placement::AfterSelection] {
+        let rejected_worker = MockWorker::start(vec![]).await;
+        let winner = MockWorker::start(vec![]).await;
+        let skipped = Arc::new(FirstPolicy::default());
+        let rejected = rejecting_policy(placement);
+        let missed = Arc::new(FirstPolicy {
+            miss: true,
+            ..Default::default()
+        });
+        let accepted = Arc::new(FirstPolicy::default());
+        let buckets = vec![
+            Bucket::new(
+                "a-empty",
+                BucketGroups::Plain(group("missing", skipped.clone())),
+            ),
+            Bucket::new(
+                "b-miss",
+                BucketGroups::Plain(group("rejected", missed.clone())),
+            ),
+            Bucket::new(
+                "c-rejected",
+                BucketGroups::Plain(group("rejected", rejected.clone())),
+            ),
+            Bucket::new(
+                "d-winner",
+                BucketGroups::Plain(group("winner", accepted.clone())),
+            ),
+            Bucket::new(
+                "e-unused",
+                BucketGroups::Plain(group("winner", skipped.clone())),
+            ),
+        ];
+        let ctx = context(
+            &[
+                ("rejected", Stage::Plain, &rejected_worker),
+                ("winner", Stage::Plain, &winner),
+            ],
+            buckets,
+        );
+        let response = build_router(ctx)
+            .oneshot(request(body("hi")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+        assert!(rejected_worker.captured.lock().unwrap().last_body.is_none());
+        assert!(winner.captured.lock().unwrap().last_body.is_some());
+        assert!(skipped.calls.lock().unwrap().is_empty());
+        assert_eq!(missed.calls.lock().unwrap().len(), 1);
+        assert_eq!(rejected.calls.lock().unwrap().len(), 1);
+        assert_eq!(accepted.calls.lock().unwrap()[0].0, "d-winner");
+    }
+}
+
+#[tokio::test]
+async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_first_prefill() {
+    // Cover an empty decode group and rejection at both admission placements.
+    for placement in [
+        None,
+        Some(Placement::BeforeSelection),
+        Some(Placement::AfterSelection),
+    ] {
+        let first_prefill = MockWorker::start(vec![]).await;
+        let second_prefill = MockWorker::start(vec![]).await;
+        let decode = MockWorker::start(vec![]).await;
+        let first = Arc::new(FirstPolicy::default());
+        let rejected = placement.map(rejecting_policy).unwrap_or_default();
+        let accepted = Arc::new(FirstPolicy::default());
+        let buckets = vec![
+            Bucket::new(
+                "a-first",
+                BucketGroups::Pd {
+                    prefill: group("p1", first.clone()),
+                    decode: group(if placement.is_some() { "d" } else { "missing" }, rejected),
+                },
+            ),
+            Bucket::new(
+                "b-second",
+                BucketGroups::Pd {
+                    prefill: group("p2", accepted.clone()),
+                    decode: group("d", accepted.clone()),
+                },
+            ),
+        ];
+        let ctx = context(
+            &[
+                ("p1", Stage::Prefill, &first_prefill),
+                ("p2", Stage::Prefill, &second_prefill),
+                ("d", Stage::Decode, &decode),
+            ],
+            buckets,
+        );
+        let response = build_router(ctx.clone())
+            .oneshot(request(body("hi")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while second_prefill.captured.lock().unwrap().last_body.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(first_prefill.captured.lock().unwrap().last_body.is_none());
+        assert!(decode.captured.lock().unwrap().last_body.is_some());
+        assert_eq!(
+            ctx.registry
+                .get(&WorkerId("p1".into()))
+                .unwrap()
+                .active_load(),
+            0
+        );
+        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        let calls = accepted.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!((&*calls[0].0, calls[0].1), ("b-second", Stage::Prefill));
+        assert_eq!((&*calls[1].0, calls[1].1), ("b-second", Stage::Decode));
+    }
+}
+
+#[tokio::test]
+async fn admission_exhaustion_is_preserved_when_later_buckets_are_empty() {
+    let worker = MockWorker::start(vec![]).await;
+    let before = rejecting_policy(Placement::BeforeSelection);
+    let after = rejecting_policy(Placement::AfterSelection);
+    let empty = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[("w", Stage::Plain, &worker)],
+        vec![
+            Bucket::new("a-before", BucketGroups::Plain(group("w", before.clone()))),
+            Bucket::new("b-after", BucketGroups::Plain(group("w", after.clone()))),
+            Bucket::new(
+                "c-empty",
+                BucketGroups::Plain(group("missing", empty.clone())),
+            ),
+        ],
+    );
+    let response = build_router(ctx.clone())
+        .oneshot(request(body("hi")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers()["x-router-error-code"],
+        "policy_selection_failed"
+    );
+    assert_eq!(before.calls.lock().unwrap().len(), 1);
+    assert_eq!(after.calls.lock().unwrap().len(), 1);
+    assert!(empty.calls.lock().unwrap().is_empty());
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+    assert_eq!(ctx.active_load.inflight_count(), 0);
+}
+
+#[tokio::test]
+async fn invalid_policy_signal_stops_bucket_iteration() {
+    let worker = MockWorker::start(vec![]).await;
+    let invalid = Arc::new(FirstPolicy {
+        invalid: true,
+        ..Default::default()
+    });
+    let later = Arc::new(FirstPolicy::default());
+    let ctx = context(
+        &[("w", Stage::Plain, &worker)],
+        vec![
+            Bucket::new(
+                "a-invalid",
+                BucketGroups::Plain(group("w", invalid.clone())),
+            ),
+            Bucket::new("b-later", BucketGroups::Plain(group("w", later.clone()))),
+        ],
+    );
+    let response = build_router(ctx)
+        .oneshot(request(body("hi")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(invalid.calls.lock().unwrap().len(), 1);
+    assert!(later.calls.lock().unwrap().is_empty());
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
 }

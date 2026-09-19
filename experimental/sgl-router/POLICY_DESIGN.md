@@ -7,8 +7,8 @@ listed at the end.
 
 ## Principles
 
-1. **Choose one bucket by token length first.** `BucketResolver` selects the
-   smallest compatible bucket without inspecting worker availability or policies.
+1. **Order compatible buckets by token length first.** `BucketResolver` returns
+   all matching buckets, smallest capacity first, without inspecting workers or policies.
 2. **The selected bucket determines plain versus PD serving.** `BucketGroups`
    contains either one plain `EngineGroup`, or both prefill and decode groups.
    Both PD engines come from that same selected bucket.
@@ -19,7 +19,8 @@ listed at the end.
    It cannot choose another bucket or cross a PD role boundary.
 5. **The handler coordinates stages and dispatch.** A plain request needs one
    pick; a PD request needs both picks before either engine is dispatched.
-   Missing candidates and admission failures return errors without changing buckets.
+   Missing candidates or admission rejection advance to the next bucket, where
+   all required engines are selected again. Invalid signals or policy results stop routing.
 
 An engine is represented by `Worker`. Registry role labels remain authoritative
 when filtering candidates. Groups reference worker IDs rather than owning live
@@ -29,11 +30,11 @@ workers. Group policy instances are reused across requests.
 
 | Type | Owns |
 | --- | --- |
-| `BucketResolver` | A model's bucket collection and length-based selection |
+| `BucketResolver` | A model's bucket collection, length filtering, and ordering |
 | `Bucket` | ID, input-token limits, context capacity, tie-break rank, and plain or PD groups |
 | `EngineGroup` | Engine membership, attached policy, and engine selection |
 | `WorkerRegistry` | Live workers, model membership, health, and role |
-| Request handler | Prepared request facts, group calls for the selected mode, and dispatch |
+| Request handler | Ordered bucket iteration, group calls for each mode, and dispatch |
 
 `worker_ids: None` means every healthy engine serving the requested model and
 role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
@@ -77,9 +78,10 @@ tier executor, or separate selection framework is required.
 
 ## 2. Responsibilities and request flow
 
-`BucketResolver::resolve(input_tokens, expected_peak_tokens)` returns one bucket
-reference or `NoMatchingBucket`. It does not receive a stage or a load view and
-does not resolve live engines or invoke policies.
+`BucketResolver::resolve(input_tokens, expected_peak_tokens)` returns an ordered
+list of compatible bucket references (possibly empty), or an invalid-signal error.
+It does not receive a stage or a load view, resolve live engines, or invoke policies.
+The handler iterates this list until a bucket supplies the complete engine selection.
 
 `EngineGroup::pick(workers, request)` resolves healthy workers for the request's
 model and stage, intersects them with its membership, sorts them by stable ID,
@@ -90,7 +92,10 @@ allocated worker with the same ID as a candidate.
 chat_completions (reorg configured): prepare tokens and expected peak
   |
   v
-BucketResolver::resolve: choose best length-compatible bucket
+BucketResolver::resolve: ordered length-compatible buckets
+  |
+  v
+For each bucket:
   |
   +-- BucketGroups::Plain
   |     plain.pick() -> one plain engine
@@ -99,15 +104,20 @@ BucketResolver::resolve: choose best length-compatible bucket
         prefill.pick() -> P engine
         decode.pick()  -> D engine from the same bucket
   |
+  +-- empty group / admission rejection -> try next bucket (repeat all picks)
+  +-- invalid signal / configuration / foreign pick -> return error
+  |
   v
-forward_chat_request: acquire guards, attach PD bootstrap, forward response
+Complete selection -> forward_chat_request: acquire guards, attach PD bootstrap, forward response
 ```
 
 The handler creates a fresh `LoadView` and stage-specific `PickRequest` for each
 group call. Each request carries the selected bucket ID, input length, optional
 expected peak, token IDs, and session/routing keys. PD uses separate group
 policies, but never independently resolves a decode bucket. Decode selection
-failure happens before forwarding acquires accounting guards or sends prefill.
+failure discards that tentative prefill choice and advances to the next bucket
+on missing candidates or admission rejection. No forwarding guards are acquired
+and no prefill request is sent until both picks in one bucket succeed.
 PD compatibility constraints beyond model and role remain follow-up work.
 
 There is one endpoint: `POST /v1/chat/completions`. `AppContext::chat_routing`
@@ -134,16 +144,19 @@ the existing body-size estimate when tokenization is unavailable.
 2. Keep buckets whose inclusive input-token range contains the input length.
 3. Check the bucket context capacity against input plus requested output when
    known, or against input length when the output budget is unknown.
-4. Choose the smallest compatible input capacity (the lesser of the input upper
-   bound and context capacity). Unbounded capacities sort last. Break ties by
-   ascending bucket rank, then ID.
-5. Inspect that bucket's `BucketGroups` and select its required engine(s).
+4. Sort by ascending input capacity (the lesser of the input upper bound and
+   context capacity). Unbounded capacities sort last. Break ties by ascending
+   bucket rank, then ID, and return the entire ordered list.
+5. The handler tries each bucket's `BucketGroups` until one supplies its required
+   engine(s). A failed PD attempt never contributes an engine to a later pair.
 
 The handler checks addition overflow when computing the expected peak.
-`NoMatchingBucket` becomes a 400 response; missing group engines become a
-stage-specific 503. Admission rejection remains a selection failure (503), and
-invalid policy signals/configuration or out-of-candidate picks are internal
-errors. No error causes automatic selection from another bucket.
+An empty bucket list becomes a 400 `NoMatchingBucket` response. After exhausting
+the list, accumulated admission rejection details produce a selection failure
+(503); if there were no admission rejections, the last unavailable stage produces
+a stage-specific 503. Invalid policy signals/configuration or out-of-candidate
+picks stop the pass immediately with an internal error. Successful engine
+selection ends the pass; forwarding errors do not restart bucket iteration.
 
 Token ranges and rank belong to the bucket, not its engine groups. For a PD
 bucket, both groups share this one request-length decision. Policy fallback on
@@ -218,7 +231,7 @@ Each policy has an admission attachment and a placement:
 
 Both placements return `NoCandidates` for an empty original set. If a cache
 policy prefers A but only B passes admission, before-selection can choose B;
-after-selection rejects A and the handler returns the selection failure.
+after-selection rejects A and the handler advances to the next compatible bucket.
 
 Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
@@ -447,7 +460,7 @@ validation, including dispatch-time breaker probes and request cancellation.
 | Behavior | Target |
 | --- | --- |
 | Round-robin cursor | One cursor per role-group policy instance |
-| Capacity exhaustion | Return the selected group's error; do not switch buckets |
+| Capacity exhaustion | Try the next compatible bucket; return accumulated rejection details if all fail |
 | Primary/backup proposals and post-policy substitution | Removed; each policy returns one engine |
 | Session affinity | Reuse admitted bindings; remove primary/backup pressure escape |
 | Omitted `--affinity-mode` | Admitted-binding reuse replaces the former soft-mode default |
@@ -470,9 +483,10 @@ A successful pick means admission passed against the observed state. Health and
 capacity can change before dispatch. The handler owns network operations, retry
 rules, and accounting for the engines actually dispatched to.
 
-A retry rebuilds candidates within the selected bucket, excludes failed engines
-as required, and invokes the attached policy. It does not silently replace a cache winner
-with a different engine after selection.
+Selection fallback advances through the ordered compatible buckets before any
+network dispatch. Every PD attempt picks both engines from that bucket. Transport
+retry integration remains separate work; a forwarding failure does not resume
+the bucket loop or silently replace a successful policy pick.
 
 For PD, acquire and release accounting for the actual stages and clean up
 partial setup on failure. Policy selection does not own the PD request lifetime.
@@ -486,14 +500,15 @@ This PR adds the side-by-side interfaces in `src/buckets_reorg.rs` and
 
 Implemented here:
 
-- `BucketResolver::resolve` chooses one bucket by length, then capacity/rank/ID.
+- `BucketResolver::resolve` returns all length-compatible buckets in capacity/rank/ID order.
 - `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, admission placement, and `AllowAll`.
 - Lazy report capture through one `LoadView` per group selection pass.
-- The reorg chat implementation prepares request facts, resolves one bucket,
-  calls one plain group or both PD groups, maps errors, and reuses the forwarder.
+- The reorg chat implementation iterates resolved buckets, calls one plain group
+  or both PD groups, advances on empty candidates/admission rejection, and
+  dispatches only after one complete selection. Exhaustion retains admission reasons.
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
 
