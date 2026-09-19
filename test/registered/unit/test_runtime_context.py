@@ -394,7 +394,7 @@ class TestSpawnIdentities(_IsolatedOverrides):
 class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
     """With a spawn bundle, a rank read works before any group exists.
 
-    This is what `ParallelState` provided by being a plain frozen record, and
+    This is what the per-runner record provided by being a plain frozen object, and
     what the topology init could not: it needs the groups. Deriving at publish
     is what lets a reader ask the context in a process that never initialises
     distributed -- every unit test that builds a scheduler component, for one.

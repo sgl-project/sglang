@@ -20,7 +20,6 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
@@ -181,15 +180,6 @@ class _FakeModelRunner:
         attn_dp_size: int | None = None,
     ):
         self.model = model
-        self.ps = ParallelState.trivial(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            attn_dp_size=attn_dp_size if attn_dp_size is not None else dp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-        )
 
 
 # ---------------------------------------------------------------------------

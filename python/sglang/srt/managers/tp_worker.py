@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -322,7 +321,6 @@ class TpModelWorker(BaseTpWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -335,7 +333,6 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
-        self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -522,7 +519,6 @@ class TpModelWorker(BaseTpWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -543,7 +539,6 @@ class TpModelWorker(BaseTpWorker):
                     model_config=self.model_config,
                     mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
-                    ps=self.ps,
                     nccl_port=self.nccl_port,
                     server_args=self.server_args,
                     is_draft_worker=self.is_draft_worker,

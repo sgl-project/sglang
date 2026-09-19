@@ -75,7 +75,6 @@ from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -329,32 +328,10 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             cfg.attn_cp_size,
         )
     )
-    ps = ParallelState(
-        tp_rank=tp_rank,
-        tp_size=cfg.tp_size,
-        pp_rank=0,
-        pp_size=1,
-        dp_rank=None,
-        dp_size=cfg.dp_size,
-        attn_tp_rank=attn_tp_rank,
-        attn_tp_size=attn_tp_size,
-        attn_cp_rank=0,
-        attn_cp_size=cfg.attn_cp_size,
-        attn_dcp_rank=tp_rank % cfg.dcp_size,
-        attn_dcp_size=cfg.dcp_size,
-        attn_dp_rank=attn_dp_rank,
-        attn_dp_size=attn_dp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=cfg.ep_size,
-        moe_dp_rank=None,
-        moe_dp_size=cfg.moe_dp_size,
-        gpu_id=gpu_id,
-    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,
         gpu_id=gpu_id,
-        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -571,7 +548,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             model_runner=model_runner,
             dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
-            attn_cp_size=model_runner.ps.attn_cp_size,
+            attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),

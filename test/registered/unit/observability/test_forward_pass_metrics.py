@@ -9,23 +9,12 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
 from sglang.test.test_utils import CustomTestCase, enter_scope
-
-
-def _make_ps(**overrides) -> ParallelState:
-    """Build a ParallelState with reasonable defaults for tests; override fields via kwargs."""
-    defaults = dict(
-        dp_rank=None,
-        moe_dp_rank=None,
-    )
-    defaults.update(overrides)
-    return ParallelState.trivial(**defaults)
 
 
 class _FakeReq:
@@ -75,11 +64,30 @@ class _DummyPublisherThread:
 
 
 def _publish_server_args(test, **fields):
-    """Publish a config for the reporter under test and return the instance."""
+    """Publish a config for the reporter under test and return the instance.
+
+    The collector asks the context where this process sits, so the ranks are
+    stated too: without them a rank read falls through to a process group that
+    a unit test has not built.
+    """
     fields.setdefault("decode_log_interval", 40)
     override = get_context().override_server_args(**fields)
     server_args = override.install()
     test.addCleanup(override.restore)
+    enter_scope(
+        test,
+        get_parallel().override(
+            tp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            moe_ep_rank=0,
+            attn_dp_rank=0,
+            dp_rank=0,
+            moe_ep_size=1,
+            moe_dp_size=1,
+            moe_tp_size=1,
+        ),
+    )
     return server_args
 
 
@@ -93,8 +101,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
             enable_mfu_metrics=False,
             enable_forward_pass_metrics=False,
         )
-    if not hasattr(scheduler, "ps"):
-        scheduler.ps = ParallelState.trivial()
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
@@ -291,9 +297,9 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=2, pp_rank=0, pp_size=1)
-        # The reporter asks the context whether this is the last stage.
-        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1))
+        # The reporter asks the context whether this is the last stage, and
+        # which replica it is reporting for.
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1, dp_rank=2))
         scheduler.enable_kv_cache_events = False
 
         with patch(
@@ -330,7 +336,6 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        scheduler.ps = _make_ps(attn_tp_rank=0, dp_rank=0, pp_rank=0, pp_size=2)
         # The reporter asks the context whether this is the last stage.
         enter_scope(self, get_parallel().override(pp_rank=0, pp_size=2))
         scheduler.enable_kv_cache_events = False

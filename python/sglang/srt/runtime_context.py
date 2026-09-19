@@ -1911,7 +1911,7 @@ def _attention_ranks(parallel, tp_rank: int) -> dict:
     The widths are already on the bag -- `publish` computed them a moment ago --
     and the rank comes from the spawn, so the position is known here, before any
     process group exists. That is the point: a rank read then works in a process
-    that never initialises distributed, which is what `ParallelState` provided
+    that never initialises distributed, which is what the per-runner record used to provide
     by being a plain frozen record.
 
     These are stamped rather than written as bag leaves because they are

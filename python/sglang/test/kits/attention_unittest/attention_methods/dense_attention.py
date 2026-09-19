@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -339,7 +338,6 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.is_draft_worker = False
         self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;

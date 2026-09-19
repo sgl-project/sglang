@@ -8,7 +8,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -71,12 +70,11 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
 
 
 class ProfileManager:
-    def __init__(self, ps: ParallelState, cpu_group):
+    def __init__(self, cpu_group):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
-        self.ps = ps
         self.cpu_group = cpu_group
         self.first_rank_in_node = get_device().gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
@@ -154,7 +152,6 @@ class ProfileManager:
         set_detailed_annotations_enabled(self.detailed_annotations)
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
-            ps=self.ps,
             cpu_group=self.cpu_group,
             first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
@@ -303,7 +300,6 @@ class _ProfilerConcreteBase(_ProfilerBase):
         output_prefix: str,
         output_suffix: str,
         profile_id: str,
-        ps: ParallelState,
         cpu_group,
         first_rank_in_node: bool,
     ):
@@ -311,7 +307,6 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.output_prefix = output_prefix
         self.output_suffix = output_suffix
         self.profile_id = profile_id
-        self.ps = ps
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
 

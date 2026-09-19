@@ -22,7 +22,6 @@ from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
@@ -64,7 +63,6 @@ def init_torch_distributed(
     server_args: ServerArgs,
     model_config: ModelConfig,
     device: str,
-    ps: ParallelState,
     dist_port: int,
     is_draft_worker: bool,
     local_omp_cpuid: Optional[List[int]],
