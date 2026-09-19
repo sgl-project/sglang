@@ -1265,6 +1265,8 @@
                       "cookbook/autoregressive/Qwen/Qwen3-Coder",
                       "cookbook/autoregressive/Qwen/Qwen3-Coder-Next",
                       "cookbook/autoregressive/Qwen/Qwen3-VL",
+                      "cookbook/autoregressive/Qwen/Qwen3-Reranker",
+                      "cookbook/autoregressive/Qwen/Qwen3-VL-Reranker",
                       "cookbook/autoregressive/Qwen/Qwen2.5-VL"
                     ]
                   },
