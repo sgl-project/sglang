@@ -892,6 +892,14 @@ class ModelRunner:
             device=self.device,
         )
 
+    def max_shared_logits_buffer_rows(self) -> int:
+        """Maximum rows in the persistent logits buffer used by graph runners.
+
+        This includes outputs produced inside a graph as well as eager logits
+        tails that reuse the runner-owned buffer after graph replay.
+        """
+        return self.max_decode_logits_rows()
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
