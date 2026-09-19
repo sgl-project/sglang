@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
@@ -15,6 +16,7 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
 )
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -187,31 +189,58 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
             )
 
 
-class TestDcpPackBufferBytes(CustomTestCase):
-    def test_manager_publishes_the_page_aligned_allocation_limit(self):
-        manager = SimpleNamespace(
-            _dcp_pack_buffers=None,
-            _dcp_pack_max_tokens=None,
-            kv_args=SimpleNamespace(kv_item_lens=[64 * 16], page_size=64),
-            transfer_queues=[object()],
-            _register_staging_memory=Mock(),
-        )
-        with (
-            patch(
-                "sglang.srt.disaggregation.common.conn.max_prefill_buffer_tokens",
-                return_value=8193,
-            ),
-            patch(
-                "sglang.srt.disaggregation.common.dcp_pack.init_dcp_pack_buffers",
-                return_value=[object()],
-            ) as init,
-        ):
-            CommonKVManager._init_dcp_pack_buffers_once(manager, 4)
-            CommonKVManager._init_dcp_pack_buffers_once(manager, 4)
-        init.assert_called_once()
-        self.assertEqual(manager._dcp_pack_max_tokens, 8256)
-        self.assertEqual(init.call_args.args[-1], manager._dcp_pack_max_tokens)
+class TestDcpCachedPrefixSend(CustomTestCase):
+    def test_cached_prefix_fits_pack_capacity_and_preserves_pages_and_state(self):
+        """A large cached-prefix send must fit pack capacity without losing KV or state."""
+        total, limit = 2055, 256
+        for prefix in (0, 256):
+            with self.subTest(decode_prefix=prefix):
+                sender = Mock()
+                sender.get_max_transfer_tokens.return_value = limit
+                sender.should_send_kv_chunk.return_value = True
+                req = SimpleNamespace(
+                    rid="cached-prefix",
+                    kv=SimpleNamespace(req_pool_idx=0),
+                    origin_input_ids=[0] * total,
+                    extend_range=SimpleNamespace(end=total),
+                    start_send_idx=prefix,
+                    disagg_decode_prefix_len=prefix,
+                    disagg_kv_sender=sender,
+                )
+                scheduler = SimpleNamespace(
+                    enable_staging=False,
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        page_size=64, translate_kv_indices_for_transfer=lambda x: x
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(total).reshape(1, -1),
+                        req_index_to_mamba_index_mapping=torch.tensor([17]),
+                        translate_mamba_indices=lambda x: x,
+                    ),
+                    disagg_metadata_buffers=Mock(),
+                    disagg_prefill_bootstrap_queue=SimpleNamespace(
+                        kv_manager=SimpleNamespace(
+                            kv_args=SimpleNamespace(state_types=[StateType.MAMBA])
+                        )
+                    ),
+                    disagg_prefill_pending_chunk_rids=set(),
+                )
+                SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                    scheduler, req, last_chunk=True
+                )
+                calls = sender.send.call_args_list
+                token_counts = [c.kwargs["num_kv_tokens"] for c in calls]
+                self.assertLessEqual(max(token_counts), limit)
+                self.assertEqual(sum(token_counts), total - prefix)
+                np.testing.assert_array_equal(
+                    np.concatenate([c.args[0] for c in calls]),
+                    np.arange(prefix // 64, 33),
+                )
+                self.assertTrue(all(c.args[1] is None for c in calls[:-1]))
+                self.assertEqual(int(calls[-1].args[1][0][0]), 17)
 
+
+class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_fixed_regions_for_each_dcp_rank(self):
         self.assertEqual(
             dcp_pack_buffer_bytes(
@@ -231,21 +260,8 @@ class TestDcpPackBufferBytes(CustomTestCase):
 
 
 class TestTryDcpPack(CustomTestCase):
-    def test_rejects_gather_that_overlaps_next_rank_region(self):
-        buf = Mock()
-        buf.fits.return_value = True
-        buf.get_size.return_value = 128
-        result = try_pack_dcp_src(
-            pack_buffer=buf,
-            kv_data_ptrs=[0x1000],
-            src_token_indices=np.arange(5, dtype=np.int64),
-            token_item_lens=[8],
-            pack_capacity_bytes=32,
-        )
-        self.assertIsNone(result)
-        buf.get_gather_stream.assert_not_called()
-
     def test_try_pack_uses_requested_region_and_dense_indices(self):
+        """A gather must fit its rank region even when the total buffer has space."""
         dim = 4
         kv = torch.arange(16 * dim, dtype=torch.float32).view(16, 1, dim)
         item_len = int(kv[0].nbytes)
@@ -283,7 +299,16 @@ class TestTryDcpPack(CustomTestCase):
                 token_item_lens=[item_len],
                 pack_offset_bytes=pack_offset,
             )
+            overflow = try_pack_dcp_src(
+                pack_buffer=buf,
+                kv_data_ptrs=[kv.data_ptr()],
+                src_token_indices=src,
+                token_item_lens=[item_len],
+                pack_offset_bytes=pack_offset,
+                pack_capacity_bytes=2 * item_len,
+            )
 
+        self.assertIsNone(overflow)
         gather_stream.synchronize.assert_called_once_with()
         self.assertIsNotNone(packed)
         ptrs, indices = packed
