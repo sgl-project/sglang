@@ -72,6 +72,22 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     fuse_swiglu_interleaved: bool = False
 
 
+def _needs_expert_filter(
+    config: MoeRunnerConfig, num_weight_experts: Optional[int] = None
+) -> bool:
+    """Whether topk ids can address a non-local expert and must be filtered.
+
+    The filter bounds ids by the weight's expert count, so pass it where known:
+    weights holding a different count than the config claims still need it.
+    """
+    if config.num_experts is None or config.num_experts != config.num_local_experts:
+        return True
+    return (
+        num_weight_experts is not None
+        and num_weight_experts != config.num_local_experts
+    )
+
+
 class TritonRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
@@ -108,6 +124,9 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
+                filter_expert=_needs_expert_filter(
+                    self.config, quant_info.w13_weight.shape[0]
+                ),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -119,11 +138,6 @@ class TritonRunnerCore(MoeRunnerCore):
 
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
-        )
-
-        filter_expert = (
-            self.config.num_experts is None
-            or self.config.num_experts != self.config.num_local_experts
         )
 
         out = _fused_moe_kernel_sequence(
@@ -161,7 +175,7 @@ class TritonRunnerCore(MoeRunnerCore):
             routed_scaling_factor=self.config.routed_scaling_factor,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
-            filter_expert=filter_expert,
+            filter_expert=_needs_expert_filter(self.config),
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
@@ -208,6 +222,9 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
+            filter_expert=_needs_expert_filter(
+                runner_config, quant_info.w13_weight.shape[0]
+            ),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():
