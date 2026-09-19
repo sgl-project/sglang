@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
     USE_AITER_GFX942,
+    USE_AITER_GFX1250,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,8 @@ def _can_use_fmha_fp8_prefill(
     num_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    """True if MHA q/k/v head_dim==128 on a gfx950-class arch."""
-    if not USE_AITER_GFX95:
+    """True if MHA q/k/v head_dim==128 on gfx950 or gfx1250."""
+    if not (USE_AITER_GFX95 or USE_AITER_GFX1250):
         return False
     if num_kv_heads != num_heads:
         return False
