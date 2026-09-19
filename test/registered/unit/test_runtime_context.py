@@ -60,6 +60,56 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 _SRT = _pathlib.Path(next(iter(_sglang.__path__))).resolve() / "srt"
+_PACKAGE = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
+
+
+def _sources():
+    """Every Python file this checkout ships, package and siblings alike.
+
+    The package alone is the wrong subject set for anything about entries or
+    public names: `benchmark/`, `examples/` and the top-level `test/` call the
+    same doors and are not covered by any suite that would notice them break.
+    An installed package has no siblings, and then this is the package alone."""
+    roots = [_PACKAGE]
+    checkout = _PACKAGE.parents[1]
+    roots += [
+        checkout / name
+        for name in ("benchmark", "examples", "scripts", "test")
+        if (checkout / name).is_dir()
+    ]
+    for root in roots:
+        for path in root.rglob("*.py"):
+            yield path
+
+
+def _scope_entries_that_say_nothing(paths):
+    """Draft-scope entries that do not state `owns_attention`, as `path:line`.
+
+    The scope either narrows the draft's attention and expert identity or
+    leaves the target's in place, and only the worker knows which -- so the
+    keyword has no default. Omitting it is a `TypeError`, but only on the path
+    that runs, and those paths want a GPU and a draft model.
+    """
+    import ast
+
+    missing = []
+    for path in paths:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
+                continue
+            if not any(kw.arg == "owns_attention" for kw in node.keywords):
+                missing.append(f"{path}:{node.lineno}")
+    return missing
+
+
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
 
@@ -348,9 +398,8 @@ class TestStampedRanks(_IsolatedOverrides):
     """`attn_dp_rank` comes from the stamp, and says so when there is none.
 
     It is the one rank no group answers with: `initialize_dp_attention`
-    computes it from this process's `tp_rank`, and an elastic scale-up
-    replaces it with a rank in the expanded WORLD. Falling back to anything
-    would be inventing a placement for this process.
+    computes it from this process's `tp_rank`. Falling back to anything would
+    be inventing a placement for this process.
     """
 
     def setUp(self):
@@ -408,9 +457,11 @@ class TestStampedRanks(_IsolatedOverrides):
             )
         self.assertIs(mode, DpPaddingMode.SUM_LEN)
 
-    def test_a_scale_up_stamps_the_width_and_the_rank_together(self):
-        """The two describe one topology; a reader that saw only one moved
-        would place this process in a group it is not in."""
+    def test_a_scale_up_moves_the_expanded_world_and_leaves_the_topology(self):
+        """A scale-up admits ranks into a WORLD that was pre-allocated; the
+        group coordinators keep the width they were built at. So the launch
+        topology has to keep answering for the groups that exist, and the
+        expanded replica set is a second pair of names."""
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
 
         # It also flips a process-wide gather flag; put it back, or every
@@ -418,11 +469,39 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags = get_flags().dp
         saved_gather = dp_flags.use_world_group_for_gather
         self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
+        self.addCleanup(reset_context)
 
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3),
+        )
         parallel = get_parallel()
+        self.assertEqual(parallel.elastic_dp_size, parallel.attn_dp_size)
+        self.assertEqual(parallel.elastic_dp_rank, parallel.attn_dp_rank)
+
         update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
-        self.assertEqual(parallel.attn_dp_size, 16)
-        self.assertEqual(parallel.attn_dp_rank, 11)
+        self.assertEqual(parallel.elastic_dp_size, 16)
+        self.assertEqual(parallel.elastic_dp_rank, 11)
+        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(parallel.attn_dp_rank, 3)
+        self.assertEqual(parallel.tp_size, 8)
+
+    def test_the_expanded_pair_is_checked_like_any_other(self):
+        """It stays out of the topology identities, not out of all of them."""
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3),
+        )
+        with self.assertRaises(ValueError) as caught:
+            get_parallel().override_permanently(elastic_dp_size=16, elastic_dp_rank=16)
+        self.assertIn("elastic_dp_rank", str(caught.exception))
 
 
 class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
@@ -2618,29 +2697,36 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         worker states it, and a caller that forgets is the bug this catches --
         `owns_attention` has no default, but a missing one is a TypeError only
         on the path that runs, and these paths need a GPU and a draft model."""
-        import ast
+        self.assertEqual(
+            _scope_entries_that_say_nothing(_sources()),
+            [],
+            "these enter the draft scope without saying",
+        )
 
-        package = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
-        checkout = package.parents[1]
-        roots = [package] + [
-            checkout / name for name in ("test",) if (checkout / name).is_dir()
-        ]
-        missing = []
-        for path in (q for root in roots for q in root.rglob("*.py")):
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                name = getattr(func, "attr", None) or getattr(func, "id", None)
-                if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
-                    continue
-                if not any(kw.arg == "owns_attention" for kw in node.keywords):
-                    missing.append(f"{path}:{node.lineno}")
-        self.assertEqual(missing, [], "these enter the draft scope without saying")
+    def test_the_census_would_notice_one(self):
+        """Two ways for it to report zero and still be wrong: the matcher does
+        not recognise the call, or the walk never reaches the file. A draft
+        scope entered from `benchmark/` breaks the same way as one in the
+        package and no suite covers it, so the roots are part of the check."""
+        trees = {
+            part
+            for path in _sources()
+            for part in ("benchmark", "examples", "scripts", "test")
+            if f"/{part}/" in path.as_posix()
+        }
+        self.assertEqual(
+            trees,
+            {"benchmark", "examples", "scripts", "test"},
+            "the walk misses a tree that can enter the scope",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = _pathlib.Path(tmp) / "probe.py"
+            probe.write_text(
+                "with self.draft_tp_context(runner.tp_group):\n    pass\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_scope_entries_that_say_nothing([probe]), [f"{probe}:1"])
 
     def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
         """The other caller. A draft built outside any scope carries the

@@ -844,7 +844,9 @@ class TestShardConfig(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
         with (
-            get_parallel().override(tp_size=8, pp_size=1, moe_dp_size=2, moe_ep_size=4),
+            get_parallel().override(
+                tp_size=8, pp_size=1, moe_dp_size=2, moe_ep_size=4, moe_tp_size=1
+            ),
             mock.patch(
                 "sglang.srt.layers.dp_attention.get_moe_cp_size",
                 return_value=2,

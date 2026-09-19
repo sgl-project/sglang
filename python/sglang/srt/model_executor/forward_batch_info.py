@@ -1166,7 +1166,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # DP / MLP-sync path: per-DP padded width.
             if require_mlp_tp_gather():
                 num_tokens_per_dp = self.global_num_tokens_cpu[
-                    get_parallel().attn_dp_rank
+                    get_parallel().elastic_dp_rank
                 ]
             else:
                 num_tokens_per_dp = self.global_num_tokens_cpu[0]
@@ -1520,7 +1520,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
+            num_tokens = global_num_tokens[get_parallel().elastic_dp_rank]
         else:
             num_tokens = global_num_tokens[0]
 

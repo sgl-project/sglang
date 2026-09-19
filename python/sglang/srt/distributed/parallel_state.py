@@ -3108,10 +3108,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
         narrowed.update(
             attn_tp_size=tp_group.world_size,
             attn_tp_rank=tp_group.rank_in_group,
+            attn_tp_group=tp_group,
             attn_dp_size=1,
             attn_dp_rank=0,
             attn_cp_size=1,
             attn_cp_rank=0,
+            attn_cp_group=None,
             moe_ep_size=1,
             moe_ep_rank=0,
             moe_ep_group=None,

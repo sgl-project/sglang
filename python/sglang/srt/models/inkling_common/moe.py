@@ -681,6 +681,7 @@ class InklingSharedFusedMoE(FusedMoE):
             moe_ep_size=1,
             moe_ep_rank=0,
             moe_ep_group=None,
+            moe_dp_size=1,
             moe_tp_size=get_parallel().tp_size,
             moe_tp_rank=get_parallel().tp_rank,
         ):

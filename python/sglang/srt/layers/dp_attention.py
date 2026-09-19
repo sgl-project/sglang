@@ -59,7 +59,7 @@ def enable_joiner_all_gather():
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     get_parallel().override_permanently(
-        attn_dp_size=new_dp_size, attn_dp_rank=new_dp_rank
+        elastic_dp_size=new_dp_size, elastic_dp_rank=new_dp_rank
     )
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
@@ -90,7 +90,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = get_parallel().attn_dp_size
+        dp_size = get_parallel().elastic_dp_size
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -378,8 +378,12 @@ def initialize_dp_attention(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
 
+    expanded = None
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
+        offset = get_parallel().ep_join_rank_offset
+        expanded = dict(
+            elastic_dp_rank=tp_rank + offset, elastic_dp_size=offset + tp_size
+        )
         # Reads the resolution, not a bag: this runs under
         # `initialize_dp_attention`, which the weight-cache daemon calls from
         # `_init_distributed` -- and other callers reach it from processes
@@ -394,6 +398,8 @@ def initialize_dp_attention(
     get_parallel().override_permanently(
         attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
     )
+    if expanded is not None:
+        get_parallel().override_permanently(**expanded)
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

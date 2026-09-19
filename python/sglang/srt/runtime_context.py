@@ -210,6 +210,24 @@ _LIVE_READS: dict = {
             "bundle has no replica index to report"
         ),
     ),
+    "elastic_dp_size": Live(
+        source=lambda self: self.attn_dp_size,
+        doc=(
+            "How many attention-DP replicas are serving now. The same number "
+            "as `attn_dp_size` until an elastic-EP scale-up admits ranks into "
+            "the pre-allocated WORLD: the group coordinators keep the width "
+            "they were built at, so the launch topology and the expanded one "
+            "are two facts, and this is the expanded one."
+        ),
+    ),
+    "elastic_dp_rank": Live(
+        source=lambda self: self.attn_dp_rank,
+        doc=(
+            "This process's replica index among those serving now -- the "
+            "companion to `elastic_dp_size`, and equal to `attn_dp_rank` "
+            "until a scale-up renumbers the admitted ranks."
+        ),
+    ),
     "world_group": "get_world_group",
     "tp_group": "get_tp_group",
     "pp_group": "get_pp_group",
@@ -449,14 +467,16 @@ class SpawnRanks(msgspec.Struct, frozen=True):
     the rank cannot say which replica this is. `None` means "no controller",
     which is an answer rather than an absence, and it is recorded as one.
 
-    Nothing else belongs here. A device index, for instance, is a placement
-    decision rather than a position -- the launcher may reindex it, and Ray
-    assigns it from its own allocator -- so it stays an argument to whoever
-    was handed it.
+    `gpu_id` is the device the parent picked for this process. It is not a
+    position in any group -- reindexing narrows the visible devices before the
+    spawn, and Ray allocates from its own pool -- but it is the same kind of
+    fact: something only the entry that spawned the process can state. `None`
+    for a process that runs on no device.
     """
 
     world_rank: int
     dp_rank: Optional[int] = None
+    gpu_id: Optional[int] = None
 
 
 _RANK_AND_WIDTH = (
@@ -466,6 +486,7 @@ _RANK_AND_WIDTH = (
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
     ("moe_ep_rank", "moe_ep_size"),
+    ("elastic_dp_rank", "elastic_dp_size"),
 )
 
 # `moe_dp` is absent because `initialize_model_parallel` aliases the MoE-DP
@@ -1910,6 +1931,8 @@ def publish(
             ),
         )
     _CONTEXT._publish_role = role
+    if ranks is not None and ranks.gpu_id is not None:
+        _CONTEXT.override("spawn", gpu_id=ranks.gpu_id)
     if ranks is not None:
         # The placement, worked out here rather than carried: the widths are on
         # the bag a moment ago, and `world_rank` fixes the rest. A read of any

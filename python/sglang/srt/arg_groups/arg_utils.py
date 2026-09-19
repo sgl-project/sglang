@@ -110,7 +110,7 @@ class Derived(msgspec.Struct, frozen=True):
     Every declaration carries ``fn`` today, the parallel quotients included:
     they are a function of the configured leaves, so they are computed at
     publish like the rest. What is special about them is not how they are
-    computed but that a stamp can move one afterwards -- an elastic scale-up
+    computed but that a stamp can move one afterwards -- ``initialize_dp_attention``
     restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
     published leaf.
     """
