@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import attention_backends_of
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     model_config_of,
+    resolved_view,
     resolving_view,
     run_post_process_pass,
 )
@@ -213,9 +215,19 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
     if cfg.cp_strategy == "zigzag" and not is_npu():
         raise ValueError(
-            "DeepSeekV4 zigzag CP requires the NPU backend; the CUDA backend "
-            "reindexes with interleave order."
+            "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
+            "reindex with interleave order."
         )
+    if get_platform().is_hip:
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
+            raise ValueError(
+                "DeepSeekV4 prefill CP on HIP requires the dsv4 attention "
+                f"backend for both phases, got prefill={prefill_backend!r}, "
+                f"decode={decode_backend!r}."
+            )
 
     declare_resolution(
         server_args,
@@ -236,6 +248,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
+        assert cfg.nnodes == 1, "DeepSeekV4 context parallel only supports one node."
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
