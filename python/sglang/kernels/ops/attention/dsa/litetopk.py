@@ -8,8 +8,8 @@ PR #48726 (``csrc/dsa_litetopk/``); this module orchestrates the three
 primitives (``seed_prep`` / ``scan`` / ``select``) and allocates scratch.
 
 Prefill (ragged extend) only. The output indices are gathered-KV absolute
-positions -- the same coordinates the dense ``fp8_mqa_logits`` +
-``fast_topk_transform_ragged_fused`` path produces -- padded with ``-1``.
+positions, padded with ``-1`` -- the dense path's RAGGED top-k transform
+contract, not the PAGED one (KV-pool locations).
 
 Caveats:
   * Exact top-k SET by construction (conservative gate), but tie-breaking at
