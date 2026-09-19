@@ -782,6 +782,23 @@ class QuarkConfig(QuantizationConfig):
         )
         return is_mx_fp4_weight and is_static_fp8_activation
 
+    def has_mx_w4a8_global_config(self) -> bool:
+        """True when the checkpoint's global config is MX-FP4 weights with static
+        per-tensor FP8 activations.
+
+        Exposed because consumers outside this module need to know whether the
+        MoE weights are mxfp4 — and therefore whether the backend requires
+        hidden_size rounded up to a 256 multiple — which the quant method's
+        name ("quark") does not tell them.
+        """
+        global_config = self.quant_config.get("global_quant_config")
+        if not global_config:
+            return False
+        return self._is_mx_w4a8(
+            weight_quant=global_config.get("weight"),
+            input_quant=global_config.get("input_tensors"),
+        )
+
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
