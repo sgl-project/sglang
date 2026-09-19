@@ -2491,7 +2491,15 @@ class KVCacheConfigurator:
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
         if replayssm_active:
-            record_len = get_exec().mamba.linear_replayssm_cache_len
+            # GDN sizes the fold window to the draft maximum; the KDA ring
+            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            max_draft_tokens = max_speculative_num_draft_tokens()
+            if self.hybrid_kda_config is not None:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
+            elif max_draft_tokens is not None:
+                record_len = max_draft_tokens
+            else:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
