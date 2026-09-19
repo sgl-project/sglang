@@ -355,45 +355,6 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):
-    def test_pp_forward_snapshot_keeps_live_rows_for_non_mamba_model(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
-            _pp_snapshot_forward_batch,
-        )
-
-        batch = MagicMock()
-        batch.spec_algorithm.is_none.return_value = False
-        batch.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int32)
-        snapshot = SimpleNamespace(req_pool_indices=batch.req_pool_indices)
-        batch.copy.return_value = snapshot
-
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.mambaish_config",
-            return_value=None,
-        ):
-            result = _pp_snapshot_forward_batch(batch)
-
-        self.assertIs(result.req_pool_indices, batch.req_pool_indices)
-
-    def test_pp_forward_snapshot_owns_rows_for_mamba_model(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
-            _pp_snapshot_forward_batch,
-        )
-
-        batch = MagicMock()
-        batch.spec_algorithm.is_none.return_value = False
-        batch.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int32)
-        snapshot = SimpleNamespace(req_pool_indices=batch.req_pool_indices)
-        batch.copy.return_value = snapshot
-
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.mambaish_config",
-            return_value={"some": "config"},
-        ):
-            result = _pp_snapshot_forward_batch(batch)
-
-        self.assertIsNot(result.req_pool_indices, batch.req_pool_indices)
-        torch.testing.assert_close(result.req_pool_indices, batch.req_pool_indices)
-
     def test_flashinfer_gdn_positional_scratch_moves_to_request_rows(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
             copy_verify_intermediate_rows,

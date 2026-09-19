@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 
-from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
@@ -59,14 +58,7 @@ def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     if batch.spec_algorithm.is_none():
         return None
     fwd_batch = batch.copy()
-    if mambaish_config(batch.model_config) is not None:
-        # A hybrid target's relayed accept result may return after another
-        # in-flight microbatch has reused the live request-index buffer.  Its
-        # recurrent-state commit therefore needs an owning snapshot.  Keep the
-        # historical shared reference for non-hybrid targets: DSpark's generic
-        # PP relay uses that live row mapping when it adopts the returned
-        # proposal.
-        fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
     return fwd_batch
 
 
