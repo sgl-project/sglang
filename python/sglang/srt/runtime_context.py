@@ -110,28 +110,34 @@ def _parallel_config_leaves() -> frozenset:
     )
 
 
-# Ranks and group handles: the names no configuration carries, each with the
-# canonical getter that answers it live. This table is their declaration, the
-# way `arg_groups/fields/parallel.py` is the leaves' and `Derived` is the
-# widths'. `None` marks a name only a stamp can answer: no coordinator knows
-# this process's attention-DP rank.
+# Ranks and group handles: the names no configuration carries. This table is
+# their declaration, the way `arg_groups/fields/parallel.py` is the leaves' and
+# `Derived` is the widths'. A group handle names the getter that owns it,
+# because the module that builds the groups is where it lives; a rank is a
+# position in one of those groups, so it is read off the handle. `None` marks a
+# name only a stamp can answer: no coordinator knows this process's
+# attention-DP rank.
 _MISSING_READ = object()
 
 
 class Live(msgspec.Struct, frozen=True):
     """How a rank / group / world width is answered, and what it means.
 
-    `source` is the canonical getter's name in `parallel_state`, a callable
-    taking the context, or `None` for a name only a stamp can answer.
+    `source` is a group getter's name in `parallel_state`, a callable taking
+    the context, or `None` for a name only a stamp can answer.
 
-    Most entries in the table below are a bare getter name: a rank or a group
-    handle is its own explanation. This shape is for a name whose meaning is
-    not in its getter, and it carries the prose with the declaration rather
-    than in a second table keyed by the same names.
+    Most entries in the table below are a bare getter name: a group handle is
+    its own explanation. This shape is for a name whose meaning is not in its
+    getter, and it carries the prose with the declaration rather than in a
+    second table keyed by the same names.
     """
 
     source: Any = None
     doc: str = ""
+    # The `parallel_state` getter this name replaces, when the context computes
+    # the answer itself rather than calling it. Declared here so the deprecation
+    # shim stays derived from this table instead of keeping a second list.
+    replaces: str = ""
     # For a stamp-only name (`source=None`): what a reader should be told when
     # nothing has stamped it. These names have no fallback by construction, so
     # the message is the only thing pointing at what did not happen.
@@ -145,7 +151,8 @@ _LIVE_READS: dict = {
     # and asked of it directly -- a width that lives somewhere else does not
     # become a WORLD fact by being readable from here.
     "launch_world_size": Live(
-        source="get_world_size",
+        source=lambda self: self.world_group.world_size,
+        replaces="get_world_size",
         doc=(
             "Width the WORLD group was built at: `len(ranks)`, frozen when the "
             "coordinator was constructed. What every startup reader wants -- "
@@ -165,21 +172,46 @@ _LIVE_READS: dict = {
         ),
     ),
     "launch_world_rank": Live(
-        source="get_world_rank",
+        source=lambda self: self.world_group.rank_in_group,
+        replaces="get_world_rank",
         doc=(
             "This process's rank in the WORLD group as built. Frozen with the "
             "coordinator, exactly like `launch_world_size`, and named for the "
             "same reason: a scale-up does not renumber it."
         ),
     ),
-    "tp_rank": "get_tensor_model_parallel_rank",
-    "pp_rank": "get_pipeline_model_parallel_rank",
-    "moe_ep_rank": "get_moe_expert_parallel_rank",
-    "moe_dp_rank": "get_moe_data_parallel_rank",
-    "moe_tp_rank": "get_moe_tensor_parallel_rank",
-    "attn_tp_rank": "get_attn_tensor_model_parallel_rank",
-    "attn_cp_rank": "get_attn_context_model_parallel_rank",
-    "dcp_rank": "get_dcp_rank",
+    "tp_rank": Live(
+        source=lambda self: getattr(self.tp_group, "rank_in_group"),
+        replaces="get_tensor_model_parallel_rank",
+    ),
+    "pp_rank": Live(
+        source=lambda self: getattr(self.pp_group, "rank_in_group"),
+        replaces="get_pipeline_model_parallel_rank",
+    ),
+    "moe_ep_rank": Live(
+        source=lambda self: getattr(self.moe_ep_group, "rank_in_group"),
+        replaces="get_moe_expert_parallel_rank",
+    ),
+    "moe_dp_rank": Live(
+        source=lambda self: getattr(self.moe_dp_group, "rank_in_group"),
+        replaces="get_moe_data_parallel_rank",
+    ),
+    "moe_tp_rank": Live(
+        source=lambda self: getattr(self.moe_tp_group, "rank_in_group"),
+        replaces="get_moe_tensor_parallel_rank",
+    ),
+    "attn_tp_rank": Live(
+        source=lambda self: getattr(self.attn_tp_group, "rank_in_group"),
+        replaces="get_attn_tensor_model_parallel_rank",
+    ),
+    "attn_cp_rank": Live(
+        source=lambda self: getattr(self.attn_cp_group, "rank_in_group"),
+        replaces="get_attn_context_model_parallel_rank",
+    ),
+    "dcp_rank": Live(
+        source=lambda self: getattr(self.dcp_group, "rank_in_group"),
+        replaces="get_dcp_rank",
+    ),
     "attn_dcp_rank": lambda self: self.dcp_rank if self.dcp_enabled else 0,
     "attn_dp_rank": Live(
         source=None,
@@ -626,8 +658,8 @@ class ParallelContext:
 
         Scoped override, then the permanent stamp, then what the name is
         answered by when nobody has stated it: the published leaf for a
-        configured value or a derived width, the canonical getter for a rank
-        or a group handle.
+        configured value or a derived width, the owning getter for a group
+        handle, and for a rank the group it is a position in.
 
         The two override maps stay separate because they are taken down by
         different things -- a `with` block and `clear_stamp()` -- and
@@ -647,7 +679,9 @@ class ParallelContext:
         if live is not _MISSING_READ:
             source = live.source if isinstance(live, Live) else live
             if isinstance(source, str):
-                return getattr(_ps(), source)()
+                parallel_state = _ps()
+                getter = getattr(parallel_state, source)
+                return parallel_state._UNWRAPPED.get(getter, getter)()
             if source is not None:
                 return source(self)
             why = live.unstamped if isinstance(live, Live) else ""

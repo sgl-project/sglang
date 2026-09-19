@@ -3453,21 +3453,19 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
 # keeps calling them -- a read there would go through the context back into
 # itself -- so the warning fires only for callers outside it, and once per
 # name, because the point is to name the replacement rather than to fill a log.
-
-# The context's own read path calls these -- that is how it answers -- so it is
-# exempt for the same reason the defining package is.
-_EXEMPT_CALLERS = ("sglang.srt.distributed.", "sglang.srt.runtime_context")
+_EXEMPT_CALLERS = ("sglang.srt.distributed.",)
 
 # Derived from the table that says which context name each getter answers, so a
-# getter added there is covered without being listed again here.
-_CONTEXT_NAME_OF = {
-    source: name
-    for name, source in (
-        (name, live.source if isinstance(live, Live) else live)
-        for name, live in _LIVE_READS.items()
-    )
-    if isinstance(source, str)
-}
+# getter added there is covered without being listed again here. A name the
+# context still reads through gives its getter as the source; one the context
+# computes itself names the getter it replaced.
+_CONTEXT_NAME_OF = {}
+for _context_name, _live in _LIVE_READS.items():
+    _source = _live.source if isinstance(_live, Live) else _live
+    _getter = _source if isinstance(_source, str) else getattr(_live, "replaces", "")
+    if _getter:
+        _CONTEXT_NAME_OF[_getter] = _context_name
+del _context_name, _live, _source, _getter
 # The width getters read a built group; the context answers the same names from
 # the configuration. Those are one answer rather than two only for the groups
 # the build checks against the configuration -- `_WIDTH_AND_GROUP` in
@@ -3482,6 +3480,12 @@ _CONTEXT_NAME_OF["get_pipeline_model_parallel_world_size"] = "pp_size"
 _CONTEXT_NAME_OF["get_moe_expert_parallel_world_size"] = "moe_ep_size"
 
 _ALREADY_WARNED: set = set()
+
+# Each wrapper to the function it wraps. The context resolves a getter by name,
+# so a test that patches one is still seen, and then takes the original from
+# here: the warning is for callers that reach past the context, and walking the
+# stack on the way to every group read would charge them all for it.
+_UNWRAPPED: dict = {}
 
 
 def _warn_if_called_from_outside(name: str, replacement: str):
@@ -3509,5 +3513,7 @@ def _warn_if_called_from_outside(name: str, replacement: str):
 for _name, _replacement in _CONTEXT_NAME_OF.items():
     _fn = globals().get(_name)
     if _fn is not None:
-        globals()[_name] = _warn_if_called_from_outside(_name, _replacement)(_fn)
+        _wrapper = _warn_if_called_from_outside(_name, _replacement)(_fn)
+        _UNWRAPPED[_wrapper] = _fn
+        globals()[_name] = _wrapper
 del _name, _replacement, _fn

@@ -13,6 +13,8 @@ import tempfile
 import types
 import unittest
 import warnings
+from types import SimpleNamespace
+from unittest import mock as _mock
 from unittest.mock import patch
 
 import msgspec
@@ -114,24 +116,26 @@ def _scope_entries_that_say_nothing(paths):
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
 
-# Ranks and the launch width are asked of the group: they are not implied by
-# anything, so there is nothing to derive them from. The quotients are not
-# here -- `attn_tp_size` and its siblings are functions of the configured
-# leaves, and `TestDerivedWidths` pins them. `attn_dp_rank` is not here either: no group coordinator
-# knows it, so it is stamped when the attention topology is initialized and
-# `TestStampedRanks` is what pins it. The other world width is not here
-# because the group does not know it; `TestTheTwoWorldWidths` pins it.
+# Ranks and the launch width are read off the group they are a position in:
+# they are not implied by anything else, and the group is the only thing that
+# knows. The quotients are not here -- `attn_tp_size` and its siblings are
+# functions of the configured leaves, and `TestDerivedWidths` pins them.
+# `attn_dp_rank` is not here either: no group coordinator knows it, so it is
+# stamped when the attention topology is initialized and `TestStampedRanks` is
+# what pins it. The other world width is not here because the group does not
+# know it; `TestTheTwoWorldWidths` pins it.
+#: (name, the group it is a position in, the member that answers it).
 SIZE_RANK_DELEGATIONS = [
-    ("launch_world_size", f"{_PS}.get_world_size"),
-    ("launch_world_rank", f"{_PS}.get_world_rank"),
-    ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
-    ("dcp_rank", f"{_PS}.get_dcp_rank"),
-    ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
-    ("moe_ep_rank", f"{_PS}.get_moe_expert_parallel_rank"),
-    ("moe_dp_rank", f"{_PS}.get_moe_data_parallel_rank"),
-    ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
-    ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
-    ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
+    ("launch_world_size", "world_group", "world_size"),
+    ("launch_world_rank", "world_group", "rank_in_group"),
+    ("tp_rank", "tp_group", "rank_in_group"),
+    ("dcp_rank", "dcp_group", "rank_in_group"),
+    ("pp_rank", "pp_group", "rank_in_group"),
+    ("moe_ep_rank", "moe_ep_group", "rank_in_group"),
+    ("moe_dp_rank", "moe_dp_group", "rank_in_group"),
+    ("moe_tp_rank", "moe_tp_group", "rank_in_group"),
+    ("attn_tp_rank", "attn_tp_group", "rank_in_group"),
+    ("attn_cp_rank", "attn_cp_group", "rank_in_group"),
 ]
 
 GROUP_DELEGATIONS = [
@@ -173,17 +177,29 @@ class _IsolatedOverrides(CustomTestCase):
 
 
 class TestParallelDelegation(_IsolatedOverrides):
-    def test_size_rank_delegate_to_canonical_getters(self):
-        # Patch each getter to a distinct sentinel: a miswired attribute would read
-        # a different (unpatched) getter and fail.
-        for i, (attr, target) in enumerate(SIZE_RANK_DELEGATIONS):
+    def test_a_rank_is_read_off_the_group_it_is_a_rank_in(self):
+        # A distinct sentinel per group: a miswired name would read a different
+        # (unpatched) group and fail rather than agree by accident.
+        for i, (attr, group, member) in enumerate(SIZE_RANK_DELEGATIONS):
             sentinel = 1000 + i
-            with patch(target, return_value=sentinel):
+            with get_parallel().override(
+                **{group: SimpleNamespace(**{member: sentinel})}
+            ):
                 self.assertEqual(
                     getattr(get_parallel(), attr),
                     sentinel,
-                    msg=f"{attr} must delegate to {target}",
+                    msg=f"{attr} must read {group}.{member}",
                 )
+
+    def test_a_rank_follows_the_group_a_scope_installs(self):
+        """The reason they are read off the group rather than stated beside it:
+        a scope that swaps the group moves the rank with it, and cannot install
+        one without the other."""
+        with get_parallel().override(tp_group=SimpleNamespace(rank_in_group=3)):
+            self.assertEqual(get_parallel().tp_rank, 3)
+            with get_parallel().override(tp_group=SimpleNamespace(rank_in_group=5)):
+                self.assertEqual(get_parallel().tp_rank, 5)
+            self.assertEqual(get_parallel().tp_rank, 3)
 
     def test_groups_delegate_to_canonical_getters(self):
         for attr, target in GROUP_DELEGATIONS:
@@ -2547,6 +2563,45 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             any("get_parallel().tp_group" in m for m in messages),
             f"expected the replacement to be named, got {messages}",
         )
+
+    def test_reading_through_the_context_does_not_walk_the_stack(self):
+        """The context is not a caller to warn: it is the replacement. It takes
+        the undecorated function, so a group read -- which runs per row-linear
+        on an eager forward -- does not pay for a frame inspection that can
+        only ever conclude the call was fine."""
+        from sglang.srt.distributed import parallel_state
+
+        wrapper = parallel_state.get_tp_group
+        self.assertIn(
+            wrapper,
+            parallel_state._UNWRAPPED,
+            "the getter should be wrapped, or this test proves nothing",
+        )
+        calls = []
+        original = parallel_state._UNWRAPPED[wrapper]
+
+        def counting():
+            calls.append(1)
+            return original()
+
+        parallel_state._UNWRAPPED[wrapper] = counting
+        self.addCleanup(parallel_state._UNWRAPPED.__setitem__, wrapper, original)
+        with _mock.patch.object(parallel_state, "sys") as fake_sys:
+            try:
+                get_parallel().tp_group
+            except Exception:
+                pass
+            fake_sys._getframe.assert_not_called()
+        self.assertEqual(calls, [1], "the context should reach the original")
+
+    def test_a_patched_getter_is_still_what_the_context_reads(self):
+        """Unwrapping must not cost the patch surface: a test that stands a
+        group into `parallel_state` is still the answer the context gives."""
+        from sglang.srt.distributed import parallel_state
+
+        stand_in = object()
+        with _mock.patch.object(parallel_state, "get_tp_group", return_value=stand_in):
+            self.assertIs(get_parallel().tp_group, stand_in)
 
     def test_the_package_that_defines_them_is_not_warned_at(self):
         """`srt/distributed/` keeps calling them: a read there would go through
