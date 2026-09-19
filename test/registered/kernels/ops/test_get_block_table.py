@@ -132,7 +132,22 @@ def test_get_block_table_strategies_match_reference(topk):
     assert torch.equal(expected, get_block_table(*inputs, elementwise=True))
 
 
-@pytest.mark.parametrize(("topk", "block_size"), [(10, 32), (7, 128)])
+@pytest.mark.parametrize(
+    ("topk", "block_size"),
+    [
+        (10, 32),
+        (7, 128),
+        # The blockwise kernel spreads one output row over
+        # `block_size // vec_width` threads, with `vec_width` 4 when
+        # `block_size % 4 == 0` and 1 otherwise. The two cases above only cover
+        # vec_width 4 with 8 and 32 threads per row. Cover the boundaries of that
+        # mapping as well: a scalar (vec_width 1) store path, and `block_size == 4`
+        # where a whole row is written by a single thread.
+        (8, 13),
+        (8, 4),
+        (8, 1),
+    ],
+)
 def test_get_block_table_supports_configured_layout(topk, block_size):
     token_num = seqlen_q_max = 256
     inputs = _make_valid_inputs(
