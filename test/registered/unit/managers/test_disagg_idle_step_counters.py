@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -168,11 +169,20 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 )
                 with (
                     patch(f"{PDMUX_MODULE}.get_current_stream_idx", return_value=0),
-                    patch(f"{PDMUX_MODULE}.set_pdmux_status"),
                     patch(f"{PDMUX_MODULE}.torch.cuda.empty_cache"),
                     patch(
                         f"{PDMUX_MODULE}.torch.cuda.stream",
                         side_effect=lambda stream: nullcontext(),
+                    ),
+                    # The prefill section runs under the duplicate communicator
+                    # `--enable-pdmux` builds, in place of the module flag this
+                    # replaces. The loop has no process groups at all, so stand
+                    # one in: the scope refuses to open without it rather than
+                    # letting prefill quietly share the decode communicator.
+                    patch.object(
+                        parallel_state,
+                        "_PDMUX_PREFILL_TP_GROUP",
+                        SimpleNamespace(world_size=1, rank_in_group=0),
                     ),
                 ):
                     self.run_and_check(

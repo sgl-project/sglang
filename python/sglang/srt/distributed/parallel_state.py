@@ -2077,8 +2077,7 @@ _WORLD: Optional[GroupCoordinator] = None
 
 
 def get_world_group() -> GroupCoordinator:
-    assert _WORLD is not None, "world group is not initialized"
-    return _WORLD
+    return get_parallel().world_group
 
 
 def init_world_group(
@@ -2157,43 +2156,37 @@ _DCP: Optional[GroupCoordinator] = None
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
-_ENABLE_PDMUX_P_TP: bool = False
 
+@contextmanager
+def pdmux_prefill_tp_group():
+    """Run on the prefill stream's own tensor-parallel communicator.
 
-def set_pdmux_status(enable_prefill_multiplexing: bool):
-    global _ENABLE_PDMUX_P_TP
-    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+    PD multiplexing builds a duplicate TP group -- the same ranks, a second
+    communicator -- so prefill and decode can occupy separate streams without
+    serialising on one. Nothing about the topology differs, so the scope states
+    the handle and nothing else.
+    """
+    assert _PDMUX_PREFILL_TP_GROUP is not None, (
+        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+    )
+    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
+        yield
 
 
 def get_tp_group() -> GroupCoordinator:
-    if _ENABLE_PDMUX_P_TP:
-        assert _PDMUX_PREFILL_TP_GROUP is not None, (
-            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-        )
-        return _PDMUX_PREFILL_TP_GROUP
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    return _TP
+    return get_parallel().tp_group
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert _ATTN_TP is not None, (
-        "attention tensor model parallel group is not initialized"
-    )
-    return _ATTN_TP
+    return get_parallel().attn_tp_group
 
 
 def get_shared_experts_tp_group() -> GroupCoordinator:
-    assert _SHARED_EXPERTS_TP is not None, (
-        "shared-expert tensor model parallel group is not initialized"
-    )
-    return _SHARED_EXPERTS_TP
+    return get_parallel().shared_experts_tp_group
 
 
 def get_attn_cp_group() -> GroupCoordinator:
-    assert _ATTN_CP is not None, (
-        "attention context model parallel group is not initialized"
-    )
-    return _ATTN_CP
+    return get_parallel().attn_cp_group
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2201,8 +2194,7 @@ def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
 
 
 def get_dcp_group() -> GroupCoordinator:
-    assert _DCP is not None, "decode context parallel group is not initialized"
-    return _DCP
+    return get_parallel().dcp_group
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -2211,18 +2203,15 @@ _MOE_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
-    assert _MOE_DP is not None, "moe data parallel group is not initialized"
-    return _MOE_DP
+    return get_parallel().moe_dp_group
 
 
 def get_moe_ep_group() -> GroupCoordinator:
-    assert _MOE_EP is not None, "expert model parallel group is not initialized"
-    return _MOE_EP
+    return get_parallel().moe_ep_group
 
 
 def get_moe_tp_group() -> GroupCoordinator:
-    assert _MOE_TP is not None, "expert model parallel group is not initialized"
-    return _MOE_TP
+    return get_parallel().moe_tp_group
 
 
 # kept for backward compatibility
@@ -2238,8 +2227,7 @@ def get_self_pp_group() -> GroupCoordinator:
 
 
 def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
+    return get_parallel().pp_group
 
 
 # kept for backward compatibility
@@ -3456,16 +3444,15 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
 _EXEMPT_CALLERS = ("sglang.srt.distributed.",)
 
 # Derived from the table that says which context name each getter answers, so a
-# getter added there is covered without being listed again here. A name the
-# context still reads through gives its getter as the source; one the context
-# computes itself names the getter it replaced.
-_CONTEXT_NAME_OF = {}
-for _context_name, _live in _LIVE_READS.items():
-    _source = _live.source if isinstance(_live, Live) else _live
-    _getter = _source if isinstance(_source, str) else getattr(_live, "replaces", "")
-    if _getter:
-        _CONTEXT_NAME_OF[_getter] = _context_name
-del _context_name, _live, _source, _getter
+# getter added there is covered without being listed again here. All of them
+# are covered, now that a group getter reads the context too -- nothing here is
+# called by the replacement, so the read path needs no exemption from its own
+# warning.
+_CONTEXT_NAME_OF = {
+    live.replaces: name
+    for name, live in _LIVE_READS.items()
+    if isinstance(live, Live) and live.replaces
+}
 # The width getters read a built group; the context answers the same names from
 # the configuration. Those are one answer rather than two only for the groups
 # the build checks against the configuration -- `_WIDTH_AND_GROUP` in
@@ -3480,12 +3467,6 @@ _CONTEXT_NAME_OF["get_pipeline_model_parallel_world_size"] = "pp_size"
 _CONTEXT_NAME_OF["get_moe_expert_parallel_world_size"] = "moe_ep_size"
 
 _ALREADY_WARNED: set = set()
-
-# Each wrapper to the function it wraps. The context resolves a getter by name,
-# so a test that patches one is still seen, and then takes the original from
-# here: the warning is for callers that reach past the context, and walking the
-# stack on the way to every group read would charge them all for it.
-_UNWRAPPED: dict = {}
 
 
 def _warn_if_called_from_outside(name: str, replacement: str):
@@ -3513,7 +3494,5 @@ def _warn_if_called_from_outside(name: str, replacement: str):
 for _name, _replacement in _CONTEXT_NAME_OF.items():
     _fn = globals().get(_name)
     if _fn is not None:
-        _wrapper = _warn_if_called_from_outside(_name, _replacement)(_fn)
-        _UNWRAPPED[_wrapper] = _fn
-        globals()[_name] = _wrapper
+        globals()[_name] = _warn_if_called_from_outside(_name, _replacement)(_fn)
 del _name, _replacement, _fn

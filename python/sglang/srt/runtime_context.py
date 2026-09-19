@@ -120,6 +120,18 @@ def _parallel_config_leaves() -> frozenset:
 _MISSING_READ = object()
 
 
+def _coordinator(attr: str, what: str):
+    """A process group the build stored, by the name it stored it under.
+
+    Read from `parallel_state`'s module state rather than through its getter,
+    because the getter now reads this context: the group has one address, and
+    a scope that redirects it is seen by everything.
+    """
+    group = getattr(_ps(), attr)
+    assert group is not None, f"{what} is not initialized"
+    return group
+
+
 class Live(msgspec.Struct, frozen=True):
     """How a rank / group / world width is answered, and what it means.
 
@@ -242,16 +254,64 @@ _LIVE_READS: dict = {
             "bundle has no replica index to report"
         ),
     ),
-    "world_group": "get_world_group",
-    "tp_group": "get_tp_group",
-    "pp_group": "get_pp_group",
-    "moe_ep_group": "get_moe_ep_group",
-    "moe_dp_group": "get_moe_dp_group",
-    "moe_tp_group": "get_moe_tp_group",
-    "attn_tp_group": "get_attn_tp_group",
-    "attn_cp_group": "get_attn_cp_group",
-    "shared_experts_tp_group": "get_shared_experts_tp_group",
-    "dcp_group": "get_dcp_group",
+    "world_group": Live(
+        source=lambda self, _a="_WORLD", _w="world group": _coordinator(_a, _w),
+        replaces="get_world_group",
+    ),
+    "tp_group": Live(
+        source=lambda self, _a="_TP", _w="tensor model parallel group": _coordinator(
+            _a, _w
+        ),
+        replaces="get_tp_group",
+    ),
+    "pp_group": Live(
+        source=lambda self, _a="_PP", _w="pipeline model parallel group": _coordinator(
+            _a, _w
+        ),
+        replaces="get_pp_group",
+    ),
+    "moe_ep_group": Live(
+        source=lambda self, _a="_MOE_EP", _w="expert model parallel group": (
+            _coordinator(_a, _w)
+        ),
+        replaces="get_moe_ep_group",
+    ),
+    "moe_dp_group": Live(
+        source=lambda self, _a="_MOE_DP", _w="moe data parallel group": _coordinator(
+            _a, _w
+        ),
+        replaces="get_moe_dp_group",
+    ),
+    "moe_tp_group": Live(
+        source=lambda self, _a="_MOE_TP", _w="expert model parallel group": (
+            _coordinator(_a, _w)
+        ),
+        replaces="get_moe_tp_group",
+    ),
+    "attn_tp_group": Live(
+        source=lambda self, _a="_ATTN_TP", _w="attention tensor model parallel group": (
+            _coordinator(_a, _w)
+        ),
+        replaces="get_attn_tp_group",
+    ),
+    "attn_cp_group": Live(
+        source=lambda self, _a="_ATTN_CP", _w="attention context model parallel group": (
+            _coordinator(_a, _w)
+        ),
+        replaces="get_attn_cp_group",
+    ),
+    "shared_experts_tp_group": Live(
+        source=lambda self, _a="_SHARED_EXPERTS_TP", _w="shared-expert tensor model parallel group": (
+            _coordinator(_a, _w)
+        ),
+        replaces="get_shared_experts_tp_group",
+    ),
+    "dcp_group": Live(
+        source=lambda self, _a="_DCP", _w="decode context parallel group": _coordinator(
+            _a, _w
+        ),
+        replaces="get_dcp_group",
+    ),
 }
 
 
@@ -678,10 +738,6 @@ class ParallelContext:
         live = _LIVE_READS.get(name, _MISSING_READ)
         if live is not _MISSING_READ:
             source = live.source if isinstance(live, Live) else live
-            if isinstance(source, str):
-                parallel_state = _ps()
-                getter = getattr(parallel_state, source)
-                return parallel_state._UNWRAPPED.get(getter, getter)()
             if source is not None:
                 return source(self)
             why = live.unstamped if isinstance(live, Live) else ""

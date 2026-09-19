@@ -14,7 +14,6 @@ import types
 import unittest
 import warnings
 from types import SimpleNamespace
-from unittest import mock as _mock
 from unittest.mock import patch
 
 import msgspec
@@ -114,6 +113,14 @@ def _scope_entries_that_say_nothing(paths):
 
 
 _PS = "sglang.srt.distributed.parallel_state"
+
+
+def _parallel_state():
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 _DP = "sglang.srt.layers.dp_attention"
 
 # Ranks and the launch width are read off the group they are a position in:
@@ -138,16 +145,17 @@ SIZE_RANK_DELEGATIONS = [
     ("attn_cp_rank", "attn_cp_group", "rank_in_group"),
 ]
 
+#: (context name, the module global the build stores that group in).
 GROUP_DELEGATIONS = [
-    ("world_group", f"{_PS}.get_world_group"),
-    ("tp_group", f"{_PS}.get_tp_group"),
-    ("dcp_group", f"{_PS}.get_dcp_group"),
-    ("pp_group", f"{_PS}.get_pp_group"),
-    ("moe_ep_group", f"{_PS}.get_moe_ep_group"),
-    ("moe_dp_group", f"{_PS}.get_moe_dp_group"),
-    ("moe_tp_group", f"{_PS}.get_moe_tp_group"),
-    ("attn_tp_group", f"{_PS}.get_attn_tp_group"),
-    ("attn_cp_group", f"{_PS}.get_attn_cp_group"),
+    ("world_group", "_WORLD"),
+    ("tp_group", "_TP"),
+    ("dcp_group", "_DCP"),
+    ("pp_group", "_PP"),
+    ("moe_ep_group", "_MOE_EP"),
+    ("moe_dp_group", "_MOE_DP"),
+    ("moe_tp_group", "_MOE_TP"),
+    ("attn_tp_group", "_ATTN_TP"),
+    ("attn_cp_group", "_ATTN_CP"),
 ]
 
 
@@ -201,14 +209,16 @@ class TestParallelDelegation(_IsolatedOverrides):
                 self.assertEqual(get_parallel().tp_rank, 5)
             self.assertEqual(get_parallel().tp_rank, 3)
 
-    def test_groups_delegate_to_canonical_getters(self):
-        for attr, target in GROUP_DELEGATIONS:
+    def test_a_group_is_read_from_where_the_build_stored_it(self):
+        from sglang.srt.distributed import parallel_state
+
+        for attr, stored_in in GROUP_DELEGATIONS:
             sentinel = object()
-            with patch(target, return_value=sentinel):
+            with patch.object(parallel_state, stored_in, sentinel):
                 self.assertIs(
                     getattr(get_parallel(), attr),
                     sentinel,
-                    msg=f"{attr} must delegate to {target}",
+                    msg=f"{attr} must read parallel_state.{stored_in}",
                 )
 
     def test_wrapper_holds_no_resolved_state(self):
@@ -230,17 +240,14 @@ class TestTheTwoWorldWidths(_IsolatedOverrides):
     """
 
     def test_the_launch_width_is_what_the_group_was_built_at(self):
-        with patch(f"{_PS}.get_world_size", return_value=4):
+        with patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=4)):
             self.assertEqual(get_parallel().launch_world_size, 4)
 
     def test_the_ceiling_is_the_configured_one_when_there_is_one(self):
         parallel = get_parallel()
         with (
             parallel.override(max_ep_size=32),
-            patch(
-                f"{_PS}.get_world_size",
-                side_effect=AssertionError("the built group must not be asked"),
-            ),
+            patch.object(_parallel_state(), "_WORLD", None),
         ):
             self.assertEqual(parallel.max_world_size, 32)
 
@@ -248,7 +255,7 @@ class TestTheTwoWorldWidths(_IsolatedOverrides):
         parallel = get_parallel()
         with (
             parallel.override(max_ep_size=None),
-            patch(f"{_PS}.get_world_size", return_value=8),
+            patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=8)),
         ):
             self.assertEqual(parallel.max_world_size, 8)
 
@@ -257,10 +264,7 @@ class TestTheTwoWorldWidths(_IsolatedOverrides):
         parallel = get_parallel()
         with (
             parallel.override(launch_world_size=2, max_ep_size=None),
-            patch(
-                f"{_PS}.get_world_size",
-                side_effect=AssertionError("the built group must not be asked"),
-            ),
+            patch.object(_parallel_state(), "_WORLD", None),
         ):
             self.assertEqual(parallel.launch_world_size, 2)
             self.assertEqual(parallel.max_world_size, 2)
@@ -397,19 +401,15 @@ class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
             role="test",
             ranks=SpawnRanks(world_rank=5),
         )
-        with patch(
-            f"{_PS}.get_attn_tensor_model_parallel_rank",
-            side_effect=AssertionError("no group must be consulted"),
-        ):
+        with patch.object(_parallel_state(), "_ATTN_TP", None):
             self.assertEqual(get_parallel().attn_tp_rank, 1)
             self.assertEqual(get_parallel().attn_dp_rank, 1)
 
     def test_without_a_bundle_it_still_asks_the_group(self):
         """Unchanged for every process that publishes without a placement."""
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
-        with patch(
-            f"{_PS}.get_attn_tp_group",
-            return_value=SimpleNamespace(rank_in_group=3),
+        with patch.object(
+            _parallel_state(), "_ATTN_TP", SimpleNamespace(rank_in_group=3)
         ):
             self.assertEqual(get_parallel().attn_tp_rank, 3)
 
@@ -766,12 +766,12 @@ class TestParallelDCP(_IsolatedOverrides):
         gated on a width that is."""
         with (
             get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=False),
-            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
+            patch.object(_parallel_state(), "_DCP", None),
         ):
             self.assertEqual(get_parallel().attn_dcp_rank, 0)
         with (
             get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True),
-            patch(f"{_PS}.get_dcp_rank", return_value=3),
+            patch.object(_parallel_state(), "_DCP", SimpleNamespace(rank_in_group=3)),
         ):
             self.assertEqual(get_parallel().attn_dcp_rank, 3)
 
@@ -2096,7 +2096,7 @@ class TestDerivedWidths(_IsolatedOverrides):
         )
         parallel = get_parallel()
         parallel.override_permanently(attn_tp_size=4)
-        with patch(f"{_PS}.get_world_size", return_value=9):
+        with patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=9)):
             self.assertEqual(parallel.launch_world_size, 9)
 
     def test_the_bare_name_is_gone(self):
@@ -2553,58 +2553,63 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
 
         from sglang.srt.distributed import parallel_state
 
-        parallel_state._ALREADY_WARNED.discard("get_tp_group")
-        self.addCleanup(parallel_state._ALREADY_WARNED.discard, "get_tp_group")
+        parallel_state._ALREADY_WARNED.discard("get_tensor_model_parallel_rank")
+        self.addCleanup(
+            parallel_state._ALREADY_WARNED.discard, "get_tensor_model_parallel_rank"
+        )
         with warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always")
             try:
-                parallel_state.get_tp_group()
+                parallel_state.get_tensor_model_parallel_rank()
             except Exception:
                 pass
         messages = [str(w.message) for w in seen]
         self.assertTrue(
-            any("get_parallel().tp_group" in m for m in messages),
+            any("get_parallel().tp_rank" in m for m in messages),
             f"expected the replacement to be named, got {messages}",
         )
 
-    def test_reading_through_the_context_does_not_walk_the_stack(self):
-        """The context is not a caller to warn: it is the replacement. It takes
-        the undecorated function, so a group read -- which runs per row-linear
-        on an eager forward -- does not pay for a frame inspection that can
-        only ever conclude the call was fine."""
-        from sglang.srt.distributed import parallel_state
+    def test_nothing_the_context_answers_with_calls_back_into_the_package(self):
+        """The read path reaches the stored group, not the getter that used to
+        wrap it -- which is what lets the getters be deprecated without the
+        replacement tripping the warning meant for people who bypass it."""
 
-        wrapper = parallel_state.get_tp_group
-        self.assertIn(
-            wrapper,
-            parallel_state._UNWRAPPED,
-            "the getter should be wrapped, or this test proves nothing",
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import _LIVE_READS, Live
+
+        sources = [
+            live.source if isinstance(live, Live) else live
+            for live in _LIVE_READS.values()
+        ]
+        self.assertEqual(
+            [src for src in sources if isinstance(src, str)],
+            [],
+            "a name answered by calling a parallel_state getter is a name the "
+            "deprecation cannot cover",
         )
-        calls = []
-        original = parallel_state._UNWRAPPED[wrapper]
+        self.assertNotIn("sglang.srt.runtime_context", parallel_state._EXEMPT_CALLERS)
+        self.assertFalse(hasattr(parallel_state, "_UNWRAPPED"))
 
-        def counting():
-            calls.append(1)
-            return original()
-
-        parallel_state._UNWRAPPED[wrapper] = counting
-        self.addCleanup(parallel_state._UNWRAPPED.__setitem__, wrapper, original)
-        with _mock.patch.object(parallel_state, "sys") as fake_sys:
-            try:
-                get_parallel().tp_group
-            except Exception:
-                pass
-            fake_sys._getframe.assert_not_called()
-        self.assertEqual(calls, [1], "the context should reach the original")
-
-    def test_a_patched_getter_is_still_what_the_context_reads(self):
-        """Unwrapping must not cost the patch surface: a test that stands a
-        group into `parallel_state` is still the answer the context gives."""
+    def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
+        """The getters read the context, so redirecting a group redirects them
+        too. PD multiplexing needs exactly this: the in-package readers have to
+        follow the prefill communicator, not just the ones asking the context."""
         from sglang.srt.distributed import parallel_state
 
-        stand_in = object()
-        with _mock.patch.object(parallel_state, "get_tp_group", return_value=stand_in):
+        stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
+        with get_parallel().override(tp_group=stand_in):
             self.assertIs(get_parallel().tp_group, stand_in)
+            self.assertIs(parallel_state.get_tp_group(), stand_in)
+
+    def test_standing_in_the_store_is_what_a_test_does_now(self):
+        """The read reaches the stored group, so that is the patch surface --
+        and a getter, which reads the context, follows it."""
+        from sglang.srt.distributed import parallel_state
+
+        stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
+        with patch.object(parallel_state, "_TP", stand_in):
+            self.assertIs(get_parallel().tp_group, stand_in)
+            self.assertIs(parallel_state.get_tp_group(), stand_in)
 
     def test_the_package_that_defines_them_is_not_warned_at(self):
         """`srt/distributed/` keeps calling them: a read there would go through
@@ -2613,10 +2618,14 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
 
         from sglang.srt.distributed import parallel_state
 
-        parallel_state._ALREADY_WARNED.discard("get_tp_group")
-        self.addCleanup(parallel_state._ALREADY_WARNED.discard, "get_tp_group")
+        parallel_state._ALREADY_WARNED.discard("get_tensor_model_parallel_rank")
+        self.addCleanup(
+            parallel_state._ALREADY_WARNED.discard, "get_tensor_model_parallel_rank"
+        )
         caller = types.ModuleType("sglang.srt.distributed.pretend_internal")
-        caller.__dict__["call"] = lambda: parallel_state.get_tp_group()
+        caller.__dict__["call"] = lambda: (
+            parallel_state.get_tensor_model_parallel_rank()
+        )
         exec(
             "def call():\n    from sglang.srt.distributed import parallel_state\n"
             "    return parallel_state.get_tp_group()",
