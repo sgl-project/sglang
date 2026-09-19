@@ -16,7 +16,9 @@ from sglang.test.test_utils import CustomTestCase, find_available_port
 register_cpu_ci(est_time=43, suite="stage-a-test-cpu-intel")
 
 
-def run_distributed_test(rank, world_size, master_port, output_writer, fn):
+def run_distributed_test(
+    rank, world_size, master_port, output_writer, fn, init_legacy_shm=True
+):
     try:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -25,10 +27,10 @@ def run_distributed_test(rank, world_size, master_port, output_writer, fn):
         os.environ["LOCAL_SIZE"] = str(world_size)
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        torch.ops.sgl_kernel.initialize(world_size, rank)
 
+        if init_legacy_shm:
+            torch.ops.sgl_kernel.initialize(world_size, rank)
         fn(rank, world_size)
-
         execution_ok = True
     except Exception as e:
         print(f"subprocess[{rank=}] has error: {e}", flush=True)
@@ -221,7 +223,7 @@ def group_all_to_all_fn(rank, world_size):
 
 
 class TestComm(CustomTestCase):
-    def _spawn_and_check(self, fn, world_size=2):
+    def _spawn_and_check(self, fn, world_size=2, init_legacy_shm=True):
         mp.set_start_method("spawn", force=True)
         master_port = find_available_port(23456)
 
@@ -237,6 +239,7 @@ class TestComm(CustomTestCase):
                     master_port=master_port,
                     output_writer=output_writer,
                     fn=fn,
+                    init_legacy_shm=init_legacy_shm,
                 ),
             )
             p.start()
@@ -249,22 +252,22 @@ class TestComm(CustomTestCase):
             p.join()
 
     def test_all_reduce(self):
-        self._spawn_and_check(all_reduce_fn)
+        self._spawn_and_check(all_reduce_fn, init_legacy_shm=True)
 
     def test_all_gather(self):
-        self._spawn_and_check(all_gather_fn)
+        self._spawn_and_check(all_gather_fn, init_legacy_shm=True)
 
     def test_all_gather_into_tensor(self):
-        self._spawn_and_check(all_gather_into_tensor_fn)
+        self._spawn_and_check(all_gather_into_tensor_fn, init_legacy_shm=True)
 
     def test_reduce_scatter_tensor(self):
-        self._spawn_and_check(reduce_scatter_tensor_fn)
+        self._spawn_and_check(reduce_scatter_tensor_fn, init_legacy_shm=True)
 
     def test_group_all_reduce(self):
-        self._spawn_and_check(group_all_reduce_fn, world_size=4)
+        self._spawn_and_check(group_all_reduce_fn, world_size=4, init_legacy_shm=False)
 
     def test_group_all_gather(self):
-        self._spawn_and_check(group_all_gather_fn, world_size=4)
+        self._spawn_and_check(group_all_gather_fn, world_size=4, init_legacy_shm=False)
 
     def test_group_all_to_all(self):
         self._spawn_and_check(group_all_to_all_fn, world_size=4)

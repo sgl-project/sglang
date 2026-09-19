@@ -1,8 +1,8 @@
 #include <ATen/record_function.h>
 #include <torch/all.h>
 
+#include "group_shm.h"
 #include "shm.h"
-
 // Communication settings
 static int world_rank = -1;
 static int world_size = -1;
