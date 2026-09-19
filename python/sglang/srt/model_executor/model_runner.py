@@ -610,10 +610,12 @@ class ModelRunner:
         )
 
     def init_kv_cache_configurator(self):
+        # The replica count that shares this KV budget is the deployment's, not
+        # the one a draft scope reports; the pool is allocated outside any scope.
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
-            attn_dp_size=self.attn_dp_size,
+            attn_dp_size=get_parallel().attn_dp_size,
             pp_size=self.pp_size,
             pp_group=self.pp_group,
             model=self.model,
