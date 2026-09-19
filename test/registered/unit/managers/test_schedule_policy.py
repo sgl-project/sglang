@@ -276,6 +276,35 @@ class TestShortestPrefillFirst(CustomTestCase):
                 self.assertEqual(limit, expected_limit)
                 self.assertEqual([r.rid for r in waiting], expected_order)
 
+    def test_interleaving_scan_cap_preserves_unscanned_requests(self):
+        continuation = self.make_req("continuation", 8192)
+        for large_count in (126, 127, 128):
+            with self.subTest(large_count=large_count):
+                policy = self.make_policy("hrrn", enable_prefill_interleaving=True)
+                large = [self.make_req(str(i), 4096) for i in range(large_count)]
+                small = [self.make_req("first", 256), self.make_req("second", 256)]
+                waiting = large + small
+                selected_count = min(2, 128 - large_count)
+                limit = policy.prefill_interleaving_chunk_limit(
+                    continuation, waiting, 4096, 256
+                )
+                self.assertEqual(
+                    limit, 4096 - selected_count * 256 if selected_count else None
+                )
+                self.assertEqual(
+                    waiting, small[:selected_count] + large + small[selected_count:]
+                )
+
+        waiting = [self.make_req(str(i), 1) for i in range(130)]
+        original = waiting[:]
+        self.assertEqual(
+            self.policy.prefill_interleaving_chunk_limit(
+                continuation, waiting, 4096, 1
+            ),
+            4096 - 128,
+        )
+        self.assertEqual(waiting, original)
+
     def test_minimum_and_shorter_than_continuation_are_independent(self):
         for name in ("hrrn", "shortest-prefill-first"):
             with self.subTest(policy=name):

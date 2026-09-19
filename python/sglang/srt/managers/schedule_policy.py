@@ -15,6 +15,9 @@ from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
+# Match the HRRN/LPM fallback threshold; this is a CPU-work cap, not a tuned optimum.
+_PREFILL_INTERLEAVING_SCAN_LIMIT = 128
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -479,7 +482,7 @@ class SchedulePolicy:
         reserved = 0
         selected = []
         skipped = []
-        for req in waiting_queue:
+        for req in waiting_queue[:_PREFILL_INTERLEAVING_SCAN_LIMIT]:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if (shortest_first and work >= remaining) or (
@@ -495,7 +498,7 @@ class SchedulePolicy:
             return None
         if not shortest_first:
             # Admission stops on failure; try fitting requests before skipped ones.
-            waiting_queue[:] = selected + skipped
+            waiting_queue[: len(selected) + len(skipped)] = selected + skipped
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
 

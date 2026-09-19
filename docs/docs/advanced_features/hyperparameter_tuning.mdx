@@ -89,7 +89,12 @@ continuation uses the normal chunk budget. Memory admission can still limit eith
 | Policy | Waiting-request selection |
 | --- | --- |
 | `shortest-prefill-first` | Select requests shorter than the continuation; stop at the first ineligible request. |
-| `hrrn` | Scan the whole queue in HRRN order, selecting requests that fit the remaining budget and skipping those that do not. |
+| `hrrn` | Select fitting requests in queue order, skipping those that do not fit. |
+
+Both policies check at most the first 128 waiting requests per interleaving pass;
+the unscanned tail stays in place. HRRN uses FCFS ordering when the waiting queue
+exceeds its existing 128-request fallback threshold. The interleaving scan cap
+limits eligibility checks, not prefix matching or total scheduler work.
 
 HRRN ages requests by prefill tokens processed since arrival, relative to uncached
 work. Interleaving preserves HRRN order among selected requests but does not bound
