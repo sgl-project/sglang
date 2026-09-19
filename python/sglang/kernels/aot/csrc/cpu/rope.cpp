@@ -13,6 +13,11 @@ struct RopeParams {
   int64_t batches{1}, seqlen{1}, num_heads{1}, num_heads_kv{1};
   int64_t q_strideB{0}, q_strideS{0}, q_strideH{0};
   int64_t k_strideB{0}, k_strideS{0}, k_strideH{0};
+  // out-of-place destination strides; default to a contiguous [B, S, H, D] output
+  int64_t q_out_strideB{0}, q_out_strideS{0}, q_out_strideH{0};
+  int64_t k_out_strideB{0}, k_out_strideS{0}, k_out_strideH{0};
+
+  RopeParams() = default;
 
   RopeParams(const at::Tensor& query, const at::Tensor& key, int64_t head_size_, int64_t rotary_dim_)
       : rotary_dim(rotary_dim_), head_size(head_size_) {
@@ -51,6 +56,12 @@ struct RopeParams {
       default:
         TORCH_CHECK(false, "Expected a 2D/3D/4D tensor, got ", ndim, "D.");
     }
+    q_out_strideH = head_size;
+    k_out_strideH = head_size;
+    q_out_strideS = num_heads * head_size;
+    k_out_strideS = num_heads_kv * head_size;
+    q_out_strideB = seqlen * q_out_strideS;
+    k_out_strideB = seqlen * k_out_strideS;
   }
 
   inline int64_t rows() const {
@@ -63,10 +74,10 @@ struct RopeParams {
     return b * k_strideB + s * k_strideS + h * k_strideH;
   }
   inline int64_t q_out_offset(int64_t b, int64_t s, int64_t h) const {
-    return ((b * seqlen + s) * num_heads + h) * head_size;
+    return b * q_out_strideB + s * q_out_strideS + h * q_out_strideH;
   }
   inline int64_t k_out_offset(int64_t b, int64_t s, int64_t h) const {
-    return ((b * seqlen + s) * num_heads_kv + h) * head_size;
+    return b * k_out_strideB + s * k_out_strideS + h * k_out_strideH;
   }
 };
 
@@ -196,7 +207,8 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull> {
   template <typename CosT>
   static inline void
   apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, SplitCosSinRow<CosT> cache, int size) {
-    constexpr int kVecSize = at::vec::Vectorized<scalar_t>::size();
+    // load_float_vec2/store_float_vec2 move two float vectors per call, for float and reduced alike
+    constexpr int kVecSize = 2 * at::vec::Vectorized<float>::size();
     const int half_size = size / 2;
     int d = 0;
     for (; d <= half_size - kVecSize; d += kVecSize) {
@@ -210,8 +222,8 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull> {
       auto out1 = x1 * cos_x1 - y1 * sin_x1;
       auto out2 = y0 * cos_y0 + x0 * sin_y0;
       auto out3 = y1 * cos_y1 + x1 * sin_y1;
-      convert_from_float_ext<scalar_t>(out0, out1).store(out + d);
-      convert_from_float_ext<scalar_t>(out2, out3).store(out + half_size + d);
+      store_float_vec2(out + d, out0, out1);
+      store_float_vec2(out + half_size + d, out2, out3);
     }
     for (; d < half_size; ++d) {
       float x = input[d], y = input[d + half_size];
@@ -270,7 +282,7 @@ void rotary_embedding_kernel_impl(
 // cos:   [num_tokens, head_dim]
 // sin:   [num_tokens, head_dim]
 // Gemma 4's vision tower rotates ndim = 2 head_dim chunks independently, so
-// this is apply_rotary_pos_emb_cpu run once per chunk, in place.
+// this is the neox/rotate_half rope run once per chunk, in place.
 void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
   CHECK_DIM(3, query);
   const auto input_dtype = query.scalar_type();
@@ -379,37 +391,92 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   return std::make_tuple(query_out, key_out);
 }
 
-// query: [num_tokens, num_heads, head_size]
-// key: [num_tokens, num_heads, head_size]
-// cos: [num_tokens, head_size]
-// sin: [num_tokens, head_size]
+// Matches apply_rotary_pos_emb_native_eager: neox/rotate_half, computed in float, out-of-place.
+// query: [..., num_heads, head_size], with num_heads at unsqueeze_dim
+// key:   [..., num_kv_heads, head_size]
+// cos/sin: query's shape with the unsqueeze_dim axis removed, e.g.
+//   3D query [num_tokens, num_heads, head_size], cos [num_tokens, head_size], unsqueeze_dim = 1
+//   4D query [batch, num_heads, seq_len, head_size], cos [batch, seq_len, head_size], unsqueeze_dim = 1
 std::tuple<at::Tensor, at::Tensor>
-apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
-  CHECK_DIM(3, query);
+apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin, int64_t unsqueeze_dim) {
+  const int64_t ndim = query.dim();
+  TORCH_CHECK(ndim >= 3, "query/key must be at least 3D [..., num_heads, head_size], got ", ndim, "D.");
+  CHECK_EQ(key.dim(), ndim);
+  CHECK_EQ(cos.dim(), ndim - 1);
+  CHECK_EQ(sin.dim(), ndim - 1);
+  TORCH_CHECK(unsqueeze_dim >= 0 && unsqueeze_dim < ndim - 1, "invalid unsqueeze_dim ", unsqueeze_dim);
+
   const auto input_dtype = query.scalar_type();
-  int64_t num_tokens = query.size(0);
-  int64_t num_heads = query.size(1);
-  int64_t head_size = query.size(2);
+  CHECK_EQ(key.scalar_type(), input_dtype);
+  CHECK_EQ(sin.scalar_type(), cos.scalar_type());
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, num_heads, head_size}, input_dtype);
-  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
-  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
+  const int64_t head_size = query.size(-1);
   TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
+  CHECK_EQ(key.size(-1), head_size);
+  CHECK_EQ(cos.size(-1), head_size);
+  CHECK_EQ(sin.size(-1), head_size);
 
-  const RopeParams p{query, key, head_size, head_size};
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), [&] {
-    scalar_t* q_ptr = query.data_ptr<scalar_t>();
-    scalar_t* k_ptr = key.data_ptr<scalar_t>();
-    const param_t* cos_ptr = cos.data_ptr<param_t>();
-    const param_t* sin_ptr = sin.data_ptr<param_t>();
+  // Fold the non-head dims into [outer, num_heads, inner, head_size]: cos/sin are shared
+  // across num_heads, so a cos/sin row is addressed by (outer, inner).
+  int64_t outer_size = 1, inner_size = 1;
+  for (int64_t d = 0; d < ndim - 1; ++d) {
+    if (d == unsqueeze_dim) {
+      continue;
+    }
+    const int64_t cos_d = d < unsqueeze_dim ? d : d - 1;
+    CHECK_EQ(key.size(d), query.size(d));
+    CHECK_EQ(cos.size(cos_d), query.size(d));
+    CHECK_EQ(sin.size(cos_d), query.size(d));
+    if (d < unsqueeze_dim) {
+      outer_size *= query.size(d);
+    } else {
+      inner_size *= query.size(d);
+    }
+  }
+
+  at::Tensor query_c = query.contiguous();
+  at::Tensor key_c = key.contiguous();
+  at::Tensor cos_c = cos.contiguous();
+  at::Tensor sin_c = sin.contiguous();
+  at::Tensor query_out = at::empty_like(query_c);
+  at::Tensor key_out = at::empty_like(key_c);
+
+  RopeParams p;
+  p.head_size = head_size;
+  p.rotary_dim = head_size;
+  p.batches = outer_size;
+  p.seqlen = inner_size;
+  p.num_heads = query.size(unsqueeze_dim);
+  p.num_heads_kv = key.size(unsqueeze_dim);
+  p.q_strideS = head_size;
+  p.k_strideS = head_size;
+  p.q_strideH = inner_size * head_size;
+  p.k_strideH = inner_size * head_size;
+  p.q_strideB = p.num_heads * p.q_strideH;
+  p.k_strideB = p.num_heads_kv * p.k_strideH;
+  // output keeps the input layout, head dim still at unsqueeze_dim
+  p.q_out_strideB = p.q_strideB;
+  p.q_out_strideS = p.q_strideS;
+  p.q_out_strideH = p.q_strideH;
+  p.k_out_strideB = p.k_strideB;
+  p.k_out_strideS = p.k_strideS;
+  p.k_out_strideH = p.k_strideH;
+
+  CPU_DISPATCH_FLOATING_TYPES_EXT(input_dtype, cos_c.scalar_type(), [&] {
+    const param_t* cos_ptr = cos_c.data_ptr<param_t>();
+    const param_t* sin_ptr = sin_c.data_ptr<param_t>();
     auto cache_pos = [cos_ptr, sin_ptr, head_size](int64_t token) -> SplitCosSinRow<param_t> {
       return {cos_ptr + token * head_size, sin_ptr + token * head_size};
     };
-    rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, true>(q_ptr, k_ptr, q_ptr, k_ptr, p, cache_pos);
+    rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, false>(
+        query_out.data_ptr<scalar_t>(),
+        key_out.data_ptr<scalar_t>(),
+        query_c.data_ptr<scalar_t>(),
+        key_c.data_ptr<scalar_t>(),
+        p,
+        cache_pos);
   });
-  return std::make_tuple(query, key);
+  return std::make_tuple(query_out, key_out);
 }
 
 // positions: [num_tokens] (text only) or [3, num_tokens] (T/H/W positions with multimodal inputs)
