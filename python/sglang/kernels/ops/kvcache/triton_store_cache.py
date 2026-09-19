@@ -61,7 +61,13 @@ def _triton_fused_store_flashmla_kernel(
     if token_id >= N:
         return
 
-    loc = tl.load(indices_ptr + token_id).to(tl.int32)
+    # int64 slot arithmetic: with int32 the byte offsets (page * BYTES_PER_PAGE) wrap once a
+    # per-layer cache passes 2 GiB (~3.68M tokens at 584 B) and the store lands ~4 GiB below the
+    # buffer -> GPU memory fault. A negative slot id is the "no write" sentinel (as in the HIP
+    # K-store kernel); unguarded, its scale bytes overwrote slot PAGE_SIZE-1 of page 0.
+    loc = tl.load(indices_ptr + token_id).to(tl.int64)
+    if loc < 0:
+        return
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
@@ -169,7 +175,10 @@ def _triton_fused_store_indexer_kernel(
     if token_id >= N:
         return
 
-    loc = tl.load(indices_ptr + token_id).to(tl.int32)
+    # same int64 / negative-sentinel handling as the flashmla store above
+    loc = tl.load(indices_ptr + token_id).to(tl.int64)
+    if loc < 0:
+        return
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
