@@ -329,7 +329,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "fa3"
         elif (
             get_platform().is_sm100
-            and is_no_spec_infer_or_topk_one(resolved_view(server_args))
+            and cfg.speculative_eagle_topk in (None, 1)
             and (
                 cfg.speculative_algorithm is None
                 or cfg.speculative_eagle_topk is not None
