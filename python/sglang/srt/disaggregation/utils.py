@@ -288,6 +288,10 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class CustomizedInfoError(ValueError):
+    """A request's customized_info cannot fit or be encoded for PD transfer."""
+
+
 class MetadataBuffers:
     def __init__(
         self,
@@ -491,19 +495,22 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-        payload = (
-            b""
-            if req.customized_info is None
-            else msgspec.msgpack.encode(
-                req.customized_info,
-                # Do not carry the sender's GPU ordinal to the decode host.
-                enc_hook=lambda obj: enc_hook(
-                    obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
-                ),
+        try:
+            payload = (
+                b""
+                if req.customized_info is None
+                else msgspec.msgpack.encode(
+                    req.customized_info,
+                    # Do not carry the sender's GPU ordinal to the decode host.
+                    enc_hook=lambda obj: enc_hook(
+                        obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
+                    ),
+                )
             )
-        )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CustomizedInfoError(f"Cannot encode customized_info: {exc}") from exc
         if len(payload) > self.output_customized_info.shape[1]:
-            raise ValueError(
+            raise CustomizedInfoError(
                 f"customized_info payload ({len(payload)} bytes) exceeds "
                 "disaggregation metadata capacity "
                 f"({self.output_customized_info.shape[1]} bytes). Increase "
