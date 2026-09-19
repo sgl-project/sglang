@@ -3,7 +3,7 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
@@ -79,7 +80,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_function_calling_format(self):
         """
@@ -883,7 +884,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
     def test_pythonic_tool_call_prompt(self):
         """
