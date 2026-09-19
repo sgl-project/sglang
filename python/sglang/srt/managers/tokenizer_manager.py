@@ -3066,6 +3066,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
+            reason_type = (recv_obj.finished_reasons[i] or {}).get("type")
+            if reason_type in ("stop", "length"):
+                outcome = "success"
+            elif reason_type == "abort":
+                outcome = "abort"
+            else:
+                outcome = "other"
+            self.metrics_collector.observe_finished_outcome(
+                labels=labels,
+                outcome=outcome,
+                prompt_tokens=recv_obj.prompt_tokens[i],
+                cached_tokens=recv_obj.cached_tokens[i],
+            )
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
