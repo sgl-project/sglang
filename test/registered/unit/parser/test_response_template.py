@@ -21,7 +21,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
-    resolve_detector_response_template,
+    resolve_response_template,
     validate_response_template_for_serving,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -140,7 +140,7 @@ class TestResponseTemplateLoading(unittest.TestCase):
         )
 
         self.assertEqual(
-            resolve_detector_response_template(tokenizer, None),
+            resolve_response_template(tokenizer, None),
             GEMMA4_RESPONSE_TEMPLATE,
         )
 

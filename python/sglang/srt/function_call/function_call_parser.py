@@ -129,11 +129,12 @@ class FunctionCallParser:
         ) or self._InternalToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
-            sig = inspect.signature(detector_class)
-            if tokenizer is not None and "tokenizer" in sig.parameters:
-                kwargs["tokenizer"] = tokenizer
-            if "prefix" in sig.parameters:
-                kwargs["prefix"] = prefix
+            if tokenizer is not None or prefix:
+                parameters = inspect.signature(detector_class).parameters
+                if tokenizer is not None and "tokenizer" in parameters:
+                    kwargs["tokenizer"] = tokenizer
+                if prefix and "prefix" in parameters:
+                    kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")

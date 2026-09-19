@@ -1056,7 +1056,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and self.tool_call_parser
                     and request.tool_choice != "none"
                 ),
-                prefix=request._response_parser_prefix,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -2017,24 +2016,20 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
+            native_parser = None
             detector_owns_format = False
             if self.tool_call_parser:
-                probe = FunctionCallParser(
+                native_parser = FunctionCallParser(
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                 )
-                detector_owns_format = self._tool_parser_owns_format(probe)
+                detector_owns_format = self._tool_parser_owns_format(native_parser)
             if is_required and not detector_owns_format:
                 tool_parser = JsonArrayParser()
-            elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    prefix=request._response_parser_prefix,
-                )
+            else:
+                tool_parser = native_parser
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -2048,7 +2043,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=isinstance(tool_parser, FunctionCallParser),
-                prefix=request._response_parser_prefix,
             )
 
         current_output_index = -1

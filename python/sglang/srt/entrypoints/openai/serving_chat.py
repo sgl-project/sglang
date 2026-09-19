@@ -2387,7 +2387,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_call_parser_active=self._tool_call_parsing_active(request),
-                        prefix=request._response_parser_prefix,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -2761,7 +2760,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=self._tool_call_parsing_active(request),
-                prefix=request._response_parser_prefix,
             )
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
@@ -3044,34 +3042,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.tool_choice, ToolChoice
             )
             # For required/named tool choice: use JsonArrayParser when the
-            # constrained output is plain JSON (detector doesn't support
-            # structural_tag or no parser configured). Use FunctionCallParser
-            # only when the detector supports structural_tag and will produce
-            # native format output.
-            if is_required:
-                use_native_parser = False
-                if self.tool_call_parser:
-                    probe = FunctionCallParser(
-                        tools=effective_tools,
-                        tool_call_parser=self.tool_call_parser,
-                        tokenizer=self.tokenizer_manager.tokenizer,
-                        prefix=request._response_parser_prefix,
-                    )
-                    use_native_parser = (
-                        probe.detector.supports_structural_tag()
-                        or probe.detector.parses_required_natively()
-                    )
-                if use_native_parser:
-                    parser_dict[index] = probe
-                else:
-                    parser_dict[index] = JsonArrayParser()
+            # detector cannot produce its native format under constraints.
+            native_parser = FunctionCallParser(
+                tools=effective_tools,
+                tool_call_parser=self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                prefix=request._response_parser_prefix,
+            )
+            if is_required and not (
+                native_parser.detector.supports_structural_tag()
+                or native_parser.detector.parses_required_natively()
+            ):
+                parser_dict[index] = JsonArrayParser()
             else:
-                parser_dict[index] = FunctionCallParser(
-                    tools=effective_tools,
-                    tool_call_parser=self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    prefix=request._response_parser_prefix,
-                )
+                parser_dict[index] = native_parser
 
         parser = parser_dict[index]
 

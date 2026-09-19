@@ -39,13 +39,12 @@ from sglang.srt.parser.chat_parsing.response_templates import (
 
 logger = logging.getLogger(__name__)
 
-RESPONSE_TEMPLATE_CONFIG_KEY = "response_template"
-SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
-    {
-        "thinking",
-        "content",
-        "tool_calls",
-    }
+_THINKING_FIELD = "thinking"
+_CONTENT_FIELD = "content"
+_TOOL_FIELD = "tool_calls"
+_PASSTHROUGH_FIELD = "normal"
+_SUPPORTED_RESPONSE_TEMPLATE_FIELDS = frozenset(
+    {_THINKING_FIELD, _CONTENT_FIELD, _TOOL_FIELD}
 )
 
 
@@ -53,24 +52,24 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
     """Validate the template and reject semantic fields serving cannot route."""
     loaded = load_response_template(template)
     fields = set(loaded.fields)
-    unsupported = (fields - SUPPORTED_RESPONSE_TEMPLATE_FIELDS) | (
+    unsupported = (fields - _SUPPORTED_RESPONSE_TEMPLATE_FIELDS) | (
         set(loaded.defaults) - {"role"}
     )
     if unsupported:
         raise ValueError(
             "response_template contains unsupported semantic fields: "
             f"{sorted(unsupported)}. Supported fields are: "
-            f"{sorted(SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
+            f"{sorted(_SUPPORTED_RESPONSE_TEMPLATE_FIELDS)}"
         )
-    for name in ("thinking", "content"):
-        field = template.get("fields", {}).get(name)
-        if not isinstance(field, dict):
+    for name in (_THINKING_FIELD, _CONTENT_FIELD):
+        field = loaded.fields.get(name)
+        if field is None:
             continue
         if (
-            field.get("content", "text") != "text"
-            or field.get("transform") is not None
-            or field.get("join") is not None
-            or field.get("content_args", {}).get("strip") is True
+            field.content != "text"
+            or field.transform is not None
+            or field.join is not None
+            or field.content_args.get("strip") is True
         ):
             raise ValueError(
                 f"response_template field {name!r} uses semantics that cannot "
@@ -79,7 +78,7 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
     return loaded
 
 
-def resolve_detector_response_template(
+def resolve_response_template(
     tokenizer: Any | None,
     fallback: dict | None,
 ) -> dict | None:
@@ -87,12 +86,12 @@ def resolve_detector_response_template(
     if tokenizer is None:
         return fallback
 
-    template = getattr(tokenizer, RESPONSE_TEMPLATE_CONFIG_KEY, None)
+    template = getattr(tokenizer, "response_template", None)
     if isinstance(template, dict):
         return template
 
     init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
-    template = init_kwargs.get(RESPONSE_TEMPLATE_CONFIG_KEY)
+    template = init_kwargs.get("response_template")
     if isinstance(template, dict):
         return template
 
@@ -119,18 +118,13 @@ def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
         }
     for field in fields.values():
         field["optional"] = True
-    tool_field = fields.get("tool_calls")
+    tool_field = fields.get(_TOOL_FIELD)
     if isinstance(tool_field, dict) and tool_field.get("content") == "xml-inline":
         tool_field.setdefault("content_args", {})["strict"] = True
     return result
 
 
-def _tool_extraction_template(
-    template: dict[str, Any],
-    *,
-    sink_field: str,
-    tool_field: str,
-) -> dict[str, Any]:
+def _tool_extraction_template(template: dict[str, Any]) -> dict[str, Any]:
     template = _streaming_template(template)
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
@@ -138,8 +132,11 @@ def _tool_extraction_template(
     return {
         anchor_name: template[anchor_name],
         "fields": {
-            sink_field: {"content": "text", "content_args": {"strip": False}},
-            tool_field: template["fields"][tool_field],
+            _PASSTHROUGH_FIELD: {
+                "content": "text",
+                "content_args": {"strip": False},
+            },
+            _TOOL_FIELD: template["fields"][_TOOL_FIELD],
         },
     }
 
@@ -149,28 +146,20 @@ class ResponseTemplateStreamAdapter:
 
     def __init__(
         self,
-        template: Any,
+        template: dict | ResponseTemplate,
         *,
         prefix: str | None = None,
-        tool_field: str = "tool_calls",
-        thinking_field: str = "thinking",
-        content_field: str = "content",
-        passthrough_field: str = "normal",
     ):
-        self._tool_field = tool_field
-        self._thinking_field = thinking_field
-        self._content_field = content_field
-        self._passthrough_field = passthrough_field
-        self._parser_template = template
-        self._prefix = "" if prefix is None else prefix
-        self._stream_parser = None
+        self._parser_template = load_response_template(template)
+        self._prefix = prefix or ""
+        self._stream_parser: ResponseParser | None = None
         self._pending_reasoning = ""
         self._pending_tool_start: int | None = None
         self._pending_tool_body_start: int | None = None
         self._pending_tool_streamed = False
         self._finalized = False
 
-    def _make_parser(self, tools: Sequence[Any] | None = None):
+    def _make_parser(self, tools: Sequence[Any] | None = None) -> ResponseParser:
         parser_tools = [
             tool if isinstance(tool, dict) else tool.model_dump()
             for tool in tools or []
@@ -181,16 +170,14 @@ class ResponseTemplateStreamAdapter:
             tools=parser_tools,
         )
 
-    def _active_initial_tool_event(self, parser: Any) -> list[dict]:
-        active_open: dict | None = None
-        for event in parser.initial_events:
-            if event.get("field") != self._tool_field:
+    @staticmethod
+    def _active_initial_tool_event(parser: ResponseParser) -> list[dict]:
+        for event in reversed(parser.initial_events):
+            if event.get("field") != _TOOL_FIELD:
                 continue
-            if event["type"] == "region_open":
-                active_open = event
-            elif event["type"] in {"region_close", "region_malformed"}:
-                active_open = None
-        return [] if active_open is None else [active_open]
+            if event["type"] in {"region_open", "region_close", "region_malformed"}:
+                return [event] if event["type"] == "region_open" else []
+        return []
 
     @staticmethod
     def _tool_name(value: Any) -> str | None:
@@ -205,8 +192,7 @@ class ResponseTemplateStreamAdapter:
         start: int | None = None,
         end: int | None = None,
     ) -> str:
-        if self._stream_parser is None:
-            return ""
+        assert self._stream_parser is not None
         start = event["start"] if start is None else start
         end = event["end"] if end is None else end
         start = max(start, self._stream_parser.prefix_end)
@@ -219,7 +205,7 @@ class ResponseTemplateStreamAdapter:
         except (KeyError, RuntimeError, TypeError, ValueError):
             return False
         return any(
-            event["type"] == "region_open" and event.get("field") == self._tool_field
+            event["type"] == "region_open" and event.get("field") == _TOOL_FIELD
             for event in events
         )
 
@@ -269,7 +255,7 @@ class ResponseTemplateStreamAdapter:
         for event in events:
             field = event.get("field")
             etype = event["type"]
-            if field == self._thinking_field:
+            if field == _THINKING_FIELD:
                 if etype == "region_chunk":
                     text = self._generated_text(event)
                     if stream_reasoning:
@@ -279,21 +265,14 @@ class ResponseTemplateStreamAdapter:
                 elif etype == "region_close" and not stream_reasoning:
                     reasoning_parts.append(self._pending_reasoning)
                     self._pending_reasoning = ""
-            elif (
-                field == self._content_field
-                and etype == "region_chunk"
-                or field == self._tool_field
-                and etype
-                in {
-                    "region_open",
-                    "region_chunk",
-                    "region_close",
-                }
-            ):
+            elif field == _CONTENT_FIELD and etype == "region_chunk":
                 normal_parts.append(self._generated_text(event))
-            elif field == self._tool_field and etype == "region_malformed":
-                close_start = event["end"] - len(event["raw_close"])
-                normal_parts.append(self._generated_text(event, start=close_start))
+            elif field == _TOOL_FIELD:
+                if etype == "region_malformed":
+                    start = event["end"] - len(event["raw_close"])
+                    normal_parts.append(self._generated_text(event, start=start))
+                elif etype in {"region_open", "region_chunk", "region_close"}:
+                    normal_parts.append(self._generated_text(event))
         return "".join(normal_parts), "".join(reasoning_parts)
 
     def route_tool_events(
@@ -308,15 +287,14 @@ class ResponseTemplateStreamAdapter:
         malformed_starts = {
             event["start"]
             for event in events
-            if event.get("field") == self._tool_field
-            and event["type"] == "region_malformed"
+            if event.get("field") == _TOOL_FIELD and event["type"] == "region_malformed"
         }
         for event in events:
             field = event.get("field")
             etype = event["type"]
-            if field == self._passthrough_field and etype == "region_chunk":
+            if field == _PASSTHROUGH_FIELD and etype == "region_chunk":
                 normal_parts.append(self._generated_text(event))
-            elif field == self._tool_field:
+            elif field == _TOOL_FIELD:
                 if etype == "region_open":
                     self._pending_tool_start = event["start"]
                     self._pending_tool_body_start = event["end"]
@@ -375,6 +353,22 @@ class ResponseTemplateStreamAdapter:
 class _ResponseTemplateParserInputMixin:
     """Preserve response-template delimiters until parsing."""
 
+    response_template: dict | None = None
+
+    def _load_response_template(
+        self,
+        tokenizer: Any | None,
+        response_template: dict | None,
+    ) -> tuple[dict, ResponseTemplate]:
+        fallback = (
+            self.response_template if response_template is None else response_template
+        )
+        template = resolve_response_template(tokenizer, fallback)
+        if template is None:
+            raise ValueError("response_template is required")
+        self.response_template = template
+        return template, validate_response_template_for_serving(template)
+
     @staticmethod
     def configure_request_for_parsing(request: Any) -> None:
         request.skip_special_tokens = False
@@ -386,11 +380,6 @@ class _ResponseTemplateParserInputMixin:
 class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
     """Reasoning detector driven by a `response_template` grammar."""
 
-    response_template: dict | None = None
-    thinking_field: str = "thinking"
-    content_field: str = "content"
-    tool_field: str = "tool_calls"
-
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -399,34 +388,23 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         prefix: str | None = None,
         **_kwargs,
     ):
-        fallback = (
-            self.response_template if response_template is None else response_template
+        template, loaded = self._load_response_template(
+            tokenizer,
+            response_template,
         )
-        template = resolve_detector_response_template(tokenizer, fallback)
-        if template is None:
-            raise ValueError("response_template is required")
-        loaded = validate_response_template_for_serving(template)
-        self.response_template = template
         self.stream_reasoning = stream_reasoning
-        thinking = loaded.fields.get(self.thinking_field)
+        thinking = loaded.fields.get(_THINKING_FIELD)
         self.think_start_token = (
-            (thinking.open_literals or [""])[0] if thinking is not None else ""
-        ) or getattr(self, "_default_think_start", "")
+            thinking.open_literals[0] if thinking and thinking.open_literals else ""
+        )
         self.think_end_token = (
-            (thinking.close_literals or [""])[0] if thinking is not None else ""
-        ) or getattr(
-            self,
-            "_default_think_end",
-            "",
+            thinking.close_literals[0] if thinking and thinking.close_literals else ""
         )
         self.think_start_self_label = ""
         self.thinks_internally = False
         self.reasoning_default = "explicit_enable_thinking"
         self._adapter = ResponseTemplateStreamAdapter(
             _streaming_template(template),
-            thinking_field=self.thinking_field,
-            content_field=self.content_field,
-            tool_field=self.tool_field,
             prefix=prefix,
         )
 
@@ -449,9 +427,6 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         normal_text, reasoning_text = self._adapter.route_reasoning_events(
             events, stream_reasoning=self.stream_reasoning
         )
-        if not self.stream_reasoning and self._adapter._pending_reasoning:
-            reasoning_text = self._adapter._pending_reasoning + reasoning_text
-            self._adapter._pending_reasoning = ""
         return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
 
@@ -461,10 +436,6 @@ class ResponseTemplateToolDetector(
 ):
     """Tool-call detector driven by a `response_template` grammar."""
 
-    response_template: dict | None = None
-    tool_field: str = "tool_calls"
-    passthrough_field: str = "normal"
-
     def __init__(
         self,
         tokenizer=None,
@@ -472,28 +443,19 @@ class ResponseTemplateToolDetector(
         prefix: str | None = None,
     ):
         super().__init__()
-        fallback = (
-            self.response_template if response_template is None else response_template
+        template, loaded = self._load_response_template(
+            tokenizer,
+            response_template,
         )
-        template = resolve_detector_response_template(tokenizer, fallback)
-        if template is None:
-            raise ValueError("response_template is required")
-        loaded = validate_response_template_for_serving(template)
-        self.response_template = template
         self._adapter = ResponseTemplateStreamAdapter(
-            _tool_extraction_template(
-                template,
-                sink_field=self.passthrough_field,
-                tool_field=self.tool_field,
-            ),
-            tool_field=self.tool_field,
-            passthrough_field=self.passthrough_field,
+            _tool_extraction_template(template),
             prefix=prefix,
         )
-        tool_spec = loaded.fields[self.tool_field]
+        tool_spec = loaded.fields[_TOOL_FIELD]
         if tool_spec.close_literals:
             self.eot_token = tool_spec.close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
+        self._tool_indices: dict[str, int] | None = None
 
     @property
     def has_incomplete_tool_call(self) -> bool:
@@ -654,16 +616,14 @@ class ResponseTemplateToolDetector(
     def _emit_streaming_events(
         self, events: list[dict], tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
+        tool_indices = self._tool_indices
 
         pending_calls: list[ToolCallItem] = []
 
         def on_open(name: str) -> bool:
-            if (
-                name not in self._tool_indices
-                and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-            ):
+            if name not in tool_indices and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return False
             self._emit_tool_name(name, pending_calls)
             return True
@@ -672,7 +632,7 @@ class ResponseTemplateToolDetector(
             tool_index = max(self.current_tool_id, 0)
             items = self._to_tool_call_items(
                 value,
-                self._tool_indices,
+                tool_indices,
                 tool_index,
             )
             if items is None:

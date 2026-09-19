@@ -864,11 +864,11 @@ def resolve_auto_parsers(server_args) -> None:
     detected: Dict[str, Optional[str]] = {}
     if tokenizer is not None and chat_template_arg is None:
         from sglang.srt.parser.response_template import (
-            resolve_detector_response_template,
+            resolve_response_template,
             validate_response_template_for_serving,
         )
 
-        response_template = resolve_detector_response_template(tokenizer, None)
+        response_template = resolve_response_template(tokenizer, None)
         if response_template is not None:
             try:
                 template = validate_response_template_for_serving(response_template)
@@ -878,12 +878,11 @@ def resolve_auto_parsers(server_args) -> None:
                     exc,
                 )
             else:
-                parser_fields = {
-                    "reasoning_parser": "thinking",
-                    "tool_call_parser": "tool_calls",
-                }
-                for attr in needs:
-                    if parser_fields[attr] in template.fields:
+                for attr, field in (
+                    ("reasoning_parser", "thinking"),
+                    ("tool_call_parser", "tool_calls"),
+                ):
+                    if attr in needs and field in template.fields:
                         detected[attr] = "response_template"
                 if detected:
                     logger.info(
