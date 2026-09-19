@@ -26,7 +26,6 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -463,7 +462,10 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather
             and not self.do_tensor_parallel_all_gather_dp_attn
         ):
-            group = get_attn_tp_group() if self.use_attn_tp_group else get_tp_group()
+            parallel = get_parallel()
+            group = (
+                parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
+            )
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
@@ -1061,7 +1063,9 @@ class LogitsProcessor(nn.Module):
         """Exchange only the row block owned by each destination DP rank."""
         logits = logits.contiguous()
         all_to_all_output = torch.empty_like(logits)
-        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
+        get_parallel().tp_group.all_to_all_single(
+            all_to_all_output.view(-1), logits.view(-1)
+        )
         return _reassemble_tp_lm_head_all_to_all_output(
             all_to_all_output, get_parallel().tp_size
         )

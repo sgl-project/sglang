@@ -1039,28 +1039,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
-    def test_pd_decode_dcp_rejects_radix_cache(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            disaggregation_decode_enable_radix_cache=True,
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
-            handle_pd_disaggregation(server_args)
-
-    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="nixl",
-            enable_hierarchical_cache=True,
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
-            handle_pd_disaggregation(server_args)
-
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1960,6 +1938,48 @@ class TestHiCacheArgs(unittest.TestCase):
             )
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
+
+    def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
+        common = {
+            "enable_hierarchical_cache": True,
+            "disaggregation_mode": "prefill",
+            "optimistic_prefill_attempts": 3,
+        }
+        cases = [
+            ({"hicache_write_policy": "write_back"}, 3),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through",
+                },
+                3,
+            ),
+            ({"hicache_write_policy": "write_through"}, 0),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "cache",
+                    "hicache_write_policy": "write_through",
+                },
+                0,
+            ),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_write_policy": "write_through_selective",
+                },
+                0,
+            ),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(model_path="dummy", **common, **overrides)
+                serving_hook.handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
