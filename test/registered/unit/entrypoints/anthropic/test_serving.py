@@ -1,9 +1,10 @@
 import asyncio
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
@@ -19,12 +21,17 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+async def _run_preprocessing(function, *args):
+    return function(*args)
 
 
 class _FakeOpenAIServingChat:
@@ -34,7 +41,8 @@ class _FakeOpenAIServingChat:
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
-            tokenizer=SimpleNamespace(chat_template=chat_template)
+            tokenizer=SimpleNamespace(chat_template=chat_template),
+            run_in_request_preprocessor=_run_preprocessing,
         )
 
     def supports_native_reasoning_history(self):
@@ -58,6 +66,9 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns a configurable error response from the OpenAI handler."""
 
     def __init__(self, status_code=400, body=None, content=None):
+        self.tokenizer_manager = SimpleNamespace(
+            run_in_request_preprocessor=_run_preprocessing
+        )
         self._status_code = status_code
         self._body = body
         self._content = content
@@ -90,6 +101,9 @@ class _FakeNonStreamingOpenAI:
     """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
 
     def __init__(self, response):
+        self.tokenizer_manager = SimpleNamespace(
+            run_in_request_preprocessor=_run_preprocessing
+        )
         self._response = response
 
     def _validate_request(self, chat_request):
@@ -139,7 +153,52 @@ async def _collect_anthropic_events(serving, anthropic_request):
     return events
 
 
-class TestAnthropicServing(unittest.TestCase):
+class TestAnthropicServing(CustomTestCase):
+    def test_messages_validation_runs_off_loop(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.init_request_preprocessor()
+        self.addCleanup(manager._request_preprocessor_executor.shutdown)
+        main_thread = threading.get_ident()
+
+        def validate(request):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            return "invalid schema"
+
+        chat = _FakeNonStreamingErrorOpenAI()
+        chat.tokenizer_manager = manager
+        chat._validate_request = validate
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = asyncio.run(
+                    AnthropicServing(chat).handle_messages(
+                        self._anthropic_request(stream=stream), object()
+                    )
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    json.loads(response.body)["error"]["message"], "invalid schema"
+                )
+
+    def test_count_tokens_runs_preprocessing_off_loop(self):
+        serving = self._serving()
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.init_request_preprocessor()
+        self.addCleanup(manager._request_preprocessor_executor.shutdown)
+        manager.model_config = SimpleNamespace(is_multimodal=False)
+        serving.openai_serving_chat.tokenizer_manager = manager
+
+        def process_messages(request, is_multimodal):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            return SimpleNamespace(prompt_ids=[1, 2, 3])
+
+        main_thread = threading.get_ident()
+        serving.openai_serving_chat._process_messages = process_messages
+        request = AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hello"}]
+        )
+        response = asyncio.run(serving.handle_count_tokens(request, object()))
+        self.assertEqual(json.loads(response.body), {"input_tokens": 3})
+
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"

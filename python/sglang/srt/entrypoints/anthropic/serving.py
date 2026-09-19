@@ -203,6 +203,11 @@ class AnthropicServing:
             return None
         return getattr(tokenizer, "chat_template", None)
 
+    async def _run_conversion(self, function, *args):
+        return await self.openai_serving_chat.tokenizer_manager.run_in_request_preprocessor(
+            function, *args
+        )
+
     async def handle_messages(
         self,
         request: AnthropicMessagesRequest,
@@ -210,7 +215,9 @@ class AnthropicServing:
     ) -> Union[JSONResponse, StreamingResponse]:
         """Main entry point for /v1/messages endpoint."""
         try:
-            chat_request = self._convert_to_chat_completion_request(request)
+            chat_request = await self._run_conversion(
+                self._convert_to_chat_completion_request, request
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -745,7 +752,9 @@ class AnthropicServing:
         received_time = monotonic_time()
 
         # Validate
-        error_msg = self.openai_serving_chat._validate_request(chat_request)
+        error_msg = await self._run_conversion(
+            self.openai_serving_chat._validate_request, chat_request
+        )
         if error_msg:
             return self._error_response(
                 status_code=400,
@@ -755,10 +764,10 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = await self._run_conversion(
+                self.openai_serving_chat._convert_to_internal_request,
+                chat_request,
+                raw_request,
             )
             adapted_request.received_time = received_time
 
@@ -796,7 +805,9 @@ class AnthropicServing:
         received_time = monotonic_time()
 
         # Validate
-        error_msg = self.openai_serving_chat._validate_request(chat_request)
+        error_msg = await self._run_conversion(
+            self.openai_serving_chat._validate_request, chat_request
+        )
         if error_msg:
             return self._error_response(
                 status_code=400,
@@ -805,10 +816,10 @@ class AnthropicServing:
             )
 
         try:
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
-                )
+            adapted_request, processed_request = await self._run_conversion(
+                self.openai_serving_chat._convert_to_internal_request,
+                chat_request,
+                raw_request,
             )
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
@@ -1433,7 +1444,9 @@ class AnthropicServing:
                 tools=request.tools,
                 tool_choice=request.tool_choice,
             )
-            chat_request = self._convert_to_chat_completion_request(messages_request)
+            chat_request = await self._run_conversion(
+                self._convert_to_chat_completion_request, messages_request
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1448,8 +1461,8 @@ class AnthropicServing:
             is_multimodal = (
                 self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
             )
-            processed = self.openai_serving_chat._process_messages(
-                chat_request, is_multimodal
+            processed = await self._run_conversion(
+                self.openai_serving_chat._process_messages, chat_request, is_multimodal
             )
 
             if isinstance(processed.prompt_ids, list):
@@ -1457,7 +1470,9 @@ class AnthropicServing:
             else:
                 # prompt_ids is a string (multimodal case) — tokenize it
                 tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
-                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+                input_tokens = len(
+                    await self._run_conversion(tokenizer.encode, processed.prompt_ids)
+                )
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(

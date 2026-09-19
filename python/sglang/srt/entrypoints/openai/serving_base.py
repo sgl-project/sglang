@@ -69,6 +69,9 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    async def _run_request_conversion(self, function, *args):
+        return await self.tokenizer_manager.run_in_request_preprocessor(function, *args)
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -79,7 +82,9 @@ class OpenAIServingBase(ABC):
 
         try:
             # Validate request
-            error_msg = self._validate_request(request)
+            error_msg = await self._run_request_conversion(
+                self._validate_request, request
+            )
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -89,8 +94,8 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            adapted_request, processed_request = await self._run_request_conversion(
+                self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):

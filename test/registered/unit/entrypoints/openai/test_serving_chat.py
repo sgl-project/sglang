@@ -117,6 +117,9 @@ def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
 
 
 class _MockTokenizerManager:
+    async def run_in_request_preprocessor(self, function, *args):
+        return function(*args)
+
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):

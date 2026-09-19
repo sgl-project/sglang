@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import sys
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, patch
@@ -1726,6 +1727,34 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+@pytest.mark.parametrize("harmony", [False, True])
+def test_response_conversion_uses_shared_executor(response_serving, harmony):
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+    serving = response_serving(harmony=harmony)
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.init_request_preprocessor()
+    serving.tokenizer_manager.run_in_request_preprocessor = (
+        manager.run_in_request_preprocessor
+    )
+    method = "_make_request_with_harmony" if harmony else "_make_request_sync"
+    original = getattr(serving, method)
+    main_thread = threading.get_ident()
+
+    def convert(*args):
+        assert threading.get_ident() != main_thread
+        return original(*args)
+
+    setattr(serving, method, convert)
+    with manager._request_preprocessor_executor:
+        result = asyncio.run(
+            create_response_result(
+                serving, ResponsesRequest(model="x", input="Hello", store=False)
+            )
+        )
+    assert result.status == "completed"
 
 
 if __name__ == "__main__":
