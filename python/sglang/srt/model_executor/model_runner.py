@@ -1162,7 +1162,7 @@ class ModelRunner:
         )
 
     def init_torch_distributed(self):
-        result = bootstrap.init_torch_distributed(
+        self.pre_model_load_memory = bootstrap.init_torch_distributed(
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
@@ -1171,10 +1171,14 @@ class ModelRunner:
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
         )
-        self.tp_group = result.tp_group
-        self.pp_group = result.pp_group
-        self.attention_tp_group = result.attention_tp_group
-        self.pre_model_load_memory = result.pre_model_load_memory
+        # Read once, here: a draft runner is constructed inside the scope that
+        # states its topology and used outside it, so what it holds has to be
+        # the group it was built for rather than whatever the context answers
+        # later.
+        parallel = get_parallel()
+        self.tp_group = parallel.tp_group
+        self.pp_group = parallel.pp_group
+        self.attention_tp_group = parallel.attn_tp_group
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
