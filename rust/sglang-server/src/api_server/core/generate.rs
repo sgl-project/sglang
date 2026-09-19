@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::api_server::core::error::ApiError;
@@ -35,7 +36,7 @@ pub(crate) struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             created_at: Instant::now(),
             time_to_first_token: None,
@@ -98,10 +99,34 @@ pub(crate) async fn generate_start(
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request. `return_text_in_logprobs` is decoded on the
     // detok shard into `*_txt`, so frame shaping never needs a tokenizer here.
+    let mut plan = start_generate_plan_with_timing(state, payloads, timing).await?;
+    plan.is_batch = is_batch;
+    Ok(plan)
+}
+
+/// Submit protocol-neutral generation requests through the common lifecycle.
+/// This is the only generation submission entry point adapters should call.
+pub(crate) async fn start_generate_plan(
+    state: &CoreState,
+    requests: Vec<crate::message::request::GenerateRequest>,
+) -> Result<GeneratePlan, ApiError> {
+    start_generate_plan_with_timing(state, requests, RequestTiming::new()).await
+}
+
+async fn start_generate_plan_with_timing(
+    state: &CoreState,
+    requests: Vec<crate::message::request::GenerateRequest>,
+    timing: RequestTiming,
+) -> Result<GeneratePlan, ApiError> {
+    if requests.is_empty() {
+        return Err(ApiError::bad_request("generation request list is empty"));
+    }
+
     let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut receivers = Vec::with_capacity(payloads.len());
-    for req in payloads {
-        let (rid, rx) = submit(state, RequestKind::Generate(Box::new(req))).await?;
+    let is_batch = requests.len() > 1;
+    let mut receivers = Vec::with_capacity(requests.len());
+    for request in requests {
+        let (rid, rx) = submit(state, RequestKind::Generate(Box::new(request))).await?;
         guard.arm(rid.clone());
         receivers.push((rid, rx, timing.clone()));
     }
@@ -164,10 +189,79 @@ pub(crate) async fn drain_unary(
                     message: e.to_string(),
                 };
             }
-            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
+            ResponseItem::Control(_) => continue, // never on `/generate`
         }
     }
     UnaryOutcome::Truncated
+}
+
+pub(crate) enum UnaryDrainPolicy {
+    /// Drain every item and preserve one outcome per input. Native batch uses
+    /// this because its public contract is per-item errors in a 200 response.
+    PerItem,
+    /// Stop at the first failed/truncated item. OpenAI fan-out uses this
+    /// because several scheduler requests represent one logical HTTP request.
+    AggregateFailFast,
+}
+
+fn outcome_error(outcome: &UnaryOutcome) -> Option<ApiError> {
+    match outcome {
+        UnaryOutcome::Complete(_, _) => None,
+        UnaryOutcome::Error { code, message } => Some(ApiError::new(*code, message.clone())),
+        UnaryOutcome::Truncated => Some(ApiError::internal("response truncated before completion")),
+    }
+}
+
+/// Convert the one successful unary outcome used by protocol adapters. The
+/// shared driver owns failure classification; adapters only need this one
+/// common success/error boundary.
+pub(crate) fn unary_output(outcome: UnaryOutcome) -> Result<ChunkEvent, ApiError> {
+    match outcome {
+        UnaryOutcome::Complete(output, _) => Ok(output),
+        UnaryOutcome::Error { code, message } => Err(ApiError::new(code, message)),
+        UnaryOutcome::Truncated => Err(ApiError::internal("response truncated before completion")),
+    }
+}
+
+/// Drain all planned items through the same fold used by native unary output.
+/// The policy controls only how a multi-item logical request treats failures;
+/// receiver ownership and guard disarming stay in this shared function.
+pub(crate) async fn drain_plan_unary(
+    plan: GeneratePlan,
+    policy: UnaryDrainPolicy,
+) -> Result<Vec<(Rid, UnaryOutcome)>, ApiError> {
+    let GeneratePlan {
+        receivers,
+        mut guard,
+        ..
+    } = plan;
+
+    let mut futures = futures::stream::FuturesUnordered::new();
+    for (order, (rid, mut rx, timing)) in receivers.into_iter().enumerate() {
+        futures.push(async move {
+            let outcome = drain_unary(&mut rx, timing).await;
+            (order, rid, outcome)
+        });
+    }
+
+    let mut drained = Vec::new();
+    while let Some((order, rid, outcome)) = futures.next().await {
+        if !matches!(outcome, UnaryOutcome::Truncated) {
+            guard.disarm(&rid);
+        }
+        if matches!(policy, UnaryDrainPolicy::AggregateFailFast)
+            && let Some(error) = outcome_error(&outcome)
+        {
+            // Dropping the guard here aborts every unfinished sibling.
+            return Err(error);
+        }
+        drained.push((order, rid, outcome));
+    }
+    drained.sort_unstable_by_key(|(order, _, _)| *order);
+    Ok(drained
+        .into_iter()
+        .map(|(_, rid, outcome)| (rid, outcome))
+        .collect())
 }
 
 /// Await the next item from `rx`, then drain whatever queued behind it (so the caller
@@ -193,8 +287,10 @@ async fn recv_indexed(
 /// The state machine in [`generation_event_stream_with`] is shared; only the
 /// frame rendering differs per transport.
 pub(crate) trait FrameShaper {
+    /// One opaque renderer output; adapters own expansion and rendering failures.
     type Frame: Send + 'static;
     /// An incremental step frame (only under `incremental`).
+    /// Only the completion count is retained in `acc` for incremental streams.
     fn delta(
         &mut self,
         out: ChunkEvent,
@@ -211,6 +307,7 @@ pub(crate) trait FrameShaper {
         index: Option<usize>,
     ) -> Self::Frame;
     /// The terminal frame (never an abort — aborts became `item_error`).
+    /// As with `delta`, incremental `acc` contains only the running count.
     fn terminal(
         &mut self,
         out: ChunkEvent,
@@ -223,6 +320,10 @@ pub(crate) trait FrameShaper {
     /// One request's failure (pipeline error, scheduler abort, truncation);
     /// the stream continues for the other batch items.
     fn item_error(&mut self, code: u16, message: &str, index: Option<usize>) -> Self::Frame;
+    /// Protocol-only trailer, e.g. OpenAI's final usage chunk.
+    fn finish(&mut self) -> Option<Self::Frame> {
+        None
+    }
 }
 
 /// The HTTP rendering: complete JSON frame strings — the serialized typed
@@ -326,30 +427,19 @@ impl FrameShaper for PbFrameShaper {
     }
 }
 
-/// Multiplex `receivers` (one per request) into complete JSON frame strings;
-/// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
-/// `guard` aborts unfinished on drop. The stream ends when every request has
-/// terminated — the `[DONE]` sentinel is SSE framing, appended by `sse_encode`.
-pub(crate) fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
-    guard: AbortGuard,
-    incremental: bool,
-    with_index: bool,
-) -> impl futures::Stream<Item = String> {
-    generation_event_stream_with(receivers, guard, incremental, with_index, JsonFrameShaper)
+/// Multiplex a generation plan into JSON frames. The [DONE] sentinel is
+/// transport framing, appended by sse_encode.
+pub(crate) fn generation_event_stream(plan: GeneratePlan) -> impl futures::Stream<Item = String> {
+    generation_event_stream_with(plan, JsonFrameShaper)
 }
 
-/// The shared multiplex/coalesce/abort state machine, rendered by `shaper`.
+/// The shared multiplex/coalesce/abort state machine, rendered by shaper.
 pub(crate) fn generation_event_stream_with<S: FrameShaper>(
-    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
-    mut guard: AbortGuard,
-    incremental: bool,
-    with_index: bool,
+    plan: GeneratePlan,
     mut shaper: S,
 ) -> impl futures::Stream<Item = S::Frame> {
     async_stream::stream! {
-        use futures::StreamExt;
-
+        let GeneratePlan { receivers, mut guard, incremental, is_batch: with_index } = plan;
         let n = receivers.len();
         let rid_strs: Vec<Rid> = receivers
             .iter()
@@ -390,7 +480,11 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                 match item {
                     ResponseItem::Frame(out) => {
                         timings[i].observe_first_output();
-                        accs[i].fold(&out);
+                        if incremental {
+                            accs[i].count_tokens(&out);
+                        } else {
+                            accs[i].fold(&out);
+                        }
                         if incremental {
                             yield shaper.delta(out, &accs[i], rid_strs[i].client_facing(), idx(i));
                         } else {
@@ -400,23 +494,29 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                     ResponseItem::Done(out) => {
                         timings[i].observe_first_output();
                         timings[i].finish();
-                        accs[i].fold(&out);
+                        if incremental {
+                            accs[i].count_tokens(&out);
+                        } else {
+                            accs[i].fold(&out);
+                        }
                         terminal = Some(out);
                     }
                     ResponseItem::Error(e) => {
                         timings[i].finish();
                         failed = Some(e);
                     }
-                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
+                    ResponseItem::Control(_) => {} // never on /generate
                 }
             }
 
             if let Some(e) = failed {
-                yield shaper.item_error(e.http_status(), &e.to_string(), idx(i));
                 guard.disarm(&rid_strs[i]);
+                yield shaper.item_error(e.http_status(), &e.to_string(), idx(i));
             } else if let Some(out) = terminal {
                 // A validation abort → an error item, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
+                // Disarm before rendering/yielding, even if rendering fails or the client drops.
+                guard.disarm(&rid_strs[i]);
                 yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
                     Some((code, message)) => {
                         let (code, message) = (code, message.to_owned());
@@ -431,7 +531,6 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                         &timings[i],
                     ),
                 };
-                guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
                     yield shaper.coalesced(&accs[i], rid_strs[i].client_facing(), idx(i));
@@ -439,6 +538,7 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
         }
+        if let Some(frame) = shaper.finish() { yield frame; }
     }
 }
 
@@ -479,19 +579,17 @@ fn terminal_stream_frame_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::core::frame::frame_typed;
+    use crate::api_server::core::state::CoreState;
+    use crate::api_server::core::test_utils::{TestReceiver, plan, senders};
+    use crate::message::config::ServerArgs;
+    use crate::message::request::GenerateRequest;
     use crate::message::response::ChunkEvent;
     use crate::tokenizer_manager::wiring::Senders;
     use crate::utils::error::Error;
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
+    use std::sync::{Arc, atomic::AtomicU64};
     use std::time::Duration;
-    fn senders() -> Senders {
-        Senders {
-            tok_manager_tx: flume::unbounded().0,
-            abort_tx: flume::unbounded().0,
-            tokenizer_tx: flume::unbounded().0,
-            detokenizer_tx: vec![],
-        }
-    }
 
     fn frame(rid: u64, text: &str) -> ResponseItem {
         ResponseItem::Frame(ChunkEvent {
@@ -518,10 +616,7 @@ mod tests {
         serde_json::from_str(s).expect("frame is JSON")
     }
 
-    fn timed_receiver(
-        rid: u64,
-        rx: mpsc::Receiver<ResponseItem>,
-    ) -> (Rid, mpsc::Receiver<ResponseItem>, RequestTiming) {
+    fn timed_receiver(rid: u64, rx: mpsc::Receiver<ResponseItem>) -> TestReceiver {
         (
             Rid::from(rid.to_string()),
             rx,
@@ -531,6 +626,57 @@ mod tests {
                 e2e_latency: None,
             },
         )
+    }
+
+    fn abort_senders() -> (
+        Senders,
+        flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
+    ) {
+        let (abort_tx, abort_rx) = flume::unbounded();
+        (
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![],
+            },
+            abort_rx,
+        )
+    }
+
+    fn aborted_rids(
+        abort_rx: &flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
+    ) -> Vec<String> {
+        use crate::tokenizer_manager::wiring::AbortSource;
+
+        let mut rids = abort_rx
+            .try_iter()
+            .filter_map(|source| match source {
+                AbortSource::Guard(rid) => Some(rid.as_str().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        rids.sort();
+        rids
+    }
+
+    fn submission_state(
+        tok_manager_tx: flume::Sender<crate::tokenizer_manager::wiring::TmEvent>,
+        abort_tx: flume::Sender<crate::tokenizer_manager::wiring::AbortSource>,
+    ) -> CoreState {
+        CoreState {
+            senders: Senders {
+                tok_manager_tx,
+                abort_tx,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![],
+            },
+            response_buf: 4,
+            api_key: None,
+            server_args: Arc::new(ServerArgs::default()),
+            chat_formatter: None,
+            response_activity: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     #[test]
@@ -616,6 +762,189 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn partial_submission_failure_aborts_exactly_submitted_requests() {
+        let (tok_manager_tx, tok_manager_rx) = flume::bounded(1);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let state = Arc::new(submission_state(tok_manager_tx, abort_tx));
+        let requests = vec![
+            GenerateRequest {
+                rid: "submitted".into(),
+                ..Default::default()
+            },
+            GenerateRequest {
+                rid: "not-submitted".into(),
+                ..Default::default()
+            },
+        ];
+
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { start_generate_plan(&state, requests).await }
+        });
+        while tok_manager_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        drop(tok_manager_rx);
+
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(aborted_rids(&abort_rx), ["submitted"]);
+    }
+
+    #[tokio::test]
+    async fn submission_cancellation_aborts_exactly_submitted_requests() {
+        let (tok_manager_tx, tok_manager_rx) = flume::bounded(1);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let state = Arc::new(submission_state(tok_manager_tx, abort_tx));
+        let requests = vec![
+            GenerateRequest {
+                rid: "submitted".into(),
+                ..Default::default()
+            },
+            GenerateRequest {
+                rid: "pending".into(),
+                ..Default::default()
+            },
+        ];
+
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { start_generate_plan(&state, requests).await }
+        });
+        while tok_manager_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        drop(tok_manager_rx);
+
+        assert_eq!(aborted_rids(&abort_rx), ["submitted"]);
+    }
+
+    #[tokio::test]
+    async fn per_item_plan_drain_preserves_order() {
+        let (tx0, rx0) = mpsc::channel(2);
+        let (tx1, rx1) = mpsc::channel(2);
+        tx1.send(done(11, "second")).await.unwrap();
+
+        let drain = drain_plan_unary(
+            plan(
+                vec![timed_receiver(10, rx0), timed_receiver(11, rx1)],
+                senders(),
+            ),
+            UnaryDrainPolicy::PerItem,
+        );
+        futures::pin_mut!(drain);
+        assert!(drain.as_mut().now_or_never().is_none());
+        tx0.send(done(10, "first")).await.unwrap();
+        let result = drain.await.expect("both planned items complete");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0.as_str(), "10");
+        assert_eq!(result[1].0.as_str(), "11");
+    }
+
+    #[tokio::test]
+    async fn per_item_plan_drain_disarms_terminal_items_and_aborts_truncation() {
+        use crate::tokenizer_manager::wiring::AbortSource;
+
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let (done_tx, done_rx) = mpsc::channel(2);
+        let (error_tx, error_rx) = mpsc::channel(2);
+        let (truncated_tx, truncated_rx) = mpsc::channel(2);
+        done_tx.send(done(10, "ok")).await.unwrap();
+        error_tx
+            .send(ResponseItem::Error(Error::Validation("bad".into())))
+            .await
+            .unwrap();
+        drop(truncated_tx);
+
+        let result = drain_plan_unary(
+            plan(
+                vec![
+                    timed_receiver(10, done_rx),
+                    timed_receiver(11, error_rx),
+                    timed_receiver(12, truncated_rx),
+                ],
+                Senders {
+                    tok_manager_tx: flume::unbounded().0,
+                    abort_tx,
+                    tokenizer_tx: flume::unbounded().0,
+                    detokenizer_tx: vec![],
+                },
+            ),
+            UnaryDrainPolicy::PerItem,
+        )
+        .await
+        .expect("per-item mode keeps draining after one item fails");
+
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0].1, UnaryOutcome::Complete(..)));
+        assert!(matches!(result[1].1, UnaryOutcome::Error { .. }));
+        assert!(matches!(result[2].1, UnaryOutcome::Truncated));
+        assert!(matches!(
+            abort_rx.try_recv().expect("truncation remains armed"),
+            AbortSource::Guard(rid) if rid.as_str() == "12"
+        ));
+        assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn aggregate_plan_drain_fail_fast_aborts_unfinished_siblings() {
+        use crate::tokenizer_manager::wiring::AbortSource;
+
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let (error_tx, error_rx) = mpsc::channel(2);
+        let (_pending_tx, pending_rx) = mpsc::channel(2);
+        error_tx
+            .send(ResponseItem::Error(Error::Validation("bad choice".into())))
+            .await
+            .unwrap();
+
+        let result = drain_plan_unary(
+            plan(
+                vec![timed_receiver(10, error_rx), timed_receiver(11, pending_rx)],
+                Senders {
+                    tok_manager_tx: flume::unbounded().0,
+                    abort_tx,
+                    tokenizer_tx: flume::unbounded().0,
+                    detokenizer_tx: vec![],
+                },
+            ),
+            UnaryDrainPolicy::AggregateFailFast,
+        )
+        .await;
+
+        assert!(result.is_err(), "the logical request fails fast");
+        assert!(matches!(
+            abort_rx.try_recv().expect("unfinished sibling is aborted"),
+            AbortSource::Guard(rid) if rid.as_str() == "11"
+        ));
+        assert!(abort_rx.try_recv().is_err(), "the failed item was disarmed");
+    }
+
+    #[tokio::test]
+    async fn dropping_native_stream_after_terminal_aborts_only_pending_item() {
+        let (senders, abort_rx) = abort_senders();
+        let (tx0, rx0) = mpsc::channel(4);
+        let (_tx1, rx1) = mpsc::channel(4);
+        tx0.send(done(10, "complete")).await.unwrap();
+
+        {
+            let stream = generation_event_stream(GeneratePlan {
+                incremental: true,
+                ..plan(
+                    vec![timed_receiver(10, rx0), timed_receiver(11, rx1)],
+                    senders,
+                )
+            });
+            futures::pin_mut!(stream);
+            assert_eq!(parse(&stream.next().await.unwrap())["text"], "complete");
+        }
+
+        assert_eq!(aborted_rids(&abort_rx), ["11"]);
+    }
+
     /// Two sub-requests' frames interleave into one stream, each tagged with its
     /// batch `index`; text accumulates per item; `[DONE]` comes only after both
     /// terminate, then the stream ends.
@@ -624,8 +953,11 @@ mod tests {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: false,
+            is_batch: true,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         // Drive deterministically: exactly one channel has data before each poll.
@@ -663,8 +995,11 @@ mod tests {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: false,
+            is_batch: true,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         tx0.send(ResponseItem::Error(Error::Validation("bad".into())))
@@ -687,8 +1022,11 @@ mod tests {
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: true,
+            is_batch: true,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "Hello")).await.unwrap();
@@ -722,8 +1060,11 @@ mod tests {
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: false,
+            is_batch: false,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         tx.send(done(10, "hi")).await.unwrap();
@@ -743,8 +1084,11 @@ mod tests {
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: false,
+            is_batch: false,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         // Three chunks queued before the stream is ever polled (a client falling behind).
@@ -792,27 +1136,30 @@ mod tests {
                 let (tx0, rx0) = mpsc::channel(8);
                 let (tx1, rx1) = mpsc::channel(8);
                 let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-                let guard = AbortGuard::new_empty(senders());
-                (vec![tx0, tx1], receivers, guard, shaperless)
+                (vec![tx0, tx1], receivers, shaperless)
             };
 
-            let (txs, receivers, guard, _) = run(true);
+            let (txs, receivers, _) = run(true);
             script(&txs).await;
             drop(txs);
-            let json_frames: Vec<String> =
-                generation_event_stream(receivers, guard, incremental, with_index)
-                    .collect()
-                    .await;
+            let json_frames: Vec<String> = generation_event_stream(GeneratePlan {
+                incremental,
+                is_batch: with_index,
+                ..plan(receivers, senders())
+            })
+            .collect()
+            .await;
 
-            let (txs, receivers, guard, _) = run(false);
+            let (txs, receivers, _) = run(false);
             script(&txs).await;
             drop(txs);
             let typed_frames: Vec<sglang_api_types::api::v1::GenerateStreamItem> =
                 generation_event_stream_with(
-                    receivers,
-                    guard,
-                    incremental,
-                    with_index,
+                    GeneratePlan {
+                        incremental,
+                        is_batch: with_index,
+                        ..plan(receivers, senders())
+                    },
                     PbFrameShaper,
                 )
                 .collect()
@@ -851,8 +1198,11 @@ mod tests {
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![timed_receiver(10, rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
+        let stream = generation_event_stream(GeneratePlan {
+            incremental: true,
+            is_batch: false,
+            ..plan(receivers, senders())
+        });
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "a")).await.unwrap();

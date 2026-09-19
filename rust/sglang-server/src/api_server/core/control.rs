@@ -32,10 +32,8 @@ pub(crate) async fn await_control_result(
     match received {
         Some(ResponseItem::Control(bytes)) => Ok(bytes),
         Some(ResponseItem::Error(e)) => Err(ApiError::from_pipeline(&e)),
-        // A control request never receives generation frames or service-call data.
-        Some(ResponseItem::Frame(_))
-        | Some(ResponseItem::Done(_))
-        | Some(ResponseItem::Data(_)) => Err(ApiError::internal(
+        // A control request never receives generation frames.
+        Some(ResponseItem::Frame(_)) | Some(ResponseItem::Done(_)) => Err(ApiError::internal(
             "unexpected generation output for control request",
         )),
         None => Err(ApiError::new(499, "request aborted")),

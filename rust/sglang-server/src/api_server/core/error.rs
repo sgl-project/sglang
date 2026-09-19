@@ -45,12 +45,6 @@ impl ApiError {
         Self::new(error.http_status(), error.to_string())
     }
 
-    /// A scheduler validation abort (`finish_reason.abort_status()`), which
-    /// carries its own HTTP status + diagnostic.
-    pub(crate) fn from_abort(code: u16, message: &str) -> Self {
-        Self::new(code, message)
-    }
-
     /// `http_code` as a typed status; an out-of-range code (never expected —
     /// every constructor takes a real one) falls back to 500 rather than
     /// panicking on a scheduler-supplied value.

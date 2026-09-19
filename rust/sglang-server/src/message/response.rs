@@ -53,11 +53,6 @@ pub enum ResponseItem {
     /// A control-request result: one verbatim payload (e.g. `/server_info`),
     /// delivered as-is with no per-protocol formatting.
     Control(Bytes),
-    /// Reply to an internal service request (`RequestKind::Detokenize`): raw
-    /// bytes for the SUBMITTER to consume (e.g. the decoded prompt text), not
-    /// client-bound JSON like `Control` and not a generation frame. Generation
-    /// and control drains never see it.
-    Data(Bytes),
     /// Terminal failure: handler emits an error frame (stream) or status (unary).
     Error(Error),
 }
@@ -401,6 +396,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // Even in an extras batch, most requests carry none — box only if this
             // one actually does, so its `ChunkEvent` stays the small common frame.
             let ex = ChunkExtras {
+                prompt_text: None,
                 out_lp_val,
                 out_lp_idx,
                 in_lp_val,
@@ -559,6 +555,9 @@ pub struct ChunkEvent {
 /// [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
+    /// Optional prompt text requested by the generation request. Kept behind
+    /// the rare-column box so normal generation frames remain compact.
+    pub prompt_text: Option<String>,
     /// Output-token logprobs (parallel `val`/`idx`, one entry per new output token).
     pub out_lp_val: Vec<f32>,
     pub out_lp_idx: Vec<i32>,
@@ -598,7 +597,8 @@ impl ChunkExtras {
     /// True when no logprob / hidden column carries data — lets the decoder skip the
     /// box allocation for the common (extras-free) frame.
     fn is_empty(&self) -> bool {
-        self.out_lp_val.is_empty()
+        self.prompt_text.is_none()
+            && self.out_lp_val.is_empty()
             && self.in_lp_val.is_empty()
             && self.out_top_lens.is_empty()
             && self.in_top_lens.is_empty()

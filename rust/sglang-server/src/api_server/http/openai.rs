@@ -16,27 +16,21 @@ use super::app::AppState;
 use super::response::{
     HttpResponse, error_response, json_response, json_typed_response, read_json, sse_encode,
 };
-use crate::api_server::core::guard::AbortGuard;
 use crate::api_server::core::openai::chat::{
-    SamplingDefaults, chat_event_stream, chat_sampling, chat_sse_payload, prepare_chat_request,
-    unary_chat,
+    ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_sampling, chat_sse_payload,
+    prepare_chat_request, unary_chat,
 };
 use crate::api_server::core::openai::completions::{
-    PromptSpec, SubmittedChoice, completion_event_stream, completion_prompt_specs,
-    completion_sampling_params, completion_sse_payload, decode_prompt_echo, unary_completion,
+    CompletionFrameShaper, CompletionRenderingOptions, PromptSpec, completion_event_stream,
+    completion_prompt_specs, completion_sampling_params, completion_sse_payload, unary_completion,
 };
 use crate::api_server::core::openai::models::model_card;
 use crate::api_server::core::openai::tools::dynamo_tool_choice;
-use crate::api_server::core::openai::{error_payload_value, submit_generation, unix_seconds_u32};
+use crate::api_server::core::openai::{error_payload_value, unix_seconds_u32};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
-
-/// The OpenAI error payload.
-pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
-    error_payload_value(code.as_u16(), &message.into())
-}
 
 /// Form an OpenAI error response: unary → `code` plus the JSON `body`,
 /// streaming → 200 with one SSE error frame + `[DONE]`.
@@ -45,7 +39,11 @@ pub(super) fn openai_error(
     message: impl Into<String>,
     stream: bool,
 ) -> super::response::HttpResponse {
-    error_response(code, error_payload(code, message), stream)
+    error_response(
+        code,
+        error_payload_value(code.as_u16(), &message.into()),
+        stream,
+    )
 }
 
 fn contains_media(value: &serde_json::Value) -> bool {
@@ -131,9 +129,11 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
         .as_ref()
         .is_some_and(|tools| !tools.is_empty())
         && tool_choice != DynamoToolChoice::None;
-    let parser = tools_enabled
-        .then(|| state.server_args.tool_call_parser.clone())
-        .flatten();
+    let parser = if tools_enabled {
+        state.server_args.tool_call_parser.clone()
+    } else {
+        None
+    };
     if tools_enabled && parser.is_none() {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -145,22 +145,25 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
     // the Dynamo request type has no such field, so it is always on when the
     // server was launched with `--reasoning-parser`.
     let reasoning_parser = state.server_args.reasoning_parser.clone();
-    let tools = request.tools.as_ref().map(|tools| {
+
+    let (mut request, mut prompt) = match prepare_chat_request(&state, request).await {
+        Ok(prepared) => prepared,
+        Err(e) => return openai_error(e.http_status(), e.message, false),
+    };
+
+    // The renderer is done with the tools, so move them out instead of cloning
+    // every function name and parameter schema.
+    let tools = request.tools.take().map(|tools| {
         tools
-            .iter()
+            .into_iter()
             .map(|tool| ToolDefinition {
-                name: tool.function.name.clone(),
-                parameters: tool.function.parameters.clone(),
+                name: tool.function.name,
+                parameters: tool.function.parameters,
                 strict: tool.function.strict,
             })
             .collect::<Vec<_>>()
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
-
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
-        Ok(prepared) => prepared,
-        Err(e) => return openai_error(e.http_status(), e.message, false),
-    };
 
     let sampling = match chat_sampling(
         &request,
@@ -191,23 +194,20 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut submitted = Vec::with_capacity(n);
+    let mut requests = Vec::with_capacity(n);
 
-    let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == n {
-            prompt.take().expect("last chat choice owns the prompt")
-        } else {
-            prompt
-                .as_ref()
-                .expect("chat prompt exists until the last choice")
-                .clone()
-        };
+        // The last choice takes the rendered prompt by move; earlier choices
+        // still need a copy of their own.
+        let last = index + 1 == n;
         let native = GenerateRequest {
-            rid: rid.clone(),
-            text: Some(choice_prompt),
+            rid,
+            text: Some(if last {
+                std::mem::take(&mut prompt)
+            } else {
+                prompt.clone()
+            }),
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -219,47 +219,38 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let rx = match submit_generation(&state, native, &mut guard).await {
-            Ok(rx) => rx,
-            Err(e) => return openai_error(e.http_status(), e.message, stream),
-        };
-        submitted.push((index, rid, rx));
+        requests.push(native);
     }
 
+    let plan = match crate::api_server::core::generate::start_generate_plan(&state, requests).await
+    {
+        Ok(plan) => plan,
+        Err(e) => return openai_error(e.http_status(), e.message, stream),
+    };
+
+    let options = ChatRenderingOptions {
+        response_id,
+        model,
+        created,
+        want_logprobs,
+        parser,
+        reasoning_parser,
+        tools,
+        parallel_tool_calls,
+        service_tier,
+    };
     if stream {
         let event_stream = chat_event_stream(
-            submitted,
-            guard,
-            response_id,
-            model,
-            created,
-            want_logprobs,
+            plan,
+            n,
+            options,
             include_usage,
-            parser,
-            reasoning_parser,
-            tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
-            parallel_tool_calls,
-            service_tier,
         );
         sse_encode(event_stream.map(chat_sse_payload))
     } else {
-        match unary_chat(
-            submitted,
-            guard,
-            response_id,
-            model,
-            created,
-            want_logprobs,
-            parser,
-            reasoning_parser,
-            tools,
-            parallel_tool_calls,
-            service_tier,
-        )
-        .await
-        {
+        match unary_chat(plan, options).await {
             Ok(response) => json_typed_response(StatusCode::OK, &response),
             Err(e) => openai_error(e.http_status(), e.message, false),
         }
@@ -279,11 +270,10 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
     };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
-    let model = request.model.clone();
-    if model != state.server_args.served_model_name {
+    if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
-            format!("The model `{model}` does not exist"),
+            format!("The model `{}` does not exist", request.model),
             false,
         );
     }
@@ -319,13 +309,31 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
-    let prompts = match completion_prompt_specs(&request.prompt) {
+    // Per-choice logprob flags, resolved before the request is destructured.
+    let want_logprobs = request.logprobs.is_some();
+    let top_logprobs_num = i64::from(request.logprobs.unwrap_or(0));
+    let logprob_start_len = if echo && want_logprobs { 0 } else { -1 };
+    let return_text_in_logprobs = want_logprobs.then_some(true);
+    // Resolved now, evaluated after the prompt moves: a bad prompt still reports
+    // before a bad sampling param, as it did when this borrowed `request`.
+    let sampling_result = completion_sampling_params(&request);
+
+    let CreateCompletionRequest {
+        model,
+        prompt,
+        n,
+        stream_options,
+        ..
+    } = request;
+    let n = n.unwrap_or(1) as usize;
+
+    let prompts = match completion_prompt_specs(prompt) {
         Ok(prompts) => prompts,
         Err(message) => {
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
-    let mut sampling = match completion_sampling_params(&request) {
+    let mut sampling = match sampling_result {
         Ok(sampling) => sampling,
         Err(message) => {
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
@@ -338,7 +346,6 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
         return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
 
-    let n = request.n.unwrap_or(1) as usize;
     let choice_count = match prompts.len().checked_mul(n) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
@@ -351,94 +358,64 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut submitted = Vec::with_capacity(choice_count);
+    let mut requests = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        let (text, input_ids, mut prompt_echo) = match prompt {
-            PromptSpec::Text(text) => {
-                let prompt_echo = if echo { text.clone() } else { String::new() };
-                (Some(text), None, prompt_echo)
-            }
-            PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
+        let (mut text, mut input_ids) = match prompt {
+            PromptSpec::Text(text) => (Some(text), None),
+            PromptSpec::TokenIds(input_ids) => (None, Some(input_ids)),
         };
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
-            if echo
-                && sample_index == 0
-                && let Some(token_ids) = &input_ids
-            {
-                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
-                    Ok(echo) => echo,
-                    Err(e) => return openai_error(e.http_status(), e.message, false),
-                };
-            }
-            let native = GenerateRequest {
-                rid: rid.clone(),
-                text: text.clone(),
-                input_ids: input_ids.clone(),
+            // The last choice of each prompt takes the payload by move; the ones
+            // before it still need a copy of their own.
+            let last = sample_index + 1 == n;
+            requests.push(GenerateRequest {
+                rid,
+                text: if last { text.take() } else { text.clone() },
+                input_ids: if last {
+                    input_ids.take()
+                } else {
+                    input_ids.clone()
+                },
                 sampling_params: sampling.clone(),
                 stream,
-                return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if echo && request.logprobs.is_some() {
-                    0
-                } else {
-                    -1
-                },
-                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
-                return_text_in_logprobs: request.logprobs.map(|_| true),
+                return_logprob: want_logprobs,
+                logprob_start_len,
+                top_logprobs_num,
+                return_text_in_logprobs,
+                return_prompt_text: echo,
                 ..Default::default()
-            };
-            let rx = match submit_generation(&state, native, &mut guard).await {
-                Ok(rx) => rx,
-                Err(e) => return openai_error(e.http_status(), e.message, stream),
-            };
-            submitted.push(SubmittedChoice {
-                index,
-                prompt_index,
-                rid,
-                echo: prompt_echo.clone(),
-                rx,
             });
         }
     }
 
+    let plan = match crate::api_server::core::generate::start_generate_plan(&state, requests).await
+    {
+        Ok(plan) => plan,
+        Err(e) => return openai_error(e.http_status(), e.message, stream),
+    };
+    let options = CompletionRenderingOptions {
+        response_id,
+        model,
+        created,
+        echo,
+        want_logprobs,
+        n,
+    };
     if stream {
-        let include_usage = request
-            .stream_options
-            .map(|o| o.include_usage)
-            .unwrap_or(false)
+        let include_usage = stream_options.map(|o| o.include_usage).unwrap_or(false)
             || state.server_args.stream_response_default_include_usage;
-        let continuous_usage = request
-            .stream_options
+        let continuous_usage = stream_options
             .map(|o| o.continuous_usage_stats)
             .unwrap_or(false);
-        let want_logprobs = request.logprobs.is_some();
-        let s = completion_event_stream(
-            submitted,
-            guard,
-            response_id,
-            model,
-            created,
-            echo,
-            want_logprobs,
-            include_usage,
-            continuous_usage,
-        );
+        let shaper =
+            CompletionFrameShaper::new(choice_count, options, include_usage, continuous_usage);
+        let s = completion_event_stream(plan, shaper);
         sse_encode(s.map(completion_sse_payload))
     } else {
-        match unary_completion(
-            submitted,
-            guard,
-            response_id,
-            model,
-            created,
-            echo,
-            request.logprobs.is_some(),
-        )
-        .await
-        {
+        match unary_completion(plan, options).await {
             Ok(value) => json_response(StatusCode::OK, &value),
             Err(e) => openai_error(e.http_status(), e.message, false),
         }
@@ -482,7 +459,7 @@ mod tests {
 
     use super::super::response::{HttpBody, HttpResponse, empty, full};
     use super::openai_error;
-    use crate::api_server::core::openai::test_utils::senders;
+    use crate::api_server::core::test_utils::senders;
     use crate::message::config::ServerArgs;
     use crate::tokenizer_manager::wiring::Senders;
 
@@ -508,24 +485,6 @@ mod tests {
     /// (those have their own tests in `api_server::layers`).
     pub(super) fn app(state: Arc<super::AppState>) -> axum::Router {
         super::super::app::router(state, None)
-    }
-
-    pub(super) fn senders_closed() -> Senders {
-        // Dropping the receivers disconnects the channels; the senders stay
-        // valid (moveable) but every send reports `Err`, the shutdown state
-        // `submit` surfaces as a 503.
-        let (tm_tx, tm_rx) = flume::unbounded();
-        drop(tm_rx);
-        let (abort_tx, abort_rx) = flume::unbounded();
-        drop(abort_rx);
-        let (tok_tx, tok_rx) = flume::unbounded();
-        drop(tok_rx);
-        Senders {
-            tok_manager_tx: tm_tx,
-            abort_tx,
-            tokenizer_tx: tok_tx,
-            detokenizer_tx: vec![],
-        }
     }
 
     /// Serve one request through the full service (extraction, routing); the
@@ -559,6 +518,18 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// The first SSE frame's JSON: the text before the first blank line, with
+    /// the `data: ` prefix stripped.
+    fn first_sse_frame(text: &str) -> serde_json::Value {
+        let frame = text
+            .split("\n\n")
+            .next()
+            .expect("SSE text has a frame")
+            .strip_prefix("data: ")
+            .expect("frame carries the data prefix");
+        serde_json::from_str(frame).expect("frame is JSON")
+    }
+
     /// The common StatusCode→error helper follows `error_response`'s shape:
     /// unary requests get the JSON error with its status; a committed stream gets
     /// 200 + one SSE error frame + `[DONE]`, and the frame carries the OpenAI
@@ -577,13 +548,7 @@ mod tests {
         assert_eq!(streamed.status(), StatusCode::OK);
         let bytes = streamed.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        let frame = text
-            .split("\n\n")
-            .next()
-            .unwrap()
-            .strip_prefix("data: ")
-            .unwrap();
-        let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let frame = first_sse_frame(&text);
         assert_eq!(frame["error"]["message"], "bad input");
         assert_eq!(frame["error"]["type"], "BadRequestError");
         assert!(text.contains("[DONE]"));
@@ -626,15 +591,6 @@ mod tests {
             .unwrap();
         let response = oneshot(app_.clone(), req).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        // A closed tm inbox (shutdown) surfaces as 503.
-        let app_ = app(app_state(senders_closed()));
-        let response = post_json(
-            app_.clone(),
-            "/v1/completions",
-            json!({"model": "model", "prompt": "hi"}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -688,59 +644,69 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A closed tm inbox with a *streaming* request must answer inside the
-    /// committed stream: 200 + one OpenAI-shaped SSE error frame + `[DONE]` (the
-    /// same `error_response` rule the native API applies), not a unary 503.
+    /// A closed tm inbox (shutdown) must answer in the shape the client asked
+    /// for: unary → 503 JSON; streaming → 200 with one OpenAI-shaped SSE error
+    /// frame + `[DONE]` and the SSE headers (the same `error_response` rule the
+    /// native API applies), not a unary 503.
     #[tokio::test]
-    async fn streaming_submit_failure_answers_inside_the_stream() {
-        let app_ = app(app_state(senders_closed()));
-        let response = post_json(
-            app_,
-            "/v1/completions",
-            json!({"model": "model", "prompt": "hi", "stream": true}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    async fn submit_failure_answer_shape_follows_stream_flag() {
+        let body = |stream| json!({"model": "model", "prompt": "hi", "stream": stream});
+
+        let unary = post_json(app(app_state(senders())), "/v1/completions", body(false)).await;
+        assert_eq!(unary.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(unary).await["error"]["code"], 503);
+
+        let streamed = post_json(app(app_state(senders())), "/v1/completions", body(true)).await;
+        assert_eq!(streamed.status(), StatusCode::OK);
+        assert_eq!(
+            streamed
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            streamed
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache")
+        );
+        let bytes = streamed.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        let frame = text
-            .split("\n\n")
-            .next()
-            .unwrap()
-            .strip_prefix("data: ")
-            .unwrap();
-        let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let frame = first_sse_frame(&text);
         assert_eq!(frame["error"]["message"], "service unavailable");
         assert_eq!(frame["error"]["type"], "InternalServerError");
         assert_eq!(frame["error"]["code"], 503);
         assert!(text.contains("[DONE]"));
     }
 
-    /// The HTTP-edge wire contract the de-axum swap must reproduce byte-for-byte:
-    /// the extractor rejection texts (clients see them in 400 bodies), the SSE
-    /// response headers, and the no-route / wrong-method statuses.
+    /// The HTTP edge: this handler coerces extractor rejections to 400 (it
+    /// ignores `JsonRejection.status`), and the router answers unknown paths and
+    /// wrong methods. Exact rejection texts are pinned by `http::response` tests.
     #[tokio::test]
     async fn http_edge_wire_contract() {
         use http::header::CONTENT_TYPE;
 
         let mk_app = || app(app_state(senders()));
 
-        // Malformed JSON: 400 with axum's syntax text incl. serde's position.
-        let req = Request::builder()
+        // Malformed JSON, a type mismatch, and a missing content type all become
+        // this handler's 400 rather than axum's default 415/422.
+        let malformed = Request::builder()
             .method("POST")
             .uri("/v1/completions")
             .header(CONTENT_TYPE, "application/json")
             .body(full("{\"model\": }"))
             .unwrap();
-        let res = oneshot(mk_app(), req).await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(res).await;
-        assert_eq!(
-            v["error"]["message"],
-            "Failed to parse the request body as JSON: model: expected value at line 1 column 11"
-        );
-
-        // Type mismatch: 400 with axum's data-error text.
+        let missing_type = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .body(full("{}"))
+            .unwrap();
+        for req in [malformed, missing_type] {
+            let res = oneshot(mk_app(), req).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
         let res = post_json(
             mk_app(),
             "/v1/completions",
@@ -748,27 +714,8 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(res).await;
-        assert_eq!(
-            v["error"]["message"],
-            "Failed to deserialize the JSON body into the target type: model: invalid type: integer `3`, expected a string at line 1 column 10"
-        );
 
-        // Missing JSON content type: 400 with axum's content-type text.
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/completions")
-            .body(full("{}"))
-            .unwrap();
-        let res = oneshot(mk_app(), req).await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(res).await;
-        assert_eq!(
-            v["error"]["message"],
-            "Expected request with `Content-Type: application/json`"
-        );
-
-        // Unknown path: bare 404. Known path, wrong method: bare 405 + Allow.
+        // Unknown path: bare 404. Known path, wrong method: 405 + Allow.
         let res = oneshot(
             mk_app(),
             Request::builder().uri("/nope").body(empty()).unwrap(),
@@ -790,28 +737,6 @@ mod tests {
                 .get(http::header::ALLOW)
                 .and_then(|v| v.to_str().ok()),
             Some("POST")
-        );
-
-        // A committed stream: 200 with the SSE headers axum set.
-        let app_ = app(app_state(senders_closed()));
-        let res = post_json(
-            app_,
-            "/v1/completions",
-            serde_json::json!({"model": "model", "prompt": "hi", "stream": true}),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            res.headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream")
-        );
-        assert_eq!(
-            res.headers()
-                .get(http::header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-cache")
         );
     }
 }

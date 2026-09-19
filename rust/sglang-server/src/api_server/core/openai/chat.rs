@@ -15,11 +15,14 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
 use crate::api_server::core::error::ApiError;
 use crate::api_server::core::event::CoreEvent;
-use crate::api_server::core::guard::AbortGuard;
+use crate::api_server::core::frame::OutputAccumulator;
+use crate::api_server::core::generate::{
+    FrameShaper, GeneratePlan, RequestTiming, UnaryDrainPolicy, drain_plan_unary,
+    generation_event_stream_with, unary_output,
+};
 use crate::api_server::core::openai::completions::completion_usage;
 use crate::api_server::core::openai::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use crate::api_server::core::openai::template::ChatFormatter;
@@ -27,11 +30,9 @@ use crate::api_server::core::openai::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
     parse_chat_tool_calls,
 };
-use crate::api_server::core::openai::{collect_output, indexed_decode_stream};
 use crate::api_server::core::state::CoreState;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
-use crate::message::ids::Rid;
-use crate::message::response::{ChunkExtras, ResponseItem};
+use crate::message::response::{ChunkEvent, ChunkExtras};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
@@ -203,43 +204,51 @@ pub(crate) fn chat_sampling_params(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct ChatRenderingOptions {
+    pub(crate) response_id: String,
+    pub(crate) model: String,
+    pub(crate) created: u32,
+    pub(crate) want_logprobs: bool,
+    pub(crate) parser: Option<String>,
+    pub(crate) reasoning_parser: Option<String>,
+    pub(crate) tools: Option<Vec<ToolDefinition>>,
+    pub(crate) parallel_tool_calls: bool,
+    pub(crate) service_tier: Option<ChatServiceTier>,
+}
+
 pub(crate) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
-    response_id: String,
-    model: String,
-    created: u32,
-    want_logprobs: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
-    parallel_tool_calls: bool,
-    service_tier: Option<ChatServiceTier>,
+    plan: GeneratePlan,
+    options: ChatRenderingOptions,
 ) -> Result<CreateChatCompletionResponse, ApiError> {
-    let mut choices = Vec::with_capacity(submitted.len());
+    let drained = drain_plan_unary(plan, UnaryDrainPolicy::AggregateFailFast).await?;
+    let mut choices = Vec::with_capacity(drained.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
 
-    for (index, rid, rx) in submitted {
-        let output = collect_output(rx, &mut guard, &rid).await?;
+    for (index, (_, outcome)) in drained.into_iter().enumerate() {
+        let output = unary_output(outcome)?;
 
         if prompt_tokens == 0 {
             prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-        let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+        let logprobs = options
+            .want_logprobs
+            .then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning_unary(
+            options.reasoning_parser.as_deref(),
+            &output.text,
+            &output.token_ids,
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
-            parser.as_deref(),
-            tools.as_deref(),
-            parallel_tool_calls,
+            options.parser.as_deref(),
+            options.tools.as_deref(),
+            options.parallel_tool_calls,
         )
         .await;
         let finish_reason = if tool_calls.is_some() {
@@ -267,11 +276,11 @@ pub(crate) async fn unary_chat(
     }
 
     Ok(CreateChatCompletionResponse {
-        id: response_id,
+        id: options.response_id,
         choices,
-        created,
-        model,
-        service_tier,
+        created: options.created,
+        model: options.model,
+        service_tier: options.service_tier,
         system_fingerprint: None,
         object: "chat.completion".into(),
         usage: Some(completion_usage(
@@ -281,236 +290,274 @@ pub(crate) async fn unary_chat(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
+struct ChatStreamFrameShaper {
     response_id: String,
     model: String,
     created: u32,
     want_logprobs: bool,
     include_usage: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
+    reasoning_splitters: Vec<ReasoningStreamSplitter>,
+    prelude_emitted: Vec<bool>,
+    prompt_tokens: Option<u32>,
+    completion_tokens: u64,
+    service_tier: Option<ChatServiceTier>,
+}
+
+impl ChatStreamFrameShaper {
+    fn annotated(
+        data: Option<CreateChatCompletionStreamResponse>,
+        error: Option<String>,
+    ) -> Annotated<CreateChatCompletionStreamResponse> {
+        Annotated {
+            data,
+            error,
+            id: None,
+            event: None,
+            comment: None,
+        }
+    }
+
+    fn response(
+        &self,
+        choices: Vec<ChatChoiceStream>,
+        usage: Option<dynamo_protocols::types::CompletionUsage>,
+    ) -> Annotated<CreateChatCompletionStreamResponse> {
+        Self::annotated(
+            Some(CreateChatCompletionStreamResponse {
+                id: self.response_id.clone(),
+                choices,
+                created: self.created,
+                model: self.model.clone(),
+                service_tier: self.service_tier.clone(),
+                system_fingerprint: None,
+                object: "chat.completion.chunk".into(),
+                usage,
+            }),
+            None,
+        )
+    }
+
+    fn error_frame(&self, error: &ApiError) -> Annotated<CreateChatCompletionStreamResponse> {
+        Self::annotated(None, Some(encode_stream_error(error)))
+    }
+
+    fn role_prelude(
+        &mut self,
+        index: usize,
+    ) -> Option<Annotated<CreateChatCompletionStreamResponse>> {
+        if std::mem::replace(&mut self.prelude_emitted[index], true) {
+            return None;
+        }
+        Some(self.response(
+            vec![ChatChoiceStream {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                delta: chat_delta(None, Some(Role::Assistant), None, None),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            None,
+        ))
+    }
+
+    fn render_output(
+        &mut self,
+        choice_index: usize,
+        mut output: ChunkEvent,
+        terminal: bool,
+    ) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+        let index = u32::try_from(choice_index).unwrap_or(u32::MAX);
+        // First non-zero count wins, matching the unary fan-in: an early frame may
+        // carry 0 before the scheduler reports the real prompt token count.
+        if self.prompt_tokens.unwrap_or(0) == 0 {
+            self.prompt_tokens = Some(output.prompt_tokens);
+        }
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(output.completion_tokens);
+        let finish_reason = if terminal {
+            chat_finish_reason(&output)
+        } else {
+            None
+        };
+        let reasoning_enabled = !self.reasoning_splitters.is_empty();
+        let mut emitted = Vec::with_capacity(2);
+        if reasoning_enabled {
+            let (reasoning_text, normal_text) =
+                self.reasoning_splitters[choice_index].split(&output.text, &output.token_ids);
+            let mut remaining_logprobs = self
+                .want_logprobs
+                .then(|| chat_logprobs(output.extras.as_deref()));
+            if !reasoning_text.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index,
+                    delta: chat_delta(None, None, None, Some(reasoning_text)),
+                    finish_reason: None,
+                    logprobs: remaining_logprobs.take(),
+                });
+            }
+            if !normal_text.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index,
+                    delta: chat_delta(Some(normal_text), None, None, None),
+                    finish_reason: None,
+                    logprobs: remaining_logprobs,
+                });
+            }
+        } else {
+            emitted.push(ChatChoiceStream {
+                index,
+                delta: chat_delta(
+                    (!output.text.is_empty()).then_some(std::mem::take(&mut output.text)),
+                    None,
+                    None,
+                    None,
+                ),
+                finish_reason: None,
+                logprobs: self
+                    .want_logprobs
+                    .then(|| chat_logprobs(output.extras.as_deref())),
+            });
+        }
+        if terminal && reasoning_enabled && finish_reason.is_some() {
+            let (reasoning_tail, normal_tail) = self.reasoning_splitters[choice_index].finish();
+            if !reasoning_tail.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index,
+                    delta: chat_delta(None, None, None, Some(reasoning_tail)),
+                    finish_reason: None,
+                    logprobs: None,
+                });
+            }
+            if !normal_tail.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index,
+                    delta: chat_delta(Some(normal_tail), None, None, None),
+                    finish_reason: None,
+                    logprobs: None,
+                });
+            }
+        }
+        match emitted.last_mut() {
+            Some(last) => last.finish_reason = finish_reason,
+            None => emitted.push(ChatChoiceStream {
+                index,
+                delta: chat_delta(None, None, None, None),
+                finish_reason,
+                logprobs: None,
+            }),
+        }
+        self.role_prelude(choice_index)
+            .into_iter()
+            .chain(
+                emitted
+                    .into_iter()
+                    .map(|choice| self.response(vec![choice], None)),
+            )
+            .collect()
+    }
+}
+
+impl FrameShaper for ChatStreamFrameShaper {
+    type Frame = Vec<Annotated<CreateChatCompletionStreamResponse>>;
+
+    fn delta(
+        &mut self,
+        out: ChunkEvent,
+        _acc: &OutputAccumulator,
+        _rid: &str,
+        index: Option<usize>,
+    ) -> Self::Frame {
+        self.render_output(index.unwrap_or(0), out, false)
+    }
+
+    fn coalesced(
+        &mut self,
+        acc: &OutputAccumulator,
+        _rid: &str,
+        index: Option<usize>,
+    ) -> Self::Frame {
+        self.delta(acc.snapshot().clone(), acc, "", index)
+    }
+
+    fn terminal(
+        &mut self,
+        out: ChunkEvent,
+        _acc: &OutputAccumulator,
+        _incremental: bool,
+        _rid: &str,
+        index: Option<usize>,
+        _timing: &RequestTiming,
+    ) -> Self::Frame {
+        self.render_output(index.unwrap_or(0), out, true)
+    }
+
+    fn item_error(&mut self, code: u16, message: &str, index: Option<usize>) -> Self::Frame {
+        let mut frames: Vec<_> = self.role_prelude(index.unwrap_or(0)).into_iter().collect();
+        frames.push(self.error_frame(&ApiError::new(code, message)));
+        frames
+    }
+
+    fn finish(&mut self) -> Option<Self::Frame> {
+        if !self.include_usage {
+            return None;
+        }
+        Some(vec![self.response(
+            vec![],
+            Some(completion_usage(
+                self.prompt_tokens.unwrap_or_default(),
+                u32::try_from(self.completion_tokens).unwrap_or(u32::MAX),
+            )),
+        )])
+    }
+}
+
+pub(crate) fn chat_event_stream(
+    plan: GeneratePlan,
+    count: usize,
+    options: ChatRenderingOptions,
+    include_usage: bool,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
-    parallel_tool_calls: bool,
-    service_tier: Option<ChatServiceTier>,
 ) -> impl futures::Stream<Item = CoreEvent<CreateChatCompletionStreamResponse>> {
-    let count = submitted.len();
-    let raw = async_stream::stream! {
-        let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
-        let mut streams = Vec::with_capacity(count);
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u64;
-        // One stateful reasoning splitter per choice (Python keeps a
-        // `reasoning_parser_dict` per index).
-        let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
-            if reasoning_parser.is_some() {
-                (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
-                    .collect()
-            } else {
-                vec![]
-            };
-        let reasoning_enabled = !reasoning_splitters.is_empty();
-
-        for (index, rid, rx) in submitted {
-            rids.push(rid);
-            streams.push(indexed_decode_stream(index, rx));
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id.clone(),
-                    choices: vec![ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, Some(Role::Assistant), None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    }],
-                    created,
-                    model: model.clone(),
-                    service_tier: service_tier.clone(),
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: None,
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
-        }
-
-        let mut events = futures::stream::select_all(streams);
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(encode_stream_error(&ApiError::internal("response truncated before completion"))),
-                };
-                continue;
-            };
-            let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield Annotated {
-                        data: None,
-                        id: None,
-                        event: None,
-                        comment: None,
-                        error: Some(encode_stream_error(&ApiError::from_pipeline(&error))),
-                    };
-                    continue;
-                }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
-            };
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(encode_stream_error(&ApiError::from_abort(code, message))),
-                };
-                continue;
-            }
-
-            if prompt_tokens == 0 {
-                prompt_tokens = output.prompt_tokens;
-            }
-            completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-            let finish_reason = chat_finish_reason(&output);
-            // Split the step's text into (reasoning, normal) deltas when
-            // `--reasoning-parser` is set. Mirrors Python's per-step emission:
-            // reasoning chunk first (logprobs ride it), then the content chunk.
-            let mut emitted = Vec::with_capacity(2);
-            if reasoning_enabled {
-                let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
-                let mut remaining_logprobs =
-                    want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-                if !reasoning_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_text)),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs.clone(),
-                    });
-                    remaining_logprobs = None;
-                }
-                if !normal_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_text), None, None, None),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs,
-                    });
-                }
-            } else {
-                emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(
-                        (!output.text.is_empty()).then_some(output.text),
-                        None,
-                        None,
-                        None,
-                    ),
-                    finish_reason: None,
-                    logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
-                });
-            };
-            // Flush the choice's buffered reasoning tail before its terminal
-            // frame (Python `parse_stream_end`, which skips aborts — abort
-            // frames already became error chunks above). Both columns flush:
-            // some parsers buffer the answer text until EOF.
-            if reasoning_enabled && finish_reason.is_some() {
-                let (reasoning_tail, normal_tail) = reasoning_splitters[index].finish();
-                if !reasoning_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_tail)),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-                if !normal_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_tail), None, None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-            }
-            // The finish reason rides the last emitted chunk (the wire format
-            // the equivalence tests pin); a step whose text was entirely
-            // buffered inside the parser still gets a finish-only frame.
-            match emitted.last_mut() {
-                Some(last) => last.finish_reason = finish_reason,
-                None => emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(None, None, None, None),
-                    finish_reason,
-                    logprobs: None,
-                }),
-            }
-            for choice in emitted {
-                yield Annotated {
-                    data: Some(CreateChatCompletionStreamResponse {
-                        id: response_id.clone(),
-                        choices: vec![choice],
-                        created,
-                        model: model.clone(),
-                        service_tier: service_tier.clone(),
-                        system_fingerprint: None,
-                        object: "chat.completion.chunk".into(),
-                        usage: None,
-                    }),
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: None,
-                };
-            }
-        }
-
-        if include_usage {
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id,
-                    choices: vec![],
-                    created,
-                    model,
-                    service_tier,
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: Some(completion_usage(
-                        prompt_tokens,
-                        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                    )),
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
-        }
+    let ChatRenderingOptions {
+        response_id,
+        model,
+        created,
+        want_logprobs,
+        parser,
+        reasoning_parser,
+        tools,
+        parallel_tool_calls,
+        service_tier,
+    } = options;
+    let reasoning_splitters = reasoning_parser
+        .as_deref()
+        .map(|parser| {
+            (0..count)
+                .map(|_| ReasoningStreamSplitter::new(Some(parser)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan = GeneratePlan {
+        incremental: true,
+        ..plan
     };
-
+    let raw = generation_event_stream_with(
+        plan,
+        ChatStreamFrameShaper {
+            response_id,
+            model,
+            created,
+            want_logprobs,
+            include_usage,
+            reasoning_splitters,
+            prelude_emitted: vec![false; count],
+            prompt_tokens: None,
+            completion_tokens: 0,
+            service_tier,
+        },
+    )
+    .flat_map(futures::stream::iter);
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
@@ -524,12 +571,11 @@ pub(crate) fn chat_event_stream(
     } else {
         Box::pin(raw)
     };
-
     async_stream::stream! {
         let mut tool_calls_seen = vec![false; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
-            if let Some(response) = item.data.as_mut() {
+            if let Some(mut response) = item.data.take() {
                 if !parallel_tool_calls {
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
@@ -550,7 +596,7 @@ pub(crate) fn chat_event_stream(
                         }
                     }
                 }
-                yield CoreEvent::Item(response.clone());
+                yield CoreEvent::Item(response);
             } else if let Some(error) = item.error {
                 yield CoreEvent::ItemError(decode_stream_error(error));
             }
@@ -649,16 +695,67 @@ pub(crate) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
-    use crate::api_server::core::guard::AbortGuard;
+    use crate::api_server::core::openai::template::ChatFormatter;
+    use crate::api_server::core::test_utils::{
+        abort_senders, aborted_guard_rids, chunk, plan, planned, senders,
+    };
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{ChunkExtras, ResponseItem};
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
+
+    /// The common rendering options; tests override one field with struct-update
+    /// syntax.
+    fn chat_options() -> ChatRenderingOptions {
+        ChatRenderingOptions {
+            response_id: "chatcmpl-test".into(),
+            model: "model".into(),
+            created: 1,
+            want_logprobs: false,
+            parser: None,
+            reasoning_parser: None,
+            tools: None,
+            parallel_tool_calls: true,
+            service_tier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_during_chat_frame_expansion_aborts_only_unfinished_choices() {
+        for terminal in [false, true] {
+            let (senders, abort_rx) = abort_senders();
+            let (choice0, tx0) = planned("r0");
+            let (choice1, _tx1) = planned("r1");
+            tx0.send(chunk("r0", "content", terminal)).await.unwrap();
+            let plan = plan(vec![choice0, choice1], senders);
+
+            {
+                let stream = chat_event_stream(plan, 2, chat_options(), false, None, false);
+                futures::pin_mut!(stream);
+                let role: serde_json::Value =
+                    serde_json::from_str(&super::chat_sse_payload(stream.next().await.unwrap()))
+                        .unwrap();
+                assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+                // Drop with content still buffered inside the adapter's expansion.
+                // A terminal RID was already disarmed by the shared core.
+            }
+
+            let expected = if terminal {
+                vec!["r1"]
+            } else {
+                vec!["r0", "r1"]
+            };
+            assert_eq!(
+                aborted_guard_rids(&abort_rx),
+                expected,
+                "terminal={terminal}"
+            );
+        }
+    }
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -669,7 +766,8 @@ mod tests {
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
-    /// config (`--sampling-defaults model`) > OpenAI terminal default.
+    /// config (`--sampling-defaults model`) > OpenAI terminal default. A
+    /// `None` model value is the `--sampling-defaults openai` shape.
     #[test]
     fn sampling_defaults_follow_python_priority_chain() {
         let model = DefaultSamplingParams {
@@ -678,13 +776,18 @@ mod tests {
             ..Default::default()
         };
         // Omitted → model defaults, not the 1.0 OpenAI terminals.
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&model),
-        )
-        .unwrap();
-        assert_eq!(sampling.temperature, 0.6);
-        assert_eq!(sampling.top_p, 0.9);
+        for (model, temperature, top_p) in [
+            (model.clone(), 0.6_f64, 0.9_f64),
+            (DefaultSamplingParams::default(), 1.0, 1.0),
+        ] {
+            let sampling = chat_sampling_params(
+                &request(),
+                &SamplingDefaults::CHAT.with_model_defaults(&model),
+            )
+            .unwrap();
+            assert_eq!(sampling.temperature, temperature);
+            assert_eq!(sampling.top_p, top_p);
+        }
         // Explicit request values win. `Option<f32>` loses precision in f64 —
         // compare with tolerance.
         let mut request = request();
@@ -699,26 +802,12 @@ mod tests {
         assert!((sampling.top_p - 0.5).abs() < 1e-6);
     }
 
-    /// `--sampling-defaults openai` resolves an empty model-config slice, so the
-    /// conversion falls back to the OpenAI terminal defaults.
-    #[test]
-    fn sampling_defaults_fall_back_to_openai_terminals_in_openai_mode() {
-        let openai_mode = DefaultSamplingParams::default();
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&openai_mode),
-        )
-        .unwrap();
-        assert_eq!(sampling.temperature, 1.0);
-        assert_eq!(sampling.top_p, 1.0);
-    }
-
     /// Python `_apply_conversation_template`: template `stop_str` first, then
     /// the request's own stops.
     #[test]
     fn template_stops_merge_before_request_stops() {
         let chatml = crate::api_server::core::openai::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
+        let formatter = ChatFormatter::Legacy(Box::new(
             crate::api_server::core::openai::template::LegacyFormatter { spec: chatml },
         ));
         assert_eq!(
@@ -768,23 +857,18 @@ mod tests {
         req.stop = Some(Stop::TokenIdArray(vec![2, 3]));
         merge_template_stops(&mut req, &formatter);
         assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
-    }
 
-    /// The HuggingFace renderer carries no template stops (Python's jinja path
-    /// keeps only the request's stops), so the request is left unchanged.
-    #[test]
-    fn huggingface_formatter_leaves_request_stops_alone() {
-        let mut req = request();
-        req.stop = Some(Stop::String("x".into()));
-        // A prompt formatter is not constructible here without a tokenizer; the
-        // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
+        // A formatter with no template stops — the HuggingFace renderer's shape
+        // (Python's jinja path keeps only the request's stops); the empty legacy
+        // spec is that branch's constructible twin — leaves the request alone.
+        let legacy = ChatFormatter::Legacy(Box::new(
             crate::api_server::core::openai::template::LegacyFormatter {
                 spec: crate::api_server::core::openai::template::LegacySpec::default(),
             },
         ));
         assert!(legacy.stop_strs().is_none());
+        let mut req = request();
+        req.stop = Some(Stop::String("x".into()));
         merge_template_stops(&mut req, &legacy);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
     }
@@ -828,37 +912,26 @@ mod tests {
 
     #[tokio::test]
     async fn unary_chat_fans_in_choices_and_usage() {
-        let (choice0, tx0) = chat_submitted(0, "r0");
-        let (choice1, tx1) = chat_submitted(1, "r1");
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
         tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+        tx1.send(chunk("r1", "London", true)).await.unwrap();
 
-        let response = unary_chat(
-            vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            None,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await
-        .expect("unary chat succeeds");
+        let response = unary_chat(plan(vec![choice0, choice1], senders()), chat_options())
+            .await
+            .expect("unary chat succeeds");
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
+        assert_eq!(value["choices"][1]["message"]["content"], "London");
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 2);
     }
 
     #[tokio::test]
     async fn unary_chat_separates_reasoning_content_with_parser_configured() {
-        let (choice, tx) = chat_submitted(0, "r0");
+        let (choice, tx) = planned("r0");
         tx.send(chunk(
             "r0",
             "<think>because Paris is famous</think>Paris",
@@ -868,17 +941,11 @@ mod tests {
         .unwrap();
 
         let response = unary_chat(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            None,
-            Some("deepseek-r1".into()),
-            None,
-            true,
-            None,
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                reasoning_parser: Some("deepseek-r1".into()),
+                ..chat_options()
+            },
         )
         .await
         .expect("unary chat succeeds");
@@ -893,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_separates_reasoning_into_own_deltas() {
-        let (choice, tx) = chat_submitted(0, "r0");
+        let (choice, tx) = planned("r0");
         // Force mode starts in reasoning, so the opener is stripped and the first
         // reasoning fragment streams immediately.
         tx.send(chunk("r0", "<think>be", false)).await.unwrap();
@@ -903,20 +970,15 @@ mod tests {
         tx.send(chunk("r0", "is", true)).await.unwrap();
 
         let stream = chat_event_stream(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
+            plan(vec![choice], senders()),
             1,
-            false,
+            ChatRenderingOptions {
+                reasoning_parser: Some("deepseek-r1".into()),
+                ..chat_options()
+            },
             true,
             None,
-            Some("deepseek-r1".into()),
-            None,
-            None,
             false,
-            true,
-            None,
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.map(super::chat_sse_payload).collect().await;
@@ -946,25 +1008,17 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_emits_role_deltas_usage_and_done() {
-        let (choice, tx) = chat_submitted(0, "r0");
+        let (choice, tx) = planned("r0");
         tx.send(chunk("r0", "Par", false)).await.unwrap();
         tx.send(chunk("r0", "is", true)).await.unwrap();
 
         let stream = chat_event_stream(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
+            plan(vec![choice], senders()),
             1,
-            false,
+            chat_options(),
             true,
             None,
-            None,
-            None,
-            None,
             false,
-            true,
-            None,
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.map(super::chat_sse_payload).collect().await;
@@ -981,5 +1035,60 @@ mod tests {
         assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
+    }
+
+    /// With `include_usage=false` the stream ends at the terminal chunk; no
+    /// usage-only trailer is emitted.
+    #[tokio::test]
+    async fn streaming_chat_omits_usage_trailer_when_disabled() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "Par", false)).await.unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            1,
+            chat_options(),
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.map(super::chat_sse_payload).collect().await;
+        assert_eq!(frames.len(), 3, "role + delta + terminal, no usage chunk");
+        let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+        assert!(terminal["usage"].is_null());
+    }
+
+    /// Usage must recover the prompt count when an early frame carries 0: the
+    /// streaming shaper keeps the first NON-zero count (matching the unary
+    /// fan-in) instead of latching the first frame's value.
+    #[tokio::test]
+    async fn streaming_usage_recovers_prompt_tokens_from_a_later_frame() {
+        let (choice, tx) = planned("r0");
+        let mut first = chunk("r0", "Par", false);
+        if let ResponseItem::Frame(event) = &mut first {
+            event.prompt_tokens = 0;
+        }
+        let mut terminal = chunk("r0", "is", true);
+        if let ResponseItem::Done(event) = &mut terminal {
+            event.prompt_tokens = 19;
+        }
+        tx.send(first).await.unwrap();
+        tx.send(terminal).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            1,
+            chat_options(),
+            true,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.map(super::chat_sse_payload).collect().await;
+        let usage: serde_json::Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+        assert_eq!(usage["usage"]["prompt_tokens"], 19);
     }
 }

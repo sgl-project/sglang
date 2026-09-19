@@ -417,6 +417,7 @@ impl GenerateBody {
                 return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
+                return_prompt_text: false,
                 bootstrap_host,
                 bootstrap_port,
                 bootstrap_room,
@@ -576,13 +577,6 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
-    /// Internal service call: decode a complete token-id sequence to text. Walks
-    /// the same FSM as every request (validate → register → Queued), but the
-    /// stage that answers it is the detok shard itself, never the scheduler
-    /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
 }
 
 /// A single in-flight `/generate` request (per-item from
@@ -642,6 +636,10 @@ pub struct GenerateRequest {
     /// it is consumed on the way out, by `register_detok` → `DetokMsg::Register`
     /// → the shard's `decode_logprob_texts`.
     pub return_text_in_logprobs: Option<bool>,
+    /// Ask the normal detokenizer lifecycle to attach the original prompt text
+    /// to the first generation frame. This replaces endpoint-owned detokenize
+    /// side channels such as OpenAI completion echo.
+    pub return_prompt_text: bool,
     /// PD-disaggregation routing, forwarded verbatim to the scheduler (which
     /// fills a `None` port from `--disaggregation-bootstrap-port` and 400-aborts
     /// a room-less request in PD mode).
