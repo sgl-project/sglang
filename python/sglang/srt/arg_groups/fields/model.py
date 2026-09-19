@@ -381,7 +381,8 @@ class Model(msgspec.Struct):
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
             "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
-            "using the caller's physical GPU UUID.",
+            "using the caller's physical GPU UUID plus a digest of resolved "
+            "model/parallel configuration.",
         ),
     ] = None
     weight_cache_timeout: A[
