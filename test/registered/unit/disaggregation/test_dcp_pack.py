@@ -188,7 +188,9 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
 
 
 class TestDcpPackBufferBytes(CustomTestCase):
-    def test_sizes_fixed_regions_for_each_dcp_rank(self):
+    def test_sizes_a_full_max_tokens_region_per_dcp_rank(self):
+        # Each rank packs the FULL token range, so the buffer is
+        # dcp_size * max_tokens * per-token bytes -- not max_tokens / dcp_size.
         self.assertEqual(
             dcp_pack_buffer_bytes(
                 [64 * 16, 64 * 16],
@@ -196,8 +198,33 @@ class TestDcpPackBufferBytes(CustomTestCase):
                 max_tokens=10,
                 dcp_size=4,
             ),
-            4 * 3 * (16 + 16),
+            4 * 10 * (16 + 16),
         )
+
+    def test_rank_region_holds_a_full_chunk(self):
+        """The invariant try_pack_dcp_src.fits() depends on.
+
+        `_pack_source_for_dcp_rank` slices the buffer as
+        `rank_stride = size // dcp_size` and each rank packs all `n` tokens of
+        the chunk, so a rank's stride must cover max_tokens * per-token bytes.
+        Undersizing it makes fits() fail and silently degrade to per-token RDMA.
+        """
+        item_lens = [64 * 16, 64 * 16]
+        per_token = sum(x // 64 for x in item_lens)
+        for dcp_size in (1, 2, 4, 8):
+            for max_tokens in (1, 10, 16384):
+                size = dcp_pack_buffer_bytes(
+                    item_lens, page_size=64, max_tokens=max_tokens, dcp_size=dcp_size
+                )
+                rank_stride = size // dcp_size
+                self.assertGreaterEqual(
+                    rank_stride,
+                    max_tokens * per_token,
+                    f"dcp_size={dcp_size} max_tokens={max_tokens}: rank region "
+                    f"{rank_stride} B cannot hold a full chunk "
+                    f"({max_tokens * per_token} B) -- fits() would fail and "
+                    f"fall back to per-token RDMA",
+                )
 
     def test_rejects_invalid_item_lens(self):
         with self.assertRaisesRegex(ValueError, "at least one page"):
