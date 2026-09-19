@@ -4634,6 +4634,20 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                revision=None,
+                enable_cache_report=False,
+                stream_response_default_include_usage=False,
+                default_chat_template_kwargs=None,
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+            ),
+            role="tokenizer",
+        )
         self.tm = _MockTokenizerManager()
         self.tm.server_args.tool_call_parser = "kimi_k3"
         self.tm.server_args.reasoning_parser = "kimi_k3"
@@ -4800,6 +4814,21 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
     _STUB = OpenAIServingChat._KIMI_K3_GENERATION_STUB_TOKENS
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                revision=None,
+                enable_cache_report=False,
+                stream_response_default_include_usage=False,
+                default_chat_template_kwargs=None,
+                tool_call_parser="hermes",
+                reasoning_parser=None,
+                incremental_streaming_output=True,
+            ),
+            role="tokenizer",
+        )
         self.tm = _MockTokenizerManager()
         self.tm.server_args.incremental_streaming_output = True
         self.template_manager = _MockTemplateManager()
@@ -4979,6 +5008,38 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             if f["choices"] and f["choices"][0]["finish_reason"]
         }
         self.assertEqual(finished, {0, 1})
+
+    def test_framed_sglext_keeps_k3_response_id_and_timestamp(self):
+        self.fastapi_request.headers["x-sglext-ids-framed"] = "1"
+        req = self._req(
+            return_output_ids_in_sglext=True,
+            return_cached_tokens_details=True,
+        )
+        req._stream_created_ts = 1_700_000_000
+        chunks = self._stream(
+            [
+                self._event(
+                    rid="different-engine-id",
+                    finish={"type": "stop", "matched": None},
+                    cached_tokens_details={"device": 6, "host": 0},
+                )
+            ],
+            req,
+        )
+        named_prefix = "event: sglext_ids\ndata: "
+        named = [
+            json.loads(c[len(named_prefix) :])
+            for c in chunks
+            if c.startswith(named_prefix)
+        ]
+        plain = self._frames(chunks)
+        self.assertEqual(len(named), 1)
+        self.assertEqual(named[0]["sglext"]["output_ids"], [[101, 102]])
+        self.assertTrue(any("sglext" in f for f in plain))
+        for frame in plain + named:
+            self.assertEqual(frame["id"], plain[0]["id"])
+            self.assertRegex(frame["id"], r"^chatcmpl-[0-9a-f]{24}$")
+            self.assertEqual(frame["created"], 1_700_000_000)
 
     def test_engine_assigns_a_separate_rid_per_sampled_choice(self):
         """The premise behind pinning the wire id: n>1 fans one request out

@@ -43,7 +43,7 @@ class _NoopRecorder:
 
 def _make_linear_model(layers, *, attn_res_block_size, eagle3_ids):
     """Bare KimiK3LinearModel with stub layers; skips __init__ and the
-    distributed stack (get_pp_group / recorder are patched at call sites)."""
+    distributed stack (get_parallel / recorder are patched at call sites)."""
     model = object.__new__(KimiK3LinearModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -75,7 +75,11 @@ def _run_model(model, input_ids):
         forward_mode=SimpleNamespace(is_extend=lambda: False)
     )
     with (
-        patch.object(kimi_k3_mod, "get_pp_group", lambda: model.pp_group),
+        patch.object(
+            kimi_k3_mod,
+            "get_parallel",
+            lambda: SimpleNamespace(pp_group=model.pp_group),
+        ),
         patch.object(
             kimi_k3_mod,
             "get_global_expert_distribution_recorder",

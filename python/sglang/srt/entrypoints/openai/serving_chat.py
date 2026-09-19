@@ -2845,7 +2845,6 @@ class OpenAIServingChat(OpenAIServingBase):
             content={"error": error.model_dump()}, status_code=status_code
         )
 
-
     def _process_tool_call_id(
         self,
         call_item: ToolCallItem,
