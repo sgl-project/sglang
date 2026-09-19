@@ -223,6 +223,52 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
+        """Re-check remote existence before the scheduler commits device
+        slots to the async layer-wise load.
+
+        The match-time lookup and ``batch_get_session_start`` can be minutes
+        apart; master-side memory-watermark eviction in that window expires
+        replicas and would fail the layer-wise load fatally. Re-checking here
+        lets the caller degrade the request to a plain cache miss instead.
+
+        Failures inside the revalidation itself never propagate: this hook
+        guards a hot scheduling path, so an unexpected error falls back to
+        "validated" and the async load path retains its own semantics.
+        """
+        try:
+            resolved = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
+            if not resolved:
+                return True
+            key_strs: list[str] = []
+            for transfer in resolved:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                key_strs.extend(self.storage._tag_keys(component_keys))
+            if not key_strs:
+                return True
+            exist = self.storage._batch_exist(key_strs)
+        except BaseException:
+            logger.exception("Mooncake direct linker load revalidation error")
+            return True
+        missing = [key for key, state in zip(key_strs, exist) if state != 1]
+        if missing:
+            logger.warning(
+                "Mooncake direct linker load revalidation failed: "
+                "missing=%d/%d keys (master eviction race), "
+                "degrading request to cache miss",
+                len(missing),
+                len(key_strs),
+            )
+            failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+            if failed_get_cache is not None:
+                failed_get_cache.update_batch([], missing)
+            return False
+        return True
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
@@ -307,10 +353,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
+                failed = [key for key, code in zip(keys, result) if code != 0]
+                if failed:
+                    # Master-side eviction (memory watermark) can expire a
+                    # replica between the match-time lookup and this call.
+                    # Session start re-queries the master, so retry the batch
+                    # once before giving up.
+                    logger.warning(
+                        "Mooncake get session start partial failure "
+                        "(keys=%d, failed=%d), retrying once: results=%s",
+                        len(keys),
+                        len(failed),
+                        result,
+                    )
+                    result = self.storage.store.batch_get_session_start(keys)
+                    failed = [key for key, code in zip(keys, result) if code != 0]
+                if failed:
+                    failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+                    if failed_get_cache is not None:
+                        failed_get_cache.update_batch([], failed)
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
+                        f"failed={len(failed)}, results={result}"
                     )
                 started.append(keys)
 
