@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
-    init_unified_mamba_pools,
     init_unified_mamba_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1051,34 +1050,91 @@ class TestTriFactorySizing(unittest.TestCase):
                     with self.subTest(
                         tri_pool=tri_pool, lazy=lazy, keep=keep_checkpoint
                     ):
-                        kw = self._factory_kwargs(
-                            enable_mamba_extra_buffer=True,
-                            enable_mamba_extra_buffer_lazy=lazy,
-                            disable_overlap_schedule=False,
-                            lazy_compaction=True,
+                        from sglang.srt.mem_cache import kv_cache_configurator as cfg
+
+                        kw = self._factory_kwargs()
+                        model = SimpleNamespace(
+                            get_num_kv_heads=lambda tp, dcp: 2,
+                            head_dim=4,
+                            context_len=16,
+                            full_attention_layer_ids=[0],
+                            swa_attention_layer_ids=[1],
+                            sliding_window_size=8,
                         )
-                        factory = init_unified_mamba_swa_pools
-                        if not tri_pool:
-                            factory = init_unified_mamba_pools
-                            kw["max_total_num_tokens"] = kw.pop(
-                                "full_max_total_num_tokens"
-                            )
-                            for name in (
-                                "v_head_dim",
-                                "swa_head_num",
-                                "swa_head_dim",
-                                "swa_v_head_dim",
-                                "swa_attention_layer_ids",
-                                "swa_max_total_num_tokens",
-                            ):
-                                kw.pop(name)
-                            kw.update(
-                                is_draft_worker=False,
-                                use_mla_backend=False,
-                                speculative_num_draft_tokens=None,
-                            )
-                        with get_parallel().override(attn_dcp_size=1):
-                            pool = factory(**kw).req_to_token_pool
+                        configurator = SimpleNamespace(
+                            mambaish_config=SimpleNamespace(
+                                mamba2_cache_params=kw["mamba2_cache_params"],
+                                full_attention_layer_ids=[0],
+                            ),
+                            model_config=model,
+                            layer_info=SimpleNamespace(start_layer=0, end_layer=2),
+                            device=_DEV,
+                            kv_cache_dtype=torch.float16,
+                            page_size=1,
+                            is_draft_worker=False,
+                            use_mla_backend=False,
+                            is_hybrid_swa=tri_pool,
+                            is_hybrid_swa_compress=False,
+                            forward_stream=None,
+                        )
+                        # Run the production configurator AND factory. Reverting
+                        # either top-level flag forwarding must break cleanup.
+                        with (
+                            get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+                            patch.object(
+                                cfg,
+                                "get_exec",
+                                return_value=SimpleNamespace(
+                                    features=SimpleNamespace(enable_memory_saver=False),
+                                    mamba=SimpleNamespace(
+                                        enable_mamba_extra_buffer=True,
+                                        enable_mamba_extra_buffer_lazy=lazy,
+                                    ),
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_spec",
+                                return_value=SimpleNamespace(
+                                    speculative_num_draft_tokens=None,
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_schedule",
+                                return_value=SimpleNamespace(
+                                    max_mamba_cache_size=4,
+                                    disable_overlap_schedule=False,
+                                    mamba_full_memory_ratio=None,
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_disagg",
+                                return_value=SimpleNamespace(
+                                    disaggregation_mode="null",
+                                ),
+                            ),
+                            patch.object(
+                                cfg, "_should_enable_lazy_compaction", return_value=True
+                            ),
+                        ):
+                            if tri_pool:
+                                bundle = cfg.KVCacheConfigurator._init_unified_mamba_swa_pools(
+                                    configurator,
+                                    max_num_reqs=4,
+                                    full_max_total_num_tokens=64,
+                                    swa_max_total_num_tokens=32,
+                                )
+                            else:
+                                bundle = (
+                                    cfg.KVCacheConfigurator._init_unified_mamba_pools(
+                                        configurator,
+                                        max_num_reqs=4,
+                                        max_total_num_tokens=64,
+                                    )
+                                )
+                            pool = bundle.req_to_token_pool
                         self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
                         allocator = pool.mamba_allocator
                         initial_available = allocator.available_size()
