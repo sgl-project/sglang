@@ -371,32 +371,19 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
-    else:
-        # New API: infers result type automatically
-        return Float32(
-            nvvm.fmax(
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
+    # Pick the nvvm.fmax signature by what the installed cutlass DSL accepts
+    # rather than by CUDA version: cu12.9 images can ship a DSL whose fmax
+    # already uses the new (no explicit result type) signature, in which case
+    # the version gate passed three positionals and every fa4 compile failed
+    # with "fmax() takes 2 positional arguments but 3 were given".
+    ir_c = Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None
+    ir_a = Float32(a).ir_value(loc=loc, ip=ip)
+    ir_b = Float32(b).ir_value(loc=loc, ip=ip)
+    try:
+        return Float32(nvvm.fmax(ir_a, ir_b, c=ir_c, loc=loc, ip=ip))
+    except TypeError:
+        # Older DSL API: explicit result type as first positional argument.
+        return Float32(nvvm.fmax(T.f32(), ir_a, ir_b, c=ir_c, loc=loc, ip=ip))
 
 
 @cute.jit
