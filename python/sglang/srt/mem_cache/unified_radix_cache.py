@@ -1016,6 +1016,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 cache_salt=req.cache_salt,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
+
+            if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+                # A request that finishes directly after prefill would otherwise
+                # cache its whole final chunk as live sliding-window KV. Trim it
+                # like the unfinished path does at every chunk boundary, measured
+                # on the page-aligned insert key (a bigram key is one shorter than
+                # the tokens it spans) so the frontier stops a page below
+                # page_floor(len(key)) and the leaf this insert creates keeps a
+                # full window of live SWA.
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, page_aligned_len - 1, insert_params
+                    )
+
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
             insert_params.key = radix_key
