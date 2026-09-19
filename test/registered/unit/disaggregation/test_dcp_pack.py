@@ -188,6 +188,30 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
 
 
 class TestDcpPackBufferBytes(CustomTestCase):
+    def test_manager_publishes_the_page_aligned_allocation_limit(self):
+        manager = SimpleNamespace(
+            _dcp_pack_buffers=None,
+            _dcp_pack_max_tokens=None,
+            kv_args=SimpleNamespace(kv_item_lens=[64 * 16], page_size=64),
+            transfer_queues=[object()],
+            _register_staging_memory=Mock(),
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.max_prefill_buffer_tokens",
+                return_value=8193,
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.init_dcp_pack_buffers",
+                return_value=[object()],
+            ) as init,
+        ):
+            CommonKVManager._init_dcp_pack_buffers_once(manager, 4)
+            CommonKVManager._init_dcp_pack_buffers_once(manager, 4)
+        init.assert_called_once()
+        self.assertEqual(manager._dcp_pack_max_tokens, 8256)
+        self.assertEqual(init.call_args.args[-1], manager._dcp_pack_max_tokens)
+
     def test_sizes_fixed_regions_for_each_dcp_rank(self):
         self.assertEqual(
             dcp_pack_buffer_bytes(
@@ -207,6 +231,20 @@ class TestDcpPackBufferBytes(CustomTestCase):
 
 
 class TestTryDcpPack(CustomTestCase):
+    def test_rejects_gather_that_overlaps_next_rank_region(self):
+        buf = Mock()
+        buf.fits.return_value = True
+        buf.get_size.return_value = 128
+        result = try_pack_dcp_src(
+            pack_buffer=buf,
+            kv_data_ptrs=[0x1000],
+            src_token_indices=np.arange(5, dtype=np.int64),
+            token_item_lens=[8],
+            pack_capacity_bytes=32,
+        )
+        self.assertIsNone(result)
+        buf.get_gather_stream.assert_not_called()
+
     def test_try_pack_uses_requested_region_and_dense_indices(self):
         dim = 4
         kv = torch.arange(16 * dim, dtype=torch.float32).view(16, 1, dim)
