@@ -271,8 +271,8 @@ class PrefillBootstrapQueue:
         )
         num_draft_entries = 0
         if draft_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # Draft KV shares target virtual ids. Unified target KV is transferred
+            # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
@@ -1463,14 +1463,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
+            raw_kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+                    raw_kv_indices
                 )
             )
             page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1479,9 +1479,10 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            send_state_indices = state_indices if segment_is_last else None
             req.disagg_kv_sender.send(
                 page_indices,
-                state_indices if segment_is_last else None,
+                send_state_indices,
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
