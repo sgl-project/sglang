@@ -207,6 +207,27 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return get_video_feature(self.vision_tower, items, self.use_data_parallel)
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.text_config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
