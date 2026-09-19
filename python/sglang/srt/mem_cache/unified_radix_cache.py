@@ -955,22 +955,22 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
+    @rank_consensus(same_params=["req.rid", "is_insert", "owned_kv_len"])
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         if self.disable:
-            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(0, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         result = None
@@ -1078,7 +1078,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
-            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
 
         # Synthetic profiling requests may own KV without locking a tree node.
         if req.last_node is not None:
@@ -1981,9 +1981,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
-            # A too-short/fully-matched suffix can become a full recompute if
-            # the device match evicts while queued; arm the retry.
-            self.storage_prefetch_retries.poll_miss(req_id)
+            # No lookup was issued, so no retry is armed: polling here would
+            # spend the re-issue budget the admission-time device-hit-loss
+            # re-query needs once the device match evicts while queued.
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
@@ -3548,7 +3548,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # can resolve + validate them without reaching into Controller state.
         if self.buffer_pipeline is not None:
             ongoing_write_through = [
-                (nid, entry.intent.node_id)
+                (nid, entry.intent.snapshot.node_id)
                 for nid, entry in self.buffer_pipeline.ongoing_write_through.items()
             ]
         else:

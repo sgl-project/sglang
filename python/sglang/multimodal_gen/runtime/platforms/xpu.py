@@ -191,3 +191,10 @@ class XpuPlatform(Platform):
         """Get device communicator class for Intel XPU distributed communication."""
         # Use base communicator for now; can be updated to use oneCCL-based communicator
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+
+    @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )

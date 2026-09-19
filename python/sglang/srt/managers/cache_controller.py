@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -696,7 +695,7 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_parallel().attn_tp_rank
             self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_attention_dp_rank()
+            self.dp_rank = get_parallel().attn_dp_rank
         else:
             self.tp_rank = get_parallel().tp_rank
             self.tp_size = get_parallel().tp_size

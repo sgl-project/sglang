@@ -45,8 +45,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -391,7 +389,7 @@ class Dots3MoE(nn.Module):
             )
 
             self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -459,7 +457,7 @@ class Dots3MoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(get_parallel().tp_group) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
 
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
@@ -491,7 +489,7 @@ class Dots3MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            with use_symmetric_memory(get_parallel().tp_group) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
@@ -1731,7 +1729,7 @@ class Dots3Model(nn.Module):
         super().__init__()
         _require_cuda()
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1865,7 +1863,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 "g_proj",
             ]
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -2605,7 +2603,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         )
 
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         model_dir = Path(config._name_or_path)
         self.language_model = Dots3LanguageModelForCausalLM(
             config,

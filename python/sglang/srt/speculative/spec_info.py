@@ -136,6 +136,14 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_prefill_shared_read_done(self) -> bool:
+        """Whether target EXTEND has no later speculative shared-buffer reader.
+
+        The backend must still declare a pre-replay read end. Other algorithms
+        must stage their draft's shared reads before publishing the target event.
+        """
+        return self.is_none() or self.is_dflash_family()
+
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
 
@@ -402,6 +410,10 @@ class SpecInput(ABC):
     # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
+
+    # Dataclasses assign fields before __post_init__ calls this base's __init__;
+    # assigning None there would overwrite the constructor's custom_mask.
+    custom_mask: Optional[torch.Tensor] = None
 
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
