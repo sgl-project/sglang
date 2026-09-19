@@ -80,7 +80,7 @@ struct CodecQ4 : public CodecBase {
   static constexpr int kScaleFactor = std::is_same<T, half>::value ? 0xB000B000 : 0xBE00BE00;
 
   // {1e-7, 1e-7}, f16x2_t
-  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
+  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x01020102 : 0x33D733D7;
 
   // {-8, -8}, f16x2_t
   static constexpr int kRangeMin = std::is_same<T, half>::value ? 0xC800C800 : 0xC100C100;
@@ -105,7 +105,7 @@ struct CodecQ4 : public CodecBase {
       int decoding_scale;
       int encoding_scale;
       decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
-      encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+      encoding_scale = packed_max<T>(decoding_scale, kScaleEpsilon);
       encoding_scale = packed_rcp<T>(encoding_scale);
 
       // Apply scales to get quantized values
@@ -222,7 +222,7 @@ struct CodecQ6 : public CodecBase {
   static constexpr int kScaleFactor = std::is_same<T, half>::value ? 0xA800A800 : 0xBD00BD00;
 
   // {1e-7, 1e-7}, fp16x2_t
-  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
+  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x01020102 : 0x33D733D7;
 
   // {-32, -32}, fp16x2_t
   static constexpr int kRangeMin = std::is_same<T, half>::value ? 0xD000D000 : 0xC200C200;
@@ -247,7 +247,7 @@ struct CodecQ6 : public CodecBase {
       int decoding_scale;
       int encoding_scale;
       decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
-      encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+      encoding_scale = packed_max<T>(decoding_scale, kScaleEpsilon);
       encoding_scale = packed_rcp<T>(encoding_scale);
 
       // Apply scales to get quantized values
@@ -382,7 +382,7 @@ struct CodecQ8 : public CodecBase {
   static constexpr int kScaleFactor = std::is_same<T, half>::value ? 0xA000A000 : 0xBC00BC00;
 
   // {1e-7, 1e-7}, f16x2_t
-  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
+  static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x01020102 : 0x33D733D7;
 
   // {-128, -128}, f16x2_t
   static constexpr int kRangeMin = std::is_same<T, half>::value ? 0xD800D800 : 0xC300C300;
@@ -405,7 +405,7 @@ struct CodecQ8 : public CodecBase {
       int decoding_scale;
       int encoding_scale;
       decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
-      encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+      encoding_scale = packed_max<T>(decoding_scale, kScaleEpsilon);
       encoding_scale = packed_rcp<T>(encoding_scale);
 
       // Apply scales to get quantized values
