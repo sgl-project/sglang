@@ -67,7 +67,8 @@ def make_candidate_indexer(
 @dataclass
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
-    request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    # Prefill: [rows_b, lc_b] bool masks or [rows_b, topk_blocks] int32 block IDs.
+    request_masks: Optional[List[torch.Tensor]] = None
 
 
 def published_masks(candidate) -> CandidateMasks:
@@ -96,11 +97,13 @@ def select_candidate_blocks(
     compress_lens: Union[torch.Tensor, int],
     topk_blocks: int,
     block_size: int,
+    return_indices: bool = False,
 ) -> torch.Tensor:
     """Level one of the two-level top-k: a bool mask over positions keeping the
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
+    query's newest position is always kept. With return_indices, return ascending
+    int32 block IDs instead; num_blocks marks unreachable padding."""
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -112,6 +115,13 @@ def select_candidate_blocks(
     )
 
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    if return_indices:
+        # Partial final blocks and unreachable padding sort last.
+        return (
+            top.indices.masked_fill(~(top.values > -torch.inf), num_blocks)
+            .sort(dim=-1)
+            .values.to(torch.int32)
+        )
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
