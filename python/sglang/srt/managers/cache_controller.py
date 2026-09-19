@@ -37,11 +37,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -79,9 +79,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -100,7 +98,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -238,7 +235,8 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
-        self.stats_total_tokens = 0
+        # Absolute token offset at which this storage-prefetched span starts.
+        self.storage_start = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -283,7 +281,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -596,7 +593,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "npu_memcache",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -690,7 +695,7 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_parallel().attn_tp_rank
             self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_attention_dp_rank()
+            self.dp_rank = get_parallel().attn_dp_rank
         else:
             self.tp_rank = get_parallel().tp_rank
             self.tp_size = get_parallel().tp_size
@@ -714,9 +719,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -739,6 +744,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
         )
 
@@ -869,6 +875,24 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+                to_device_no_sync,
+            )
+
+            if ascendc_io_enabled():
+                # The fused acc_offload kv_exchange kernel reads the token
+                # indices directly on the device; keeping them there avoids
+                # the D2H sync that would serialize the layer-group pipeline.
+                # (The legacy memcpy2d exchange op still wants CPU indices and
+                # converts them itself.)
+                # Upload through pinned memory: host_indices comes from the
+                # radix-tree match as a pageable CPU tensor, and a pageable
+                # .to(device) completes with a stream synchronize that drains
+                # all compute queued on the current (default) stream.
+                if host_indices.device != self.device:
+                    host_indices = to_device_no_sync(host_indices, self.device)
+                return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
@@ -1076,8 +1100,8 @@ class HiCacheController:
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
-                if prefix_keys and len(prefix_keys) > 0:
-                    prefix_keys += batch_hashes
+                if prefix_keys is not None:
+                    prefix_keys = prefix_keys + batch_hashes
                 completed_pages += hit_pages
             ack = PrefetchAck(
                 rid=operation.request_id,
@@ -1119,7 +1143,7 @@ class HiCacheController:
                 for transfer in kv_derived_transfers
             ]
             sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers
+                current_kv_derived_transfers, extra_info=extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
 
@@ -1170,11 +1194,11 @@ class HiCacheController:
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
-        prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        prefix_keys = operation.prefix_keys
 
         storage_query_count = 0
         hash_value = []
-        page_hashes = self.get_hash_str(
+        page_hashes = get_storage_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
         operation.all_hash_values = page_hashes
@@ -1187,8 +1211,8 @@ class HiCacheController:
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
 
         return hash_value, storage_query_count
 
@@ -1274,8 +1298,8 @@ class HiCacheController:
                 )
                 break
 
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):

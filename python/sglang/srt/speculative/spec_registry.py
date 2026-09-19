@@ -82,6 +82,9 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_uno(self) -> bool:
+        return False
+
     def is_dspark(self) -> bool:
         return False
 
@@ -95,6 +98,10 @@ class CustomSpecAlgo:
         return False
 
     def supports_target_verify_for_draft(self) -> bool:
+        return False
+
+    def supports_prefill_shared_read_done(self) -> bool:
+        # Whether target EXTEND has no later speculative shared-buffer reader.
         return False
 
     def supports_ragged_verify(self) -> bool:

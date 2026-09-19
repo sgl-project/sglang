@@ -14,7 +14,21 @@ import torch
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+
+
+@pytest.fixture
+def stated_tp_group():
+    """A TP group for a test that runs in a process without one.
+
+    The production call passes the group *into* `use_symmetric_memory`, so
+    stubbing that context manager does not stop the read -- the argument is
+    evaluated first. Stating it on the context answers every spelling.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
 
 
 def _random_weights(num_experts: int, hidden: int, intermediate: int):
@@ -84,6 +98,7 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
 
 def test_dsv4_sm120_load_contract(monkeypatch, request):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
+    from sglang.srt.runtime_context import get_context
 
     platform = override_platform(is_sm120=True)
     platform.install()
@@ -95,7 +110,8 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
         def create_weights(self, *args, **kwargs):
             captured.update(kwargs)
 
-    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
     method.create_weights(
         SimpleNamespace(),
         num_experts=4,
@@ -108,7 +124,7 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
-def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
+def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 12:
@@ -126,12 +142,12 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 256, 256
     w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
@@ -155,9 +171,10 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         moe_ep_rank=0,
     )
 
-    method = Mxfp4FlashinferCutlassMoEMethod(
-        SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
-    )
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
+        )
     config = MoeRunnerConfig(
         num_experts=num_experts,
         num_local_experts=num_experts,
@@ -250,7 +267,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
+def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (12, 0):
@@ -273,7 +290,6 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 160, 160
     padded_hidden = padded_intermediate = 256
