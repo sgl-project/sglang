@@ -26,18 +26,18 @@ listed at the end.
    substitutes another engine after a successful pick.
 
 An engine is represented by `Worker`. A bucket describes a service class, such
-as a context capacity. It contains optional plain, prefill, and
+as a context capacity and SLO profile. It contains optional plain, prefill, and
 decode groups. All three use the same `EngineGroup` type; the containing field
 identifies the role. Each group has its own policy instance and engine IDs.
 
 ```text
 Model's bucket configuration
   Bucket: short-context
-    shared context limit
+    shared context limit, TTFT estimate, throughput estimate
     prefill: EngineGroup { engine IDs, token range, rank, policy }
     decode:  EngineGroup { engine IDs, token range, rank, policy }
   Bucket: long-context
-    shared context limit
+    shared context limit, TTFT estimate, throughput estimate
     prefill: EngineGroup { engine IDs, token range, rank, policy }
     decode:  EngineGroup { engine IDs, token range, rank, policy }
 ```
@@ -56,10 +56,10 @@ be selected together, paired engine by engine, or retried together.
 
 | Type | Owns |
 | --- | --- |
-| `Bucket` | ID, shared context limit, optional plain/prefill/decode groups |
+| `Bucket` | ID, shared context limit and SLO estimates, optional plain/prefill/decode groups |
 | `EngineGroup` | Engine membership, token range, rank, and attached policy |
 | `WorkerRegistry` | Live `Worker` objects, model membership, and access to engine health and role |
-| `BucketResolver` | Bucket collection and rejection fallback setting |
+| `BucketResolver` | Bucket collection, per-stage SLO preferences, and rejection fallback setting |
 
 `worker_ids: None` means every healthy engine serving the requested model and
 role. An explicit empty set means no engines. `EngineGroup::new(policy)` creates
@@ -116,7 +116,7 @@ tier executor, or separate selection framework is required.
 | Request handler | Request preparation, coordination of PD stages, dispatch, and request cleanup | The HTTP response |
 
 `BucketResolver::matching_buckets(request)` returns bucket references whose
-role and length limits fit, ordered by rank and ID. It does not resolve live
+role and length limits fit, ordered by SLO preference, rank, and ID. It does not resolve live
 engines or invoke policies. A matching bucket can have no available engines.
 
 `BucketResolver::pick(request)` resolves healthy engines for the requested model
@@ -128,7 +128,7 @@ there is no additional request wrapper or resolved-group data structure.
 Prepare request: model, tokens, output budget, affinity keys
   |
   v
-Match buckets by role and length, then order by rank and ID
+Match buckets by role and length, then order by SLO preference, rank, and ID
   |
   v
 Resolve healthy engines for this model and stage
@@ -172,7 +172,7 @@ For one model and stage, routing proceeds as follows:
 
 1. Keep buckets with a group for the requested role.
 2. Check the group's token range and the parent bucket's context limit.
-3. Sort matching buckets by the group's ascending rank, then bucket ID.
+3. Apply the stage's SLO preference, then the group's ascending rank and bucket ID.
 4. In `pick`, obtain healthy engines serving the model and matching the role.
 5. Intersect each group's membership with those engines; skip empty groups.
 6. Invoke that group's attached policy, returning the first admitted engine.
@@ -198,13 +198,33 @@ Legacy configuration with no decode buckets is translated to a catch-all
 decode group. Existing prefill bucket configuration maps to plain groups for a
 plain deployment. Explicitly absent groups in the new model remain absent.
 
-### SLO ordering (separate follow-up)
+### SLO ordering
 
-The skeleton supports length matching only. After the power-of-two PR (#40271),
-a separate PR adds optional TTFT and token-throughput estimates and request
-targets, with per-stage `disabled`, `slo_first`, and `best_effort` ordering.
-SLO preference orders length-compatible buckets; it never relaxes context or
-token limits. The skeleton has no SLO fields, request wrapper, or ordering enum.
+SLO ordering is added in a separate PR after the power-of-two PR (#40271).
+`Bucket.ttft_ms` and `Bucket.tokens_per_second` are optional performance
+estimates; `PickRequest` carries optional targets using the same field names.
+They extend the existing matching method without another request wrapper or
+resolved-group type.
+
+| Stage | Match | Resolver preference |
+| --- | --- | --- |
+| Plain / prefill | Estimated TTFT is at most the requested TTFT | `prefill_slo` |
+| Decode | Estimated tokens/second is at least the requested rate | `decode_slo` |
+
+| Preference | Order |
+| --- | --- |
+| `Disabled` (default) | Rank, then bucket ID |
+| `SloFirst` | Matching buckets, then nonmatching buckets |
+| `BestEffort` | Nonmatching buckets, then matching buckets |
+
+Within each preference tier, rank/ID ordering is unchanged. Missing request
+targets treat all buckets equally. A supplied target with no bucket estimate
+is a nonmatch. Token-throughput targets must be finite and positive.
+
+SLO preference orders length-compatible buckets; it never relaxes context,
+token limits, engine membership, or admission. Nonmatching buckets remain
+fallback candidates. Estimates establish preference, not a runtime performance
+guarantee. The length-only skeleton (#40241) remains free of SLO support.
 
 ### Affinity before size buckets (follow-up)
 
@@ -218,9 +238,9 @@ the rule that it can only choose from the candidates it receives.
 
 | Property | Affinity group behavior |
 | --- | --- |
-| Candidates | Healthy engines serving this model and stage, filtered by each engine's own bucket context limit and, after SLO support lands, the applicable SLO rule |
+| Candidates | Healthy engines serving this model and stage, filtered by each engine's own bucket context limit and the applicable SLO rule |
 | Size ranges | Extend-token ranges do not exclude an existing affinity holder |
-| SLO filtering (after the SLO PR) | Under prefill `slo_first`, the engine's own bucket must meet the TTFT target |
+| SLO filtering | Under prefill `slo_first`, the engine's own bucket must meet the TTFT target |
 | Unbucketed engines | Remain eligible among healthy engines of the model and stage |
 | Policy | The stage's default affinity-capable policy |
 | Pick mode | `HitRequired`: return an admitted affinity hit; never run a fallback or create a binding |
@@ -505,6 +525,8 @@ current CLI/JSON syntax; existing bucket field names need not change.
 buckets:
   - id: short-context
     max_context_tokens: 8192
+    ttft_ms: 100
+    tokens_per_second: 50
     prefill:
       rank: 10
       worker_ids: [P1, P2]
@@ -562,9 +584,9 @@ do not accept and ignore them.
 ### Retained behavior
 
 - Keep `load_based` as the CLI name for `LeastLoadPolicy`.
-- Preserve bucket membership, ranges, context limits, and rank/ID ordering.
-  Restore existing SLO behavior in the separate SLO PR before serving switchover;
-  legacy routing continues to support SLOs during this skeleton-only phase.
+- Preserve bucket membership, ranges, context limits, rank/ID ordering, and
+  SLO preference semantics. Serving still uses the legacy path; configuration
+  wiring for the new bucket fields follows separately.
 - Preserve cache-provider selection, endpoint validation, query timeout and
   concurrency limits, and unavailable-backend fallback.
 - Preserve cache thresholds and tuning: the 1,024-token default minimum hit,
@@ -623,14 +645,15 @@ Selection metrics must not imply that dispatch or execution succeeded.
 
 ## Implementation status
 
-The series adds the side-by-side selection implementation in `src/buckets_reorg.rs` and
-`src/policies_reorg/`. The live `src/policies/` path still serves traffic.
+The series adds the side-by-side selection implementation in
+`src/buckets_reorg.rs` and `src/policies_reorg/`. The live `src/policies/` path still serves traffic.
 
 Implemented here:
 
-- `Bucket` with a shared context limit and optional role groups.
+- `Bucket` with a shared context limit, optional SLO estimates, and role groups.
+- Optional request SLO targets and independent prefill/decode preferences.
 - `EngineGroup` with membership, token range, rank, and attached policy.
-- `matching_buckets` for role/length matching and rank/ID ordering.
+- `matching_buckets` for role/length matching and SLO/rank/ID ordering.
 - `pick` for model/health/role/membership filtering and one-pass selection with
   exact candidate validation.
 - `Policy::pick`, fallback interface, admission placement, and `AllowAll`.
@@ -638,12 +661,11 @@ Implemented here:
 - Power-of-two selection, stage-aware load comparison, and capacity, in-flight,
   queue, and combined admission checks (#40271).
 
-Next: bucket SLO ordering in a separate PR after power-of-two (#40271),
-followed by the remaining policy and wiring work.
+This PR adds bucket SLO ordering after power-of-two (#40271). The remaining
+policy and wiring work follows separately.
 
 Not yet implemented or wired in this path:
 
-- SLO estimates, request targets, and per-stage preference ordering.
 - Other concrete policies and pending-prefill admission.
 - Configuration parsing, validation, model-specific construction, and default
   group synthesis for the new bucket format. The YAML above is illustrative.
