@@ -690,6 +690,8 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DECODE_PREALLOC_POLICY = EnvStr("fcfs")
+    SGLANG_TRUST_PREFILL_COST_HEADER = EnvBool(False)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
