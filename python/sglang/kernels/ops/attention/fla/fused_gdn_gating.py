@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import torch
 import triton
@@ -37,8 +36,10 @@ def fused_gdn_gating_kernel(
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # Keep beta in fp32 (no bf16 round-trip); beta_output is an fp32 buffer and
+    # this value is applied to the recurrent state every step.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    tl.store(beta_output + off, blk_beta_output, mask=mask)
 
 
 def fused_gdn_gating(
@@ -48,7 +49,7 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
     stride_a = a.stride(0)
