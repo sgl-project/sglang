@@ -391,7 +391,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
-        self._storage_prefetch_hit_remaining_by_reqid: dict[str, int] = {}
+        self._storage_prefetch_hit_remaining_by_reqid: dict[
+            CacheRequestHandle, int
+        ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
@@ -2457,8 +2459,8 @@ class UnifiedRadixCache(BasePrefixCache):
         rid = request.rid
         if self.linker is not None:
             self.linker.release_request(rid)
-        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
+        self.prefetch_loaded_tokens_by_reqid.pop(request, None)
+        self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None
