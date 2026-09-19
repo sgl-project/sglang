@@ -133,6 +133,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -293,7 +294,7 @@ async def lifespan(fast_api_app: FastAPI):
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         if get_disagg().disaggregation_mode == "prefill":
@@ -659,6 +660,13 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+@app.get("/ready")
+async def ready() -> Response:
+    """Report whether the server is ready to receive new requests."""
+    status_code = 200 if _global_state.tokenizer_manager.is_ready() else 503
+    return Response(status_code=status_code)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -771,6 +779,9 @@ async def model_info():
         ),
         "tool_call_parser": _global_state.tokenizer_manager.config_value(
             "tool_call_parser"
+        ),
+        "disaggregation_mode": _global_state.tokenizer_manager.config_value(
+            "disaggregation_mode"
         ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
@@ -1554,6 +1565,23 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/pd_role_switch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pd_role_switch(
+    obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
+):
+    """Switch this instance's PD disaggregation role (prefill<->decode) at runtime.
+    Requires --enable-pd-role-switch; the instance must be idle."""
+    try:
+        result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(
@@ -2241,6 +2269,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         bool(model_info.get("has_image_understanding", False))
         and not get_disagg().language_only
         and not get_disagg().language_model_only
+        and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
     )
     if model_info["is_generation"]:

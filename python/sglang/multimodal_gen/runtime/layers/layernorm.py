@@ -13,8 +13,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    fused_scale_residual_norm_scale_shift_triton,
     triton_one_pass_rms_norm,
 )
 from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
@@ -38,6 +40,7 @@ from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
+_is_rocm = current_platform.is_rocm()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
@@ -521,6 +524,22 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         return output.to(origin_dtype)
 
+    def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
+        def matches_input(param: torch.Tensor | None) -> bool:
+            return param is None or (
+                param.dtype == inputs.dtype and param.device == inputs.device
+            )
+
+        if not (matches_input(self.weight) and matches_input(self.bias)):
+            return self.forward_native(inputs)
+        return F.layer_norm(
+            inputs,
+            self.normalized_shape,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+
 
 ################################################################################
 # Fused norm kernel
@@ -667,10 +686,37 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.norm_type == "layer":
+            weight = self.norm.weight
+            bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_triton(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_triton(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
+        return self.forward_native(residual, x, gate, shift, scale)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
@@ -939,10 +985,10 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    # Only try fused path on CUDA and when it won't introduce implicit copies.
+    # Only try fused path on CUDA/ROCm and when it won't introduce implicit copies.
     # The in-place kernel needs a real view (no copy), so it also requires contiguity.
     if (
-        _is_cuda
+        (_is_cuda or _is_rocm)
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -983,6 +1029,7 @@ def apply_qk_norm_with_optional_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    allow_strided_qk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
@@ -1008,6 +1055,7 @@ def apply_qk_norm_with_optional_rope(
         positions=positions,
         position_offset=position_offset,
         allow_inplace=allow_inplace,
+        allow_strided_qk=allow_strided_qk,
     )
 
 
@@ -1101,7 +1149,7 @@ def apply_qk_norm_rope(
 
     if (
         fused_enabled
-        and _is_cuda
+        and (_is_cuda or _is_rocm)
         and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)

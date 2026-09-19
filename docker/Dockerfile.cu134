@@ -354,7 +354,9 @@ ARG DEEPGEMM_REF
 ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
 ARG TVM_FFI_VERSION=0.1.11
 
+# DeepJIT's exception handling requires elfutils/libdwfl.h and libelf headers.
 RUN yum install -y --nogpgcheck git wget tar gcc gcc-c++ make \
+    elfutils-devel elfutils-libelf-devel \
  && yum clean all && rm -rf /var/cache/yum
 
 RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
