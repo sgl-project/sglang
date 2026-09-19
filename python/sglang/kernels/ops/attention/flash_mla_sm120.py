@@ -295,6 +295,35 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
     return num_tokens <= decode_max_tokens and num_heads in supported_heads
 
 
+# FlashInfer's SM120 sparse-MLA prefill dispatcher (sparse_mla_prefill_dispatch
+# in csrc/sparse_mla_sm120.cu) instantiates a fixed envelope:
+#   * single cache: topk in {128, 192, 256, 512, 1024, 2048}
+#   * dual cache (hierarchical candidate pool, DSV4 only): topk == 128 and
+#     extra_page_block_size in {64, 2}
+# Any other shape returns false from the C++ and aborts the engine with
+# "Unsupported sparse-MLA prefill configuration". The Triton implementation has
+# no such constraint, so route the uncovered shapes to it for that call instead
+# of requiring the global SGLANG_SM120_FLASHMLA_BACKEND=triton override.
+_FLASHINFER_PREFILL_TOPK = frozenset({128, 192, 256, 512, 1024, 2048})
+_FLASHINFER_EXTRA_PAGE_BLOCK_SIZES = frozenset({64, 2})
+
+
+def _flashinfer_covers(q, indices, extra_k_cache, extra_indices) -> bool:
+    """Whether FlashInfer's SM120 kernels have an instantiation for this call."""
+    if q.shape[0] <= SM120_DECODE_MAX_TOKENS:
+        # Decode is dispatched from Python via the decode dispatch table and
+        # takes the (num_heads, topk) pairs this model uses; the extra cache
+        # does not change the decode dispatch.
+        return True
+    if int(indices.shape[-1]) not in _FLASHINFER_PREFILL_TOPK:
+        return False
+    if extra_k_cache is None or extra_indices is None:
+        return True
+    if extra_k_cache.ndim < 3:
+        return False
+    return int(extra_k_cache.shape[1]) in _FLASHINFER_EXTRA_PAGE_BLOCK_SIZES
+
+
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
@@ -313,7 +342,24 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    flashinfer_ok = _sm120_default_backend != "flashinfer" or _flashinfer_covers(
+        q, indices, extra_k_cache, extra_indices
+    )
+    if _sm120_default_backend == "flashinfer" and not flashinfer_ok:
+        logger.info(
+            "SM120 sparse-MLA: FlashInfer's dispatcher has no instantiation for "
+            "this call (num_tokens=%d, topk=%d, extra_page_block_size=%s); using "
+            "the Triton sparse-MLA implementation for this call.",
+            q.shape[0],
+            int(indices.shape[-1]),
+            (
+                int(extra_k_cache.shape[1])
+                if extra_k_cache is not None and extra_k_cache.ndim >= 3
+                else None
+            ),
+        )
+
+    if _sm120_default_backend == "flashinfer" and flashinfer_ok:
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
                 q,
