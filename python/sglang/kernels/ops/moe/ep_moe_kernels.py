@@ -709,6 +709,8 @@ def silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe(
     fp8_max,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
 ):
     num_tokens = tl.load(num_tokens_tensor_ptr)
     numel = num_tokens * intermediate_size
@@ -727,6 +729,9 @@ def silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe(
         offs = ids + token_ids * intermediate_size
         gate = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if HAS_SWIGLU_LIMIT:
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
         gate_up = gate / (1 + tl.exp(-gate)) * up
         absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
 
@@ -741,12 +746,14 @@ def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
     num_tokens_tensor: torch.Tensor,
     expected_num_tokens: int,
     intermediate_size: int,
+    swiglu_limit: Optional[float] = None,
 ):
     grid, block_dim = _get_launch_config_1d(
         input.device, expected_num_tokens * intermediate_size
     )
     scale.zero_()
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    has_swiglu_limit = swiglu_limit is not None
 
     silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe[grid](
         input_ptr=input,
@@ -756,9 +763,17 @@ def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
         fp8_max=fp8_max,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
     )
     silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        input, output, scale, num_tokens_tensor, expected_num_tokens, intermediate_size
+        input,
+        output,
+        scale,
+        num_tokens_tensor,
+        expected_num_tokens,
+        intermediate_size,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -771,6 +786,8 @@ def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     intermediate_size,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
 ):
     OutDtype = output_ptr.dtype.element_ty
 
@@ -791,6 +808,9 @@ def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
         offs = ids + token_ids * intermediate_size
         gate = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if HAS_SWIGLU_LIMIT:
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
         output = gate / (1 + tl.exp(-gate)) * up * scale
         tl.store(output_ptr + ids, output.to(OutDtype), mask=mask)
 
@@ -802,10 +822,12 @@ def silu_mul_static_tensorwise_quant_for_cutlass_moe(
     num_tokens_tensor: torch.Tensor,
     expected_num_tokens: int,
     intermediate_size: int,
+    swiglu_limit: Optional[float] = None,
 ):
     grid, block_dim = _get_launch_config_1d(
         input.device, expected_num_tokens * intermediate_size
     )
+    has_swiglu_limit = swiglu_limit is not None
 
     silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe[grid](
         input_ptr=input,
@@ -815,6 +837,8 @@ def silu_mul_static_tensorwise_quant_for_cutlass_moe(
         intermediate_size=intermediate_size,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
     )
 
 
