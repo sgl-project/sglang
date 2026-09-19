@@ -390,6 +390,21 @@ class HiCacheController:
 
     def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+        from sglang.srt.mem_cache.pool_host.common import _clear_sticky_cuda_error
+
+        # A failed cudaHostRegister earlier in startup (e.g. a degraded
+        # host-pool registration, or storage-backend native init such as
+        # mooncake) leaves a sticky CUDA error that would otherwise surface
+        # here as an "invalid argument" from the first CUDA op inside
+        # all_gather_object. Consume it before creating the groups, but log
+        # the code so an unrelated failure is not silently masked.
+        leftover = _clear_sticky_cuda_error()
+        if leftover:
+            logger.warning(
+                "Consumed leftover CUDA error %d before creating storage sync "
+                "groups",
+                leftover,
+            )
 
         groups: List[torch.distributed.ProcessGroup] = []
         seen_rank_sets = set()

@@ -387,8 +387,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                if self.layout in ("page_first", "page_first_direct", "page_head")
+                else self.token_stride_size
             ),
         )
         return buffer
@@ -413,16 +413,29 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.staging_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.layer_num,
-                1,
-                self.kv_cache_dim,
-            ),
-            dtype=self.dtype,
-            device=self.device_pool.device,
-        )
+        try:
+            self.staging_buffer = torch.empty(
+                (
+                    self.staging_token_capacity,
+                    self.layer_num,
+                    1,
+                    self.kv_cache_dim,
+                ),
+                dtype=self.dtype,
+                device=self.device_pool.device,
+            )
+        except Exception as exc:
+            # CUDA memory operations were observed to fail intermittently with
+            # cudaErrorInvalidValue on hosts under heavy GPU memory usage.
+            # The staged write-back is an optimization; fall back to the
+            # non-JIT path instead of crashing the scheduler at startup.
+            logger.warning(
+                "Write-back staging buffer allocation failed (%s); "
+                "fall back to the non-JIT write-back path.",
+                exc,
+            )
+            self.staging_buffer = None
+            self.can_use_write_back_jit = False
 
     def _indexer_slot_range_for_layer(self, device_pool, device_layer_id):
         """Map a device layer onto the indexer slot space.
