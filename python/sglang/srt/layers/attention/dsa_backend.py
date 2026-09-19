@@ -1142,6 +1142,21 @@ class DeepseekSparseAttnBackend(
         )
         self.forward_metadata = metadata
 
+        pool = self.token_to_kv_pool
+        if hasattr(pool, "set_layer_split_broadcast_read_set"):
+            token_slots = metadata.page_table_1_flattened
+            if token_slots is None and metadata.page_table_1 is not None:
+                token_slots = metadata.page_table_1.view(-1)
+            if token_slots is not None:
+                token_slots = token_slots[token_slots >= 0].to(torch.int64)
+            page_indices = metadata.real_page_table.view(-1)
+            if page_indices is not None:
+                page_indices = page_indices[page_indices >= 0].to(torch.int64)
+            pool.set_layer_split_broadcast_read_set(
+                token_slots=token_slots,
+                index_pages=page_indices,
+            )
+
     def _cal_indexer_k_start_end(
         self,
         forward_batch: ForwardBatch,
