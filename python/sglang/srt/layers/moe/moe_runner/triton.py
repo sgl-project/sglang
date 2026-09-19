@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class TritonRunnerInput(RunnerInput):
-
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -42,7 +41,6 @@ class TritonRunnerInput(RunnerInput):
 
 @dataclass
 class TritonRunnerOutput(RunnerOutput):
-
     hidden_states: torch.Tensor
 
     @property
@@ -75,7 +73,6 @@ class TritonMoeQuantInfo(MoeQuantInfo):
 
 
 class TritonRunnerCore(MoeRunnerCore):
-
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 

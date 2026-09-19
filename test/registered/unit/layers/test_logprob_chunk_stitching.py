@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import coverage_cases
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 VOCAB = 11
 # Heterogeneous per-sequence parameters; uniform ones hide misalignment.
@@ -96,7 +96,7 @@ def _run(proc, batch, chunked, chunk_size):
 class TestLogprobChunkStitching(CustomTestCase):
     def _sweep(self, with_token_ids):
         torch.manual_seed(0)
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         combos = list(coverage_cases(SEQ_SPEC_MENU, max_seqs=4))
         self.assertEqual(len(combos), EXPECTED_CASES)
         tried = 0

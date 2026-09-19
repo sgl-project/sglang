@@ -3,6 +3,9 @@
 
 import unittest
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    trailing_padding_used_len,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -10,6 +13,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 
 class TestMiniMaxH3PackedSequence(unittest.TestCase):
+    def test_trailing_padding_layout(self):
+        self.assertEqual(trailing_padding_used_len(64, 61, (0, 61, 64)), 61)
+        self.assertIsNone(trailing_padding_used_len(64, 31, (0, 32, 64)))
+        self.assertIsNone(trailing_padding_used_len(64, 61, (0, 61)))
+
     def test_t2va_structure(self):
         built = minimax_h3_packed_sequence(
             text_len=97,
@@ -23,6 +31,16 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         self.assertEqual(int(built["img_pos"].shape[0]), 62 * 24 * 38)
         self.assertEqual(int(built["seq_len"]) % 64, 0)
         self.assertEqual(built["token_tags"][built["audio_pos"]].unique().tolist(), [2])
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (62, 24, 38),
+                "cond_image_shapes": (),
+                "cond_image_roles": (),
+                "cond_event_orders": (),
+                "cond_audio_stream_lens": (),
+            },
+        )
 
     def test_fl2va_first_last_cond_blocks_use_exact_rope_span(self):
         text_len = 11
@@ -61,6 +79,16 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         )
         self.assertFalse(built["update_mask"][:cond_rows].any())
         self.assertTrue(built["update_mask"][cond_rows:].all())
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (37, 24, 38),
+                "cond_image_shapes": ((1, 24, 38), (1, 24, 38)),
+                "cond_image_roles": ("joint_cube", "joint_cube"),
+                "cond_event_orders": (("imgvid", 0), ("imgvid", 1)),
+                "cond_audio_stream_lens": (),
+            },
+        )
 
     def test_i2va_and_l2va_single_cond_blocks_use_endpoint_rope(self):
         text_len = 11
@@ -154,6 +182,21 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         target_video_t0 = built["img_position_ids"][built["img_pos"][12], 0]
         target_audio_t0 = built["img_position_ids"][built["audio_pos"][8], 0]
         self.assertEqual(float(target_audio_t0), float(target_video_t0))
+        self.assertEqual(
+            built["stream_layout"],
+            {
+                "target_shape": (2, 2, 2),
+                "cond_image_shapes": ((1, 2, 2), (2, 2, 2)),
+                "cond_image_roles": ("dense_prefix", "independent_cube"),
+                "cond_event_orders": (
+                    ("imgvid", 0),
+                    ("audio", 0),
+                    ("imgvid", 1),
+                    ("audio", 1),
+                ),
+                "cond_audio_stream_lens": (6, 2),
+            },
+        )
 
     def test_ref2va_hybrid_packs_keyframes_before_references(self):
         built = minimax_h3_packed_sequence_ref2va_blocks(
