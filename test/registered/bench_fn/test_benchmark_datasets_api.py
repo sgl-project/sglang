@@ -164,7 +164,7 @@ class TestBenchmarkCacheFlush(CustomTestCase):
     def test_cache_flush_uses_the_backend_specific_request(self):
         """SGLang forwards its timeout without changing other backend requests."""
         with (
-            patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
+            patch("sglang.benchmark.serving.get_request_headers", return_value={}),
             patch("sglang.benchmark.serving.requests.post") as post,
         ):
             post.return_value = MagicMock()
