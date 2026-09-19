@@ -8,6 +8,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 """
 
 import unittest
+import torch
 
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import is_hip
@@ -27,6 +28,7 @@ from sglang.test.test_utils import (
 _is_hip = is_hip()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class HiCacheBaseServer(CustomTestCase):
     """Base class for HiCache tests with configurable server setup"""
 
@@ -56,6 +58,7 @@ class HiCacheBaseServer(CustomTestCase):
         terminate_and_kill_process_tree(cls.process)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
@@ -73,6 +76,7 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     mmlu_num_threads = 32
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
@@ -90,6 +94,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
         mgsm_en_num_threads = 32
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
 class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
@@ -124,6 +129,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     mmlu_accept_length_thres = 2.26
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 

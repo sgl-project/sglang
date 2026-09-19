@@ -30,6 +30,9 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def run_triton_kernel(A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):

@@ -8,7 +8,7 @@ test into unit tests so that's easily reproducible in CI.
 """
 
 import unittest
-
+import torch
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -31,6 +31,7 @@ register_xpu_ci(est_time=207, suite="stage-b-test-1-gpu-xpu")
 _is_xpu = is_xpu()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(_is_xpu, "CUDA runner only")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFlashinferDeterministic(TestDeterministicBase):
@@ -48,6 +49,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
 
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
@@ -64,6 +66,7 @@ class TestFa3Deterministic(TestDeterministicBase):
 
 
 @unittest.skipIf(_is_xpu, "CUDA/AMD runner only")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod

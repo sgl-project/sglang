@@ -12,6 +12,7 @@ import time
 import unittest
 
 import numpy as np
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -97,6 +98,7 @@ def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
     return float(acc), float(latency)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepSeekV31EvalAMD(unittest.TestCase):
     """DeepSeek-V3.1 GSM8K Completion Evaluation Test for AMD MI300X."""
 

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
 import requests
+import torch
 from prometheus_client.parser import text_string_to_metric_families
 
 from sglang.srt.disaggregation.prefill import should_force_retry
@@ -64,6 +65,7 @@ class OptimisticPrefillRetryCounterMixin:
         return result
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOptimisticPrefill(
     OptimisticPrefillRetryCounterMixin, PDDisaggregationServerBase
 ):
@@ -143,6 +145,7 @@ class TestOptimisticPrefill(
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

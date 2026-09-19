@@ -303,6 +303,7 @@ def _parse_comparator_stats(stdout: str) -> dict[str, Any]:
     return out
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyPrecisionRegression(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

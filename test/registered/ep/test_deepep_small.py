@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -19,6 +20,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=407, stage="base-c", runner_config="4-gpu-h100")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -66,6 +68,7 @@ class TestPureDP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -108,6 +111,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -160,6 +164,7 @@ class TestTBO(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMTPWithTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):

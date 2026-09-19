@@ -54,6 +54,7 @@ def dynamically_loaded_adapter(runner, lora_path: str, lora_name: str):
         runner.unload_lora_adapter(lora_name=lora_name)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAEviction(CustomTestCase):
     def test_lora_eviction_with_different_target_modules(self):
         """

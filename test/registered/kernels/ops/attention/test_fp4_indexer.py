@@ -29,6 +29,10 @@ if _is_xpu:
 else:
     from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
 GROUP_SIZE = 32
