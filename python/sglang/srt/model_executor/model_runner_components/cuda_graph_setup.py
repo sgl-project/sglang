@@ -227,7 +227,7 @@ def refresh_deep_gemm_layout_memory_budget(
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=world_group.world_size > 1,
+        distributed=get_parallel().launch_world_size > 1,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
