@@ -45,6 +45,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_gather_slot,
     set_dp_buffer_len,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
@@ -1165,9 +1166,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
             if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[
-                    get_parallel().elastic_dp_rank
-                ]
+                num_tokens_per_dp = self.global_num_tokens_cpu[dp_gather_slot()]
             else:
                 num_tokens_per_dp = self.global_num_tokens_cpu[0]
         else:
@@ -1520,7 +1519,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[get_parallel().elastic_dp_rank]
+            num_tokens = global_num_tokens[dp_gather_slot()]
         else:
             num_tokens = global_num_tokens[0]
 

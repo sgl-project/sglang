@@ -2429,7 +2429,7 @@ class Scheduler(
             kv_events_config=get_observability().kv_events_config,
             attn_tp_rank=get_parallel().attn_tp_rank,
             attn_cp_rank=get_parallel().attn_cp_rank,
-            attn_dp_rank=get_parallel().elastic_dp_rank,
+            attn_dp_rank=get_parallel().attn_dp_rank,
             dp_rank=get_parallel().dp_rank,
             tree_cache=self.tree_cache,
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,

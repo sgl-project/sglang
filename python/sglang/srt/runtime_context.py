@@ -210,24 +210,6 @@ _LIVE_READS: dict = {
             "bundle has no replica index to report"
         ),
     ),
-    "elastic_dp_size": Live(
-        source=lambda self: self.attn_dp_size,
-        doc=(
-            "How many attention-DP replicas are serving now. The same number "
-            "as `attn_dp_size` until an elastic-EP scale-up admits ranks into "
-            "the pre-allocated WORLD: the group coordinators keep the width "
-            "they were built at, so the launch topology and the expanded one "
-            "are two facts, and this is the expanded one."
-        ),
-    ),
-    "elastic_dp_rank": Live(
-        source=lambda self: self.attn_dp_rank,
-        doc=(
-            "This process's replica index among those serving now -- the "
-            "companion to `elastic_dp_size`, and equal to `attn_dp_rank` "
-            "until a scale-up renumbers the admitted ranks."
-        ),
-    ),
     "world_group": "get_world_group",
     "tp_group": "get_tp_group",
     "pp_group": "get_pp_group",
@@ -486,7 +468,6 @@ _RANK_AND_WIDTH = (
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
     ("moe_ep_rank", "moe_ep_size"),
-    ("elastic_dp_rank", "elastic_dp_size"),
 )
 
 # `moe_dp` is absent because `initialize_model_parallel` aliases the MoE-DP

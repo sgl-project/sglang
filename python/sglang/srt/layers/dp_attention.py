@@ -47,6 +47,33 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def dp_gather_width() -> int:
+    """How many replicas the DP sync gathers over.
+
+    The attention-DP replicas, except after an elastic-EP scale-up, when the
+    gather spans the expanded WORLD -- whose width is the `dp_size` the
+    scale-up published. Read from the context either way: a scoped width has
+    to reach this, which is the whole reason the name has one home.
+    """
+    parallel = get_parallel()
+    return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
+
+
+def dp_gather_slot() -> int:
+    """This process's index in the list the DP sync just gathered.
+
+    The gather spans the attention-DP replicas, except after an elastic-EP
+    scale-up, when it spans the expanded WORLD and the joining cohort is
+    numbered from its offset. Which list was gathered is what the flag below
+    says, so the index is read from there rather than kept as a second name on
+    the topology.
+    """
+    parallel = get_parallel()
+    if world_dp_gather_enabled():
+        return parallel.tp_rank + parallel.ep_join_rank_offset
+    return parallel.attn_dp_rank
+
+
 def world_dp_gather_enabled() -> bool:
     """Whether DP gathers should use expanded WORLD after joiner admission."""
     dp = get_flags().dp
@@ -58,9 +85,13 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    get_parallel().override_permanently(
-        elastic_dp_size=new_dp_size, elastic_dp_rank=new_dp_rank
-    )
+    """Point the DP gather at the expanded WORLD.
+
+    The widths themselves are not written here: the caller scales `dp_size` on
+    the published bag, and the gather reads its width and this process's slot
+    from there. The arguments are the values the caller is about to publish,
+    kept so the log says which scale-up this was.
+    """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -90,7 +121,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = get_parallel().elastic_dp_size
+        dp_size = dp_gather_width()
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -378,12 +409,7 @@ def initialize_dp_attention(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
 
-    expanded = None
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        offset = get_parallel().ep_join_rank_offset
-        expanded = dict(
-            elastic_dp_rank=tp_rank + offset, elastic_dp_size=offset + tp_size
-        )
         # Reads the resolution, not a bag: this runs under
         # `initialize_dp_attention`, which the weight-cache daemon calls from
         # `_init_distributed` -- and other callers reach it from processes
@@ -398,8 +424,6 @@ def initialize_dp_attention(
     get_parallel().override_permanently(
         attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
     )
-    if expanded is not None:
-        get_parallel().override_permanently(**expanded)
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
@@ -418,7 +442,10 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    dp_rank = get_parallel().attn_dp_rank
+    # The slot in the list that was gathered. A scale-up widens that list
+    # to WORLD, and this process's index in it is not its index among the
+    # launch replicas.
+    dp_rank = dp_gather_slot()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -442,7 +469,10 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank
+    # The slot in the list that was gathered. A scale-up widens that list
+    # to WORLD, and this process's index in it is not its index among the
+    # launch replicas.
+    dp_rank = dp_gather_slot()
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch

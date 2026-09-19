@@ -457,20 +457,27 @@ class TestStampedRanks(_IsolatedOverrides):
             )
         self.assertIs(mode, DpPaddingMode.SUM_LEN)
 
-    def test_a_scale_up_moves_the_expanded_world_and_leaves_the_topology(self):
-        """A scale-up admits ranks into a WORLD that was pre-allocated; the
-        group coordinators keep the width they were built at. So the launch
-        topology has to keep answering for the groups that exist, and the
-        expanded replica set is a second pair of names."""
-        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+    def test_the_gather_slot_follows_the_list_that_was_gathered(self):
+        """The DP sync gathers over the attention-DP replicas, or over the
+        expanded WORLD once a scale-up has moved the gather there. The index
+        into that list is a property of the gather, so it is read beside the
+        flag that says which one happened rather than kept on the topology."""
+        from sglang.srt.layers.dp_attention import dp_gather_slot
 
-        # It also flips a process-wide gather flag; put it back, or every
-        # later test in this process runs as if a scale-up had happened.
-        dp_flags = get_flags().dp
-        saved_gather = dp_flags.use_world_group_for_gather
-        self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
         self.addCleanup(reset_context)
+        dp_flags = get_flags().dp
+        saved = (
+            dp_flags.use_world_group_for_gather,
+            dp_flags.joiner_skip_all_gather,
+        )
 
+        def restore():
+            (
+                dp_flags.use_world_group_for_gather,
+                dp_flags.joiner_skip_all_gather,
+            ) = saved
+
+        self.addCleanup(restore)
         publish(
             ServerArgs(
                 model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
@@ -479,18 +486,27 @@ class TestStampedRanks(_IsolatedOverrides):
             ranks=SpawnRanks(world_rank=3),
         )
         parallel = get_parallel()
-        self.assertEqual(parallel.elastic_dp_size, parallel.attn_dp_size)
-        self.assertEqual(parallel.elastic_dp_rank, parallel.attn_dp_rank)
+        dp_flags.use_world_group_for_gather = False
+        self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
-        self.assertEqual(parallel.elastic_dp_size, 16)
-        self.assertEqual(parallel.elastic_dp_rank, 11)
+        # After a scale-up the gather spans the expanded WORLD, and the joining
+        # cohort is numbered from its offset.
+        dp_flags.use_world_group_for_gather = True
+        dp_flags.joiner_skip_all_gather = False
+        parallel.override_permanently(ep_join_rank_offset=8)
+        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
+        # and the topology it was read off is untouched
         self.assertEqual(parallel.attn_dp_size, 8)
-        self.assertEqual(parallel.attn_dp_rank, 3)
         self.assertEqual(parallel.tp_size, 8)
 
-    def test_the_expanded_pair_is_checked_like_any_other(self):
-        """It stays out of the topology identities, not out of all of them."""
+    def test_a_scale_up_writes_no_width(self):
+        """The identities stay unconditional because nothing overrides them:
+        the scale-up only points the gather at the expanded WORLD."""
+        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+        dp_flags = get_flags().dp
+        saved_gather = dp_flags.use_world_group_for_gather
+        self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
         self.addCleanup(reset_context)
         publish(
             ServerArgs(
@@ -499,9 +515,13 @@ class TestStampedRanks(_IsolatedOverrides):
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
-        with self.assertRaises(ValueError) as caught:
-            get_parallel().override_permanently(elastic_dp_size=16, elastic_dp_rank=16)
-        self.assertIn("elastic_dp_rank", str(caught.exception))
+        parallel = get_parallel()
+        before = (parallel.attn_dp_size, parallel.attn_dp_rank, parallel.tp_size)
+        update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
+        self.assertTrue(dp_flags.use_world_group_for_gather)
+        self.assertEqual(
+            (parallel.attn_dp_size, parallel.attn_dp_rank, parallel.tp_size), before
+        )
 
 
 class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
