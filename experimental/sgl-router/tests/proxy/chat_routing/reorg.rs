@@ -6,19 +6,32 @@ use crate::common::mock_worker::MockWorker;
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::policies::PolicyRegistry;
-use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
-use sgl_router::policies_reorg::{Pick, PickContext, PickError, PickRequest, Policy, Stage};
+use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::{
+    Pick, PickContext, PickError, PickRequest, Policy, Rejection, Stage,
+};
 use sgl_router::server::app_context::ChatRouting;
 use std::sync::Mutex;
 
 type PickCall = (String, Stage, u64, Option<u64>);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FirstPolicy {
     calls: Mutex<Vec<PickCall>>,
-    admission: Admission,
+    admission: Arc<dyn EngineAdmission>,
     miss: bool,
     invalid: bool,
+}
+
+impl Default for FirstPolicy {
+    fn default() -> Self {
+        Self {
+            admission: Arc::new(AllowAll),
+            miss: false,
+            invalid: false,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Policy for FirstPolicy {
@@ -41,15 +54,20 @@ impl Policy for FirstPolicy {
             if self.miss {
                 return Err(PickError::NoCandidates);
             }
-            let engines = self.admission.before(engines, request, context)?;
-            self.admission.after(
-                Pick {
-                    engine: engines[0].clone(),
-                    reason: "first",
-                },
-                request,
-                context,
-            )
+            if engines.is_empty() {
+                return Err(PickError::NoCandidates);
+            }
+            let engine = engines[0].clone();
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, context)? {
+                return Err(PickError::AdmissionRejected(Rejection {
+                    engine: engine.id.clone(),
+                    reason,
+                }));
+            }
+            Ok(Pick {
+                engine,
+                reason: "test",
+            })
         })
     }
 }
@@ -68,12 +86,9 @@ impl EngineAdmission for RejectAll {
     }
 }
 
-fn rejecting_policy(placement: Placement) -> Arc<FirstPolicy> {
+fn rejecting_policy() -> Arc<FirstPolicy> {
     Arc::new(FirstPolicy {
-        admission: Admission {
-            check: Arc::new(RejectAll),
-            placement,
-        },
+        admission: Arc::new(RejectAll),
         ..Default::default()
     })
 }
@@ -332,80 +347,74 @@ async fn reorg_route_keeps_chat_body_limit() {
 
 #[tokio::test]
 async fn plain_fallback_skips_empty_missed_and_rejected_buckets_then_stops_on_success() {
-    for placement in [Placement::BeforeSelection, Placement::AfterSelection] {
-        let rejected_worker = MockWorker::start(vec![]).await;
-        let winner = MockWorker::start(vec![]).await;
-        let skipped = Arc::new(FirstPolicy::default());
-        let rejected = rejecting_policy(placement);
-        let missed = Arc::new(FirstPolicy {
-            miss: true,
-            ..Default::default()
-        });
-        let accepted = Arc::new(FirstPolicy::default());
-        let buckets = vec![
-            Bucket::new(
-                "a-empty",
-                BucketGroups::Plain(group("missing", skipped.clone())),
-            ),
-            Bucket::new(
-                "b-miss",
-                BucketGroups::Plain(group("rejected", missed.clone())),
-            ),
-            Bucket::new(
-                "c-rejected",
-                BucketGroups::Plain(group("rejected", rejected.clone())),
-            ),
-            Bucket::new(
-                "d-winner",
-                BucketGroups::Plain(group("winner", accepted.clone())),
-            ),
-            Bucket::new(
-                "e-unused",
-                BucketGroups::Plain(group("winner", skipped.clone())),
-            ),
-        ];
-        let ctx = context(
-            &[
-                ("rejected", Stage::Plain, &rejected_worker),
-                ("winner", Stage::Plain, &winner),
-            ],
-            buckets,
-        );
-        let response = build_router(ctx)
-            .oneshot(request(body("hi")))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = response.into_body().collect().await.unwrap();
-        assert!(rejected_worker.captured.lock().unwrap().last_body.is_none());
-        assert!(winner.captured.lock().unwrap().last_body.is_some());
-        assert!(skipped.calls.lock().unwrap().is_empty());
-        assert_eq!(missed.calls.lock().unwrap().len(), 1);
-        assert_eq!(rejected.calls.lock().unwrap().len(), 1);
-        assert_eq!(accepted.calls.lock().unwrap()[0].0, "d-winner");
-    }
+    let rejected_worker = MockWorker::start(vec![]).await;
+    let winner = MockWorker::start(vec![]).await;
+    let skipped = Arc::new(FirstPolicy::default());
+    let rejected = rejecting_policy();
+    let missed = Arc::new(FirstPolicy {
+        miss: true,
+        ..Default::default()
+    });
+    let accepted = Arc::new(FirstPolicy::default());
+    let buckets = vec![
+        Bucket::new(
+            "a-empty",
+            BucketGroups::Plain(group("missing", skipped.clone())),
+        ),
+        Bucket::new(
+            "b-miss",
+            BucketGroups::Plain(group("rejected", missed.clone())),
+        ),
+        Bucket::new(
+            "c-rejected",
+            BucketGroups::Plain(group("rejected", rejected.clone())),
+        ),
+        Bucket::new(
+            "d-winner",
+            BucketGroups::Plain(group("winner", accepted.clone())),
+        ),
+        Bucket::new(
+            "e-unused",
+            BucketGroups::Plain(group("winner", skipped.clone())),
+        ),
+    ];
+    let ctx = context(
+        &[
+            ("rejected", Stage::Plain, &rejected_worker),
+            ("winner", Stage::Plain, &winner),
+        ],
+        buckets,
+    );
+    let response = build_router(ctx)
+        .oneshot(request(body("hi")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(rejected_worker.captured.lock().unwrap().last_body.is_none());
+    assert!(winner.captured.lock().unwrap().last_body.is_some());
+    assert!(skipped.calls.lock().unwrap().is_empty());
+    assert_eq!(missed.calls.lock().unwrap().len(), 1);
+    assert_eq!(rejected.calls.lock().unwrap().len(), 1);
+    assert_eq!(accepted.calls.lock().unwrap()[0].0, "d-winner");
 }
 
 #[tokio::test]
 async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_first_prefill() {
-    // Cover an empty decode group and rejection at both admission placements.
-    for placement in [
-        None,
-        Some(Placement::BeforeSelection),
-        Some(Placement::AfterSelection),
-    ] {
+    // Cover an empty decode group and rejection of a selected decode engine.
+    for reject_decode in [false, true] {
         let first_prefill = MockWorker::start(vec![]).await;
         let second_prefill = MockWorker::start(vec![]).await;
         let decode = MockWorker::start(vec![]).await;
         let first = Arc::new(FirstPolicy::default());
-        let rejected = placement.map(rejecting_policy).unwrap_or_default();
+        let rejected = rejecting_policy();
         let accepted = Arc::new(FirstPolicy::default());
         let buckets = vec![
             Bucket::new(
                 "a-first",
                 BucketGroups::Pd {
                     prefill: group("p1", first.clone()),
-                    decode: group(if placement.is_some() { "d" } else { "missing" }, rejected),
+                    decode: group(if reject_decode { "d" } else { "missing" }, rejected),
                 },
             ),
             Bucket::new(
@@ -457,14 +466,14 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
 #[tokio::test]
 async fn admission_exhaustion_is_preserved_when_later_buckets_are_empty() {
     let worker = MockWorker::start(vec![]).await;
-    let before = rejecting_policy(Placement::BeforeSelection);
-    let after = rejecting_policy(Placement::AfterSelection);
+    let first = rejecting_policy();
+    let second = rejecting_policy();
     let empty = Arc::new(FirstPolicy::default());
     let ctx = context(
         &[("w", Stage::Plain, &worker)],
         vec![
-            Bucket::new("a-before", BucketGroups::Plain(group("w", before.clone()))),
-            Bucket::new("b-after", BucketGroups::Plain(group("w", after.clone()))),
+            Bucket::new("a-first", BucketGroups::Plain(group("w", first.clone()))),
+            Bucket::new("b-second", BucketGroups::Plain(group("w", second.clone()))),
             Bucket::new(
                 "c-empty",
                 BucketGroups::Plain(group("missing", empty.clone())),
@@ -480,8 +489,8 @@ async fn admission_exhaustion_is_preserved_when_later_buckets_are_empty() {
         response.headers()["x-router-error-code"],
         "policy_selection_failed"
     );
-    assert_eq!(before.calls.lock().unwrap().len(), 1);
-    assert_eq!(after.calls.lock().unwrap().len(), 1);
+    assert_eq!(first.calls.lock().unwrap().len(), 1);
+    assert_eq!(second.calls.lock().unwrap().len(), 1);
     assert!(empty.calls.lock().unwrap().is_empty());
     assert!(worker.captured.lock().unwrap().last_body.is_none());
     assert_eq!(ctx.active_load.inflight_count(), 0);

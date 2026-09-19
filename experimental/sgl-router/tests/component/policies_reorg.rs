@@ -8,17 +8,31 @@ use sgl_router::buckets_reorg::{
     Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
-use sgl_router::policies_reorg::{Pick, PickContext, PickError, PickRequest, Policy, Stage};
+use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::{
+    Pick, PickContext, PickError, PickRequest, Policy, Rejection, Stage,
+};
 use sgl_router::workers::{Worker, WorkerRegistry};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TestPolicy {
-    admission: Admission,
+    admission: Arc<dyn EngineAdmission>,
     result: Option<Arc<Worker>>,
     miss: bool,
     invalid: bool,
     calls: Mutex<Vec<String>>,
+}
+
+impl Default for TestPolicy {
+    fn default() -> Self {
+        Self {
+            admission: Arc::new(AllowAll),
+            result: None,
+            miss: false,
+            invalid: false,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Policy for TestPolicy {
@@ -36,16 +50,20 @@ impl Policy for TestPolicy {
             if self.miss {
                 return Err(PickError::NoCandidates);
             }
-            let admitted = self.admission.before(engines, request, context)?;
-            let engine = self.result.clone().unwrap_or_else(|| admitted[0].clone());
-            self.admission.after(
-                Pick {
-                    engine,
-                    reason: "test",
-                },
-                request,
-                context,
-            )
+            if engines.is_empty() {
+                return Err(PickError::NoCandidates);
+            }
+            let engine = self.result.clone().unwrap_or_else(|| engines[0].clone());
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, context)? {
+                return Err(PickError::AdmissionRejected(Rejection {
+                    engine: engine.id.clone(),
+                    reason,
+                }));
+            }
+            Ok(Pick {
+                engine,
+                reason: "test",
+            })
         })
     }
 }
@@ -280,25 +298,17 @@ async fn group_propagates_rejections_misses_and_invalid_signals() {
     let workers = registry();
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
-    for placement in [Placement::BeforeSelection, Placement::AfterSelection] {
-        let group = group(
-            &["a"],
-            Arc::new(TestPolicy {
-                admission: Admission {
-                    check: Arc::new(Reject("a")),
-                    placement,
-                },
-                ..Default::default()
-            }),
-        );
-        let error = group.pick(&workers, &request).await.unwrap_err();
-        match placement {
-            Placement::BeforeSelection => {
-                assert!(matches!(error, PickError::NoAdmissibleEngine(_)))
-            }
-            Placement::AfterSelection => assert!(matches!(error, PickError::AdmissionRejected(_))),
-        }
-    }
+    let rejected = group(
+        &["a"],
+        Arc::new(TestPolicy {
+            admission: Arc::new(Reject("a")),
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(
+        rejected.pick(&workers, &request).await,
+        Err(PickError::AdmissionRejected(_))
+    ));
     let miss = group(
         &["a"],
         Arc::new(TestPolicy {
@@ -342,25 +352,17 @@ async fn group_rejects_foreign_pick_even_with_same_worker_id() {
 }
 
 #[tokio::test]
-async fn admission_placement_changes_whether_an_alternative_can_win() {
+async fn selected_engine_rejection_does_not_try_an_alternative() {
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
     let engines = [
         Arc::new(Worker::new(spec("a", Stage::Plain, "m"))),
         Arc::new(Worker::new(spec("b", Stage::Plain, "m"))),
     ];
-    let mut policy = TestPolicy {
-        admission: Admission {
-            check: Arc::new(Reject("a")),
-            placement: Placement::BeforeSelection,
-        },
+    let policy = TestPolicy {
+        admission: Arc::new(Reject("a")),
         ..Default::default()
     };
-    assert_eq!(
-        policy.pick(&engines, &request).await.unwrap().engine.id.0,
-        "b"
-    );
-    policy.admission.placement = Placement::AfterSelection;
     assert!(matches!(
         policy.pick(&engines, &request).await,
         Err(PickError::AdmissionRejected(_))
@@ -418,4 +420,69 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
     assert_eq!(picks.prefill.engine.id.0, "b");
     assert_eq!(picks.prefill.reason, "inspected");
     assert!(picks.decode.is_none());
+}
+
+#[tokio::test]
+async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use sgl_router::state::load_monitor::engine_load::EngineLoadTable;
+
+    #[derive(Debug)]
+    struct Check {
+        calls: Mutex<Vec<WorkerId>>,
+        reject: bool,
+        invalid: bool,
+    }
+
+    impl EngineAdmission for Check {
+        fn check(
+            &self,
+            engine: &Worker,
+            _: &PickRequest<'_>,
+            _: &PickContext,
+        ) -> Result<Decision, PickError> {
+            self.calls.lock().unwrap().push(engine.id.clone());
+            if self.invalid {
+                Err(PickError::InvalidSignal("admission input".into()))
+            } else if self.reject {
+                Ok(Decision::Reject("full".into()))
+            } else {
+                Ok(Decision::Allow)
+            }
+        }
+    }
+
+    let model = ModelId("m".into());
+    let request = PickRequest::new(&model, Stage::Plain, 10);
+    let engine = Arc::new(Worker::new(spec("a", Stage::Plain, "m")));
+    for (reject, invalid) in [(false, false), (true, false), (false, true)] {
+        let check = Arc::new(Check {
+            calls: Mutex::new(Vec::new()),
+            reject,
+            invalid,
+        });
+        let fallback = Arc::new(TestPolicy::default());
+        let mut policy = PowerOfTwoPolicy::new(EngineLoadTable::new());
+        policy.admission = check.clone();
+        policy.fallback = Some(fallback.clone());
+        assert!(matches!(
+            policy.pick(&[], &request).await,
+            Err(PickError::NoCandidates)
+        ));
+        assert!(check.calls.lock().unwrap().is_empty());
+        let result = policy.pick(std::slice::from_ref(&engine), &request).await;
+        if invalid {
+            assert!(matches!(result, Err(PickError::InvalidSignal(_))));
+        } else if reject {
+            assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
+                if reason.engine == engine.id && reason.reason == "full"));
+        } else {
+            assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
+        }
+        assert_eq!(
+            check.calls.lock().unwrap().as_slice(),
+            std::slice::from_ref(&engine.id)
+        );
+        assert!(fallback.calls.lock().unwrap().is_empty());
+    }
 }
