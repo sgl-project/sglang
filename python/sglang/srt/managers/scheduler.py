@@ -2449,6 +2449,7 @@ class Scheduler(
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step: Optional[Tuple[int, float, bool]] = None
+        self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
@@ -4333,7 +4334,11 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
+        is_split_prefill = batch.forward_mode.is_split_prefill()
+        if not is_split_prefill or batch.split_index == 0:
+            batch.after_idle_gap = self._sched_idled
+            if is_split_prefill:
+                batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
         self._sched_idled = False
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
@@ -4798,15 +4803,36 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
+        if is_prefill and mode.is_split_prefill():
+            start_iter, start_ts = batch.split_prefill_start
+        else:
+            start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
         self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
         # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
-        if prev is None or batch.after_idle_gap:
-            return
-        prev_iter, prev_ts, prev_is_prefill = prev
-        if prev_iter + 1 != batch.forward_iter or prev_is_prefill != is_prefill:
-            return
-        step_us = int((batch.launch_ts - prev_ts) * 1e6)
+        contiguous = False
+        if prev is not None:
+            prev_iter, prev_launch_ts, prev_is_prefill = prev
+            contiguous = (
+                not batch.after_idle_gap
+                and prev_iter + 1 == start_iter
+                and prev_is_prefill == is_prefill
+            )
+        if is_prefill:
+            # Completion boundaries include the burst tail and scheduling overhead
+            # without double-counting overlapping launch-to-result spans.
+            end_ts = time.monotonic()
+            prev_end_ts = self._prev_prefill_end_ts
+            self._prev_prefill_end_ts = end_ts
+            if prev_end_ts is not None:
+                # A new burst or mode can still overlap an earlier prefill.
+                start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
+            step_us = int((end_ts - start_ts) * 1e6)
+        else:
+            # Decode regression uses launch cadence and skips boundaries.
+            if not contiguous:
+                return
+            step_us = int((batch.launch_ts - prev_launch_ts) * 1e6)
         if not 0 < step_us < STEP_MAX_US:
             return
         if is_prefill:
