@@ -195,7 +195,7 @@ class TestMultimodalTokenPadding(CustomTestCase):
                         pattern=type(pattern).__name__, source=source, items=bool(items)
                     ):
                         mm = MultimodalInputs(mm_items=items, im_token_id=1)
-                        with self.assertRaisesRegex(TypeError, "array"):
+                        with self.assertRaisesRegex(AssertionError, "array"):
                             pattern.pad_input_tokens(source, mm)
 
     def test_scheduler_round_trip_keeps_unpadded_request_alias(self):
@@ -367,11 +367,17 @@ class TestTokenPairPadding(CustomTestCase):
 
 
 class TestModelPaddingContract(CustomTestCase):
-    def test_invalid_input_is_rejected_before_calling_model(self):
-        callback = Mock(return_value=array("q", [300]))
-        with self.assertRaisesRegex(TypeError, "input_ids must be array"):
-            pad_mm_input_ids([300], MultimodalInputs(mm_items=[]), callback)
-        callback.assert_not_called()
+    def test_invalid_input_is_rejected_by_shared_helper(self):
+        source = array("d", [300, 301])
+        mm = MultimodalInputs(
+            mm_items=[mm_item(Modality.IMAGE, 1001, [(0, 0)])], im_token_id=1
+        )
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        callback = Mock(wraps=pattern.pad_input_tokens)
+        with self.assertRaisesRegex(AssertionError, "input_ids must be array"):
+            pad_mm_input_ids(source, mm, callback)
+        callback.assert_called_once_with(source, mm)
+        self.assertEqual(source, array("d", [300, 301]))
 
     def test_model_cannot_return_a_list_or_wrong_array_format(self):
         source = array("q", [300, 301])
@@ -380,7 +386,7 @@ class TestModelPaddingContract(CustomTestCase):
             with self.subTest(output=output):
                 callback = Mock(return_value=output)
                 with self.assertRaisesRegex(
-                    TypeError, "pad_input_ids result must be array"
+                    AssertionError, "pad_input_ids result must be array"
                 ):
                     pad_mm_input_ids(source, mm, callback)
                 callback.assert_called_once_with(source, mm)
