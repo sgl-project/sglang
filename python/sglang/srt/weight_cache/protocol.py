@@ -157,12 +157,43 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
+def _mxfp4_round_trips_via_ipc(quant_config: Any) -> bool:
+    """Recognize the compressed-tensors MXFP4 IPC layout.
+
+    IPC support is a property of the serialized tensor contract, not of a
+    particular model or user opt-in environment variable. Models using a
+    different quantized layout remain rejected by this exact predicate.
+    """
+    if not isinstance(quant_config, dict):
+        return False
+    if quant_config.get("quant_method") != "compressed-tensors":
+        return False
+    if quant_config.get("format") != "mxfp4-pack-quantized":
+        return False
+    groups = quant_config.get("config_groups", {})
+    group = groups.get("group_0", {}) if isinstance(groups, dict) else {}
+    weights = group.get("weights", {}) if isinstance(group, dict) else {}
+    return (
+        weights.get("num_bits") == 4
+        and weights.get("group_size") == 32
+        and weights.get("scale_dtype") == "torch.uint8"
+        and weights.get("type") == "float"
+        and weights.get("strategy") == "group"
+    )
+
+
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+    "compressed-tensors": _mxfp4_round_trips_via_ipc,
 }
+
+
+def is_ipc_mxfp4_config(quant_config: Any) -> bool:
+    """Return whether a compressed-tensors config uses the IPC MXFP4 layout."""
+    return _mxfp4_round_trips_via_ipc(quant_config)
 
 
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
