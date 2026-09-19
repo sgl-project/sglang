@@ -3534,3 +3534,14 @@ for _name, _replacement in _CONTEXT_NAME_OF.items():
     if _fn is not None:
         globals()[_name] = _warn_if_called_from_outside(_name, _replacement)(_fn)
 del _name, _replacement, _fn
+
+
+# What `from sglang.srt.distributed import *` re-exports: everything public
+# except the deprecated getters. Business code reaches them through
+# `get_parallel()`, and the package that defines them imports them from this
+# module by name, so nothing needs the package path to reach one.
+__all__ = [
+    _public
+    for _public in list(globals())
+    if not _public.startswith("_") and _public not in _CONTEXT_NAME_OF
+]

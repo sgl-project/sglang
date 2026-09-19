@@ -7,7 +7,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import (
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_allreduce_only,
     get_default_distributed_backend,
     get_tp_group,
     get_world_group,
@@ -17,10 +19,6 @@ from sglang.srt.distributed import (
     set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
-)
-from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
-from sglang.srt.distributed.parallel_state import (
-    _tag_groups_for_flashinfer_allreduce_only,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention

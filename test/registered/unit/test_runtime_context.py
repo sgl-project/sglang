@@ -2596,18 +2596,30 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         }
 
     def _callers(self, name):
+        """Every call in business code, including one hiding behind an import
+        alias -- `from ... import get_moe_dp_group as _g` then `_g()` is the
+        same reach past the context, and searching for the original spelling
+        alone reports zero while it is right there."""
         import re
 
         from sglang.srt.distributed import parallel_state as parallel_state_module
 
         root = _pathlib.Path(parallel_state_module.__file__).parents[2]
-        pattern = re.compile(rf"(?<![.\w]){re.escape(name)}\(")
         hits = []
         for path in root.rglob("*.py"):
             rel = path.relative_to(root).as_posix()
             if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
                 continue
-            for number, line in enumerate(path.read_text().splitlines(), 1):
+            text = path.read_text()
+            spellings = (
+                {name}
+                | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
+                | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
+            )
+            pattern = re.compile(
+                r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
+            )
+            for number, line in enumerate(text.splitlines(), 1):
                 if line.lstrip().startswith(("def ", "#")):
                     continue
                 if pattern.search(line):
