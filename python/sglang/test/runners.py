@@ -35,7 +35,12 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import get_device, is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+from sglang.test.test_utils import (
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+    calculate_rouge_l,
+    collect_process_tree_pids,
+    wait_for_gpu_release,
+)
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -428,12 +433,14 @@ class HFRunner:
         # Fire-and-forget terminate() leaves the child holding the accelerator
         # during teardown; a follow-on SRTRunner on the same device can then
         # deadlock in driver init (observed on Intel XPU B580).
+        pid = self.model_proc.pid
         self.model_proc.terminate()
         self.model_proc.join(timeout=30)
         if self.model_proc.is_alive():
             self.model_proc.kill()
             self.model_proc.join()
         self.in_queue = self.out_queue = None
+        wait_for_gpu_release([pid])
 
     def terminate(self):
         self._stop_model_proc()
@@ -751,8 +758,13 @@ class SRTRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # Wait only on the pids this shutdown actually killed;
+        # a nested HFRunner or SRTRunner is deliberately still alive.
+        before = collect_process_tree_pids(os.getpid(), include_parent=False)
         self.engine.shutdown()
         del self.engine
+        alive = set(collect_process_tree_pids(os.getpid(), include_parent=False))
+        wait_for_gpu_release([pid for pid in before if pid not in alive])
 
     @staticmethod
     def forward_generation_raw(
@@ -935,9 +947,9 @@ def check_close_model_outputs(
     print(f"{srt_outputs.output_strs=}")
     rouge_l_scores = calculate_rouge_l(hf_outputs.output_strs, srt_outputs.output_strs)
     print(f"{rouge_l_scores=}")
-    assert all(
-        score >= rouge_l_tolerance for score in rouge_l_scores
-    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    assert all(score >= rouge_l_tolerance for score in rouge_l_scores), (
+        f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    )
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):

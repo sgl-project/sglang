@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
-
     ### TODO: Get rid of code duplication with python/sglang/srt/modelslim/modelslim_moe.py @OrangeRedeng @TamirBaydasov
     def __init__(self, quantization_config) -> None:
         self.group_size = 0

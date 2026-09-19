@@ -1,6 +1,7 @@
 """Public interface of sglang.kernels.jit.utils."""
 
 from sglang.kernels.jit.utils.arch import (
+    get_activation_cuda_cflags,
     get_jit_cuda_arch,
     is_arch_support_pdl,
     override_jit_cuda_arch,
@@ -27,6 +28,7 @@ __all__ = [
     "make_cpp_args",
     "load_jit",
     "override_jit_cuda_arch",
+    "get_activation_cuda_cflags",
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
     "KERNEL_PATH",

@@ -155,7 +155,6 @@ def _cleanup(actor, pg):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
 class TestRayEngineOfflineTP1(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -196,7 +195,6 @@ class TestRayEngineOfflineTP1(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEngineOfflineTP2(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -231,7 +229,6 @@ class TestRayEngineOfflineTP2(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
 class TestRayEngineOfflinePP2(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():
@@ -347,7 +344,6 @@ class TestRayEngineOfflineDPAttention(unittest.TestCase):
 @unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
 class TestRayEngineErrors(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         if not ray.is_initialized():

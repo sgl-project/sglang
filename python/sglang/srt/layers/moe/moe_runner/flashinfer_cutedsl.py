@@ -448,7 +448,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -535,7 +537,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    ), (
+        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -630,10 +634,12 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for Flashinfer"
+    ), (
+        f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for Flashinfer"
+    )
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 

@@ -171,8 +171,10 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+!tools/sglang-simulator/examples/replay/trace.jsonl
 tmp*.txt
 /tmp/
+.tmp/
 
 # Torch Compile logs
 tl_out/
@@ -232,6 +234,7 @@ work_dirs/
 Cargo.lock
 !rust/Cargo.lock
 !rust/sglang-radix-tree/Cargo.lock
+!experimental/sgl-router/Cargo.lock
 
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-model-gateway/tests/fixtures/golden/

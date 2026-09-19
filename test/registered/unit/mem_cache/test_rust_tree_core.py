@@ -12,7 +12,7 @@ from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInte
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 if shutil.which("cargo") is None:
     pytest.skip("the rust backend builds with cargo", allow_module_level=True)
@@ -76,10 +76,10 @@ def test_lock_moves_tokens_between_evictable_and_protected():
         InsertParams(key=_key([1, 2]), value=torch.tensor([10, 11], dtype=torch.int64)),
     )
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    core.inc_lock_ref(matched.best_match_node)
+    lock = core.inc_lock_ref(matched.best_match_node)
     assert core.protected_size() == 2
     assert core.evictable_size() == 0
-    core.dec_lock_ref(matched.best_match_node)
+    core.dec_lock_ref(matched.best_match_node, lock.to_dec_params())
     assert core.evictable_size() == 2
 
 

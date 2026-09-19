@@ -209,7 +209,9 @@ def _set_k_and_s_torch(
         == num_tokens_to_write_nope
         == num_tokens_to_write_rope
         == num_tokens_to_write_scale
-    ), f"{num_tokens_to_write=} {num_tokens_to_write_nope=} {num_tokens_to_write_rope=} {num_tokens_to_write_scale=}"
+    ), (
+        f"{num_tokens_to_write=} {num_tokens_to_write_nope=} {num_tokens_to_write_rope=} {num_tokens_to_write_scale=}"
+    )
 
     assert buf.dtype == torch.uint8
     assert loc.dtype in [

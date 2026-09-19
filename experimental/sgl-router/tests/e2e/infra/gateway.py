@@ -186,7 +186,7 @@ class Gateway:
                          each worker's mode (plain) and any disaggregation
                          metadata are learned from ``/server_info``.
             policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
-                    or ``cache_aware_zmq``.
+                    or ``cache_aware``.
             kv_indexer_endpoint: Optional external KV Indexer gRPC endpoint.
             timeout: How long to wait for ``/readyz`` before giving up.
         """

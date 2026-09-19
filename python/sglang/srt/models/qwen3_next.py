@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -505,7 +504,6 @@ def _apply_qwen3_next_mlp(
 
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -596,7 +594,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -1007,7 +1004,7 @@ class Qwen3NextForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         # The quant config's packed_modules_mapping may be None if it wasn't
@@ -1145,9 +1142,7 @@ class Qwen3NextForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if is_mtp:
-
                 if "mtp" not in name:
                     continue
 
@@ -1240,9 +1235,9 @@ class Qwen3NextForCausalLM(nn.Module):
                     #     continue
 
                     if name.endswith("_scale") and name not in params_dict:
-                        assert (
-                            abs(loaded_weight.item() - 1.0) < 1e-6
-                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        assert abs(loaded_weight.item() - 1.0) < 1e-6, (
+                            f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        )
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
