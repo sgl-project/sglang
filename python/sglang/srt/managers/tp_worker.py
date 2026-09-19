@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -577,10 +578,20 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # Decode context parallelism and logical-page KV sharding each widen
+        # the scheduler-visible index space over the physical per-rank pool
+        # (dcp_size splits a sequence across ranks; KV sharding stripes each
+        # logical page across shard_size ranks). At most one factor is above 1
+        # -- they are validated mutually exclusive -- so the product is the
+        # active widening and degenerates to 1x when neither is on.
+        kv_capacity = (
+            self.model_runner.effective_max_total_num_tokens
+            * self.ps.attn_dcp_size
+            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
-            - 1,
+            kv_capacity - 1,
         )
         return (
             self.model_runner.req_to_token_pool.schedulable_token_capacity(

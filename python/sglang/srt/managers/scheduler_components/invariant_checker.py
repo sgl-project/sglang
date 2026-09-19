@@ -21,6 +21,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -117,29 +118,60 @@ class SchedulerInvariantChecker:
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
-        if get_parallel().dcp_enabled and allocator.page_size > 1:
-            # DCP stores logical tokens in widened physical pages.  Prefix cache
-            # counters are logical-token based, while the allocator frees whole
-            # physical pages, so round cached tokens up to physical page units.
-            full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
+        full_available = ps.full_available_size
+        class_watermark_msg = ""
+        kv_shard_size = page_interleave_shard_size(allocator)
+        dcp_page_alloc = (
+            kv_shard_size == 1
+            and get_parallel().dcp_enabled
+            and allocator.page_size > 1
+        )
+        if kv_shard_size > 1:
+            # Conservation needs every free page, not the min-class capacity
+            # floor used for admission. Sharding keeps the tree and allocator
+            # page sizes equal, so cached counts must already be page-aligned.
+            full_available = allocator.aggregate_free_size()
+            class_watermark_msg = (
+                f", class_free_pages={allocator.class_free_page_counts()}"
             )
+        elif dcp_page_alloc:
+            # Preserve the existing DCP-only accounting adjustment. DCP widens
+            # allocator pages; its scheduler counters still use per-rank units.
+            full_evictable_size = ceil_align(full_evictable_size, allocator.page_size)
         leak, msg = self._check_pool_invariant(
             "full",
-            ps.full_available_size,
+            full_available,
             full_evictable_size,
             protected,
             session_held,
             total,
             uncached,
         )
-        if leak and get_parallel().dcp_enabled and allocator.page_size > 1:
-            # Radix/Mamba cache accounting is logical-token based while DCP full
-            # KV allocation is physical-page based. Partial physical pages can
-            # leave a small page-level slack even when all pages are owned by
-            # either the allocator or the prefix cache.
+        msg += class_watermark_msg
+        if kv_shard_size > 1:
+            # Partial active pages are already rounded in
+            # _get_total_uncached_sizes. Rounding cached counts or accepting
+            # arbitrary slack here would hide corruption and lost pages.
+            unaligned = {
+                name: value
+                for name, value in (
+                    ("available", full_available),
+                    ("evictable", full_evictable_size),
+                    ("protected", protected),
+                    ("session_held", session_held),
+                    ("uncached", uncached),
+                    ("total", total),
+                )
+                if value % allocator.page_size != 0
+            }
+            if unaligned:
+                return True, (
+                    f"{msg}, unaligned_sharded_counts={unaligned}, "
+                    f"page_size={allocator.page_size}"
+                )
+        if leak and dcp_page_alloc:
+            # Legacy DCP counters use different page/capacity units. Keep that
+            # compatibility path separate from exact KV-shard conservation.
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
@@ -380,14 +412,17 @@ class SchedulerInvariantChecker:
         idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
         allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
         mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
-        owner_pages = rtt[idx][mask] // self.page_size
+        owner_locs = rtt[idx][mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
-        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
+        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator;
+        # the classed sharding allocator keeps per-class lists instead of a
+        # flat free_pages and exposes them through get_all_free_pages().
         alloc = self.token_to_kv_pool_allocator
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None
+            or page_interleave_shard_size(alloc) > 1
             else [
                 sub
                 for n in ("full_attn_allocator", "swa_attn_allocator")
@@ -398,6 +433,10 @@ class SchedulerInvariantChecker:
         if not sub_allocs:
             return
 
+        # Page ids in the ALLOCATOR's page units (== the physical page for
+        # the classed sharding allocator, whose free lists hold logical page
+        # ids in the same unit).
+        owner_pages = owner_locs // sub_allocs[0].page_size
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
             free = sub.get_all_free_pages()
