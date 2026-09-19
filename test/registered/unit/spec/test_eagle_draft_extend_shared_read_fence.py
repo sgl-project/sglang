@@ -35,7 +35,9 @@ def test_draft_extend_fence_covers_declared_reads(declared, expected_order):
     # must clear it so the scheduler takes its whole-forward fallback.
     stale_event = object()
     runner.model_runner = SimpleNamespace(
-        device_timer=None, shared_read_done_event=stale_event
+        device_timer=None,
+        shared_read_done_event=stale_event,
+        model_config=SimpleNamespace(model_is_mrope=False),
     )
     runner.device_module = SimpleNamespace(Event=lambda: event)
     runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
