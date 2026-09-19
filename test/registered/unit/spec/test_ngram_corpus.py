@@ -576,6 +576,31 @@ class TestNgramCorpusIncremental(CustomTestCase):
 class TestNgramCorpusExternalSam(CustomTestCase):
     """Verify external SAM loading and fixed-budget composition."""
 
+    def test_sam_match_depth_is_independent_of_trie_depth(self):
+        documents = [
+            [101, 1, 2, 3, 4, 10],
+            [202, 1, 2, 3, 4, 20],
+        ]
+        common_kwargs = dict(
+            draft_token_num=2,
+            max_trie_depth=4,
+            min_bfs_breadth=1,
+            max_bfs_breadth=1,
+            external_sam_budget=1,
+            external_corpus_documents=documents,
+        )
+
+        legacy_depth = _make_corpus("BFS", **common_kwargs)
+        expanded_depth = _make_corpus("BFS", max_sam_match_depth=5, **common_kwargs)
+
+        # The four-token suffix is shared, so recency selects the second
+        # document. The preceding token disambiguates the first document only
+        # when SAM is allowed to match beyond max_trie_depth.
+        legacy_ids, _ = _batch_get(legacy_depth, [[101, 1, 2, 3, 4]])
+        expanded_ids, _ = _batch_get(expanded_depth, [[101, 1, 2, 3, 4]])
+        self.assertEqual(legacy_ids.tolist(), [4, 20])
+        self.assertEqual(expanded_ids.tolist(), [4, 10])
+
     def test_external_corpus_iterator_streams_documents(self):
         corpus = _make_corpus(
             "BFS",
