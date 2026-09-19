@@ -833,7 +833,7 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
 
 
 # Fixtures shared by the streaming tests: one representative input per template,
-# re-used for both the correctness invariant (any chunking → same dict) and the
+# reused for both the correctness invariant (any chunking → same dict) and the
 # event-shape tests (do we emit the right events in the right order?).
 _STREAMING_FIXTURES = [
     (
