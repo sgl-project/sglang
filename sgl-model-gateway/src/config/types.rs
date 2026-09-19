@@ -278,6 +278,13 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
+        /// Number of prefill workers for short requests (0 = use dynamic buckets).
+        /// When > 0, enables fixed grouped_threshold mode with round-robin per group.
+        #[serde(default)]
+        prefill_short_count: usize,
+        /// Character count threshold separating short and long requests
+        #[serde(default = "default_length_threshold")]
+        prefill_length_threshold: usize,
     },
 
     /// Manual routing policy with sticky sessions using DashMap.
@@ -328,6 +335,10 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_length_threshold() -> usize {
+    4096
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
@@ -897,6 +908,8 @@ mod tests {
             balance_abs_threshold: 20,
             balance_rel_threshold: 2.0,
             bucket_adjust_interval_secs: 5,
+            prefill_short_count: 0,
+            prefill_length_threshold: 4096,
         };
 
         match bucket {
@@ -904,6 +917,7 @@ mod tests {
                 balance_abs_threshold,
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
+                ..
             } => {
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
