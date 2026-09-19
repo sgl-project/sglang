@@ -165,7 +165,14 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+    # Match eager indexer quantization: PPU SM80 uses INT8 for both Q and K.
+    # act_quant unconditionally produces FP8, which Triton cannot compile there.
+    if indexer.use_int8:
+        from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+
+        q_fp8, q_scale = per_token_quant_int8(query.contiguous())
+    else:
+        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
     # Reuse the compiled head-gate util shared with the eager path.
     weights = indexer._get_logits_head_gate(x, q_scale)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
