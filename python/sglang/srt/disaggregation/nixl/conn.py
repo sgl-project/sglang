@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import signal
 import struct
 import threading
 import time
@@ -60,12 +62,14 @@ try:
         nixlRemoteDisconnectError,
     )
 
+    _NIXL_REMOTE_DISCONNECT_ERRORS = (nixlRemoteDisconnectError,)
     _NIXL_TRANSPORT_ERRORS = (
         nixlRemoteDisconnectError,
         nixlBackendError,
         nixlCancelledError,
     )
 except ImportError:
+    _NIXL_REMOTE_DISCONNECT_ERRORS = ()
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
@@ -421,6 +425,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._disconnect_shutdown_lock = threading.Lock()
+        self._disconnect_shutdown_signaled = False
+        self._scheduler_parent_pid = os.getppid()
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -717,6 +724,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         all_settled = False
             except Exception as e:
                 logger.warning(f"Failed to read NIXL transfer state: {e}")
+                self._shutdown_on_remote_disconnect(e)
                 return False, True
             if all_settled:
                 return True, any_failed
@@ -1477,6 +1485,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
+                self._shutdown_on_remote_disconnect(e)
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
                 # rather than only after the barrier.
@@ -1491,6 +1500,32 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
+
+    def _shutdown_on_remote_disconnect(self, error: Exception) -> None:
+        # TODO: safely reconnect peers after settling outstanding transfers and
+        # rebuilding remote metadata and prepared descriptors. Shutdown is only
+        # an opt-in mitigation, not transparent recovery.
+        # NIXL invalidates the peer metadata on disconnect, but our registration
+        # cache still considers that peer registered. Until coordinated peer
+        # recovery is supported, supervisors can opt in to rebuilding the engine
+        # rather than keeping a live process that cannot transfer to that peer.
+        if not (
+            envs.SGLANG_DISAGGREGATION_NIXL_EXIT_ON_REMOTE_DISCONNECT.get()
+            and isinstance(error, _NIXL_REMOTE_DISCONNECT_ERRORS)
+        ):
+            return
+        with self._disconnect_shutdown_lock:
+            if self._disconnect_shutdown_signaled:
+                return
+            logger.error(
+                "NIXL invalidated a remote peer; requesting engine shutdown "
+                "to rebuild transport state: %s",
+                error,
+            )
+            # Use the same parent shutdown path as a scheduler exception.
+            # This does not send a successful transfer or a drained-abort ack.
+            os.kill(self._scheduler_parent_pid, signal.SIGQUIT)
+            self._disconnect_shutdown_signaled = True
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
