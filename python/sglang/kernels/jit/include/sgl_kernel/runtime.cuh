@@ -67,6 +67,40 @@ inline void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
   return device_ptr;
 }
 
+/// \brief Same translation as get_device_accessible_ptr, but tolerates host memory
+/// that was never registered.
+///
+/// Registered host memory carries a device address that can differ from its host
+/// VA: always on ROCm, and on any CUDA platform whose
+/// cudaDevAttrCanUseHostPointerForRegisteredMem is 0 (for example WSL2's GPU-PV
+/// memory model). Callers that pass such a pointer to a pointer-to-pointer copy
+/// API need the device address, not the host VA.
+///
+/// Pageable host memory has no separate device address, and the copy APIs that
+/// accept it expect the host VA, so this variant falls back to the host pointer
+/// instead of failing like get_device_accessible_ptr does.
+inline void* try_get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
+  void* ptr = tensor.data_ptr();
+  const auto tensor_device_type = tensor.device().device_type;
+  if (tensor_device_type != kDLCPU && tensor_device_type != kDLGPUHost) {
+    return ptr;
+  }
+
+  void* device_ptr = nullptr;
+#ifdef USE_ROCM
+  if (::hipHostGetDevicePointer(&device_ptr, ptr, 0) != hipSuccess) {
+    (void)::hipGetLastError();
+    return ptr;
+  }
+#else
+  if (::cudaHostGetDevicePointer(&device_ptr, ptr, 0) != cudaSuccess) {
+    (void)::cudaGetLastError();
+    return ptr;
+  }
+#endif
+  return device_ptr;
+}
+
 namespace details {
 
 template <typename T, T kDefault>
