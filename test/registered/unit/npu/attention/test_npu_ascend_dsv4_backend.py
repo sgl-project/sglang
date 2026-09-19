@@ -10,6 +10,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Load the real extension before installing import stubs, so the graph test
+# exercises torch_npu when it is installed and fails on a broken installation.
+try:
+    import torch_npu  # noqa: F401
+except ModuleNotFoundError as exc:
+    if exc.name != "torch_npu":
+        raise
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="base-a-test-1-npu-a2")
@@ -70,7 +78,10 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenToKVPool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+    DSV4NPUTokenToKVPool,
+    NPUCompressStatePool,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
@@ -499,6 +510,139 @@ class TestApplyHadamard(unittest.TestCase):
 
 
 class TestCompressorStateTableABI(unittest.TestCase):
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+        return_value=False,
+    )
+    def test_graph_state_tables_read_live_buffers(self, _):
+        for tokens_per_req in (1, 3):
+            with self.subTest(tokens_per_req=tokens_per_req):
+                self._check_graph_state_tables(tokens_per_req)
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+        return_value=False,
+    )
+    def test_npu_graph_state_tables_read_live_buffers(self, _):
+        for tokens_per_req in (1, 3):
+            with self.subTest(tokens_per_req=tokens_per_req):
+                self._check_graph_state_tables(tokens_per_req, device="npu")
+
+    def _check_graph_state_tables(self, tokens_per_req, device="cpu"):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.req_to_token = torch.arange(
+            3 * 256, dtype=torch.int32, device=device
+        ).reshape(3, 256)
+        backend.req_to_token[0].zero_()
+        mapping = torch.arange(3 * 256, device=device) + 16
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+        )
+        backend._dsv4_state_pools_by_ratio = {}
+        for ratio in (4, 128):
+            pool = NPUCompressStatePool.__new__(NPUCompressStatePool)
+            pool.ring_size = 8 if ratio == 4 else 256
+            pool.swa_page_size = 16
+            pool.dummy_state_loc = 1023
+            backend._dsv4_state_pools_by_ratio[ratio] = pool
+
+        tables = {
+            ratio: torch.full(
+                (2, history + tokens_per_req), 1023, dtype=torch.int32, device=device
+            )
+            for ratio, history in ((4, 8), (128, 128))
+        }
+        fm = backend.forward_metadata = SimpleNamespace(
+            dsv4_explicit_state_block_tables=tables,
+            start_pos=torch.zeros(2, dtype=torch.int32, device=device),
+            seqused=torch.zeros(2, dtype=torch.int32, device=device),
+            actual_seq_lengths_q_pa=torch.tensor(
+                [0, tokens_per_req, 2 * tokens_per_req],
+                dtype=torch.int32,
+                device=device,
+            ),
+            dsv4_max_input_capacity=tokens_per_req,
+        )
+        # The runner's buffer can be larger than this bucket. The unused tail
+        # deliberately contains an invalid request index.
+        fb = SimpleNamespace(
+            batch_size=2, req_pool_indices=torch.tensor([0, 0, 999], device=device)
+        )
+        pointers = [table.data_ptr() for table in tables.values()]
+
+        def build(req_pool_indices, start_pos, seqused):
+            fb.req_pool_indices = req_pool_indices
+            fm.start_pos = start_pos
+            fm.seqused = seqused
+            backend.init_forward_metadata_in_graph(fb)
+            return tables[4], tables[128]
+
+        inputs = (fb.req_pool_indices, fm.start_pos, fm.seqused)
+        if device == "npu":
+            for _ in range(2):
+                build(*inputs)
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph, auto_dispatch_capture=True):
+                build(*inputs)
+            replay = graph.replay
+        else:
+            # Trace the tensor dataflow on CPU, without calling the Python
+            # hook again on replay. The NPU case above checks actual capture.
+            graph = torch.jit.trace(build, inputs, check_trace=False)
+
+            def replay():
+                return graph(*inputs)
+
+        # Capture uses the runner's zeroed dummy inputs. Live requests arrive
+        # only after capture; their values must not be frozen into the graph.
+        fb.req_pool_indices[:2].copy_(torch.tensor([1, 2]))
+        fm.start_pos.copy_(torch.tensor([3, 127], dtype=torch.int32))
+        fm.seqused.copy_(torch.tensor([tokens_per_req, 0], dtype=torch.int32))
+        replay()
+        self.assertEqual(
+            tables[4][0].tolist(), [1023] * 5 + list(range(136, 139 + tokens_per_req))
+        )
+        self.assertEqual(
+            tables[128][0].tolist(),
+            [1023] * 125 + list(range(256, 259 + tokens_per_req)),
+        )
+        self.assertTrue(torch.all(tables[4][1] == 1023))
+        self.assertTrue(torch.all(tables[128][1] == 1023))
+
+        # Reorder requests, cross compression/ring boundaries, and activate
+        # the padded row, while keeping all captured input/output addresses.
+        fb.req_pool_indices[:2].copy_(torch.tensor([2, 1]))
+        fm.start_pos.copy_(torch.tensor([129, 8], dtype=torch.int32))
+        fm.seqused.fill_(tokens_per_req)
+        replay()
+        self.assertEqual(tables[4][0].tolist(), list(range(321, 329 + tokens_per_req)))
+        self.assertEqual(
+            tables[4][1].tolist(),
+            list(range(136, 144)) + list(range(136, 136 + tokens_per_req)),
+        )
+        self.assertEqual(
+            tables[128][0].tolist(), list(range(513, 641 + tokens_per_req))
+        )
+        self.assertEqual(
+            tables[128][1].tolist(),
+            [1023] * 120 + list(range(256, 264 + tokens_per_req)),
+        )
+
+        backend.req_to_token[2, 121] = 0
+        mapping[0] = -1
+        replay()
+        self.assertEqual(tables[4][0, 0].item(), 1023)
+
+        fm.seqused.zero_()
+        replay()
+        for table, ptr in zip(tables.values(), pointers):
+            self.assertEqual(table.data_ptr(), ptr)
+            self.assertTrue(torch.all(table == 1023))
+
     def test_arch35_cycle_table_is_one_bank_per_request(self):
         req_pool_indices = torch.tensor([7, 3], dtype=torch.int64)
         table = _build_cycle_state_block_table(req_pool_indices)
@@ -564,7 +708,6 @@ class TestCompressorStateTableABI(unittest.TestCase):
         for name in (
             "_refresh_graph_seq_metadata",
             "_refresh_graph_compress_page_tables_direct",
-            "_refresh_graph_explicit_state_block_tables",
             "_refresh_graph_swa_metadata_direct",
             "_refresh_graph_dspark_sparse_metadata",
             "_refresh_graph_kernel_metadata",
@@ -572,6 +715,8 @@ class TestCompressorStateTableABI(unittest.TestCase):
             setattr(backend, name, MagicMock())
 
         backend._apply_dsv4_graph_metadata(SimpleNamespace())
+        # A5 must not build or consume explicit tables in the graph hook.
+        backend.init_forward_metadata_in_graph(SimpleNamespace())
 
         self.assertIs(ctx.fm.dsv4_cycle_state_block_table, table)
         self.assertEqual(table.tolist(), [7])
