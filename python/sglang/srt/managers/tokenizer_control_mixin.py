@@ -954,7 +954,13 @@ class TokenizerControlMixin:
             return None
 
         future = asyncio.Future()
-        obj.session_incarnation = uuid.uuid4().hex
+        # The proxy persists this fence before sending open, so another
+        # frontend can identify an accepted open even if the response is lost.
+        obj.session_incarnation = (
+            getattr(request.state, "native_session_incarnation", None)
+            if request is not None
+            else None
+        ) or uuid.uuid4().hex
         self.session_futures[obj.session_id] = future
         self._dispatch_to_scheduler(obj)
 

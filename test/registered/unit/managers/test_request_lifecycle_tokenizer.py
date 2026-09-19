@@ -18,6 +18,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     GenerateReqInput,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
     SessionParams,
     SessionRoutingReqInput,
     SessionRoutingReqOutput,
@@ -39,6 +41,30 @@ class TestLifecycleTokenizer(unittest.IsolatedAsyncioTestCase):
         self.manager._lifecycle_tasks = {}
         self.attempt = uuid.uuid4().hex
         self.manager.request_lifecycle.claim(self.attempt, "null")
+
+    async def test_open_uses_proxy_fence_but_ignores_untrusted_body_incarnation(self):
+        manager = self.manager
+        manager.session_futures = {}
+        manager.auto_create_handle_loop = Mock()
+        manager._dispatch_to_scheduler = lambda obj: (
+            manager._handle_open_session_req_output(
+                OpenSessionReqOutput(session_id=obj.session_id, success=True)
+            )
+        )
+        chosen = uuid.uuid4().hex
+        for request in [
+            SimpleNamespace(state=SimpleNamespace(native_session_incarnation=chosen)),
+            None,
+        ]:
+            obj = OpenSessionReqInput(
+                capacity_of_str_len=0, session_id="s", session_incarnation="body-value"
+            )
+            self.assertEqual(await manager.open_session(obj, request), "s")
+            self.assertEqual(len(obj.session_incarnation), 32)
+            if request is not None:
+                self.assertEqual(obj.session_incarnation, chosen)
+            else:
+                self.assertNotIn(obj.session_incarnation, (chosen, "body-value"))
 
     def test_stale_session_close_is_rejected_before_releasing_radix_state(self):
         controller, cache = MagicMock(), Mock()

@@ -873,6 +873,11 @@ async def server_info():
                         and not server_args.enable_dp_attention
                         and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
                     ),
+                    "session_open_version": int(
+                        server_args.disaggregation_mode == "null"
+                        and not server_args.enable_dp_attention
+                        and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+                    ),
                 }
                 if _global_state.tokenizer_manager.request_lifecycle is not None
                 else None
@@ -1784,6 +1789,13 @@ async def unload_lora_adapter(
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
+    incarnation = _get_session_header(request, "x-sglang-session-incarnation")
+    if incarnation is not None:
+        if len(incarnation) != 32 or any(
+            c not in "0123456789abcdef" for c in incarnation
+        ):
+            raise HTTPException(400, "session incarnation must be a UUID hex string")
+        request.state.native_session_incarnation = incarnation
     session_id = _get_session_header(request, "x-sglang-session-id")
     if session_id is not None:
         if obj.session_id is not None and obj.session_id != session_id:
