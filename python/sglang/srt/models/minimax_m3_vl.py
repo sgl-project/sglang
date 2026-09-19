@@ -230,14 +230,21 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         if layer_ids is None:
             num_layers = self.config.text_config.num_hidden_layers
             layer_ids = [2, num_layers // 2, num_layers - 3]
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_layers_to_capture([int(layer_id) + 1 for layer_id in layer_ids])
 
-        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
-        # attribute (not ``i in layers_to_capture``); set it explicitly so the
-        # (hidden, aux) tuple is actually returned during capture-enabled forwards.
-        for layer_id in self.model.layers_to_capture:
-            if 0 <= layer_id < len(self.model.layers):
-                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit target layer ids for hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_layers_to_capture([int(layer_id) + 1 for layer_id in layer_ids])
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.set_dflash_layers_to_capture(layer_ids)
 
     def forward(
         self,

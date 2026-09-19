@@ -115,6 +115,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
+        self.is_dspark = runner.spec_algorithm.is_dspark()
         self.kv_pool = runner.token_to_kv_pool
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
@@ -158,6 +159,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        # MiniMax-M3 DSpark supports uniform-width (static) target verify only.
+        # Keep the constant extend metadata alive for the whole graph-runner
+        # lifetime: full CUDA graphs capture tensor addresses, not the Python
+        # attributes rebound before replay.
+        self._static_dspark_verify_width_cg: int = 0
+        self._static_dspark_extend_lens_cg: Optional[torch.Tensor] = None
+        self._static_dspark_extend_start_loc_cg: Optional[torch.Tensor] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -336,6 +344,125 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "take minutes; compiles serialize across TP ranks)."
             )
 
+    def _is_static_dspark_target_verify(self, forward_batch: ForwardBatch) -> bool:
+        if self.is_npu or not self.is_dspark:
+            return False
+        if not forward_batch.forward_mode.is_target_verify():
+            return False
+        spec_info = getattr(forward_batch, "spec_info", None)
+        return (
+            spec_info is not None
+            and getattr(spec_info, "ragged_verify_layout", None) is None
+        )
+
+    def _ensure_static_dspark_verify_metadata(
+        self, forward_batch: ForwardBatch, *, in_capture: bool = False
+    ) -> None:
+        """Build uniform verify lengths for non-NPU MiniMax-M3 DSpark."""
+        if not self._is_static_dspark_target_verify(forward_batch):
+            return
+
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        extend_lens = getattr(forward_batch, "extend_seq_lens", None)
+        if (prefix_lens is None) != (extend_lens is None):
+            raise RuntimeError(
+                "MiniMax-M3 DSpark static verify requires both prefix and "
+                "extend lengths when either one is provided."
+            )
+        if prefix_lens is not None:
+            return
+
+        spec_info = forward_batch.spec_info
+        verify_width = int(
+            getattr(spec_info, "draft_token_num", 0)
+            or self.speculative_num_draft_tokens
+            or 0
+        )
+        if verify_width <= 0:
+            raise RuntimeError(
+                "MiniMax-M3 DSpark static verify requires a positive verify width."
+            )
+
+        batch_size = int(forward_batch.seq_lens.shape[0])
+        device = forward_batch.seq_lens.device
+        static_extend_lens = getattr(self, "_static_dspark_extend_lens_cg", None)
+        static_extend_start_loc = getattr(
+            self, "_static_dspark_extend_start_loc_cg", None
+        )
+        if static_extend_lens is not None and batch_size <= static_extend_lens.shape[0]:
+            assert static_extend_start_loc is not None
+            static_width = int(self._static_dspark_verify_width_cg)
+            if verify_width != static_width:
+                raise RuntimeError(
+                    "MiniMax-M3 DSpark CUDA Graph verify width changed after "
+                    f"capture: captured={static_width}, runtime={verify_width}."
+                )
+            # During capture and replay this is the graph runner's persistent
+            # seq_lens buffer. Aliasing it keeps the captured prefix pointer
+            # stable; the runner refreshes its contents with copy_ before replay.
+            prefix_lens = forward_batch.seq_lens
+            extend_lens = static_extend_lens[:batch_size]
+            extend_start_loc = static_extend_start_loc[:batch_size]
+        else:
+            # Eager-only startup (--disable-cuda-graph) has no graph state.
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_lens = torch.full(
+                (batch_size,), verify_width, dtype=torch.int32, device=device
+            )
+            extend_start_loc = (
+                torch.arange(batch_size, dtype=torch.int32, device=device)
+                * verify_width
+            )
+
+        forward_batch.extend_prefix_lens = prefix_lens
+        forward_batch.extend_seq_lens = extend_lens
+        forward_batch.extend_num_tokens = batch_size * verify_width
+        forward_batch.extend_start_loc = extend_start_loc
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            total_lens_cpu_raw = (
+                seq_lens_cpu.tolist()
+                if hasattr(seq_lens_cpu, "tolist")
+                else seq_lens_cpu
+            )
+            total_lens_cpu = [int(length) for length in total_lens_cpu_raw]
+            if len(total_lens_cpu) != batch_size:
+                raise RuntimeError(
+                    "MiniMax-M3 DSpark static verify received mismatched CPU "
+                    f"length metadata: batch_size={batch_size}, "
+                    f"num_cpu_lengths={len(total_lens_cpu)}."
+                )
+            if in_capture:
+                prefix_lens_cpu = total_lens_cpu
+            else:
+                num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+                num_real_requests = batch_size - num_padding
+                if num_real_requests < 0:
+                    raise RuntimeError(
+                        "MiniMax-M3 DSpark static verify received invalid CUDA "
+                        f"Graph padding: batch_size={batch_size}, "
+                        f"num_padding={num_padding}."
+                    )
+                if any(
+                    total_len < verify_width
+                    for total_len in total_lens_cpu[:num_real_requests]
+                ):
+                    raise RuntimeError(
+                        "MiniMax-M3 DSpark static verify received a total CPU "
+                        "sequence length smaller than the verify width."
+                    )
+                prefix_lens_cpu = [
+                    total_len - verify_width
+                    for total_len in total_lens_cpu[:num_real_requests]
+                ] + total_lens_cpu[num_real_requests:]
+            forward_batch.extend_prefix_lens_cpu = prefix_lens_cpu
+            forward_batch.extend_logprob_start_lens_cpu = prefix_lens_cpu
+        else:
+            forward_batch.extend_prefix_lens_cpu = None
+            forward_batch.extend_logprob_start_lens_cpu = None
+        forward_batch.extend_seq_lens_cpu = [verify_width] * batch_size
+
     @staticmethod
     def _choose_decode_score_max_chunks(batch_size: int) -> int:
         """Score chunk count per graph bucket.
@@ -370,6 +497,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
+        self._ensure_static_dspark_verify_metadata(forward_batch, in_capture=in_capture)
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
         # New forward -> drop the per-forward index-cache top-k (prefill only).
@@ -402,6 +530,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or self._is_static_dspark_target_verify(forward_batch)
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -540,7 +669,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        pass
+        if self.is_npu or not self.is_dspark:
+            return
+
+        verify_width = int(self.speculative_num_draft_tokens or 0)
+        if verify_width <= 0:
+            raise RuntimeError(
+                "MiniMax-M3 DSpark CUDA Graph requires a positive static verify width."
+            )
+        device = self.req_to_token.device
+        self._static_dspark_verify_width_cg = verify_width
+        self._static_dspark_extend_lens_cg = torch.full(
+            (max_bs,), verify_width, dtype=torch.int32, device=device
+        )
+        self._static_dspark_extend_start_loc_cg = (
+            torch.arange(max_bs, dtype=torch.int32, device=device) * verify_width
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1321,6 +1465,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
+        self._ensure_static_dspark_verify_metadata(forward_batch)
         # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
         if self.is_npu and forward_batch.extend_seq_lens is None:
@@ -1355,11 +1500,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
         if forward_batch.extend_prefix_lens is not None:
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            prefix_lens = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
+        if self._is_static_dspark_target_verify(forward_batch):
+            seq_lens = prefix_lens + forward_batch.extend_seq_lens.to(torch.int32)
+        else:
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
 
         # NPU cache write.
         if self.is_npu:
