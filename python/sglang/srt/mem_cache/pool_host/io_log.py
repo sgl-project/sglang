@@ -24,6 +24,10 @@ Fields worth reading first:
   the batch copy API does not translate.
 * ``jit`` / ``wb_jit`` -- which implementation served the transfer (JIT kernel vs
   the AOT ``sgl_kernel.kvcacheio`` path).
+
+The same fields also feed the crash snapshot (``SGLANG_DEBUG_CRASH_SNAPSHOT``),
+which writes the last transfers to the crash-dump folder when the scheduler
+handles a crash -- a log line can be rotated away, a crash artifact cannot.
 """
 
 from __future__ import annotations
@@ -32,10 +36,11 @@ import functools
 import inspect
 import logging
 import time
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 import torch
 
+from sglang.srt.debug_utils import crash_snapshot
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -93,8 +98,13 @@ def _host_base_ptr(pool: Any) -> Optional[str]:
     return None
 
 
-def describe_transfer(pool: Any, func_name: str, bound: Any, elapsed_ms: float) -> str:
-    """One CPU-only summary line for a single host-pool transfer."""
+def transfer_fields(
+    pool: Any, func_name: str, bound: Any, elapsed_ms: float
+) -> Dict[str, Any]:
+    """Ordered CPU-only fields for one host-pool transfer.
+
+    Single source of truth for both sinks: the log line and the crash snapshot.
+    """
     page_size = getattr(pool, "page_size", None)
     layer_num = getattr(pool, "layer_num", None)
     stride = getattr(pool, "token_stride_size", None)
@@ -103,47 +113,109 @@ def describe_transfer(pool: Any, func_name: str, bound: Any, elapsed_ms: float) 
         # Same quantity the JIT kernels pass as `first_page_bytes`.
         per_page_bytes = page_size * layer_num * stride
 
-    fields = [
-        func_name,
-        f"direction={_direction_of(func_name)}",
-        f"layout={getattr(pool, 'layout', None)}",
-        f"page_size={page_size}",
-        f"per_page_bytes={per_page_bytes}",
-        f"batch_threshold={per_page_bytes is not None and per_page_bytes >= BATCH_COPY_THRESHOLD_BYTES}",
-        f"host_alloc={_alloc_func_name(pool)}",
-        f"host_base={_host_base_ptr(pool)}",
-        f"jit={getattr(pool, 'can_use_jit', None)}",
-        f"wb_jit={getattr(pool, 'can_use_write_back_jit', None)}",
-    ]
-
-    indices = []
+    indices = {}
     for name, value in sorted(bound.arguments.items()):
         brief = _tensor_brief(value)
         if brief is not None:
-            indices.append(f"{name}={brief}")
-    fields.append("indices[" + ",".join(indices) + "]")
+            indices[name] = brief
 
+    fields: Dict[str, Any] = {
+        "op": func_name,
+        "direction": _direction_of(func_name),
+        "layout": getattr(pool, "layout", None),
+        "page_size": page_size,
+        "per_page_bytes": per_page_bytes,
+        "batch_threshold": per_page_bytes is not None
+        and per_page_bytes >= BATCH_COPY_THRESHOLD_BYTES,
+        "host_alloc": _alloc_func_name(pool),
+        "host_base": _host_base_ptr(pool),
+        "jit": getattr(pool, "can_use_jit", None),
+        "wb_jit": getattr(pool, "can_use_write_back_jit", None),
+        "indices": indices,
+        "elapsed_ms": round(elapsed_ms, 3),
+    }
     for name in ("layer_id", "io_backend", "is_draft"):
         if name in bound.arguments:
-            fields.append(f"{name}={bound.arguments[name]}")
+            fields[name] = bound.arguments[name]
+    return fields
 
-    fields.append(f"elapsed_ms={elapsed_ms:.3f}")
-    return "[host_pool_io] " + " ".join(fields)
+
+# Log-line field order; the snapshot keeps the same keys in the same order.
+_FIELD_ORDER = (
+    "direction",
+    "layout",
+    "page_size",
+    "per_page_bytes",
+    "batch_threshold",
+    "host_alloc",
+    "host_base",
+    "jit",
+    "wb_jit",
+)
+_OPTIONAL_FIELD_ORDER = ("layer_id", "io_backend", "is_draft")
+
+
+def render_transfer(fields: Dict[str, Any]) -> str:
+    """Render `transfer_fields` output as one log line."""
+    parts = [fields["op"]]
+    parts += [f"{key}={fields[key]}" for key in _FIELD_ORDER]
+    parts.append(
+        "indices["
+        + ",".join(f"{key}={value}" for key, value in sorted(fields["indices"].items()))
+        + "]"
+    )
+    parts += [f"{key}={fields[key]}" for key in _OPTIONAL_FIELD_ORDER if key in fields]
+    parts.append(f"elapsed_ms={fields['elapsed_ms']:.3f}")
+    return "[host_pool_io] " + " ".join(parts)
+
+
+def describe_transfer(pool: Any, func_name: str, bound: Any, elapsed_ms: float) -> str:
+    """One CPU-only summary line for a single host-pool transfer."""
+    return render_transfer(transfer_fields(pool, func_name, bound, elapsed_ms))
+
+
+def _emit(
+    pool: Any,
+    func_name: str,
+    bound: Any,
+    start: float,
+    *,
+    raised: bool,
+    log_enabled: bool,
+    snapshot_enabled: bool,
+) -> None:
+    fields = transfer_fields(
+        pool, func_name, bound, (time.perf_counter() - start) * 1e3
+    )
+    if log_enabled:
+        if raised:
+            logger.error("%s raised", render_transfer(fields))
+        else:
+            logger.info("%s", render_transfer(fields))
+    if snapshot_enabled:
+        # Recorded before the failure is known too: a synchronous failure and a
+        # later asynchronous one are attributed from the same ring.
+        crash_snapshot.record("host_pool_io", fields)
 
 
 def log_host_pool_io(func: _F) -> _F:
-    """Log one metadata-only line per call of a host-pool transfer method.
+    """Log and/or record one host-pool transfer per call.
 
-    A returning call logs at INFO -- an asynchronous fault is *not* reported here,
-    because the call did return; the fault surfaces later, which is exactly the
-    problem this log exists to work around. A raising call is logged at ERROR
-    before the exception is propagated.
+    A returning call logs at INFO -- an asynchronous fault is *not* reported
+    here, because the call did return; the fault surfaces later, which is exactly
+    the problem this hook exists to work around. A raising call is logged at
+    ERROR before the exception is propagated.
+
+    The crash snapshot (`SGLANG_DEBUG_CRASH_SNAPSHOT`) consumes the same fields,
+    so the two diagnostics report identical metadata and can run independently.
     """
     signature = inspect.signature(func)
 
     @functools.wraps(func)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if not host_pool_io_log_enabled():
+        log_enabled = host_pool_io_log_enabled()
+        snapshot_enabled = crash_snapshot.is_enabled()
+        if not (log_enabled or snapshot_enabled):
             return func(self, *args, **kwargs)
 
         try:
@@ -157,20 +229,26 @@ def log_host_pool_io(func: _F) -> _F:
             result = func(self, *args, **kwargs)
         except BaseException:
             if bound is not None:
-                logger.error(
-                    "%s raised",
-                    describe_transfer(
-                        self, func.__name__, bound, (time.perf_counter() - start) * 1e3
-                    ),
+                _emit(
+                    self,
+                    func.__name__,
+                    bound,
+                    start,
+                    raised=True,
+                    log_enabled=log_enabled,
+                    snapshot_enabled=snapshot_enabled,
                 )
             raise
 
         if bound is not None:
-            logger.info(
-                "%s",
-                describe_transfer(
-                    self, func.__name__, bound, (time.perf_counter() - start) * 1e3
-                ),
+            _emit(
+                self,
+                func.__name__,
+                bound,
+                start,
+                raised=False,
+                log_enabled=log_enabled,
+                snapshot_enabled=snapshot_enabled,
             )
         return result
 
