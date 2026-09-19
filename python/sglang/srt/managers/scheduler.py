@@ -619,6 +619,7 @@ class Scheduler(
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
+        self.storage_contributor = result.storage_contributor
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller

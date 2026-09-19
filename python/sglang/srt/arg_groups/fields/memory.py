@@ -216,6 +216,17 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    mooncake_store_contributor: A[
+        bool,
+        Arg(
+            help=(
+                "Decode only: register this rank's host memory as passive "
+                "capacity in the Mooncake store the prefill ranks write to. "
+                "The rank mounts a segment but attaches no cache pool, so no "
+                "KV is read or written through it."
+            ),
+        ),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention

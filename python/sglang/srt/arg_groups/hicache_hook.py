@@ -23,6 +23,20 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.mooncake_store_contributor:
+        if cfg.disaggregation_mode != "decode":
+            raise ValueError(
+                "--mooncake-store-contributor only applies to decode ranks; a "
+                "prefill or aggregated rank reaches the store through its own "
+                "cache path."
+            )
+        if cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--mooncake-store-contributor and "
+                "--enable-unified-cache-external-linker both mount a segment "
+                "on this rank. Keep the linker to also read and write the "
+                "store, or keep the contributor to only lend capacity."
+            )
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
