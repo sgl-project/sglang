@@ -558,6 +558,16 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
+    if not tensor.is_cuda:
+        return tensor.to("cpu", non_blocking=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return host
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
