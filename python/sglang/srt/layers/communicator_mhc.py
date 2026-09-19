@@ -18,7 +18,6 @@ from typing import Callable, Optional
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.communication_op import (
     attention_tensor_model_parallel_all_reduce,
 )
@@ -50,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
@@ -58,7 +58,7 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
     )
     total_tokens = forward_batch.input_ids.shape[0]
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-    get_tp_group().all_gather_into_tensor(output, hidden_states)
+    get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
 
     return output
 
@@ -199,7 +199,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
             return hidden_states, hidden_states
 
         scatter_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
-        get_tp_group().reduce_scatter_tensor(scatter_states, hidden_states)
+        get_parallel().tp_group.reduce_scatter_tensor(scatter_states, hidden_states)
 
         scatter_states, residual = mhc.attn_to_mlp(
             scatter_states, residual, out_norm=layernorm
@@ -238,7 +238,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
         if context.attn_dp_size != 1:
             if hidden_states.shape[0] != 0:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = mhc.attn_to_mlp(
@@ -248,7 +248,7 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                 hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -305,7 +305,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             hidden_states = local_states.new_empty(
                 local_states.shape[0] * context.tp_size, *local_states.shape[1:]
             )
-            get_tp_group().all_gather_into_tensor(hidden_states, local_states)
+            get_parallel().tp_group.all_gather_into_tensor(hidden_states, local_states)
 
         return hidden_states, None
 
@@ -322,13 +322,13 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         **kwargs,
     ):
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer_mhc(get_tp_group(), 1),
+            get_local_dp_buffer_mhc(get_parallel().tp_group, 1),
             hidden_states,
         )
         # MoE skips its post-expert all-reduce with reduce_scatterv, so this
         # scatter must reduce while combining local-expert partial sums.
         if should_use_dp_reduce_scatterv():
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
@@ -362,7 +362,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
         hidden_states, local_hidden_states = (
             get_local_dp_buffer_mhc(
-                get_tp_group(), 1 if is_last_layer else mhc.hc_mult
+                get_parallel().tp_group, 1 if is_last_layer else mhc.hc_mult
             ),
             hidden_states,
         )

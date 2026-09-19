@@ -61,14 +61,16 @@ _SRT = _pathlib.Path(next(iter(_sglang.__path__))).resolve() / "srt"
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
 
-# Ranks and the world size read the live group: they are not implied by
-# anything, so there is nothing to derive them from. The quotients used to be
-# in this table and are not any more -- `attn_tp_size` and its siblings are
-# functions of the configured leaves, and `TestDerivedWidthsComeFromTheLeaves`
-# is what pins them.
+# Ranks and the launch width are asked of the group: they are not implied by
+# anything, so there is nothing to derive them from. The quotients are not
+# here -- `attn_tp_size` and its siblings are functions of the configured
+# leaves, and `TestDerivedWidths` pins them. `attn_dp_rank` is not here either: no group coordinator
+# knows it, so it is stamped when the attention topology is initialized and
+# `TestStampedRanks` is what pins it. The other world width is not here
+# because the group does not know it; `TestTheTwoWorldWidths` pins it.
 SIZE_RANK_DELEGATIONS = [
-    ("world_size", f"{_PS}.get_world_size"),
-    ("world_rank", f"{_PS}.get_world_rank"),
+    ("launch_world_size", f"{_PS}.get_world_size"),
+    ("launch_world_rank", f"{_PS}.get_world_rank"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
     ("dcp_rank", f"{_PS}.get_dcp_rank"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
@@ -77,7 +79,6 @@ SIZE_RANK_DELEGATIONS = [
     ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
     ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
     ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
-    ("attn_dp_rank", f"{_DP}.get_attention_dp_rank"),
 ]
 
 GROUP_DELEGATIONS = [
@@ -148,6 +149,294 @@ class TestParallelDelegation(_IsolatedOverrides):
         self.assertTrue(hasattr(ParallelContext, "tp_group"))
         # local_attn_dp is intentionally not part of the wrapper surface.
         self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
+
+
+class TestTheTwoWorldWidths(_IsolatedOverrides):
+    """Two questions about the WORLD group: what it was built at, and what it
+    has room for.
+
+    Neither is stored here. How much of that room is serving after a scale-up
+    is elastic-EP state, and is asked of the manager that owns it rather than
+    mirrored onto this namespace.
+    """
+
+    def test_the_launch_width_is_what_the_group_was_built_at(self):
+        with patch(f"{_PS}.get_world_size", return_value=4):
+            self.assertEqual(get_parallel().launch_world_size, 4)
+
+    def test_the_ceiling_is_the_configured_one_when_there_is_one(self):
+        parallel = get_parallel()
+        with (
+            parallel.override(max_ep_size=32),
+            patch(
+                f"{_PS}.get_world_size",
+                side_effect=AssertionError("the built group must not be asked"),
+            ),
+        ):
+            self.assertEqual(parallel.max_world_size, 32)
+
+    def test_without_a_configured_ceiling_the_room_is_the_launch_width(self):
+        parallel = get_parallel()
+        with (
+            parallel.override(max_ep_size=None),
+            patch(f"{_PS}.get_world_size", return_value=8),
+        ):
+            self.assertEqual(parallel.max_world_size, 8)
+
+    def test_each_width_can_be_stated_on_its_own(self):
+        """Stating one must not answer for the other: they are two names."""
+        parallel = get_parallel()
+        with (
+            parallel.override(launch_world_size=2, max_ep_size=None),
+            patch(
+                f"{_PS}.get_world_size",
+                side_effect=AssertionError("the built group must not be asked"),
+            ),
+        ):
+            self.assertEqual(parallel.launch_world_size, 2)
+            self.assertEqual(parallel.max_world_size, 2)
+            with parallel.override(max_ep_size=6):
+                self.assertEqual(parallel.max_world_size, 6)
+                self.assertEqual(parallel.launch_world_size, 2)
+
+
+class TestStampedRanks(_IsolatedOverrides):
+    """`attn_dp_rank` comes from the stamp, and says so when there is none.
+
+    It is the one rank no group answers with: `initialize_dp_attention`
+    computes it from this process's `tp_rank`, and an elastic scale-up
+    replaces it with a rank in the expanded WORLD. Falling back to anything
+    would be inventing a placement for this process.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_derived = dict(parallel._stamp)
+        parallel.clear_stamp()
+        self.addCleanup(
+            lambda: (
+                parallel.clear_stamp(),
+                parallel.override_permanently(**self._saved_derived),
+            )
+        )
+
+    def test_the_stamp_is_the_answer(self):
+        parallel = get_parallel()
+        parallel.override_permanently(attn_dp_rank=3)
+        self.assertEqual(parallel.attn_dp_rank, 3)
+        # An elastic scale-up restamps it; the newest stamp wins.
+        parallel.override_permanently(attn_dp_rank=9)
+        self.assertEqual(parallel.attn_dp_rank, 9)
+
+    def test_a_scope_still_wins_over_the_stamp(self):
+        parallel = get_parallel()
+        parallel.override_permanently(attn_dp_rank=3)
+        with parallel.override(attn_dp_rank=0):
+            self.assertEqual(parallel.attn_dp_rank, 0)
+        self.assertEqual(parallel.attn_dp_rank, 3)
+
+    def test_unstamped_names_the_cause(self):
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_dp_rank
+        self.assertIn("initialize_dp_attention", str(caught.exception))
+
+    def test_a_stated_width_reaches_the_padding_mode(self):
+        """The reason this PR exists, from a reader's side.
+
+        `get_dp_padding_mode` reads the attention-DP width. Before the width
+        had one home, a scoped `override` moved the context and left the
+        module global answering, so stating a topology moved only half the
+        runtime: this asserted `SUM_LEN` with the width stated as 1.
+        """
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        with get_parallel().override(attn_dp_size=1):
+            mode = DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True, global_num_tokens=[3, 5]
+            )
+        self.assertIs(mode, DpPaddingMode.MAX_LEN)
+
+        # And the branch it would have taken with the target's width.
+        with get_parallel().override(attn_dp_size=2):
+            mode = DpPaddingMode.get_dp_padding_mode(
+                is_extend_in_batch=True, global_num_tokens=[3, 5]
+            )
+        self.assertIs(mode, DpPaddingMode.SUM_LEN)
+
+    def test_a_scale_up_stamps_the_width_and_the_rank_together(self):
+        """The two describe one topology; a reader that saw only one moved
+        would place this process in a group it is not in."""
+        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+        # It also flips a process-wide gather flag; put it back, or every
+        # later test in this process runs as if a scale-up had happened.
+        dp_flags = get_flags().dp
+        saved_gather = dp_flags.use_world_group_for_gather
+        self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
+
+        parallel = get_parallel()
+        update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
+        self.assertEqual(parallel.attn_dp_size, 16)
+        self.assertEqual(parallel.attn_dp_rank, 11)
+
+
+class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
+    """The overridable set is read from the declarations, not maintained by hand.
+
+    A hand-kept list can hold a name the class does not answer, or miss one it
+    does; either way `override()` refuses or accepts the wrong thing with
+    nothing to say so. The three tests below check the set against the
+    declarations from both sides.
+    """
+
+    def test_every_declared_name_can_be_stated_and_reads_back(self):
+        from sglang.srt.runtime_context import _parallel_fields
+
+        names = sorted(_parallel_fields())
+        # Sizes, ranks, groups and the configured leaves of the namespace.
+        self.assertGreater(len(names), 30)
+        parallel = get_parallel()
+        for name in names:
+            sentinel = object()
+            with parallel.override(**{name: sentinel}):
+                self.assertIs(getattr(parallel, name), sentinel, msg=name)
+
+    def test_every_name_the_class_answers_for_is_in_the_set(self):
+        """Cross-check from the other side: the class's own surface.
+
+        Derived from the class rather than from the same declarations the set
+        is built from, so a source dropped out of `_parallel_fields` shows up
+        here instead of agreeing with itself.
+        """
+        from sglang.srt.runtime_context import _parallel_fields
+
+        answered = {
+            name
+            for name, value in vars(ParallelContext).items()
+            if isinstance(value, property)
+        }
+        self.assertTrue(answered)
+        self.assertEqual(answered - _parallel_fields(), set())
+
+    def test_a_live_name_is_never_also_answered_from_the_bag(self):
+        """The two answer differently, so a name in both would make the read
+        order -- not the declaration -- decide which one a caller gets.
+
+        The bag carries the declared quotients as well as the operator's
+        leaves, and both are ahead of the live getter once a configuration is
+        published: a name in `_LIVE_READS` and in either of them would answer
+        from the getter before publish and from the bag after."""
+        from sglang.srt.runtime_context import (
+            _LIVE_READS,
+            _derived_widths,
+            _parallel_config_leaves,
+        )
+
+        self.assertEqual(set(_LIVE_READS) & _parallel_config_leaves(), set())
+        self.assertEqual(set(_LIVE_READS) & set(_derived_widths()), set())
+
+    def test_an_undeclared_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            with get_parallel().override(not_a_parallel_name=1):
+                pass
+
+
+class TestReadsWithoutAPublishedConfig(_IsolatedOverrides):
+    """The namespace has to answer in a process that publishes nothing.
+
+    `multimodal_gen` lends its own TP group to shared `srt` layers from a
+    process with no `srt` config to publish against, and those layers ask for
+    `attn_tp_size` anyway -- through code `multimodal_gen` does not own, which
+    is why grepping that package for `get_parallel()` finds nothing while the
+    read plainly happens.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_stamp(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_a_stamped_width_reads_with_nothing_published(self):
+        parallel = get_parallel()
+        self.assertIsNone(parallel._config)
+        parallel.override_permanently(
+            **derive_parallel_widths(
+                tp_size=2,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            )
+        )
+        self.assertEqual(parallel.attn_tp_size, 2)
+        self.assertEqual(parallel.moe_tp_size, 2)
+
+    def test_an_unstamped_width_still_names_the_cause(self):
+        """Without a stamp there is nothing to answer with, and the failure
+        has to say so rather than invent a width."""
+        with self.assertRaisesRegex(RuntimeError, r"not available"):
+            get_parallel().attn_tp_size
+
+
+class TestPrivateAttributeProbing(_IsolatedOverrides):
+    def test_probing_a_private_name_does_not_recurse(self):
+        """`copy` and `pickle` probe for hooks before `__init__` has run.
+
+        `__getattr__` reaches for `self._config`, so if it did not refuse
+        underscore names outright, probing one on a half-built instance would
+        recurse until the stack ran out.
+        """
+        fresh = ParallelContext.__new__(ParallelContext)  # slots unset
+        for probe in ("_config", "_stamp", "_overrides", "__deepcopy__"):
+            with self.assertRaises(AttributeError, msg=probe):
+                getattr(fresh, probe)
+
+    def test_a_built_context_survives_a_copy(self):
+        import copy
+
+        self.assertIsInstance(copy.copy(get_parallel()), ParallelContext)
+
+
+class TestAWidthReadStaysTraceable(_IsolatedOverrides):
+    """A width read inside compiled model code must stay inside the graph.
+
+    Shared layers read widths inside a compiled forward. A graph break there
+    is a performance regression and nothing else -- every suite stays green
+    through it -- so `fullgraph=True` is what turns it into a failure. This
+    pins the read path, whichever form it takes: the sibling leaf test
+    compiles names served by `__getattr__` and they trace too.
+    """
+
+    def test_a_width_read_compiles_into_the_graph(self):
+        import torch
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
+            ),
+            role="test",
+        )
+
+        def read(x):
+            return x * get_parallel().attn_tp_size
+
+        # backend="eager": this pins tracing, not code generation, and stays
+        # runnable on a box with no inductor toolchain.
+        compiled = torch.compile(read, fullgraph=True, backend="eager")
+        self.assertEqual(compiled(torch.ones(3)).tolist(), [4.0, 4.0, 4.0])
 
 
 class TestParallelOverride(_IsolatedOverrides):
@@ -1430,11 +1719,11 @@ class TestDerivedWidths(_IsolatedOverrides):
     def setUp(self):
         super().setUp()
         parallel = get_parallel()
-        self._saved_derived = dict(parallel._derived)
-        parallel.clear_derived_widths()
+        self._saved_derived = dict(parallel._stamp)
+        parallel.clear_stamp()
         self.addCleanup(
             lambda: (
-                parallel.clear_derived_widths(),
+                parallel.clear_stamp(),
                 parallel.override_permanently(**self._saved_derived),
             )
         )
@@ -1485,14 +1774,15 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.assertIn("not available", str(caught.exception))
 
     def test_a_permanent_override_and_a_live_group_both_win_over_the_leaves(self):
-        """Order is permanent override, then live group, then the leaves.
-        Where a group exists it is the truth -- elastic scale-up moves the
-        group without a fresh override -- so the leaf derivation only
-        answers where there is none.
+        """Order is scoped override, then the stamp, then the published leaf.
+
+        No group is consulted for a width -- `test_the_group_is_never_consulted`
+        in this class asserts that -- so a stamp is what an elastic scale-up
+        leaves behind, and the leaf answers only where there is none.
         """
         parallel = get_parallel()
         parallel.override_permanently(attn_tp_size=7)
-        self.addCleanup(parallel.clear_derived_widths)
+        self.addCleanup(parallel.clear_stamp)
         with parallel.override(tp_size=8, attn_dp_size=2):
             self.assertEqual(parallel.attn_tp_size, 7)
 
@@ -1510,12 +1800,12 @@ class TestDerivedWidths(_IsolatedOverrides):
         self.assertEqual(widths["moe_tp_size"], 8 // 4 // 2)
         self.assertEqual(widths["attn_dcp_size"], 1)
 
-    def test_the_world_size_is_not_permanently_overridden(self):
-        """It is not a quotient, and the live getter is right at every moment.
-        A value fixed when the groups are built would answer with the launch
-        count after `try_admit_scale_ranks` expands WORLD, and with the joining
-        cohort's own width on a scale-joiner, which lays its groups out at
-        `tp * pp` while WORLD spans `ep_join_rank_offset + tp * pp`."""
+    def test_no_world_width_is_a_quotient_of_the_leaves(self):
+        """Deriving one would answer with the joining cohort's own width on a
+        scale joiner, which lays its groups out at `tp * pp` while WORLD spans
+        `ep_join_rank_offset + tp * pp`. The launch width comes off the group
+        that was actually built; the ceiling is not this function's to give
+        either, and `TestTheTwoWorldWidths` says where each comes from."""
         widths = derive_parallel_widths(
             tp_size=4,
             attn_cp_size=1,
@@ -1525,11 +1815,27 @@ class TestDerivedWidths(_IsolatedOverrides):
             dcp_size=1,
             dcp_enabled=False,
         )
-        self.assertNotIn("world_size", widths)
+        self.assertEqual(
+            {name for name in widths if "world" in name},
+            set(),
+        )
         parallel = get_parallel()
         parallel.override_permanently(attn_tp_size=4)
         with patch(f"{_PS}.get_world_size", return_value=9):
-            self.assertEqual(parallel.world_size, 9)
+            self.assertEqual(parallel.launch_world_size, 9)
+
+    def test_the_bare_name_is_gone(self):
+        """It answered two questions, so every reader had to remember which.
+
+        Both spellings fail: reading it, and stating it -- the overridable set
+        is derived from the same declarations the read path is, so a name that
+        cannot be read cannot be stated either.
+        """
+        with self.assertRaisesRegex(AttributeError, r"has no 'world_size'"):
+            get_parallel().world_size
+        with self.assertRaisesRegex(ValueError, r"unknown parallel field"):
+            with get_parallel().override(world_size=4):
+                pass
 
     def test_a_permanently_overridden_width_is_what_the_reader_answers_with(self):
         parallel = get_parallel()
@@ -1573,22 +1879,6 @@ class TestDerivedWidths(_IsolatedOverrides):
             with self.assertRaisesRegex(RuntimeError, r"derived parallel width"):
                 get_parallel().attn_tp_size
 
-    def test_a_temporary_disable_beats_the_permanent_override(self):
-        """`disable_dp_size()` runs a draft scope without DP attention. It moves
-        the module global the legacy getter reads, so it has to move the derived
-        width too -- the scoped override wins over the permanent one, and a
-        scope that left it alone would answer with the target model's width
-        for its duration."""
-        from sglang.srt.layers import dp_attention
-
-        parallel = get_parallel()
-        parallel.override_permanently(attn_dp_size=4)
-        with patch.object(dp_attention, "_ATTN_DP_SIZE", 4):
-            with dp_attention.disable_dp_size():
-                self.assertEqual(dp_attention.get_attention_dp_size(), 1)
-                self.assertEqual(parallel.attn_dp_size, 1)
-            self.assertEqual(parallel.attn_dp_size, 4)
-
     def test_the_permanent_override_is_cleared_and_reset(self):
         parallel = get_parallel()
         parallel.override_permanently(attn_dp_size=2)
@@ -1596,14 +1886,14 @@ class TestDerivedWidths(_IsolatedOverrides):
         # Elastic scaling overrides again where it updates the live width.
         parallel.override_permanently(attn_dp_size=4)
         self.assertEqual(parallel.attn_dp_size, 4)
-        parallel.clear_derived_widths()
+        parallel.clear_stamp()
         with parallel.override(tp_size=8, attn_dp_size=1):
             self.assertEqual(parallel.attn_dp_size, 1)
 
     def test_reset_context_drops_the_permanent_override(self):
         """The permanent override belongs to the lifecycle that made it.
 
-        `_derived_width` prefers it over the published leaf, so one that
+        `_read` prefers it over the published leaf, so one that
         outlived `reset_context()` would let the next test read the previous
         topology.
         """
@@ -1639,8 +1929,7 @@ class TestDerivedWidths(_IsolatedOverrides):
     def test_recomputing_from_published_leaves_matches_the_publish_bag(self):
         """`initialize_model_parallel` no longer overrides anything -- see
         `test_initialize_model_parallel_no_longer_touches_the_bag` below --
-        which makes this the load-bearing half of 16-field-registry-design.md
-        §6e: every real caller must forward leaves that already match its own
+        so every real caller must forward leaves that already match its own
         published config, because nothing corrects a mismatch anymore.
         `scheduler.py`'s `ps.attn_dp_size`/`ps.moe_ep_size`/etc, and the
         weight-cache daemon's own already-published config, both do -- this
@@ -1696,7 +1985,7 @@ class TestDerivedWidths(_IsolatedOverrides):
                 self.assertEqual(published, recomputed)
 
     def test_initialize_model_parallel_no_longer_touches_the_bag(self):
-        """§6e, landed: `initialize_model_parallel` used to recompute and
+        """`initialize_model_parallel` used to recompute and
         permanently override the six derived widths on `get_parallel()`
         after building its groups; that call is gone. Publish a placeholder
         config (tp_size defaults to 1), then build real groups at a
