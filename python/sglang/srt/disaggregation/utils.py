@@ -565,9 +565,17 @@ class MetadataBuffers:
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        room = req.bootstrap_room if req.bootstrap_room is not None else 0
+        if self.bootstrap_room.dtype == torch.uint64:
+            # PyTorch's scalar setter first converts Python integers to int64,
+            # even for uint64 destinations. Store the same bits through a view
+            # to avoid crashing the scheduler for a valid high-bit room ID.
+            signed_room = room if room < (1 << 63) else room - (1 << 64)
+            self.bootstrap_room.view(torch.int64)[req.metadata_buffer_index, 0] = (
+                signed_room
+            )
+        else:
+            self.bootstrap_room[req.metadata_buffer_index, 0] = room
 
 
 #########################

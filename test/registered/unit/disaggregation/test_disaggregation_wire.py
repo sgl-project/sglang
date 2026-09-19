@@ -588,6 +588,20 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_bootstrap_room_preserves_full_uint64_range(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
+        )
+        req = self._make_req(None)
+        for room in (None, 0, (1 << 63) - 1, 1 << 63, (1 << 64) - 1):
+            with self.subTest(room=room):
+                req.bootstrap_room = room
+                buffers.set_buf(req)
+                self.assertEqual(buffers.bootstrap_room[0, 0].item(), room or 0)
+
     def test_sampling_mask_metadata_is_opt_in(self):
         """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
         schemas = []
