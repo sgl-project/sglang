@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_index_translator import KVReadTables
+from sglang.srt.mem_cache.layout.page_major import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1248,20 +1249,27 @@ class FlashAttentionBackend(AttentionBackend):
         head_group_num: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        return (
-            key_cache.view(
+        key_cache = paged_kv_view(
+            key_cache, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        value_cache = paged_kv_view(
+            value_cache, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        if head_group_num != 1:
+            # Reinterpret each page's heads as `head_group_num` pseudo-pages.
+            key_cache = key_cache.view(
                 -1,
                 self.page_size,
                 layer.tp_k_head_num // head_group_num,
                 layer.head_dim,
-            ),
-            value_cache.view(
+            )
+            value_cache = value_cache.view(
                 -1,
                 self.page_size,
                 layer.tp_v_head_num // head_group_num,
                 layer.v_head_dim,
-            ),
-        )
+            )
+        return key_cache, value_cache
 
     def prepare_paged_mha_query(
         self,
@@ -1631,9 +1639,12 @@ class FlashAttentionBackend(AttentionBackend):
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     # The suffix table stores physical token slots, so expose
                     # the paged cache as page-size-one blocks.
-                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
-                    v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                    k_cache=paged_view(
+                        key_cache.view(-1, layer.tp_k_head_num, layer.head_dim), 1
+                    ),
+                    v_cache=paged_view(
+                        value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        1,
                     ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
@@ -1733,15 +1744,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = k_rope.view(
-                    -1,
-                    self.page_size,
-                    layer.tp_k_head_num,
-                    layer.head_dim - layer.v_head_dim,
-                )
-                c_kv_cache = c_kv.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                )
+                k_rope_cache = paged_view(k_rope, self.page_size)
+                c_kv_cache = paged_view(c_kv, self.page_size)
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                     q_rope = q_rope.view(
@@ -2129,15 +2133,8 @@ class FlashAttentionBackend(AttentionBackend):
             kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
-            k_rope_cache = k_rope.view(
-                -1,
-                self.page_size,
-                layer.tp_k_head_num,
-                layer.head_dim - layer.v_head_dim,
-            )
-            c_kv_cache = c_kv.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-            )
+            k_rope_cache = paged_view(k_rope, self.page_size)
+            c_kv_cache = paged_view(c_kv, self.page_size)
 
             if q_rope is not None:
                 q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
