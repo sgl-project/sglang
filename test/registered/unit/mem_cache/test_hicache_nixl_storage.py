@@ -15,6 +15,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
@@ -686,6 +687,114 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(get_results[PoolName.SWA], [True])
         self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
         self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
+
+    def test_batch_set_v2_chunks_oversized_bounce_transfer(self):
+        """An oversized non-zero-copy transfer must be chunked, not dropped.
+
+        The pre-registered bounce buffer holds only STORAGE_BATCH_SIZE slots, so
+        a hybrid-pool transfer larger than that was previously rejected wholesale
+        by _prepare_pool_transfer and reported all-False for every page. The fix
+        splits it into STORAGE_BATCH_SIZE-key sub-transfers so each fits the
+        bounce buffer.
+        """
+        n = STORAGE_BATCH_SIZE * 2 + 44
+        pool = MockHybridPool(num_pages=n, expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        chunk_sizes = []
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            chunk_sizes.append(len(key_strs))
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        keys = [f"p{i}" for i in range(n)]
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=keys,
+                    host_indices=torch.arange(n, dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.MAMBA], [True] * n)
+        self.assertEqual(
+            chunk_sizes,
+            [STORAGE_BATCH_SIZE, STORAGE_BATCH_SIZE, n - 2 * STORAGE_BATCH_SIZE],
+        )
+
+    def test_batch_get_v2_stops_after_first_failed_chunk(self):
+        """A failed chunk must truncate the result to a contiguous prefix.
+
+        Pages form a radix-cache prefix, so once a chunk fails no later page can
+        be a valid hit. The v2 loop must stop issuing transfers after the first
+        failed chunk and pad the result so a True never follows a False.
+        """
+        n = STORAGE_BATCH_SIZE * 2 + 44
+        pool = MockHybridPool(num_pages=n, expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        call_count = {"count": 0}
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            call_count["count"] += 1
+            # Chunk 1 succeeds, chunk 2 fails, chunk 3 would succeed if the loop
+            # kept going -- that must not happen.
+            return [call_count["count"] != 2] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        keys = [f"p{i}" for i in range(n)]
+        results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=keys,
+                    host_indices=torch.arange(n, dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(call_count["count"], 2)
+        self.assertEqual(
+            results[PoolName.MAMBA],
+            [True] * STORAGE_BATCH_SIZE + [False] * (n - STORAGE_BATCH_SIZE),
+        )
+
+    def test_batch_set_v2_rejects_malformed_transfer_atomically(self):
+        """A transfer whose host_indices don't match len(keys)*page_size must be
+        rejected as a whole before any partial I/O is issued.
+
+        Chunking must not slice a malformed host_indices into "valid-looking"
+        sub-chunks that get transferred against the wrong pages.
+        """
+        n = STORAGE_BATCH_SIZE * 2 + 44
+        page_size = 2
+        pool = MockHybridPool(num_pages=n, page_size=page_size, expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        calls = []
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            calls.append(len(key_strs))
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        keys = [f"p{i}" for i in range(n)]
+        # Correct length is n * page_size == 600; pass only n == 300.
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=keys,
+                    host_indices=torch.arange(n, dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(results[PoolName.MAMBA], [False] * n)
 
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
