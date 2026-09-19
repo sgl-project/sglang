@@ -12,12 +12,14 @@ export const MiniMaxM25Deployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'a3', label: 'Ascend A3', default: false }
       ]
     },
     gpuCount: {
       name: 'gpuCount',
       title: 'GPU Count',
+      condition: (values) => values.hardware !== 'a3',
       getDynamicItems: (values) => {
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
         return [
@@ -45,6 +47,7 @@ export const MiniMaxM25Deployment = () => {
     thinking: {
       name: 'thinking',
       title: 'Thinking Capabilities',
+      condition: (values) => values.hardware !== 'a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -54,16 +57,120 @@ export const MiniMaxM25Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
+      condition: (values) => values.hardware !== 'a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
       ],
       commandRule: (value) => value === 'enabled' ? '--tool-call-parser minimax-m2' : null
+    },
+    ascendPreset: {
+      name: 'ascendPreset',
+      title: 'A3 Configuration',
+      condition: (values) => values.hardware === 'a3',
+      items: [
+        {
+          id: '8p-in3k5-out1k5',
+          label: '1 node / 8 cards / 16 dies',
+          subtitle: 'PD co-located · W8A8 + EAGLE3 · 3.5k input / 1.5k output',
+          default: true
+        }
+      ]
+    },
+    modelPath: {
+      name: 'modelPath',
+      title: 'W8A8 Model Directory',
+      type: 'text',
+      default: '/models/MiniMax-M2.5-w8a8-QuaRot',
+      condition: (values) => values.hardware === 'a3'
+    },
+    draftModelPath: {
+      name: 'draftModelPath',
+      title: 'EAGLE3 Directory',
+      type: 'text',
+      default: '/models/MiniMax-M2.5-eagel-model-0318',
+      condition: (values) => values.hardware === 'a3'
+    },
+    networkInterface: {
+      name: 'networkInterface',
+      title: 'HCCL / Gloo Interface',
+      type: 'text',
+      default: 'lo',
+      condition: (values) => values.hardware === 'a3'
     }
   };
 
   const generateCommand = (values) => {
     const { hardware, gpuCount, thinking, toolcall } = values;
+
+    if (hardware === 'a3') {
+      const { ascendPreset, modelPath, draftModelPath, networkInterface } = values;
+      if (ascendPreset !== '8p-in3k5-out1k5') {
+        return '# Select the A3 configuration: 1 node / 8 cards / 16 dies.';
+      }
+      const isAbsolutePath = (path) => typeof path === 'string' && path.startsWith('/') && !/[\u0000-\u001f\u007f]/.test(path);
+      if (!isAbsolutePath(modelPath) || !isAbsolutePath(draftModelPath)) {
+        return '# Enter absolute paths to both model directories inside the container.';
+      }
+      if (typeof networkInterface !== 'string' || !/^[a-zA-Z0-9_.:-]+$/.test(networkInterface)) {
+        return '# Enter a valid network interface name from ip -brief address.';
+      }
+      const shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
+      const environment = [
+        '# Ascend A3: 1 node / 8 cards / 16 dies, PD co-located',
+        '# Complete the Ascend prerequisites in this guide before launching.',
+        `MODEL_PATH=${shellQuote(modelPath)}`,
+        `DRAFT_MODEL_PATH=${shellQuote(draftModelPath)}`,
+        'export PYTHONPATH="${DRAFT_MODEL_PATH}${PYTHONPATH:+:${PYTHONPATH}}"',
+        '',
+        'unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING',
+        'source /usr/local/Ascend/ascend-toolkit/set_env.sh',
+        'source /usr/local/Ascend/nnal/atb/set_env.sh',
+        '',
+        'export ASCEND_USE_FIA=1',
+        'export DEEPEP_HCCL_BUFFSIZE=1024',
+        `export GLOO_SOCKET_IFNAME=${shellQuote(networkInterface)}`,
+        `export HCCL_SOCKET_IFNAME=${shellQuote(networkInterface)}`,
+        'export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
+        'export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800',
+        'export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1',
+        'export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3',
+        'export SGLANG_SET_CPU_AFFINITY=1',
+        'export STREAMS_PER_DEVICE=32',
+        'export TASK_QUEUE_ENABLE=1',
+        ''
+      ];
+      const launch = [
+        'python3 -m sglang.launch_server',
+        '    --model-path "$MODEL_PATH"',
+        '    --host 127.0.0.1 --port 6688',
+        '    --tp-size 16',
+        '    --enable-dp-attention',
+        '    --dp-size 16',
+        '    --mem-fraction-static 0.75',
+        '    --max-running-requests 320',
+        '    --disable-radix-cache',
+        '    --reasoning-parser minimax-append-think',
+        '    --tool-call-parser minimax-m2',
+        '    --prefill-delayer-max-delay-passes 500',
+        '    --enable-prefill-delayer',
+        '    --chunked-prefill-size 196608',
+        '    --max-prefill-tokens 8192',
+        '    --cuda-graph-bs-decode 1 2 4 8 12 16 20',
+        '    --moe-a2a-backend ascend_fuseep',
+        '    --fuseep-mode 2',
+        '    --quantization modelslim',
+        '    --speculative-algorithm EAGLE3',
+        '    --speculative-draft-model-path "$DRAFT_MODEL_PATH"',
+        '    --speculative-num-steps 3',
+        '    --speculative-eagle-topk 1',
+        '    --speculative-num-draft-tokens 4',
+        '    --speculative-draft-model-quantization unquant',
+        '    --dtype bfloat16',
+        '    --device npu'
+      ];
+      return environment.join('\n') + '\n' + launch.join(' \\\n');
+    }
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     if (gpuCount === '2gpu' && !isAMD) {
@@ -162,8 +269,20 @@ export const MiniMaxM25Deployment = () => {
     return initialState;
   };
 
+  const getUpdatedValues = (previous, optionName, value) => {
+    const next = { ...previous, [optionName]: value };
+    if (optionName === 'hardware' && value !== 'a3') {
+      const items = options.gpuCount.getDynamicItems(next);
+      if (!items.some((item) => item.id === next.gpuCount && !item.disabled)) {
+        next.gpuCount = items.find((item) => item.default && !item.disabled).id;
+      }
+    }
+    return next;
+  };
+
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+  const [copyState, setCopyState] = useState({ command: null, failed: false });
 
   useEffect(() => {
     const checkDarkMode = () => {
@@ -184,7 +303,7 @@ export const MiniMaxM25Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => getUpdatedValues(prev, optionName, value));
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -205,6 +324,17 @@ export const MiniMaxM25Deployment = () => {
   };
 
   const command = generateCommand(values);
+  const handleCopyCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopyState({ command, failed: false });
+    } catch {
+      setCopyState({ command, failed: true });
+    }
+  };
+  const copyLabel = copyState.command !== command
+    ? 'Copy command'
+    : copyState.failed ? 'Select text to copy' : 'Copied!';
 
   const containerStyle = {
     maxWidth: '900px',
@@ -293,6 +423,8 @@ export const MiniMaxM25Deployment = () => {
     color: isDark ? '#e5e7eb' : '#374151',
     whiteSpace: 'pre-wrap',
     overflowX: 'auto',
+    maxHeight: '420px',
+    overflowY: 'auto',
     margin: 0,
     border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`,
   };
@@ -311,6 +443,7 @@ export const MiniMaxM25Deployment = () => {
               {option.type === 'text' ? (
                 <input
                   type="text"
+                  aria-label={option.title}
                   value={values[option.name] || ''}
                   placeholder={option.placeholder || ''}
                   onChange={(event) => handleTextChange(option.name, event.target.value)}
@@ -397,8 +530,18 @@ export const MiniMaxM25Deployment = () => {
           </div>
         );
       })}
-      <div style={cardStyle}>
-        <div style={titleStyle}>Run this Command:</div>
+      <div style={{ ...cardStyle, flexDirection: 'column', alignItems: 'stretch' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+          <div style={titleStyle}>Run this Command:</div>
+          <button
+            type="button"
+            onClick={handleCopyCommand}
+            aria-live="polite"
+            style={{ ...labelBaseStyle, flex: 'none' }}
+          >
+            {copyLabel}
+          </button>
+        </div>
         <pre style={commandDisplayStyle}>{command}</pre>
       </div>
     </div>
