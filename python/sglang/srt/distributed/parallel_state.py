@@ -86,6 +86,9 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+# Used for CPU (gloo) groups when no distributed timeout is configured.
+_DEFAULT_GLOO_TIMEOUT = timedelta(seconds=120 * 60)
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -290,7 +293,7 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
-        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        gloo_timeout: Optional[timedelta] = None,
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
@@ -330,6 +333,13 @@ class GroupCoordinator:
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
+
+        if gloo_timeout is None:
+            gloo_timeout = (
+                _MODEL_PARALLEL_GROUP_TIMEOUT
+                if _MODEL_PARALLEL_GROUP_TIMEOUT is not None
+                else _DEFAULT_GLOO_TIMEOUT
+            )
 
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
