@@ -181,7 +181,7 @@ class PrefillBootstrapQueue:
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
