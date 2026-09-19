@@ -2896,6 +2896,11 @@ class Scheduler(
         elif (
             session_id in self.session_controller
             and not self.session_controller.get(session_id).close_on_finish
+            and (
+                recv_req.session_params.incarnation is None
+                or recv_req.session_params.incarnation
+                == self.session_controller.get(session_id).incarnation
+            )
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
@@ -2921,9 +2926,16 @@ class Scheduler(
         else:
             # Session not found, or session is closing
             if session_id in self.session_controller:
-                error_msg = (
-                    f"Invalid request: close was requested for session {session_id}"
-                )
+                session = self.session_controller.get(session_id)
+                if (
+                    recv_req.session_params.incarnation is not None
+                    and recv_req.session_params.incarnation != session.incarnation
+                ):
+                    error_msg = "Invalid request: session incarnation changed"
+                else:
+                    error_msg = (
+                        f"Invalid request: close was requested for session {session_id}"
+                    )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
             req = Req(
@@ -5846,6 +5858,11 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
+        if recv_req.session_incarnation is not None:
+            session = self.session_controller.get(recv_req.session_id)
+            if session is None or session.incarnation != recv_req.session_incarnation:
+                # A delayed close must not release a later open's radix/session KV.
+                return
         if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
         if (

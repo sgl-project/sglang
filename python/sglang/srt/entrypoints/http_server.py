@@ -868,6 +868,11 @@ async def server_info():
                         server_args.disaggregation_mode == "null"
                         and not server_args.enable_dp_attention
                     ),
+                    "session_fencing_version": int(
+                        server_args.disaggregation_mode == "null"
+                        and not server_args.enable_dp_attention
+                        and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+                    ),
                 }
                 if _global_state.tokenizer_manager.request_lifecycle is not None
                 else None
@@ -942,6 +947,15 @@ def _get_request_lifecycle(request: Request):
     if request.headers.get("x-sglang-worker-incarnation") != registry.incarnation:
         raise HTTPException(409, "worker incarnation changed")
     return registry
+
+
+def _get_session_header(request: Request, name: str):
+    value = request.headers.get(name)
+    if value is not None:
+        if not envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+            raise HTTPException(400, "session header overrides are disabled")
+        _get_request_lifecycle(request)
+    return value
 
 
 @app.get("/request_lifecycle/{attempt_id}")
@@ -1050,6 +1064,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    incarnation = _get_session_header(request, "x-sglang-session-incarnation")
+    if incarnation is not None:
+        if not obj.session_params or not obj.session_params.get("id"):
+            raise HTTPException(400, "session incarnation requires session_params.id")
+        if obj.session_params.get("incarnation", incarnation) != incarnation:
+            raise HTTPException(400, "conflicting session incarnation")
+        obj.session_params = {**obj.session_params, "incarnation": incarnation}
     attempt_id = getattr(request.state, "lifecycle_attempt_id", None)
     if attempt_id is not None:
         obj._lifecycle_attempt_id = attempt_id
@@ -1763,6 +1784,11 @@ async def unload_lora_adapter(
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
+    session_id = _get_session_header(request, "x-sglang-session-id")
+    if session_id is not None:
+        if obj.session_id is not None and obj.session_id != session_id:
+            raise HTTPException(400, "conflicting session ID")
+        obj.session_id = session_id
     try:
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
         if session_id is None:
@@ -1802,6 +1828,14 @@ async def session_routing(
 @app.api_route("/close_session", methods=["GET", "POST"])
 async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
+    incarnation = _get_session_header(request, "x-sglang-session-incarnation")
+    if incarnation is not None:
+        if (
+            obj.session_incarnation is not None
+            and obj.session_incarnation != incarnation
+        ):
+            raise HTTPException(400, "conflicting session incarnation")
+        obj.session_incarnation = incarnation
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
