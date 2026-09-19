@@ -268,10 +268,8 @@ class TestLoadPublisherGating(CustomTestCase):
 
         _, open_sock = self._build(
             explicit="tcp://*:7000",
-            attn_dp_size=1,
-            attn_dp_rank=0,
-            dp_rank=2,
             dp_size=4,
+            ranks={"world_rank": 0, "dp_rank": 2},
         )
         open_sock.assert_called_once_with("tcp://*:7002")
 
