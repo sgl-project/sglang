@@ -138,14 +138,18 @@ class CompressedGather:
     # chunk-invariant per request; subsequent layers only overwrite that prefix.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
+    # Valid only for this forward's gather layout. Each ratio has its own
+    # workspace; its compressed prefix survives consumer layers' SWA writes.
+    dequantized_source: Optional[tuple[int, int]] = None
 
 
 @dataclass
 class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
-    Fields depend on request/token mappings and compressed page tables, not
-    per-layer k_cache; per-layer top-k combinations are recomputed into reused
+    Gather layouts depend on request/token mappings and compressed page tables.
+    Shared-source dequantization keys live only for this forward; per-layer
+    top-k combinations are recomputed into reused
     buffers.
     """
 

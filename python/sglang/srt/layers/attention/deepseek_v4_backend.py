@@ -1432,6 +1432,10 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
+        # Keep CP low-ratio prefixes intact across interleaved ratio/SWA layers.
+        self.shared_compressed_prefill_workspaces = {
+            ratio: SparsePrefillKVBuffer(self.device) for ratio in (1, 2)
+        }
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -4560,28 +4564,47 @@ class DeepseekV4AttnBackend(
                     self._cutedsl_h16_c128_combined_topk
                 )
             n_compressed = flat_token_ids.shape[0]
-            # Layers sharing a kv_source reuse its dequant: no later layer writes
-            # that cache, and graph replay keeps the layer order.
-            workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
-                n_compressed + cache.swa_token_ids.shape[0],
-                head_source=(
-                    extra_k_cache.data_ptr(),
-                    flat_token_ids.data_ptr(),
-                    n_compressed,
-                ),
-            )
-            if not compressed_filled:
+            reuse_compressed = compress_ratio in (1, 2) and is_cp_active(forward_batch)
+            if reuse_compressed:
+                workspace = self.shared_compressed_prefill_workspaces[compress_ratio].get(
+                    n_compressed + cache.swa_token_ids.shape[0]
+                )
                 compressed_slice = workspace[:n_compressed]
+            else:
+                workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
+                    n_compressed + cache.swa_token_ids.shape[0],
+                    head_source=(
+                        extra_k_cache.data_ptr(),
+                        flat_token_ids.data_ptr(),
+                        n_compressed,
+                    ),
+                )
+                if not compressed_filled:
+                    compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged_dsv4(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
-            )
+            source_key = None
+            if reuse_compressed:
+                source_layer = token_to_kv_pool.source_layer_of(layer_id)
+                source_key = (source_layer, workspace.data_ptr())
+                gather = cache.compressed[compress_ratio]
+            # A source layer may have just updated its cache in place. Consumer
+            # layers only reuse the compressed prefix; their top-k and SWA stay live.
+            if (
+                source_key is None
+                or layer_id == source_key[0]
+                or gather.dequantized_source != source_key
+            ):
+                dequantize_k_cache_paged_dsv4(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                )
+                if source_key is not None:
+                    gather.dequantized_source = source_key
         dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
