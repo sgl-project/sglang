@@ -1,0 +1,291 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use crate::common::mock_worker::MockWorker;
+use futures::future::BoxFuture;
+use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
+use sgl_router::policies::PolicyRegistry;
+use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use sgl_router::server::app_context::ChatRouting;
+use std::sync::Mutex;
+
+type PickCall = (String, Stage, u64, Option<u64>);
+
+#[derive(Debug, Default)]
+struct FirstPolicy {
+    calls: Mutex<Vec<PickCall>>,
+}
+
+impl Policy for FirstPolicy {
+    fn pick<'a>(
+        &'a self,
+        engines: &'a [Arc<Worker>],
+        request: &'a PickRequest<'a>,
+    ) -> BoxFuture<'a, Result<Pick, PickError>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((
+                request.bucket.to_owned(),
+                request.stage,
+                request.input_tokens,
+                request.expected_peak_tokens,
+            ));
+            Ok(Pick {
+                engine: engines[0].clone(),
+                reason: "first",
+            })
+        })
+    }
+}
+
+fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
+    EngineGroup {
+        worker_ids: Some([WorkerId(id.into())].into_iter().collect()),
+        policy,
+    }
+}
+
+fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<AppContext> {
+    let config = config_for("");
+    let registry = Arc::new(WorkerRegistry::default());
+    for &(id, mode, worker) in workers {
+        registry
+            .add(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: worker.url.clone(),
+                mode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8998),
+            })
+            .unwrap();
+    }
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
+    let mut ctx = AppContext::new(
+        config,
+        tokenizers,
+        Arc::new(Proxy::new(TEST_TIMEOUT).unwrap()),
+        registry,
+        // The reorg route must not require the legacy policy registry.
+        Arc::new(PolicyRegistry::default()),
+    );
+    ctx.chat_routing = ChatRouting::Reorg(
+        [(ModelId("tiny".into()), BucketResolver::new(buckets))]
+            .into_iter()
+            .collect(),
+    );
+    Arc::new(ctx)
+}
+
+fn request(value: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+        .unwrap()
+}
+
+fn body(content: &str) -> serde_json::Value {
+    serde_json::json!({"model": "tiny", "messages": [{"role": "user", "content": content}]})
+}
+
+#[tokio::test]
+async fn length_selects_plain_bucket_before_engine_selection() {
+    let short_worker = MockWorker::start(vec![]).await;
+    let long_worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut short = Bucket::new("short", BucketGroups::Plain(group("short", policy.clone())));
+    short.limits.max = Some(4);
+    let long = Bucket::new("long", BucketGroups::Plain(group("long", policy.clone())));
+    let ctx = context(
+        &[
+            ("short", Stage::Plain, &short_worker),
+            ("long", Stage::Plain, &long_worker),
+        ],
+        vec![long, short],
+    );
+    let app = build_router(ctx);
+    let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(short_worker.captured.lock().unwrap().last_body.is_some());
+    assert!(long_worker.captured.lock().unwrap().last_body.is_none());
+
+    let response = app
+        .oneshot(request(body(&"hello ".repeat(30))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(long_worker.captured.lock().unwrap().last_body.is_some());
+    let calls = policy.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!((&*calls[0].0, calls[0].1), ("short", Stage::Plain));
+    assert_eq!((&*calls[1].0, calls[1].1), ("long", Stage::Plain));
+}
+
+#[tokio::test]
+async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut selected = Bucket::new(
+        "selected",
+        BucketGroups::Pd {
+            prefill: group("p", policy.clone()),
+            decode: group("d", policy.clone()),
+        },
+    );
+    selected.limits.max = Some(100);
+    let other_policy = Arc::new(FirstPolicy::default());
+    let other = Bucket::new(
+        "other",
+        BucketGroups::Pd {
+            prefill: group("p", other_policy.clone()),
+            decode: group("d", other_policy.clone()),
+        },
+    );
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![other, selected],
+    );
+    let mut body = body("hello");
+    body["max_completion_tokens"] = 10.into();
+    let response = build_router(ctx).oneshot(request(body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-sgl-decode-url"], decode.url);
+    let _ = response.into_body().collect().await.unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while prefill.captured.lock().unwrap().last_body.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let p: serde_json::Value =
+        serde_json::from_slice(prefill.captured.lock().unwrap().last_body.as_ref().unwrap())
+            .unwrap();
+    let d: serde_json::Value =
+        serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
+            .unwrap();
+    assert!(p["bootstrap_room"].is_number());
+    assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
+    let calls = policy.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!((&*calls[0].0, calls[0].1), ("selected", Stage::Prefill));
+    assert_eq!((&*calls[1].0, calls[1].1), ("selected", Stage::Decode));
+    assert_eq!(calls[0].3, Some(calls[0].2 + 10));
+    assert_eq!(calls[1].3, calls[0].3);
+    assert!(other_policy.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn missing_decode_does_not_use_another_bucket_or_dispatch_prefill() {
+    let prefill = MockWorker::start(vec![]).await;
+    let decode = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut selected = Bucket::new(
+        "selected",
+        BucketGroups::Pd {
+            prefill: group("p", policy.clone()),
+            decode: group("missing", policy.clone()),
+        },
+    );
+    selected.limits.max = Some(100);
+    let other = Bucket::new(
+        "other",
+        BucketGroups::Pd {
+            prefill: group("p", policy.clone()),
+            decode: group("d", policy.clone()),
+        },
+    );
+    let ctx = context(
+        &[
+            ("p", Stage::Prefill, &prefill),
+            ("d", Stage::Decode, &decode),
+        ],
+        vec![other, selected],
+    );
+    let response = build_router(ctx.clone())
+        .oneshot(request(body("hi")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers()["x-router-error-code"],
+        "no_decode_workers_available"
+    );
+    assert!(prefill.captured.lock().unwrap().last_body.is_none());
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
+    assert_eq!(policy.calls.lock().unwrap().len(), 1);
+    assert_eq!(ctx.active_load.inflight_count(), 0);
+    assert_eq!(
+        ctx.registry
+            .get(&WorkerId("p".into()))
+            .unwrap()
+            .active_load(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn rejects_unsupported_length_unknown_model_and_overflow_before_policy() {
+    let worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut bucket = Bucket::new("short", BucketGroups::Plain(group("w", policy.clone())));
+    bucket.max_context_tokens = Some(4);
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    let mut long = body("hi");
+    long["max_tokens"] = 100.into();
+    let mut overflow = body("hi");
+    overflow["max_tokens"] = u64::MAX.into();
+    let mut unknown = body("hi");
+    unknown["model"] = "unknown".into();
+    for (body, status) in [
+        (long, StatusCode::BAD_REQUEST),
+        (overflow, StatusCode::BAD_REQUEST),
+        (unknown, StatusCode::NOT_FOUND),
+        (serde_json::json!({}), StatusCode::BAD_REQUEST),
+    ] {
+        let response = app.clone().oneshot(request(body)).await.unwrap();
+        assert_eq!(response.status(), status);
+    }
+    assert!(policy.calls.lock().unwrap().is_empty());
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+}
+
+#[tokio::test]
+async fn streaming_uses_existing_forwarder() {
+    let worker = MockWorker::start(vec!["data: {\"choices\":[]}\n\n", "data: [DONE]\n\n"]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let bucket = Bucket::new("plain", BucketGroups::Plain(group("w", policy)));
+    let app = build_router(context(&[("w", Stage::Plain, &worker)], vec![bucket]));
+    let mut body = body("hi");
+    body["stream"] = true.into();
+    let response = app.oneshot(request(body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn reorg_route_keeps_chat_body_limit() {
+    let app = build_router(context(&[], vec![]));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(vec![b' '; MAX_CHAT_BODY_BYTES + 1]))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
