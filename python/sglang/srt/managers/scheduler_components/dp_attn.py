@@ -60,13 +60,17 @@ def _resolve_elastic_world_dp_size(
 
     live_dp_size = get_parallel().attn_dp_size
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+    # The group's own membership, not the width it was built at: this is the
+    # one number an out-of-process join moves, and it is the upper bound the
+    # served width has to stay under.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"live_dp_size={live_dp_size} "
+            f"effective_ep_size={effective_ep_size} "
             f"world_size={world_size} server_args_dp_size={dp_size} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"

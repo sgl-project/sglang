@@ -59,7 +59,7 @@ def compute_post_capture_kv_resize(
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_parallel().world_group.world_size > 1,
+        distributed=get_parallel().launch_world_size > 1,
         cpu_group=get_parallel().world_group.cpu_group,
     )
     headroom_gb = model_runner.pre_model_load_memory * (

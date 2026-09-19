@@ -92,7 +92,7 @@ class ElasticEPStateManager:
 
         if get_exec().moe.elastic_ep_backend is not None:
             world_size = torch.distributed.get_world_size()
-            active_rank_capacity = get_parallel().max_ep_size or world_size
+            active_rank_capacity = get_parallel().max_world_size
             assert active_rank_capacity >= world_size, (
                 f"--max-ep-size ({active_rank_capacity}) must be >= "
                 f"world_size ({world_size})."
