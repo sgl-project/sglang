@@ -106,6 +106,12 @@ class _ReasoningResult:
         self.reasoning_text = reasoning_text
 
 
+def _prepare_streaming_field(field: dict[str, Any]) -> None:
+    field["optional"] = True
+    if field.get("content") == "xml-inline":
+        field.setdefault("content_args", {})["strict"] = True
+
+
 def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(template)
     fields = result["fields"]
@@ -117,15 +123,13 @@ def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
             "content_args": {"strip": False},
         }
     for field in fields.values():
-        field["optional"] = True
-    tool_field = fields.get(_TOOL_FIELD)
-    if isinstance(tool_field, dict) and tool_field.get("content") == "xml-inline":
-        tool_field.setdefault("content_args", {})["strict"] = True
+        _prepare_streaming_field(field)
     return result
 
 
 def _tool_extraction_template(template: dict[str, Any]) -> dict[str, Any]:
-    template = _streaming_template(template)
+    tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
+    _prepare_streaming_field(tool_field)
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
@@ -136,7 +140,7 @@ def _tool_extraction_template(template: dict[str, Any]) -> dict[str, Any]:
                 "content": "text",
                 "content_args": {"strip": False},
             },
-            _TOOL_FIELD: template["fields"][_TOOL_FIELD],
+            _TOOL_FIELD: tool_field,
         },
     }
 
@@ -153,6 +157,7 @@ class ResponseTemplateStreamAdapter:
         self._parser_template = load_response_template(template)
         self._prefix = prefix or ""
         self._stream_parser: ResponseParser | None = None
+        self._event_parser: ResponseParser | None = None
         self._pending_reasoning = ""
         self._pending_tool_start: int | None = None
         self._pending_tool_body_start: int | None = None
@@ -192,11 +197,11 @@ class ResponseTemplateStreamAdapter:
         start: int | None = None,
         end: int | None = None,
     ) -> str:
-        assert self._stream_parser is not None
+        assert self._event_parser is not None
         start = event["start"] if start is None else start
         end = event["end"] if end is None else end
-        start = max(start, self._stream_parser.prefix_end)
-        return self._stream_parser.input_text[start:end] if start < end else ""
+        start = max(start, self._event_parser.prefix_end)
+        return self._event_parser.input_text[start:end] if start < end else ""
 
     def has_tool_region(self, text: str) -> bool:
         try:
@@ -215,10 +220,20 @@ class ResponseTemplateStreamAdapter:
         tools: Sequence[Any] | None = None,
     ) -> list[dict]:
         parser = self._make_parser(tools)
-        self._stream_parser = parser
+        self._event_parser = parser
         events = self._active_initial_tool_event(parser) + parser.feed(text)
         _, final_events = parser.finalize()
         return events + final_events
+
+    def _bootstrap_stream_parser(
+        self, tools: Sequence[Any] | None
+    ) -> tuple[ResponseParser, list[dict]]:
+        initial_events: list[dict] = []
+        if self._stream_parser is None:
+            self._stream_parser = self._make_parser(tools)
+            initial_events = self._active_initial_tool_event(self._stream_parser)
+        self._event_parser = self._stream_parser
+        return self._stream_parser, initial_events
 
     def feed(
         self,
@@ -227,11 +242,8 @@ class ResponseTemplateStreamAdapter:
     ) -> list[dict]:
         if self._finalized:
             return []
-        initial_events: list[dict] = []
-        if self._stream_parser is None:
-            self._stream_parser = self._make_parser(tools)
-            initial_events = self._active_initial_tool_event(self._stream_parser)
-        return initial_events + self._stream_parser.feed(text)
+        parser, initial_events = self._bootstrap_stream_parser(tools)
+        return initial_events + parser.feed(text)
 
     def finalize(
         self,
@@ -239,11 +251,8 @@ class ResponseTemplateStreamAdapter:
     ) -> list[dict]:
         if self._finalized:
             return []
-        initial_events: list[dict] = []
-        if self._stream_parser is None:
-            self._stream_parser = self._make_parser(tools)
-            initial_events = self._active_initial_tool_event(self._stream_parser)
-        _, events = self._stream_parser.finalize()
+        parser, initial_events = self._bootstrap_stream_parser(tools)
+        _, events = parser.finalize()
         self._finalized = True
         return initial_events + events
 
@@ -257,7 +266,7 @@ class ResponseTemplateStreamAdapter:
             etype = event["type"]
             if field == _THINKING_FIELD:
                 if etype == "region_chunk":
-                    text = self._generated_text(event)
+                    text = event["text"]
                     if stream_reasoning:
                         reasoning_parts.append(text)
                     else:
@@ -266,13 +275,17 @@ class ResponseTemplateStreamAdapter:
                     reasoning_parts.append(self._pending_reasoning)
                     self._pending_reasoning = ""
             elif field == _CONTENT_FIELD and etype == "region_chunk":
-                normal_parts.append(self._generated_text(event))
+                normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
                 if etype == "region_malformed":
                     start = event["end"] - len(event["raw_close"])
                     normal_parts.append(self._generated_text(event, start=start))
                 elif etype in {"region_open", "region_chunk", "region_close"}:
-                    normal_parts.append(self._generated_text(event))
+                    normal_parts.append(
+                        event["text"]
+                        if etype == "region_chunk"
+                        else self._generated_text(event)
+                    )
         return "".join(normal_parts), "".join(reasoning_parts)
 
     def route_tool_events(
@@ -293,7 +306,7 @@ class ResponseTemplateStreamAdapter:
             field = event.get("field")
             etype = event["type"]
             if field == _PASSTHROUGH_FIELD and etype == "region_chunk":
-                normal_parts.append(self._generated_text(event))
+                normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
                 if etype == "region_open":
                     self._pending_tool_start = event["start"]

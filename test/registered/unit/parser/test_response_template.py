@@ -217,6 +217,18 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
         self.assertEqual(template.normal_text, existing.normal_text)
         self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
 
+    def test_non_streaming_parse_does_not_finalize_streaming_state(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        )
+
+        parsed = detector.detect_and_parse(TOOL_CALL, [_tool()])
+        normal_text, calls = _collect_tool_stream(detector, [TOOL_CALL])
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(calls, _call_values(parsed.calls))
+
     def test_content_between_tool_calls_is_preserved(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,

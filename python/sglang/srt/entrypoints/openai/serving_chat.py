@@ -1305,6 +1305,14 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        self._maybe_set_response_parser_prefix(request, adapted_request)
+        return adapted_request, request
+
+    def _maybe_set_response_parser_prefix(
+        self,
+        request,
+        adapted_request: GenerateReqInput,
+    ) -> None:
         if "response_template" in (
             self.reasoning_parser,
             self.tool_call_parser,
@@ -1312,7 +1320,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request._response_parser_prefix = self._response_parser_prefix(
                 adapted_request
             )
-        return adapted_request, request
 
     def _response_parser_prefix(self, adapted_request: GenerateReqInput) -> str:
         prompt = getattr(adapted_request, "text", None)
