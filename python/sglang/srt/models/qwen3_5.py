@@ -87,6 +87,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import qwen3_5_gdn_out_proj_fusion as gdn_out_proj_fusion
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
@@ -913,6 +914,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = z.new_zeros(z_flat_shape)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
+
+        if _is_hip and gdn_out_proj_fusion.owns_out_proj(self):
+            return gdn_out_proj_fusion.apply(self, core_attn_out, z, z_shape_og)
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
