@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
@@ -453,7 +454,6 @@ def test_active_observer_uses_observer_logits_preprocessing():
 def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
     event = object()
     scheduler = object.__new__(Scheduler)
-    scheduler.ps = SimpleNamespace(pp_size=1)
     scheduler.device_module = SimpleNamespace(Event=Mock(return_value=event))
     result = SimpleNamespace(
         logits_output=SimpleNamespace(auxiliary_device_output=object()),
@@ -463,7 +463,8 @@ def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
     )
     batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
-    Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
+    with published_topology():
+        Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
 
     assert result.copy_done is event
     result.copy_to_cpu.assert_called_once_with(
@@ -474,7 +475,6 @@ def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
 
 def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler = object.__new__(Scheduler)
-    scheduler.ps = SimpleNamespace(pp_size=2)
     scheduler.device_module = SimpleNamespace(Event=Mock())
     result = SimpleNamespace(
         logits_output=SimpleNamespace(auxiliary_device_output=object()),
@@ -484,7 +484,8 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     )
     batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
-    Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
+    with published_topology(pp_size=2):
+        Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
 
     assert result.copy_done is None
     result.copy_to_cpu.assert_not_called()
@@ -514,7 +515,6 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.is_generation = True
     scheduler.enable_overlap = False
     scheduler.enable_pdmux = True
-    scheduler.ps = SimpleNamespace(pp_size=1)
     scheduler.tp_worker = SimpleNamespace(
         forward_batch_split_prefill=Mock(return_value=result)
     )
@@ -535,9 +535,12 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
         return_hidden_states=False,
     )
 
-    with patch(
-        "sglang.srt.managers.scheduler.resolve_forward_inputs"
-    ) as resolve_forward_inputs:
+    with (
+        published_topology(),
+        patch(
+            "sglang.srt.managers.scheduler.resolve_forward_inputs"
+        ) as resolve_forward_inputs,
+    ):
         output_result = Scheduler.run_batch(scheduler, batch)
 
     resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
