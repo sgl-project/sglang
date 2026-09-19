@@ -98,6 +98,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_offload_compatibility, server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        validate_cutlass_mxfp4,
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
@@ -312,6 +313,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_deepep_v2_speculative_draft,
     )
 
+    handle_moe_kernel_config(server_args)
+    handle_a2a_moe(server_args)
+    handle_eplb_and_dispatch(server_args)
+    handle_expert_distribution_metrics(server_args)
+    handle_elastic_ep(server_args)
+    validate_experimental_sgl_marlin(server_args)
+    validate_cutlass_mxfp4(server_args)
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
