@@ -589,12 +589,8 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        # The encoder serves the vision tower on a world of its own: `tp_size`
-        # ranks wide, with no pipeline, no expert or MoE-DP dimension and no
-        # decode context parallelism, whatever the generation side published.
-        # That has always been the layout it builds; stating it is what stops
-        # the context from answering with the other side's topology while these
-        # groups answer with this one.
+        # The encoder's own world: `tp_size` ranks, no pipeline, no expert or
+        # MoE-DP dimension, no decode context parallelism.
         parallel = get_parallel()
         attn_cp_size = parallel.attn_cp_size
         attn_tp_size = parallel.tp_size // attn_cp_size

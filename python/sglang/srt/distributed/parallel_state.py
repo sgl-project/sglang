@@ -2944,10 +2944,6 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    # The groups just built and the configuration they were built from are two
-    # accounts of one layout. Check them against each other here, where the
-    # disagreement is still attributable, rather than letting a collective run
-    # on the wrong peers.
     _validate_parallel(get_parallel(), "group build")
 
 
@@ -3048,8 +3044,7 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     global _PP
     _PP = pp_group
     try:
-        # `pp_size` is a configured leaf: unlike the rank and the handle it
-        # does not follow the group being swapped, so the scope has to name it.
+        # `pp_size` is a configured leaf: it does not follow the group.
         with get_parallel().override(
             pp_size=pp_group.world_size,
             pp_rank=pp_group.rank_in_group,
@@ -3430,20 +3425,13 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
 
 # --- deprecation ---------------------------------------------------------
 #
-# These getters are the definition of a name, not a second spelling of it.
-# Business code asks `get_parallel()`, which answers by calling them and which
-# a scope can redirect; a call that arrives here directly cannot be redirected,
-# so a draft worker's scope does not reach it. The package that defines them
-# keeps calling them -- a read there would go through the context back into
-# itself -- so the warning fires only for callers outside it, and once per
-# name, because the point is to name the replacement rather than to fill a log.
+# Business code reads these through `get_parallel()`, which a scope can
+# redirect. Callers that go straight to a getter are warned, once per name.
 
-# The context's own read path calls these -- that is how it answers -- so it is
-# exempt for the same reason the defining package is.
+# Exempt: the package that defines them, and the context's own read path.
 _EXEMPT_CALLERS = ("sglang.srt.distributed.", "sglang.srt.runtime_context")
 
-# Derived from the table that says which context name each getter answers, so a
-# getter added there is covered without being listed again here.
+# Derived: a getter added to the table is covered without being listed here.
 _CONTEXT_NAME_OF = {
     source: name
     for name, source in (
@@ -3452,13 +3440,10 @@ _CONTEXT_NAME_OF = {
     )
     if isinstance(source, str)
 }
-# The width getters read a built group; the context answers the same names from
-# the configuration. Those are one answer rather than two only for the groups
-# the build checks against the configuration -- `_WIDTH_AND_GROUP` in
-# `runtime_context` -- so only those are listed here. `moe_dp`, `moe_tp` and
-# `dcp` are not on that list and are deliberately absent: the MoE-DP group is
-# the attention-CP group when the latter is wider, and the other two are simply
-# not pinned yet.
+# A width getter reads a built group; the context answers from configuration.
+# Only the groups in `_WIDTH_AND_GROUP` are checked to agree, so only those are
+# listed. `moe_dp` (aliased to attention-CP when that is wider), `moe_tp` and
+# `dcp` are absent.
 _CONTEXT_NAME_OF["get_tensor_model_parallel_world_size"] = "tp_size"
 _CONTEXT_NAME_OF["get_attn_tensor_model_parallel_world_size"] = "attn_tp_size"
 _CONTEXT_NAME_OF["get_attn_context_model_parallel_world_size"] = "attn_cp_size"
@@ -3498,9 +3483,7 @@ del _name, _replacement, _fn
 
 
 # What `from sglang.srt.distributed import *` re-exports: everything public
-# except the deprecated getters. Business code reaches them through
-# `get_parallel()`, and the package that defines them imports them from this
-# module by name, so nothing needs the package path to reach one.
+# except the deprecated getters.
 __all__ = [
     _public
     for _public in list(globals())

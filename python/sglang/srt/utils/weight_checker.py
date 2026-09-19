@@ -70,10 +70,8 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 class WeightChecker:
     def __init__(self, *, get_model: Callable[[], Any]):
         self._get_model = get_model
-        # A check is served on demand from the scheduler loop, which is outside
-        # the scope that describes a draft runner. The report has to name the
-        # runner it was built for, so the placement is read here, at
-        # construction, rather than asked for when the request arrives.
+        # Frozen here: a check is served from the scheduler loop, outside the
+        # scope that describes a draft runner.
         parallel = get_parallel()
         self._placement = ParallelismInfo(
             tp_rank=parallel.tp_rank,
@@ -176,9 +174,7 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        # The WORLD position is asked for now rather than frozen: unlike the
-        # runner's placement it is a property of the process, and an elastic
-        # scale-up moves it.
+        # The WORLD position is live: an elastic scale-up moves it.
         return self._placement.model_copy(
             update={
                 "rank": dist.get_rank() if dist.is_initialized() else 0,

@@ -59,8 +59,7 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
-#: Set by `init_parallel`; `destroy_model_parallel` clears it, so a test that
-#: tears the groups down can build them again.
+#: Cleared by `destroy_model_parallel`.
 _PARALLEL_INITIALISED = False
 
 

@@ -129,9 +129,7 @@ def mixer2_gated_norm_tensor_parallel(
         )
         mixer.weight.weight_loader(mixer.weight, weight)
 
-    # m2 reads tp via get_parallel().tp_size/rank — state a single-rank topology
-    # through the context. Every width that follows from `tp_size` is named:
-    # narrowing one leaf and leaving the quotients behind describes no layout.
+    # m2 reads tp through the context; every width that follows is named.
     with get_parallel().override(
         tp_size=1,
         tp_rank=0,

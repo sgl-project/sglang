@@ -5,9 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# State the topology before importing modules that read it at __init__. The
-# group is stated too: `RowParallelLinear.forward` asks for it to manage
-# symmetric memory, and `world_size=1` short-circuits that.
+# Before importing modules that read the topology at __init__.
 from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(

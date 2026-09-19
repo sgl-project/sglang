@@ -217,8 +217,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
-            # `parallel_state`, not the package re-export: a stub on the
-            # re-export is never consulted.
+            # `parallel_state`, not the package re-export.
             patch(
                 "sglang.srt.distributed.parallel_state.get_tp_group",
                 return_value=tp_group,

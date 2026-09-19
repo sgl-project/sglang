@@ -297,8 +297,6 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        # The reporter asks the context whether this is the last stage, and
-        # which replica it is reporting for.
         enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1, dp_rank=2))
         scheduler.enable_kv_cache_events = False
 
@@ -336,7 +334,6 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        # The reporter asks the context whether this is the last stage.
         enter_scope(self, get_parallel().override(pp_rank=0, pp_size=2))
         scheduler.enable_kv_cache_events = False
 

@@ -216,8 +216,6 @@ def build_kv_cache(
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
-    # Built from the scheduler loop, outside any draft scope, so the context
-    # answers for the process this cache belongs to.
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None

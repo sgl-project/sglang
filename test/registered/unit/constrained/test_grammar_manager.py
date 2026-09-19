@@ -778,9 +778,7 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        # After that override, not before: installing a server-args override
-        # re-resolves the parallel bag from defaults, which puts `pp_size`
-        # back to 1 whatever was published.
+        # After that override: installing one re-resolves the parallel bag.
         enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
         scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)

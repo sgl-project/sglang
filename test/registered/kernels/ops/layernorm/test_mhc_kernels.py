@@ -36,8 +36,6 @@ def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     # This is a single-process kernel unit test with no TP group initialized.
     # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
-    # pool, which asks for the TP group; bypassing the allocation is enough, and
-    # then nothing asks. Mirrors the workaround in test_mxfp4_sm90_cutlass.py.
     monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
     torch.manual_seed(0)

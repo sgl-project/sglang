@@ -518,8 +518,6 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
-        # Phase two: make the topology this process published exist, before
-        # anything that reads a group does.
         bootstrap.init_parallel_runtime(
             server_args=server_args,
             model_config=self.model_config,
@@ -5993,13 +5991,8 @@ def run_scheduler_process(
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
-    # The parent picked the device -- reindexing narrows what this process can
-    # see, so it cannot work the number out for itself.
+    # The parent picked the device; reindexing narrows what this process sees.
     server_args.gpu_id = gpu_id
-    # Publish before anything in this process reads configuration, with the
-    # placement the launcher decided: from here on a rank read is answered
-    # without a process group, which is what every reader needs before
-    # `init_torch_distributed` has run.
     publish(
         server_args,
         role="scheduler",

@@ -385,9 +385,6 @@ def initialize_dp_attention(
         if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
-    # Stamped together, after the elastic adjustment: the width and the rank
-    # describe one topology, and a reader that caught them mid-update would
-    # see this process placed in a group it is not in.
     get_parallel().override_permanently(
         attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
     )

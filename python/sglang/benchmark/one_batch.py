@@ -338,7 +338,6 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         server_args=server_args,
     )
 
-    # Phase two: this entry has no scheduler to run it.
     bootstrap.init_parallel_runtime(
         server_args=server_args,
         model_config=model_config,
@@ -696,8 +695,6 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    # With the placement this process was spawned with, so a rank read here
-    # does not need a process group -- the same bundle the runner is handed.
     server_args.gpu_id = gpu_id
     publish(
         server_args,

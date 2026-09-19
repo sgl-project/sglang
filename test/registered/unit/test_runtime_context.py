@@ -64,13 +64,9 @@ _SRT = _pathlib.Path(next(iter(_sglang.__path__))).resolve() / "srt"
 _PS = "sglang.srt.distributed.parallel_state"
 _DP = "sglang.srt.layers.dp_attention"
 
-# Ranks and the launch width are asked of the group: they are not implied by
-# anything, so there is nothing to derive them from. The quotients are not
-# here -- `attn_tp_size` and its siblings are functions of the configured
-# leaves, and `TestDerivedWidths` pins them. `attn_dp_rank` is not here either: no group coordinator
-# knows it, so it is stamped when the attention topology is initialized and
-# `TestStampedRanks` is what pins it. The other world width is not here
-# because the group does not know it; `TestTheTwoWorldWidths` pins it.
+# Only the names a group answers. The quotients are pinned by
+# `TestDerivedWidths`, `attn_dp_rank` by `TestStampedRanks`, and the other
+# world width by `TestTheTwoWorldWidths`.
 SIZE_RANK_DELEGATIONS = [
     ("launch_world_size", f"{_PS}.get_world_size"),
     ("launch_world_rank", f"{_PS}.get_world_rank"),
@@ -402,7 +398,6 @@ class TestStampedRanks(_IsolatedOverrides):
             )
         self.assertIs(mode, DpPaddingMode.MAX_LEN)
 
-        # And the branch it would have taken with the target's width.
         with get_parallel().override(attn_dp_size=2):
             mode = DpPaddingMode.get_dp_padding_mode(
                 is_extend_in_batch=True, global_num_tokens=[3, 5]
@@ -2187,7 +2182,6 @@ class TestDerivedWidths(_IsolatedOverrides):
             parallel_state.initialize_model_parallel()
         self.addCleanup(parallel_state.destroy_model_parallel)
 
-        # The first group built is TP, one group spanning the published width.
         self.assertEqual(built_at[0], [list(range(world_size))])
         self.assertEqual(get_parallel().attn_tp_size, world_size)
 
@@ -2308,29 +2302,22 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
     """
 
     #: May have callers. `get_self_pp_group` builds the single-rank group a
-    #: draft pipeline scope installs, so there is nothing for the context to
-    #: answer with until the scope has installed it; the other two are not
-    #: topology at all.
+    #: draft pipeline scope installs; the other two are not topology.
     ALLOWED = {
         "get_self_pp_group",
         "get_default_distributed_backend",
         "get_mooncake_transfer_engine",
     }
 
-    #: Zero callers required, but not deprecated either: the context has no
-    #: name that answers the same question.
-    #:
-    #: The three widths read a group the build does not check against the
-    #: configuration, so "the group's width" and "the configured width" are two
-    #: facts -- the MoE-DP group is the attention-CP group when the latter is
-    #: wider, and the other two are simply not pinned yet. Pinning them in
-    #: `_WIDTH_AND_GROUP` is what would let them move.
+    #: Zero callers required, but not deprecated: the context has no name
+    #: that answers the same question. The three widths read a group
+    #: `_WIDTH_AND_GROUP` does not check, so the group's width and the
+    #: configured width are two facts there.
     NOT_ANSWERED_BY_THE_CONTEXT = {
         "get_moe_data_parallel_world_size",
         "get_moe_tensor_parallel_world_size",
         "get_dcp_world_size",
-        # Answers `None` where the context asserts, which is the whole point of
-        # the caller that wants it.
+        # Answers `None` where the context asserts.
         "get_dcp_group_no_assert",
         "get_torch_distributed_pg_options",
     }
@@ -2391,9 +2378,8 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             "context cannot answer them",
         )
 
-    #: How many callers each exempt accessor has outside the defining package.
-    #: A ratchet, not a description: these may go down and never up, and a name
-    #: that reaches zero comes off the list. Anything not here must have none.
+    #: A ratchet: these counts may go down and never up, and a name that
+    #: reaches zero comes off the list. Anything not here must have none.
     ALLOWED_CALLERS = {
         "get_self_pp_group": 1,
         "get_default_distributed_backend": 1,
@@ -2429,9 +2415,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         for name in sorted(unclassified):
             if name in marked:
                 continue
-            # Not answered by the context and not exempt: a getter that is
-            # neither is a name with no home, which is what this module exists
-            # to prevent.
             self.assertIn(
                 name,
                 marked,
@@ -2795,8 +2778,6 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_cp_size, 1)
                 self.assertEqual(parallel.attn_cp_rank, 0)
                 self.assertEqual(parallel.dp_size, 1)
-                # The whole point of stating all of them: the identity the
-                # override path and the group build both check holds in here.
                 self.assertEqual(
                     parallel.tp_size,
                     parallel.attn_tp_size
@@ -2822,7 +2803,6 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
             with parallel_state.patch_pipeline_parallel_group(group):
                 checker = WeightChecker(get_model=lambda: None)
 
-        # The scope has closed and the context answers the target's shape again.
         self.assertEqual(get_parallel().pp_size, 2)
         info = checker._parallelism_info()
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
