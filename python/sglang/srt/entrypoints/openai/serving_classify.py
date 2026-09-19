@@ -70,7 +70,7 @@ class OpenAIServingClassify(OpenAIServingBase):
 
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
-            rid=request.rid,
+            rid=self.extract_rid_from_header(raw_request, request.rid),
             priority=request.priority,
         )
 
