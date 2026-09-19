@@ -177,9 +177,20 @@ struct TopKProblem {
   uint32_t seq_len;
   int32_t bias = 0;
   uint32_t input_start = 0;  // needed by ragged mode
+  // Optional per-block keep flags of this row (kMasked paths only): position p
+  // of the window (p = idx - input_start) takes part in the selection iff
+  // mask[p >> mask_bits] != 0. Masked positions rank below every score and are
+  // never emitted, exactly as if they had been -inf and lost every tie.
+  const uint8_t* __restrict__ mask = nullptr;
+  uint32_t mask_bits = 0;
 
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
+  }
+  /// `idx` is relative to `in`; the alignment padding ahead of the window is
+  /// never masked (it is already the NaN padding value).
+  SGL_DEVICE bool masked(uint32_t idx) const {
+    return idx >= input_start && mask[(idx - input_start) >> mask_bits] == 0;
   }
 };
 
@@ -241,7 +252,13 @@ struct TopKConfig {
         problem.emit(base + t, tie_buffer[t].idx);
       }
       for (uint32_t t = num_ties + tx; t < topk; t += kBlockSize) {
-        problem.emit(base + t, base + t);
+        // Unfillable slots: a valid (dereferenceable) index for the plain
+        // kernels, -1 when a keep-mask left too few candidates.
+        if (problem.mask != nullptr) {
+          problem.out[base + t] = -1;
+        } else {
+          problem.emit(base + t, base + t);
+        }
       }
     } else if (num_ties <= kWarpSize) {
       if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
@@ -539,7 +556,7 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
+  template <bool kUsePDL, bool kMasked = false>
   SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -563,6 +580,10 @@ struct TopKRegister : TopKRadixBase<12> {
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
+    // Masked positions take the padding value: they then sit in the padding
+    // bin, are moved to bin 0 with the padding below, and fail both collect
+    // comparisons, so they are never emitted.
+    uint32_t num_masked = 0;
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
@@ -573,13 +594,25 @@ struct TopKRegister : TopKRadixBase<12> {
           if (j >= tail_start) local_vecs[i][j] = padding_value();
         }
       }
+      if constexpr (kMasked) {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          const auto idx = vi * kVecSize + j;
+          if (idx < problem.seq_len && problem.masked(idx)) {
+            local_vecs[i][j] = padding_value();
+            ++num_masked;
+          }
+        }
+      }
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
       }
     }
-    const auto num_padding = kVecSize - tail_start + problem.input_start;
-    if (tx == 0 && num_padding > 0) {
+    auto num_padding = kVecSize - tail_start + problem.input_start;
+    if (tx != 0) num_padding = 0;
+    if constexpr (kMasked) num_padding += num_masked;
+    if (num_padding > 0) {
       // Ask the histogram's own binning where the platform's NaN landed.
       atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
       atomicAdd(&smem->histogram[0], num_padding);
@@ -640,7 +673,7 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
+  template <bool kUsePDL, bool kMasked = false>
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -653,8 +686,16 @@ struct TopKStreaming : TopKRadixBase<12> {
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
 
-    // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+    // Phase 1: Load and build histogram. Masked positions are counted straight
+    // into bin 0 (below every score), where the padding goes too.
+    uint32_t num_masked = 0;
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if constexpr (kMasked) {
+        if (problem.masked(idx)) {
+          ++num_masked;
+          return;
+        }
+      }
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
@@ -662,6 +703,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     if (tx == 0 && num_padding != 0) {
       atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
       atomicAdd(&smem->histogram[0], num_padding);
+    }
+    if constexpr (kMasked) {
+      if (num_masked != 0) atomicAdd(&smem->histogram[0], num_masked);
     }
     __syncthreads();
 
@@ -682,6 +726,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto v_lo = smem->v_lo;
     const auto topk = problem.topk;
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if constexpr (kMasked) {
+        if (problem.masked(idx)) return;
+      }
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {
