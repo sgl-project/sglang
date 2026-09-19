@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.pd_responses import PDResponsesError
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -206,6 +207,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.background_tasks: dict[str, asyncio.Task] = {}
         self.enable_response_store = get_serving().enable_response_store
         self.is_disaggregated = get_disagg().disaggregation_mode != "null"
+        self.responses_generation_url = get_serving().responses_generation_url
 
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
@@ -360,6 +362,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             self.use_harmony
             and self.tool_server is not None
             and self.is_disaggregated
+            and not self.responses_generation_url
             and self._has_response_tool(
                 request, "web_search", "web_search_preview", "code_interpreter"
             )
@@ -761,6 +764,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 pass
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
+        except PDResponsesError as e:
+            return self.create_error_response(
+                str(e), err_type="ServerError", status_code=e.status_code
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -2671,20 +2678,36 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         while True:
             # Generate using SGLang's tokenizer manager
-            generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            )
+            if self.responses_generation_url:
+                from sglang.srt.entrypoints.openai.pd_responses import routed_turn
 
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+                generator = routed_turn(
+                    adapted_request, self.responses_generation_url, raw_request
+                )
+            else:
+                generator = self.tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                )
+
+            try:
+                async for res in generator:
+                    if self.responses_generation_url:
+                        reason = (res.get("meta_info") or {}).get("finish_reason") or {}
+                        if reason.get("type") == "abort":
+                            raise PDResponsesError(
+                                reason.get("message") or "PD generation aborted",
+                                reason.get("status_code", 500),
+                            )
+                    context.append_output(res)
+                    yield context
+            finally:
+                await generator.aclose()
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.
                 break
 
-            if self.is_disaggregated:
+            if self.is_disaggregated and not self.responses_generation_url:
                 raise ValueError(
                     "built-in tool calls are not supported with prefill-decode "
                     "disaggregation"
