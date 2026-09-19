@@ -133,7 +133,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             get_parallel().override(
                                 pp_size=2,
                                 pp_async_batch_depth=depth,
-                                enable_dsa_prefill_context_parallel=False,
                             ),
                             patch(
                                 f"{PP_MODULE}.get_disagg",
