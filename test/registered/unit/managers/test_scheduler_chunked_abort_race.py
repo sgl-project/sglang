@@ -5,7 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -38,13 +43,16 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
-    sched.ps = SimpleNamespace(pp_size=1)
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
     return sched
 
 
 class TestPendingChunkedAbortRace(CustomTestCase):
+    def setUp(self):
+        # The abort path asks the context for the pipeline width.
+        enter_scope(self, published_topology())
+
     def test_req_left_chunked_slot_is_aborted(self):
         req = _FakeReq("zombie_rid")
         sched = _make_scheduler(req, chunked_req=None, running_reqs=[req])

@@ -84,6 +84,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    draft_pp_context,
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -402,7 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_init_ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             draft_init_ctx = empty_context()
-        with draft_init_ctx:
+        with draft_pp_context(), draft_init_ctx:
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -598,7 +599,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with (
+            draft_pp_context(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+        ):
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -608,7 +612,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with (
+            draft_pp_context(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+        ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
