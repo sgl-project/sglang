@@ -5,6 +5,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.ops.attention.dsa.triton_kernel import _supports_fp8
+from sglang.kernels.ops.attention.dsv4 import (
+    dequantize_k_cache_paged_cuda as _dequantize_k_cache_paged_cuda,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported
@@ -53,17 +57,12 @@ def dequantize_k_cache_paged(
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
 
-    # The buffer's dtype is whatever the pool exposes (often bf16); the
-    # underlying storage is uint8. Reinterpret to byte-space first.
     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
     num_tokens = page_table_1_flattened.shape[0]
-    bytes_per_page = quant_k_cache_u8.shape[-1]
-    s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
-    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
-    buf_uint8 = quant_k_cache_u8.reshape(-1)
+    # The CUDA kernel requires int32 page table; convert if needed.
+    if page_table_1_flattened.dtype != torch.int32:
+        page_table_1_flattened = page_table_1_flattened.to(torch.int32)
 
     if out is None:
         out = torch.empty(
@@ -75,22 +74,12 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
-    _dequantize_k_cache_paged_kernel[(num_tokens,)](
-        out,
-        buf_fp8,
-        buf_bf16,
-        buf_uint8,
-        page_table_1_flattened,
-        out.stride(0),
-        BYTES_PER_PAGE=bytes_per_page,
-        PAGE_SIZE=page_size,
-        DIM_NOPE=DIM_NOPE,
-        DIM_ROPE=DIM_ROPE,
-        TILE_SIZE=TILE_SIZE,
-        NUM_SCALE_TILES=NUM_SCALE_TILES,
-        NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
-        PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
-        S_OFFSET_BYTES=s_offset_bytes,
+    _dequantize_k_cache_paged_cuda(
+        out=out,
+        k_cache=quant_k_cache_u8,
+        page_table=page_table_1_flattened,
+        page_size=page_size,
+        use_fp8_native=_supports_fp8(),
     )
     return out
 
