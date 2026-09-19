@@ -138,8 +138,9 @@ class SchedulerProfilerManager:
         self.profile_prefix = profile_prefix
         self.detailed_annotations = detailed_annotations
 
-        if start_step:
-            self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
+        self.profiler_start_forward_ct = (
+            max(start_step, self.get_forward_ct() + 1) if start_step else None
+        )
 
         if num_steps:
             if self.profile_by_stage:
@@ -472,7 +473,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_stages,
                 )
             else:
-                self._init_profile(
+                result = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -485,6 +486,12 @@ class SchedulerProfilerManager:
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
                 )
+                if not result.success:
+                    return result
                 return self._start_profile()
         else:
-            return self._stop_profile()
+            result = self._stop_profile()
+            if result is not None and result.success:
+                self.profile_by_stage = False
+                self.profiler_target_forward_ct = None
+            return result
