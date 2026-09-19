@@ -1664,6 +1664,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if (
+            self.is_fp4_expert
+            and get_moe_a2a_backend().is_megamoe()
+            and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+        ):
+            fp4_weight_dtype = _require_fp4_dtype()
+            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            build_mega_moe_experts_weights(layer)
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path.
         # Skipped when dequant_fp4_to_fp8 is requested: this branch returns
         # unconditionally, so without the extra check SGLANG_DSV4_FP4_DEQUANT=1

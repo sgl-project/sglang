@@ -1449,6 +1449,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        mega_moe_idle_materialize = bool(
+            envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and self.is_extend_in_batch
+            and self.forward_mode.is_idle()
+        )
+        if mega_moe_idle_materialize:
+            global_num_tokens = [1] * len(global_num_tokens)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1549,7 +1556,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
-            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            elif mega_moe_idle_materialize or (
+                self.is_extend_in_batch and dp_padding_mode.is_max_len()
+            ):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
