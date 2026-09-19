@@ -170,7 +170,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                             build_stack.call_args.kwargs[f"{name}_layer_mapping"],
                             mapping,
                         )
-                    self.assertEqual(result.transfer_layer_num, 4)
+                    self.assertEqual(result.cache_controller.transfer_layer_id_max, 4)
                     self.assertEqual(
                         kvcache.full_attention_layer_id_mapping, global_maps["full"]
                     )
