@@ -139,7 +139,7 @@ def linear_with_pad(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None)
 
 def _logsigmoid_normalize(logits: torch.Tensor) -> torch.Tensor:
     log_probs = F.logsigmoid(logits)
-    return torch.exp(log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True))
+    return log_probs.softmax(dim=-1)
 
 
 def _renorm_topk_logits(
@@ -173,8 +173,9 @@ def _inkling_compute_logsigmoid_norm(logits, mask_a):
     sum_exp = tl.sum(
         tl.where(mask_a[None, :], exp_shifted, 0.0), axis=1, keep_dims=True
     )
-    logsumexp = max_log_probs + libdevice.log(sum_exp)
-    return libdevice.exp(log_probs - logsumexp)
+    # Normalize the shifted values directly: adding log(sum_exp) back to a
+    # very negative max_log_probs can round away the normalization term.
+    return exp_shifted / sum_exp
 
 
 @triton.jit(do_not_specialize=["T", "route_scale"])
@@ -381,7 +382,7 @@ class InklingGate(nn.Module):
             logits = inkling_gate_gemv(x, self.weight, enable_pdl=is_arch_support_pdl())
         else:
             logits = inkling_fused_gate_linear_with_fp32_out(x, self.weight)
-        # Fused sigmoid[+bias] select-top-k + logsigmoid-renorm in one launch.
+        # Fused sigmoid[+bias] select-top-k + stable sigmoid renorm in one launch.
         # Pre-packed topk is consumed only by the SRT MoeRunner apply path (quantized
         # experts). Unquantized experts use forward_moe, which needs standard topk
         # tensors; packed mode returns None for routed_weights/topk_indices and would
