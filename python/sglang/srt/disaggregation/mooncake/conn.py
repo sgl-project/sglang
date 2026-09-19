@@ -1126,50 +1126,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if plan.empty():
             return 0
 
-        target_src_kv_ptrs = src_kv_ptrs[:num_target]
-        src_token_indices = plan.target_src_token_indices
-        if pack_buffer is not None and src_token_indices.size:
-            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
-
-            packed = try_pack_dcp_src(
-                pack_buffer=pack_buffer,
-                kv_data_ptrs=target_src_kv_ptrs,
-                src_token_indices=src_token_indices,
-                token_item_lens=dcp_token_item_lens[:num_target],
-            )
-            if packed is not None:
-                target_src_kv_ptrs, src_token_indices = packed
-
-        layers_params = []
-        if src_token_indices.size:
-            target_groups = group_concurrent_contiguous(
-                src_token_indices,
-                plan.target_dst_token_indices,
-            )
-            layers_params += [
-                (
-                    target_src_kv_ptrs[entry],
-                    dst_kv_ptrs[entry],
-                    dcp_token_item_lens[entry],
-                    target_groups,
-                )
-                for entry in range(num_target)
-            ]
-        if num_draft > 0 and plan.draft_src_token_indices.size:
-            draft_groups = group_concurrent_contiguous(
-                plan.draft_src_token_indices,
-                plan.draft_dst_token_indices,
-            )
-            layers_params += [
-                (
-                    src_kv_ptrs[num_target + entry],
-                    dst_kv_ptrs[num_target + entry],
-                    dcp_token_item_lens[num_target + entry],
-                    draft_groups,
-                )
-                for entry in range(num_draft)
-            ]
-
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> List[Tuple[int, int, int]]:
@@ -1191,17 +1147,183 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
             )
 
-        if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(process_layer, *layer_params)
-                for layer_params in layers_params
-            ]
-            return self._await_transfer_futures(futures)
+        def run_layers(layers_params) -> int:
+            if not layers_params:
+                return 0
+            if self.enable_custom_mem_pool:
+                futures = [
+                    executor.submit(process_layer, *layer_params)
+                    for layer_params in layers_params
+                ]
+                return self._await_transfer_futures(futures)
+            transfer_blocks = []
+            for layer_params in layers_params:
+                transfer_blocks.extend(set_transfer_blocks(*layer_params))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        transfer_blocks = []
-        for layer_params in layers_params:
-            transfer_blocks.extend(set_transfer_blocks(*layer_params))
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        target_src_kv_ptrs = src_kv_ptrs[:num_target]
+        src_token_indices = plan.target_src_token_indices
+        target_transferred = False
+        draft_transferred = False
+        if pack_buffer is not None and src_token_indices.size and num_target > 0:
+            (
+                target_transferred,
+                draft_transferred,
+                ret,
+            ) = self._send_kvcache_dcp_packed_slices(
+                mooncake_session_id,
+                pack_buffer=pack_buffer,
+                src_kv_ptrs=src_kv_ptrs,
+                src_token_indices=src_token_indices,
+                dst_token_indices=plan.target_dst_token_indices,
+                dst_kv_ptrs=dst_kv_ptrs,
+                token_item_lens=dcp_token_item_lens,
+                num_target=num_target,
+                draft_src_token_indices=plan.draft_src_token_indices,
+                draft_dst_token_indices=plan.draft_dst_token_indices,
+                run_layers=run_layers,
+            )
+            if ret != 0:
+                return ret
+
+        layers_params = []
+        if src_token_indices.size and not target_transferred:
+            target_groups = group_concurrent_contiguous(
+                src_token_indices,
+                plan.target_dst_token_indices,
+            )
+            layers_params += [
+                (
+                    target_src_kv_ptrs[entry],
+                    dst_kv_ptrs[entry],
+                    dcp_token_item_lens[entry],
+                    target_groups,
+                )
+                for entry in range(num_target)
+            ]
+        if (
+            num_draft > 0
+            and plan.draft_src_token_indices.size
+            and not draft_transferred
+        ):
+            draft_groups = group_concurrent_contiguous(
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
+            )
+            layers_params += [
+                (
+                    src_kv_ptrs[num_target + entry],
+                    dst_kv_ptrs[num_target + entry],
+                    dcp_token_item_lens[num_target + entry],
+                    draft_groups,
+                )
+                for entry in range(num_draft)
+            ]
+
+        return run_layers(layers_params)
+
+    def _send_kvcache_dcp_packed_slices(
+        self,
+        mooncake_session_id: str,
+        *,
+        pack_buffer,
+        src_kv_ptrs: List[int],
+        src_token_indices: npt.NDArray[np.int64],
+        dst_token_indices: npt.NDArray[np.int64],
+        dst_kv_ptrs: List[int],
+        token_item_lens: List[int],
+        num_target: int,
+        draft_src_token_indices: npt.NDArray[np.int64],
+        draft_dst_token_indices: npt.NDArray[np.int64],
+        run_layers,
+    ) -> Tuple[bool, bool, int]:
+        """Transfer target (and draft) KV via the pack buffer, slicing
+        oversized transfers.
+
+        A chunk whose per-dst-rank token shard exceeds the pack buffer is
+        split into buffer-sized slices; each slice is gathered into the pack
+        buffer and bulk-transferred, and the transfer is awaited before the
+        buffer is reused for the next slice. This keeps long (mostly
+        cache-hit) prompts on the packed bulk-RDMA path instead of falling
+        back to per-token RDMA.
+
+        When the draft shares the target's src token indices (the plan's
+        current sharding convention), draft layers are packed into the same
+        buffer after the target layers and transferred in the same slice;
+        slice capacity then accounts for draft bytes, slightly lowering the
+        single-slice token ceiling. Otherwise draft falls back to per-token
+        groups (handled by the caller).
+
+        Returns (target_done, draft_done, ret): a False flag means that part
+        was not transferred and the caller must fall back to the per-token
+        path for it; ret is the first non-zero transfer status.
+        """
+        from sglang.srt.disaggregation.common.dcp_pack import (
+            dcp_pack_slice_tokens,
+            try_pack_dcp_src,
+        )
+
+        num_draft = len(src_kv_ptrs) - num_target
+        pack_draft = num_draft > 0 and np.array_equal(
+            draft_src_token_indices, src_token_indices
+        )
+        kv_ptrs = src_kv_ptrs if pack_draft else src_kv_ptrs[:num_target]
+        item_lens = token_item_lens if pack_draft else token_item_lens[:num_target]
+
+        slice_tokens = dcp_pack_slice_tokens(pack_buffer.get_size(), item_lens)
+        if slice_tokens <= 0:
+            return False, False, 0
+
+        n = int(src_token_indices.size)
+        for begin in range(0, n, slice_tokens):
+            end = min(begin + slice_tokens, n)
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=kv_ptrs,
+                src_token_indices=src_token_indices[begin:end],
+                token_item_lens=item_lens,
+            )
+            if packed is None:
+                # Slice capacity derives from the buffer size, so a misfit is
+                # unexpected; stay correct by falling back to per-token RDMA.
+                logger.warning(
+                    "PD DCP pack slice of %d tokens did not fit the pack "
+                    "buffer; falling back to per-token RDMA",
+                    end - begin,
+                )
+                return False, False, 0
+            packed_ptrs, packed_indices = packed
+            target_groups = group_concurrent_contiguous(
+                packed_indices, dst_token_indices[begin:end]
+            )
+            layers_params = [
+                (
+                    packed_ptrs[entry],
+                    dst_kv_ptrs[entry],
+                    item_lens[entry],
+                    target_groups,
+                )
+                for entry in range(num_target)
+            ]
+            if pack_draft:
+                draft_groups = group_concurrent_contiguous(
+                    packed_indices, draft_dst_token_indices[begin:end]
+                )
+                layers_params += [
+                    (
+                        packed_ptrs[num_target + entry],
+                        dst_kv_ptrs[num_target + entry],
+                        item_lens[num_target + entry],
+                        draft_groups,
+                    )
+                    for entry in range(num_draft)
+                ]
+            # run_layers awaits the slice's RDMA writes, so the pack buffer is
+            # safe to overwrite when the next slice is gathered.
+            ret = run_layers(layers_params)
+            if ret != 0:
+                return True, pack_draft, ret
+        return True, pack_draft, 0
 
     def send_kvcache_slice(
         self,

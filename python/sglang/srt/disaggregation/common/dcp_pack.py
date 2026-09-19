@@ -36,6 +36,14 @@ def dcp_pack_buffer_bytes(
     return dcp_size * rank_tokens * sum(token_item_lens)
 
 
+def dcp_pack_slice_tokens(pack_buffer_size: int, token_item_lens: Sequence[int]) -> int:
+    """Max tokens per pack slice: how many tokens' packed rows fit the buffer."""
+    per_token_bytes = sum(int(item_len) for item_len in token_item_lens)
+    if per_token_bytes <= 0:
+        return 0
+    return pack_buffer_size // per_token_bytes
+
+
 def try_pack_dcp_src(
     *,
     pack_buffer: StagingBuffer,
