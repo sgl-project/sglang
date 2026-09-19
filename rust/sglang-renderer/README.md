@@ -57,6 +57,23 @@ The CLI defaults to sampling parameters from the model's generation config.
 `--help` for template, parser, and limit options. A custom Cargo target directory
 or compilation target changes the executable path shown above.
 
+## Tool-call parser support
+
+`--tool-call-parser` uses Dynamo's parsers. See
+[Dynamo's supported tool-call parsers](https://docs.nvidia.com/dynamo/dev/parsing/tool-call-parsing#supported-tool-call-parsers)
+for parser names and model formats. These SGLang names need special attention:
+
+| SGLang name | Renderer support |
+| --- | --- |
+| `llama3` | Accepted alias for `llama3_json` |
+| `qwen` | Accepted alias for `qwen25` |
+| `glm`, `glm45` | Accepted aliases for `glm47` |
+| `deepseekv3` | Use `deepseek_v3` |
+| `gpt-oss` | Use `harmony` |
+| `step3` | Unsupported |
+
+Reasoning parsers are configured separately with `--reasoning-parser`.
+
 ## Docker image
 
 Build the CPU-only renderer image from the repository root (`linux/amd64` or
