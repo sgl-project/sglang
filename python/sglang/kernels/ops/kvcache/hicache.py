@@ -106,6 +106,7 @@ def _jit_hicache_tma_module(*, block_quota: int) -> Module:
             ("launch_all", f"&HiCacheTmaKernel<{args}>::run_all"),
             ("launch_one_mla", f"&HiCacheTmaKernel<{args}>::run_one_mla"),
             ("launch_all_mla", f"&HiCacheTmaKernel<{args}>::run_all_mla"),
+            ("fits_device", f"&HiCacheTmaKernel<{args}>::fits_device"),
         ],
     )
 
@@ -134,13 +135,13 @@ def use_hicache_tma_kernel(
     if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
         return False
     try:
-        _jit_hicache_tma_module(block_quota=block_quota)
-        return True
+        module = _jit_hicache_tma_module(block_quota=block_quota)
     except Exception as e:
         logging.getLogger(__name__).warning(
             f"Failed to load the TMA HiCache kernel, using the register kernel: {e}"
         )
         return False
+    return bool(module.fits_device(torch.cuda.current_device()))
 
 
 def can_use_hicache_jit_kernel(

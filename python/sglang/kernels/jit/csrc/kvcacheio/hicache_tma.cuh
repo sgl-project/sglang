@@ -375,6 +375,15 @@ struct HiCacheTmaKernel {
     return hicache_tma_rows_per_chunk(kStageBytes, row_bytes);
   }
 
+  // Whether the device can hold the smem ring in one CTA; sm_90+ parts with
+  // small opt-in shared memory (consumer Blackwell) must keep the register kernel.
+  static bool fits_device(int64_t device_id) {
+    int max_smem = 0;
+    host::RuntimeDeviceCheck(
+        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, static_cast<int>(device_id)));
+    return static_cast<std::size_t>(max_smem) >= sizeof(Smem);
+  }
+
   // ceil(2^32 / units_per_row): (u * magic) >> 32 overestimates u / units_per_row
   // by at most one for the unit counts a stage can hold; the kernel fixes that up.
   static uint64_t units_per_row_magic(uint32_t row_bytes) {
