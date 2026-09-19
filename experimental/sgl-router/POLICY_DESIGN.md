@@ -342,9 +342,9 @@ required settings even when the model's default uses a different policy.
 
 `state/load_monitor/` owns engine reports and existing router-local request
 accounting. Power-of-two owns an `Arc<EngineLoadTable>` and captures a snapshot
-locally for each nonempty selection attempt. Its private selection helper returns
-the chosen engine together with that engine's `Option<EngineWorkerLoad>`; admission
-borrows that record. No snapshot or observation is added to `Pick`, `PickRequest`,
+locally for each nonempty selection attempt. Its `pick` method selects the engine,
+then passes that engine's borrowed load record directly to admission.
+No snapshot or observation is added to `Pick`, `PickRequest`,
 or the bucket interface, and no shared observation context is threaded through
 policies or fallbacks.
 
