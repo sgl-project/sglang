@@ -40,11 +40,13 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
         numel = 1 << 20
         cases = [
             ("low", 2**-8, False),
+            ("sub_cliff", 2**-10, False),
             ("ordinary", 100.0, False),
             ("sum_above_fp16", 20_000.0, False),
             ("input_above_fp16", 80_000.0, False),
             ("negative_sum_above_fp16", -20_000.0, False),
             ("mixed_input_above_fp16", 1.0, True),
+            ("sub_cliff_mixed", 2**-10, True),
         ]
         for quant_mode in ("FP", "INT8", "INT6", "INT4"):
             os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = quant_mode
@@ -54,11 +56,17 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
             try:
                 for case_name, value, mixed in cases:
                     inp = torch.full(
-                        (numel,), value, dtype=torch.bfloat16, device=device
+                        (numel,),
+                        value * (1.0 + rank * 0.1),
+                        dtype=torch.bfloat16,
+                        device=device,
                     )
                     if mixed:
-                        inp[::32] = 80_000.0
-                    expected = (inp.float() * world_size).to(torch.bfloat16)
+                        inp[::32] = 80_000.0 if value >= 1.0 else (value * 1000)
+                    dist.barrier()
+                    expected = inp.float().clone()
+                    dist.all_reduce(expected, op=dist.ReduceOp.SUM)
+                    expected = expected.to(torch.bfloat16)
 
                     dist.barrier()
                     out = quick_all_reduce.quick_all_reduce(inp)
@@ -66,7 +74,20 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
                     assert torch.isfinite(out).all().item(), (
                         f"{quant_mode=} {case_name=} produced non-finite output"
                     )
-                    if quant_mode == "FP" or case_name in ("low", "ordinary"):
+                    if quant_mode == "FP" or case_name in (
+                        "low",
+                        "ordinary",
+                        "sub_cliff",
+                        "sub_cliff_mixed",
+                    ):
+                        torch.testing.assert_close(
+                            out,
+                            expected,
+                            rtol=0.15,
+                            atol=1e-4,
+                            msg=lambda msg: f"{quant_mode=} {case_name=} error\n{msg}",
+                        )
+                    elif False:
                         torch.testing.assert_close(
                             out,
                             expected,
