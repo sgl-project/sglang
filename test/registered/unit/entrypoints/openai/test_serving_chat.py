@@ -1332,8 +1332,11 @@ class ServingChatTestCase(unittest.TestCase):
                 {
                     "role": "developer",
                     "content": "<|kimi_image_placeholder|>",
-                    "tools": [tool],
                 },
+                # Tools ride on their own content-less message: the K3 encoder
+                # renders a tools-carrying system message as a tool declaration
+                # and drops its content, so the two cannot share one message.
+                {"role": "developer", "content": "", "tools": [tool]},
                 {
                     "role": "user",
                     "content": [
@@ -1383,17 +1386,17 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(
             rendered_messages[0]["content"], "<| kimi_image_placeholder |>"
         )
-        self.assertNotIn("strict", rendered_messages[0]["tools"][0]["function"])
+        self.assertNotIn("strict", rendered_messages[1]["tools"][0]["function"])
         self.assertEqual(
-            rendered_messages[1]["content"][0]["text"],
+            rendered_messages[2]["content"][0]["text"],
             "Explain <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[2]["reasoning_content"],
+            rendered_messages[3]["reasoning_content"],
             "Inspect <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[2]["tool_calls"][0]["function"]["arguments"],
+            rendered_messages[3]["tool_calls"][0]["function"]["arguments"],
             {
                 "source": "<| kimi_image_placeholder |>",
                 "nested": ["<| kimi_image_placeholder |>"],
@@ -2159,12 +2162,13 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(remaining, '["get_weather"]')
         self.assertEqual(finish_reason["type"], "stop")
 
-    def test_required_tool_choice_rejects_conflicting_output_constraint(self):
-        """response_format and a forced tool call cannot both be honored: the
-        tool-call constraint was dropped with only a warning, so the model was
-        constrained to a shape that can never contain a tool call."""
+    def test_required_tool_choice_overrides_conflicting_response_format(self):
+        """A forced tool call produces a tool_calls message with no content,
+        so response_format has nothing left to constrain: the tool-call
+        constraint wins and response_format is dropped with a warning
+        (OpenAI/Moonshot behavior), instead of rejecting the request."""
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
-        constraint = ("structural_tag", None)
+        constraint = ("json_schema", {"type": "array"})
         conflicting = [
             {"type": "json_object"},
             {
@@ -2185,13 +2189,41 @@ class ServingChatTestCase(unittest.TestCase):
                         tool_choice=tool_choice,
                         response_format=response_format,
                     )
-                    with self.assertRaises(ValueError) as ctx:
-                        request.to_sampling_params(
+                    with self.assertLogs(
+                        "sglang.srt.entrypoints.openai.protocol", level="WARNING"
+                    ) as logs:
+                        sampling_params = request.to_sampling_params(
                             stop=[],
                             model_generation_config={},
                             tool_call_constraint=constraint,
                         )
-                    self.assertIn("cannot be combined", str(ctx.exception))
+                    self.assertIn("ignoring response_format", "\n".join(logs.output))
+                    self.assertEqual(
+                        sampling_params["json_schema"], '{"type": "array"}'
+                    )
+                    self.assertIsNone(sampling_params.get("structural_tag"))
+
+    def test_required_tool_choice_still_rejects_regex_and_ebnf(self):
+        """regex/ebnf are explicit output constraints with no OpenAI
+        equivalent: silently dropping one would be surprising, so a forced
+        tool call combined with either stays a hard error."""
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        for extra in ({"regex": "a+"}, {"ebnf": 'root ::= "a"'}):
+            with self.subTest(extra=extra):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=tools,
+                    tool_choice="required",
+                    **extra,
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    request.to_sampling_params(
+                        stop=[],
+                        model_generation_config={},
+                        tool_call_constraint=("json_schema", {"type": "array"}),
+                    )
+                self.assertIn("cannot be combined", str(ctx.exception))
 
     def test_auto_tool_choice_keeps_response_format_without_raising(self):
         """ "auto" means the model need not call a tool, so dropping the
@@ -4593,6 +4625,106 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+
+class KimiK3ToolCallRequestTestCase(unittest.TestCase):
+    """Tool-call request handling under the K3 encoding."""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def setUp(self):
+        # Bag-read config (get_serving()) comes from the published ServerArgs;
+        # the mock server_args still answers config_value() lookups.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+
+    def _template_kwargs(self, **kwargs):
+        request = ChatCompletionRequest(model="x", messages=self.MESSAGES, **kwargs)
+        self.chat._process_messages(request, is_multimodal=False)
+        return self.tm.tokenizer.apply_chat_template.call_args.kwargs
+
+    def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
+        """The constraint has to know which channel the prompt left open."""
+        from unittest.mock import patch
+
+        for kwargs, expected in (
+            ({"chat_template_kwargs": {"thinking": False}}, True),
+            ({"chat_template_kwargs": {"thinking": True}}, False),
+            ({}, False),
+        ):
+            with self.subTest(request=kwargs):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=self.MESSAGES,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    tool_choice="required",
+                    **kwargs,
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as ParserMock:
+                    parser = ParserMock.return_value
+                    parser.get_structure_constraint.return_value = None
+                    parser.detector.parses_required_natively.return_value = False
+                    parser.detector.eot_token = "<|close|>tools<|sep|>"
+                    self.chat._process_messages(request, is_multimodal=False)
+                self.assertEqual(
+                    parser.get_structure_constraint.call_args.kwargs[
+                        "response_channel_open"
+                    ],
+                    expected,
+                )
+
+    def test_draft07_identifier_in_tool_parameters_is_accepted(self):
+        """A `$id` with a fragment is draft-07 style: it fails the 2020-12
+        metaschema's URI form check but constrains nothing, and this stack
+        renders and constrains such a schema correctly."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {
+                            "$id": "#user",
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(request))
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -97,12 +98,19 @@ def _tools_section(*calls):
     return TOOLS_OPEN + "".join(calls) + TOOLS_CLOSE
 
 
-def _grammar(tools, tool_choice="auto", thinking_mode=False, parallel_tool_calls=True):
+def _grammar(
+    tools,
+    tool_choice="auto",
+    thinking_mode=False,
+    parallel_tool_calls=True,
+    response_channel_open=False,
+):
     structural_tag = get_kimik3_structural_tag(
         tools,
         tool_choice=tool_choice,
         thinking_mode=thinking_mode,
         parallel_tool_calls=parallel_tool_calls,
+        response_channel_open=response_channel_open,
     )
     return xgr.Grammar.from_structural_tag(structural_tag)
 
@@ -200,6 +208,34 @@ def test_required_allows_response_prefix_but_requires_tools():
     response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
+    assert not _accepts(grammar, response)
+
+
+def test_required_inside_an_open_response_channel_must_close_it_first():
+    """With reasoning off the generation prompt leaves the response channel open.
+
+    Free text there is a trap: the model answers in that channel, never reaches
+    the tools section the grammar still requires, and so cannot stop either --
+    generation runs to max_tokens with no tool call.
+    """
+    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=True)
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, "Checking." + RESPONSE_CLOSE + call)
+    assert not _accepts(grammar, call)
+    assert not _accepts(grammar, RESPONSE_CLOSE)
+
+
+def test_required_without_an_open_response_channel_is_unchanged():
+    """Reasoning on: the model closes think itself, and a complete response block
+    before the call stays legitimate."""
+    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=False)
+    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
+    call = _tools_section(_valid_weather_call())
+
+    assert _accepts(grammar, response + call)
+    assert _accepts(grammar, call)
     assert not _accepts(grammar, response)
 
 
@@ -410,6 +446,119 @@ def test_strict_schema_handles_one_sided_negative_integer_minimum():
             grammar,
             _tools_section(_call("submit", 1, _argument("value", "number", value))),
         )
+
+
+def test_strict_schema_relaxes_non_ascii_property_names():
+    """A declared non-ASCII property name is unsatisfiable in xgrammar, so the
+    argument falls back to the bare type instead of an impossible grammar."""
+    key = "abc\U0001f60a"
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "object",
+                        "properties": {key: {"type": "string"}},
+                        "required": [key],
+                        "additionalProperties": False,
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    for spelling in (
+        json.dumps({key: ""}),
+        json.dumps({key: ""}, ensure_ascii=False),
+    ):
+        assert _accepts(
+            grammar,
+            _tools_section(_call("submit", 1, _argument("value", "object", spelling))),
+        ), spelling
+    # ASCII siblings keep their constraint: a wrong type is still refused.
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("submit", 1, _argument("value", "number", "1"))),
+    )
+
+
+def test_unreferenced_definition_does_not_relax_other_arguments():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {"amount": {"$ref": "#/$defs/Money"}},
+                "required": ["amount"],
+                "additionalProperties": False,
+                "$defs": {
+                    "Money": {"type": "integer"},
+                    # Never referenced by any argument of this tool.
+                    "Loc": {
+                        "type": "object",
+                        "properties": {
+                            "\u0433\u043e\u0440\u043e\u0434\u0435": {"type": "string"}
+                        },
+                    },
+                },
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    assert _accepts(
+        grammar, _tools_section(_call("submit", 1, _argument("amount", "number", "5")))
+    )
+    # Still constrained: the relaxation did not leak across from `Loc`.
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("submit", 1, _argument("amount", "string", "five"))),
+    )
+
+
+def test_strict_schema_keeps_ascii_property_names_constrained():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "object",
+                        "properties": {"only": {"type": "string"}},
+                        "required": ["only"],
+                        "additionalProperties": False,
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+    assert _accepts(
+        grammar,
+        _tools_section(
+            _call("submit", 1, _argument("value", "object", '{"only": "x"}'))
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call("submit", 1, _argument("value", "object", '{"other": "x"}'))
+        ),
+    )
 
 
 def test_strict_schema_preserves_additional_properties_default():
