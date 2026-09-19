@@ -303,7 +303,7 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     def test_mxfp8_view_and_swizzled_input(self):
         if "flashinfer_cutedsl" not in _block32_backends():
             self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
-        from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+        from sglang.kernels.ops.attention.dsv4.wo_a import (
             _quantize_partial,
             _wo_a_reduce,
         )
