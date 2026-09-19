@@ -59,7 +59,6 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -212,12 +211,14 @@ def build_kv_cache(
     attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: ParallelState,
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
+    # Built from the scheduler loop, outside any draft scope, so the context
+    # answers for the process this cache belongs to.
+    parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -318,10 +319,10 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-        pp_rank=ps.pp_rank,
-        pp_size=ps.pp_size,
-        attn_cp_rank=ps.attn_cp_rank,
-        attn_cp_size=ps.attn_cp_size,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        attn_cp_rank=parallel.attn_cp_rank,
+        attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -340,8 +341,8 @@ def build_kv_cache(
             effective_chunked_prefill_size=effective_chunked_prefill_size,
             tp_worker=tp_worker,
             model_config=model_config,
-            tp_size=ps.tp_size,
-            tp_rank=ps.tp_rank,
+            tp_size=parallel.tp_size,
+            tp_rank=parallel.tp_rank,
             tp_group=tp_group,
         )
     )
