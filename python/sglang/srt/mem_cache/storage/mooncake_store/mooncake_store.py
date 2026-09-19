@@ -874,14 +874,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # caller has to intersect these sets across ranks.
         restorable = list(range(1, kv_pages + 1))
 
+        if not restorable:
+            return PoolTransferResult(0, hit_count, [])
+
+        prepared = []
+        all_component_keys = []
         for transfer in pool_transfers or []:
-            if not restorable:
-                break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
+            start = len(all_component_keys)
+            all_component_keys.extend(component_keys)
+            prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
+
+        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
+        for transfer, key_multiplier, start, end in prepared:
+            if not restorable:
+                break
+            ex = all_exists[start:end]
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -923,13 +934,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
-        # Unified v2 I/O path: each PoolTransfer can expand to one or more
-        # storage objects per logical page, but API still reports page-level result.
-        results: dict = {}
+        # Expand every pool first so one logical operation becomes one Mooncake
+        # RPC rather than one RPC per hybrid-cache component.
+        prepared = []
+        all_key_strs = []
+        all_ptrs = []
+        all_sizes = []
+        all_group_ids = []
+        buffer_requests = []
         for transfer in transfers:
-            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            host_pool = self.registered_pools.get(transfer.name)
             keys = transfer.keys
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            if host_pool is None:
+                raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
+            page_size = host_pool.page_size or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
@@ -939,36 +957,103 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if len(ptr_list) != len(key_strs):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
-
-            if is_set:
-                group_ids = (
+            start = len(all_key_strs)
+            all_key_strs.extend(key_strs)
+            buffer_requests.append(
+                (host_pool, host_indices, key_strs, key_multiplier, start)
+            )
+            if is_set and self._can_use_group_semantics():
+                all_group_ids.extend(
                     self._expand_group_ids(tagged_keys, key_multiplier)
-                    if self._can_use_group_semantics()
-                    else None
                 )
-                exist_result = self._batch_exist(key_strs)
-                io_results = [0 if state == 1 else -1 for state in exist_result]
-                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
-                    put_results = self._put_batch_zero_copy_impl(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
-                        self._filter_group_ids(group_ids, missing_idx),
+            prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
+
+        if not prepared:
+            return {}
+
+        exist_result = self._batch_exist(all_key_strs) if is_set else None
+        for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
+            object_indices = list(range(len(key_strs)))
+            if exist_result is not None:
+                # Only pages the store is missing need per-layer addresses. Zero
+                # placeholders keep result and group offsets aligned for the rest.
+                missing_pages = [
+                    page
+                    for page in range(len(key_strs) // key_multiplier)
+                    if any(
+                        state != 1
+                        for state in exist_result[
+                            start + page * key_multiplier : start
+                            + (page + 1) * key_multiplier
+                        ]
                     )
-                    for i, res in zip(missing_idx, put_results):
-                        io_results[i] = res
-            else:
-                io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
+                ]
+                if not missing_pages:
+                    all_ptrs.extend([0] * len(key_strs))
+                    all_sizes.extend([0] * len(key_strs))
+                    continue
+                if len(missing_pages) * key_multiplier < len(key_strs):
+                    # Metadata generation consumes CPU indices anyway, so select
+                    # the logical pages there rather than uploading a new index.
+                    page_size = host_pool.page_size or 1
+                    host_indices = host_indices.detach().to(device="cpu")
+                    host_indices = host_indices.reshape(-1, page_size)[
+                        missing_pages
+                    ].reshape(-1)
+                    object_indices = [
+                        page * key_multiplier + component
+                        for page in missing_pages
+                        for component in range(key_multiplier)
+                    ]
+            selected_keys = [key_strs[i] for i in object_indices]
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if len(ptr_list) != len(selected_keys):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    selected_keys, ptr_list, element_size_list
                 )
-            results[transfer.name] = self._batch_postprocess(
-                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
+            pool_ptrs = [0] * len(key_strs)
+            pool_sizes = [0] * len(key_strs)
+            for index, ptr, size in zip(object_indices, ptr_list, element_size_list):
+                pool_ptrs[index] = ptr
+                pool_sizes[index] = size
+            all_ptrs.extend(pool_ptrs)
+            all_sizes.extend(pool_sizes)
+
+        if any(isinstance(ptr, Sequence) for ptr in all_ptrs):
+            all_ptrs = [
+                list(ptr) if isinstance(ptr, Sequence) else [ptr] for ptr in all_ptrs
+            ]
+            all_sizes = [
+                list(size) if isinstance(size, Sequence) else [size]
+                for size in all_sizes
+            ]
+
+        if is_set:
+            assert exist_result is not None
+            io_results = [0 if state == 1 else -1 for state in exist_result]
+            missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+            if missing_idx:
+                put_results = self._put_batch_zero_copy_impl(
+                    [all_key_strs[i] for i in missing_idx],
+                    [all_ptrs[i] for i in missing_idx],
+                    [all_sizes[i] for i in missing_idx],
+                    self._filter_group_ids(
+                        all_group_ids if all_group_ids else None, missing_idx
+                    ),
+                )
+                for i, res in zip(missing_idx, put_results):
+                    io_results[i] = res
+        else:
+            io_results = self._get_batch_zero_copy_impl(
+                all_key_strs, all_ptrs, all_sizes
+            )
+
+        results: dict = {}
+        for name, key_multiplier, start, end in prepared:
+            results[name] = self._batch_postprocess(
+                io_results[start:end],
+                is_set_operate=is_set,
+                key_multiplier=key_multiplier,
             )
         return results
 
