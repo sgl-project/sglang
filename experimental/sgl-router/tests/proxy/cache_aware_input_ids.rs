@@ -198,7 +198,20 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             send(Arc::clone(&ctx), request.clone()).await,
             StatusCode::OK
         );
-        assert_eq!(captured(&mock), request, "body must be forwarded untouched");
+        // The abort-on-disconnect path mints a `rid` into every plain-mode
+        // body; everything else must be forwarded untouched.
+        let mut forwarded = captured(&mock);
+        let rid = forwarded
+            .as_object_mut()
+            .expect("a forwarded chat body is an object")
+            .remove("rid");
+        assert!(
+            rid.as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.starts_with("router-")),
+            "plain mode must mint an abort rid; got {rid:?}",
+        );
+        assert_eq!(forwarded, request, "body must be forwarded untouched");
     }
     // Bypasses are not rendering failures.
     assert!(!ctx

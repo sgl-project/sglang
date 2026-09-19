@@ -106,9 +106,27 @@ fn without_forwarding(mut cfg: Config, policy: PolicyKind) -> Config {
     cfg
 }
 
+/// Strip the router-minted `rid` the abort-on-disconnect path injects into
+/// every plain-mode body, so the assertion stays about what these tests are
+/// actually pinning: that no `input_ids` were added and `messages` survived.
+/// The rid's own shape is covered in `chat_routing.rs`.
+fn without_minted_rid(mut body: Value) -> Value {
+    let rid = body
+        .as_object_mut()
+        .expect("a forwarded chat body is an object")
+        .remove("rid");
+    assert!(
+        rid.as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|r| r.starts_with("router-")),
+        "plain mode must mint an abort rid; got {rid:?}",
+    );
+    body
+}
+
 async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
     assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
-    assert_eq!(captured(mock), *request);
+    assert_eq!(without_minted_rid(captured(mock)), *request);
     assert!(!ctx
         .metrics
         .render()
