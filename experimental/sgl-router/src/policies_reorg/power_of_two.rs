@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use futures::future::BoxFuture;
 
-use crate::state::load_monitor::engine_load::{EngineLoadTable, EngineWorkerLoad};
+use crate::state::load_monitor::engine_load::EngineLoadTable;
 use crate::workers::Worker;
 
 use super::admission::{AllowAll, Decision, EngineAdmission};
@@ -30,28 +30,6 @@ impl PowerOfTwoPolicy {
             fallback: None,
         }
     }
-
-    fn select_engine(
-        &self,
-        engines: &[Arc<Worker>],
-        _request: &PickRequest<'_>,
-    ) -> Result<(Arc<Worker>, Option<EngineWorkerLoad>), PickError> {
-        if engines.is_empty() {
-            return Err(PickError::NoCandidates);
-        }
-        // Keep load local to selection. Admission receives the chosen engine's
-        // record from this same snapshot, including capacity and report time.
-        let load = self.engine_load.capture_snapshot(Instant::now());
-        match engines {
-            [engine] => Ok((
-                Arc::clone(engine),
-                load.fresh_load_for_url(&engine.url).cloned(),
-            )),
-            _ => {
-                todo!("sample two engines and compare load for request.stage")
-            }
-        }
-    }
 }
 
 impl Policy for PowerOfTwoPolicy {
@@ -61,10 +39,17 @@ impl Policy for PowerOfTwoPolicy {
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>> {
         Box::pin(async move {
-            let (engine, load) = self.select_engine(engines, request)?;
-            if let Decision::Reject(reason) =
-                self.admission.check(&engine, request, load.as_ref())?
-            {
+            if engines.is_empty() {
+                return Err(PickError::NoCandidates);
+            }
+            // Selection and admission use the same load observation.
+            let load = self.engine_load.capture_snapshot(Instant::now());
+            let engine = match engines {
+                [engine] => Arc::clone(engine),
+                _ => todo!("sample two engines and compare load for request.stage"),
+            };
+            let engine_load = load.fresh_load_for_url(&engine.url);
+            if let Decision::Reject(reason) = self.admission.check(&engine, request, engine_load)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
