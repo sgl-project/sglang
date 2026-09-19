@@ -125,7 +125,7 @@ async fn pools_isolate_model_health_and_stage() {
     let load = LoadView::new(&table);
     let model = ModelId("m".into());
     let request = request(&model, Stage::Plain, &load);
-    let plain = BucketResolver::new(registry(), Pools::Plain(implicit()));
+    let plain = BucketResolver::new(registry(), Pools::plain(implicit()));
     let groups = plain.ordered_groups(&request).unwrap();
     assert_eq!(
         groups[0]
@@ -140,7 +140,7 @@ async fn pools_isolate_model_health_and_stage() {
     let pd_model = ModelId("pd".into());
     let pd = BucketResolver::new(
         registry(),
-        Pools::Disaggregated {
+        Pools {
             prefill: implicit(),
             decode: implicit(),
         },
@@ -148,11 +148,13 @@ async fn pools_isolate_model_health_and_stage() {
     for (stage, id) in [(Stage::Prefill, "p"), (Stage::Decode, "d")] {
         let request = self::request(&pd_model, stage, &load);
         assert_eq!(pd.pick(&request).await.unwrap().engine.id.0, id);
-        assert!(matches!(
-            plain.pick(&request).await,
-            Err(PickError::InvalidConfiguration(_))
-        ));
     }
+    // A plain deployment has no decode pool.
+    let decode = self::request(&pd_model, Stage::Decode, &load);
+    assert!(matches!(
+        plain.pick(&decode).await,
+        Err(PickError::NoCandidates)
+    ));
 }
 
 #[test]
@@ -177,16 +179,13 @@ fn groups_order_by_slo_then_rank_and_id_and_filter_limits() {
         bucket("a", 1, &["a"], policy.clone()),
         bucket("empty", 0, &["missing"], policy),
     ];
-    let mut resolver = BucketResolver::new(registry(), Pools::Plain(pool(buckets)));
+    let mut resolver = BucketResolver::new(registry(), Pools::plain(pool(buckets)));
     for (slo, expected) in [
         (SloPreference::Disabled, vec!["a", "z", "fast"]),
         (SloPreference::SloFirst, vec!["fast", "a", "z"]),
         (SloPreference::BestEffort, vec!["a", "z", "fast"]),
     ] {
-        let Pools::Plain(pool) = &mut resolver.pools else {
-            unreachable!()
-        };
-        pool.slo = slo;
+        resolver.pools.prefill.slo = slo;
         let groups = resolver.ordered_groups(&request).unwrap();
         assert_eq!(
             groups.iter().map(|g| g.bucket).collect::<Vec<_>>(),
@@ -213,7 +212,7 @@ fn decode_unknown_output_uses_only_unbounded_sequence_ranges() {
     catch_all.limits.context = Some(30);
     let resolver = BucketResolver::new(
         registry(),
-        Pools::Disaggregated {
+        Pools {
             prefill: implicit(),
             decode: pool(vec![bounded, catch_all]),
         },
@@ -250,7 +249,7 @@ async fn rejection_advances_once_or_stops_without_relaxing_admission() {
         let second = Arc::new(TestPolicy::default());
         let mut resolver = BucketResolver::new(
             registry(),
-            Pools::Plain(pool(vec![
+            Pools::plain(pool(vec![
                 bucket("first", 0, &["a"], first.clone()),
                 bucket("second", 1, &["b"], second.clone()),
             ])),
@@ -303,7 +302,7 @@ async fn misses_advance_but_invalid_signals_and_foreign_picks_stop() {
         let second = Arc::new(TestPolicy::default());
         let resolver = BucketResolver::new(
             registry(),
-            Pools::Plain(pool(vec![
+            Pools::plain(pool(vec![
                 bucket("first", 0, &["a"], Arc::new(first)),
                 bucket("second", 1, &["b"], second.clone()),
             ])),

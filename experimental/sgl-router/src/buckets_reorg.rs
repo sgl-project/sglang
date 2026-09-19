@@ -92,7 +92,7 @@ pub enum SloPreference {
     BestEffort,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Pool {
     pub buckets: Vec<Bucket>,
     pub slo: SloPreference,
@@ -116,21 +116,25 @@ impl Pool {
     }
 }
 
+/// The prefill pool also serves plain requests; a plain deployment never asks for decode.
 #[derive(Debug)]
-pub enum Pools {
-    Plain(Pool),
-    Disaggregated { prefill: Pool, decode: Pool },
+pub struct Pools {
+    pub prefill: Pool,
+    pub decode: Pool,
 }
 
 impl Pools {
-    fn for_stage(&self, stage: Stage) -> Result<&Pool, PickError> {
-        match (self, stage) {
-            (Self::Plain(pool), Stage::Plain) => Ok(pool),
-            (Self::Disaggregated { prefill, .. }, Stage::Prefill) => Ok(prefill),
-            (Self::Disaggregated { decode, .. }, Stage::Decode) => Ok(decode),
-            _ => Err(PickError::InvalidConfiguration(
-                "stage does not belong to deployment".into(),
-            )),
+    pub fn plain(pool: Pool) -> Self {
+        Self {
+            prefill: pool,
+            decode: Pool::default(),
+        }
+    }
+
+    fn for_stage(&self, stage: Stage) -> &Pool {
+        match stage {
+            Stage::Plain | Stage::Prefill => &self.prefill,
+            Stage::Decode => &self.decode,
         }
     }
 }
@@ -173,7 +177,7 @@ impl BucketResolver {
                 "invalid request size or SLO".into(),
             ));
         }
-        let pool = self.pools.for_stage(pick.stage)?;
+        let pool = self.pools.for_stage(pick.stage);
         let mut engines: Vec<_> = self
             .workers
             .healthy_workers_for(pick.model)

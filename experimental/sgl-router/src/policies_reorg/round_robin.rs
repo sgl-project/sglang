@@ -18,6 +18,15 @@ pub struct RoundRobinPolicy {
     cursor: AtomicUsize,
 }
 
+impl RoundRobinPolicy {
+    pub fn new(admission: Admission) -> Self {
+        Self {
+            admission,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+}
+
 impl Policy for RoundRobinPolicy {
     fn pick<'a>(
         &'a self,

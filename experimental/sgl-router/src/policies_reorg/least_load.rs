@@ -21,6 +21,15 @@ pub struct LeastLoadPolicy {
     rotor: AtomicUsize,
 }
 
+impl LeastLoadPolicy {
+    pub fn new(admission: Admission) -> Self {
+        Self {
+            admission,
+            rotor: AtomicUsize::new(0),
+        }
+    }
+}
+
 impl Policy for LeastLoadPolicy {
     fn pick<'a>(
         &'a self,

@@ -42,6 +42,7 @@ fn bucket(id: &str, stage: BucketStage, rank: u32, worker_id: &str) -> BucketSpe
         ttft_p95_at_capacity_ms: None,
         tps_p05_at_capacity: None,
         max_pending_prefill_tokens: None,
+        policy: None,
     }
 }
 

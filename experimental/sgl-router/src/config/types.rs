@@ -53,7 +53,8 @@ impl Default for ActiveLoadConfig {
 }
 
 /// Routing strategies accepted by `--policy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
     #[default]
     #[value(name = "round_robin")]
@@ -145,6 +146,9 @@ pub struct BucketSpec {
     pub tps_p05_at_capacity: Option<f64>,
     #[serde(default)]
     pub max_pending_prefill_tokens: Option<u64>,
+    /// Overrides the model's `--policy` for this bucket.
+    #[serde(default)]
+    pub policy: Option<PolicyKind>,
 }
 
 impl std::fmt::Display for PolicyKind {

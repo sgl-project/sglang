@@ -56,6 +56,26 @@ impl EngineAdmission for Capacity {
     }
 }
 
+/// Waiting uncached tokens plus this request's input must fit the bucket
+/// budget; admits without a fresh native sample.
+#[derive(Debug)]
+pub struct PendingPrefill(pub u64);
+
+impl EngineAdmission for PendingPrefill {
+    fn check(&self, engine: &Worker, request: &PickRequest<'_>) -> Result<Decision, PickError> {
+        let fits = request
+            .load
+            .snapshot()
+            .fresh_native_cache_load_for_url(&engine.url)
+            .is_none_or(|load| {
+                load.num_waiting_uncached_tokens
+                    .saturating_add(request.input_tokens)
+                    <= self.0
+            });
+        Ok(Decision::from(fits, "pending_prefill_budget"))
+    }
+}
+
 /// Router-local in-flight requests must stay below the limit.
 #[derive(Debug)]
 pub struct InFlightLimit(pub usize);

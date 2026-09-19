@@ -5,6 +5,7 @@
 //! `policies` stays live until the switch PR replaces it.
 
 pub mod admission;
+pub mod factory;
 pub mod least_load;
 pub mod power_of_two;
 pub mod random;
@@ -83,8 +84,6 @@ pub enum PickError {
     AdmissionRejected(Rejection),
     #[error("invalid signal: {0}")]
     InvalidSignal(String),
-    #[error("invalid configuration: {0}")]
-    InvalidConfiguration(String),
     #[error("policy selected an engine outside its candidates: {0:?}")]
     OutsideCandidates(WorkerId),
 }
