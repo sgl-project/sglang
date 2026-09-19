@@ -848,7 +848,11 @@ class SchedulerPPMixin:
                 get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
             )
         else:
-            data = None
+            # Same two-hop fan-out as SchedulerRequestReceiver: the attn_tp
+            # hop runs first, and its source in an attn_cp_rank != 0 slice has
+            # nothing yet. broadcast_pyobj reads len(data) on the source, so
+            # start from an empty list and let the attn_cp hop fill it in.
+            data = []
 
         data = attn_cp_tp_broadcast_pyobj(data)
         return data
