@@ -14,12 +14,11 @@ class C_HiRadixCacheHook(BaseHook):
             # The async thread for prefetching and backup in `HiCacheController` has been deprecated.
             # So we have to handle the backup or prefetch operation manually.
             self.cache_controller.handle_backup_operation()
-            self.cache_controller.handle_prefetch_operation()
+            self.cache_controller.handle_prefetch_query()
             result = original_check_hicache_events(self, *args, **kwargs)
             # Host pages are allocated after the storage query. Run the
             # simulated transfer only after that allocation step.
-            if hasattr(self.cache_controller, "prefetch_hit_queue"):
-                self.cache_controller.handle_prefetch_operation()
+            self.cache_controller.handle_prefetch_operation()
             return result
 
         target.check_hicache_events = wrapped_check_hicache_events
