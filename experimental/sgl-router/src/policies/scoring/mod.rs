@@ -417,11 +417,11 @@ mod tests {
     use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{resolve_prefill, CandidateRange};
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::load_based::LoadBasedPolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::state::load_monitor::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use std::collections::HashMap;
     use std::time::Instant;
 

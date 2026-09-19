@@ -8,14 +8,17 @@ use sgl_router::{
     config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
     policies::{
-        active_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
-        factory::build_registry as build_policy_registry,
-        kv_events::{BlockSizeOracle, KvEventIndex},
-        prefix_provider::RadixTreePrefixProvider,
+        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
     },
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
+    state::{
+        kv_events::{BlockSizeOracle, KvEventIndex},
+        load_monitor::active_load::{
+            spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock,
+        },
+    },
     tokenizer::TokenizerRegistry,
     workers::{manager, WorkerRegistry},
 };

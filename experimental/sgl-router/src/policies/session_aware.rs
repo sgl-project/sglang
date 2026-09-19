@@ -5,10 +5,12 @@
 
 use crate::config::{AffinityConfig, SessionAffinityMode};
 use crate::discovery::WorkerId;
-use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::state::load_monitor::active_load::{
+    spawn_sweeper, Clock, JanitorHandle, SystemTimeClock,
+};
 use crate::workers::Worker;
 use dashmap::DashMap;
 use rand::Rng;
@@ -308,7 +310,7 @@ fn stable_backup(
 mod lifecycle_tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerMode, WorkerSpec};
-    use crate::policies::active_load::MockClock;
+    use crate::state::load_monitor::active_load::MockClock;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 

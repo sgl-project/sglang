@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use zeromq::SocketSend;
 
-use sgl_router::policies::kv_events::discovery::EventConfig;
-use sgl_router::policies::kv_events::{compute_block_hashes, KvEventIndex, KvWorkerId};
+use sgl_router::state::kv_events::discovery::EventConfig;
+use sgl_router::state::kv_events::{compute_block_hashes, KvEventIndex, KvWorkerId};
 
 use super::zmq_helpers::{
     build_multipart, encode_block_stored_event, encode_event_batch, make_pub_bound,

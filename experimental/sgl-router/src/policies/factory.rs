@@ -7,7 +7,6 @@ use crate::config::{
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware::CacheAwarePolicy,
-    kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
@@ -20,6 +19,7 @@ use crate::policies::{
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
+use crate::state::kv_events::{BlockSizeOracle, HashTree};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;

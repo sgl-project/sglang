@@ -6,8 +6,6 @@ mod preparation;
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::engine_load::EngineLoadSnapshot;
-use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
@@ -16,6 +14,8 @@ use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
+use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::state::load_monitor::engine_load::EngineLoadSnapshot;
 use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;

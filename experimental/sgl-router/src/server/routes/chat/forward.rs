@@ -5,13 +5,13 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::policies::active_load::ActiveLoadGuard;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::load_monitor::active_load::ActiveLoadGuard;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
