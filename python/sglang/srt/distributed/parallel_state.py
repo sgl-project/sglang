@@ -2763,11 +2763,19 @@ def initialize_model_parallel(
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
 
+        if is_hip():
+            # Attention TP collectives run inside decode CUDA graphs. On ROCm,
+            # use PyNccl instead of c10d, whose watchdog cannot query
+            # capture-owned HIP events.
+            attention_tp_use_pynccl = True
+        else:
+            attention_tp_use_pynccl = SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem
+
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            use_pynccl=attention_tp_use_pynccl,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

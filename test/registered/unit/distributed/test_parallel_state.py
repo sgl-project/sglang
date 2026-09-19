@@ -208,10 +208,12 @@ def test_parallel_group_construction_tp8_attn_cp2():
     ):
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
+        created_group_options = {}
 
         def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
             group_name = kwargs.get("group_name", "unknown")
             created_groups[group_name] = group_ranks
+            created_group_options[group_name] = kwargs
 
             # Create a mock group object
             mock_group = Mock()
@@ -224,6 +226,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
                 "init_model_parallel_group",
                 side_effect=mock_init_model_parallel_group,
             ),
+            patch.object(parallel_state, "is_hip", return_value=True),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
             # Mock world group
@@ -264,6 +267,13 @@ def test_parallel_group_construction_tp8_attn_cp2():
             assert attn_cp_groups == expected_attn_cp, (
                 f"Wrong ATTN_CP groups: {attn_cp_groups}"
             )
+
+            # A distinct attention-TP group participates in decode CUDA graph
+            # capture. It needs PyNccl so the graph path cannot fall through to
+            # torch.distributed, while avoiding a second custom-AR buffer pool.
+            attn_tp_options = created_group_options["attention_tp"]
+            assert attn_tp_options["use_custom_allreduce"] is False
+            assert attn_tp_options["use_pynccl"] is True
 
             print("TP=8, Attn CP=2 group construction verified")
 
