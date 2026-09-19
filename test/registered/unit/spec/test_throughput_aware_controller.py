@@ -1,0 +1,243 @@
+import ast
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+    SpecProfilePoint,
+)
+from sglang.srt.speculative.throughput_aware_controller import (
+    ThroughputAwarePolicy,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+
+
+class FakeWorker:
+    def __init__(self):
+        self.speculative_num_steps = 3
+        self.model_config = SimpleNamespace(context_len=4096)
+        self.build_calls = []
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs=None
+    ):
+        self.build_calls.append((speculative_num_steps, cuda_graph_bs))
+        return SpecRuntimeState(
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    def apply_runtime_state(self, state):
+        self.speculative_num_steps = state.speculative_num_steps
+
+
+class TestThroughputAwareController(unittest.TestCase):
+    def make_controller(self, **settings):
+        config = {
+            "window_size": 2,
+            "update_interval": 2,
+            "1": {"candidate_steps": [1, 3]},
+            "8": {"candidate_steps": [1]},
+            **settings,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            policy = ThroughputAwarePolicy(
+                initial_steps=3,
+                config_path=str(path),
+            )
+            controller = AdaptiveController(FakeWorker(), policy)
+        controller.init_states([1, 4, 8, 16])
+        return controller
+
+    def test_policy_interface_builds_pruned_runtime_states(self):
+        controller = self.make_controller()
+        self.assertIsInstance(controller.params, ThroughputAwarePolicy)
+        self.assertEqual(
+            controller.worker.build_calls, [(1, [1, 4, 8, 16]), (3, [1, 4])]
+        )
+        self.assertEqual(controller.worker.speculative_num_steps, 3)
+
+    def test_feedback_defers_switch_until_next_decode(self):
+        controller = self.make_controller()
+        controller.params._cost_table.set(1, 1, 1.0)
+        controller.params._cost_table.set(1, 3, 10.0)
+        controller.on_verify_complete([3, 3], 1)
+        controller.activate_step_by_batch(1)
+        self.assertEqual(controller.worker.speculative_num_steps, 3)
+        controller.on_verify_complete([3, 3], 1)
+        self.assertEqual(controller.worker.speculative_num_steps, 3)
+        controller.activate_step_by_batch(1)
+        self.assertEqual(controller.worker.speculative_num_steps, 1)
+        self.assertEqual(
+            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 1.0]
+        )
+        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
+
+    def test_hysteresis_keeps_current_step(self):
+        controller = self.make_controller()
+        controller.params._cost_table.set(1, 1, 2 / 1.05)
+        controller.params._cost_table.set(1, 3, 4.0)
+        for _ in range(2):
+            controller.on_verify_complete([3], 1)
+        controller.activate_step_by_batch(1)
+        self.assertEqual(controller.worker.speculative_num_steps, 3)
+
+    def test_delayed_feedback_after_shrink_uses_verify_time_steps(self):
+        controller = self.make_controller()
+        controller.activate_step_by_batch(8)
+        controller.on_verify_complete([2], batch_size=1, num_steps=3)
+        self.assertEqual(
+            controller.params._tracker.snapshot_position_rates(3), [1.0, 1.0, 0.0]
+        )
+
+    def test_cpu_result_processor_delivers_original_steps_to_controller(self):
+        # Run production callback bodies with an older result than the active
+        # state, avoiding imports of the scheduler's GPU backends.
+        srt = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+        namespace = {}
+        for filename, names in (
+            (
+                "managers/scheduler_components/batch_result_processor.py",
+                {"_get_speculative_output_stride", "_resolve_spec_v2_tokens"},
+            ),
+            ("speculative/eagle_worker_v2.py", {"on_verify_complete_cpu"}),
+        ):
+            tree = ast.parse((srt / filename).read_text(encoding="utf-8"))
+            functions = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name in names
+            ]
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    *functions,
+                ],
+                type_ignores=[],
+            )
+            exec(
+                compile(ast.fix_missing_locations(module), filename, "exec"), namespace
+            )
+
+        controller = self.make_controller()
+        worker = SimpleNamespace(adaptive_controller=controller)
+        worker.on_verify_complete_cpu = lambda *args, **kwargs: namespace[
+            "on_verify_complete_cpu"
+        ](worker, *args, **kwargs)
+        processor = SimpleNamespace(
+            model_worker=worker, advance_grammar_fsm=lambda *args: None
+        )
+        cpu = lambda values: SimpleNamespace(is_cpu=True, tolist=lambda: values)
+        result = SimpleNamespace(
+            next_token_ids=cpu([10, 11]),
+            accept_lens=cpu([2]),
+            speculative_output_stride=None,
+            speculative_num_draft_tokens=2,
+            speculative_num_steps=1,
+            num_non_draft_tokens_per_req=1,
+            block_accept_lens=None,
+            cap_lens=None,
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(is_retracted=True)])
+        tokens = namespace["_resolve_spec_v2_tokens"](processor, result, batch)
+        self.assertEqual(tokens, [[10, 11]])
+        self.assertEqual(controller.params._batches_since_reevaluation, 1)
+        self.assertTrue(controller.params._tracker.is_position_extrapolated(1))
+
+    def test_batch_change_selects_captured_state_before_tracker_warmup(self):
+        controller = self.make_controller()
+        # BS=5 pads to the captured BS=8, whose only allowed step is 1.
+        controller.activate_step_by_batch(5)
+        self.assertEqual(controller.worker.speculative_num_steps, 1)
+        self.assertEqual(controller.params._batches_since_reevaluation, 0)
+
+    def test_profile_plan_uses_resolved_buckets_and_request_limit(self):
+        controller = self.make_controller(profile_run_batch_sizes=[1, 2, 4, 8, 16])
+        self.assertEqual(
+            controller.params._build_profile_points(8),
+            (
+                SpecProfilePoint(1, 1),
+                SpecProfilePoint(1, 4),
+                SpecProfilePoint(1, 8),
+                SpecProfilePoint(3, 1),
+                SpecProfilePoint(3, 4),
+            ),
+        )
+        controller.params.set_cuda_graph_bs(None)
+        self.assertEqual(controller.params._build_profile_points(8), ())
+
+    def test_profile_context_leaves_decode_headroom(self):
+        controller = self.make_controller(profile_run_seq_len=4096)
+        self.assertEqual(
+            controller.params._resolve_profile_seq_len(controller.worker),
+            4096 - 15 * 4 - 16,
+        )
+        controller.worker.model_config.context_len = 32
+        with self.assertRaisesRegex(ValueError, "headroom"):
+            controller.params._resolve_profile_seq_len(controller.worker)
+
+    def test_invalid_config_fails_before_runtime_state_building(self):
+        for setting in (
+            {"window_size": True},
+            {"switch_hysteresis": -1},
+            {"profile_run_n_measure": 0},
+        ):
+            with self.subTest(setting=setting), self.assertRaises(ValueError):
+                self.make_controller(**setting)
+
+    def test_profiling_populates_costs_and_restores_initial_step(self):
+        controller = self.make_controller()
+        session = SimpleNamespace(measure=lambda: 2.5)
+        progress = SimpleNamespace(
+            set_postfix=lambda **kwargs: None,
+            update=lambda count: None,
+            close=lambda: None,
+        )
+        with (
+            patch(
+                "sglang.srt.speculative.spec_profiling_session.SpecProfilingSession",
+                return_value=session,
+            ) as factory,
+            patch(
+                "sglang.srt.speculative.adaptive_runtime_state.tqdm",
+                return_value=progress,
+            ) as progress_factory,
+            patch(
+                "sglang.srt.speculative.adaptive_runtime_state.logger.isEnabledFor",
+                return_value=True,
+            ),
+        ):
+            controller.run_profiling(object(), max_running_requests=4)
+        self.assertEqual(factory.call_count, 4)
+        progress_factory.assert_called_once_with(
+            total=4,
+            desc="Adaptive speculative profiling",
+            unit="point",
+            disable=False,
+        )
+        self.assertEqual(controller.params._cost_table.lookup(4, 3), 2.5)
+        self.assertEqual(controller.worker.speculative_num_steps, 3)
+        self.assertEqual(controller.params._batches_since_reevaluation, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
