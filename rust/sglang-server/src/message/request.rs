@@ -100,6 +100,9 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
+    /// Scalar-only, shared by every prompt in a batch, as in Python.
+    #[serde(default)]
+    pub require_reasoning: bool,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
     pub sampling_params: Option<SamplingParamsInput>,
@@ -171,6 +174,7 @@ impl GenerateBody {
             text,
             input_ids,
             stream,
+            require_reasoning,
             sampling_params,
             return_logprob,
             logprob_start_len,
@@ -449,6 +453,7 @@ impl GenerateBody {
                 skip_special_tokens: false,
                 sampling_params,
                 stream,
+                require_reasoning,
                 // Python `GenerateReqInput` defaults.
                 return_logprob: return_logprob.unwrap_or(false),
                 logprob_start_len: logprob_start_len.unwrap_or(-1),
@@ -652,6 +657,8 @@ pub struct GenerateRequest {
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
+    /// Forwarded to the scheduler's reasoning accounting and grammar handling.
+    pub require_reasoning: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
     /// `TokenizerManager`, so `into_requests` replicates its scalar
     /// normalization. Resolved to concrete values THERE rather than at the wire
@@ -931,6 +938,49 @@ mod tests {
         assert!(is_batch);
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[1].input_ids, Some(vec![3]));
+    }
+
+    /// Reasoning is one request-wide flag, including for token-id batches.
+    #[test]
+    fn require_reasoning_defaults_and_broadcasts() {
+        use serde_json::json;
+
+        for input in [
+            json!({"text": "hi"}),
+            json!({"text": ["hi", "hello"]}),
+            json!({"input_ids": [1, 2]}),
+            json!({"input_ids": [[1, 2], [3]]}),
+        ] {
+            for flag in [None, Some(false), Some(true)] {
+                let mut body = input.clone();
+                if let Some(flag) = flag {
+                    body["require_reasoning"] = json!(flag);
+                }
+                let (requests, _) = requests(&body.to_string()).unwrap();
+                for req in requests {
+                    assert_eq!(req.require_reasoning, flag.unwrap_or(false), "{body}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn require_reasoning_rejects_non_boolean_values() {
+        use serde_json::json;
+
+        for flag in [
+            json!(null),
+            json!(1),
+            json!("true"),
+            json!([true]),
+            json!({}),
+        ] {
+            let body = json!({"text": "hi", "require_reasoning": flag});
+            assert!(
+                serde_json::from_value::<GenerateBody>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
     }
 
     /// Both / neither of text+input_ids is a 400.
