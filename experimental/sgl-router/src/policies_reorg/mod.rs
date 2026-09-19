@@ -5,6 +5,7 @@
 //! `policies` stays live until the switch PR replaces it.
 
 pub mod admission;
+pub mod affinity;
 pub mod factory;
 pub mod least_load;
 pub mod power_of_two;
@@ -22,12 +23,23 @@ use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
 
+/// `HitRequired` returns only an existing affinity hit: no fallback, no new binding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PickMode {
+    #[default]
+    Normal,
+    HitRequired,
+}
+
 /// Request facts a policy may read. Resolver-only facts live in `SelectionRequest`.
 #[derive(Debug, Clone, Copy)]
 pub struct PickRequest<'a> {
     pub model: &'a ModelId,
     pub stage: Stage,
     pub bucket: &'a str,
+    pub mode: PickMode,
+    /// False once global-preserve has decided later groups may not look up or bind.
+    pub affinity_enabled: bool,
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub token_ids: Option<&'a [u32]>,
@@ -47,6 +59,8 @@ impl<'a> PickRequest<'a> {
             model,
             stage,
             bucket: "",
+            mode: PickMode::Normal,
+            affinity_enabled: true,
             input_tokens,
             expected_peak_tokens: None,
             token_ids: None,
@@ -59,6 +73,12 @@ impl<'a> PickRequest<'a> {
     /// KV the request will hold: the input, or the projected peak when known.
     pub fn kv_tokens(&self) -> u64 {
         self.expected_peak_tokens.unwrap_or(self.input_tokens)
+    }
+
+    /// Binding key for `kind`, scoped to this bucket unless `global`.
+    pub fn affinity_key(&self, kind: &str, global: bool, value: &str) -> String {
+        let scope = if global { "global" } else { self.bucket };
+        format!("{:?}/{kind}/{scope}/{value}", self.stage)
     }
 }
 
@@ -96,20 +116,9 @@ pub trait Policy: Send + Sync + Debug {
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// The nested policy a miss falls back to, within the same candidates.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
-    }
-
-    fn pick_fallback<'a>(
-        &'a self,
-        engines: &'a [Arc<Worker>],
-        request: &'a PickRequest<'a>,
-    ) -> BoxFuture<'a, Result<Pick, PickError>> {
-        match self.fallback() {
-            Some(fallback) => fallback.pick(engines, request),
-            None => ready(Err(PickError::NoCandidates)),
-        }
     }
 }
 
@@ -141,12 +150,22 @@ pub(crate) mod testing {
         policy: &dyn Policy,
         engines: &[Arc<Worker>],
     ) -> Result<Pick, PickError> {
+        pick_as(policy, engines, None, PickMode::Normal).await
+    }
+
+    pub(crate) async fn pick_as(
+        policy: &dyn Policy,
+        engines: &[Arc<Worker>],
+        session_key: Option<&str>,
+        mode: PickMode,
+    ) -> Result<Pick, PickError> {
         let table = EngineLoadTable::new();
         let load = LoadView::new(&table);
         let model = ModelId("m".into());
-        policy
-            .pick(engines, &PickRequest::new(&model, Stage::Plain, 10, &load))
-            .await
+        let mut request = PickRequest::new(&model, Stage::Plain, 10, &load);
+        request.session_key = session_key;
+        request.mode = mode;
+        policy.pick(engines, &request).await
     }
 
     /// First admitted engine under `admission`.

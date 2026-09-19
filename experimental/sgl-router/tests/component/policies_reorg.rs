@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{
@@ -9,9 +10,10 @@ use sgl_router::buckets_reorg::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Admission, Decision, EngineAdmission, Placement};
+use sgl_router::policies_reorg::affinity::{AffinityKind, AffinityPolicy};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
 use sgl_router::state::engine_load::EngineLoadTable;
-use sgl_router::state::LoadView;
+use sgl_router::state::{AffinityStore, LoadView};
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug, Default)]
@@ -99,7 +101,7 @@ fn implicit() -> Pool {
 fn pool(buckets: Vec<Bucket>) -> Pool {
     Pool {
         buckets,
-        slo: SloPreference::Disabled,
+        ..Default::default()
     }
 }
 
@@ -342,4 +344,40 @@ async fn admission_placement_changes_whether_an_alternative_can_win() {
         policy.pick(&[], &request).await,
         Err(PickError::NoCandidates)
     ));
+}
+
+#[tokio::test]
+async fn affinity_group_is_probed_first_and_preserve_keeps_a_stranded_binding() {
+    let table = EngineLoadTable::new();
+    let load = LoadView::new(&table);
+    let model = ModelId("m".into());
+    let store = AffinityStore::new(Duration::from_secs(60));
+    let session = || -> Arc<dyn Policy> {
+        Arc::new(AffinityPolicy {
+            kind: AffinityKind::Session,
+            admission: Admission::default(),
+            store: store.clone(),
+            global: true,
+            fallback: Arc::new(TestPolicy::default()),
+        })
+    };
+    let mut small = bucket("small", 0, &["a"], session());
+    small.limits.max = Some(5);
+    let mut pool = pool(vec![small, bucket("big", 1, &["b"], session())]);
+    pool.affinity = Some(session());
+    pool.preserve_global_binding = true;
+    let resolver = BucketResolver::new(registry(), Pools::plain(pool));
+    let mut request = request(&model, Stage::Plain, &load);
+    request.pick.session_key = Some("s");
+    // Only "big" fits 10 tokens: the session binds to b.
+    assert_eq!(resolver.pick(&request).await.unwrap().engine.id.0, "b");
+    // "small" now fits first, but the affinity group returns the bound engine.
+    request.pick.input_tokens = 3;
+    let pick = resolver.pick(&request).await.unwrap();
+    assert!(pick.engine.id.0 == "b" && pick.reason == "session_hit");
+    // The bound engine leaves: later buckets serve without rebinding.
+    resolver.workers.remove(&WorkerId("b".into()));
+    let pick = resolver.pick(&request).await.unwrap();
+    assert!(pick.engine.id.0 == "a" && pick.reason == "test");
+    assert_eq!(store.binding("Plain/session/global/s").unwrap().0, "b");
 }

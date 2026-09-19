@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::discovery::WorkerId;
-use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::policies_reorg::{Pick, PickError, PickMode, PickRequest, Policy, Stage};
 use crate::workers::{Worker, WorkerRegistry};
 
 /// Resolver input: the policy-facing request plus the SLO targets used for ordering.
@@ -96,6 +96,10 @@ pub enum SloPreference {
 pub struct Pool {
     pub buckets: Vec<Bucket>,
     pub slo: SloPreference,
+    /// Probes the whole pool for an existing binding before the size buckets.
+    pub affinity: Option<Arc<dyn Policy>>,
+    /// Global-preserve: a stranded binding stops later buckets from binding.
+    pub preserve_global_binding: bool,
 }
 
 impl Pool {
@@ -111,7 +115,7 @@ impl Pool {
                 tokens_per_second: None,
                 policy,
             }],
-            slo: SloPreference::Disabled,
+            ..Default::default()
         }
     }
 }
@@ -142,6 +146,7 @@ impl Pools {
 #[derive(Debug)]
 pub struct ResolvedGroup<'a> {
     pub bucket: &'a str,
+    pub mode: PickMode,
     pub engines: Vec<Arc<Worker>>,
     pub policy: &'a dyn Policy,
 }
@@ -186,6 +191,35 @@ impl BucketResolver {
             .collect();
         // Stable order so cursor-based policies see a consistent candidate list.
         engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut groups = Vec::new();
+        if let Some(policy) = &pool.affinity {
+            // Size ranges do not exclude a binding holder; its own context limit and SLO rule do.
+            let members: Vec<_> = engines
+                .iter()
+                .filter(|engine| {
+                    pool.buckets
+                        .iter()
+                        .find(|bucket| bucket.contains(engine))
+                        .is_none_or(|bucket| {
+                            bucket
+                                .limits
+                                .context
+                                .is_none_or(|max| pick.input_tokens <= max)
+                                && (pool.slo != SloPreference::SloFirst
+                                    || bucket.matches_slo(request))
+                        })
+                })
+                .cloned()
+                .collect();
+            if !members.is_empty() {
+                groups.push(ResolvedGroup {
+                    bucket: "affinity",
+                    mode: PickMode::HitRequired,
+                    engines: members,
+                    policy: policy.as_ref(),
+                });
+            }
+        }
         let mut buckets: Vec<_> = pool
             .buckets
             .iter()
@@ -199,28 +233,31 @@ impl BucketResolver {
             };
             (demoted, bucket.rank, &bucket.id)
         });
-        Ok(buckets
-            .into_iter()
-            .filter_map(|bucket| {
-                let members: Vec<_> = engines
-                    .iter()
-                    .filter(|engine| bucket.contains(engine))
-                    .cloned()
-                    .collect();
-                (!members.is_empty()).then_some(ResolvedGroup {
-                    bucket: &bucket.id,
-                    engines: members,
-                    policy: bucket.policy.as_ref(),
-                })
+        groups.extend(buckets.into_iter().filter_map(|bucket| {
+            let members: Vec<_> = engines
+                .iter()
+                .filter(|engine| bucket.contains(engine))
+                .cloned()
+                .collect();
+            (!members.is_empty()).then_some(ResolvedGroup {
+                bucket: &bucket.id,
+                mode: PickMode::Normal,
+                engines: members,
+                policy: bucket.policy.as_ref(),
             })
-            .collect())
+        }));
+        Ok(groups)
     }
 
     pub async fn pick(&self, request: &SelectionRequest<'_>) -> Result<Pick, PickError> {
+        let pool = self.pools.for_stage(request.pick.stage);
+        let mut affinity_enabled = true;
         let mut rejections = Vec::new();
         for group in self.ordered_groups(request)? {
             let scoped = PickRequest {
                 bucket: group.bucket,
+                mode: group.mode,
+                affinity_enabled,
                 ..request.pick
             };
             match group.policy.pick(&group.engines, &scoped).await {
@@ -235,10 +272,16 @@ impl BucketResolver {
                     return Ok(pick);
                 }
                 Err(PickError::NoCandidates) => continue,
-                Err(error) if !self.fallback_on_rejection => return Err(error),
                 Err(PickError::NoAdmissibleEngine(reasons)) => rejections.extend(reasons),
                 Err(PickError::AdmissionRejected(reason)) => rejections.push(reason),
                 Err(error) => return Err(error),
+            }
+            // Only an admission rejection reaches here.
+            if !self.fallback_on_rejection {
+                return Err(PickError::NoAdmissibleEngine(rejections));
+            }
+            if group.mode == PickMode::HitRequired && pool.preserve_global_binding {
+                affinity_enabled = false;
             }
         }
         if rejections.is_empty() {

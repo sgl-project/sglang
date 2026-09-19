@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::workers::Worker;
 
-use super::{Pick, PickError, PickRequest, Rejection};
+use super::{Pick, PickError, PickRequest, Policy, Rejection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -164,6 +164,18 @@ impl Admission {
         let admitted = self.admit(engines, request)?;
         let engine = choose(&admitted).ok_or(PickError::NoCandidates)?;
         self.verify(Pick { engine, reason }, request)
+    }
+
+    /// Lets `fallback` choose among the admitted candidates at this placement.
+    pub async fn delegate(
+        &self,
+        fallback: &dyn Policy,
+        engines: &[Arc<Worker>],
+        request: &PickRequest<'_>,
+    ) -> Result<Pick, PickError> {
+        let admitted = self.admit(engines, request)?;
+        let pick = fallback.pick(&admitted, request).await?;
+        self.verify(pick, request)
     }
 
     /// Candidates a policy may choose from; a no-op under `AfterSelection`.
