@@ -363,7 +363,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
-
         # --- buffers ---------------------------------------------------
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
         # which `general_mm_embed_routine` copies the merged text+media
@@ -2052,6 +2051,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_top_logprobs_idx=output.input_top_logprobs_idx,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
+            full_logits=(
+                output.full_logits[: self.raw_num_tokens]
+                if output.full_logits is not None
+                else None
+            ),
+            dllm_vocab_state=(
+                output.dllm_vocab_state.slice_rows(self.raw_num_tokens)
+                if output.dllm_vocab_state is not None
+                else None
+            ),
+            customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
         )
 

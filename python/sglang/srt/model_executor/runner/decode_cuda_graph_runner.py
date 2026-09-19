@@ -1488,6 +1488,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                dllm_vocab_state=(
+                    output.dllm_vocab_state.slice_rows(self.raw_num_token)
+                    if self.is_dllm and output.dllm_vocab_state is not None
+                    else None
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
