@@ -240,6 +240,15 @@ class TokenizerManagerScoreMixin:
 
                 prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
 
+                # Single-label cross-encoder heads (e.g. bge-reranker-v2-m3)
+                # produce a scalar per item: CrossEncodingPooler squeezes the
+                # [num_labels] classification logits down to a 0-d value.
+                # ScoreResult.scores declares one row per item, so wrap
+                # scalars into a row here. This also keeps apply_softmax
+                # well-defined (a 0-d tensor has no trailing dim to reduce).
+                if not isinstance(embedding, list):
+                    embedding = [embedding]
+
                 if apply_softmax:
                     embedding = torch.softmax(
                         torch.as_tensor(embedding), dim=-1
