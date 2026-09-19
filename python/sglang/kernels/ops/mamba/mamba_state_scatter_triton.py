@@ -192,14 +192,13 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Source index is just the request index itself
     src_idx = pid_req
 
-    # Bounds check to avoid illegal memory access
-    if not (
-        (dst_idx >= 0)
-        & (dst_idx < dst_req_size)
-        & (src_idx >= 0)
-        & (src_idx < src_req_size)
-        & (step_idx < src_step_size)
-    ):
+    # Bounds check to avoid illegal memory access (sequential early-return
+    # is safer than a combined & expression on some Triton backends).
+    if dst_idx < 0 or dst_idx >= dst_req_size:
+        return
+    if src_idx < 0 or src_idx >= src_req_size:
+        return
+    if step_idx < 0 or step_idx >= src_step_size:
         return
 
     # Compute base offsets
@@ -215,8 +214,10 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     offsets = start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < elem_per_entry
 
-    # Load from source and store to destination
-    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+    # Load from source and store to destination.
+    # other=0.0 is required on some backends (e.g. PPU/HGGC) to avoid a
+    # device-side assert when masked-out lanes reference OOB addresses.
+    data = tl.load(src_ptr + src_offset + offsets, mask=mask, other=0.0)
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
@@ -361,12 +362,12 @@ def _fused_conv_window_scatter_with_mask_kernel(
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
     src_idx = pid_req
 
-    if not (
-        (dst_idx >= 0)
-        & (dst_idx < dst_req_size)
-        & (src_idx < src_req_size)
-        & (step_idx < src_step_size)
-    ):
+    # Sequential early-return is safer than combined & on some backends.
+    if dst_idx < 0 or dst_idx >= dst_req_size:
+        return
+    if src_idx < 0 or src_idx >= src_req_size:
+        return
+    if step_idx < 0 or step_idx >= src_step_size:
         return
 
     start = pid_block * BLOCK_SIZE
