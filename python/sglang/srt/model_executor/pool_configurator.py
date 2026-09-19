@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -453,6 +454,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         if num_layers == 0:
@@ -465,6 +467,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_layers,
+            compressed_dtype=resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
         )
 
     def _compute_dsa_indexer_cell_size(

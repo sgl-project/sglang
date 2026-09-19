@@ -693,6 +693,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
 
+    def test_qwen4_fp8_indexer_dtype_platform_gate(self):
+        """fp8_e4m3 needs CUDA SM90/SM100 and a compressed QSA indexer. The bf16
+        spellings never consult the platform."""
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        compressed = {
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+        }
+        with override_platform(is_cuda=True, is_sm100=True):
+            sa = self._construct(
+                *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+            )
+            self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
+            # No compressed indexer fields: no QSA profile, nothing to store in fp8.
+            with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
+                self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
+        with override_platform(
+            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90/SM100"):
+                self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+                )
+            for name in ("auto", "bfloat16"):
+                sa = self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype=name
+                )
+                self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))
