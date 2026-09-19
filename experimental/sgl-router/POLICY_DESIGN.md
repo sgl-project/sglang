@@ -184,19 +184,29 @@ standard serving path switches.
 
 ### Policy
 
-All policies implement one asynchronous, object-safe interface. A boxed future
-supports the remote prefix indexer; local policies can return an immediately
-ready result.
+All policies implement one asynchronous, object-safe interface. `Policy::pick`
+creates a fresh `PickContext` and delegates to `pick_with_context`, which concrete
+policies implement. A boxed future supports the remote prefix indexer; local
+policies can return an immediately ready result.
 
 ```rust
 pub trait Policy: Send + Sync + std::fmt::Debug {
-    fn pick<'a>(
+    fn pick_with_context<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
+        context: &'a PickContext,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
+    // pick(...) supplies a fresh context; pick_fallback(..., context) reuses it.
 }
 ```
+
+`PickContext` contains only attempt-local observations. Admission receives the
+same context through `before`/`after` and `EngineAdmission::check`. Nested fallback
+uses `pick_fallback(..., context)`, which calls the fallback's `pick_with_context`
+without creating another context. Buckets and HTTP handlers continue to call
+`Policy::pick` with only candidates and request facts; they never supply state
+handles or observation contexts.
 
 `Pick` identifies one engine and a selection reason for metrics and tracing.
 `PickRequest` carries model, stage, selected bucket ID, input and optional
@@ -247,9 +257,11 @@ Prepare the signals needed by admission before checking. A pending-prefill check
 uses per-engine uncached work when a prefix is known, and full input otherwise.
 Decode capacity uses the expected peak sequence length when available, including
 on a cache hit. The policy/admission implementation owns observation preparation
-and consistency; no load view is supplied by the bucket or HTTP handler.
-Concrete load-aware admission and its snapshot-sharing interface remain follow-up
-work. Synchronous checks do not fetch telemetry over the network themselves.
+and consistency through the shared `PickContext`; no load view is supplied by
+the bucket or HTTP handler. Checks call `context.load(&self.engine_load)` using
+their injected handle, reusing the same snapshot as selection and nested fallback.
+Concrete load-aware acceptance rules remain follow-up work. Synchronous checks
+do not fetch telemetry over the network themselves.
 
 `AllowAll` is the default for new explicit policy attachments. It leaves health,
 role, membership, and policy preferences in force. Migrated configurations must
@@ -342,12 +354,21 @@ or correction for dispatches since the report. Those follow-ups must preserve
 source, freshness, and available measurements without adding another independent
 in-flight counter.
 
-A load-aware policy owns an `Arc<EngineLoadTable>` and creates a fresh `LoadView`
-inside each pick. The table is long-lived; the view and its snapshot are local
-to the attempt, never stored on a bucket or long-lived policy. A retry creates
-a new view. The power-of-two skeleton has this constructor dependency and local
-view, but its concrete load comparison and admission integration remain in #40271.
-No snapshot is collected if no consumer reads it. Load and cache observations
+A load-aware policy or admission check owns an `Arc<EngineLoadTable>` and calls
+`context.load(&self.engine_load)`. `PickContext` lazily creates one `LoadView`
+per source and returns shared `Arc<EngineLoadSnapshot>` values. The first consumer
+captures reports; all later consumers of that source in the attempt reuse the
+exact snapshot, including all admission checks and nested policy fallbacks.
+Different source handles have separate cached snapshots; the context retains
+source Arcs so addresses cannot be reused while cached. A mutex serializes first
+capture and lookup; it is not held across admission, policy execution, or awaits.
+
+A fresh top-level `Policy::pick` means a fresh context, including another bucket
+attempt, another PD stage, or a retry. No snapshot is captured for sources no
+consumer reads. Contexts and views belong to attempts, not long-lived policies.
+Power-of-two is wired to this context, but its concrete comparison and load-aware
+admission rules remain in #40271. Cache/affinity observation memoization remains
+follow-up work; the current context caches load only. Load and cache observations
 are not an atomic global snapshot. Preserve report freshness, rank aggregation,
 and request-guard cleanup.
 
@@ -523,8 +544,9 @@ Implemented here:
 - `EngineGroup::pick` owns live candidate filtering, policy invocation, and
   exact candidate validation, without cross-bucket fallback.
 - `Policy::pick`, within-group fallback interface, admission placement, and `AllowAll`.
-- Policy-owned load dependency and pick-local lazy `LoadView` in the power-of-two
-  skeleton. `PickRequest` and bucket APIs carry no load state.
+- Policy-owned load dependency and a fresh `PickContext` per group attempt.
+  Admission, selection, and nested fallback share lazy snapshots per source.
+  `PickRequest` and bucket APIs carry no load state or observation context.
 - The reorg chat implementation iterates resolved buckets, calls `pick_engines`,
   advances on empty candidates/admission rejection, and
   dispatches only after one complete selection. Exhaustion retains admission reasons.
