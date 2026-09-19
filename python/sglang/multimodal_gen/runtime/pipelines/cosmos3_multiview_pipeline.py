@@ -105,12 +105,14 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
                     "pip install natten==0.21.7 -f https://whl.natten.org"
                 )
             # The LiDAR range-map VAE is not a model_index component; it ships
-            # as lidar_vae/ next to the transformer and stays in FP32.
+            # as lidar_vae/ next to the transformer and stays in FP32. Read it
+            # from the resolved snapshot directory: server_args.model_path may
+            # still be the Hub id when the checkpoint was downloaded.
             lidar_encoder = Cosmos3LidarEncoder.from_pretrained(
-                server_args.model_path, deployment.lidar, get_local_torch_device()
+                self.model_path, deployment.lidar, get_local_torch_device()
             )
             lidar_decoder = Cosmos3LidarDecoder.from_pretrained(
-                server_args.model_path, deployment.lidar, get_local_torch_device()
+                self.model_path, deployment.lidar, get_local_torch_device()
             )
 
         self.add_stage(Cosmos3MultiviewInputStage(deployment))
