@@ -337,6 +337,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     run_hook(validate_cutedsl_a2a_token_budget, server_args)
 
+    from sglang.srt.arg_groups.mega_moe_hook import (
+        validate_mega_moe_token_budget_for_model,
+    )
+
+    run_hook(validate_mega_moe_token_budget_for_model, server_args)
+
     # Handle model loading format.
     run_hook(handle_load_format, server_args)
 
