@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -43,7 +43,7 @@ def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
     and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
-    if is_npu():
+    if not is_cuda():
         return False
     if _FAST_SUPPORTED is None:
         _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
