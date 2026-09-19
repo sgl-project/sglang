@@ -227,10 +227,20 @@ def test_scheduler_crash_path_writes_snapshot(tmp_path, monkeypatch):
     Everything before the failing ``Scheduler(...)`` construction is stubbed, and
     the parent-process signal is captured instead of delivered, so this exercises
     the production code path without touching a GPU or killing the test runner.
+
+    ``server_args`` answers every attribute with a neutral value: the startup steps
+    ahead of the ``try`` keep growing upstream (``resolve_spawn_dp_rank`` reads
+    config fields), and this test only cares that control reaches the crash handler.
     """
     import signal as signal_module
 
     import sglang.srt.managers.scheduler as scheduler_module
+
+    class _PermissiveArgs(types.SimpleNamespace):
+        """Answers any config read with 0 instead of raising."""
+
+        def __getattr__(self, name):
+            return 0
 
     monkeypatch.setattr(scheduler_module, "load_plugins", lambda: None)
     monkeypatch.setattr(scheduler_module, "publish", lambda *a, **k: None)
@@ -262,7 +272,7 @@ def test_scheduler_crash_path_writes_snapshot(tmp_path, monkeypatch):
 
     with envs.SGLANG_DEBUG_CRASH_SNAPSHOT.override(True):
         scheduler_module.run_scheduler_process(
-            server_args=types.SimpleNamespace(crash_dump_folder=str(tmp_path)),
+            server_args=_PermissiveArgs(crash_dump_folder=str(tmp_path)),
             port_args=None,
             gpu_id=0,
             tp_rank=0,
