@@ -30,6 +30,8 @@ class Qwen3VLVisionOutput:
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    recompute_on_device_change = False
+
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -39,7 +41,10 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         self._inv_freq_device = inv_freq.device
 
     def forward(self, sequence_length: int) -> torch.Tensor:
-        if self.inv_freq.device != self._inv_freq_device:
+        if (
+            self.recompute_on_device_change
+            and self.inv_freq.device != self._inv_freq_device
+        ):
             # match resident initialization: CPU and GPU pow round differently
             indices = torch.arange(
                 0, self.dim, 2, dtype=torch.float32, device=self.inv_freq.device

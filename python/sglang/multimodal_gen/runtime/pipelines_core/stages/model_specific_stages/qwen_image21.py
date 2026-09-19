@@ -63,6 +63,7 @@ class QwenImage21EncodingStage(PipelineStage):
             scheduler,
         )
         self.text_encoder.model.visual.fp32_position_interpolation = False
+        self.text_encoder.model.visual.rotary_pos_emb.recompute_on_device_change = True
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}

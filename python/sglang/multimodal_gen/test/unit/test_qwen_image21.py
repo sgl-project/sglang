@@ -68,6 +68,7 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     assert slots.tolist() == [False, True, False]
     encoder.model.language_model.norm.assert_not_called()
     assert encoder.model.visual.fp32_position_interpolation is False
+    assert encoder.model.visual.rotary_pos_emb.recompute_on_device_change is True
     kwargs = processor.call_args.kwargs
     prefix = " ".join(
         f"<image{i + 1}><|vision_start|><|image_pad|><|vision_end|>"

@@ -30,17 +30,21 @@ from sglang.srt.runtime_context import get_parallel
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dim", [36, 40, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_vision_rope_device_transfer_matches_resident_initialization(dim, dtype):
+@pytest.mark.parametrize("recompute_on_device_change", [False, True])
+def test_vision_rope_device_transfer(dim, dtype, recompute_on_device_change):
     with torch.device("cpu"):
         transferred = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        assert transferred.recompute_on_device_change is False
+        transferred.recompute_on_device_change = recompute_on_device_change
         expected_cpu = transferred(64).clone()
     with torch.device("cuda"):
         resident = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
         expected_cuda = resident(64)
 
     transferred.cuda()
-    torch.testing.assert_close(transferred(64), expected_cuda, atol=0, rtol=0)
-    torch.testing.assert_close(transferred(64), expected_cuda, atol=0, rtol=0)
+    expected = expected_cuda if recompute_on_device_change else expected_cpu.cuda()
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
     transferred.cpu()
     torch.testing.assert_close(transferred(64), expected_cpu, atol=0, rtol=0)
 
