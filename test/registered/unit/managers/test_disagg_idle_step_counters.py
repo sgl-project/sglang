@@ -406,7 +406,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
