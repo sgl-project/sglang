@@ -22,9 +22,16 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
+    TWO_SHOT_PUSH = enum.auto()
 
-    def is_push(self) -> bool:
-        return self == AllReduceAlgo.ONE_SHOT_PUSH
+    def supports_zero_copy(self) -> bool:
+        """Whether peers can reduce straight out of the caller's own buffer.
+
+        The two push algorithms cannot: ``1shot_push`` and ``2shot_push``
+        both publish their input to peers up front (whole, or shard-wise), so
+        there is nothing for the graph pointer table to register.
+        """
+        return self not in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
 
     @property
     def algo_name(self) -> str:
@@ -35,6 +42,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
 }
 
 if TYPE_CHECKING:
@@ -56,6 +64,12 @@ def _init_communicator() -> None:
 class PushPlane(tvm_ffi.Object):
     """Lamport push plane: a zero-filled symmetric workspace + a local counter.
 
+    A plane whose workspaces carry ``4 * world_size`` slot rows instead of
+    ``2 * world_size`` dedicates the second half to ``2shot_push``'s
+    per-source shard slots (same slot size, same marker discipline); both
+    halves share the one counter, so every push-family kernel advances the
+    double buffer together.
+
     All buffers are owned by the caller; this object only validates and
     records them.
     """
@@ -64,6 +78,8 @@ class PushPlane(tvm_ffi.Object):
     if TYPE_CHECKING:
         rank: int
         world_size: int
+        slot_bytes: int
+        has_scatter: bool
 
     def __init__(
         self,
@@ -76,9 +92,11 @@ class PushPlane(tvm_ffi.Object):
     ) -> None:
         """
         :param workspaces: per-rank ``[2 * world_size, slot_bytes]`` uint8
-                           views of symmetric memory. The local rank's view
-                           MUST be zero-filled before first use -- the
-                           kernels poll for a pos-zero marker.
+                           views of symmetric memory (``4 * world_size``
+                           rows when the plane carries a scatter region).
+                           The local rank's view MUST be zero-filled before
+                           first use -- the kernels poll for a pos-zero
+                           marker.
         :param counter: local ``[num_blocks, 4]`` uint8 tensor, zero-filled.
         :param mc_workspace: multicast VA of the local workspace, or None.
         """
