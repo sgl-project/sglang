@@ -559,10 +559,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
+        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
+                "(built-in TP MoE), 'megamoe', or 'mori', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":
@@ -594,9 +594,9 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        if cfg.disaggregation_mode != "prefill" or _is_npu:
+        if cfg.disaggregation_mode != "prefill":
             raise ValueError(
-                "DSpark pipeline parallelism requires CUDA PD prefill; "
+                "DSpark pipeline parallelism requires PD prefill; "
                 "decode and non-disaggregated serving require pp_size == 1."
             )
 

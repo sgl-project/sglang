@@ -544,20 +544,20 @@ class MambaRadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ) -> None:
         """Cache request when it finishes."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :kv_len_to_handle
+                req.kv.req_pool_idx, :owned_kv_len
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         if is_insert:
@@ -607,7 +607,7 @@ class MambaRadixCache(BasePrefixCache):
                 page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
             assert cache_len == page_aligned_len, (
-                f"It is required {cache_len=}, {page_aligned_len=}, {kv_len_to_handle=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+                f"It is required {cache_len=}, {page_aligned_len=}, {owned_kv_len=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
             )
 
             # Radix Cache takes one ref in memory pool

@@ -54,7 +54,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
-_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+_ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -227,10 +227,10 @@ class TestChatTemplateCache(CustomTestCase):
 
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
         first = self._render()
-        first[1].append(99)
+        first[0].append(99)
         second = self._render()
 
-        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.assertEqual(second, ([11, 12], "decoded"))
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
         self.tokenizer_manager.tokenizer.decode.assert_called_once()
@@ -292,6 +292,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.tokenizer.reset_mock()
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(
@@ -2677,8 +2678,9 @@ class ServingChatTestCase(unittest.TestCase):
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -2691,6 +2693,8 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
+            logprobs=True,
+            top_logprobs=5,
         )
 
         with patch(

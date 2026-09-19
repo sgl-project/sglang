@@ -205,6 +205,22 @@ store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const device::Alig
 
 }  // namespace v41
 
+#else  // USE_ROCM
+
+namespace v41 {
+
+template <KVLayout>
+inline constexpr bool dependent_false_v = false;
+
+/// A discarded `if constexpr` branch is still parsed, so the V4 callers need the name to
+/// resolve on ROCm; instantiating it is the error.
+template <KVLayout kLayout, typename... Ts>
+SGL_DEVICE void store_row(uint8_t*, uint8_t*, uint32_t, Ts&&...) {
+  static_assert(dependent_false_v<kLayout>, "the V4.1 KV layouts are CUDA only");
+}
+
+}  // namespace v41
+
 #endif  // USE_ROCM
 
 }  // namespace deepseek_v4
