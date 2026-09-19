@@ -49,6 +49,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.arg_groups.arg_utils import redacted_call
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     resolved_view,
@@ -266,11 +267,13 @@ class Engine(EngineScoreMixin, EngineBase):
             server_args = self.server_args_class(**kwargs)
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
-            # shows here even when the caller did not pass it.
+            # shows here even when the caller did not pass it. Credentials are
+            # redacted as in the CLI launcher: this string is published by
+            # `get_server_info`.
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                redacted_call(self.server_args_class, "Engine", kwargs),
             )
         self.server_args = server_args
         logger.info(f"server_args={server_args.resolved_dict()}")
