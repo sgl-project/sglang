@@ -97,7 +97,9 @@ class RequestFuncInput:
 
 @dataclass
 class RequestFuncOutput:
-    generated_text: str = ""
+    generated_text: str = ""  # reasoning + content, for output accounting
+    reasoning_text: str = ""
+    content_text: str = ""
     success: bool = False
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
@@ -140,13 +142,16 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
-def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+def _openai_chat_reasoning(message: Dict[str, Any]) -> str:
     # Most OpenAI-compatible servers use ``reasoning_content``. vLLM's Kimi
     # parser instead streams its reasoning in ``reasoning``. Prefer the
     # standard field when both are present to avoid counting the same tokens
     # twice on servers that expose aliases.
-    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-    return reasoning + (message.get("content") or "")
+    return message.get("reasoning_content") or message.get("reasoning") or ""
+
+
+def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
+    return _openai_chat_reasoning(message) + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -475,6 +480,8 @@ async def async_request_openai_chat_completions(
                         # Non-streaming response
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
+                        output.reasoning_text = _openai_chat_reasoning(message)
+                        output.content_text = message.get("content") or ""
                         output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
                         output.latency = time.perf_counter() - st
@@ -526,9 +533,14 @@ async def async_request_openai_chat_completions(
                                     continue
 
                                 # Reasoning models stream thoughts via
-                                # `reasoning_content`; count them like content.
+                                # `reasoning_content`; count them like content
+                                # but keep the two fields apart for multi-turn.
                                 delta = choices[0].get("delta") or {}
-                                content = _combine_openai_chat_content(delta)
+                                reasoning_piece = _openai_chat_reasoning(delta)
+                                content_piece = delta.get("content") or ""
+                                output.reasoning_text += reasoning_piece
+                                output.content_text += content_piece
+                                content = reasoning_piece + content_piece
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -1295,7 +1307,23 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
     return None
 
 
-def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+def _assistant_message_for_next_turn(
+    output: RequestFuncOutput, echo_reasoning: bool
+) -> Dict[str, str]:
+    """Build the assistant message added to the history before the next round.
+
+    By default only ``content`` is included. With ``echo_reasoning``,
+    ``reasoning_content`` is added as well when the model produced thinking tokens.
+    """
+    message: Dict[str, str] = {"role": "assistant", "content": output.content_text}
+    if echo_reasoning and output.reasoning_text:
+        message["reasoning_content"] = output.reasoning_text
+    return message
+
+
+def wrap_multi_turn_request_func(
+    request_func: Callable, backend: str, echo_reasoning: bool = False
+) -> Callable:
     assert backend in MULTI_TURN_BACKENDS, (
         f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
     )
@@ -1327,7 +1355,7 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             outputs.append(output)
 
             prev_messages.append(
-                {"role": "assistant", "content": output.generated_text}
+                _assistant_message_for_next_turn(output, echo_reasoning=echo_reasoning)
             )
 
         return outputs
@@ -1380,7 +1408,11 @@ async def benchmark(
             and _normalize_round_messages(first_prompt[0]) is not None
         )
     if is_multi_turn:
-        request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+        request_func = wrap_multi_turn_request_func(
+            request_func,
+            backend=backend,
+            echo_reasoning=getattr(args, "multi_turn_echo_reasoning", False),
+        )
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2459,6 +2491,16 @@ def cli_main():
         "Supported with sglang backends (native, oai, oai-chat).",
     )
     parser.add_argument("--seed", type=int, default=42, help="The random seed.")
+    parser.add_argument(
+        "--multi-turn-echo-reasoning",
+        action="store_true",
+        help="In multi-turn conversations, send the model's reasoning back as "
+        "`reasoning_content` on the assistant message of the next turn, as "
+        "Kimi K3's API requires. By default only `content` is sent back, as "
+        "OpenAI-style clients do. For a thinking model this decides whether the "
+        "chat template reproduces the generated tokens, and so how far a "
+        "prefix-cache hit reaches on the next turn.",
+    )
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
