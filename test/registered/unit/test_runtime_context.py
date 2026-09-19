@@ -2781,14 +2781,21 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         """A weight check is an on-demand request served from the scheduler
         loop, so it runs outside the scope that describes a draft runner. Its
-        report has to name the runner it was built for, which is why it holds
-        a record instead of asking the context."""
-        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        report has to name the runner it was built for, which is why it reads
+        the placement once, where it is built, instead of asking again when the
+        request arrives."""
+        from sglang.srt.distributed import parallel_state
         from sglang.srt.utils.weight_checker import WeightChecker
 
-        draft = ParallelState.trivial(pp_rank=0, pp_size=1)
-        checker = WeightChecker(get_model=lambda: None, ps=draft)
         self._two_stage_pipeline()
+        self.assertEqual(get_parallel().pp_size, 2)
+        group = self._single_member_group()
+        with patch.object(parallel_state, "_PP", group):
+            with parallel_state.patch_pipeline_parallel_group(group):
+                checker = WeightChecker(get_model=lambda: None)
+
+        # The scope has closed and the context answers the target's shape again.
+        self.assertEqual(get_parallel().pp_size, 2)
         info = checker._parallelism_info()
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
