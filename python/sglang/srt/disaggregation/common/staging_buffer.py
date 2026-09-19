@@ -129,6 +129,7 @@ class StagingBuffer:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        pool_already_active: bool = False,
     ):
         self.size_bytes = size_bytes
         self.device = device
@@ -136,10 +137,17 @@ class StagingBuffer:
         self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
+        if custom_mem_pool is not None and not pool_already_active:
             with torch.cuda.use_mem_pool(custom_mem_pool):
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "custom_mem_pool (cuMemCreate)"
+        elif pool_already_active:
+            # The caller already holds ``torch.cuda.use_mem_pool(custom_mem_pool)``.
+            # Re-entering it per buffer makes the CUDA caching allocator release and
+            # re-acquire the same pool id repeatedly, which can trip
+            # "use_count > 0 INTERNAL ASSERT FAILED" in CUDACachingAllocator.
+            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+            alloc_method = "custom_mem_pool (cuMemCreate, caller-held ctx)"
         else:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "cudaMalloc"

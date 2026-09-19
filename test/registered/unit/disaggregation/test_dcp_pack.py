@@ -1,11 +1,12 @@
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.common import dcp_pack, staging_buffer
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
@@ -18,7 +19,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
@@ -254,6 +255,89 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+
+_PACK_COUNT = 4
+_PACK_SIZE = 1 << 20
+
+
+class _PackKvArgs:
+    kv_item_lens = [1024]
+    num_draft_entries = 0
+    page_size = 64
+    gpu_id = 0
+
+
+class TestDcpPackMemPoolEnteredOnce(CustomTestCase):
+    """``init_dcp_pack_buffers`` must enter the custom mem pool exactly once.
+
+    It runs on the prefill bootstrap thread. Entering
+    ``torch.cuda.use_mem_pool`` once per buffer releases and re-acquires the
+    same pool id in a loop, which can raise "use_count > 0 INTERNAL ASSERT
+    FAILED" from CUDACachingAllocator. That exception kills the bootstrap
+    thread, so the rank silently stops accepting decode KV registrations and
+    every request routed to it stalls until the KVPoll.Bootstrapping timeout --
+    surfaced with a message that blames the decode side.
+
+    The real ``StagingBuffer`` runs here (only the CUDA calls are stubbed) so
+    the count covers every entry, whoever makes it.
+    """
+
+    def _run(self, custom_mem_pool):
+        entries = []
+        next_ptr = [0x1000]
+
+        @contextmanager
+        def _counting_use_mem_pool(pool, device=None):
+            entries.append(pool)
+            yield
+
+        def _fake_empty(*args, **kwargs):
+            tensor = Mock()
+            next_ptr[0] += _PACK_SIZE
+            tensor.data_ptr.return_value = next_ptr[0]
+            return tensor
+
+        registered = []
+        with (
+            patch.object(dcp_pack, "max_prefill_buffer_tokens", return_value=16384),
+            patch.object(dcp_pack, "dcp_pack_buffer_bytes", return_value=_PACK_SIZE),
+            patch.object(dcp_pack.torch.cuda, "use_mem_pool", _counting_use_mem_pool),
+            patch.object(dcp_pack.torch.cuda, "set_device"),
+            patch.object(staging_buffer.torch, "empty", _fake_empty),
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
+                return_value=(custom_mem_pool, "NVLINK"),
+            ),
+        ):
+            buffers = dcp_pack.init_dcp_pack_buffers(
+                lambda ptr, size: registered.append(ptr),
+                _PackKvArgs(),
+                count=_PACK_COUNT,
+                dcp_size=8,
+            )
+        return entries, buffers, registered
+
+    def test_pool_entered_once_for_all_buffers(self):
+        pool = object()
+        entries, buffers, registered = self._run(pool)
+        self.assertEqual(
+            len(entries),
+            1,
+            f"use_mem_pool entered {len(entries)}x for {_PACK_COUNT} buffers; it "
+            "must be entered exactly once, otherwise the same pool id is released "
+            "and re-acquired per buffer.",
+        )
+        self.assertIs(entries[0], pool)
+        self.assertEqual(len(buffers), _PACK_COUNT)
+        self.assertEqual(len(registered), _PACK_COUNT)
+        self.assertEqual(len(set(registered)), _PACK_COUNT)
+
+    def test_without_custom_pool_no_context_is_entered(self):
+        entries, buffers, registered = self._run(None)
+        self.assertEqual(entries, [])
+        self.assertEqual(len(buffers), _PACK_COUNT)
+        self.assertEqual(len(registered), _PACK_COUNT)
 
 
 if __name__ == "__main__":
