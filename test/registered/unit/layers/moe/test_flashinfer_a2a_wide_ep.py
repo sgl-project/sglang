@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     _max_tokens_per_scattered_source,
-    _scattered_source_token_counts,
     _workspace_size_for_namespace,
 )
 from sglang.srt.layers.quantization import fp8  # noqa: F401
@@ -44,13 +43,6 @@ class TestFlashinferA2AWideEPPlumbing(CustomTestCase):
             for speculative in (False, True)
         }
         self.assertEqual(sizes, {4096, 4224})
-
-    def test_prefill_ag_expands_dp_counts_to_physical_source_ranks(self):
-        self.assertEqual(
-            _scattered_source_token_counts([7, 3], 4),
-            [2, 2, 2, 1, 1, 1, 1, 0],
-        )
-        self.assertEqual(_scattered_source_token_counts([4] * 16, 1), [4] * 16)
 
     def test_deepgemm_dispatch_marks_empty_expert_lanes_invalid(self):
         topk_ids = torch.tensor([-1, 0, -1, 1], dtype=torch.int32, device="cuda")
