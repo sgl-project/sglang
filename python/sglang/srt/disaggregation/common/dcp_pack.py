@@ -110,10 +110,33 @@ def init_dcp_pack_buffers(
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []
-    for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        register_fn(buf.get_ptr(), buf.get_size())
-        buffers.append(buf)
+    if custom_mem_pool is not None:
+        # Enter the pool once for all `count` buffers. Entering it per buffer
+        # repeatedly releases and re-acquires the same pool id, which can trip
+        # "use_count > 0 INTERNAL ASSERT FAILED" inside CUDACachingAllocator.
+        # This runs on the prefill bootstrap thread, so the resulting exception
+        # kills that thread and the rank silently stops accepting decode KV
+        # registrations -- every request then stalls until the
+        # KVPoll.Bootstrapping timeout.
+        torch.cuda.set_device(gpu_id)
+        with torch.cuda.use_mem_pool(custom_mem_pool):
+            for _ in range(count):
+                buffers.append(
+                    StagingBuffer(
+                        size_bytes,
+                        device,
+                        gpu_id,
+                        custom_mem_pool=custom_mem_pool,
+                        pool_already_active=True,
+                    )
+                )
+        for buf in buffers:
+            register_fn(buf.get_ptr(), buf.get_size())
+    else:
+        for _ in range(count):
+            buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=None)
+            register_fn(buf.get_ptr(), buf.get_size())
+            buffers.append(buf)
     logger.info(
         "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
         count,
