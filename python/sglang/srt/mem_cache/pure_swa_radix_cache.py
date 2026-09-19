@@ -52,8 +52,8 @@ class PureSWARadixCache(RadixCache):
         return 0
 
     def sanity_check(self):
-        """No-op: the invariant checker calls this on every SWA-capable cache,
-        and RadixCache's single LRU has no second tier to cross-check."""
+        """No-op: an all-SWA model has no full tier, so there is no full/SWA
+        split to cross-check."""
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:
