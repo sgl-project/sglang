@@ -60,6 +60,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.parameter import (
@@ -67,10 +69,12 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -172,6 +176,40 @@ def _disable_shared_experts_fusion() -> bool:
         envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
         or is_shared_experts_fusion_disabled()
     )
+
+
+def _can_fuse_shared_expert_on_cuda(config, quant_config) -> bool:
+    # The shared slot has a per-token gate and must be appended to explicit
+    # routing tensors. Backends that perform routing internally cannot use it.
+    backend = get_moe_runner_backend()
+    if not get_moe_a2a_backend().is_none() or not (
+        backend.is_triton() or backend.is_auto()
+    ):
+        return False
+    if quant_config is None:
+        return True
+    if not isinstance(quant_config, Fp8Config) or quant_config.get_name() != "fp8":
+        return False
+    if quant_config.weight_block_size is None or quant_config.is_fp4_experts:
+        return False
+
+    # Fusing a BF16 shared expert into FP8 routed weights loses its precision
+    # and scales. Compare the actual module paths, so excluding only the gate
+    # (as official FP8 checkpoints do) still permits fusion.
+    # The weight loader uses one fusion decision for the model, so a mismatch
+    # in any layer must disable fusion before any of the layers are built.
+    ignored = quant_config.ignored_layers
+    for model_prefix in ("model", "mtp"):
+        for layer_id in range(config.num_hidden_layers):
+            prefix = f"{model_prefix}.layers.{layer_id}.mlp"
+            routed_skipped = is_layer_skipped(add_prefix("experts", prefix), ignored)
+            if any(
+                is_layer_skipped(add_prefix(f"shared_expert.{proj}", prefix), ignored)
+                != routed_skipped
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            ):
+                return False
+    return True
 
 
 def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
@@ -1985,13 +2023,21 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        num_fused_shared_experts = next(
+            (
+                self.layers[i].mlp.num_fused_shared_experts
+                for i in range(self.start_layer, self.end_layer)
+                if hasattr(self.layers[i].mlp, "num_fused_shared_experts")
+            ),
+            0,
+        )
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts + num_fused_shared_experts,
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -2008,13 +2054,21 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             "_input_scale",
         )
 
-        is_fused_expert = False
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
         num_experts = self.config.num_experts
+        if num_fused_shared_experts:
+            expert_params_mapping.append(
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                )
+            )
 
         def load_fused_expert_weights(
             name: str,
@@ -2062,11 +2116,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
+            if num_fused_shared_experts and "mlp.shared_expert." in name:
+                name = name.replace("mlp.shared_expert.", f"mlp.experts.{num_experts}.")
+            is_fused_expert = (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -2095,7 +2155,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
@@ -2140,13 +2200,21 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
                         weight_loader = param.weight_loader
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
+                        if "gate_up_proj" in name:
+                            for shared_shard, weight in zip(
+                                ("w1", "w3"), loaded_weight.chunk(2, dim=-2)
+                            ):
+                                weight_loader(
+                                    param, weight, name_mapped, shared_shard, expert_id
+                                )
+                        else:
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
                     name = name_mapped
                     break
                 else:
@@ -2451,7 +2519,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "_input_scale",
         )
 
-        is_fused_expert = False
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -2555,13 +2622,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         f"mlp.experts.{num_experts}.",
                     )
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if name.endswith("experts.gate_up_proj") or name.endswith(
-                    "experts.down_proj"
-                ):
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
+            # Select per tensor: packed routed weights and the shared expert
+            # can appear in either order in a checkpoint.
+            is_fused_expert = (
+                name.endswith("experts.gate_up_proj")
+                or name.endswith("experts.down_proj")
+                or (
+                    self.enable_shared_expert_fusion
+                    and f"mlp.experts.{num_experts}." in name
+                )
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
 
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -2592,7 +2669,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
@@ -2739,21 +2816,30 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
     """Why this Qwen3.5 checkpoint cannot fuse its shared expert, or None.
 
-    ROCm-only: an MXFP4 checkpoint cannot fuse, and the model still wants the
-    #25885 multi-streaming path. Asked by the loader before any layer is built,
+    Asked by the loader before any layer is built,
     so it resolves the text config itself -- the loader hands over whichever
     config the entry class takes.
     """
-    if not _is_hip:
+    if not (_is_hip or _is_cuda):
         return None
     text_config = getattr(hf_config, "text_config", hf_config)
     if text_config.model_type not in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
         return None
+    if _is_cuda and get_exec().moe.ep_num_redundant_experts:
+        return (
+            "Qwen3.5 shared-expert fusion uses a fixed shared slot and does not "
+            "support redundant routed experts."
+        )
+    if _is_cuda and not _can_fuse_shared_expert_on_cuda(text_config, quant_config):
+        return (
+            "Qwen3.5 CUDA shared-expert fusion requires Triton MoE without A2A "
+            "with compatible BF16 or blockwise FP8 shared and routed experts."
+        )
     if can_fuse_shared_expert(text_config, quant_config):
         return None
     return (
-        "Qwen3.5: shared-expert fusion not supported for this checkpoint "
-        "(multi-streaming #25885 still applies)."
+        "Qwen3.5 shared-expert fusion is not supported for this checkpoint "
+        "or MoE backend."
     )
 
 

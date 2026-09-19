@@ -7,8 +7,8 @@ kernel (``fuse_gate=True``). The old (``apply_sigmoid=False, fuse_gate=False``)
 path must stay byte-for-byte identical; the ``apply_sigmoid`` path must equal
 the eager ``sigmoid(logits.float()) * scale`` it replaces; and the ``fuse_gate``
 path must equal the eager ``sigmoid((hidden @ W_gate).float()) * scale`` GEMV it
-replaces. These paths only run on the AITER shared-expert-fusion route at
-serving time, so they are otherwise uncovered by CI.
+replaces. The fused gate is used by AITER shared-expert fusion and by
+Qwen3.5 CUDA shared-expert fusion.
 """
 
 import unittest

@@ -284,6 +284,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.num_shared_experts = get_num_shared_experts(config)
         self.num_fused_shared_experts = 0
+        self.fuse_shared_expert_gate = _use_aiter or (
+            _is_cuda and config.model_type == "qwen3_5_moe_text"
+        )
 
         self.enable_shared_expert_fusion = False  # default to False
         if support_shared_expert_fusion and (
@@ -309,6 +312,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
+            # All experts now execute together; there is no separate MLP to
+            # overlap, so avoid the dual-stream waits during CUDA graph capture.
+            self.alt_stream = None
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -472,8 +478,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             fused_append_shared_experts_with_weights,
         )
 
-        if _use_aiter:
-            # HIP/aiter: fuse the shared_expert_gate GEMV + sigmoid + scale into
+        if self.fuse_shared_expert_gate:
+            # Fuse the shared_expert_gate GEMV + sigmoid + scale into
             # the append kernel, eliminating the standalone gate GEMM launch.
             # This subsumes the sigmoid-only fusion: there is no separate gate
             # GEMM and no _get_shared_expert_weights call on this path.
@@ -491,7 +497,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             )
         else:
-            # CUDA: _get_shared_expert_weights returns pre-activated weights
+            # _get_shared_expert_weights returns pre-activated weights
             # (sigmoid + scale already folded in) → legacy append, no fusion.
             shared = self._get_shared_expert_weights(hidden_states)
             if shared is None:

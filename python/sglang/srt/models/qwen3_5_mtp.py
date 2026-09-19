@@ -125,20 +125,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
-        self.num_fused_shared_experts = next(
-            (
-                layer.mlp.num_fused_shared_experts
-                for layer in self.model.layers
-                if hasattr(layer.mlp, "num_fused_shared_experts")
-            ),
-            0,
-        )
-        if self.num_fused_shared_experts > 1:
-            raise ValueError(
-                "Qwen3.5 MTP shared expert fusion currently supports exactly "
-                "one shared expert."
-            )
-        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
         if get_parallel().pp_group.is_last_rank:
             if config.tie_word_embeddings:
@@ -272,15 +258,30 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Params for MoE experts (non-fused/fused)
         num_experts = getattr(self.config, "num_experts", None)
         # A fused shared expert lives in routed slot `num_experts`.
+        num_fused_shared_experts = 0
+        for module in self.modules():
+            fused = getattr(module, "num_fused_shared_experts", 0)
+            if fused:
+                num_fused_shared_experts = fused
+                break
         if num_experts is not None:
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=num_experts + self.num_fused_shared_experts,
+                num_experts=num_experts + num_fused_shared_experts,
             )
         else:
             expert_params_mapping = []
+        if num_fused_shared_experts:
+            expert_params_mapping.append(
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                )
+            )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
         ignore_suffixes = (
@@ -303,33 +304,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
-        if self.enable_shared_expert_fusion and num_experts is not None:
-            fused_expert_params_mapping += [
-                (
-                    "experts.w13_",
-                    f"experts.{num_experts}.gate_up_proj.",
-                    num_experts,
-                    "w1",
-                ),
-                (
-                    "experts.w2_",
-                    f"experts.{num_experts}.down_proj.",
-                    num_experts,
-                    "w2",
-                ),
-                (
-                    "experts.w13_",
-                    f"experts.{num_experts}.gate_proj.",
-                    num_experts,
-                    "w1",
-                ),
-                (
-                    "experts.w13_",
-                    f"experts.{num_experts}.up_proj.",
-                    num_experts,
-                    "w3",
-                ),
-            ]
 
         def load_fused_expert_weights(
             name: str,
@@ -390,12 +364,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            if (
-                self.enable_shared_expert_fusion
-                and num_experts is not None
-                and "mlp.shared_expert." in name
-            ):
-                name = name.replace("mlp.shared_expert.", f"mlp.experts.{num_experts}.")
+            if num_fused_shared_experts > 0 and "mlp.shared_expert." in name:
+                # Map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
 
             is_fused_expert = (
                 "experts.gate_up_proj" in name or "experts.down_proj" in name
@@ -464,7 +438,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                                 "w3",
                                 num_experts,
                             )
-                        elif "experts.down_proj" in name:
+                        else:
                             # down_proj fused: distribute entire weight
                             load_fused_expert_weights(
                                 name_mapped,
@@ -473,35 +447,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                                 shard_id,
                                 num_experts,
                             )
-                        elif self.enable_shared_expert_fusion:
-                            param = params_dict[name_mapped]
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            if f"{num_experts}.gate_up_proj" in name:
-                                loaded_w1, loaded_w3 = loaded_weight.chunk(2, dim=-2)
-                                weight_loader(
-                                    param,
-                                    loaded_w1,
-                                    name_mapped,
-                                    "w1",
-                                    expert_id,
-                                )
-                                weight_loader(
-                                    param,
-                                    loaded_w3,
-                                    name_mapped,
-                                    "w3",
-                                    expert_id,
-                                )
-                            else:
-                                weight_loader(
-                                    param,
-                                    loaded_weight,
-                                    name_mapped,
-                                    shard_id,
-                                    expert_id,
-                                )
                     else:
                         # Non-fused expert, load by expert_id/shard
                         if (
@@ -513,13 +458,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                             break
                         param = params_dict[name_mapped]
                         weight_loader = param.weight_loader
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
+                        if "gate_up_proj" in name:
+                            # A packed shared expert is one expert, not the
+                            # leading expert dimension of a routed tensor.
+                            for shared_shard, weight in zip(
+                                ("w1", "w3"), loaded_weight.chunk(2, dim=-2)
+                            ):
+                                weight_loader(
+                                    param, weight, name_mapped, shared_shard, expert_id
+                                )
+                        else:
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
                     name = name_mapped
                     break
                 else:

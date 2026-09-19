@@ -22,7 +22,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -467,20 +467,97 @@ class TestQwen3_5Gate(_FusionGateCase):
         ):
             self.assertTrue(
                 hasattr(cls, "shared_experts_fusion_disable_reason"),
-                f"{cls.__name__} would silently skip the ROCm auto-disable",
+                f"{cls.__name__} would silently skip the fusion compatibility gate",
             )
 
-    def test_the_auto_disable_is_rocm_only(self):
+    def _cuda_reason(self, quant=None, backend="auto", a2a="none", **config_fields):
         import sglang.srt.models.qwen3_5 as qwen3_5
+        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 
-        self._seed()
-        # On a non-ROCm build the gate never objects, whatever the checkpoint is.
-        wrapper = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="qwen3_5_moe_text")
+        config = SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            num_hidden_layers=2,
+            shared_expert_intermediate_size=512,
+            moe_intermediate_size=512,
         )
-        if not qwen3_5._is_hip:
-            self.assertIsNone(
-                self._reason(qwen3_5.Qwen3_5MoeForConditionalGeneration, wrapper)
+        config.__dict__.update(config_fields)
+        # Hardware is the external boundary; backend/config decisions are real.
+        with (
+            unittest.mock.patch.object(qwen3_5, "_is_cuda", True),
+            unittest.mock.patch.object(qwen3_5, "_is_hip", False),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend(backend),
+                a2a_backend=MoeA2ABackend(a2a),
+            ),
+        ):
+            return self._reason(
+                qwen3_5.Qwen3_5MoeForConditionalGeneration,
+                SimpleNamespace(text_config=config),
+                quant,
+            )
+
+    @staticmethod
+    def _fp8(ignored=(), block_size=(128, 128), **kwargs):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=list(block_size) if block_size else None,
+            ignored_layers=list(ignored),
+            **kwargs,
+        )
+
+    def test_cuda_fuses_default_triton_bf16_and_block_fp8(self):
+        self._seed()
+        for backend in ("auto", "triton"):
+            for quant in (None, self._fp8()):
+                with self.subTest(backend=backend, quant=quant):
+                    self.assertIsNone(self._cuda_reason(quant, backend))
+
+    def test_cuda_keeps_incompatible_backends_and_quantization_separate(self):
+        self._seed()
+        for backend in ("triton_kernel", "flashinfer_trtllm", "deep_gemm"):
+            with self.subTest(backend=backend):
+                self.assertIsNotNone(self._cuda_reason(self._fp8(), backend))
+        for a2a in ("deepep", "mooncake"):
+            with self.subTest(a2a=a2a):
+                self.assertIsNotNone(self._cuda_reason(self._fp8(), "triton", a2a))
+        for quant in (
+            self._fp8(block_size=None),
+            self._fp8(is_fp4_experts=True),
+            _quant("compressed-tensors"),
+        ):
+            with self.subTest(quant=quant):
+                self.assertIsNotNone(self._cuda_reason(quant))
+
+    def test_cuda_gate_exclusion_does_not_disable_fp8_fusion(self):
+        self._seed()
+        self.assertIsNone(
+            self._cuda_reason(self._fp8(["model.layers.0.mlp.shared_expert_gate"]))
+        )
+        # Excluding the whole layer leaves both expert types in BF16.
+        self.assertIsNone(self._cuda_reason(self._fp8(["model.layers.0.mlp"])))
+
+    def test_cuda_redundant_experts_cannot_overlap_the_shared_slot(self):
+        self._seed(ep_num_redundant_experts=2)
+        self.assertIn("redundant routed experts", self._cuda_reason(self._fp8()))
+
+    def test_cuda_precision_mismatch_in_any_layer_disables_whole_model(self):
+        """One global weight remap cannot represent mixed per-layer fusion."""
+        self._seed()
+        for prefix in ("model.layers.1.mlp", "mtp.layers.0.mlp"):
+            for suffix in ("shared_expert.down_proj", "experts"):
+                with self.subTest(prefix=prefix, suffix=suffix):
+                    self.assertIsNotNone(
+                        self._cuda_reason(self._fp8([f"{prefix}.{suffix}"]))
+                    )
+
+    def test_cuda_respects_disable_flag_and_intermediate_size(self):
+        self._seed(disable_shared_experts_fusion=True)
+        self.assertIsNotNone(self._cuda_reason(self._fp8()))
+        with get_context().override_server_args(disable_shared_experts_fusion=False):
+            self.assertIsNotNone(
+                self._cuda_reason(self._fp8(), shared_expert_intermediate_size=1024)
             )
 
 
