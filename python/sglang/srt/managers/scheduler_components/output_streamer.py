@@ -539,8 +539,6 @@ class _GenerationStreamAccumulator:
             if (
                 req.return_logprob
                 and not req.input_logprob_sent
-                # Decode server does not send input logprobs
-                and self.disaggregation_mode != DisaggregationMode.DECODE
                 # Only send when input logprobs have been computed (after prefill)
                 and req.logprob.input_token_logprobs_val is not None
             ):

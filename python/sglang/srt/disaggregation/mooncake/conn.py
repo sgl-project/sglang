@@ -96,8 +96,9 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
-    # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
+    # Keep staging as the final positional field for existing constructors.
     staging: Optional[StagingTransferInfo] = None
+    prefill_logprobs_version: int = dataclasses.field(default=0, kw_only=True)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -129,6 +130,7 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            prefill_logprobs_version=int(msg[10]) if len(msg) > 10 else 0,
         )
 
 
@@ -207,6 +209,7 @@ class KVArgsRegisterInfo:
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    supports_prefill_logprobs = True
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
@@ -2442,6 +2445,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 msg = recv()
                 if msg is None:
                     continue
+                if self.handle_prefill_logprobs(msg):
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -2871,6 +2876,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
+                            b"1" if self.want_prefill_logprobs else b"0",
                         ]
                     )
             except zmq.ZMQError:
