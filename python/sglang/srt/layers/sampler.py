@@ -37,7 +37,8 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
+
+    from sglang.srt.layers.sampling_renorm import (
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
@@ -45,8 +46,11 @@ if is_cuda():
 if is_musa():
     from sgl_kernel import (
         min_p_sampling_from_probs,
-        top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+    )
+
+    from sglang.srt.layers.sampling_renorm import (
+        top_k_renorm_prob,
         top_p_renorm_prob,
     )
 
@@ -648,12 +652,10 @@ class Sampler(nn.Module):
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
-            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
-            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
-            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            # Off by default to save an all-reduce; correct only while the last all-reduce,
+            # the lm_head matmul and every sampling kernel agree across ranks. The top-p /
+            # top-k renorm kernels do not (SGLANG_RENORM_DETERMINISTIC=1 fixes that), so
+            # enable this when TP ranks desynchronize. Grammar always syncs: xgrammar makes it likely.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
