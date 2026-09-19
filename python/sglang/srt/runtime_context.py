@@ -458,6 +458,100 @@ class SpawnRanks(msgspec.Struct, frozen=True):
     dp_rank: Optional[int] = None
 
 
+_RANK_AND_WIDTH = (
+    ("tp_rank", "tp_size"),
+    ("pp_rank", "pp_size"),
+    ("attn_tp_rank", "attn_tp_size"),
+    ("attn_dp_rank", "attn_dp_size"),
+    ("attn_cp_rank", "attn_cp_size"),
+    ("moe_ep_rank", "moe_ep_size"),
+)
+
+# `moe_dp` is absent because `initialize_model_parallel` aliases the MoE-DP
+# group to the attention-CP group when the latter is wider: there the group and
+# the name are two facts, which is the same reason `moe_dp_rank` is left off the
+# record at publish.
+_WIDTH_AND_GROUP = (
+    ("tp_size", "tp_group"),
+    ("pp_size", "pp_group"),
+    ("attn_tp_size", "attn_tp_group"),
+    ("attn_cp_size", "attn_cp_group"),
+    ("moe_ep_size", "moe_ep_group"),
+)
+
+_UNREADABLE = object()
+
+
+def _validate_parallel(parallel, source: str) -> None:
+    """Fail on a topology that cannot describe a real process layout.
+
+    The three identities hold unconditionally: a width and a rank are both
+    plausible small integers whichever way they are wrong, so an inconsistent
+    set is not caught by anything downstream -- it surfaces as a hang or a
+    wrong answer in a collective, far from the write. Stating one leaf without
+    the quotients that follow from it leaves the namespace describing no real
+    layout, and the caller that did so is the one that has to say what it meant.
+
+    Names that cannot be read are skipped rather than treated as zero: a
+    process that has published nothing can still stamp a rank, and a group that
+    has not been built answers nothing at all.
+    """
+
+    def read(name):
+        """A width or a rank, or `_UNREADABLE` for anything these identities
+        cannot be stated about -- an absent name, `None`, or a stand-in a test
+        put in a group's place. Booleans are integers in Python and are not
+        widths, so they are out too."""
+        try:
+            value = getattr(parallel, name)
+        except Exception:
+            return _UNREADABLE
+        if isinstance(value, bool) or not isinstance(value, int):
+            return _UNREADABLE
+        return value
+
+    problems = []
+
+    for rank_name, size_name in _RANK_AND_WIDTH:
+        rank, size = read(rank_name), read(size_name)
+        if _UNREADABLE in (rank, size):
+            continue
+        if not 0 <= rank < size:
+            problems.append(
+                f"0 <= {rank_name} < {size_name}\n  {rank} is not a rank of {size}"
+            )
+
+    terms = ("tp_size", "attn_tp_size", "attn_dp_size", "attn_cp_size")
+    tp_size, a_tp, a_dp, a_cp = (read(n) for n in terms)
+    if _UNREADABLE not in (tp_size, a_tp, a_dp, a_cp):
+        if tp_size != a_tp * a_dp * a_cp:
+            problems.append(
+                "tp_size == attn_tp_size * attn_dp_size * attn_cp_size\n"
+                f"  {tp_size} != {a_tp} * {a_dp} * {a_cp} (= {a_tp * a_dp * a_cp})"
+            )
+
+    for size_name, group_name in _WIDTH_AND_GROUP:
+        size = read(size_name)
+        if size is _UNREADABLE:
+            continue
+        try:
+            group = getattr(parallel, group_name)
+        except Exception:
+            continue
+        built = getattr(group, "world_size", _UNREADABLE)
+        if isinstance(built, int) and not isinstance(built, bool) and built != size:
+            problems.append(
+                f"{group_name}.world_size == {size_name}\n"
+                f"  built {built}, configured {size}"
+            )
+
+    if problems:
+        raise ValueError(
+            f"parallel topology is inconsistent (set by {source}):\n"
+            + "\n".join(problems)
+        )
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
@@ -561,7 +655,13 @@ class ParallelContext:
         unknown = set(values) - _parallel_fields()
         if unknown:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
+        saved = dict(self._stamp)
         self._stamp.update(values)
+        try:
+            _validate_parallel(self, "override_permanently")
+        except Exception:
+            self._stamp = saved
+            raise
 
     def clear_stamp(self) -> None:
         """Drop every stamped name, ranks included."""
@@ -576,6 +676,11 @@ class ParallelContext:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
         saved = dict(self._overrides)
         self._overrides.update(kwargs)
+        try:
+            _validate_parallel(self, "override")
+        except Exception:
+            self._overrides = saved
+            raise
         try:
             yield self
         finally:
@@ -1804,8 +1909,13 @@ def publish(
         # "no controller" rather than an absence.
         placement["dp_rank"] = ranks.dp_rank
         placement["launch_world_rank"] = ranks.world_rank
+        placement.update(_attention_ranks(parallel, placement["tp_rank"]))
+        # One stamp, not two: the identities are checked on every write, and a
+        # half-placed process satisfies none of them.
         parallel.override_permanently(**placement)
-        _stamp_attention_ranks(parallel, placement["tp_rank"])
+        # Publish established the whole layout, so every identity applies here,
+        # not just the ones the stamp happened to name.
+        _validate_parallel(parallel, "publish")
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
@@ -1820,7 +1930,7 @@ def publish(
     return _CONTEXT
 
 
-def _stamp_attention_ranks(parallel, tp_rank: int) -> None:
+def _attention_ranks(parallel, tp_rank: int) -> dict:
     """Place this process in the attention topology, from the configuration.
 
     The widths are already on the bag -- `publish` computed them a moment ago --
@@ -1829,8 +1939,9 @@ def _stamp_attention_ranks(parallel, tp_rank: int) -> None:
     that never initialises distributed, which is what `ParallelState` provided
     by being a plain frozen record.
 
-    It is a stamp rather than a bag leaf because it is a per-process fact, and
-    nothing about the configuration distinguishes one rank from another.
+    These are stamped rather than written as bag leaves because they are
+    per-process facts, and nothing about the configuration distinguishes one
+    rank from another.
     """
     attn_tp_rank, attn_dp_rank = derive_attention_ranks(
         tp_rank=tp_rank,
@@ -1838,7 +1949,7 @@ def _stamp_attention_ranks(parallel, tp_rank: int) -> None:
         attn_cp_size=parallel.attn_cp_size,
         enable_dp_attention=parallel.enable_dp_attention,
     )
-    parallel.override_permanently(attn_tp_rank=attn_tp_rank, attn_dp_rank=attn_dp_rank)
+    return {"attn_tp_rank": attn_tp_rank, "attn_dp_rank": attn_dp_rank}
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:
