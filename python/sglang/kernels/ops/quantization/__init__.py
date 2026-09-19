@@ -184,6 +184,7 @@ _TRITON_KERNELS = [
     ("awq_triton", "awq_dequantize_triton"),
     ("awq_triton", "awq_gemm_triton"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
+    ("mxfp4_quant", "dynamic_mxfp4_quant"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

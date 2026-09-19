@@ -146,10 +146,21 @@ if _is_hip:
     def gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, y):
         torch.ops.sglang.aiter_gemm_afp4wfp4_pre_quant(x, w, w_scales, y)
 
+    # aiter's tile ladder is sized for prefill, where the N extent alone covers
+    # the part; a decode activation is a few dozen rows and underfills the
+    # launch. The SGLang kernel is the same per-32-block math with a tile
+    # re-pick for that case, so the output is bit-identical either way.
+    if is_gfx95_supported():
+        from sglang.kernels.ops.quantization.mxfp4_quant import (
+            dynamic_mxfp4_quant as _dynamic_mxfp4_quant_impl,
+        )
+    else:
+        _dynamic_mxfp4_quant_impl = _dynamic_mxfp4_quant_orig
+
     def _aiter_dynamic_mxfp4_quant(
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _dynamic_mxfp4_quant_orig(x)
+        return _dynamic_mxfp4_quant_impl(x)
 
     def _aiter_dynamic_mxfp4_quant_fake(
         x: torch.Tensor,
