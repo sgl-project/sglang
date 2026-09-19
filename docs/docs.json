@@ -1291,6 +1291,7 @@
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSpark",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
