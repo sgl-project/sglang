@@ -335,7 +335,7 @@ async fn drain_unary(
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     return (status, error_value(code, message), true);
                 }
-                let mut value = frame_value(&final_out, rid_str);
+                let mut value = frame_value(&final_out, &final_out, rid_str);
                 add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value, true);
             }
@@ -620,6 +620,58 @@ mod tests {
                 e2e_latency: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn statistics_survive_unary_and_interleaved_terminal_frames() {
+        use crate::message::response::GenerationStats;
+
+        for incremental in [false, true] {
+            let (tx0, rx0) = mpsc::channel(4);
+            let (tx1, rx1) = mpsc::channel(4);
+            let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
+            let stream = generation_event_stream(
+                receivers,
+                AbortGuard::new_empty(senders()),
+                incremental,
+                true,
+            );
+            futures::pin_mut!(stream);
+            for (index, tx) in [&tx0, &tx1].into_iter().enumerate() {
+                let event = ChunkEvent {
+                    stats: Some(GenerationStats {
+                        cached_tokens: index as u64 * 7,
+                        dp_rank: Some(index as u32),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                tx.send(ResponseItem::Frame(event.clone())).await.unwrap();
+                let value = parse(&stream.next().await.unwrap());
+                assert_eq!(value["index"], index);
+                assert_eq!(value["meta_info"]["dp_rank"], index);
+
+                let (unary_tx, mut unary_rx) = mpsc::channel(2);
+                unary_tx.send(ResponseItem::Frame(event)).await.unwrap();
+                unary_tx.send(done(10, "")).await.unwrap();
+                let (status, value, _) =
+                    drain_unary(&mut unary_rx, "r", RequestTiming::new()).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(value["meta_info"]["dp_rank"], index);
+            }
+            for (index, tx) in [&tx0, &tx1].into_iter().enumerate() {
+                tx.send(done(10 + index as u64, "")).await.unwrap();
+                let value = parse(&stream.next().await.unwrap());
+                assert_eq!(value["index"], index);
+                assert_eq!(value["meta_info"]["cached_tokens"], index * 7);
+                assert_eq!(value["meta_info"]["dp_rank"], index);
+                assert_eq!(
+                    value["meta_info"].get("cached_tokens_details"),
+                    Some(&serde_json::Value::Null)
+                );
+            }
+            assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        }
     }
 
     #[tokio::test]
