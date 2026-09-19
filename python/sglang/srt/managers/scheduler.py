@@ -170,6 +170,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionReapPlan,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -2103,8 +2104,11 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
-        now = time.monotonic()
-        self.session_controller.maybe_reap(now)
+        reap_plans = [r for r in recv_reqs if isinstance(r, SessionReapPlan)]
+        if reap_plans:
+            recv_reqs = [r for r in recv_reqs if not isinstance(r, SessionReapPlan)]
+            for plan in reap_plans:
+                self.session_controller.apply_reap(plan)
 
         for recv_req in recv_reqs:
             vmm_errors = None
@@ -2340,6 +2344,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            plan_session_reap=self.session_controller.plan_reap,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -3243,7 +3248,7 @@ class Scheduler(
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
         if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+            req.session.abort_req(req.rid)
             req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
         # checks that reject; no-op when the request has no group.
