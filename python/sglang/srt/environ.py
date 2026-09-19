@@ -1041,6 +1041,11 @@ class Envs:
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Use FlashInfer's fixed-grid persistent scheduler for the separate top-k
+    # reduce when the installed MegaMOE config exposes the knob. This lets the
+    # reducer scale with the runtime token count instead of requiring a second
+    # small-capacity workspace profile for decode.
+    SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT = EnvBool(True)
     # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
     # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
     # region and can win at large batch, but makes the output accumulation order
