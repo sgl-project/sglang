@@ -94,7 +94,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
 
 
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
-    """Gate contract for DSpark + dp attention + MoE a2a backends."""
+    """Gate contract for DSpark + dp attention + MoE all-to-all backends."""
 
     def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
         server_args = _make_dspark_server_args(
@@ -102,23 +102,64 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         )
         server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
-        server_args.dp_size = 2
-        server_args.tp_size = 2
+        server_args.dp_size = 8
+        server_args.tp_size = 8
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    def test_a2a_backends_are_admitted_under_static_verify(self):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
-                with self.assertRaisesRegex(ValueError, backend):
+            for backend in ("none", "deepep", "megamoe"):
+                with self.subTest(backend=backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
 
-    def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
+    def test_other_a2a_backends_are_rejected_by_name(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for backend in ("pplx", "flashinfer", "mooncake"):
+                with self.subTest(backend=backend):
+                    with self.assertRaisesRegex(ValueError, backend):
+                        _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_a2a_backend_warns_for_non_static_ragged_verify(self):
+        for mode in ("compact", "cap-accept"):
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                for backend in ("deepep", "megamoe"):
+                    with self.subTest(mode=mode, backend=backend):
+                        with self.assertLogs(
+                            "sglang.srt.arg_groups.speculative_hook", level="WARNING"
+                        ) as logs:
+                            _handle_dspark(
+                                self._dp_server_args(moe_a2a_backend=backend)
+                            )
+                        warning = "\n".join(logs.output)
+                        self.assertIn("may fail", warning)
+                        self.assertIn(f"SGLANG_RAGGED_VERIFY_MODE={mode}", warning)
+                        self.assertIn("SGLANG_RAGGED_VERIFY_MODE=static", warning)
+
+    def test_tp_moe_keeps_tolerating_compact_ragged_verify(self):
+        """Negative control: TP MoE continues to accept compact verify."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-            with self.assertRaisesRegex(ValueError, "static"):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="none"))
+
+    def test_single_dp_rank_keeps_cp_exemption(self):
+        server_args = self._dp_server_args(moe_a2a_backend="deepep")
+        server_args.dp_size = 1
+        server_args.enable_dp_lm_head = False
+        server_args.attn_cp_size = 2
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(server_args)
+
+    def test_npu_keeps_backend_exemption(self):
+        server_args = self._dp_server_args(moe_a2a_backend="ascend_fuseep")
+        server_args.device = "npu"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _handle_dspark(server_args)
+
+    def test_deepep_rejects_mismatched_draft_backend(self):
+        server_args = self._dp_server_args(moe_a2a_backend="deepep")
+        server_args.speculative_moe_a2a_backend = "none"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "must match"):
                 _handle_dspark(server_args)
 
 
