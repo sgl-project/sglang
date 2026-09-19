@@ -66,25 +66,17 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 
 ### Interleave waiting prefills with a continuing request
 
-Prefill interleaving reserves part of `--chunked-prefill-size` for waiting requests
-that can finish their remaining uncached prefill in the same pass. It supports
-`shortest-prefill-first` (enabled by default) and `hrrn` (opt-in):
+Prefill interleaving lets waiting requests finish their uncached prefill alongside
+a continuing request. It requires chunked prefill, radix caching, and an
+autoregressive model. Enable it for `hrrn` with `--enable-prefill-interleaving`;
+it is enabled by default for `shortest-prefill-first`. Use
+`--disable-prefill-interleaving` to turn it off.
 
-```bash
-# Example for a single NVIDIA GPU with an autoregressive model and radix caching.
-python -m sglang.launch_server --model-path MODEL_PATH \
-  --schedule-policy hrrn \
-  --enable-prefill-interleaving \
-  --chunked-prefill-size 16384 \
-  --prefill-interleaving-min-continuation-tokens 4096
-```
-
-The continuation minimum defaults to one KV page for `shortest-prefill-first`.
-For `hrrn`, it defaults to half the current chunk budget, rounded up to a KV page
-(8K for a 16K budget). You can override either default with a positive multiple
-of `--page-size`, smaller than the chunk size. If no waiting request fits, the
-continuation uses the normal chunk budget. Memory admission can still limit either allocation. Use
-`--disable-prefill-interleaving` to disable the shortest-prefill-first default.
+`--prefill-interleaving-min-continuation-tokens` reserves one KV page by default
+for `shortest-prefill-first`, or half the current chunk budget rounded up to a
+page for `hrrn` (8K of 16K). An explicit minimum must be a positive multiple of
+`--page-size` below `--chunked-prefill-size`. If no waiter fits, the continuation
+uses the normal chunk budget. Memory admission can still limit either allocation.
 
 | Policy | Waiting-request selection |
 | --- | --- |
@@ -96,14 +88,10 @@ the unscanned tail stays in place. HRRN uses FCFS ordering when the waiting queu
 exceeds its existing 128-request fallback threshold. The interleaving scan cap
 limits eligibility checks, not prefix matching or total scheduler work.
 
-HRRN ages requests by prefill tokens processed since arrival, relative to uncached
-work. Interleaving preserves HRRN order among selected requests but does not bound
-tail TTFT: non-fitting requests can be bypassed.
-
-The scheduler tracks only one unfinished chunked prefill. Waiting requests with
-uncached work at or above the chunk size cannot interleave with the continuation;
-smaller requests must also fit after its reservation. Supporting multiple partial
-prefills, and extending these controls to other policies, are future work.
+Only one unfinished prefill is supported: waiters must fit after the continuation
+reservation and finish in this pass. Interleaving longer requests needs support
+for multiple partial prefills. Non-fitting waiters can be bypassed, so HRRN aging
+does not guarantee bounded tail TTFT.
 
 ### Tune `--cuda-graph-max-bs-decode`
 By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).

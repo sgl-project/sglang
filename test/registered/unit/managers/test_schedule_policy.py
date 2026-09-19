@@ -278,19 +278,20 @@ class TestShortestPrefillFirst(CustomTestCase):
 
     def test_interleaving_scan_cap_preserves_unscanned_requests(self):
         continuation = self.make_req("continuation", 8192)
-        for large_count in (126, 127, 128):
+        for large_count, selected_count, expected_limit in (
+            (126, 2, 3584),
+            (127, 1, 3840),
+            (128, 0, None),
+        ):
             with self.subTest(large_count=large_count):
                 policy = self.make_policy("hrrn", enable_prefill_interleaving=True)
                 large = [self.make_req(str(i), 4096) for i in range(large_count)]
                 small = [self.make_req("first", 256), self.make_req("second", 256)]
                 waiting = large + small
-                selected_count = min(2, 128 - large_count)
                 limit = policy.prefill_interleaving_chunk_limit(
                     continuation, waiting, 4096, 256
                 )
-                self.assertEqual(
-                    limit, 4096 - selected_count * 256 if selected_count else None
-                )
+                self.assertEqual(limit, expected_limit)
                 self.assertEqual(
                     waiting, small[:selected_count] + large + small[selected_count:]
                 )
@@ -304,31 +305,6 @@ class TestShortestPrefillFirst(CustomTestCase):
             4096 - 128,
         )
         self.assertEqual(waiting, original)
-
-    def test_minimum_and_shorter_than_continuation_are_independent(self):
-        for name in ("hrrn", "shortest-prefill-first"):
-            with self.subTest(policy=name):
-                policy = self.make_policy(
-                    name,
-                    enable_prefill_interleaving=True,
-                    prefill_interleaving_min_continuation_tokens=1024,
-                )
-                waiting = [self.make_req("waiter", 3072)]
-                self.assertEqual(
-                    policy.prefill_interleaving_chunk_limit(
-                        self.make_req("continuation", 8192), waiting, 4096, 256
-                    ),
-                    1024,
-                )
-                self.assertIsNone(
-                    policy.prefill_interleaving_chunk_limit(
-                        self.make_req("continuation", 8192), waiting, 1024, 256
-                    )
-                )
-                limit = policy.prefill_interleaving_chunk_limit(
-                    self.make_req("continuation", 2048), waiting, 4096, 256
-                )
-                self.assertEqual(limit, 1024 if name == "hrrn" else None)
 
     def test_hrrn_aging_orders_fitting_requests_before_reservation(self):
         policy = self.make_policy(
@@ -353,15 +329,19 @@ class TestShortestPrefillFirst(CustomTestCase):
         )
         self.assertEqual(waiting, [old, new])
 
-    def test_policy_default_minimum_and_explicit_override(self):
-        for name, minimum, budget, waiter, expected in (
-            ("hrrn", None, 16384, 8192, 8192),
-            ("hrrn", None, 4096, 3072, None),
-            ("hrrn", None, 1280, 512, 768),
-            ("hrrn", None, 256, 1, None),
-            ("hrrn", 256, 4096, 3840, 256),
-            ("shortest-prefill-first", None, 4096, 3840, 256),
-            ("shortest-prefill-first", 2048, 4096, 3072, None),
+    def test_continuation_allocation(self):
+        for name, minimum, budget, remaining, waiter, expected in (
+            ("hrrn", None, 16384, 32768, 8192, 8192),
+            ("hrrn", None, 4096, 32768, 3072, None),
+            ("hrrn", None, 1280, 32768, 512, 768),
+            ("hrrn", None, 256, 32768, 1, None),
+            ("hrrn", 256, 4096, 32768, 3840, 256),
+            ("shortest-prefill-first", None, 4096, 32768, 3840, 256),
+            ("shortest-prefill-first", 2048, 4096, 32768, 3072, None),
+            ("hrrn", 1024, 1024, 8192, 3072, None),
+            ("shortest-prefill-first", 1024, 1024, 8192, 3072, None),
+            ("hrrn", 1024, 4096, 2048, 3072, 1024),
+            ("shortest-prefill-first", 1024, 4096, 2048, 3072, None),
         ):
             with self.subTest(policy=name, minimum=minimum, budget=budget):
                 policy = self.make_policy(
@@ -371,7 +351,7 @@ class TestShortestPrefillFirst(CustomTestCase):
                 )
                 self.assertEqual(
                     policy.prefill_interleaving_chunk_limit(
-                        self.make_req("continuation", 32768),
+                        self.make_req("continuation", remaining),
                         [self.make_req("waiter", waiter)],
                         budget,
                         256,
