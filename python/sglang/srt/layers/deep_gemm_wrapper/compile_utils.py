@@ -151,6 +151,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL = auto()
     GROUPED_GEMM_NT_I8I8BF16_FUSED = auto()
     GROUPED_GEMM_NT_BF16_FUSED = auto()
+    GROUPED_GEMM_NT_F4F4BF16_FUSED = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -367,6 +368,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -460,6 +462,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED,
         ]:
             # moe_align output memory (all int32)
             _BLOCK_M_MIN = 16  # min block_m config, used for conservative upper bound of max_num_m_blocks
@@ -510,6 +513,17 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                     + num_groups * n * k
                     + num_groups * n * 4
                     + max_m * n * 2
+                    + _moe_align_mem
+                ) / _GB
+            elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED]:
+                _GROUP_SIZE = 32  # k is came from quanted tensor
+                # lhs(uint8) + lhs_scale(uint16 groupwise) + rhs(uint8) + rhs_scale(uint16 groupwise) + out(bf16)
+                return (
+                    max_m * k
+                    + max_m * ceil_div(k, _GROUP_SIZE) * 2  # 2 means uint16_t
+                    + num_groups * n * k
+                    + num_groups * n * ceil_div(k, _GROUP_SIZE) * 2  # 2 means uint16_t
+                    + max_m * n * 2  # 2 means bfloat16
                     + _moe_align_mem
                 ) / _GB
             else:  # BF16_FUSED
@@ -1342,6 +1356,47 @@ class _GroupedFusedWarmupExecutor_fp8_channel(_BaseWarmupExecutor):
             self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=True
         )
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_fp4(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_F4F4BF16_FUSED."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_token_uint8((num_groups, n, k))
+        ### lhs_s is uint16 k major(contiguous) for DG fused_moe
+        self.lhs_s = self.lhs_s.view(torch.uint16)
+        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
+        )
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],

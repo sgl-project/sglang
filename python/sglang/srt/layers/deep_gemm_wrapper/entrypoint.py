@@ -914,6 +914,35 @@ def grouped_gemm_nt_f8f8bf16_fused(
         )
 
 
+def grouped_gemm_nt_f4f4bf16_fused(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_rows: torch.Tensor,
+    expert_ids_and_cumsum: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    aligned_num_m_blocks: torch.Tensor,
+    configs: Tuple,
+):
+    assert _is_ppu, f"only ppu deepgemm support {__name__}"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
 def moe_align_block_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -933,6 +962,8 @@ def moe_align_block_size(
         gemm_dtype = "int8"
     elif A.dtype == torch.bfloat16:
         gemm_dtype = "bf16"
+    elif A.dtype == torch.uint8:
+        gemm_dtype = "fp4"
     else:
         raise ValueError(
             f"Unsupported dtype {A.dtype}, expected one of: torch.float8_e4m3fn, torch.int8, torch.bfloat16"

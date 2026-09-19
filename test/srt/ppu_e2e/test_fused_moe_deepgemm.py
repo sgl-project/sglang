@@ -115,6 +115,13 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
         w_int8 = (weight / amax * 127.0).round().clamp(-128, 127).to(torch.int8)
         return w_int8, scale
 
+    @staticmethod
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = 2 * (x * y).sum() / denominator
+        return 1 - sim
+
     # ------------------------------------------------------------------
     # Triton reference (fused_moe direct call — pure Triton, no DeepGEMM)
     # ------------------------------------------------------------------
@@ -148,6 +155,7 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
 
         use_fp8 = quant_kwargs.get("use_fp8_w8a8", False)
         use_int8 = quant_kwargs.get("use_int8_w8a8", False)
+        use_mxfp4 = quant_kwargs.get("use_mxfp4", False)
         w1_scale = quant_kwargs.get("w1_scale")
         w2_scale = quant_kwargs.get("w2_scale")
         block_shape = quant_kwargs.get("block_shape")
@@ -164,6 +172,11 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
                 activation_scheme="dynamic",
                 ignored_layers=[],
                 use_mxfp8=False,
+            )
+        elif use_mxfp4:
+            quant_config = get_quantization_config("mxfp4")(
+                is_checkpoint_mxfp4_serialized=True,
+                ignored_layers=[],
             )
         else:
             quant_config = None
@@ -217,6 +230,13 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
             moe_experts.w2_weight_scale_inv = torch.nn.Parameter(
                 w2_scale, requires_grad=False
             )
+        elif use_mxfp4:
+            moe_experts.w13_weight_scale = torch.nn.Parameter(
+                w1_scale, requires_grad=False
+            )
+            moe_experts.w2_weight_scale = torch.nn.Parameter(
+                w2_scale, requires_grad=False
+            )
 
         # --- Run ---
         output = moe_experts(hidden_states.clone(), topk_output)
@@ -242,8 +262,43 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
         )
 
         # --- Triton reference ---
+        quant_kwargs_ = quant_kwargs.copy()
+        w1_, w2_ = w1, w2
+        hidden_states_ = hidden_states
+        use_mxfp4 = quant_kwargs_.pop("use_mxfp4", False)
+        if use_mxfp4:
+            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
+            from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+
+            ### Triton fused_moe does NOT support mxfp4. so dequant to bfloat16.
+            ### the triton fp4 path in deep_gemm is NOT support(only dequant path still exists)
+            w1_ = upcast_from_mxfp(
+                w1_,
+                quant_kwargs["w1_scale"].contiguous().view(torch.uint8),
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            w2_ = upcast_from_mxfp(
+                w2_,
+                quant_kwargs["w2_scale"].contiguous().view(torch.uint8),
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+            quant_kwargs_.pop("w1_scale")
+            quant_kwargs_.pop("w2_scale")
+            hidden_states_, hidden_states_scale_ = downcast_to_mxfp4(
+                hidden_states_, axis=1
+            )
+            hidden_states_ = upcast_from_mxfp(
+                hidden_states_,
+                hidden_states_scale_.contiguous().view(torch.uint8),
+                target_dtype=torch.bfloat16,
+                axis=-1,
+            )
+
         triton_output = self._run_triton_reference(
-            hidden_states, w1, w2, topk_output, **quant_kwargs
+            hidden_states_, w1_, w2_, topk_output, **quant_kwargs_
         )
 
         # --- DeepGEMM ---
@@ -255,6 +310,15 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
         assert not torch.isnan(deepgemm_output).any(), "DeepGEMM output has NaN"
         assert not torch.isinf(triton_output).any(), "Triton output has Inf"
         assert not torch.isinf(deepgemm_output).any(), "DeepGEMM output has Inf"
+
+        if use_mxfp4:
+            diff = self.calc_diff(triton_output, deepgemm_output)
+            ### The threshold is relaxed for mxfp4, because quant ater silu_and_mul is absent during b16 path.
+            assert diff < 0.15, (
+                f"The difference between MXFP4 and Bfloat16 is too large."
+                f"threshold=0.15 but got {diff=}"
+            )
+            return
 
         torch.testing.assert_close(deepgemm_output, triton_output, rtol=rtol, atol=atol)
 
@@ -344,6 +408,56 @@ class TestFusedMoEDeepGEMMPath(CustomTestCase):
                     w1_scale=w1_scale,
                     w2_scale=w2_scale,
                     block_shape=None,
+                )
+                torch.cuda.empty_cache()
+
+    def test_fp4(self):
+        """MXFP4: fused_moe() v.s. FusedMoE(deep_gemm)."""
+        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+
+        dtype = torch.bfloat16
+        E = self.NUM_EXPERTS
+        for m in self.M_CANDIDATES:
+            with self.subTest(m=m):
+                torch.manual_seed(42)
+                a = self.create_random_cuda_tensor((m, self.HIDDEN_SIZE), dtype)
+                w1_bf16 = self.create_random_cuda_tensor(
+                    (E, self.N_UP, self.HIDDEN_SIZE), dtype
+                )
+                w2_bf16 = self.create_random_cuda_tensor(
+                    (E, self.HIDDEN_SIZE, self.N_DOWN), dtype
+                )
+                score = self.create_random_cuda_tensor((m, E), dtype)
+
+                w1_uint8, w1_scale_uint16 = downcast_to_mxfp4(
+                    w1_bf16,
+                    axis=-1,
+                )
+                w2_uint8, w2_scale_uint16 = downcast_to_mxfp4(
+                    w2_bf16,
+                    axis=-1,
+                )
+                from deep_gemm import preprocess_mxfp4_scales
+
+                ### NOTE: the stride of scale derived from downcast_to_mxfp4
+                ### are WRONG for 3-axis tensor
+                w1_scale_uint16 = preprocess_mxfp4_scales(
+                    scale=(w1_scale_uint16.contiguous().view(torch.uint8))
+                )
+                w2_scale_uint16 = preprocess_mxfp4_scales(
+                    scale=(w2_scale_uint16.contiguous().view(torch.uint8))
+                )
+
+                self._compare_triton_vs_deepgemm(
+                    a,
+                    w1_uint8,
+                    w2_uint8,
+                    score,
+                    self.TOP_K,
+                    use_mxfp4=True,
+                    per_channel_quant=False,
+                    w1_scale=w1_scale_uint16,
+                    w2_scale=w2_scale_uint16,
                 )
                 torch.cuda.empty_cache()
 

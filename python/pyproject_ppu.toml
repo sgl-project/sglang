@@ -79,7 +79,7 @@ dependencies = [
   # ppu specific dependencies
   "cuda-python>=13.0",
   "tilelang==0.1.8",
-  "deep_gemm",
+  "deep_gemm>=1.1.0",
   "flash_attn_3",
   "flash_mla",
   "acext>=1.1.0",

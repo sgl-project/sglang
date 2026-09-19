@@ -190,7 +190,7 @@ def grouped_gemm_nt_f8f8bf16_fused_fake(
     C: torch.Tensor,
     topk_ids: torch.Tensor,
     is_perchannel: bool,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = A.shape[0] * topk_ids.shape[1]
     device = topk_ids.device
@@ -210,7 +210,7 @@ def grouped_gemm_nt_f8f8bf16_fused(
     C: torch.Tensor,
     topk_ids: torch.Tensor,
     is_perchannel: bool,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (
         configs_list,
@@ -245,7 +245,7 @@ def grouped_gemm_nt_i8i8bf16_fused_fake(
     Bs: torch.Tensor,
     C: torch.Tensor,
     topk_ids: torch.Tensor,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = A.shape[0] * topk_ids.shape[1]
     device = topk_ids.device
@@ -264,7 +264,7 @@ def grouped_gemm_nt_i8i8bf16_fused(
     Bs: torch.Tensor,
     C: torch.Tensor,
     topk_ids: torch.Tensor,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (
         configs_list,
@@ -297,7 +297,7 @@ def grouped_gemm_nt_bf16bf16bf16_fused_fake(
     B: torch.Tensor,
     C: torch.Tensor,
     topk_ids: torch.Tensor,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_groups = B.shape[0]
     numel = A.shape[0] * topk_ids.shape[1]
@@ -317,7 +317,7 @@ def grouped_gemm_nt_bf16bf16bf16_fused(
     B: torch.Tensor,
     C: torch.Tensor,
     topk_ids: torch.Tensor,
-    configs: Optional[list[int]] = None,
+    configs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (
         configs_list,
@@ -332,6 +332,61 @@ def grouped_gemm_nt_bf16bf16bf16_fused(
     deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_fused(
         A,
         B,
+        C,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        configs_list,
+    )
+
+    return m_rows, inv_perm, expert_ids
+
+
+def grouped_gemm_nt_f4f4bf16_fused_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_groups = B.shape[0]
+    numel = A.shape[0] * topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(num_groups, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+        torch.empty(numel, dtype=torch.int32, device=device),
+    )
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_f4f4bf16_fused_fake)
+def grouped_gemm_nt_f4f4bf16_fused(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    configs: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (
+        configs_list,
+        m_rows,
+        expert_ids_and_cumsum,
+        sorted_token_ids,
+        aligned_num_m_blocks,
+        inv_perm,
+        expert_ids,
+    ) = deep_gemm_wrapper.moe_align_block_size(
+        A, B, topk_ids, perchannel_quant=False, configs=configs
+    )
+
+    deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_fused(
+        (A, As),
+        (B, Bs),
         C,
         m_rows,
         expert_ids_and_cumsum,
@@ -566,6 +621,10 @@ def deep_moe_impl_fused(
         w1_scale = w1_scale.unsqueeze(-1) if w1_scale.ndim != w1.ndim else w1_scale
         w2_scale = w2_scale.unsqueeze(-1) if w2_scale.ndim != w2.ndim else w2_scale
 
+    # Hybrid fused path: requires DeepGemm commit 53ea8ff (refactor fused MoE API)
+    use_tp_fused = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
+    use_fused_path = use_tp_fused and not use_w4a16
+
     if use_int8:
         assert per_channel_quant and block_shape is None, (
             "int8 quantization only supports per-channel quant."
@@ -590,7 +649,9 @@ def deep_moe_impl_fused(
             )
     elif use_mxfp4:
         # hidden_states: torch.uint8, hidden_states_scale: torch.uint16
-        hidden_states, hidden_states_scale = downcast_to_mxfp4(hidden_states, axis=1)
+        hidden_states, hidden_states_scale = downcast_to_mxfp4(
+            hidden_states, axis=1, enable_fused_moe=use_fused_path
+        )
         block_k = block_shape[1]
     else:
         hidden_states_scale = None
@@ -600,13 +661,8 @@ def deep_moe_impl_fused(
         (num_tokens_padded, N), device=hidden_states.device, dtype=torch.bfloat16
     )
 
-    # Hybrid fused path: requires DeepGemm commit 53ea8ff (refactor fused MoE API)
-    use_tp_fused = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
-    use_fused_path = use_tp_fused and not use_mxfp4 and not use_int4_w4a16
-
     if use_fused_path:
         # ── fused path: moe_align + GEMM1 fused (gather read) ──
-        is_perchannel = use_int8 or (use_fp8 and per_channel_quant)
 
         if use_int8:
             m_rows, inv_perm, expert_ids = grouped_gemm_nt_i8i8bf16_fused(
@@ -621,6 +677,15 @@ def deep_moe_impl_fused(
                 out1,
                 topk_ids,
                 per_channel_quant,
+            )
+        elif use_mxfp4:
+            m_rows, inv_perm, expert_ids = grouped_gemm_nt_f4f4bf16_fused(
+                hidden_states,
+                hidden_states_scale,
+                w1,
+                w1_scale,
+                out1,
+                topk_ids,
             )
         else:
             m_rows, inv_perm, expert_ids = grouped_gemm_nt_bf16bf16bf16_fused(
