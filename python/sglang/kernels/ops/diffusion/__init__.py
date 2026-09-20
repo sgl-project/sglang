@@ -550,6 +550,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
+    "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",

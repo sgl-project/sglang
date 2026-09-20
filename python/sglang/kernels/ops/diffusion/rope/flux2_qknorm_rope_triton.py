@@ -5,6 +5,43 @@ import triton
 import triton.language as tl
 
 
+def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
+    if (
+        torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or torch.version.hip is not None
+        or not q.is_cuda
+        or torch.cuda.get_device_capability(q.device) != (9, 0)
+        or q.ndim != 4
+        or q.shape[-2:] != (24, 128)
+        or q.numel() == 0
+        or q.is_contiguous()
+        or k.shape != q.shape
+        or k.stride() != q.stride()
+        or q.stride(-1) != 1
+        or q.stride(-2) != 128
+        or q.stride(0) != q.shape[1] * q.stride(1)
+        or q.stride(1) < 24 * 128
+    ):
+        return False
+    if any(
+        t.device != q.device or t.dtype != torch.bfloat16
+        for t in (q, k, q_weight, k_weight)
+    ):
+        return False
+    if any(t.shape != (128,) or not t.is_contiguous() for t in (q_weight, k_weight)):
+        return False
+    return (
+        isinstance(cache, torch.Tensor)
+        and cache.device == q.device
+        and cache.dtype == torch.float32
+        and cache.ndim == 2
+        and cache.shape[0] >= q.shape[1]
+        and cache.shape[1] == 128
+        and cache.is_contiguous()
+    )
+
+
 @triton.jit
 def _flux2_strided_qknorm_rope_kernel(
     q_ptr,
@@ -39,8 +76,12 @@ def _flux2_strided_qknorm_rope_kernel(
         normalized, tl.broadcast_to(dims ^ 1, (BLOCK_ROWS, 128)), axis=1
     )
     pos = rows // HEADS % TOKENS
-    cos = tl.load(cache_ptr + pos * CACHE_STRIDE + dims // 2, mask=rows < ROWS, other=0.0)
-    sin = tl.load(cache_ptr + pos * CACHE_STRIDE + 64 + dims // 2, mask=rows < ROWS, other=0.0)
+    cos = tl.load(
+        cache_ptr + pos * CACHE_STRIDE + dims // 2, mask=rows < ROWS, other=0.0
+    )
+    sin = tl.load(
+        cache_ptr + pos * CACHE_STRIDE + 64 + dims // 2, mask=rows < ROWS, other=0.0
+    )
     # FlashInfer rounds the sine product before the cosine multiply-add.
     signed_partner = tl.where(dims % 2 == 0, -partner, partner)
     rotated = tl.fma(normalized, cos, signed_partner * sin)
@@ -68,8 +109,19 @@ def flux2_strided_qknorm_rope(
     block_rows = min(16, triton.next_power_of_2(max(1, rows // 512)))
     with torch.cuda.device(q.device):
         _flux2_strided_qknorm_rope_kernel[(triton.cdiv(rows, block_rows), 2)](
-            q, k, q_weight, k_weight, cos_sin_cache, output_q, output_k,
-            rows, tokens, heads, q.stride(1), cos_sin_cache.stride(0), eps,
+            q,
+            k,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            output_q,
+            output_k,
+            rows,
+            tokens,
+            heads,
+            q.stride(1),
+            cos_sin_cache.stride(0),
+            eps,
             BLOCK_ROWS=block_rows,
         )
     return output_q, output_k
