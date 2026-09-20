@@ -21,7 +21,12 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    dsa_indexer_state_decl,
+    dsa_indexer_pool_decl,
+)
+from sglang.srt.mem_cache.pool_host.host_pool_decl import (
+    HostPoolDecl,
+    HostPoolPlan,
+    LayerBinding,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
@@ -29,12 +34,6 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.state_spec import (
-    HostStateDecl,
-    HostStatePlan,
-    LayerBinding,
-    StateKind,
-)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
@@ -1276,28 +1275,28 @@ def build_hybrid_mamba_swa_stack(
 class DeclaredStack(NamedTuple):
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
-    plans: tuple[HostStatePlan, ...]
+    plans: tuple[HostPoolPlan, ...]
 
     @property
     def sidecars(self) -> list[SidecarPoolSpec]:
         return [p.decl.sidecar_spec() for p in self.plans if not p.decl.is_primary]
 
 
-def _plan_declared_states(
+def _plan_declared_pools(
     *,
-    decls: tuple[HostStateDecl, ...],
+    decls: tuple[HostPoolDecl, ...],
     device_pool: Any,
     full_layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
     packed_draft_device_pools: tuple[Any, ...],
-) -> tuple[HostStatePlan, ...]:
+) -> tuple[HostPoolPlan, ...]:
     names = [d.name for d in decls]
     if len(set(names)) != len(names):
-        raise ValueError(f"duplicate host state names: {names}")
+        raise ValueError(f"duplicate host pool names: {names}")
     primaries = [d for d in decls if d.is_primary]
-    if len(primaries) != 1 or primaries[0].kind is not StateKind.KV:
+    if len(primaries) != 1 or primaries[0].name != PoolName.KV:
         raise ValueError(
-            f"expected exactly one primary KV state, got {[d.name for d in primaries]}"
+            f"expected exactly one primary KV pool, got {[d.name for d in primaries]}"
         )
     primary = primaries[0].name
     for d in decls:
@@ -1307,19 +1306,19 @@ def _plan_declared_states(
         # self-reference and no sidecar-to-sidecar chains.
         if d.index_source != primary:
             raise ValueError(
-                f"{d.name}.index_source must be the primary state {primary}, "
+                f"{d.name}.index_source must be the primary pool {primary}, "
                 f"got {d.index_source}"
             )
         if d.layout_source is None or d.layout_source == d.name:
-            raise ValueError(f"{d.name}.layout_source must name another state")
+            raise ValueError(f"{d.name}.layout_source must name another pool")
         if d.layout_source not in names:
-            raise ValueError(f"{d.name} references undeclared state {d.layout_source}")
+            raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")
     layers = LayerBinding(
         transfer_to_device=full_layer_mapping,
         transfer_layer_id_max=transfer_layer_id_max,
     )
     return tuple(
-        HostStatePlan(
+        HostPoolPlan(
             decl=d,
             device_pool=device_pool,
             layers=layers,
@@ -1333,7 +1332,7 @@ def assemble_declared_stack(
     *,
     params: CacheInitParams,
     kv_pool: Any,
-    decls: tuple[HostStateDecl, ...],
+    decls: tuple[HostPoolDecl, ...],
     full_layer_mapping: dict[int, int],
     load_cache_event,
     storage_backend: Optional[str],
@@ -1362,7 +1361,7 @@ def assemble_declared_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    plans = _plan_declared_states(
+    plans = _plan_declared_pools(
         decls=decls,
         device_pool=kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -1440,7 +1439,7 @@ def _legacy_build_anchor_sidecar_stack(
     *,
     params: CacheInitParams,
     kv_pool: Any,
-    indexer_decl: HostStateDecl,
+    indexer_decl: HostPoolDecl,
     full_layer_mapping: dict[int, int],
     load_cache_event,
     storage_backend: Optional[str],
@@ -1602,7 +1601,7 @@ def build_full_draft_pools(
     if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
         # Separate draft indexer: its own host mirror laid out on the draft KV
         # mirror, but transfer indices still follow the target KV anchor.
-        indexer_decl = dsa_indexer_state_decl(pool, name=PoolName.DRAFT_INDEXER)
+        indexer_decl = dsa_indexer_pool_decl(pool, name=PoolName.DRAFT_INDEXER)
         indexer_host_pool = DSAIndexerPoolHost(
             indexer_decl,
             pool,
@@ -2108,7 +2107,7 @@ class _DsaStrategy(StackStrategy):
         stack = assemble_declared_stack(
             params=params,
             kv_pool=full_kv_pool,
-            decls=full_kv_pool.host_states(),
+            decls=full_kv_pool.host_pool_decls(),
             full_layer_mapping=full_layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -2275,31 +2274,31 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
     )
 
 
-# Strategies that assemble from host_states(), so every declared state has an
+# Strategies that assemble from host_pool_decls(), so every declared state has an
 # entry by construction; a miss here is a bug, not an unsupported combination.
 _DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy,)
 
 
 def _declaring_pool(kvcache: Any) -> Optional[Any]:
-    """The pool whose host_states() the stack must satisfy, or None."""
+    """The pool whose host_pool_decls() the stack must satisfy, or None."""
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
     pool = kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
     return pool if isinstance(pool, DSATokenToKVPool) else None
 
 
-def _verify_declared_states(
+def _verify_declared_pools(
     kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
     pool = _declaring_pool(kvcache)
     if pool is None:
         return
     entries = result.host_pool_group.entry_map
-    missing = [d.name.value for d in pool.host_states() if d.name not in entries]
+    missing = [d.name.value for d in pool.host_pool_decls() if d.name not in entries]
     if not missing:
         return
     msg = (
-        f"{type(pool).__name__} declares host states {missing} that "
+        f"{type(pool).__name__} declares host pools {missing} that "
         f"{type(strategy).__name__} did not assemble"
     )
     if isinstance(strategy, _DECLARATION_VERIFIED_STRATEGIES):
@@ -2366,7 +2365,7 @@ def attach_hybrid_pool_to_unified_cache(
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
-        _verify_declared_states(kvcache, result, strategy)
+        _verify_declared_pools(kvcache, result, strategy)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")
@@ -2557,7 +2556,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         stack = assemble_declared_stack(
             params=params,
             kv_pool=kv,
-            decls=kv.host_states(),
+            decls=kv.host_pool_decls(),
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=get_memory().hicache_storage_backend,

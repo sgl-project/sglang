@@ -20,14 +20,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
-    _verify_declared_states,
+    _verify_declared_pools,
     assemble_declared_stack,
     build_full_draft_pools,
     build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
-from sglang.srt.mem_cache.pool_host.state_spec import HostStateDecl
+from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -270,7 +270,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         seen = {}
 
         def fake_indexer_host(desc, device_pool, anchor_host, *, allocator_type):
-            self.assertIsInstance(desc, HostStateDecl)
+            self.assertIsInstance(desc, HostPoolDecl)
             self.assertIs(device_pool, draft_kv_pool)
             self.assertIs(anchor_host, draft_host_pool)
             seen["desc"] = desc
@@ -424,7 +424,7 @@ class TestDeclaredStackParity(CustomTestCase):
         return out, controller_args
 
     def test_matches_legacy_assembly(self):
-        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_state_decl
+        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_pool_decl
 
         cases = {
             "identity": dict(shard=None, mapping={0: 0, 1: 1, 2: 2}, drafts=0),
@@ -454,14 +454,14 @@ class TestDeclaredStackParity(CustomTestCase):
                     pool=pool,
                     params=params,
                     full_layer_mapping=case["mapping"],
-                    indexer_decl=dsa_indexer_state_decl(pool),
+                    indexer_decl=dsa_indexer_pool_decl(pool),
                 )
                 stack, new_ctrl = self._run(
                     assemble_declared_stack,
                     pool=pool,
                     params=params,
                     full_layer_mapping=case["mapping"],
-                    decls=pool.host_states(),
+                    decls=pool.host_pool_decls(),
                 )
                 transfer_layer_num = len(case["mapping"]) + case["drafts"]
                 self.assertEqual(
@@ -474,16 +474,16 @@ class TestDeclaredStackParity(CustomTestCase):
                     new_ctrl[1]["transfer_layer_id_max"], len(case["mapping"])
                 )
                 self.assertEqual(
-                    stack.sidecars, [dsa_indexer_state_decl(pool).sidecar_spec()]
+                    stack.sidecars, [dsa_indexer_pool_decl(pool).sidecar_spec()]
                 )
 
 
-class TestDeclaredStatePlanning(CustomTestCase):
+class TestDeclaredPoolPlanning(CustomTestCase):
     """Sidecar indices resolve from one primary source in HostPoolGroup, so the
     planner must reject self-references and sidecar chains up front."""
 
     def _plan(self, decls):
-        return hybrid_pool_assembler._plan_declared_states(
+        return hybrid_pool_assembler._plan_declared_pools(
             decls=decls,
             device_pool=object(),
             full_layer_mapping={0: 0},
@@ -494,7 +494,7 @@ class TestDeclaredStatePlanning(CustomTestCase):
     def test_rejects_self_referencing_index_source(self):
         import msgspec
 
-        kv, indexer = _dsa_pool_stub(layer_num=1).host_states()
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
         bad = msgspec.structs.replace(indexer, index_source=PoolName.INDEXER)
         with self.assertRaisesRegex(ValueError, "index_source"):
             self._plan((kv, bad))
@@ -502,13 +502,13 @@ class TestDeclaredStatePlanning(CustomTestCase):
     def test_rejects_self_referencing_layout_source(self):
         import msgspec
 
-        kv, indexer = _dsa_pool_stub(layer_num=1).host_states()
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
         bad = msgspec.structs.replace(indexer, layout_source=PoolName.INDEXER)
         with self.assertRaisesRegex(ValueError, "layout_source"):
             self._plan((kv, bad))
 
     def test_accepts_dsa_declaration(self):
-        plans = self._plan(_dsa_pool_stub(layer_num=1).host_states())
+        plans = self._plan(_dsa_pool_stub(layer_num=1).host_pool_decls())
         self.assertEqual([p.decl.name for p in plans], [PoolName.KV, PoolName.INDEXER])
 
 
@@ -535,7 +535,7 @@ class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
         self.assertEqual(transfer.hit_policy, PoolHitPolicy.ALL_PAGES)
 
 
-class TestDeclaredStateVerification(CustomTestCase):
+class TestDeclaredPoolVerification(CustomTestCase):
     def _result_with(self, *names):
         group = SimpleNamespace(entry_map={n: object() for n in names})
         return StackBuildResult(
@@ -545,7 +545,7 @@ class TestDeclaredStateVerification(CustomTestCase):
     def test_unmigrated_strategy_logs_missing_indexer(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
-            _verify_declared_states(
+            _verify_declared_pools(
                 pool, self._result_with(PoolName.KV), _MambaStrategy()
             )
         self.assertIn("indexer", logs.output[0])
@@ -553,13 +553,11 @@ class TestDeclaredStateVerification(CustomTestCase):
     def test_migrated_strategy_raises_on_missing_indexer(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
-            _verify_declared_states(
-                pool, self._result_with(PoolName.KV), _DsaStrategy()
-            )
+            _verify_declared_pools(pool, self._result_with(PoolName.KV), _DsaStrategy())
 
     def test_complete_stack_passes_silently(self):
         pool = _dsa_pool_stub(layer_num=2)
-        _verify_declared_states(
+        _verify_declared_pools(
             pool, self._result_with(PoolName.KV, PoolName.INDEXER), _DsaStrategy()
         )
 

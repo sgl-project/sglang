@@ -27,10 +27,9 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
-from sglang.srt.mem_cache.pool_host.state_spec import (
-    HostStateDecl,
-    StateKind,
-    StateLayout,
+from sglang.srt.mem_cache.pool_host.host_pool_decl import (
+    HostPoolDecl,
+    HostPoolLayout,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -65,7 +64,7 @@ class DSAIndexerMirror:
     def build(
         self,
         *,
-        decl: HostStateDecl,
+        decl: HostPoolDecl,
         device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         allocator_type: str,
@@ -75,13 +74,12 @@ class DSAIndexerMirror:
         )
 
 
-def dsa_kv_state_decl(pool: DSATokenToKVPool) -> HostStateDecl:
-    return HostStateDecl(
+def dsa_kv_pool_decl(pool: DSATokenToKVPool) -> HostPoolDecl:
+    return HostPoolDecl(
         name=PoolName.KV,
-        kind=StateKind.KV,
         index_source=None,
         layout_source=None,
-        layout=StateLayout(
+        layout=HostPoolLayout(
             bytes_per_token_per_layer=pool.kv_cache_dim * pool.store_dtype.itemsize,
             dtype=pool.store_dtype,
         ),
@@ -89,16 +87,15 @@ def dsa_kv_state_decl(pool: DSATokenToKVPool) -> HostStateDecl:
     )
 
 
-def dsa_indexer_state_decl(
+def dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
-) -> HostStateDecl:
+) -> HostPoolDecl:
     """Indexer state riding on the full-KV pages: indices and layout both follow KV."""
-    return HostStateDecl(
+    return HostPoolDecl(
         name=name,
-        kind=StateKind.INDEXER,
         index_source=PoolName.KV,
         layout_source=PoolName.KV,
-        layout=StateLayout(
+        layout=HostPoolLayout(
             bytes_per_token_per_layer=dsa_indexer_bytes_per_token_per_layer(
                 pool.index_head_dim, pool.quant_block_size
             ),
@@ -115,7 +112,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def __init__(
         self,
-        decl: HostStateDecl,
+        decl: HostPoolDecl,
         device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         *,

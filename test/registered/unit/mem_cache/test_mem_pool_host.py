@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    dsa_indexer_state_decl,
+    dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -373,7 +373,7 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 2)
 
 
-class TestDSAIndexerStateDecl(CustomTestCase):
+class TestDSAIndexerPoolDecl(CustomTestCase):
     """The declaration is the single source of indexer host bytes; the mirror
     must not re-derive them."""
 
@@ -394,7 +394,7 @@ class TestDSAIndexerStateDecl(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
         # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
-        desc = dsa_indexer_state_decl(self._stub()).layout
+        desc = dsa_indexer_pool_decl(self._stub()).layout
         self.assertEqual(desc.bytes_per_token_per_layer, 132)
         self.assertEqual(desc.page_bytes(64), 8448)
         self.assertEqual(
@@ -404,7 +404,7 @@ class TestDSAIndexerStateDecl(CustomTestCase):
 
     def test_mirror_consumes_decl(self):
         stub = self._stub()
-        decl = dsa_indexer_state_decl(stub)
+        decl = dsa_indexer_pool_decl(stub)
         desc = decl.layout
         anchor = MLATokenToKVPoolHost(
             stub,
