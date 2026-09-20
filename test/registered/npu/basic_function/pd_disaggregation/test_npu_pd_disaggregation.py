@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
     popen_with_error_check,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class DisaggregationHiCacheBase(PDDisaggregationServerBase):
@@ -68,6 +68,14 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp-size",
+            "2",
+            # Prefill takes devices 0,2 and decode 1,3 so each prefill rank
+            # shares one Ascend910 package with its decode peer: CANN only
+            # supports IPC memory sharing within one package (same PCIe
+            # switch), and prefill imports the decode peer's pre-allocated
+            # KV buffers via IPC (cross-package IpcOpenMemory fails with
+            # 507899 on 2-package 4-NPU runners).
+            "--gpu-id-step",
             "2",
             "--enable-hierarchical-cache",
             "--hicache-io-backend",
@@ -162,11 +170,6 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
 class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
     """Decode startup parameters"""
 
-    ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
-    base_gpu_id = (
-        ascend_devices.split(",")[2] if len(ascend_devices.split(",")) >= 3 else "2"
-    )
-
     @classmethod
     def start_decode(cls):
         decode_args = [
@@ -181,8 +184,12 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             2,
             "--mem-fraction-static",
             "0.9",
+            # Odd devices (1,3), pairing each rank with the prefill rank on
+            # the same package -- see start_prefill for the topology note.
             "--base-gpu-id",
-            cls.base_gpu_id,
+            1,
+            "--gpu-id-step",
+            2,
             "--disaggregation-decode-enable-offload-kvcache",
             "--hicache-io-backend",
             "kernel_ascend",

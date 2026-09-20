@@ -224,6 +224,10 @@ jobs:
           apt-get install -y libssl-dev
           pip install sglang_router
 
+      - name: Print Log Information
+        run: |
+          bash scripts/ci/npu/npu_log_print.sh
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:

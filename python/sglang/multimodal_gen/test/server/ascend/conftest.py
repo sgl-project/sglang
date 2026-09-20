@@ -7,6 +7,11 @@ available and layerwise offload degrades to the slow checkpoint-mapping path
 (observed as multi-fold latency regressions on minimax/mova perf cases).
 Dropping the page cache of non-current models before each case keeps the host
 memory budget healthy for the upcoming model load.
+
+Additionally, GitHub GT downloads (consistency images / case maps fetched via
+``requests`` in test_utils.py) are routed through ``GITHUB_PROXY_URL`` when it
+is set, because self-hosted NPU runners cannot reach raw.githubusercontent.com
+directly (see _install_github_proxy_prefix below).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import os
 import sys
 
 import pytest
+import requests
 
 from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
     MODELSCOPE_MODEL_WEIGHTS_DIR,
@@ -109,3 +115,43 @@ def _evict_stale_model_page_cache(request):
     )
     print(f"[CONFTEST] cgroup memory.current after: {_read_cgroup_memory_current()}")
     yield
+
+
+_GITHUB_PROXY_ENV = "GITHUB_PROXY_URL"
+_PROXYABLE_GITHUB_URL_PREFIXES = (
+    "https://raw.githubusercontent.com/",
+    "https://github.com/",
+)
+
+
+def _install_github_proxy_prefix() -> None:
+    """Route GitHub GT downloads through ``GITHUB_PROXY_URL`` when it is set.
+
+    Self-hosted NPU runners cannot reach raw.githubusercontent.com directly;
+    the GT / case-map downloads in test_utils.py (``requests.get`` /
+    ``requests.head``) must go through the same gh-proxy mirror the workflow
+    install steps already use. On the direct route a single case's GT
+    download has been observed to take ~20 minutes, pushing the "Run test"
+    step past its 60-minute timeout.
+
+    Non-GitHub URLs (localhost server APIs, HF mirror, modelscope) are passed
+    through untouched.
+    """
+    proxy = os.environ.get(_GITHUB_PROXY_ENV, "").strip().rstrip("/")
+    if not proxy:
+        return
+
+    def _with_proxy(original):
+        def _proxied(url, *args, **kwargs):
+            if isinstance(url, str) and url.startswith(_PROXYABLE_GITHUB_URL_PREFIXES):
+                url = f"{proxy}/{url}"
+            return original(url, *args, **kwargs)
+
+        return _proxied
+
+    requests.get = _with_proxy(requests.get)
+    requests.head = _with_proxy(requests.head)
+    print(f"[CONFTEST] Routing GitHub GT downloads through proxy: {proxy}")
+
+
+_install_github_proxy_prefix()
