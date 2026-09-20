@@ -228,6 +228,11 @@ class ReqDispatcher:
                 if len(self.future_queue) == total_request:
                     self.offline_recv_all_requests = True
                     heapq.heapify(self.future_queue)
+                    # Ingest is the client streaming requests in while this loop
+                    # polls; charging that idle wall-clock as cpu_overhead adds
+                    # the whole send window to the simulated clock at t=0, when
+                    # every request is still queued, inflating their TTFT alike.
+                    StateManager.set_last_real_time_ts(time.time())
                     logger.info("All requests received. Starting simulation now.")
                 else:
                     logger.info(
