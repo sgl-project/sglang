@@ -572,7 +572,7 @@ class TestRadixCache(CustomTestCase):
         cache.cache_finished_req(
             req,
             is_insert=True,
-            kv_len_to_handle=len(prompt_ids) + len(output_ids),
+            owned_kv_len=len(prompt_ids) + len(output_ids),
         )
 
         (prompt_node,) = cache.root_node.children.values()

@@ -7,7 +7,7 @@ import pytest
 import torch
 from flashinfer import mxfp8_quantize
 
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+from sglang.kernels.ops.attention.dsv4.wo_a import (
     _quantize_partial,
     _wo_a_reduce,
     wo_a_bf16_small_batch,
