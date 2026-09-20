@@ -8,16 +8,13 @@ per call on normally distributed inputs.
 
 Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on an SM120 device.
 Everything else goes to cuDNN SDPA. Each distinct sequence length compiles once
-(about 10 s); later calls with the same shape and strides reuse the plan.
+(about 10 s); later calls with the same shape reuse the compiled kernel. The FP8 and
+output buffers are allocated per call and belong to the caller.
 """
 
 import torch
 
-from sglang.kernels.ops.attention.fp8_fa_sm120 import (
-    HEAD_DIM,
-    FP8AttentionPlan,
-    plan_key,
-)
+from sglang.kernels.ops.attention.fp8_fa_sm120 import HEAD_DIM, fp8_attention
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -29,10 +26,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-# Shared by every impl instance: each DiT layer owns an impl, and per-layer plans would
-# hold one copy of the E4M3 and output buffers per layer. Layers run in sequence on one stream.
-_PLAN_CACHE: dict[tuple, FP8AttentionPlan] = {}
 
 
 class FP8FlashAttentionSM120Backend(AttentionBackend):
@@ -75,7 +68,6 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             prefix=prefix,
             **extra_impl_args,
         )
-        self.plans = _PLAN_CACHE
         self._reported_fallbacks: set[str] = set()
 
     # --- dispatch -------------------------------------------------------------
@@ -106,26 +98,9 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
 
     # --- kernel path ----------------------------------------------------------
 
-    def _get_plan(self, query, key, value) -> FP8AttentionPlan:
-        key_ = plan_key(query, self.softmax_scale)
-        plan = self.plans.get(key_)
-        if plan is None:
-            logger.info(
-                "fp8_fa_sm120 attention: compiling for S=%d H=%d (once per shape)",
-                query.shape[0],
-                query.shape[1],
-            )
-            plan = FP8AttentionPlan(query, key, value, self.softmax_scale)
-            self.plans[key_] = plan
-        else:
-            plan.bind_inputs(query, key, value)
-        return plan
-
     def _run(self, query, key, value):
-        """[S, H, 128] strided BF16 in, the plan's contiguous [S, H, 128] BF16 out."""
-        plan = self._get_plan(query, key, value)
-        plan.prepare()
-        output, _ = plan.launch_prepared()
+        """[S, H, 128] strided BF16 in, a new contiguous [S, H, 128] BF16 out."""
+        output, _ = fp8_attention(query, key, value, softmax_scale=self.softmax_scale)
         return output
 
     # --- AttentionImpl --------------------------------------------------------

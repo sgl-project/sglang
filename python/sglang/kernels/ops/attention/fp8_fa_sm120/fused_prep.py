@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused FP8 preparation for the SM120 kernel: two Triton passes into the plan buffers.
+"""Fused FP8 preparation for the SM120 kernel: two Triton passes into the workspace.
 
 Replaces a Torch chain (FP32 copy, amax, divide, cast,
 padded copy, V transpose copy) with one per-head amax pass and one pack pass that
@@ -9,13 +9,17 @@ writes the kernel's own buffers directly:
     V    [H, 128, padded_S]   transposed here, so the kernel stays unchanged
 
 Scales stay per head and the quantization recipe is the same (amax/448, div.rn,
-clamp, E4M3), so the kernel's numerics do not move. Padding rows are zeroed once
-by the plan and never written here.
+clamp, E4M3), so the kernel's numerics do not move. The pack pass writes every
+position of the padded buffers, padding included, because the workspace comes
+from torch.empty.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+# Power of two >= 16: the V^T key permutation works in groups of 16 tokens.
+BLOCK_TOKENS = 64
 
 
 # Triton's `/` lowers to div.full.f32 (approximate); Torch divides with div.rn.
@@ -103,8 +107,10 @@ def _head_scales(
     tl.store(scales + offsets, scale, mask=valid)
 
 
-# Pass 2: same grid as pass 1. Q/K tiles go out in [token, column] order;
-# the V tile is transposed in registers/shared and goes out in [column, token].
+# Pass 2: one program per (head, token block) up to padded_queries. Q/K tiles go
+# out in [token, column] order; the V tile is transposed in registers/shared and
+# goes out in [column, token]. Loads are masked on the input token, stores on the
+# buffer position, so padding positions receive quantized zeros.
 @triton.jit
 def _pack_qkv(
     q,
@@ -121,7 +127,6 @@ def _pack_qkv(
     padded_keys: tl.constexpr,
     heads: tl.constexpr,
     block_tokens: tl.constexpr,
-    permute_keys: tl.constexpr,
 ):
     head = tl.program_id(0)
     tokens = tl.program_id(1) * block_tokens + tl.arange(0, block_tokens)
@@ -135,12 +140,14 @@ def _pack_qkv(
     # Q is padded to the 128-row query tile, K/V to the 32-key tile.
     hsd_offsets = head * padded_queries * 128 + tokens[:, None] * 128 + columns[None, :]
     k_offsets = head * padded_keys * 128 + tokens[:, None] * 128 + columns[None, :]
+    in_queries = tokens[:, None] < padded_queries
+    in_keys = tokens[:, None] < padded_keys
 
     q_tile = _load_tile(q, head, tokens, columns, valid, head_stride, token_stride)
-    tl.store(q_fp8 + hsd_offsets, _quantize(q_tile, q_scale), mask=valid)
+    tl.store(q_fp8 + hsd_offsets, _quantize(q_tile, q_scale), mask=in_queries)
 
     k_tile = _load_tile(k, head, tokens, columns, valid, head_stride, token_stride)
-    tl.store(k_fp8 + k_offsets, _quantize(k_tile, k_scale), mask=valid)
+    tl.store(k_fp8 + k_offsets, _quantize(k_tile, k_scale), mask=in_keys)
 
     # The kernel packs P straight from the score fragment; V^T's stored key
     # order must follow it: stored position p holds key
@@ -148,96 +155,78 @@ def _pack_qkv(
     # The permutation is applied on the LOAD side as a row gather: every gathered
     # row is still 256 contiguous bytes, and the transposed store stays contiguous.
     # Permuting the store instead scatters bytes inside 16 B windows and doubled
-    # the prepare time. Padding keys are never written.
-    if permute_keys:
-        source_tokens = (
-            tokens // 16 * 16
-            + 8 * ((tokens % 4) // 2)
-            + 2 * ((tokens % 16) // 4)
-            + tokens % 2
-        )
-    else:
-        source_tokens = tokens
+    # the prepare time.
+    source_tokens = (
+        tokens // 16 * 16
+        + 8 * ((tokens % 4) // 2)
+        + 2 * ((tokens % 16) // 4)
+        + tokens % 2
+    )
     valid_source = source_tokens[:, None] < sequence
 
     hds_offsets = (
         head * 128 * padded_keys + columns[:, None] * padded_keys + tokens[None, :]
     )
-    valid_transposed = source_tokens[None, :] < sequence
+    in_keys_transposed = tokens[None, :] < padded_keys
 
     v_tile = _load_tile(
         v, head, source_tokens, columns, valid_source, head_stride, token_stride
     )
     tl.store(
-        v_fp8 + hds_offsets, tl.trans(_quantize(v_tile, v_scale)), mask=valid_transposed
+        v_fp8 + hds_offsets,
+        tl.trans(_quantize(v_tile, v_scale)),
+        mask=in_keys_transposed,
     )
 
 
-def _attach_fused_state(plan, block_tokens):
-    q, k, v = plan.inputs
-    for tensor in (k, v):
-        if tensor.stride() != q.stride():
-            raise ValueError("Q/K/V must share strides for fused preparation")
-    if q.stride(2) != 1:
-        raise ValueError("Head dimension must be contiguous for fused preparation")
-    if block_tokens & (block_tokens - 1) or block_tokens < 16:
-        raise ValueError(
-            "block_tokens must be a power of two >= 16 (key permutation groups are 16 wide)"
-        )
+def fused_prepare(q, k, v, workspace):
+    """Three launches: per-head amax, scale finalize, direct pack into the workspace.
 
+    q, k, v are [H, S, 128] views with one shared stride set; the workspace buffers are
+    sized for this S and H.
+    """
     heads = q.shape[0]
-    plan.block_tokens = block_tokens
-    plan.head_stride = q.stride(0)
-    plan.token_stride = q.stride(1)
-    plan.maximums = torch.zeros((3, heads), device=q.device, dtype=torch.float32)
-
-
-def fused_prepare(plan):
-    """Three launches: per-head amax, scale finalize, direct pack into the plan buffers."""
-    q, k, v = plan.inputs
-    heads = q.shape[0]
-    padded_queries = plan.q_fp8.shape[1]
-    padded_keys = plan.k_fp8.shape[1]
-    grid = (heads, triton.cdiv(plan.sequence, plan.block_tokens))
+    sequence = q.shape[1]
+    padded_queries = workspace.q_fp8.shape[1]
+    padded_keys = workspace.k_fp8.shape[1]
+    head_stride = q.stride(0)
+    token_stride = q.stride(1)
 
     with torch.cuda.device(q.device):
-        plan.maximums.zero_()
-        _head_amax_qkv[grid](
+        _head_amax_qkv[(heads, triton.cdiv(sequence, BLOCK_TOKENS))](
             q,
             k,
             v,
-            plan.maximums,
-            plan.sequence,
-            head_stride=plan.head_stride,
-            token_stride=plan.token_stride,
+            workspace.maximums,
+            sequence,
+            head_stride=head_stride,
+            token_stride=token_stride,
             heads=heads,
-            block_tokens=plan.block_tokens,
+            block_tokens=BLOCK_TOKENS,
             num_warps=8,
         )
         _head_scales[(1,)](
-            plan.maximums,
-            plan.scales,
+            workspace.maximums,
+            workspace.scales,
             INVERSE_FP8_MAX,
             count=3 * heads,
             block=triton.next_power_of_2(3 * heads),
             num_warps=1,
         )
-        _pack_qkv[grid](
+        _pack_qkv[(heads, triton.cdiv(padded_queries, BLOCK_TOKENS))](
             q,
             k,
             v,
-            plan.q_fp8,
-            plan.k_fp8,
-            plan.v_fp8,
-            plan.scales,
-            plan.sequence,
-            head_stride=plan.head_stride,
-            token_stride=plan.token_stride,
+            workspace.q_fp8,
+            workspace.k_fp8,
+            workspace.v_fp8,
+            workspace.scales,
+            sequence,
+            head_stride=head_stride,
+            token_stride=token_stride,
             padded_queries=padded_queries,
             padded_keys=padded_keys,
             heads=heads,
-            block_tokens=plan.block_tokens,
-            permute_keys=plan.key_order is not None,
+            block_tokens=BLOCK_TOKENS,
             num_warps=8,
         )
-    plan._prepared = True

@@ -79,20 +79,26 @@ def test_forward_matches_cudnn(sequence):
     assert cosine > 0.995, cosine
 
 
-def test_plan_is_reused_across_calls():
+def _compiled_kernels():
+    from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _KERNEL_CACHE
+
+    return len(_KERNEL_CACHE)
+
+
+def test_kernel_is_reused_across_calls():
     ours, reference = _make_impls()
     q, k, v = _fused_qkv_views(4096, seed=1)
-    first = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None).clone()
-    plans_after_first = len(ours.plans)
+    first = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+    kernels_after_first = _compiled_kernels()
 
     q2, k2, v2 = _fused_qkv_views(4096, seed=2)
     second = ours.forward(q2.unsqueeze(0), k2.unsqueeze(0), v2.unsqueeze(0), None)
-    assert len(ours.plans) == plans_after_first
+    assert _compiled_kernels() == kernels_after_first
 
-    # A second impl (another DiT layer) shares the same plan.
+    # A second impl (another DiT layer) shares the same compiled kernel.
     other, _ = _make_impls()
     other.forward(q2.unsqueeze(0), k2.unsqueeze(0), v2.unsqueeze(0), None)
-    assert len(other.plans) == plans_after_first
+    assert _compiled_kernels() == kernels_after_first
 
     expected = reference.forward(
         q2.unsqueeze(0), k2.unsqueeze(0), v2.unsqueeze(0), None
@@ -144,16 +150,58 @@ def test_varlen_multiple_segments():
         assert relative_rms < 0.08, (start, stop, relative_rms)
 
 
+def test_distinct_shapes_release_memory():
+    """A call must not retain GPU buffers keyed by shape: each distinct sequence length
+    used to keep its FP8/output buffers and the last Q/K/V alive, ~2.2 GiB at H3 size."""
+    ours, _ = _make_impls()
+    shapes = [_fused_qkv_views(1052), _fused_qkv_views(1088)]
+    q, k, v = shapes[0]
+    ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+
+    for q, k, v in shapes:
+        output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+        assert torch.isfinite(output.float()).all()
+        del output
+
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == baseline
+
+
+def test_prep_defines_every_padded_byte():
+    """The FP8 buffers come from torch.empty, so the prep must write every padding
+    position; an E4M3 NaN byte left in the V^T tail makes masked keys poison the row."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120.fused_prep import fused_prepare
+    from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _allocate_workspace
+
+    q, k, v = _fused_qkv_views(1052)
+    workspace = _allocate_workspace(q)
+    for buffer in (workspace.q_fp8, workspace.k_fp8, workspace.v_fp8):
+        buffer.view(torch.uint8).fill_(0xFF)
+
+    fused_prepare(
+        q=q.permute(1, 0, 2),
+        k=k.permute(1, 0, 2),
+        v=v.permute(1, 0, 2),
+        workspace=workspace,
+    )
+
+    for buffer in (workspace.q_fp8, workspace.k_fp8, workspace.v_fp8):
+        raw = buffer.view(torch.uint8)
+        assert not ((raw == 0xFF) | (raw == 0x7F)).any()
+
+
 def test_causal_falls_back_to_cudnn():
     ours, reference = _make_impls(causal=True)
     q, k, v = _fused_qkv_views(1024)
-    plans_before = len(ours.plans)
+    kernels_before = _compiled_kernels()
 
     output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
     expected = reference.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
 
     assert torch.equal(output, expected)
-    assert len(ours.plans) == plans_before
+    assert _compiled_kernels() == kernels_before
 
 
 def test_backend_resolves_by_name():

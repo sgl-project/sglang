@@ -1,35 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reusable FP8 attention plan on SGLang's [S, H, 128] strided BF16 views.
+"""FP8 attention on SGLang's [S, H, 128] strided BF16 views.
 
-One plan owns one compiled kernel and its E4M3, scale, output and LSE buffers for a
-fixed (sequence, heads, input strides, softmax scale, device). bind_inputs() points
-the plan at new Q/K/V storage with the same shape and strides, so every DiT layer
-reuses one compilation. prepare() quantizes with the fused Triton passes,
-launch_prepared() runs the kernel. The BF16 output buffer [S, H, 128] belongs to
-the plan and is overwritten by the next launch.
+fp8_attention() quantizes Q/K/V per head with the fused Triton passes, runs the CuTe-DSL
+kernel and returns (output [S, H, 128] BF16, lse [H, S] FP32). The compiled kernel is
+cached per (sequence, heads, device); the E4M3, scale, output and LSE buffers come from
+the caching allocator on every call and belong to the caller, nothing is retained
+between calls.
 """
 
+import logging
 import math
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import msgspec
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from sglang.kernels.ops.attention.fp8_fa_sm120.fused_prep import (
-    _attach_fused_state,
-    fused_prepare,
-)
-from sglang.kernels.ops.attention.fp8_fa_sm120.kernel import (
-    fp8_attention_host,
-    key_order_for_positions,
-)
+from sglang.kernels.ops.attention.fp8_fa_sm120.fused_prep import fused_prepare
+from sglang.kernels.ops.attention.fp8_fa_sm120.kernel import fp8_attention_host
+
+logger = logging.getLogger(__name__)
 
 HEAD_DIM = 128
 # Q and K/V are padded separately; the kernel compiles its key mask only when S % 32 != 0.
 QUERY_TILE = 128
 KEY_TILE = 32
+
+# Compiled kernels only, KBs of host state each and about 10 s to build; the buffers
+# they run on are allocated per call.
+_KERNEL_CACHE: dict[tuple, object] = {}
 
 
 def validate_inputs(q, k, v, softmax_scale):
@@ -64,117 +65,86 @@ def validate_inputs(q, k, v, softmax_scale):
     return scale
 
 
-def plan_key(q, softmax_scale):
-    """Cache key: everything the compiled kernel and the prep constants depend on."""
-    return (
-        q.shape[0],
-        q.shape[1],
-        tuple(q.stride()),
-        q.device.index,
-        float(softmax_scale),
+def kernel_key(q):
+    """Cache key: the kernel bakes the buffer shapes, which follow from (S, H)."""
+    return (q.shape[0], q.shape[1], q.device.index)
+
+
+class Workspace(msgspec.Struct, frozen=True, kw_only=True):
+    """Kernel-side buffers for one call; the kernel works in [H, S, 128]."""
+
+    q_fp8: torch.Tensor
+    k_fp8: torch.Tensor
+    v_fp8: torch.Tensor
+    scales: torch.Tensor
+    maximums: torch.Tensor
+    output: torch.Tensor
+    lse: torch.Tensor
+
+
+def _allocate_workspace(q):
+    sequence = q.shape[0]
+    heads = q.shape[1]
+    padded_queries = (sequence + QUERY_TILE - 1) // QUERY_TILE * QUERY_TILE
+    padded_keys = (sequence + KEY_TILE - 1) // KEY_TILE * KEY_TILE
+    device = q.device
+    return Workspace(
+        q_fp8=torch.empty(
+            (heads, padded_queries, HEAD_DIM), device=device, dtype=torch.float8_e4m3fn
+        ),
+        k_fp8=torch.empty(
+            (heads, padded_keys, HEAD_DIM), device=device, dtype=torch.float8_e4m3fn
+        ),
+        v_fp8=torch.empty(
+            (heads, HEAD_DIM, padded_keys), device=device, dtype=torch.float8_e4m3fn
+        ),
+        scales=torch.empty((3, heads), device=device, dtype=torch.float32),
+        maximums=torch.zeros((3, heads), device=device, dtype=torch.float32),
+        output=torch.empty(q.shape, device=device, dtype=torch.bfloat16),
+        lse=torch.empty((heads, sequence), device=device, dtype=torch.float32),
     )
 
 
-class FP8AttentionPlan:
-    """Compiled kernel plus buffers for fixed strided [S, H, 128] BF16 inputs."""
+def _kernel_views(workspace):
+    # Byte DLPack views work across Torch versions without FP8 DLPack support.
+    mQ = from_dlpack(workspace.q_fp8.view(torch.uint8), assumed_align=16)
+    mK = from_dlpack(workspace.k_fp8.view(torch.uint8), assumed_align=16)
+    mV = from_dlpack(workspace.v_fp8.view(torch.uint8), assumed_align=16)
+    mQ.element_type = cutlass.Float8E4M3FN
+    mK.element_type = cutlass.Float8E4M3FN
+    mV.element_type = cutlass.Float8E4M3FN
+    mO = from_dlpack(workspace.output.permute(1, 0, 2), assumed_align=16)
+    mLSE = from_dlpack(workspace.lse, assumed_align=16)
+    mScales = from_dlpack(workspace.scales, assumed_align=16)
+    return (mQ, mK, mV, mO, mLSE, mScales)
 
-    def __init__(self, q, k, v, softmax_scale=None, block_tokens=64):
-        scale = validate_inputs(q, k, v, softmax_scale)
-        self.sequence = q.shape[0]
-        self.heads = q.shape[1]
-        self.softmax_scale = scale
-        self.kernel_scale = cutlass.Float32(scale)
-        self.padded_queries = (
-            (self.sequence + QUERY_TILE - 1) // QUERY_TILE * QUERY_TILE
+
+def fp8_attention(q, k, v, softmax_scale=None):
+    """Attention over strided [S, H, 128] BF16 views; returns (output [S, H, 128], lse [H, S])."""
+    scale = validate_inputs(q, k, v, softmax_scale)
+    kernel_scale = cutlass.Float32(scale)
+    key = kernel_key(q)
+
+    with torch.cuda.device(q.device):
+        workspace = _allocate_workspace(q)
+        views = _kernel_views(workspace)
+        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+
+        compiled = _KERNEL_CACHE.get(key)
+        if compiled is None:
+            logger.info(
+                "fp8_fa_sm120 attention: compiling for S=%d H=%d (once per shape)",
+                q.shape[0],
+                q.shape[1],
+            )
+            compiled = cute.compile(fp8_attention_host, *views, kernel_scale, stream)
+            _KERNEL_CACHE[key] = compiled
+
+        fused_prepare(
+            q=q.permute(1, 0, 2),
+            k=k.permute(1, 0, 2),
+            v=v.permute(1, 0, 2),
+            workspace=workspace,
         )
-        self.padded_keys = (self.sequence + KEY_TILE - 1) // KEY_TILE * KEY_TILE
-        self.device = q.device
-        self.input_strides = tuple(q.stride())
-        # The kernel side works in [H, S, 128]; these are views, not copies.
-        self.inputs = (q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2))
-
-        with torch.cuda.device(q.device):
-            self.q_fp8 = torch.zeros(
-                (self.heads, self.padded_queries, HEAD_DIM),
-                device=q.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            self.k_fp8 = torch.zeros(
-                (self.heads, self.padded_keys, HEAD_DIM),
-                device=q.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            self.v_fp8 = torch.zeros(
-                (self.heads, HEAD_DIM, self.padded_keys),
-                device=q.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            self.scales = torch.empty(
-                (3, self.heads), device=q.device, dtype=torch.float32
-            )
-            # V^T is stored in the key order the kernel's register P pack expects.
-            positions = torch.arange(self.padded_keys, device=q.device)
-            self.key_order = key_order_for_positions(positions)
-            self.output = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
-            self.lse = torch.empty(
-                (self.heads, self.sequence), device=q.device, dtype=torch.float32
-            )
-
-            # Byte DLPack views work across Torch versions without FP8 DLPack support.
-            mQ = from_dlpack(self.q_fp8.view(torch.uint8), assumed_align=16)
-            mK = from_dlpack(self.k_fp8.view(torch.uint8), assumed_align=16)
-            mV = from_dlpack(self.v_fp8.view(torch.uint8), assumed_align=16)
-            mQ.element_type = cutlass.Float8E4M3FN
-            mK.element_type = cutlass.Float8E4M3FN
-            mV.element_type = cutlass.Float8E4M3FN
-            mO = from_dlpack(self.output.permute(1, 0, 2), assumed_align=16)
-            mLSE = from_dlpack(self.lse, assumed_align=16)
-            mScales = from_dlpack(self.scales, assumed_align=16)
-            self.tensor_views = (mQ, mK, mV, mO, mLSE, mScales)
-
-            stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-            self.compiled = cute.compile(
-                fp8_attention_host,
-                *self.tensor_views,
-                self.kernel_scale,
-                stream,
-            )
-
-        _attach_fused_state(self, block_tokens)
-        self._prepared = False
-
-    def bind_inputs(self, q, k, v):
-        """Point the plan at new Q/K/V storage with the same shape and strides."""
-        expected_shape = (self.sequence, self.heads, HEAD_DIM)
-        for tensor in (q, k, v):
-            if tuple(tensor.shape) != expected_shape:
-                raise ValueError(
-                    f"Plan expects shape {expected_shape}, got {tuple(tensor.shape)}"
-                )
-            if tuple(tensor.stride()) != self.input_strides:
-                raise ValueError(
-                    f"Plan expects strides {self.input_strides}, got {tuple(tensor.stride())}"
-                )
-            if tensor.device != self.device or tensor.dtype != torch.bfloat16:
-                raise ValueError("Plan inputs must stay BF16 on the plan's device")
-            if tensor.data_ptr() % 16:
-                raise ValueError("Token rows must be aligned to 16 bytes")
-        self.inputs = (q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2))
-        self._prepared = False
-
-    def prepare(self):
-        """Quantize the bound inputs: per-head amax, scales, packed Q/K and permuted V^T."""
-        fused_prepare(self)
-
-    def launch_prepared(self):
-        """Run attention on the prepared buffers; returns (output [S, H, 128], lse [H, S])."""
-        if not self._prepared:
-            raise RuntimeError("Call prepare() before launch_prepared()")
-        with torch.cuda.device(self.device):
-            stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
-            self.compiled(*self.tensor_views, self.kernel_scale, stream)
-        return self.output, self.lse
-
-    def __call__(self):
-        self.prepare()
-        return self.launch_prepared()
+        compiled(*views, kernel_scale, stream)
+    return workspace.output, workspace.lse
