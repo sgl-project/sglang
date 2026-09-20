@@ -1176,6 +1176,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.seq_lens = s["seq_lens"][:r]
             padded_view.seq_lens_cpu = self._full_cg_seq_lens_cpu
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
+            if getattr(forward_batch, "req_pool_indices_cpu", None) is not None:
+                padded_view.req_pool_indices_cpu = padded_view._pad_tensor_to_size(
+                    forward_batch.req_pool_indices_cpu, r
+                )
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
