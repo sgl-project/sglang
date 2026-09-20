@@ -533,14 +533,20 @@ struct TopKRadixBase : TopKConfig {
 // wastes work on shorter sequences.
 // ---------------------------------------------------------------------------
 
+struct IdentityScoreFilter {
+  SGL_DEVICE float operator()(float value, uint32_t) const {
+    return value;
+  }
+};
+
 template <uint32_t kLocalVecs_>
 struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kLocalVecs = kLocalVecs_;
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename ScoreFilter = IdentityScoreFilter>
+  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem, ScoreFilter filter = {}) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -575,6 +581,8 @@ struct TopKRegister : TopKRadixBase<12> {
       }
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
+        const auto idx = vi * kVecSize + j;
+        if (idx < problem.seq_len) local_vecs[i][j] = filter(local_vecs[i][j], idx);
         atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
       }
     }
@@ -640,8 +648,8 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename ScoreFilter = IdentityScoreFilter>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem, ScoreFilter filter = {}) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -654,7 +662,8 @@ struct TopKStreaming : TopKRadixBase<12> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      val = filter(val, idx);
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
     });
@@ -682,6 +691,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto v_lo = smem->v_lo;
     const auto topk = problem.topk;
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      val = filter(val, idx);
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {

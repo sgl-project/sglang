@@ -407,3 +407,28 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+for _fn in (
+    "causal_block_max",
+    "select_prefill_candidate_blocks",
+    "select_prefill_candidate_block_ids",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.prefill_candidates:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.topk_prefill_candidates",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.prefill_candidates:topk_prefill_candidates",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
