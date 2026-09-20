@@ -99,6 +99,7 @@ def init_torch_distributed(
             )
 
         # Only initialize the distributed environment on the target model worker.
+        # This builds the groups behind the context's live group-handle reads.
         _init_parallel_groups(
             backend=backend,
             dist_init_method=dist_init_method,

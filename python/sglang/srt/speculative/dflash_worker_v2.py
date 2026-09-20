@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -84,6 +85,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    draft_pp_context,
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -402,7 +404,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_init_ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             draft_init_ctx = empty_context()
-        with draft_init_ctx:
+        with draft_pp_context(), draft_init_ctx:
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -598,7 +600,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with (
+            draft_pp_context(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+        ):
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -608,10 +613,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with (
+            draft_pp_context(),
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+        ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
+            if (
+                capture_decode_cuda_graph
+                and current_platform.is_out_of_tree()
+                and not current_platform.support_cuda_graph()
+            ):
+                capture_decode_cuda_graph = False
+                logger.warning(
+                    "Disable DFLASH draft cuda graph because %s does not support "
+                    "device graph capture.",
+                    type(current_platform).__name__,
+                )
             if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
                 # Idle DP ranks skip the draft step, so they cannot join a
                 # shared graph capture/replay; keep the draft eager under dp

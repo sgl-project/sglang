@@ -52,8 +52,8 @@ class PureSWARadixCache(RadixCache):
         return 0
 
     def sanity_check(self):
-        """No-op: PureSWARadixCache uses RadixCache's simple tree structure
-        which doesn't need the dual-LRU sanity checks of SWARadixCache."""
+        """No-op: an all-SWA model has no full tier, so there is no full/SWA
+        split to cross-check."""
         pass
 
     def evict(self, params: EvictParams) -> EvictResult:
