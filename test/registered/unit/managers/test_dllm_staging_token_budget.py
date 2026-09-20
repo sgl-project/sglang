@@ -19,9 +19,9 @@ tokens and must stay admittable regardless of current capacity.
 Hardenings on top:
 
 - The reuse exemption mirrors ``alloc_for_extend``'s ``reuse_kv`` predicate
-  (``req_pool_idx is not None and bool(dllm_incomplete_ids)``): a row with
-  incomplete ids but a freed req slot re-allocates a full fresh block, so it
-  must NOT bypass the capacity gate.
+  (``kv.holds_kv and bool(dllm_incomplete_ids)``): a row with incomplete ids
+  but a freed req slot re-allocates a full fresh block, so it must NOT bypass
+  the capacity gate.
 - The reuse grant is uniform across budget regimes (only the dLLM concurrency
   budget applies), fixing an inversion where a reuse row was refused at
   small-positive ``rem_total_tokens`` yet admitted at negative.
@@ -44,6 +44,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -59,25 +60,28 @@ def _make_adder(
     """Build a PrefillAdder with only the state `_get_dllm_remain_tokens` reads.
 
     `rem_total_tokens` and `cur_rem_tokens` are properties over the same
-    allocator/tree-cache sizes minus their respective offsets. Mirror the real
-    __init__ invariant (`rem_total_token_offset >= cur_rem_token_offset`, since
-    rem_total additionally accrues max_new_tokens and the running-batch
-    reservation): keep `cur_rem_token_offset` at 0, drive `cur_rem_tokens` via
+    allocator/tree-cache sizes minus the memory_budget's respective offsets.
+    Mirror the real __init__ invariant (`total_offset >= current_offset`, since
+    the total additionally accrues max_new_tokens and the running-batch
+    reservation): keep `current_offset` at 0, drive `cur_rem_tokens` via
     `available_tokens` and `rem_total_tokens` via `rem_total_token_offset`.
+    Use the real `PrefillBudget` so the tests exercise the production offset
+    arithmetic, not a re-implementation of it.
     """
     adder = PrefillAdder.__new__(PrefillAdder)
     adder.rem_dllm_tokens = rem_dllm_tokens
     adder.dllm_block_size = dllm_block_size
     adder.page_size = page_size
-    adder.is_all_swa = False
-    adder.is_hybrid_swa = False
-    adder.is_hybrid_ssm_cache = False
     adder.token_to_kv_pool_allocator = SimpleNamespace(
-        available_size=lambda: available_tokens
+        available_size=lambda: available_tokens, page_size=page_size
     )
-    adder.tree_cache = SimpleNamespace(evictable_size=lambda: 0)
-    adder.rem_total_token_offset = rem_total_token_offset
-    adder.cur_rem_token_offset = 0
+    adder.tree_cache = SimpleNamespace(
+        evictable_size=lambda: 0, supports_mamba=lambda: False
+    )
+    adder.memory_budget = PrefillBudget(
+        adder.token_to_kv_pool_allocator, adder.tree_cache
+    )
+    adder.memory_budget.total_offset = rem_total_token_offset
     return adder
 
 
@@ -280,9 +284,14 @@ class _StubReq:
         self.full_untruncated_fill_ids = list(range(fill_len))
         self.prefix_indices = []
         self.dllm_incomplete_ids = list(range(incomplete_len))
-        self.req_pool_idx = req_pool_idx
+        # holds_kv mirrors ReqKvInfo's property (req_pool_idx is not None);
+        # holds_mamba is irrelevant here (_mamba_slot_cost == 0 below).
+        self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            holds_kv=req_pool_idx is not None,
+            holds_mamba=True,
+        )
         self.retracted_stain = False
-        self.mamba_pool_idx = 0  # irrelevant: _mamba_slot_cost == 0 below
         self.sampling_params = SimpleNamespace(max_new_tokens=64)
         self.extend_range = None
 
@@ -295,7 +304,9 @@ def _arm_admission(adder: PrefillAdder) -> PrefillAdder:
     adder.dllm_config = SimpleNamespace()
     adder.can_run_list = []
     adder._mamba_slot_cost = 0  # non-Mamba: gap reserve is 0
+    adder.rem_mamba_slots = None
     adder.rem_input_tokens = 1 << 30
+    adder.rem_chunk_tokens = None
     adder.log_hit_tokens = 0
     adder.log_input_tokens = 0
     return adder
@@ -303,7 +314,7 @@ def _arm_admission(adder: PrefillAdder) -> PrefillAdder:
 
 class TestDllmStagingReuseExemptionPredicate(CustomTestCase):
     """`add_dllm_staging_req` must mirror `alloc_for_extend`'s reuse_kv
-    predicate: exempt iff req_pool_idx is not None AND incomplete ids exist."""
+    predicate: exempt iff kv.holds_kv AND incomplete ids exist."""
 
     BLOCK_SIZE = 32
 

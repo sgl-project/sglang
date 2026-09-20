@@ -1,12 +1,13 @@
 """Regression tests for KV reclaim in RadixCache.cache_finished_req.
 
-Bug: ``cache_finished_req`` sliced the request's ``req_to_token`` row by
-``len(origin_input_ids + output_ids)``. A dLLM FDFO request aborted with an
-unresolved denoise block holds committed KV beyond that length (the block's
-tokens live only in ``dllm_incomplete_ids``), so the tail free never saw those
-slots and every such abort leaked one block of KV -- the idle invariant check
-then fails with ``pool memory leak detected``. The row must be sliced by
-``kv_len_to_handle`` (the KV length) instead.
+Bug (fixed upstream since): ``cache_finished_req`` sliced the request's
+``req_to_token`` row by ``len(origin_input_ids + output_ids)``. A dLLM FDFO
+request aborted with an unresolved denoise block holds committed KV beyond
+that length (the block's tokens live only in ``dllm_incomplete_ids``), so the
+tail free never saw those slots and every such abort leaked one block of KV --
+the idle invariant check then fails with ``pool memory leak detected``. The
+row must be sliced by ``owned_kv_len`` (the KV length) instead. These tests
+pin that property so it cannot regress.
 """
 
 import unittest
@@ -66,8 +67,7 @@ def _make_req(*, num_prompt: int, num_output: int):
         rid="test-req",
         origin_input_ids=array("q", range(num_prompt)),
         output_ids=array("q", range(1000, 1000 + num_output)),
-        req_pool_idx=1,
-        cache_protected_len=0,
+        kv=SimpleNamespace(req_pool_idx=1, cache_protected_len=0),
         extra_key=None,
         cache_salt=None,
         priority=0,
@@ -87,7 +87,7 @@ class TestCacheFinishedReqFreesByKvLen(CustomTestCase):
         req = _make_req(num_prompt=6, num_output=2)
         kv_len = 12
 
-        cache.cache_finished_req(req, kv_len_to_handle=kv_len)
+        cache.cache_finished_req(req, owned_kv_len=kv_len)
 
         self.assertEqual(
             sorted(allocator.freed),
@@ -98,7 +98,7 @@ class TestCacheFinishedReqFreesByKvLen(CustomTestCase):
 
     def test_ar_finished_req_reclaim_is_unchanged(self):
         # AR invariance: an autoregressive request finishes with
-        # kv_len_to_handle < len(origin+output) (the last output token's KV is
+        # owned_kv_len < len(origin+output) (the last output token's KV is
         # never committed), where the kv-length slice and the old
         # len(token_ids) slice are identical -- nothing extra may be freed.
         allocator = _RecordingAllocator()
@@ -106,7 +106,7 @@ class TestCacheFinishedReqFreesByKvLen(CustomTestCase):
         req = _make_req(num_prompt=6, num_output=2)
         kv_len = 7
 
-        cache.cache_finished_req(req, kv_len_to_handle=kv_len)
+        cache.cache_finished_req(req, owned_kv_len=kv_len)
 
         self.assertEqual(allocator.freed, [])
         self.assertEqual(cache.evictable_size(), kv_len)
