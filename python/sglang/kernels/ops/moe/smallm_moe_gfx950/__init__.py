@@ -22,6 +22,10 @@ import tempfile
 
 import torch
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+    find_loaded_library,
+)
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "smallm_moe.hip")
 _ENV = "SGLANG_ROCM_SMALLM_MOE"
@@ -76,7 +80,12 @@ assert ctypes.sizeof(Args) == 104, ctypes.sizeof(
 def _hip_lib():
     global _hip
     if _hip is None:
-        _hip = ctypes.CDLL("libamdhip64.so")
+        # Bind to the HIP runtime torch already mapped. ROCm 10 ships a second
+        # libamdhip64 in _rocm_sdk_devel; an unversioned CDLL("libamdhip64.so")
+        # picks that one, and every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709).
+        torch.cuda.current_device()
+        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
