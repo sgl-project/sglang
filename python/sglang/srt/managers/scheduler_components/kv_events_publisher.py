@@ -15,9 +15,11 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -61,18 +63,13 @@ class SchedulerKvEventsPublisher:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = bool(
-            kv_events_config
-            and self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        )
+        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(
-                    self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+                    self.ps.attn_dp_size, self.ps.attn_dp_rank, get_parallel().dp_rank
                 ),
             )
 
@@ -91,7 +88,7 @@ class SchedulerKvEventsPublisher:
         kv_metrics.gpu_cache_usage_perc = self.get_stats().token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.get_stats().cache_hit_rate
         kv_metrics.data_parallel_rank = (
-            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
         )
 
         if not self.send_metrics_from_scheduler.closed:

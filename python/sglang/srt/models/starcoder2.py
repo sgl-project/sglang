@@ -29,7 +29,6 @@ import torch
 from torch import nn
 from transformers import Starcoder2Config
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -52,7 +51,6 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class Starcoder2Attention(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -134,7 +132,6 @@ class Starcoder2Attention(nn.Module):
 
 
 class Starcoder2MLP(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -169,7 +166,6 @@ class Starcoder2MLP(nn.Module):
 
 
 class Starcoder2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -219,7 +215,6 @@ class Starcoder2DecoderLayer(nn.Module):
 
 
 class Starcoder2Model(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -238,7 +233,7 @@ class Starcoder2Model(nn.Module):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
         pp_size = pp_group.world_size
         pp_rank = pp_group.rank
         self.start_layer = pp_rank * config.num_hidden_layers // pp_size
@@ -276,7 +271,6 @@ class Starcoder2Model(nn.Module):
 
 
 class Starcoder2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,

@@ -208,6 +208,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     supports_dp_encode = True
     param_names_mapping = _PARAM_NAMES_MAPPING
+    # Comfy packs the vision tower across whole tensors rather than rows. Keep
+    # its language/vocabulary matrices packed and restore this smaller tower.
+    gguf_dequantize_prefixes = ("visual.", "model.visual.")
 
     @classmethod
     def configure_component_paths(

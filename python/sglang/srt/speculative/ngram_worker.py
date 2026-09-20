@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
@@ -33,10 +32,15 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
+
+if is_cuda():
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+else:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -306,9 +310,9 @@ class NGRAMWorker(BaseSpecWorker):
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
-        assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        assert total_draft_token_num == bs * self.draft_token_num, (
+            f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+        )
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
@@ -427,7 +431,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -442,7 +446,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
 
             logits_output, can_run_cuda_graph = (
@@ -528,7 +532,9 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
