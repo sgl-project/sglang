@@ -7,7 +7,7 @@ use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
-use crate::workers::{WireProtocol, WorkerRegistry};
+use crate::workers::{WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -331,6 +331,56 @@ async fn handle_discovery_event(
                 al.forget_worker(&id);
             }
         }
+        DiscoveryEvent::ReadyChanged { id, ready } => {
+            if let Some(prev) = pending.remove(&id) {
+                // Same rationale as Removed and ModeChanged: an Added for
+                // this id may still be registering, and the flag has to land
+                // on the entry that write produces, not on a missing one.
+                let _ = prev.await;
+            }
+            // Deliberately does NOT touch the registry entry, the KV-event
+            // index, or the active-load counters — the three things the
+            // `Removed` arm above tears down. That asymmetry with
+            // `Removed` is the whole point of this event: readiness flaps in
+            // seconds, and rebuilding an engine's radix view costs minutes,
+            // so a flap must cost selection only. `Removed` remains the sole
+            // path that destroys state.
+            match registry.get(&id) {
+                Some(w) => {
+                    if w.serving() != ready {
+                        tracing::info!("discovery: ~worker {id} serving→{ready}");
+                    }
+                    w.set_serving(ready);
+                    if ready {
+                        // A worker discovered before its engine could answer
+                        // `/server_info` is registered with no `model_ids` and
+                        // is therefore in no model pool — `serving` alone does
+                        // not make it selectable. Readiness is the signal that
+                        // the engine can answer now, so ask immediately instead
+                        // of waiting out the reconcile interval.
+                        reintrospect_if_unresolved(
+                            &w,
+                            registry,
+                            cfg,
+                            kv_index,
+                            introspector,
+                            pending,
+                        );
+                    }
+                }
+                None => {
+                    // A ReadyChanged for an unknown id means the backend saw
+                    // a readiness transition on a worker we never registered
+                    // (or already removed). Nothing to carry it on; log so an
+                    // ordering bug in a backend is visible rather than silent.
+                    tracing::warn!(
+                        id = %id,
+                        ready,
+                        "discovery: ReadyChanged for an unregistered worker; ignored",
+                    );
+                }
+            }
+        }
         DiscoveryEvent::ModeChanged { id, mode } => {
             if let Some(prev) = pending.remove(&id) {
                 // Same rationale as Removed: wait for the registry
@@ -393,47 +443,70 @@ fn reconcile_unresolved_workers(
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
     for worker in registry.all() {
-        if !worker.model_ids.is_empty() {
-            continue;
-        }
-        let id = worker.id.clone();
-        if pending.contains_key(&id) {
-            // A registration for this id is already in flight; let it
-            // finish rather than racing a second introspection.
-            continue;
-        }
-        let registry_t = registry.clone();
-        let introspector_t = introspector.clone();
-        let worker_url = worker.url.clone();
-        // Rebuild a discovery-shaped spec: empty `model_ids` so `register_one`
-        // re-resolves them; current mode + bootstrap_port as the seed
-        // (`register_one` re-applies any `/server_info` override).
-        let spec = WorkerSpec {
-            id: id.clone(),
-            url: worker_url.clone(),
-            mode: worker.mode(),
-            model_ids: Vec::new(),
-            bootstrap_port: worker.bootstrap_port(),
-        };
-        // `debug!` not `info!`: this fires every interval for each
-        // still-unresolved worker, so info-level would spam for one that is
-        // permanently model-less. The introspector logs the underlying failure
-        // at `warn!` on each attempt, which is the operator-facing signal.
-        tracing::debug!(
-            worker_id = %id,
-            worker_url = %worker_url,
-            "reconcile: re-introspecting worker that registered without model_ids",
-        );
-        let cfg_t = cfg.clone();
-        let kv_index_t = kv_index.clone();
-        // Safe to go back through the registry upsert only because this worker
-        // is in no model pool: the fresh `Worker` it builds discards a breaker
-        // and load counters that a model-less worker has never accumulated.
-        let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
-        });
-        pending.insert(id, handle);
+        reintrospect_if_unresolved(&worker, registry, cfg, kv_index, introspector, pending);
     }
+}
+
+/// Re-run `/server_info` for one worker that registered without `model_ids`.
+///
+/// Shared by the periodic reconcile pass and by the `ReadyChanged(true)` arm.
+/// The latter matters because a not-ready endpoint is now discovered as soon as
+/// it appears rather than when it goes ready, so `register_one` routinely asks
+/// an engine that is still loading weights and registers the worker model-less.
+/// Waiting for the next reconcile tick would add up to [`RECONCILE_INTERVAL`]
+/// to every pod's time-to-serving; readiness is the signal that the engine can
+/// answer now.
+fn reintrospect_if_unresolved(
+    worker: &Arc<Worker>,
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, JoinHandle<()>>,
+) {
+    if !worker.model_ids.is_empty() {
+        return;
+    }
+    let id = worker.id.clone();
+    if pending.contains_key(&id) {
+        // A registration for this id is already in flight; let it
+        // finish rather than racing a second introspection.
+        return;
+    }
+    let registry_t = registry.clone();
+    let introspector_t = introspector.clone();
+    let worker_url = worker.url.clone();
+    // Rebuild a discovery-shaped spec: empty `model_ids` so `register_one`
+    // re-resolves them; current mode + bootstrap_port as the seed
+    // (`register_one` re-applies any `/server_info` override).
+    let spec = WorkerSpec {
+        id: id.clone(),
+        url: worker_url.clone(),
+        mode: worker.mode(),
+        model_ids: Vec::new(),
+        bootstrap_port: worker.bootstrap_port(),
+    };
+    // `debug!` not `info!`: this fires every interval for each
+    // still-unresolved worker, so info-level would spam for one that is
+    // permanently model-less. The introspector logs the underlying failure
+    // at `warn!` on each attempt, which is the operator-facing signal.
+    tracing::debug!(
+        worker_id = %id,
+        worker_url = %worker_url,
+        "reconcile: re-introspecting worker that registered without model_ids",
+    );
+    let cfg_t = cfg.clone();
+    let kv_index_t = kv_index.clone();
+    // Safe to go back through the registry upsert only because this worker
+    // is in no model pool: the fresh `Worker` it builds discards a breaker
+    // and load counters that a model-less worker has never accumulated.
+    // Not a clean slate any more, though — `add_with_cb` carries `serving`
+    // forward on purpose, because this pass revisits exactly the pods that
+    // are also not ready.
+    let handle = tokio::spawn(async move {
+        register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+    });
+    pending.insert(id, handle);
 }
 
 /// Explain a resolved protocol at the level an operator needs: the h2c upgrade
@@ -969,6 +1042,163 @@ mod tests {
         kv_index.shutdown().await;
     }
 
+    /// A readiness flap costs SELECTION, not state.
+    ///
+    /// This is the whole point of `ReadyChanged` existing beside `Removed`.
+    /// Before it, the k8s backend expressed "not ready" as `Removed`, which
+    /// runs the teardown below and clears the worker's KV-event tree — a
+    /// seconds-long blip destroying a radix view that takes minutes to
+    /// rebuild. The assertions that matter are the ones about what SURVIVES.
+    #[tokio::test]
+    async fn ready_changed_drops_selection_but_keeps_registry_and_kv_state() {
+        use tokio::time::timeout;
+
+        let body = json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port_base": 60010,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        });
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(body).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let kv_index = KvEventIndex::new();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_config(
+            rx,
+            registry.clone(),
+            None,
+            Some(kv_index.clone()),
+            None,
+        ));
+
+        let id = WorkerId("w-ready".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+        let ready = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some() && kv_index.known_worker_count() == 1 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "manager failed to register worker");
+
+        let model = ModelId("m".into());
+        assert_eq!(
+            registry.healthy_workers_for(&model).len(),
+            1,
+            "a freshly added worker defaults to serving",
+        );
+
+        // Seed a real block so the survival assertion below is about TREE
+        // CONTENT, not merely about the subscriber still being attached.
+        let kv_id = crate::policies::kv_events::KvWorkerId::new(worker_url.clone(), 0);
+        kv_index.tree().insert_tiered(
+            &kv_id,
+            None,
+            &[4242],
+            crate::policies::kv_events::Tiers::for_store(None),
+        );
+        assert!(
+            kv_index
+                .tree()
+                .match_prefix(None, &[4242])
+                .workers()
+                .contains(&kv_id),
+            "fixture: the block must be in the tree before the flap",
+        );
+
+        // --- the flap ---
+        tx.send(DiscoveryEvent::ReadyChanged {
+            id: id.clone(),
+            ready: false,
+        })
+        .await
+        .unwrap();
+        let unserving = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some_and(|w| !w.serving()) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            unserving.is_ok(),
+            "ReadyChanged ready=false must clear serving"
+        );
+
+        assert!(
+            registry.healthy_workers_for(&model).is_empty(),
+            "a not-ready worker must not be selectable",
+        );
+        // The two that would have been destroyed by `Removed`:
+        assert!(
+            registry.get(&id).is_some(),
+            "the registry entry must survive a readiness flap",
+        );
+        assert_eq!(
+            kv_index.known_worker_count(),
+            1,
+            "the worker must stay attached to the KV-event index",
+        );
+        assert!(
+            kv_index
+                .tree()
+                .match_prefix(None, &[4242])
+                .workers()
+                .contains(&kv_id),
+            "the KV-event TREE CONTENT must survive a readiness flap — this is \
+             the regression that makes ReadyChanged worth having, and the \
+             attachment check above does not prove it",
+        );
+
+        // --- recovery, with no Added in between ---
+        tx.send(DiscoveryEvent::ReadyChanged {
+            id: id.clone(),
+            ready: true,
+        })
+        .await
+        .unwrap();
+        let restored = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.healthy_workers_for(&model).len() == 1 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            restored.is_ok(),
+            "ReadyChanged ready=true must restore selection without a re-Added",
+        );
+        assert_eq!(
+            kv_index.known_worker_count(),
+            1,
+            "recovery must not re-register the worker",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+        kv_index.shutdown().await;
+    }
+
     /// Task B: `DiscoveryEvent::Removed` calls
     /// `ActiveLoadRegistry::forget_worker` so the per-worker counters
     /// slot is reaped. Without this, a long-lived cluster with worker
@@ -1306,6 +1536,195 @@ mod tests {
             registry.get(&id).unwrap().model_ids,
             vec![ModelId("m".into())],
             "recovered worker must carry the resolved model id",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+    /// A re-registration must not silently resurrect a NOT-SERVING worker.
+    ///
+    /// `add_with_cb` is an upsert that builds a fresh `Worker`, whose
+    /// `serving` flag defaults to true. The reconcile pass re-registers every
+    /// worker whose `model_ids` are still empty — which is exactly the state a
+    /// pod is in while its engine has not answered `/server_info` yet, i.e.
+    /// while it is typically also not ready. Without carrying the flag across
+    /// the upsert the sequence is:
+    ///
+    ///   Added + ReadyChanged(false) → serving=false, model_ids empty
+    ///   → reconcile → `/server_info` answers → re-register → serving=TRUE
+    ///
+    /// and the worker joins its model pool while K8s still reports it
+    /// not-ready. Discovery never corrects this: `emit_diff` emits
+    /// `ReadyChanged` only on a TRANSITION, and `prev_union` already holds
+    /// Going ready re-introspects immediately, without waiting out the
+    /// reconcile interval.
+    ///
+    /// A not-ready endpoint is now discovered as soon as it appears, so
+    /// `register_one` asks an engine that is still loading weights and the
+    /// worker registers with no `model_ids` — present, but in no model pool.
+    /// Before this hook it stayed unselectable until the next reconcile tick.
+    /// The interval here is an hour, so a pass can only be the readiness path.
+    #[tokio::test]
+    async fn ready_changed_true_reintrospects_a_model_less_worker_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let info_ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) =
+            spawn_switchable_worker(json!({"served_model_name": "m"}), info_ready.clone()).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_secs(3600),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        let model = ModelId("m".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+        tx.send(DiscoveryEvent::ReadyChanged {
+            id: id.clone(),
+            ready: false,
+        })
+        .await
+        .unwrap();
+
+        let registered = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some_and(|w| !w.serving()) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(registered.is_ok(), "worker must register while not ready");
+        assert!(
+            registry.workers_for(&model).is_empty(),
+            "a worker whose /server_info could not answer resolves no model",
+        );
+
+        // The engine finishes loading and the endpoint flips ready.
+        info_ready.store(true, Ordering::SeqCst);
+        tx.send(DiscoveryEvent::ReadyChanged {
+            id: id.clone(),
+            ready: true,
+        })
+        .await
+        .unwrap();
+
+        let joined = timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.healthy_workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "going ready must re-introspect at once — with a 1h reconcile \
+             interval, nothing else could put this worker in its model pool",
+        );
+        assert!(
+            registry.get(&id).unwrap().serving(),
+            "and the re-registration must not clobber the restored flag",
+        );
+
+        drop(tx);
+        let _ = timeout(Duration::from_secs(2), manager_handle).await;
+    }
+
+    /// `ready: false`, so no further event is ever sent.
+    #[tokio::test]
+    async fn reconcile_preserves_not_serving_across_re_registration() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let info_ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) =
+            spawn_switchable_worker(json!({"served_model_name": "m"}), info_ready.clone()).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-notready".into());
+        let model = ModelId("m".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+        // The endpoint is present but not ready, exactly as `emit_diff`
+        // reports it: an `Added` immediately followed by `ReadyChanged`.
+        tx.send(DiscoveryEvent::ReadyChanged {
+            id: id.clone(),
+            ready: false,
+        })
+        .await
+        .unwrap();
+
+        let unserving = timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&id).is_some_and(|w| !w.serving()) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(unserving.is_ok(), "ReadyChanged must clear serving");
+
+        // The engine's HTTP surface comes up while the pod is still
+        // not-ready (a readiness probe lags the port opening by at least one
+        // probe period), so the reconcile pass now resolves model_ids.
+        info_ready.store(true, Ordering::SeqCst);
+        let resolved = timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(resolved.is_ok(), "reconcile must resolve model_ids");
+
+        assert!(
+            !registry.get(&id).unwrap().serving(),
+            "a re-registration must not resurrect the serving flag",
+        );
+        assert!(
+            registry.healthy_workers_for(&model).is_empty(),
+            "a not-ready worker must stay unselectable across a re-registration",
         );
 
         drop(tx);

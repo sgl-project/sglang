@@ -27,6 +27,7 @@
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
+//! | `sgl_router_worker_serving` | Gauge | `worker_url` |
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
@@ -472,6 +473,12 @@ pub struct WorkerSnapshot {
     pub cb_state: u8,
     /// In-flight request count for this worker (`Worker::active_load`).
     pub inflight: i64,
+    /// Discovery reports the worker able to serve (`Worker::serving`).
+    ///
+    /// Independent of `healthy`: that is the router's own breaker verdict,
+    /// this is what the deployment says. Selection requires both, so the two
+    /// gauges together explain why a present worker is receiving nothing.
+    pub serving: bool,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -1039,6 +1046,19 @@ impl MetricsRegistry {
             ));
         }
 
+        // worker_serving (1=discovery reports the worker able to serve)
+        out.push_str(
+            "# HELP sgl_router_worker_serving Worker serving state from discovery: 1 = reported able to serve, 0 = present but not ready (routed around, KV-tree state retained). Orthogonal to sgl_router_worker_health, which is the router's own circuit-breaker verdict; selection requires both.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_serving gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_serving{{worker_url=\"{}\"}} {}\n",
+                escape_label(&w.worker_url),
+                u8::from(w.serving),
+            ));
+        }
+
         // worker_cb_state (0=closed, 1=open, 2=half_open)
         out.push_str(
             "# HELP sgl_router_worker_cb_state Circuit breaker state per worker (0=closed, 1=open, 2=half_open).\n",
@@ -1586,6 +1606,12 @@ mod tests {
                 healthy: true,
                 cb_state: 0,
                 inflight: 5,
+                // Crossed against `healthy` on purpose: breaker-healthy but
+                // discovery-not-serving is a real state (the engine reports
+                // not-ready before it starts failing requests), and crossing
+                // them means transposing the two fields in the renderer fails
+                // this test instead of passing silently.
+                serving: false,
             },
             WorkerSnapshot {
                 worker_url: "http://d0:30000".into(),
@@ -1593,6 +1619,7 @@ mod tests {
                 healthy: false,
                 cb_state: 1,
                 inflight: 0,
+                serving: true,
             },
         ];
         let out = reg.render_with_workers(&workers);
@@ -1603,6 +1630,10 @@ mod tests {
         // Health: healthy prefill = 1, unhealthy decode = 0.
         assert!(out.contains(r#"sgl_router_worker_health{worker_url="http://p0:30000"} 1"#));
         assert!(out.contains(r#"sgl_router_worker_health{worker_url="http://d0:30000"} 0"#));
+        // Serving, crossed against health: the prefill worker's breaker admits
+        // while discovery says not-ready; the decode worker is the reverse.
+        assert!(out.contains(r#"sgl_router_worker_serving{worker_url="http://p0:30000"} 0"#));
+        assert!(out.contains(r#"sgl_router_worker_serving{worker_url="http://d0:30000"} 1"#));
         // Circuit breaker state codes.
         assert!(out.contains(r#"sgl_router_worker_cb_state{worker_url="http://p0:30000"} 0"#));
         assert!(out.contains(r#"sgl_router_worker_cb_state{worker_url="http://d0:30000"} 1"#));
@@ -1622,6 +1653,8 @@ mod tests {
         // Headers present, but no per-worker series lines.
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
         assert!(!out.contains("sgl_router_worker_health{"));
+        assert!(out.contains("# TYPE sgl_router_worker_serving gauge"));
+        assert!(!out.contains("sgl_router_worker_serving{"));
         assert!(!out.contains("sgl_router_worker_cb_state{"));
         assert!(!out.contains("sgl_router_worker_inflight_requests{"));
     }
