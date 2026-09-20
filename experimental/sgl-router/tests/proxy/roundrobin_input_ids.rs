@@ -412,7 +412,7 @@ async fn kimi_ids_preserve_control_boundaries_and_images_stay_on_engine() {
     assert_eq!(send(ctx.clone(), request).await, StatusCode::OK);
     assert_eq!(captured(&mock)["input_ids"], json!(expected));
 
-    let image = json!({"model":MODEL,"messages":[{"role":"user","content":[
+    let image = json!({"rid":"kimi-image","model":MODEL,"messages":[{"role":"user","content":[
         {"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
     ]}]});
     assert_eq!(send(ctx.clone(), image.clone()).await, StatusCode::OK);
