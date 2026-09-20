@@ -11,6 +11,10 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.environ import envs
+from sglang.srt.function_call.deepseekv4_format import (
+    mask_literals as mask_dsv4_literals,
+)
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -1522,6 +1526,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tool_call_parser_active: bool = False,
     ):
         super().__init__(
             dsv4_thinking_start_token,
@@ -1537,6 +1542,83 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+        self._strict_tool_boundary = (
+            tool_call_parser_active
+            and envs.SGLANG_DSV4_STRICT_TOOL_OUTPUT.get()
+            and not continue_final_message
+        )
+        self._content_pending = ""
+        self._reasoning_finished = False
+        self._tool_payload_started = False
+
+    def _parse_tool_boundary(self, text: str) -> str:
+        if self._tool_payload_started:
+            return text
+        self._content_pending += text
+        visible = mask_dsv4_literals(self._content_pending, heredocs=True)
+        marker = re.search(
+            rf"<{re.escape(dsv4_dsml_token)}(?:tool_calls>|invoke(?=\s|>))", visible
+        )
+        if marker is None:
+            return ""
+        prefix = self._content_pending[: marker.start()]
+        visible_prefix = visible[: marker.start()]
+        if self._saw_think_end and self.think_start_token not in visible_prefix:
+            # Only redundant closer-only lines immediately before an unquoted
+            # tool block are structural. Preserve prose and quoted examples.
+            pattern = r"(?m)^[ \t]*(</think>)[ \t]*(?:\r?\n[ \t]*)+\Z"
+            while match := re.search(pattern, prefix):
+                start, end = match.span(1)
+                if visible_prefix[start:end] != self.think_end_token:
+                    break
+                prefix = prefix[:start] + prefix[end:]
+                visible_prefix = visible_prefix[:start] + visible_prefix[end:]
+        normal = prefix + self._content_pending[marker.start() :]
+        self._content_pending = ""
+        self._tool_payload_started = True
+        return normal
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        if not self._strict_tool_boundary:
+            return super()._parse_streaming_increment_impl(new_text)
+        if self._reasoning_finished:
+            return StreamingParseResult(normal_text=self._parse_tool_boundary(new_text))
+
+        # Do not let the base parser inspect tool payload in this same chunk:
+        # a literal <think> there must not reopen reasoning or be removed.
+        current = self._buffer + new_text
+        boundaries = [
+            (current.find(token), token)
+            for token in (self.think_end_token, self.tool_start_token)
+            if token in current
+        ]
+        if boundaries:
+            index, token = min(boundaries)
+            split = index + len(token) - len(self._buffer)
+            result = super()._parse_streaming_increment_impl(new_text[:split])
+            result.normal_text += new_text[split:]
+            self._reasoning_finished = not self._in_reasoning
+        else:
+            result = super()._parse_streaming_increment_impl(new_text)
+        result.normal_text = self._parse_tool_boundary(result.normal_text)
+        return result
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if not self._strict_tool_boundary:
+            return super()._detect_and_parse_impl(text)
+        result = self._parse_streaming_increment_impl(text)
+        tail = self.finish()
+        return StreamingParseResult(
+            normal_text=result.normal_text + tail.normal_text,
+            reasoning_text=result.reasoning_text + tail.reasoning_text,
+        )
+
+    def finish(self) -> StreamingParseResult:
+        result = super().finish()
+        if self._strict_tool_boundary:
+            result.normal_text = self._content_pending + result.normal_text
+            self._content_pending = ""
+        return result
 
 
 class _MimoDetector(Qwen3Detector):

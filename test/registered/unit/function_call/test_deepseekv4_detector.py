@@ -8,6 +8,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -60,6 +61,38 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             normal += result.normal_text
             calls.extend(result.calls)
         return normal, calls
+
+    def test_strict_reasoning_boundary_preserves_tool_argument_literals(self):
+        value = "Example:\n<think>keep this</think>"
+        text = "Inspect.</think>Now call.\n</think>\n" + _weather_call(value)
+        for size in [1, 2, 7, 23, len(text)]:
+            with self.subTest(size=size), patch.dict(
+                os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}
+            ):
+                reasoning = ReasoningParser(
+                    "deepseek-v4",
+                    force_reasoning=True,
+                    tool_call_parser_active=True,
+                )
+                detector = DeepSeekV4Detector()
+                thought, normal, arguments, names = "", "", "", []
+                for start in range(0, len(text), size):
+                    delta_thought, delta = reasoning.parse_stream_chunk(
+                        text[start : start + size]
+                    )
+                    thought += delta_thought
+                    result = detector.parse_streaming_increment(delta, self.tools)
+                    normal += result.normal_text
+                    for call in result.calls:
+                        if call.name:
+                            names.append(call.name)
+                        arguments += call.parameters
+                self.assertEqual(reasoning.parse_stream_end(), ("", ""))
+                normal += detector.finish(self.tools).normal_text
+                self.assertEqual(thought, "Inspect.")
+                self.assertEqual(normal.strip(), "Now call.")
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(arguments), {"city": value})
 
     def test_preamble_in_same_delta_as_tool_call(self):
         """Prose sharing a delta with the tool call must not be dropped, and the
