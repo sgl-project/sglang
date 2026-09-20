@@ -580,9 +580,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req.prompt, str
         ):
             return "prompt_type"
-        if not self._supports_dynamic_batch_image_conditioning(
-            base_req, candidate_req
-        ):
+        if not self._supports_dynamic_batch_image_conditioning(base_req, candidate_req):
             return "image_conditioning"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
@@ -653,9 +651,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             return False
 
-        if not self._supports_dynamic_batch_image_conditioning(
-            base_req, candidate_req
-        ):
+        if not self._supports_dynamic_batch_image_conditioning(base_req, candidate_req):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return False

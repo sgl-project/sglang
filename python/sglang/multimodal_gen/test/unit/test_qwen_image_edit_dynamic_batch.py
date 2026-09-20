@@ -151,9 +151,7 @@ def test_dynamic_edit_conditioning_builds_one_shape_per_request():
         negative_prompt_embeds_mask=None,
         prompt_seq_lens=[[5, 5]],
         negative_prompt_seq_lens=None,
-        extra={
-            "dynamic_batch_condition_image_sizes": [(1024, 1024), (1024, 1024)]
-        },
+        extra={"dynamic_batch_condition_image_sizes": [(1024, 1024), (1024, 1024)]},
     )
 
     kwargs = config._prepare_edit_cond_kwargs(
