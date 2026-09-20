@@ -1,10 +1,12 @@
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.models import deepseek_v2
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _Backend:
@@ -60,19 +62,3 @@ def test_moe_sees_dp_gathered_rows_only_for_no_a2a_partial_dpa_full(
     modes = SimpleNamespace(mlp_mode=mlp_mode)
 
     assert deepseek_v2._moe_sees_dp_gathered_rows(mlp, modes) is expected
-
-
-@pytest.mark.parametrize("raises", [False, True])
-def test_temporarily_clear_local_token_count_restores_metadata(raises):
-    original = object()
-    forward_batch = SimpleNamespace(num_token_non_padded=original)
-
-    with pytest.raises(RuntimeError) if raises else nullcontext():
-        with deepseek_v2._temporarily_clear_local_token_count(
-            forward_batch, enabled=True
-        ):
-            assert forward_batch.num_token_non_padded is None
-            if raises:
-                raise RuntimeError("test")
-
-    assert forward_batch.num_token_non_padded is original

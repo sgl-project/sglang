@@ -1484,9 +1484,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # num_tokens_per_req, so preserve that geometry after padding too.
             # There is no reduce-scatter in LM logprob, so its length is not
             # adjusted here.
-            global_num_tokens[i] = ceil_align(
-                global_num_tokens[i], token_alignment
-            )
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_alignment)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

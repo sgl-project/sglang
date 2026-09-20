@@ -120,6 +120,21 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 _is_cpu = is_cpu()
 
 
+def should_disable_rocm_partial_dpa_target_verify_graph(
+    forward_batch: ForwardBatch, local_batch_size: int
+) -> bool:
+    """Use eager verify when partial-DPA graph metadata becomes unsafe."""
+    parallel = get_parallel()
+    return (
+        _is_hip
+        and local_batch_size > 12
+        and parallel.enable_dp_attention
+        and parallel.attn_dp_size > 1
+        and parallel.attn_tp_size > 1
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
+
 class DpPaddingMode(IntEnum):
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()

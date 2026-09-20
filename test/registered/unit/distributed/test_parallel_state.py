@@ -309,10 +309,13 @@ def test_rocm_dp_attention_disables_custom_ar_on_full_tp_group():
         patch.object(parallel_state, "get_world_group") as mock_world_group,
     ):
         mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=8,
-            attention_data_parallel_size=2,
+        publish_build_topology(
+            tp_size=8,
+            pp_size=1,
+            dp_size=2,
+            enable_dp_attention=True,
         )
+        parallel_state.initialize_model_parallel()
 
         tp_options = created_group_options["tp"]
         assert tp_options["use_pynccl"] is True

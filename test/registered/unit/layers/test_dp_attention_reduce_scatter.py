@@ -39,15 +39,11 @@ def test_partial_dp_gather_does_not_alias_collective_input(monkeypatch):
     parallel = SimpleNamespace(
         attn_tp_group=attn_tp_group,
         attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
         tp_group=tp_group,
     )
 
     monkeypatch.setattr(dp_attention, "world_dp_gather_enabled", lambda: False)
-    monkeypatch.setattr(
-        dp_attention,
-        "get_attn_tensor_model_parallel_world_size",
-        lambda: attn_tp_size,
-    )
     monkeypatch.setattr(dp_attention, "get_parallel", lambda: parallel)
 
     dp_attention._dp_gather_via_all_gather(
@@ -76,9 +72,7 @@ def test_partial_dp_reduce_scatter_does_not_alias_collective_input(monkeypatch):
     def reduce_scatter(local_output, full_input):
         assert local_output.untyped_storage() is not full_input.untyped_storage()
         torch.testing.assert_close(full_input, original)
-        local_output.copy_(
-            original.tensor_split(tp_size)[tp_rank]
-        )
+        local_output.copy_(original.tensor_split(tp_size)[tp_rank])
 
     tp_group.reduce_scatter_tensor.side_effect = reduce_scatter
     attn_tp_group = Mock()
@@ -94,13 +88,11 @@ def test_partial_dp_reduce_scatter_does_not_alias_collective_input(monkeypatch):
         attn_tp_group=attn_tp_group,
         tp_group=tp_group,
         tp_rank=tp_rank,
+        tp_size=tp_size,
     )
 
     monkeypatch.setattr(dp_attention, "_note_dp_gather_in_prefill_graph", lambda: None)
     monkeypatch.setattr(dp_attention, "is_dp_gatherv_active", lambda: False)
-    monkeypatch.setattr(
-        dp_attention, "get_tensor_model_parallel_world_size", lambda: tp_size
-    )
     monkeypatch.setattr(dp_attention, "get_parallel", lambda: parallel)
 
     dp_attention.dp_reduce_scatter_tensor(output, collective_input)
@@ -153,3 +145,26 @@ def test_attn_tp_scatter_before_mlp_uses_non_aliasing_output(monkeypatch):
 
     assert torch.equal(hidden_states, expected)
     assert output_residual is residual
+
+
+def test_large_rocm_partial_dpa_target_verify_graph_falls_back(monkeypatch):
+    monkeypatch.setattr(dp_attention, "_is_hip", True)
+    monkeypatch.setattr(
+        dp_attention,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            enable_dp_attention=True, attn_dp_size=2, attn_tp_size=4
+        ),
+    )
+    target_verify = SimpleNamespace(is_target_verify=lambda: True)
+    decode = SimpleNamespace(is_target_verify=lambda: False)
+
+    assert dp_attention.should_disable_rocm_partial_dpa_target_verify_graph(
+        SimpleNamespace(forward_mode=target_verify), 16
+    )
+    assert not dp_attention.should_disable_rocm_partial_dpa_target_verify_graph(
+        SimpleNamespace(forward_mode=target_verify), 12
+    )
+    assert not dp_attention.should_disable_rocm_partial_dpa_target_verify_graph(
+        SimpleNamespace(forward_mode=decode), 16
+    )

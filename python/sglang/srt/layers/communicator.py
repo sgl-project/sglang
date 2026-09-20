@@ -1334,9 +1334,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # peers may still be reading.  The corruption is especially visible in
         # partial-DPA CUDA graphs at larger local batch sizes.
         hidden_states = torch.empty_like(
-            input_hidden_states.tensor_split(context.attn_tp_size)[
-                context.attn_tp_rank
-            ]
+            input_hidden_states.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         )
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:

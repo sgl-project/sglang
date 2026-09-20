@@ -206,6 +206,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_sm90_supported,
     make_layers,
+    temp_attr_context,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -2481,20 +2482,6 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
-@contextmanager
-def _temporarily_clear_local_token_count(
-    forward_batch: ForwardBatch, *, enabled: bool
-):
-    """Hide DP-local padding metadata while an operator sees global rows."""
-    saved_num_token_non_padded = forward_batch.num_token_non_padded
-    if enabled:
-        forward_batch.num_token_non_padded = None
-    try:
-        yield
-    finally:
-        forward_batch.num_token_non_padded = saved_num_token_non_padded
-
-
 def _moe_sees_dp_gathered_rows(
     mlp: nn.Module, layer_scatter_modes: LayerScatterModes
 ) -> bool:
@@ -2612,10 +2599,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
+        parallel = get_parallel()
         communicator_cls = (
-            DSACPLayerCommunicator
-            if get_parallel().enable_prefill_cp
-            else LayerCommunicator
+            DSACPLayerCommunicator if parallel.enable_prefill_cp else LayerCommunicator
         )
         self.layer_communicator = communicator_cls(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -2626,6 +2612,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            force_layernorm_before_dp_gather=(
+                _is_hip
+                and parallel.enable_dp_attention
+                and parallel.attn_dp_size > 1
+                and parallel.attn_tp_size > 1
+            ),
         )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -2740,27 +2732,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        # The no-A2A DPA path gathers every DP rank's rows before sparse MoE.
-        # num_token_non_padded is local to each DP rank, so forwarding it here
-        # would mask a different subset of the global rows on each TP rank.
-        # The gathered MAX_LEN buffer is already padded consistently; mirror the
-        # DeepSeek-V4 path and suppress this local-only metadata while MoE sees it.
         mlp_sees_dp_gathered_rows = _moe_sees_dp_gathered_rows(
             self.mlp, self.layer_scatter_modes
         )
-        with _temporarily_clear_local_token_count(
-            forward_batch, enabled=mlp_sees_dp_gathered_rows
-        ):
-            with get_forward().scoped(
+        token_count_ctx = (
+            temp_attr_context(forward_batch, "num_token_non_padded", None)
+            if mlp_sees_dp_gathered_rows
+            else nullcontext()
+        )
+        with (
+            token_count_ctx,
+            get_forward().scoped(
                 fuse_mlp_allreduce=fuse_mlp_allreduce,
                 mlp_reduce_scatter=mlp_reduce_scatter,
-            ):
-                with _mlp_ctx:
-                    hidden_states = self.mlp(
-                        hidden_states,
-                        forward_batch,
-                        gemm_output_zero_allocator,
-                    )
+            ),
+            _mlp_ctx,
+        ):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
+            )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
