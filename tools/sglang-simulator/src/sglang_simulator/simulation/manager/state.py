@@ -9,6 +9,7 @@ class StateManager:
     _hicache_l2_load_segment_count: int = 0
     _hicache_l2_load_units: int = 0
     _hicache_l2_load_bytes: float = 0
+    _predictor_wall_dur: float = 0
     _evicted_tokens: int = 0
     _evict_calls: int = 0
     _last_real_time_ts: float = 0
@@ -26,6 +27,7 @@ class StateManager:
         cls._hicache_l2_load_segment_count = 0
         cls._hicache_l2_load_units = 0
         cls._hicache_l2_load_bytes = 0
+        cls._predictor_wall_dur = 0
         cls._evicted_tokens = 0
         cls._evict_calls = 0
         cls._last_real_time_ts = 0
@@ -71,6 +73,16 @@ class StateManager:
     @classmethod
     def inc_hicache_l2_backup_dur(cls, dur: float) -> None:
         cls._hicache_l2_backup_dur += dur
+
+    @classmethod
+    def inc_predictor_wall_dur(cls, dur: float) -> None:
+        cls._predictor_wall_dur += dur
+
+    @classmethod
+    def pop_predictor_wall_dur(cls) -> float:
+        dur = cls._predictor_wall_dur
+        cls._predictor_wall_dur = 0
+        return dur
 
     @classmethod
     def pop_hicache_l2_load_dur(cls) -> float:

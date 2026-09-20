@@ -543,10 +543,10 @@ class C_SchedulerHook(BaseHook):
                             simulation_batch
                         )
                     )
+                    predictor_wall_dur = time.perf_counter() - pred_start
                     # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
-                    )
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_wall_dur
+                    StateManager.inc_predictor_wall_dur(predictor_wall_dur)
                     predicted_latency = float(predicted_latency)
 
                     forward_latency = 0
@@ -596,11 +596,21 @@ class C_SchedulerHook(BaseHook):
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
                 last_real_time_ts = StateManager.get_last_real_time_ts()
+                # Running the predictor is the cost of simulating, not work a
+                # real server does; charging it would put the simulation's own
+                # runtime into the result it reports.
+                predictor_wall_dur = StateManager.pop_predictor_wall_dur()
                 # 0 means no batch has run since the last reset, so there is no
                 # elapsed host time to charge yet. Differencing against it would
                 # step the simulated clock by a whole Unix epoch.
                 cpu_overhead = (
-                    max(now - last_real_time_ts - blocked_l2_wall_dur, 0.0)
+                    max(
+                        now
+                        - last_real_time_ts
+                        - blocked_l2_wall_dur
+                        - predictor_wall_dur,
+                        0.0,
+                    )
                     if last_real_time_ts
                     else 0.0
                 )
