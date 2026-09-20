@@ -1,12 +1,15 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
 // NVIDIA recipes follow the Muse Spark 1.2 deployment specification.
 // MI355X cells are the ROCm aiter + FlyDSL profile (MXFP4 TEP 4/8, BF16
-// TEP 8). H200 and Xeon remain placeholders with no cells.
+// TEP 8). Xeon is the CPU-engine profile: the INT4 checkpoint and TP 6
+// (tensor parallel only — the CPU engine has no expert-parallel degree), with
+// KV Cache Precision and Parsers as the only overlays that apply there.
+// H200 remains a placeholder with no cells.
 export const config = {
   modelName: "Muse Spark 1.2",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
   hardware: [
-    { id: "xeon", label: "Xeon", vendor: "intel", vram: "Coming soon" },
+    { id: "xeon", label: "Xeon", vendor: "cpu", vram: "CPU" },
   ],
   showPlaygroundLink: false,
 
@@ -18,29 +21,40 @@ export const config = {
         {
           id: "nvfp4",
           label: "NVFP4",
+          showWhen: (s) => s.hw !== "xeon",
           disabled: (s) => s.hw === "mi355x",
           disableReason: "NVFP4 is the NVIDIA recipe; MI355X uses Quark MXFP4 or BF16.",
         },
         {
           id: "mxfp4",
           label: "MXFP4",
+          showWhen: (s) => s.hw !== "xeon",
           disabled: (s) => s.hw !== "mi355x",
           disableReason: "Quark MXFP4 is the MI355X recipe; NVIDIA cells use NVFP4 or BF16.",
         },
-        { id: "bf16", label: "BF16" },
+        { id: "bf16", label: "BF16", showWhen: (s) => s.hw !== "xeon" },
+        // INT4 weights, published for the CPU engine.
+        { id: "int4", label: "INT4", showWhen: (s) => s.hw === "xeon" },
       ],
     },
     {
       id: "tep",
       title: "TEP Size",
+      // Xeon has no size to pick — the CPU recipe is tensor parallel only and
+      // pins --tp-size 6 — so the whole row hides there.
+      showWhen: (s) => s.hw !== "xeon",
       options: [
         {
           id: "4",
           label: "4",
+          showWhen: (s) => s.hw !== "xeon",
           disabled: (s) => s.quant === "bf16" || s.hw === "h200",
           disableReason: "TEP 4 is unavailable for BF16 checkpoints and Hopper GPUs; use TEP 8.",
         },
-        { id: "8", label: "8" },
+        // The Xeon cell still keys on a value of this dim; the option is
+        // never rendered because the row above hides on that platform.
+        { id: "6", label: "6", showWhen: (s) => s.hw === "xeon" },
+        { id: "8", label: "8", showWhen: (s) => s.hw !== "xeon" },
       ],
     },
   ],
@@ -49,6 +63,7 @@ export const config = {
     {
       id: "sequenceParallel",
       title: "Sequence Parallel + Prefill MegaMoE",
+      showWhen: (s) => s.hw !== "xeon",
       default: "on",
       options: [
         {
@@ -73,6 +88,7 @@ export const config = {
     {
       id: "speculative",
       title: "Speculative Decoding",
+      showWhen: (s) => s.hw !== "xeon",
       default: "dflash-v2",
       options: [
         {
@@ -93,8 +109,8 @@ export const config = {
     {
       id: "mmTransport",
       title: "Multimodal Feature Transport",
+      showWhen: (s) => s.hw !== "xeon" && s.hw !== "mi355x",
       default: "cpu",
-      showWhen: (s) => s.hw !== "mi355x",
       options: [
         { id: "cpu", label: "CPU", flags: ["--mm-feature-transport cpu"] },
         {
@@ -109,6 +125,7 @@ export const config = {
     {
       id: "pdMode",
       title: "PD Disaggregation",
+      showWhen: (s) => s.hw !== "xeon",
       default: "collocated",
       options: [
         { id: "collocated", label: "Collocated" },
@@ -153,6 +170,7 @@ export const config = {
     {
       id: "hicache",
       title: "HiCache",
+      showWhen: (s) => s.hw !== "xeon",
       default: "l2",
       options: [
         {
@@ -168,6 +186,7 @@ export const config = {
       ],
     },
     {
+      // Hardware-independent (server-side text handling), so it stays on Xeon.
       id: "parsers",
       title: "Parsers",
       default: "on",
@@ -186,12 +205,14 @@ export const config = {
     nvfp4: "meta-models/Muse-Spark-1.2-816B-A42B-NVFP4-open",
     mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
     bf16: "meta-models/Muse-Spark-1.2-816B-A42B-open",
+    int4: "intel-ai/Muse-Spark-1.2-816B-A42B-open-W4A16-RTN-AutoRound",
   },
   dockerImages: {
     b300: "lmsysorg/sglang:muse-spark-1.2",
     gb300: "lmsysorg/sglang:muse-spark-1.2",
     b200: "lmsysorg/sglang:muse-spark-1.2",
     mi355x: "lmsysorg/sglang-rocm:muse-spark-1.2",
+    xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
   },
   dockerHostNetworkWhen: (s) => s.pdMode !== "collocated",
   placeholders: {
@@ -404,6 +425,20 @@ export const config = {
         "--attention-backend aiter",
         "--page-size 16",
         "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Intel Xeon (CPU engine), INT4 weights. SGLANG_USE_CPU_ENGINE=1 selects
+    // the CPU runtime; --page-size 1 is what the CPU attention path expects.
+    {
+      match: { hw: "xeon", quant: "int4", tep: "6" },
+      nnodes: 1,
+      env: ["SGLANG_USE_CPU_ENGINE=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 6",
+        "--page-size 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
