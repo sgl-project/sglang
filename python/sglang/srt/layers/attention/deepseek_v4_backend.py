@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     make_candidate_indexer,
     mask_topk_scores,
     published_masks,
+    select_candidate_block_mask,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -962,6 +963,8 @@ def _tail_rows(
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
+# Bound each captured fp32 score chunk to the original 2048 x 16K workspace.
+_PREFILL_GRAPH_INDEXER_MAX_SCORE_ELEMENTS = _PREFILL_GRAPH_INDEXER_ROW_CHUNK * 16 * 1024
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -1545,7 +1548,9 @@ class DeepseekV4AttnBackend(
         num_pages = core.page_table.shape[1]
         max_seq_len = _prefill_graph_max_seq_len()
         if max_seq_len is not None:
-            num_pages = min(max_seq_len // self.page_size, num_pages)
+            num_pages = min(
+                (max_seq_len + self.page_size - 1) // self.page_size, num_pages
+            )
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(compress_ratio)
         page_table = expand_index_page_table(
             core.page_table[:, :num_pages],
@@ -1555,7 +1560,11 @@ class DeepseekV4AttnBackend(
         )
         # Unclamped: a token with no completed group scores nothing, as in eager.
         c_seq_lens = (core.seq_lens_casual // compress_ratio).to(torch.int32)
-        row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+        width = page_table.shape[1] * index_page_size
+        row_chunk = min(
+            _PREFILL_GRAPH_INDEXER_ROW_CHUNK,
+            max(1, _PREFILL_GRAPH_INDEXER_MAX_SCORE_ELEMENTS // width),
+        )
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size,
@@ -1569,12 +1578,14 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
-        return (
-            bool(self.low_ratios)
-            and _has_dense_fp4_indexer()
-            and _is_sm100_or_newer()
-            and get_parallel().attn_cp_size == 1
+        """Whether ratio-1/2 prefill has capture-stable source metadata."""
+        supported = (
+            bool(self.low_ratios) and _has_dense_fp4_indexer() and _is_sm100_or_newer()
+        )
+        # CP's paged indexer needs a bounded static context width. It runs on
+        # the existing prepare stream, independently of multistream overlap.
+        return supported and (
+            get_parallel().attn_cp_size == 1 or _prefill_graph_max_seq_len() is not None
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -2627,10 +2638,11 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
-            for ratio in self.low_ratios:
-                self._source_projection_buffers(
-                    forward_batch.out_cache_loc.shape[0], ratio
-                )
+            if not dsa_use_prefill_cp(forward_batch):
+                for ratio in self.low_ratios:
+                    self._source_projection_buffers(
+                        forward_batch.out_cache_loc.shape[0], ratio
+                    )
         return self.forward_metadata
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
@@ -2830,39 +2842,70 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
-        if tail is not None:
-            q_lens_cpu = tail.local_lens_cpu
-            req_global, pos_global = tail.req_global, tail.pos_global
-        else:
-            q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
-                get_parallel().attn_cp_rank,
-                get_parallel().attn_cp_size,
-            )
-            req_global = token_req_indices(forward_batch, num_tokens=total)
-            pos_global = forward_batch.positions[:total].to(torch.int64)
-        num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
+            )
+            if self._low_ratio_in_prefill_graph():
+                assert tail is None, "bounded SWA replay cannot enter prefill BCG"
+                core = self.forward_metadata.core_metadata
+                bucket = core.raw_out_loc.shape[0]
+                req_global = self.forward_metadata.low_ratio_req_indices
+                assert req_global is not None and req_global.shape[0] >= bucket
+                assert x_global.shape[0] >= bucket
+                assert forward_batch.positions.shape[0] >= bucket
+                req_global = req_global[:bucket]
+                pos_global = forward_batch.positions[:bucket].to(torch.int64)
+                x_global = x_global[:bucket]
+            else:
+                total = int(cp_meta.total_seq_lens)
+                if tail is not None:
+                    req_global, pos_global = tail.req_global, tail.pos_global
+                else:
+                    req_global = token_req_indices(forward_batch, num_tokens=total)
+                    pos_global = forward_batch.positions[:total].to(torch.int64)
+                x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk_dense(
-                layer,
-                x[:num_local],
-                q_lora[:num_local],
-                positions[:num_local].to(torch.int64),
-                forward_batch,
-                self._move_to_device(q_lens_cpu),
-                q_lens_cpu,
-            )
+            if self._low_ratio_in_prefill_graph():
+                # CP-local rows were already reindexed in the captured metadata.
+                q = layer.indexer.queries(q_lora, layer.freqs_cis[positions])
+                w = layer.indexer.head_weights(x)
+                self._low_ratio_index_topk_prefill_graph(
+                    layer, self.forward_metadata.low_ratio_pos_i64, q, w
+                )
+            else:
+                if tail is not None:
+                    q_lens_cpu = tail.local_lens_cpu
+                else:
+                    q_lens_cpu = interleave_rows_per_request(
+                        _as_int_list(forward_batch.extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    )
+                num_local = sum(q_lens_cpu)
+                self._low_ratio_index_topk_dense(
+                    layer,
+                    x[:num_local],
+                    q_lora[:num_local],
+                    positions[:num_local].to(torch.int64),
+                    forward_batch,
+                    self._move_to_device(q_lens_cpu),
+                    q_lens_cpu,
+                )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
@@ -3359,12 +3402,22 @@ class DeepseekV4AttnBackend(
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_compressed_seq_len
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Every reachable block is a candidate inside the window, so the
-            # two-level selection collapses to the plain top-k below.
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
+        two_level = (
+            width > indexer.candidate_topk_blocks * indexer.candidate_block_size
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+        )
+        candidate_blocks = [] if two_level and indexer.is_candidate_source else None
+        consume = (
+            published_masks(self.forward_metadata.candidate_metadata).block_mask
+            if two_level and indexer.uses_candidates and candidate_blocks is None
+            else None
+        )
+        if consume is not None:
+            assert consume.shape == (
+                q.shape[0],
+                (width + indexer.candidate_block_size - 1)
+                // indexer.candidate_block_size,
+            ), "prefill graph candidate block layout does not match indexer"
 
         num_tokens, num_heads = q.shape[0], q.shape[1]
         q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
@@ -3396,14 +3449,41 @@ class DeepseekV4AttnBackend(
             lens_c = lens[rows].unsqueeze(-1)
             # Columns past a row's length hold garbage.
             s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
-            idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            if candidate_blocks is not None:
+                candidate_blocks.append(
+                    select_candidate_block_mask(
+                        s,
+                        lens_c,
+                        indexer.candidate_topk_blocks,
+                        indexer.candidate_block_size,
+                    )
+                )
+            elif consume is not None:
+                mask = consume[rows].repeat_interleave(
+                    indexer.candidate_block_size, dim=-1
+                )[..., :width]
+                s = s.masked_fill(~mask, -torch.inf)
+            idx = s.topk(topk, dim=-1, sorted=False).indices
             reach = idx < lens_c
+            if consume is not None:
+                reach = reach & (s.gather(-1, idx) > -torch.inf)
+            idx = torch.where(reach, idx, width).sort(dim=-1).values
+            reach = idx < width
+            idx = idx.clamp_max(width - 1)
             slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
                 idx % page_size
             )
             page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
             if raw_indices is not None:
                 raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
+        if candidate_blocks is not None:
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                block_mask=(
+                    candidate_blocks[0]
+                    if len(candidate_blocks) == 1
+                    else torch.cat(candidate_blocks, dim=0)
+                )
+            )
 
     def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos, req=None) -> None:
         from sglang.srt.model_executor.runner_utils.capture_mode import (

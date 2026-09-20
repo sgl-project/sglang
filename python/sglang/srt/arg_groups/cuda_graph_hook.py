@@ -599,11 +599,38 @@ def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
         "page_size must be resolved before prefill CUDA graph max context size"
     )
 
+    model_config = model_config_of(server_args)
     max_context_size = _resolve_max_context_size(
         requested_size=requested_size,
         page_size=page_size,
-        model_context_len=model_config_of(server_args).context_len,
+        model_context_len=model_config.context_len,
     )
+    is_v41 = (
+        getattr(getattr(model_config, "hf_config", None), "model_type", None)
+        == "deepseek_v41"
+    )
+    prefill_graph = cfg.cuda_graph_config.prefill
+    if (
+        is_v41
+        and prefill_graph.backend != Backend.DISABLED
+        and (cfg.enable_prefill_cp or cfg.attn_cp_size > 1)
+        and prefill_graph.max_seq_len is not None
+        and prefill_graph.max_seq_len > max_context_size
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 CP requires --cuda-graph-max-seq-len-prefill "
+            "to be at most --cuda-graph-prefill-max-context; CP uses "
+            "max_seq_len for graph admission."
+        )
+    changes = {"max_context_size": max_context_size}
+    if (
+        is_v41
+        and prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+    ):
+        # CP metadata cannot use the fixed-context override; the paged indexer
+        # and graph admission both use max_seq_len instead.
+        changes["max_seq_len"] = max_context_size
     logger.info(
         "Prefill CUDA graph max context size: %d; graph keys remain token-only.",
         max_context_size,
@@ -614,7 +641,7 @@ def finalize_cuda_graph_prefill_max_context(server_args: Any) -> None:
         cuda_graph_config=with_phase(
             cfg.cuda_graph_config,
             Phase.PREFILL,
-            max_context_size=max_context_size,
+            **changes,
         ),
     )
 

@@ -542,9 +542,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ) and should_enable_cp_bcg_capture(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
+                is_v41 = (
+                    getattr(
+                        getattr(model_runner.model_config, "hf_config", None),
+                        "model_type",
+                        None,
+                    )
+                    == "deepseek_v41"
+                )
+                if (
+                    is_v41
+                    and prefill_config.max_seq_len is not None
+                    and prefill_config.max_seq_len <= self.max_context_size
+                ):
+                    # CP's padded metadata cannot use max_seq_len_override;
+                    # max_seq_len still bounds admission and indexer width.
+                    logger.info(
+                        "CP prefill graph uses max_seq_len=%d for admission "
+                        "and indexer width (configured max-context=%d); "
+                        "skipping fixed metadata override.",
+                        prefill_config.max_seq_len,
+                        self.max_context_size,
+                    )
+                    self.max_context_size = None
+                else:
+                    self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )

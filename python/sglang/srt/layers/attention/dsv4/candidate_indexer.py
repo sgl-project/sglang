@@ -166,6 +166,7 @@ def make_candidate_indexer(
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    block_mask: Optional[torch.Tensor] = None  # captured prefill: [rows, blocks] bool
 
 
 def cut_request_masks(masks: CandidateMasks, tail_lens: List[int]) -> CandidateMasks:
@@ -246,6 +247,25 @@ def select_candidate_block_ids(
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 
 
+def select_candidate_block_mask(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level-one candidates in block units for fixed-width prefill graphs."""
+    top = _candidate_block_topk(
+        logits=logits,
+        compress_lens=compress_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
+    )
+    num_blocks = (logits.shape[-1] + block_size - 1) // block_size
+    return torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(-1, top.indices, top.values > -torch.inf)
+
+
 def candidate_block_mask(
     blocks: torch.Tensor, width: int, block_size: int
 ) -> torch.Tensor:
@@ -263,15 +283,7 @@ def select_candidate_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    top = _candidate_block_topk(
-        logits=logits,
-        compress_lens=compress_lens,
-        topk_blocks=topk_blocks,
-        block_size=block_size,
+    keep = select_candidate_block_mask(
+        logits, compress_lens, topk_blocks, block_size
     )
-    width = logits.shape[-1]
-    num_blocks = (width + block_size - 1) // block_size
-    keep = torch.zeros(
-        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
-    ).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return keep.repeat_interleave(block_size, dim=-1)[..., : logits.shape[-1]]

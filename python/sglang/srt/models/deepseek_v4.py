@@ -2041,10 +2041,7 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and (
-                    dsa_use_prefill_cp(forward_batch)
-                    or not getattr(attn_backend, "low_ratio_prefill_graph", False)
-                )
+                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
