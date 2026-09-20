@@ -13,7 +13,6 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -480,15 +479,6 @@ def handle_other_validations(server_args: Any):
             logger.warning(
                 "Optimistic prefill supports L2 write-back or L3 buffer-only "
                 "write-through hierarchical cache"
-            )
-            declare_resolution(
-                server_args,
-                "_handle_other_validations",
-                optimistic_prefill_attempts=0,
-            )
-        elif resolved_view(server_args).uses_mamba_radix_cache:
-            logger.warning(
-                "Optimistic prefill does not support models that use mamba radix cache."
             )
             declare_resolution(
                 server_args,
