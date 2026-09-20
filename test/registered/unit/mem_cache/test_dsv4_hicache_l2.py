@@ -12,16 +12,25 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentHostSlot
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -178,6 +187,134 @@ class TestDSV4HostViews(CustomTestCase):
 
 
 class TestC128L2Ownership(CustomTestCase):
+    @staticmethod
+    def _component(*, anchor_tokens=0):
+        root = SimpleNamespace(parent=None, key=[])
+        anchor = root
+        if anchor_tokens:
+            anchor = SimpleNamespace(parent=root, key=list(range(anchor_tokens)))
+        allocator = SimpleNamespace(
+            c128_attn_allocator=SimpleNamespace(page_size=16),
+        )
+        component = C128SidecarComponent.__new__(C128SidecarComponent)
+        component.cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        component.tree_core = SimpleNamespace(
+            page_size=128,
+            root_node=root,
+            node_by_id=lambda _node_id: anchor,
+        )
+        component._c128_kv_pool_host = MagicMock()
+        return component, anchor
+
+    def test_prefetch_sizes_only_complete_c128_groups(self):
+        component, _ = self._component()
+
+        sizes = [
+            component.prepare_prefetch(0, prefetch_tokens=tokens).staging_tokens
+            for tokens in (2048, 4096, 6144, 8064)
+        ]
+
+        self.assertEqual(sizes, [16, 32, 48, 48])
+
+    def test_prefetch_uses_complete_group_endpoint_hashes(self):
+        component, anchor = self._component()
+        token_ids = list(range(8064))
+        hashes = get_storage_hash_str(token_ids, page_size=128)
+
+        (transfer,) = component.build_hicache_transfers(
+            anchor,
+            CacheTransferPhase.PREFETCH,
+            token_ids=token_ids,
+            prefetch_tokens=len(token_ids),
+            staging_tokens=48,
+        )
+
+        self.assertEqual(transfer.name, PoolName.DEEPSEEK_V4_C128)
+        self.assertEqual(transfer.keys, [hashes[15], hashes[31], hashes[47]])
+
+    def test_prefetch_staging_uses_c128_pool_reclaim_callback(self):
+        component, _ = self._component()
+        reclaim = MagicMock()
+        host_pool_group = SimpleNamespace(
+            entry_map={
+                PoolName.DEEPSEEK_V4_C128: SimpleNamespace(host_evict_fn=reclaim)
+            },
+            alloc=MagicMock(return_value=torch.arange(16)),
+        )
+        component.cache.host_pool_group = host_pool_group
+
+        result = component.alloc_prefetch_staging(16)
+
+        self.assertTrue(torch.equal(result, torch.arange(16)))
+        host_pool_group.alloc.assert_called_once_with(
+            16,
+            pool=PoolName.DEEPSEEK_V4_C128,
+            reclaim=reclaim,
+        )
+
+    def test_storage_backup_uses_group_endpoint(self):
+        component, anchor = self._component()
+        anchor.hash_value = [f"page{i}" for i in range(16)]
+        anchor.component_data = {
+            ComponentType.C128: SimpleNamespace(host_value=torch.arange(16))
+        }
+
+        (transfer,) = component.build_hicache_transfers(
+            anchor, CacheTransferPhase.BACKUP_STORAGE
+        )
+
+        self.assertEqual(transfer.keys, ["page15"])
+        self.assertTrue(torch.equal(transfer.host_indices, torch.arange(16)))
+
+    def test_prefetch_commit_attaches_loaded_groups_and_releases_tail(self):
+        component, anchor = self._component()
+        endpoints = [
+            SimpleNamespace(
+                parent=anchor,
+                component_data={
+                    ComponentType.C128: SimpleNamespace(host_value=None, value=None)
+                },
+            )
+            for _ in range(2)
+        ]
+        target = SimpleNamespace()
+        host_lru = SimpleNamespace(in_list=lambda _node: False, insert_mru=MagicMock())
+        component.tree_core.node_by_id = lambda _node_id: target
+        component.tree_core.host_lru_lists = {ComponentType.C128: host_lru}
+        component.tree_core._update_evictable_leaf_sets = MagicMock()
+        component._ensure_boundary_node = MagicMock(side_effect=endpoints)
+        actions = []
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            host_indices=torch.arange(48),
+            keys=["page15", "page31", "page47"],
+        )
+
+        component.commit_hicache_transfer(
+            anchor,
+            CacheTransferPhase.PREFETCH,
+            [transfer],
+            cache_actions=actions,
+            insert_result=SimpleNamespace(inserted_host_node=1),
+            pool_storage_result=PoolTransferResult(32, {PoolName.DEEPSEEK_V4_C128: 2}),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                endpoints[0].component_data[ComponentType.C128].host_value,
+                torch.arange(16),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                endpoints[1].component_data[ComponentType.C128].host_value,
+                torch.arange(16, 32),
+            )
+        )
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], FreeComponentHostSlot)
+        self.assertTrue(torch.equal(actions[0].host_indices[0], torch.arange(32, 48)))
+
     def test_load_back_retains_and_attaches_each_c128_page(self):
         allocator = SimpleNamespace(
             c128_attn_allocator=SimpleNamespace(page_size=4),
@@ -222,6 +359,34 @@ class TestC128L2Ownership(CustomTestCase):
         ]
         self.assertEqual(retained, [[7], [8]])
         self.assertEqual(attached, [(1, [7]), (2, [8])])
+
+
+class TestC128StorageKeyResolution(CustomTestCase):
+    def test_controller_trims_group_keys_and_staging_to_kv_hit(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 128
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.DEEPSEEK_V4_C128: SimpleNamespace(
+                    host_pool=SimpleNamespace(page_size=16)
+                )
+            }
+        )
+        controller.append_host_mem_release = MagicMock()
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            host_indices=torch.arange(48),
+            keys=["page15", "page31", "page47"],
+        )
+
+        controller._sync_c128_endpoint_keys([transfer], [f"page{i}" for i in range(32)])
+
+        self.assertEqual(transfer.keys, ["page15", "page31"])
+        self.assertTrue(torch.equal(transfer.host_indices, torch.arange(32)))
+        released = controller.append_host_mem_release.call_args.kwargs["extra_pools"][
+            0
+        ].host_indices
+        self.assertTrue(torch.equal(released, torch.arange(32, 48)))
 
 
 class TestDSV4PoolAssembly(CustomTestCase):

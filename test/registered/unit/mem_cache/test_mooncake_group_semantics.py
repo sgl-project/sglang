@@ -1,5 +1,6 @@
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -274,6 +275,23 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_c128_exists_returns_only_consecutive_complete_group_endpoints(self):
+        store, _ = _make_store(is_mla_model=True)
+        store.mem_pool_host = SimpleNamespace(kv_buffer=None)
+        store.registered_pools = {PoolName.DEEPSEEK_V4_C128: object()}
+        store._batch_exist = lambda _keys: [1, 1, 0]
+        page_keys = [f"page{i}" for i in range(63)]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            keys=[page_keys[15], page_keys[31], page_keys[47]],
+        )
+
+        result = store.batch_exists_v2(page_keys, [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 32)
+        self.assertEqual(result.restorable_prefix_pages, [16, 32])
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.DEEPSEEK_V4_C128], 2)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(

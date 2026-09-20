@@ -1131,11 +1131,13 @@ class HybridCacheController(BaseHiCacheController):
                 if operation.sidecar_hash_values is not None
                 else kv_completed_pages
             )
+            self._sync_c128_endpoint_keys(transfers_nonkv, sidecar_hashes)
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
             results = self.storage_backend.batch_get_v2(
-                transfers_nonkv, extra_info=extra_info
+                [transfer for transfer in transfers_nonkv if transfer.keys],
+                extra_info=extra_info,
             )
             pool_hits = count_pool_hits(results)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
@@ -1310,6 +1312,41 @@ class HybridCacheController(BaseHiCacheController):
                 # transfer to match and release the tail now — otherwise the
                 # length mismatch makes batch_get_v2 fetch nothing and the
                 # whole window is silently lost downstream.
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices[needed:],
+                        )
+                    ]
+                )
+                transfer.host_indices = transfer.host_indices[:needed]
+
+    def _sync_c128_endpoint_keys(
+        self,
+        pool_transfers: list[PoolTransfer],
+        hit_hashes: list[str],
+    ) -> None:
+        """Trim complete-group C128 objects to the actual KV hit endpoint.
+
+        C128 keys are sparse radix-page hashes (one per complete compression
+        group), unlike the per-page keys used by ordinary ALL_PAGES pools.
+        The availability query may shorten the KV prefix after staging was
+        allocated, so discard keys and slots beyond that prefix before GET.
+        """
+        hit_hash_set = set(hit_hashes)
+        for transfer in pool_transfers:
+            if transfer.name != PoolName.DEEPSEEK_V4_C128:
+                continue
+            transfer.keys = [key for key in transfer.keys or () if key in hit_hash_set]
+            if transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            pool_page_size = (
+                entry.host_pool.page_size if entry is not None else self.page_size
+            )
+            needed = len(transfer.keys) * pool_page_size
+            if transfer.host_indices.numel() > needed:
                 self.append_host_mem_release(
                     extra_pools=[
                         PoolTransfer(

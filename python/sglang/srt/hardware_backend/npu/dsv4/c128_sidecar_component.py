@@ -17,12 +17,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -31,8 +33,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     EvictLayer,
     PrepareLoadBackResult,
+    PreparePrefetchResult,
     TreeComponent,
 )
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -342,6 +346,18 @@ class C128SidecarComponent(TreeComponent):
             for page_ids in action.indices:
                 self.allocator.release_c128_pages(page_ids)
             return
+        if isinstance(action, FreeComponentHostSlot):
+            for host_indices in action.host_indices:
+                if host_indices is not None and host_indices.numel() > 0:
+                    self.cache.cache_controller.append_host_mem_release(
+                        extra_pools=[
+                            PoolTransfer(
+                                name=PoolName.DEEPSEEK_V4_C128,
+                                host_indices=host_indices,
+                            )
+                        ]
+                    )
+            return
         raise AssertionError(
             f"C128SidecarComponent: unhandled action {type(action).__name__}"
         )
@@ -389,6 +405,41 @@ class C128SidecarComponent(TreeComponent):
             self._c128_kv_pool_host.free(host_value)
 
     # ---- HiCache Hooks ----
+
+    def _group_tokens(self) -> int:
+        return 128 * self.allocator.c128_attn_allocator.page_size
+
+    def prepare_prefetch(
+        self,
+        node_id: int,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        """Reserve one C128 host page for every complete group endpoint.
+
+        The radix anchor need not itself be C128-aligned.  Only boundaries
+        crossed by the requested suffix are materialized; a partial tail never
+        gets a staging slot.
+        """
+        if self._c128_kv_pool_host is None or prefetch_tokens <= 0:
+            return PreparePrefetchResult()
+        start = self._node_depth(self.tree_core.node_by_id(node_id))
+        group_tokens = self._group_tokens()
+        num_groups = (start + prefetch_tokens) // group_tokens - start // group_tokens
+        return PreparePrefetchResult(
+            staging_tokens=num_groups * self.allocator.c128_attn_allocator.page_size
+        )
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        # C128 pressure is reclaimed by atomically evicting owning FULL leaves;
+        # use the pool entry's callback instead of the component-local eviction
+        # walk (C128 deliberately has no independent host-leaf lifecycle).
+        entry = self.cache.host_pool_group.entry_map[PoolName.DEEPSEEK_V4_C128]
+        return self.cache.host_pool_group.alloc(
+            num_tokens,
+            pool=PoolName.DEEPSEEK_V4_C128,
+            reclaim=entry.host_evict_fn,
+        )
 
     @staticmethod
     def _expand_page_indices(page_ids: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -458,6 +509,50 @@ class C128SidecarComponent(TreeComponent):
                 )
             ]
 
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+            num_groups = len(cd.host_value) // page_size
+            if num_groups == 0:
+                return None
+            # C128 values live only on complete-group endpoints.  The normal
+            # case is one value per node; retaining the tail form also makes
+            # this robust to a future node carrying adjacent endpoints.
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=cd.host_value[-num_groups * page_size :],
+                    keys=node.hash_value[-num_groups:],
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            if not token_ids or staging_tokens == 0:
+                return None
+            radix_page_size = self.tree_core.page_size
+            group_tokens = self._group_tokens()
+            assert group_tokens % radix_page_size == 0
+            start = self._node_depth(node)
+            hashes = get_storage_hash_str(
+                token_ids, last_hash, page_size=radix_page_size
+            )
+            endpoint_keys = [
+                key
+                for i, key in enumerate(hashes, start=1)
+                if (start + i * radix_page_size) % group_tokens == 0
+            ]
+            if not endpoint_keys:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=endpoint_keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+            ]
+
         return None
 
     def commit_hicache_transfer(
@@ -507,4 +602,68 @@ class C128SidecarComponent(TreeComponent):
                 self.allocator.retain_c128_pages(page_ids)
                 self.tree_core.set_component_device_value(nid, ct, page_ids.clone())
                 offset += n_len
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            if not transfers:
+                return
+            xfer = transfers[0]
+            host_indices = xfer.host_indices
+            target = (
+                self.tree_core.node_by_id(insert_result.inserted_host_node)
+                if insert_result is not None
+                and insert_result.inserted_host_node is not None
+                else None
+            )
+            loaded_groups = (
+                pool_storage_result.extra_pool_hit_pages.get(
+                    PoolName.DEEPSEEK_V4_C128, 0
+                )
+                if pool_storage_result is not None
+                else 0
+            )
+            available_groups = (
+                host_indices.numel() // page_size if host_indices is not None else 0
+            )
+            usable_groups = min(loaded_groups, available_groups, len(xfer.keys or ()))
+            if target is None or usable_groups == 0:
+                if host_indices is not None:
+                    cache_actions.append(
+                        FreeComponentHostSlot(
+                            [host_indices], component_type=ComponentType.C128
+                        )
+                    )
+                return
+
+            group_tokens = self._group_tokens()
+            start = self._node_depth(node)
+            boundary = (start // group_tokens + 1) * group_tokens
+            for group_idx in range(usable_groups):
+                chunk = host_indices[
+                    group_idx * page_size : (group_idx + 1) * page_size
+                ]
+                endpoint = self._ensure_boundary_node(
+                    target, boundary + group_idx * group_tokens, cache_actions
+                )
+                cd = endpoint.component_data[ct]
+                if cd.host_value is None:
+                    cd.host_value = chunk.clone()
+                    host_lru = self.tree_core.host_lru_lists[ct]
+                    if cd.value is None and not host_lru.in_list(endpoint):
+                        host_lru.insert_mru(endpoint)
+                    self.tree_core._update_evictable_leaf_sets(endpoint)
+                    if endpoint.parent is not None:
+                        self.tree_core._update_evictable_leaf_sets(endpoint.parent)
+                else:
+                    cache_actions.append(
+                        FreeComponentHostSlot(
+                            [chunk], component_type=ComponentType.C128
+                        )
+                    )
+
+            unused = host_indices[usable_groups * page_size :]
+            if unused.numel() > 0:
+                cache_actions.append(
+                    FreeComponentHostSlot([unused], component_type=ComponentType.C128)
+                )
             return
