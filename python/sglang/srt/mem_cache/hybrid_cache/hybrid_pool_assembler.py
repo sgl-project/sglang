@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import msgspec
+
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1299,21 +1301,22 @@ def build_full_draft_pools(
     ]
 
     if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
+        # Separate draft indexer: its own host mirror, but transfer indices
+        # still follow the target KV anchor.
+        indexer_desc = msgspec.structs.replace(
+            DSAIndexerStateDesc.from_device_pool(pool),
+            pool_name=PoolName.DRAFT_INDEXER,
+        )
         indexer_host_pool = DSAIndexerPoolHost(
+            indexer_desc,
             pool,
             draft_host_pool,
-            get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
         )
-        specs.append(
-            SidecarPoolSpec(
-                pool_name=PoolName.DRAFT_INDEXER,
-                indices_from_pool=PoolName.KV,
-            )
-        )
+        specs.append(indexer_desc.sidecar_spec())
         entries.append(
             build_pool_entry(
-                name=PoolName.DRAFT_INDEXER,
+                name=indexer_desc.pool_name,
                 host_pool=indexer_host_pool,
                 device_pool=pool,
                 layer_mapping=draft_layer_mapping,

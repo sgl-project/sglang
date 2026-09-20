@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
@@ -15,7 +16,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     build_full_draft_pools,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerStateDesc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -209,6 +211,63 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
+
+    def test_full_builder_registers_separate_dsa_draft_indexer(self):
+        """The separate-draft DSA branch must build its indexer mirror from a
+        DRAFT_INDEXER desc; a constructor change that skips this call site
+        breaks only here, not on the target path."""
+        draft_kv_pool = object.__new__(DSATokenToKVPool)
+        draft_kv_pool.layer_num = 1
+        draft_kv_pool.size = 800
+        draft_kv_pool.index_head_dim = 128
+        draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
+        draft_host_pool = SimpleNamespace(layer_num=1)
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=100, logical_size=800),
+                page_size=512,
+            )
+        )
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(model_path="dummy", hicache_mem_layout="page_first"),
+            role="scheduler",
+        )
+        self.addCleanup(reset_context)
+
+        seen = {}
+
+        def fake_indexer_host(desc, device_pool, anchor_host, *, allocator_type):
+            self.assertIsInstance(desc, DSAIndexerStateDesc)
+            self.assertIs(device_pool, draft_kv_pool)
+            self.assertIs(anchor_host, draft_host_pool)
+            seen["desc"] = desc
+            return SimpleNamespace(layer_num=1)
+
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "_build_mha_mla_host_pool",
+                return_value=draft_host_pool,
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler, "DSAIndexerPoolHost", fake_indexer_host
+            ),
+        ):
+            specs, entries = build_full_draft_pools(
+                draft_kv_pool=draft_kv_pool,
+                tree_cache=tree_cache,
+            )
+
+        self.assertEqual(seen["desc"].pool_name, PoolName.DRAFT_INDEXER)
+        self.assertEqual(seen["desc"].anchor_pool, PoolName.KV)
+        self.assertEqual(specs[1], seen["desc"].sidecar_spec())
+        self.assertEqual(entries[1].name, PoolName.DRAFT_INDEXER)
 
 
 if __name__ == "__main__":
