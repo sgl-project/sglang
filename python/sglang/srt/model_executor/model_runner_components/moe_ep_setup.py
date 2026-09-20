@@ -105,7 +105,7 @@ def prebuild_deepep_v2_buffers(*, model) -> None:
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.distributed import get_moe_ep_group
+    from sglang.srt.runtime_context import get_parallel
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
@@ -118,7 +118,7 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     if metadata is None:
         return
     clear_global_lplb_solvers()
-    ep_group = get_moe_ep_group()
+    ep_group = get_parallel().moe_ep_group
     for lid in range(metadata.num_layers):
         solver = LPLBSolver(
             phy2log=metadata.physical_to_logical_map[lid],

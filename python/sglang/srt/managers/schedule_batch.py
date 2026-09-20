@@ -649,6 +649,35 @@ class MultimodalProcessorOutput(
                 padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
         return padded_input_ids
 
+    @staticmethod
+    def build_token_modalities(
+        input_ids, mm_items: List[MultimodalDataItem]
+    ) -> Optional[List[int]]:
+        """Build the pre-padding token modality map from item offsets."""
+        if input_ids is None or not mm_items:
+            return None
+        if isinstance(input_ids, torch.Tensor):
+            num_tokens = input_ids.numel()
+        else:
+            num_tokens = len(flatten_nested_list(input_ids))
+        token_modalities = [0] * num_tokens
+        for item in mm_items:
+            if not item.offsets:
+                continue
+            modality = item.modality.value
+            for start, end in item.offsets:
+                if start < 0 or end < start or end >= num_tokens:
+                    raise ValueError(
+                        "Invalid multimodal token offsets: "
+                        f"offset=({start}, {end}), num_tokens={num_tokens}"
+                    )
+                if any(token_modalities[index] for index in range(start, end + 1)):
+                    raise ValueError(
+                        f"Overlapping multimodal token offsets at ({start}, {end})"
+                    )
+                token_modalities[start : end + 1] = [modality] * (end - start + 1)
+        return token_modalities
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -659,6 +688,7 @@ class MultimodalInputs:
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
+    token_modalities: Optional[List[int]] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -701,7 +731,9 @@ class MultimodalInputs:
                 item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: MultimodalProcessorOutput):
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+    ):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
@@ -742,6 +774,12 @@ class MultimodalInputs:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
+        token_modalities = (
+            MultimodalProcessorOutput.build_token_modalities(obj.input_ids, mm_items)
+            if requires_mm_token_modalities
+            else None
+        )
+
         for item in mm_items:
             item.set_pad_value()
 
@@ -753,6 +791,7 @@ class MultimodalInputs:
         mm_inputs = MultimodalInputs(
             mm_items=mm_items,
             padded_input_ids=obj.padded_input_ids,
+            token_modalities=token_modalities,
         )
         optional_args = [
             "mrope_positions",
@@ -819,6 +858,12 @@ class MultimodalInputs:
             self_arg = getattr(self, arg, None)
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
+
+        if other.token_modalities is not None:
+            if self.token_modalities is None:
+                self.token_modalities = list(other.token_modalities)
+            else:
+                self.token_modalities += other.token_modalities
 
         mrope_positions = self.mrope_positions
         if mrope_positions is not None:
@@ -1313,6 +1358,7 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        self.expected_kv_checksum: int = 0
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
@@ -1399,7 +1445,7 @@ class Req(ReqDllmMixin):
         kv, self.kv = self.kv, ReqKvInfo()
         return kv
 
-    def effective_kv_committed_len(self) -> int:
+    def owned_kv_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
@@ -2179,6 +2225,7 @@ def release_req(
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     backup_saved = True
+    # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode == "decode" and offload_kv:
         backup_saved = retraction_backup(
             req,
@@ -2298,6 +2345,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_prefill_finished: bool = False
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
+    # A full prefill has one result but can span several run_batch calls.
+    split_prefill_start: Optional[Tuple[int, float]] = None
 
     # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
     # not read by ForwardBatch), stale in spec draft window
@@ -2336,6 +2385,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Mask marking chunked (not-yet-finished) prefill requests whose sampled
     # pseudo next-token must NOT be written into the ngram token table.
     ne_skip_token_table_update: torch.Tensor = None
+    # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
+    # of each request's first extend token (NgramEmbeddingManager).
+    engram_history: Optional[torch.Tensor] = None
+    encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2673,6 +2726,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            for req in reqs:
+                if (
+                    req.multimodal_inputs is not None
+                    or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    raise ValueError(
+                        "encoder SWA replay currently supports token-only text requests"
+                    )
+                if req.return_logprob and req.logprob_start_len not in (
+                    -1,
+                    len(req.origin_input_ids),
+                ):
+                    raise ValueError(
+                        "encoder SWA replay cannot return cached prompt logprobs"
+                    )
+            self.encoder_swa_reset = [
+                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
+            ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
@@ -2919,7 +2992,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= checkpoint_grid
+        # Pick the depth on the absolute checkpoint grid: a chunk boundary can leave
+        # the prefix off the (DCP-widened) tree page, and a prefix-relative depth then
+        # names a position no page can hold. Donate only where an h snapshot exists.
+        prefix_len = len(req.prefix_indices)
+        seq_end = prefix_len + req.extend_range.length
+        # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+        # mamba radix cache to track which seqlen this mamba state should store at.
+        mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
+        mask = (
+            mamba_track_seqlen_aligned > prefix_len
+            and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
+        )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -2932,14 +3016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
-
-            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-            # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
-            )
+            mamba_track_seqlen = seq_end
 
             # A coarser checkpoint grid may not be a model-state boundary, so
             # force retrieval from the intermediate h state in that case.
@@ -3715,6 +3792,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
+            split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
         )
 

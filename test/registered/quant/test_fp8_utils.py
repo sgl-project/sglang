@@ -1,9 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import (
     Fp8MoEMethod,
     _is_cuda,
@@ -11,8 +12,13 @@ from sglang.srt.layers.quantization.fp8 import (
     _is_hip,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    Fp8GemmRunnerBackend,
+    Mxfp8DenseGemmBackend,
+    block_fp8_scale_to_mxfp8_e8m0,
+    can_serve_block_fp8_as_mxfp8,
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
+    resolve_block_fp8_mxfp8_backend,
     transform_scale_ue8m0,
 )
 from sglang.srt.runtime_context import get_platform
@@ -102,6 +108,68 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
             assert torch.all(sf_fp32_original == sf_fp32_recreated), (
                 f"{sf_fp32_original=} {sf_fp32_recreated}"
             )
+
+
+class TestBlockFp8AsMxfp8(CustomTestCase):
+    def test_block_scale_to_e8m0_matches_reference(self):
+        # Sibling classes leave torch's default device on cuda; stay on cpu.
+        gen = torch.Generator().manual_seed(0)
+        n, k, block_n = 100, 256, 32  # 4 scale rows, the last one partial
+        exps = torch.randint(-20, 21, (4, k // 32), generator=gen, device="cpu")
+        got = block_fp8_scale_to_mxfp8_e8m0(
+            torch.exp2(exps.float()), (n, k), [block_n, 32]
+        )
+        ref = (exps + 127).to(torch.uint8).repeat_interleave(block_n, dim=0)[:n]
+        self.assertTrue(torch.equal(got, ref))
+        with self.assertRaises(ValueError):  # 128-wide K block is not MXFP8
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.ones(2, 8, device="cpu"), (64, 1024), [32, 128]
+            )
+        with self.assertRaises(ValueError):  # not a power of two
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.full((2, 8), 1.5, device="cpu"), (64, 256), [32, 32]
+            )
+
+    def test_serve_gate(self):
+        platform = MagicMock()
+        platform.is_blackwell = True
+        cutedsl = next(b for b in Mxfp8DenseGemmBackend if b.is_flashinfer_cutedsl())
+        with (
+            patch.object(fp8_utils, "_is_cuda", True),
+            patch.object(fp8_utils, "get_platform", return_value=platform),
+            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
+            patch.object(
+                fp8_utils, "resolve_mxfp8_dense_gemm_backend", return_value=cutedsl
+            ),
+        ):
+            for name, expected in (
+                ("flashinfer_cutedsl", True),
+                ("flashinfer_cutlass", True),
+                ("flashinfer_trtllm", False),
+                ("triton", False),
+                ("auto", False),
+            ):
+                with (
+                    self.subTest(backend=name),
+                    patch.object(
+                        fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(name)
+                    ),
+                ):
+                    self.assertEqual(
+                        can_serve_block_fp8_as_mxfp8([32, 32], "ue8m0"), expected
+                    )
+                    self.assertEqual(
+                        resolve_block_fp8_mxfp8_backend().is_unsupported(), not expected
+                    )
+            with patch.object(
+                fp8_utils,
+                "FP8_GEMM_RUNNER_BACKEND",
+                Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            ):
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([128, 128], "ue8m0"))
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([32, 32], None))
+                platform.is_blackwell = False
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([32, 32], "ue8m0"))
 
 
 class TestApplyFp8LinearScaleDispatch(CustomTestCase):
@@ -268,6 +336,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         native_method = native_fp8.Fp8LinearMethod.__new__(native_fp8.Fp8LinearMethod)
         native_method.use_marlin = False
         native_method.use_mxfp8 = False
+        native_method.block_fp8_as_mxfp8 = False
         native_method.block_quant = False
         native_method.cutlass_fp8_supported = True
         native_method.use_per_token_if_dynamic = False
