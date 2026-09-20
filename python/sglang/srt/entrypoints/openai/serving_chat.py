@@ -1300,14 +1300,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request,
         adapted_request: GenerateReqInput,
     ) -> None:
-        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
-        if isinstance(
-            self._reasoning_detector,
-            ResponseTemplateReasoningDetector,
-        ) or (
-            tool_detector is not None
-            and issubclass(tool_detector, ResponseTemplateToolDetector)
-        ):
+        if self._requires_response_template_detokenization(request):
             request._response_parser_prefix = self._response_parser_prefix(
                 adapted_request
             )

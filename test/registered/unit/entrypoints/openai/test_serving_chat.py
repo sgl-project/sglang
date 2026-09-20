@@ -30,7 +30,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -658,6 +660,10 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.chat.tool_call_parser = "response-template-alias"
         self.basic_req.input_ids = [1, 2, 3]
+        self.basic_req.tools = [
+            Tool(function=Function(name="get_weather", parameters={}))
+        ]
+        self.basic_req.tool_choice = "auto"
         self.tm.tokenizer.decode.return_value = "<first><second>"
 
         with (
