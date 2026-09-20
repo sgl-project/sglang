@@ -302,6 +302,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            # --- gating shape shim (patch_gdn_gating_shape.py) ---
+            # sgl-kernel-npu #747 dropped the leading dim to match its new
+            # AscendC chunk operator; the triton chunk kernel this path still
+            # calls asserts [B, T, H]. Guarded so old wheels are untouched.
+            if g.dim() == 2:
+                g = g.unsqueeze(0)
+                beta = beta.unsqueeze(0)
+            # --- end shim ---
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
