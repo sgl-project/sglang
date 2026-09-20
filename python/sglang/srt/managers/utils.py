@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
@@ -43,19 +44,6 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
-
-
-def _async_d2h(t: torch.Tensor) -> torch.Tensor:
-    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
-    to pageable host memory blocks the caller until done) and record_stream keeps
-    the source alive until the copy stream drains, so the caching allocator can't
-    recycle it early. Non-CUDA falls back to a plain copy."""
-    if not t.is_cuda:
-        return t.to("cpu", non_blocking=True)
-    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-    cpu_t.copy_(t, non_blocking=True)
-    t.record_stream(torch.cuda.current_stream(t.device))
-    return cpu_t
 
 
 @dataclasses.dataclass
@@ -292,6 +280,9 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
     logits_output = result.logits_output
     assert logits_output is not None
+    # Nested pinned CPU tensors are serialized as Python metadata by PP, so
+    # their forward-stream copies must be complete before pickling starts.
+    logits_output.finalize_input_logprobs()
     sampling_mask_output = logits_output.sampling_mask_output
 
     return {
