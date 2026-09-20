@@ -106,13 +106,30 @@ def _warn_symm_mem_wins() -> None:
     )
 
 
-def eligible_group(*, group_name: Optional[str], world_size: int) -> bool:
+@functools.lru_cache(maxsize=None)
+def _warn_deterministic_wins() -> None:
+    logger.warning(
+        "Deterministic inference is on; leaving PCIe-IPC all-reduce off. Its "
+        "kernels pick a tactic per shape, so the reduction order would follow "
+        "the batch shape."
+    )
+
+
+def eligible_group(
+    *, group_name: Optional[str], world_size: int, deterministic: bool
+) -> bool:
     """Whether ``GroupCoordinator`` should build this backend for a group."""
     if not (
         envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
         and world_size > 1
         and group_name in _ELIGIBLE_GROUP_NAMES
     ):
+        return False
+    # Deterministic inference pins NCCL and turns off custom and
+    # symmetric-memory all-reduce for the same reason; disabling tuning alone
+    # would not help, since the seed policy is per-shape too.
+    if deterministic:
+        _warn_deterministic_wins()
         return False
     # Symmetric memory wins: it is the pre-existing feature, and its eager
     # branch returns through NCCL before the dispatch reaches this backend, so

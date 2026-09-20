@@ -476,7 +476,11 @@ class GroupCoordinator:
             eligible_group,
         )
 
-        if eligible_group(group_name=group_name, world_size=self.world_size):
+        if eligible_group(
+            group_name=group_name,
+            world_size=self.world_size,
+            deterministic=self._deterministic_collectives_enabled(),
+        ):
             try:
                 # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
                 # Autotuning is the other way round: it rendezvouses on the host.

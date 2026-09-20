@@ -89,14 +89,14 @@ class TestGroupEligibility(CustomTestCase):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
             self.assertTrue(
                 pcie_ipc_ar.eligible_group(
-                    group_name="tp", world_size=4
+                    group_name="tp", world_size=4, deterministic=False
                 )
             )
             for name in ("attention_tp", "moe_tp", "pdmux_prefill_tp", "world", "pp"):
                 with self.subTest(group=name):
                     self.assertFalse(
                         pcie_ipc_ar.eligible_group(
-                            group_name=name, world_size=4
+                            group_name=name, world_size=4, deterministic=False
                         )
                     )
 
@@ -113,14 +113,14 @@ class TestGroupEligibility(CustomTestCase):
                     pcie_ipc_ar._warn_symm_mem_wins.cache_clear()
                     self.assertFalse(
                         pcie_ipc_ar.eligible_group(
-                            group_name="tp", world_size=4
+                            group_name="tp", world_size=4, deterministic=False
                         )
                     )
                 self.assertIn("--enable-symm-mem", "\n".join(logs.output))
             with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
                 self.assertTrue(
                     pcie_ipc_ar.eligible_group(
-                        group_name="tp", world_size=4
+                        group_name="tp", world_size=4, deterministic=False
                     )
                 )
 
@@ -149,11 +149,41 @@ class TestGroupEligibility(CustomTestCase):
 
         self.assertTrue(hasattr(pynccl_allocator, "is_symmetric_memory_enabled"))
 
+    def test_deterministic_inference_keeps_the_backend_off(self):
+        """Deterministic inference forbids a shape-dependent reduction order.
+
+        The kernels select a tactic per shape, so the order would follow the
+        batch shape -- which is why that mode already pins NCCL and turns off
+        custom and symmetric-memory all-reduce. Disabling tuning is not enough:
+        FlashInfer's seed policy is per-shape as well.
+        """
+        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
+            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
+                with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
+                    pcie_ipc_ar._warn_deterministic_wins.cache_clear()
+                    self.assertFalse(
+                        pcie_ipc_ar.eligible_group(
+                            group_name="tp", world_size=4, deterministic=True
+                        )
+                    )
+                self.assertIn("Deterministic inference", "\n".join(logs.output))
+
+    def test_the_deterministic_predicate_still_exists(self):
+        """The caller supplies this flag, so a mock cannot catch a rename.
+
+        GroupCoordinator owns the predicate -- it also folds in the
+        SGLANG_USE_1STAGE_ALLREDUCE override -- and this backend must keep
+        using that one rather than reading the env var a second time.
+        """
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self.assertTrue(hasattr(GroupCoordinator, "_deterministic_collectives_enabled"))
+
     def test_single_rank_group_is_not_eligible(self):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
             self.assertFalse(
                 pcie_ipc_ar.eligible_group(
-                    group_name="tp", world_size=1
+                    group_name="tp", world_size=1, deterministic=False
                 )
             )
 
@@ -161,7 +191,7 @@ class TestGroupEligibility(CustomTestCase):
         """The backend is opt-in; nothing attaches without the flag."""
         self.assertFalse(
             pcie_ipc_ar.eligible_group(
-                group_name="tp", world_size=4
+                group_name="tp", world_size=4, deterministic=False
             )
         )
 
@@ -169,12 +199,12 @@ class TestGroupEligibility(CustomTestCase):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
             self.assertFalse(
                 pcie_ipc_ar.eligible_group(
-                    group_name=None, world_size=4
+                    group_name=None, world_size=4, deterministic=False
                 )
             )
             self.assertFalse(
                 pcie_ipc_ar.eligible_group(
-                    group_name="anonymous", world_size=4
+                    group_name="anonymous", world_size=4, deterministic=False
                 )
             )
 
