@@ -23,7 +23,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    nightly=True,
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -37,24 +40,10 @@ SERVER_LAUNCH_TIMEOUT = 5400
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-    "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
     "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
-    "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
-    "SGLANG_OPT_USE_AITER_INDEXER": "true",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
-    "SGLANG_ROCM_USE_MULTI_STREAM": "false",
     "AITER_BF16_FP8_MOE_BOUND": "0",
-    "SGLANG_EAGER_INPUT_NO_COPY": "false",
 }
 
 # FP4 variant (matches test_deepseek_v4_pro_fp4.py; V4-Pro also auto-detects it).
@@ -63,6 +52,9 @@ FP4_ENV_VARS = {
 }
 
 
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
     """DeepSeek-V4-Pro FP4 unified_kv prefill CP, interleave (round-robin-split), tp=8."""
 

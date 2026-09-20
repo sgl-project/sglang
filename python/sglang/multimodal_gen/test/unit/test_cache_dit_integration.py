@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import subprocess
 import sys
 import types
 import unittest
@@ -8,14 +9,37 @@ from unittest.mock import patch
 
 
 class _FakeDBCacheConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
     def reset(self, **kwargs):
         return kwargs
 
 
+class _FakeForwardPattern:
+    # A class (not a SimpleNamespace instance) so it is a valid type in
+    # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_2 = "Pattern_2"
+    Pattern_3 = "Pattern_3"
+
+
+class _FakeTaylorSeerCalibratorConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
+    cache_dit.enable_calls = []
+    cache_dit.disable_calls = []
     cache_dit.refresh_calls = []
     cache_dit.steps_mask_calls = []
+
+    def enable_cache(target, **kwargs):
+        cache_dit.enable_calls.append({"target": target, **kwargs})
+
+    def disable_cache(target):
+        cache_dit.disable_calls.append(target)
 
     def refresh_context(transformer, cache_config, verbose=False):
         cache_dit.refresh_calls.append(
@@ -32,26 +56,42 @@ def _install_cache_dit_stub():
         )
         return [1] * total_steps
 
+    cache_dit.enable_cache = enable_cache
+    cache_dit.disable_cache = disable_cache
     cache_dit.refresh_context = refresh_context
     cache_dit.steps_mask = steps_mask
-    cache_dit.BlockAdapter = object
+    cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = object
+    cache_dit.ForwardPattern = _FakeForwardPattern
     cache_dit.ParamsModifier = object
-    cache_dit.TaylorSeerCalibratorConfig = object
+    # Not bare `object`: enable paths construct it with kwargs
+    # (TaylorSeerCalibratorConfig(taylorseer_order=...)) to fill the
+    # calibrator slot, and tests assert on the constructed instance.
+    cache_dit.TaylorSeerCalibratorConfig = _FakeTaylorSeerCalibratorConfig
 
     block_adapters = types.ModuleType("cache_dit.caching.block_adapters")
 
     class _FakeBlockAdapterRegister:
-        @staticmethod
-        def is_supported(_transformer):
-            return True
+        supported = True
+
+        @classmethod
+        def is_supported(cls, _transformer):
+            return cls.supported
 
     block_adapters.BlockAdapterRegister = _FakeBlockAdapterRegister
+    cache_dit.BlockAdapterRegister = _FakeBlockAdapterRegister
+
+    class _FakeDMDCalibratorConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    cache_dit.DMDCalibratorConfig = _FakeDMDCalibratorConfig
 
     parallelism = types.ModuleType("cache_dit.parallelism")
     parallelism.ParallelismBackend = object
     parallelism.ParallelismConfig = object
+    cache_dit.ParallelismBackend = parallelism.ParallelismBackend
+    cache_dit.ParallelismConfig = parallelism.ParallelismConfig
 
     return {
         "cache_dit": cache_dit,
@@ -125,28 +165,62 @@ def _install_torch_stub():
     }
 
 
-class TestCacheDitRefreshContext(unittest.TestCase):
-    def _import_module_with_stub(self):
-        stub_modules = _install_cache_dit_stub()
-        stub_modules.update(_install_sglang_dependency_stubs())
-        stub_modules.update(_install_torch_stub())
-        module_path = (
-            Path(__file__).resolve().parents[2]
-            / "runtime"
-            / "cache"
-            / "cache_dit_integration.py"
+def _import_module_with_stub():
+    stub_modules = _install_cache_dit_stub()
+    stub_modules.update(_install_sglang_dependency_stubs())
+    stub_modules.update(_install_torch_stub())
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "runtime"
+        / "cache"
+        / "cache_dit_integration.py"
+    )
+    with patch.dict(sys.modules, stub_modules):
+        spec = importlib.util.spec_from_file_location(
+            "test_cache_dit_integration_target", module_path
         )
-        with patch.dict(sys.modules, stub_modules):
-            spec = importlib.util.spec_from_file_location(
-                "test_cache_dit_integration_target", module_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(module)
-        return module
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return module
 
+
+def _import_module_with_legacy_stub():
+    # Full stub minus the symbols that only became top-level exports in
+    # cache-dit 1.5.0: forces cache_dit_integration onto its fallback path.
+    # All pre-1.5.0 releases pinned by sglang (1.3.0, 1.3.5) share the same
+    # import surface, so "1.3.0" represents every cache-dit < 1.5.0.
+    stub_modules = _install_cache_dit_stub()
+    stub_modules.update(_install_sglang_dependency_stubs())
+    stub_modules.update(_install_torch_stub())
+    cache_dit = stub_modules["cache_dit"]
+    cache_dit.__version__ = "1.3.0"
+    for name in (
+        "BlockAdapterRegister",
+        "DMDCalibratorConfig",
+        "ParallelismBackend",
+        "ParallelismConfig",
+    ):
+        delattr(cache_dit, name)
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "runtime"
+        / "cache"
+        / "cache_dit_integration.py"
+    )
+    with patch.dict(sys.modules, stub_modules):
+        spec = importlib.util.spec_from_file_location(
+            "test_cache_dit_integration_legacy_target", module_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return module, stub_modules
+
+
+class TestCacheDitRefreshContext(unittest.TestCase):
     def test_refresh_context_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=50,
@@ -166,7 +240,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_refresh_context_with_scm_preset_uses_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=8,
@@ -187,7 +261,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_dual_refresh_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_dual_transformer(
             transformer="transformer",
             transformer_2="transformer_2",
@@ -214,6 +288,238 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "steps_computation_policy": None,
             },
         )
+
+
+def _make_transformer(class_name, layers=None):
+    transformer = type(class_name, (), {})()
+    if layers is not None:
+        transformer.layers = layers
+    return transformer
+
+
+class TestBuildCustomBlockAdapter(unittest.TestCase):
+    def test_builds_adapter_for_registered_class(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
+
+        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
+
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+
+    def test_returns_none_for_unknown_class(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("SomeUnregisteredTransformer", ["b0"])
+
+        self.assertIsNone(module._build_custom_block_adapter(transformer))
+
+    def test_raises_when_blocks_attr_missing(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("ErnieImageTransformer2DModel")
+
+        with self.assertRaises(ValueError):
+            module._build_custom_block_adapter(transformer)
+
+    def test_has_separate_cfg_follows_runtime(self):
+        # No model pins the mode; has_separate_cfg always follows the run's CFG mode
+        # (Krea-2 Raw -> True, Krea-2 Turbo -> False).
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+
+        transformer_raw = _make_transformer("Krea2Transformer2DModel")
+        transformer_raw.transformer_blocks = blocks
+        adapter_raw = module._build_custom_block_adapter(
+            transformer_raw, has_separate_cfg=True
+        )
+        self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter_raw.has_separate_cfg)
+
+        transformer_turbo = _make_transformer("Krea2Transformer2DModel")
+        transformer_turbo.transformer_blocks = blocks
+        adapter_turbo = module._build_custom_block_adapter(
+            transformer_turbo, has_separate_cfg=False
+        )
+        self.assertFalse(adapter_turbo.has_separate_cfg)
+
+    def test_minimax_h3_uses_main_blocks_with_hidden_state_pattern(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = blocks
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertFalse(adapter.has_separate_cfg)
+
+    def test_native_qwen21_adapter_overrides_generic_family_match(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = True
+        transformer = _make_transformer("QwenImage21Transformer2DModel")
+        transformer.transformer_blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=6)
+
+        module.enable_cache_on_transformer(transformer, config, has_separate_cfg=True)
+
+        adapter = module.cache_dit.enable_calls[0]["target"]
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+        self.assertIs(adapter.blocks, transformer.transformer_blocks)
+
+    def test_custom_adapter_is_retained_until_disable(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        returned = module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(returned, transformer)
+        adapter = transformer._sglang_cache_dit_adapter
+        self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
+        self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
+        self.assertEqual(module.cache_dit.disable_calls, [adapter])
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+
+class TestCalibratorSelection(unittest.TestCase):
+    def _config(self, module, **kwargs):
+        return module.CacheDitConfig(enabled=True, num_inference_steps=28, **kwargs)
+
+    def test_dmd_takes_calibrator_slot(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        config = self._config(
+            module,
+            enable_dmd=True,
+            dmd_history=8,
+            dmd_rank=4,
+            dmd_ridge=1e-6,
+            dmd_svd_precision="high",
+        )
+
+        module.enable_cache_on_transformer(transformer, config)
+
+        calibrator = module.cache_dit.enable_calls[0]["calibrator_config"]
+        self.assertIsInstance(calibrator, module.DMDCalibratorConfig)
+        self.assertEqual(
+            calibrator.kwargs,
+            {
+                "dmd_history": 8,
+                "dmd_rank": 4,
+                "dmd_ridge": 1e-6,
+                "dmd_svd_precision": "high",
+            },
+        )
+
+    def test_both_calibrators_raise_on_transformer(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        config = self._config(module, enable_dmd=True, enable_taylorseer=True)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            module.enable_cache_on_transformer(transformer, config)
+        self.assertEqual(module.cache_dit.enable_calls, [])
+
+    def test_both_calibrators_raise_on_dual_transformer(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("AnyModel")
+        transformer.blocks = ["block_0"]
+        transformer_2 = _make_transformer("AnyModel")
+        transformer_2.blocks = ["block_0"]
+        primary = self._config(module, enable_dmd=True, enable_taylorseer=True)
+        secondary = self._config(module)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            module.enable_cache_on_dual_transformer(
+                transformer,
+                transformer_2,
+                primary,
+                secondary,
+                model_name="wan2.2",
+            )
+        self.assertEqual(module.cache_dit.enable_calls, [])
+
+
+class TestCacheDitLegacyFallback(unittest.TestCase):
+    """cache-dit < 1.5.0 (CI base jobs ship 1.3.0): fallback import + DMD guard."""
+
+    def test_fallback_import_binds_registry_and_nulls_dmd(self):
+        module, stubs = _import_module_with_legacy_stub()
+
+        self.assertIsNone(module.DMDCalibratorConfig)
+        self.assertIs(
+            module.BlockAdapterRegister,
+            stubs["cache_dit.caching.block_adapters"].BlockAdapterRegister,
+        )
+
+    def test_enable_dmd_raises_clear_error(self):
+        module, _ = _import_module_with_legacy_stub()
+        config = module.CacheDitConfig(
+            enabled=True, enable_dmd=True, num_inference_steps=4
+        )
+
+        with self.assertRaisesRegex(ValueError, "cache-dit >= 1.5.0"):
+            module.enable_cache_on_transformer(_make_transformer("AnyModel"), config)
+        self.assertEqual(module.cache_dit.enable_calls, [])
+
+    def test_taylorseer_path_still_enables_cache(self):
+        module, _ = _import_module_with_legacy_stub()
+        transformer = _make_transformer("AnyModel")
+        config = module.CacheDitConfig(
+            enabled=True,
+            enable_dmd=False,
+            enable_taylorseer=True,
+            num_inference_steps=4,
+        )
+
+        result = module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(result, transformer)
+        self.assertIsInstance(
+            module.cache_dit.enable_calls[0]["calibrator_config"],
+            _FakeTaylorSeerCalibratorConfig,
+        )
+
+
+class TestCacheDitRealPackageBoundary(unittest.TestCase):
+    """Real installed cache-dit, no stubs: catches stub/package drift — the
+    CI base jobs import this chain with cache-dit 1.3.0 while the diffusion
+    unit lane installs 1.5.1."""
+
+    @unittest.skipIf(
+        importlib.util.find_spec("cache_dit") is None, "cache_dit is not installed"
+    )
+    def test_import_chain_matches_installed_package(self):
+        script = (
+            "import cache_dit\n"
+            "import sglang.multimodal_gen.runtime.cache as cache_pkg\n"
+            "from sglang.multimodal_gen.runtime.cache import cache_dit_integration\n"
+            "print(hasattr(cache_dit, 'DMDCalibratorConfig'))\n"
+            "print(cache_dit_integration.DMDCalibratorConfig is not None)\n"
+            "print(cache_pkg.CacheDitConfig is cache_dit_integration.CacheDitConfig)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+        )
+        self.assertEqual(
+            result.returncode, 0, f"real import chain failed:\n{result.stderr}"
+        )
+        has_top_dmd, bound_not_none, reexport_ok = result.stdout.strip().splitlines()[
+            -3:
+        ]
+        self.assertEqual(
+            has_top_dmd,
+            str(bound_not_none == "True"),
+            "DMDCalibratorConfig binding mismatch vs installed package",
+        )
+        self.assertEqual(reexport_ok, "True")
 
 
 if __name__ == "__main__":

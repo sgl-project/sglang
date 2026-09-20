@@ -1,62 +1,18 @@
-import importlib.util
-import sys
-import types
 import unittest
-from pathlib import Path
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils import precision
 
-def _load_precision_module():
-    stub_names = (
-        "sglang",
-        "sglang.multimodal_gen",
-        "sglang.multimodal_gen.runtime",
-        "sglang.multimodal_gen.runtime.utils",
-        "sglang.multimodal_gen.utils",
-    )
-    missing = object()
-    previous_modules = {name: sys.modules.get(name, missing) for name in stub_names}
-
-    try:
-        utils_module = types.ModuleType("sglang.multimodal_gen.utils")
-        utils_module.PRECISION_TO_TYPE = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "fp32": torch.float32,
-        }
-        for package_name in stub_names[:-1]:
-            package = types.ModuleType(package_name)
-            package.__path__ = []
-            sys.modules[package_name] = package
-        sys.modules["sglang.multimodal_gen.utils"] = utils_module
-
-        precision_path = (
-            Path(__file__).resolve().parents[2] / "runtime/utils/precision.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "_diffusion_precision_under_test", precision_path
-        )
-        precision = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = precision
-        spec.loader.exec_module(precision)
-    finally:
-        for module_name, previous_module in previous_modules.items():
-            if previous_module is missing:
-                sys.modules.pop(module_name, None)
-            else:
-                sys.modules[module_name] = previous_module
-
-    return precision
-
-
-precision = _load_precision_module()
 align_tensor_to_module_dtype = precision.align_tensor_to_module_dtype
+autocast_context = precision.autocast_context
 autocast_enabled = precision.autocast_enabled
 get_module_dtype = precision.get_module_dtype
 precision_to_dtype = precision.precision_to_dtype
 resolve_component_precision = precision.resolve_component_precision
+resolve_decode_precision = precision.resolve_decode_precision
 resolve_precision = precision.resolve_precision
 temporary_module_dtype = precision.temporary_module_dtype
 
@@ -74,17 +30,34 @@ class _ParameterDtypeWinsModule(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float16))
 
 
+class _FakePlatform:
+    def __init__(self, device_type: str, *, is_mps: bool, amp_supported: bool):
+        self.device_type = device_type
+        self._is_mps = is_mps
+        self._amp_supported = amp_supported
+
+    def is_mps(self):
+        return self._is_mps
+
+    def is_amp_supported(self):
+        return self._amp_supported
+
+
 class TestDiffusionPrecisionConsistency(unittest.TestCase):
     def _server_args(self, **overrides):
         config = {
             "vae_precision": "fp16",
+            "vae_decode_precision": None,
+            "vae_decode_precision_high": None,
             "audio_vae_precision": "bf16",
             "dit_precision": "fp32",
             "image_encoder_precision": "fp16",
             "text_encoder_precisions": ["fp16", "bf16"],
         }
         config.update(overrides)
-        return SimpleNamespace(pipeline_config=SimpleNamespace(**config))
+        return SimpleNamespace(
+            component_precisions={}, pipeline_config=SimpleNamespace(**config)
+        )
 
     def test_precision_lookup(self):
         server_args = self._server_args()
@@ -102,8 +75,66 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported custom_precision"):
             precision_to_dtype("fp8", "custom_precision")
 
+    def test_decode_precision_override_and_fallback(self):
+        self.assertEqual(
+            resolve_decode_precision(self._server_args()),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(self._server_args(vae_decode_precision="bf16")),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="high",
+            ),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="extra-high",
+            ),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="bf16"),
+                quality="lossless",
+            ),
+            torch.float16,
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported vae_decode_precision"):
+            resolve_decode_precision(self._server_args(vae_decode_precision="fp8"))
+        with self.assertRaisesRegex(
+            ValueError, "Unsupported vae_decode_precision_high"
+        ):
+            resolve_decode_precision(
+                self._server_args(vae_decode_precision_high="fp8"), quality="high"
+            )
+
+    def test_exact_vae_precision_overrides_load_and_decode_defaults(self):
+        server_args = self._server_args(vae_decode_precision="bf16")
+        server_args.component_precisions["vae"] = "fp16"
+        server_args.component_precisions["video_vae"] = "bf16"
+
+        self.assertEqual(
+            resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+            torch.float16,
+        )
+        self.assertEqual(resolve_decode_precision(server_args, "vae"), torch.float16)
+        self.assertEqual(
+            resolve_precision(server_args, "video_vae", precision_attr="vae_precision"),
+            torch.bfloat16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(server_args, "video_vae"), torch.bfloat16
+        )
+
     def test_component_precision_mapping(self):
         server_args = self._server_args()
+        server_args.component_precisions["text_encoder_2"] = "fp32"
         expected = {
             "vae": torch.float16,
             "video_vae": torch.float16,
@@ -117,7 +148,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             "dual_tower_bridge": torch.float32,
             "image_encoder": torch.float16,
             "text_encoder": torch.float16,
-            "text_encoder_2": torch.bfloat16,
+            "text_encoder_2": torch.float32,
         }
 
         for module_name, expected_dtype in expected.items():
@@ -127,7 +158,11 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 module_name,
             )
 
-        self.assertIsNone(resolve_component_precision(SimpleNamespace(), "vae"))
+        self.assertIsNone(
+            resolve_component_precision(
+                SimpleNamespace(component_precisions={}, pipeline_config=None), "vae"
+            )
+        )
         self.assertIsNone(
             resolve_component_precision(server_args, "unregistered_component")
         )
@@ -155,6 +190,27 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         tokens = torch.ones(2, dtype=torch.long)
         aligned_tokens = align_tensor_to_module_dtype(tokens, module_without_parameters)
         self.assertEqual(aligned_tokens.dtype, torch.long)
+
+    def test_autocast_context_honors_explicit_override(self):
+        original_platform = precision.current_platform
+        try:
+            precision.current_platform = _FakePlatform(
+                "cpu", is_mps=False, amp_supported=True
+            )
+            disabled_context = autocast_context(
+                torch.bfloat16, disable_autocast=False, enabled=False
+            )
+            self.assertNotIsInstance(disabled_context, nullcontext)
+
+            precision.current_platform = _FakePlatform(
+                "mps", is_mps=True, amp_supported=False
+            )
+            mps_disabled_context = autocast_context(
+                torch.bfloat16, disable_autocast=False, enabled=False
+            )
+            self.assertIsInstance(mps_disabled_context, nullcontext)
+        finally:
+            precision.current_platform = original_platform
 
     def test_temporary_module_dtype(self):
         module = torch.nn.Linear(2, 2).to(dtype=torch.float32)

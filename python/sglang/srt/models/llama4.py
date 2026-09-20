@@ -52,7 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
@@ -70,7 +70,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4MoE(nn.Module):
-
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
@@ -139,7 +138,6 @@ class Llama4MoE(nn.Module):
         self,
         hidden_states,
         forward_batch: ForwardBatch,
-        use_reduce_scatter: bool = False,
     ):
         shared_out, routed_out = self._forward_core(
             hidden_states, forward_batch.forward_mode
@@ -149,7 +147,6 @@ class Llama4MoE(nn.Module):
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
         ):
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
@@ -197,7 +194,6 @@ def _get_or_create_alt_stream(device_module):
 
 
 class Llama4Attention(nn.Module):
-
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -479,14 +475,13 @@ class Llama4DecoderLayer(nn.Module):
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
         # Fully Connected
-        hidden_states = self.feed_forward(
-            hidden_states, forward_batch, use_reduce_scatter
-        )
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.feed_forward(hidden_states, forward_batch)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

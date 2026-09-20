@@ -1,0 +1,156 @@
+---
+title: LingBot Video MoE
+description: Serve the native LingBot Video MoE 30B-A3B text-to-video model with SGLang Diffusion.
+metatags:
+    description: "Run robbyant/lingbot-video-moe-30b-a3b text-to-video generation with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video", "text-to-video", "mixture-of-experts", "30B-A3B"]} />
+
+## 1. Model Introduction
+
+[LingBot Video MoE 30B-A3B](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
+is a text-to-video mixture-of-experts model served through a native SGLang
+Diffusion pipeline. Its main advantage is the MoE economics: 30B total
+parameters with 3B active per token, so a plain `sglang serve` invocation
+covers the released 480×480, 81-frame profile without parallelism flags.
+
+Prompting is the distinctive part of this checkpoint: it expects a structured
+JSON caption rather than an unexpanded natural-language prompt, passed as the
+request's `prompt` string. A compact 17-frame, 12-step smoke-test profile is
+available for quick validation next to the released 40-step profile.
+
+The public checkpoint served by the pipeline:
+
+| Model ID | Task | Default output |
+| --- | --- | --- |
+| `robbyant/lingbot-video-moe-30b-a3b` | Text to video | 480x480, 81 frames at 16 FPS |
+
+The checkpoint expects a structured JSON caption rather than an unexpanded
+natural-language prompt. The JSON is passed as the request's `prompt` string;
+it is not an `extra_params` object.
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+See the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation)
+for platform-specific setup.
+
+## 3. Serve LingBot Video MoE
+
+Start the server with the Hugging Face model ID:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --port 30010
+```
+
+## 4. Generate a video
+
+The following request uses the compact 17-frame, 12-step smoke-test profile.
+Use the model defaults of 81 frames and 40 steps for the released generation
+profile.
+
+```python Python
+import json
+import time
+from pathlib import Path
+
+import requests
+
+base_url = "http://127.0.0.1:30010"
+prompt = json.dumps(
+    {
+        "comprehensive_description": {
+            "scene_content_description": (
+                "A small silver robot arm on a white table slowly reaches "
+                "toward a red cube. The background is a softly lit laboratory wall."
+            ),
+            "camera_movement_description": (
+                "The camera is static at eye level in a medium shot."
+            ),
+        },
+        "camera_info": {
+            "color": "Neutral",
+            "frame_size": "Medium",
+            "shot_type_angle": "Eye level",
+            "lens_size": "Medium",
+            "composition": "Center",
+            "lighting": "Soft light",
+            "lighting_type": "Artificial light",
+        },
+        "world_knowledge": [],
+        "prominent_elements": [
+            {
+                "name": "robot arm",
+                "description": "A small silver robot arm with a two-finger gripper.",
+                "actions": [
+                    {
+                        "timestamp": "[0.0s - 1.0s]",
+                        "action": "reaches toward the red cube",
+                    }
+                ],
+                "location": "center of the frame",
+                "relative_size": "dominant",
+                "shape_and_color": "articulated silver metal arm",
+                "texture": "brushed metal",
+                "appearance_details": "two-finger gripper and visible joints",
+                "relationship": "reaching toward the red cube on the table",
+                "orientation": "upright, base on the table",
+                "pose": "reaching",
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
+
+response = requests.post(
+    f"{base_url}/v1/videos",
+    json={
+        "model": "robbyant/lingbot-video-moe-30b-a3b",
+        "prompt": prompt,
+        "size": "640x384",
+        "num_frames": 17,
+        "fps": 16,
+        "num_inference_steps": 12,
+        "guidance_scale": 6.0,
+        "flow_shift": 3.0,
+        "seed": 0,
+    },
+    timeout=60,
+)
+response.raise_for_status()
+video_id = response.json()["id"]
+
+while True:
+    job = requests.get(f"{base_url}/v1/videos/{video_id}", timeout=30).json()
+    if job["status"] == "completed":
+        break
+    if job["status"] == "failed":
+        raise RuntimeError(job.get("error") or "Video generation failed")
+    time.sleep(1)
+
+video = requests.get(
+    f"{base_url}/v1/videos/{video_id}/content",
+    timeout=300,
+)
+video.raise_for_status()
+Path("lingbot_video_moe.mp4").write_bytes(video.content)
+```
+
+## 5. Request constraints
+
+- `num_frames` must be `1` or `4n+1`; examples include 17 and 81.
+- Width and height must both be multiples of 16.
+- The native defaults are `guidance_scale=6.0`, `flow_shift=3.0`,
+  `num_inference_steps=40`, and `fps=16`.
+- Keep the prompt as serialized JSON. Raw free text is outside the
+  checkpoint's expected caption format.

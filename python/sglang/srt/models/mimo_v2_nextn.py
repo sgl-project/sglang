@@ -45,7 +45,6 @@ from sglang.srt.models.mimo_v2 import (
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 MiMoV2Config = None
@@ -239,7 +238,6 @@ class MiMoV2ModelNextN(nn.Module):
 
 
 class MiMoV2MTP(MiMoV2ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -260,7 +258,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -321,7 +319,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:

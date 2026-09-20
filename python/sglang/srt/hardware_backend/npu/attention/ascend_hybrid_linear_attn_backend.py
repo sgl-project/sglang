@@ -29,9 +29,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         self.state_indices_list_gdn = []
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         for i in range(max_bs):
             self.state_indices_list.append(
@@ -131,6 +131,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
+        in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
     ):
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
@@ -144,6 +148,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        track_buf = None
+        if mamba_track_indices is not None:
+            track_buf = mamba_track_indices
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -189,6 +196,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -198,6 +206,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                mamba_track_indices=track_buf,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -223,6 +232,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -233,6 +243,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
+        del req_pool_indices  # accepted for hook parity; slots come from metadata
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
@@ -241,9 +252,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

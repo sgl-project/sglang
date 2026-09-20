@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -31,7 +30,6 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.exaone_moe import ExaoneMoEForCausalLM, ExaoneMoEModel
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -49,7 +47,7 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
         config.num_hidden_layers = 1
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.pre_fc_norm_embedding = RMSNorm(
@@ -64,7 +62,7 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
