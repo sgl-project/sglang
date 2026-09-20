@@ -537,8 +537,7 @@ class MambaComponent(TreeComponent):
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
             # the donate to the last flush boundary (where temporal is current)
             # and reset the cursor, keeping the donated checkpoint consistent with
-            # its key length. page_size is asserted == 1, so no realign. Mirrors
-            # MambaRadixCache.cache_finished_req.
+            # its key length. page_size is asserted == 1, so no realign.
             if is_finished:
                 write_pos_buf = (
                     self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos

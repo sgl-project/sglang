@@ -528,6 +528,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
             is_prebuilt=lambda: False,
             is_split_prefill=lambda: True,
         ),
+        split_index=0,
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
@@ -659,6 +660,7 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
         next_token_ids=torch.tensor([7]),
     )
     batch = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
@@ -704,6 +706,7 @@ def test_pipeline_parallel_dsa_seed_round_trip(dsa_topk_indices):
         next_draft_input=draft_input,
     )
     batch = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
@@ -744,6 +747,7 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
         next_token_ids=torch.tensor([7]),
     )
     batch = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
