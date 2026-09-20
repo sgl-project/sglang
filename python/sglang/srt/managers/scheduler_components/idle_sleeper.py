@@ -4,10 +4,6 @@ from typing import TYPE_CHECKING
 
 import zmq
 
-from sglang.srt.environ import envs
-from sglang.srt.observability.req_time_stats import real_time
-from sglang.srt.platforms import current_platform
-
 if TYPE_CHECKING:
     from sglang.srt.rust_server.server import RustServer
 
@@ -22,24 +18,18 @@ class IdleSleeper:
 
     The simplest solution is to use zmq.Poller on all sockets that may receive
     data that needs handling immediately.
+
+    Parking is all this class does, and only the rank owning those sockets can
+    do it; idle memory reclamation belongs to the scheduler.
     """
 
     def __init__(self, sockets):
         self.poller = zmq.Poller()
-        self.last_empty_time = real_time()
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
-
     def maybe_sleep(self):
         self.poller.poll(1000)
-        if (
-            self.empty_cache_interval > 0
-            and real_time() - self.last_empty_time > self.empty_cache_interval
-        ):
-            self.last_empty_time = real_time()
-            current_platform.empty_cache()
 
 
 class RustServerIdleSleeper:
@@ -55,14 +45,6 @@ class RustServerIdleSleeper:
     def __init__(self, rust_server: RustServer, timeout_ms: int = 1000):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
-        self.last_empty_time = real_time()
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
     def maybe_sleep(self):
         self.rust_server.wait_request(self.timeout_ms)
-        if (
-            self.empty_cache_interval > 0
-            and real_time() - self.last_empty_time > self.empty_cache_interval
-        ):
-            self.last_empty_time = real_time()
-            current_platform.empty_cache()
