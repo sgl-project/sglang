@@ -972,6 +972,10 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         if (
             hidden_states.is_cuda
             and torch.version.hip is None
+            # The FP32 Welford order is validated against Hopper's native
+            # LayerNorm. A matching first input on B200 does not establish
+            # equivalence for later inputs or graph replays.
+            and current_platform.is_hopper()
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and not torch.is_grad_enabled()

@@ -105,7 +105,7 @@ These fusion families mount under both `quality="extra-high"` and
 | `scale_residual_norm_scale_shift` | KDA / Triton / CuTe-DSL / FlyDSL | bit-exact (Triton) or backend-specific close contract | the above plus the preceding `residual + gate * update` |
 | `scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `layernorm_modulate` | Triton | bit-exact | affine-free LayerNorm + adaLN modulate |
-| `try_fused_fp32_layernorm_bf16` | KDA / Triton | bit-exact against the verified native dispatch | LingBot World causal FP32 LayerNorm with FP32 affine or adaLN post-ops, including BF16 input/output conversions |
+| `try_fused_fp32_layernorm_bf16` | KDA / Triton | bit-exact against the verified native dispatch | LingBot World causal FP32 LayerNorm on Hopper with FP32 affine or adaLN post-ops, including BF16 input/output conversions; other devices retain native LayerNorm |
 | `qk_head_layernorm` | Triton | bit-exact | per-head LayerNorm on q/k |
 | `qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `norm_scale_shift` | KDA / CuTe-DSL / FlyDSL | backend-specific close contract | LN-or-RMS + scale/shift, many broadcast modes |

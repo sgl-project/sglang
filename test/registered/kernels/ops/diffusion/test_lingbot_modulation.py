@@ -70,12 +70,14 @@ class TestLingBotModulation(CustomTestCase):
             torch.equal(actual.view(torch.int16), expected.view(torch.int16))
         )
 
-    def assert_norm_dispatch(self, gate):
-        # A live Torch reduction can differ on another device. The site must
-        # either verify exact fusion or permanently choose its native path.
-        self.assertNotEqual(gate.verified, gate.disabled)
+    def assert_norm_dispatch(self, gate, exact=True):
+        # Only Hopper's native FP32 reduction order is supported. Other
+        # devices retain the reference without entering the exactness gate.
         if torch.cuda.get_device_capability() == (9, 0):
-            self.assertTrue(gate.verified)
+            self.assertEqual(gate.verified, exact)
+            self.assertEqual(gate.disabled, not exact)
+        else:
+            self.assertFalse(gate.verified)
             self.assertFalse(gate.disabled)
 
     @torch.inference_mode()
@@ -104,11 +106,9 @@ class TestLingBotModulation(CustomTestCase):
                     exact = torch.equal(
                         raw.view(torch.int16), reference.view(torch.int16)
                     )
-                    self.assertEqual(block._norm1_modulation_gate.disabled, not exact)
-                    self.assertEqual(block._norm1_modulation_gate.verified, exact)
-                    # Raw reduction equivalence was validated on Hopper. Other
-                    # Torch/device dispatches may differ (B200, D=2240); the
-                    # production site must exercise its live exactness gate.
+                    self.assert_norm_dispatch(block._norm1_modulation_gate, exact)
+                    # Raw reduction equivalence was validated on Hopper.
+                    # Other Torch/device dispatches use the native site.
                     if torch.cuda.get_device_capability() == (9, 0):
                         self.assert_bits(raw, reference)
                     weight, bias = (
@@ -128,8 +128,7 @@ class TestLingBotModulation(CustomTestCase):
                     exact = torch.equal(
                         raw.view(torch.int16), reference.view(torch.int16)
                     )
-                    self.assertEqual(block._cross_norm_gate.disabled, not exact)
-                    self.assertEqual(block._cross_norm_gate.verified, exact)
+                    self.assert_norm_dispatch(block._cross_norm_gate, exact)
                     if torch.cuda.get_device_capability() == (9, 0):
                         self.assert_bits(raw, reference)
 
@@ -185,8 +184,7 @@ class TestLingBotModulation(CustomTestCase):
         ).view_as(x)
         exact = torch.equal(raw.view(torch.int16), expected.view(torch.int16))
         self.assert_bits(block._fp32_norm(x, scale, shift), expected)
-        self.assertEqual(block._norm1_modulation_gate.disabled, not exact)
-        self.assertEqual(block._norm1_modulation_gate.verified, exact)
+        self.assert_norm_dispatch(block._norm1_modulation_gate, exact)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = block._fp32_norm(x, scale, shift)
@@ -275,9 +273,12 @@ class TestLingBotModulation(CustomTestCase):
             ),
         ):
             self.assert_bits(block._fp32_norm(normalized, scale, shift), ref)
-        with patch(
-            module + ".try_fused_fp32_layernorm_bf16",
-            return_value=torch.zeros_like(ref),
+        with (
+            patch(module + ".current_platform.is_hopper", return_value=True),
+            patch(
+                module + ".try_fused_fp32_layernorm_bf16",
+                return_value=torch.zeros_like(ref),
+            ),
         ):
             self.assert_bits(block._fp32_norm(normalized, scale, shift), ref)
         self.assertTrue(block._norm1_modulation_gate.disabled)
@@ -286,6 +287,36 @@ class TestLingBotModulation(CustomTestCase):
             side_effect=AssertionError("disabled fusion ran"),
         ):
             self.assert_bits(block._fp32_norm(normalized, scale, shift), ref)
+
+    @torch.inference_mode()
+    def test_non_hopper_norm_keeps_native_replay(self):
+        block = make_sites(256)
+        x = torch.randn(2, 63, 256, device="cuda", dtype=torch.bfloat16)
+        scale = torch.randn(2, 1, 1, 256, device="cuda")
+        shift = torch.randn_like(scale)
+        module = "sglang.multimodal_gen.runtime.models.dits.lingbot_world"
+        with (
+            patch(module + ".current_platform.is_hopper", return_value=False),
+            patch(module + ".try_fused_fp32_layernorm_bf16") as fused,
+        ):
+            block._fp32_norm(x, scale, shift)
+            block._fp32_norm(x)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                modulated = block._fp32_norm(x, scale, shift)
+                affine = block._fp32_norm(x)
+            x.normal_()
+            scale.normal_()
+            shift.normal_()
+            block.self_attn_residual_norm.norm.weight.normal_()
+            graph.replay()
+            self.assert_bits(
+                modulated, native_modulation(x, scale[:, 0, 0], shift[:, 0, 0])
+            )
+            self.assert_bits(affine, block.self_attn_residual_norm.norm(x))
+            fused.assert_not_called()
+        self.assertFalse(block._norm1_modulation_gate.verified)
+        self.assertFalse(block._cross_norm_gate.verified)
 
     @torch.no_grad()
     def test_affine_norm_and_live_parameters(self):
