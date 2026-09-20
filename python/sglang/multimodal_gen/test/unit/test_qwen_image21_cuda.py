@@ -176,6 +176,37 @@ def test_batched_targets_preserve_ragged_prefixes_and_cache_ownership(model, edi
         )
 
 
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_samples_sharing_prefix_caches_prefill_once(model, edit):
+    samples = [inputs(5, edit), inputs(5, edit)]
+    samples[1]["hidden_states"] = torch.randn_like(samples[1]["hidden_states"])
+    independent = batched_inputs(deepcopy(samples))
+    shared = batched_inputs(deepcopy(samples))
+    shared["prefix_caches"] = [shared["prefix_caches"][0]] * 2
+    prefills = []
+    handle = model.txt_in.register_forward_hook(
+        lambda module, args, output: prefills.append(output.shape)
+    )
+    try:
+        for timestep in (700, 300):
+            independent["timestep"].fill_(timestep)
+            shared["timestep"].fill_(timestep)
+            with set_forward_context(None, None):
+                expected = model(**independent)
+                prefills.clear()
+                actual = model(**shared)
+            assert len(prefills) == (1 if timestep == 700 else 0)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    finally:
+        handle.remove()
+    for cache, reference in zip(
+        shared["prefix_caches"][0], independent["prefix_caches"][1], strict=True
+    ):
+        torch.testing.assert_close(cache["key"], reference["key"], atol=0, rtol=0)
+        torch.testing.assert_close(cache["value"], reference["value"], atol=0, rtol=0)
+
+
 def test_bf16_qk_norm_matches_reference(model):
     norm = deepcopy(model.transformer_blocks[0].attn.norm_q).bfloat16()
     reference = ReferenceRMSNorm(32, eps=1e-6).cuda().bfloat16()

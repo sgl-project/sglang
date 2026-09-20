@@ -180,7 +180,7 @@ class QwenImage21EncodingStage(PipelineStage):
             else None
         )
         for negative in [False, True] if batch.do_classifier_free_guidance else [False]:
-            embeds, masks, layouts = [], [], []
+            embeds, masks, layouts, prefix_caches = [], [], [], []
             for prompt in negatives if negative else prompts:
                 with set_forward_context(
                     current_timestep=None, attn_metadata=None, forward_batch=batch
@@ -189,9 +189,12 @@ class QwenImage21EncodingStage(PipelineStage):
                 layout = build_layout(
                     slots.tolist(), shapes, config.dit_config.axes_dims_rope, device
                 )
+                # outputs of one prompt have the same prefix, so they hold one KV cache
+                caches = [{} for _ in range(config.dit_config.num_layers)]
                 for _ in range(batch.num_outputs_per_prompt):
                     embeds.append(hidden)
                     layouts.append(layout)
+                    prefix_caches.append(caches)
             max_length = max(x.shape[0] for x in embeds)
             for x in embeds:
                 masks.append(torch.arange(max_length, device=device) < x.shape[0])
@@ -213,10 +216,7 @@ class QwenImage21EncodingStage(PipelineStage):
             batch.extra["qwen21_negative" if negative else "qwen21_positive"] = dict(
                 layouts=layouts,
                 condition_latents=condition_latents,
-                prefix_caches=[
-                    [{} for _ in range(config.dit_config.num_layers)]
-                    for _ in range(sample_count)
-                ],
+                prefix_caches=prefix_caches,
             )
         sched = self.scheduler.config
         batch.extra["qwen21_mu"] = calculate_linear_shift(
