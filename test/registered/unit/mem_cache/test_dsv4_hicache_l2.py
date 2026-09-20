@@ -254,7 +254,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             pp_cache_group=None,
         )
         mappings = assembler._DeepSeekV4LayerMappings(
-            transfer_layer_num=1,
+            transfer_layer_id_max=1,
             full={0: 0},
             swa={},
             c4={0: 0},
