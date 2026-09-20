@@ -958,7 +958,9 @@ class CommonKVManager(BaseKVManager):
             if not (
                 same_tp_with_prefill_cp
                 or non_cp_mla_layout
-                or (non_cp_layout and info.attn_tp_size == self.attn_tp_size)
+                # Equal attention TP also supports prefill CP -> decode DP:
+                # the receiver gathers every CP shard into one DP replica.
+                or (self.attn_cp_size == 1 and info.attn_tp_size == self.attn_tp_size)
             ):
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
