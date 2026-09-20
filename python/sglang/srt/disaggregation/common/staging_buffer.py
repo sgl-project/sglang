@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import List, Optional, Tuple
 
@@ -21,11 +20,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
-_USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
+_USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
 
 
 @triton.jit
@@ -132,6 +133,7 @@ class StagingBuffer:
         self.size_bytes = size_bytes
         self.device = device
         self.gpu_id = gpu_id
+        self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
         if custom_mem_pool is not None:
@@ -144,7 +146,7 @@ class StagingBuffer:
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(
-            f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
+            f"StagingBuffer allocated: {size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
         )
 
@@ -156,6 +158,11 @@ class StagingBuffer:
 
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes
+
+    def get_gather_stream(self) -> torch.cuda.Stream:
+        if self._gather_stream is None:
+            self._gather_stream = torch.cuda.Stream(device=self.device)
+        return self._gather_stream
 
 
 class StagingAllocator:
@@ -194,10 +201,13 @@ class StagingAllocator:
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
+        # Lazily created on the decode side by the first scatter; stays None
+        # until then so release_room can drain it without a defensive check.
+        self._scatter_stream = None
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "
-            f"{total_size_bytes / (1024*1024):.1f} MB "
+            f"{total_size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
@@ -233,8 +243,12 @@ class StagingAllocator:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
+                # An empty ring makes the entire prior round reusable. Start a
+                # fresh round at offset zero so the watermark cannot stay stale.
+                self.round += 1
+                self.head = 0
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                self.watermark_tail = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd
@@ -252,10 +266,6 @@ class StagingAllocator:
     def get_offset(self, alloc_id: int) -> int:
         offset, _, _ = self.allocations[alloc_id]
         return offset
-
-    def get_round(self, alloc_id: int) -> int:
-        _, _, rnd = self.allocations[alloc_id]
-        return rnd
 
     def get_base_ptr(self) -> int:
         return self.base_ptr
@@ -350,16 +360,12 @@ def _gather_all_layers_torch(
 
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with torch.cuda.stream(gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -389,7 +395,7 @@ def _gather_all_layers_torch(
             )
             offset += per_layer_bytes
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return offset
 
 
@@ -430,17 +436,13 @@ def _gather_all_layers_triton(
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with torch.cuda.stream(gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -454,7 +456,7 @@ def _gather_all_layers_triton(
             BLOCK_SIZE,
         )
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return total_bytes
 
 
@@ -708,9 +710,11 @@ def compute_head_slice_params(
         unique_head_idx = local_tp_rank // src_replication
         dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
-        src_head_start = (
-            dst_tp_rank_in_group * dst_heads_per_rank
-        ) % src_heads_per_rank
+        # GQA replication: consecutive decode ranks share a KV head
+        # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
+        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+        unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 
@@ -766,3 +770,29 @@ def resolve_total_kv_heads(
         "nor kv_head_num. "
         "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
     )
+
+
+def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> int:
+    """Token width of one staging grid slot; shared by prefetch and the
+    sender's grid alignment."""
+    cps = chunked_prefill_size or 8192
+    return max(1, cps // page_size) * page_size
+
+
+def compute_grid_segments(
+    start_idx: int, end_idx: int, base: int, grid_tokens: int
+) -> List[Tuple[int, int]]:
+    """Split [start_idx, end_idx) at grid boundaries base + k * grid_tokens
+    so each segment maps to exactly one staging slot. An empty range yields
+    one empty segment (a metadata-only last chunk still needs a send).
+    """
+    segments: List[Tuple[int, int]] = []
+    seg_start = start_idx
+    while seg_start < end_idx:
+        next_boundary = base + ((seg_start - base) // grid_tokens + 1) * grid_tokens
+        seg_end = min(next_boundary, end_idx)
+        segments.append((seg_start, seg_end))
+        seg_start = seg_end
+    if not segments:
+        segments = [(start_idx, end_idx)]
+    return segments

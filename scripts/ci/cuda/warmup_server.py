@@ -26,9 +26,8 @@ from pathlib import Path
 
 # Reuse helpers from warmup_deep_gemm (same directory)
 sys.path.insert(0, os.path.dirname(__file__))
-from warmup_deep_gemm import get_architecture_key, get_config_json
+from warmup_deep_gemm import MARKER_DIR, get_architecture_key, get_config_json
 
-MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
 HEALTH_POLL_INTERVAL = 10  # seconds between health checks
 SERVER_STARTUP_TIMEOUT = 900  # 15 min max to wait for server ready
 DEFAULT_PORT = 39876

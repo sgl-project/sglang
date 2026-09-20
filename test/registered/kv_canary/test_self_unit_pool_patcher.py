@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import (
+from sglang.kernels.ops.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
+from sglang.kernels.ops.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
@@ -24,7 +24,7 @@ from sglang.test.kv_canary.fixtures import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 
