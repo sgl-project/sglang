@@ -2,10 +2,6 @@
 """
 Pre-commit hook: validate CI registry calls under test/registered/.
 
-Catches the ways a test silently never runs: a missing registry call, a CUDA
-`suite=` no workflow invokes, and TestCase classes `__main__` never executes.
-Each ERROR states the exact fix.
-
 Reuses ut_parse_one_file() from ci_register.py (AST-based parsing) to match
 run_suite.py's collect_tests().
 """
@@ -126,8 +122,8 @@ def main() -> int:
         if len(registries) == 0:
             missing.append(f)
             continue
-        # TestCase classes are dead unless __main__ runs them (CI does
-        # `python3 file.py`); the ERROR text below explains the fix.
+        # TestCase classes are dead unless __main__ runs them; CI runs the
+        # registered file as `python3 file.py`.
         with open(f, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=f)
         taxonomy_violations.extend(taxonomy_errors(f, tree))
