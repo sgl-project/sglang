@@ -178,17 +178,17 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
             prefix_lens=[0, 8, 0, 12],
             extend_lens=[3, 4, 2, 4],
         )
+        # fmt: off
         self.assertEqual(
             out.tolist(),
-            # fmt: off
             [
                 10000, 10001, 10002,          # row 0, fresh
                 1008, 1009, 1010, 1011,       # row 1, reuse @ pool row 1 off 8
                 10003, 10004,                 # row 2, fresh
                 3012, 3013, 3014, 3015,       # row 3, reuse @ pool row 3 off 12
             ],
-            # fmt: on
         )
+        # fmt: on
 
     def test_all_reuse_allocates_nothing_and_still_reassembles_in_order(self):
         # No fresh slots at all: fresh_slots stays None and reuse_dtype falls
