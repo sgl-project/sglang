@@ -1,0 +1,547 @@
+---
+title: Qwen-Image 2.1
+description: "Run Qwen-Image 2.1 text-to-image and image-conditioned generation with SGLang Diffusion."
+tag: NEW
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
+
+<DiffusionModelTags tags={["RGBA image", "text-to-image", "image editing", "multi-image references", "block-causal attention"]} />
+
+## 1. Quick start
+
+Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prerelease=allow`,
+then install this integration from its source checkout with
+`uv pip install -e "python[diffusion]"`. Use an authorized checkpoint directory in
+place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux;
+the hardware picker selects a tested single-GPU recipe for the full checkpoint.
+
+<Deployment config={config} />
+
+Use **Setup** to select text-to-image, single-image editing, or multi-image
+editing. **Server** controls placement, attention, encoder scheduling, VAE
+tiling, and graph execution. **Request** controls the background, resolution,
+steps, and output count. Set reference PNG paths under **Variables**; edits
+upload files from the machine running cURL, so they need not exist on the server.
+
+Hardware selection applies the recommended placement for that GPU. H200,
+B200, and RTX PRO 6000 96GB keep weights resident; RTX 5090 and RTX 4090 use
+offload to fit the full pipeline.
+Custom two- and four-GPU topologies and unverified feature combinations remain selectable and are labeled
+**Unverified**. Invalid topology combinations disable Copy. This integration
+currently uses the Python/source command; no published Docker image is verified.
+
+Both request modes return base64 PNGs. To save all returned images, append
+`> response.json` to the request command, then run:
+
+```bash Command
+python - <<'PY'
+import base64
+import json
+from pathlib import Path
+
+for i, item in enumerate(json.loads(Path("response.json").read_text())["data"]):
+    Path(f"output-{i}.png").write_bytes(base64.b64decode(item["b64_json"]))
+PY
+```
+
+### Platform measurements
+
+The following four-platform comparison and the fusion measurements below precede
+the training-template and VAE normalization corrections in `c2a31b2693c`;
+their output comparisons should not be treated as baselines for that revision.
+The separate RTX PRO 6000 measurement uses the corrected implementation.
+
+| GPU | Recommended placement / attention | Generation median | Single edit | Peak device memory |
+| --- | --- | --- | --- | --- |
+| H200 141GB | Resident / FlashAttention | Functional verification only | Passed | Not measured in this comparison |
+| B200 192GB | Resident / FlashAttention | 3.44 s | 3.84 s | 40.1 GiB |
+| RTX 5090 32GB | DiT layerwise offload / SDPA | 14.30 s | 16.84 s | 26.9 GiB |
+| RTX 4090 24GB | DiT layerwise + encoder CPU offload / FlashAttention | 24.60 s | 25.59 s | 21.4 GiB |
+
+The recommendations compare exact attention backends and memory placement on
+one GPU per platform. Each run warms up with one 512px, 4-step request, then
+measures three 1024px, 40-step generations, one single-image edit, and one
+transparent generation. All use seed 42, CFG 1, eager execution, full-image VAE
+decoding, and PNG output. Generation latency is the median of three sequential
+HTTP requests; editing is one request. Times include encoding and PNG response
+serialization, but exclude server startup. Device memory is the highest sampled
+`nvidia-smi` usage across loading and requests, sampled every 0.5 seconds.
+
+Measured on 2026-09-16 with source revision `128ae46cc`, PyTorch 2.13.0+cu130,
+Transformers 5.12.1, and Diffusers 0.37.0. SGLang's native encoder uses the
+Transformers 4.57.3 numerical semantics described below. The RTX 5090 runs used
+a 50 GiB process-group memory limit on a roughly 60 GiB host; this is a tested
+budget, not a minimum host-memory requirement.
+
+B200 FlashAttention was faster than SDPA in this comparison (3.44 vs 3.70 s).
+On RTX 5090, both commands used Torch SDPA: this runtime falls back to SDPA
+when `--attention-backend fa` is selected on SM120. The measured 14.30 s
+(explicit SDPA) and 14.39 s (FA selection with SDPA fallback) therefore do not
+compare different backends. The picker defaults to SDPA and rejects Ring with
+either selection on RTX 5090. Keeping eight DiT layers resident
+did not improve the RTX 5090 generation median, so that flag is omitted.
+On RTX 4090, DiT offload alone passed generation but ran out of memory during
+editing. The recommended command also sets `--text-encoder-cpu-offload true`;
+this complete recipe passed generation, editing, and transparent PNG output.
+
+These are measurements of this small workload, not universal latency or image
+quality guarantees. Different prompts, reference sizes, batching, and software
+versions can change memory use and latency. Multi-reference and batched request
+recipes retain their separate H200 verification scope in the picker.
+
+### RTX PRO 6000 Blackwell 96GB
+
+The recommended single-GPU command keeps all weights resident and selects Torch
+SDPA. This is the 96GB Blackwell Server Edition (SM120). This runtime also maps
+`--attention-backend fa` to SDPA on this GPU; Ring therefore requires another
+supported backend and is rejected with either selection in the picker.
+
+Source revision `1eab5de5990` was measured on 2026-09-18:
+
+| Placement | Generation median | Edit median | Peak device memory |
+| --- | --- | --- | --- |
+| Resident (recommended) | 8.23 s | 9.85 s | 40.1 GiB |
+| DiT layerwise offload | 10.28 s | 10.66 s | 26.1 GiB |
+
+Both runs used PyTorch 2.13.0+cu130, Transformers 5.12.1, Diffusers 0.37.0,
+native precision, eager execution, and full-image VAE decoding.
+After two 1024px/40-step warmups, each measured five generations and three edits
+at that same resolution and step count, with seed 42, CFG 1, and CPU noise
+generation. HTTP latency includes PNG serialization and excludes server startup;
+device memory was sampled every 0.5 seconds across startup and requests.
+
+Transparent generation and two repeated edits of the same transparent input passed
+with both placements, retaining alpha values from 0 to 255. Repeated requests
+and corresponding outputs across placements produced identical RGBA pixels for
+this workload. Quantized checkpoints and multi-GPU recipes on RTX PRO 6000 remain
+unverified.
+
+### Lossless RoPE fusion
+
+The native DiT fuses the float conversion, complex rotary multiplication, and
+output cast on supported CUDA tensors. Its first eager call checks exact
+agreement with the original PyTorch operation; a mismatch disables the fusion.
+No additional command flag is needed.
+
+A separate comparison on 2026-09-17 used native revision `6b190085c48` as the
+baseline and `63ed20bbedb` with the fusion. Both used the software versions
+listed above, full-image VAE decode, eager execution, and the recommended
+placement and attention backend for each GPU:
+
+- B200: generation **3.42 → 3.27 s** (4.5% lower latency), editing
+  **4.03 → 3.89 s** (3.4% lower).
+- RTX 5090: generation **14.49 → 14.20 s** (2.0% lower), editing
+  **16.97 → 16.68 s** (1.7% lower).
+
+Each GPU ran four fresh servers in optimized/baseline/baseline/optimized order.
+Each startup used two full-size warmups followed by five generations and three
+edits. The medians pool 10 generations and six edits per variant, all at
+1024px, 40 steps, seed 42, CFG 1, CPU noise generation, and one RGBA PNG per
+request. The workload generated a red teapot and edited the same reference
+image to blue. HTTP times include PNG serialization and exclude startup.
+All corresponding output pixels were identical between revisions on each GPU.
+These measurements cover this fixed workload; other prompts and configurations
+can have different gains.
+
+### Lossless MLP and residual fusion
+
+The native DiT also uses the shared BF16 SiLU-multiply and gated-residual
+kernels, preserving the eager operations' intermediate rounding. SiLU-multiply
+checks its first eager call and falls back on mismatch. These optimizations
+are automatic on supported CUDA inputs.
+
+A second B200 comparison on 2026-09-17 used `f874eae18be` (already including
+the RoPE fusion) versus `a3d14531474`. With resident weights, FlashAttention,
+and the same four-startup protocol and workload above, generation decreased
+from **3.272 to 3.134 s** (4.23%) and editing from **3.886 to 3.762 s** (3.18%).
+All corresponding RGBA pixels were identical across the 10 generation and six
+editing samples per variant. These are additional gains over the RoPE baseline;
+this comparison does not establish the gain on other GPUs.
+
+### Lossless Q/K normalization
+
+Q/K RMSNorm fuses the input conversion and square, then the normalization,
+output cast, and weight multiply. It retains the original FP32 mean reduction
+with the same tensor shape, preserving the eager reduction order and
+cast-before-weight rounding. The native DiT verifies its first eager call and
+uses the original implementation if the outputs differ. No flag is needed.
+
+A B200 comparison on 2026-09-17 used revision `4e5459e0eda` (including the
+RoPE, MLP, and residual fusions) versus `d9e1e5dac96`. With resident weights,
+FlashAttention, and the four-startup protocol above, generation decreased from
+**3.114 to 2.828 s** (9.17%) and editing from **3.742 to 3.450 s** (7.81%).
+Each variant has 10 generation and six editing measurements at 1024px,
+40 steps, seed 42, and CFG 1. Every corresponding RGBA pixel was identical.
+These gains apply to this fixed B200 workload; other GPUs were not measured
+in this comparison.
+
+### Lossless LayerNorm modulation
+
+The DiT fuses affine-free LayerNorm and `* (1 + scale)` while retaining the
+eager Welford reduction and BF16 rounding order. Scale-only modulation skips
+the shift addition, including its effect on signed zeros. The first eager call
+checks the fused result against the native path and falls back on a mismatch.
+
+A B200 comparison on 2026-09-17 used `5bddbfca9b1` (including the preceding
+fusions) versus `162181ff0ec`. With resident weights, FlashAttention, eager
+execution, and the same four-startup protocol, generation decreased from
+**2.831 to 2.748 s** (2.92%) and editing from **3.436 to 3.358 s** (2.26%).
+Each variant has 10 generation and six editing measurements at 1024px,
+40 steps, seed 42, and CFG 1. Every corresponding RGBA pixel was identical.
+This comparison measures this B200 workload only.
+
+## 2. Model capabilities
+
+Qwen-Image 2.1 supports text-to-image generation and image-conditioned editing
+through one pipeline. Qwen3-VL encodes the instruction and reference images;
+a single-stream transformer inserts each reference image's latents into its
+corresponding position in that sequence. Block-causal attention keeps each
+image internally bidirectional while respecting the order of text and images.
+
+For successive edits, send the previous output as the next request's reference
+image. Requests do not retain dialogue history. Conditional KV is reused across
+denoising steps within one request and released afterward; cross-request caching
+and incremental dialogue-history caching are not implemented.
+
+Choose this pipeline for checkpoints declaring `QwenImage21Pipeline`,
+`QwenImage21Transformer2DModel`, and `AutoencoderKLQwenImage21`. The older
+Qwen-Image and Qwen-Image-Edit checkpoints use different components and latent
+packing. They cannot share this model's VAE or transformer weights. Text and
+condition-image activations use timestep zero, allowing their attention keys
+and values to be reused for the remaining denoising steps.
+
+## 3. Checkpoint layout
+
+The checkpoint directory must contain `model_index.json` and the `processor`,
+`text_encoder`, `transformer`, `vae`, and `scheduler` subdirectories. The
+processor must include the Qwen3-VL tokenizer assets. SGLang loads all three
+neural components natively. A separate tokenizer directory is not required.
+
+The checkpoint's VAE uses RGBA input and output with 64-channel latents. PNG
+reference images retain their alpha channel; RGB inputs receive an opaque
+alpha channel. Save generated images as PNG to preserve transparency.
+
+Text conditioning uses the last decoder layer's output before the final
+normalization, matching the reference implementation with Transformers
+4.57.3. Vision position interpolation also follows its BF16 rounding order.
+SGLang selects these native semantics explicitly, so keep the
+repository's installed dependencies instead of downgrading the entire runtime.
+The updated [Diffusers reference](https://github.com/huggingface/diffusers/pull/14804)
+also selects pre-normalization hidden states explicitly on newer Transformers.
+
+Editing uses the training markers `<image1>`, `<image2>`, and so on. The vision
+encoder sees alpha composited over white, while the VAE receives the original
+RGBA pixels. Empty prompts become a space. The VAE normalizes features in
+FP32 before casting back to the activation dtype and compresses spatial
+dimensions by a factor of 16.
+
+Use `--model-id Qwen-Image-2.1` when the checkpoint directory has a different
+name. The model ID is a routing identifier; it does not grant access to model
+weights. Keep checkpoint access credentials in your environment.
+
+### Two-GPU end-to-end test
+
+The `qwen_image21_t2i_tp2` case is temporarily disabled until the checkpoint is
+accessible to fork PR CI. Its configuration and pinned reference image are
+retained for re-enabling the test.
+
+The case uses TP 2 with sequence
+parallelism disabled, 1024 × 1024 PNG output, 40 steps, CFG 1, and seed 42.
+It sends two consecutive requests and checks the model API and image consistency.
+This case does not enforce a latency baseline or run a component accuracy check.
+
+### Transparent PNG output
+
+Choose **Transparent / alpha** under Request to generate an isolated subject
+or preserve a transparent reference during editing. The picker adds the
+transparency instruction to the prompt and sets `output_format: "png"`.
+`background: "transparent"` alone only selects an output format; it does not
+remove the background or change model conditioning. JPEG cannot retain alpha.
+
+The model predicts continuous alpha values, including partly transparent edges.
+No thresholding or background-removal postprocessing is applied. Transparent
+generation and transparent-input editing were compared against the reference
+at 1024 × 1024 and 40 steps; that check does not guarantee perfect cutouts for
+every prompt. Transparent generation and single-image editing also passed on
+the recommended one-H200 and one-RTX PRO 6000 servers at that resolution and
+step count, with one output per request.
+
+## 4. Offline requests
+
+### Text-to-image
+
+```bash Command
+sglang generate \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --prompt "A capybara reading a book by candlelight" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 1 \
+  --seed 0 --save-output
+```
+
+### Image-conditioned editing
+
+```bash Command
+sglang generate \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --image-path /path/to/input.png \
+  --prompt "Move the scene to a snowy mountain at sunrise" \
+  --width 1024 --height 1024 \
+  --num-inference-steps 40 --guidance-scale 1 \
+  --seed 0 --save-output
+```
+
+Height and width must be positive multiples of 32. Reference images preserve
+their aspect ratio and are resized to approximately the requested output area;
+the same resized image feeds the VLM and VAE. Image labels are deterministic
+(`Picture 1`, `Picture 2`, and so on). Multiple outputs receive independent
+noise seeds and independent prefix caches.
+
+## 5. Runtime features
+
+The API requires a text prompt; precomputed embeddings alone do not provide
+the image-token positions needed by this pipeline.
+
+The default is 40 Euler flow-matching steps with CFG disabled. To use CFG,
+provide `--negative-prompt` and a `--guidance-scale` greater than one. CFG uses
+the ordinary linear combination without the older Qwen-Image norm correction.
+Positive and negative prompts have separate request-owned prefix caches.
+
+TP uses native parallel projections. Ulysses and Ring shard target-image
+attention while keeping the condition prefix replicated. The target token
+count, `(height / 16) × (width / 16)`, must be divisible by the SP degree. Encoder
+folding shards Qwen3-VL's language projections using the native encoder TP group.
+Full-checkpoint editing passed with TP2 × Ulysses2 and TP2 × Ring2 + FlashAttention
+on four B200 GPUs. These CLI checks do not mark every HTTP topology as verified.
+
+VAE tiling is disabled by default for both encoding and decoding. Enable
+`--vae-tiling true` for tiled encoding and decoding; `--vae-sp true` also distributes tiles
+across the configured GPUs. These paths use the standard VAE runtime; tiled
+decode can differ from full image decode near tile boundaries.
+
+For full-image spatial parallel decode, select **Spatial shard** or pass
+`--vae-config.parallel-decode-mode spatial_shard` with at least two GPUs.
+This mode splits feature-map height, exchanges convolution halos, and gathers
+the full map for VAE attention. It does not require `--vae-tiling` or `--vae-sp`.
+Two-B200 checks cover TP2, CFG parallelism, and all-component layerwise offload.
+FP64 component comparisons match full decode; BF16 full-checkpoint output can
+differ through floating-point rounding.
+
+Select **All components layerwise** or pass `--layerwise-offload-components all`
+to stream repeated blocks in the DiT, Qwen3-VL language and vision encoders, and
+VAE encoder/decoder. Full-checkpoint 512px editing passed on one B200 and on
+two B200s with TP2 plus spatial VAE decode. This setting reduces device memory
+at the cost of host-device transfers; it is not the measured default for the
+consumer-GPU recipes above.
+
+Revision `f1f3366c7c` fixes CPU/GPU initialization rounding in the vision
+encoder's rotary frequencies after device transfer. On one B200, native
+1024px/40-step generation, editing, and transparent output with all-component
+layerwise offload matched resident RGBA pixels exactly. Repeated editing after
+a transparent-generation request also matched. Resident output was unchanged
+from revision `6ee35b52fb`. These checks use FlashAttention, seed 42, and CFG 1.
+
+Revision `81c8c550fa` also preserves the loader's FP8 weights and FP32 rotary
+buffers when moving the whole encoder between CPU and GPU. With that fix,
+`--text-encoder-cpu-offload true` matched resident generation, editing, and
+transparent RGBA pixels for both native precision and the combined serialized
+FP8 export in the same B200 workload, including repeated editing.
+
+The pipeline also supports the shared
+[disaggregated runtime](/docs/sglang-diffusion/disaggregation). The encoder role
+loads both Qwen3-VL and the VAE to prepare reference-image conditioning; nested
+condition tensors and complex RoPE tensors transfer with the request. Separate
+encoder, denoiser, and decoder processes matched monolithic RGBA output for
+512px/4-step generation, editing, different prompt lengths, and CFG on B200.
+That check used same-host Mooncake TCP; multi-host RDMA remains unverified.
+
+Online FP8 is available independently for the DiT and encoder through
+`--component-quantizations.transformer fp8` and
+`--component-quantizations.text_encoder fp8`. Each component and the combination
+passed 1024px/40-step HTTP generation and editing on a resident B200. FP8 changes
+the output: in one generation/edit pair, DiT-only FP8 gave RGBA PSNR
+37.56/41.07 dB against native precision; quantizing both gave 32.66/40.99 dB.
+These samples do not establish general image or alpha quality. Native precision
+remains the default.
+
+### Serialized FP8 components
+
+Select a **Serialized FP8** precision option in the picker and set the component
+directories under **Variables**. The tested format is E4M3FN weights with one
+FP32 `weight_scale` per linear and dynamic activation quantization. Each
+component directory contains its own architecture `config.json`, weight shards,
+and index; merge this top-level quantization configuration into its `config.json`:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic"
+  }
+}
+```
+
+Load compatible exported components through the shared loader:
+
+```bash Command
+sglang serve \
+  --model-path /models/qwen-image-2.1 \
+  --model-id Qwen-Image-2.1 \
+  --component-paths.transformer /models/qwen-image-2.1-fp8/transformer \
+  --component-paths.text_encoder /models/qwen-image-2.1-fp8/text_encoder \
+  --num-gpus 1 --performance-mode speed --attention-backend fa \
+  --host 0.0.0.0 --port 30010
+```
+
+Use either override independently, or both as shown. Omit online quantization
+flags: the component metadata selects serialized loading. Adding metadata to
+BF16 weights does not convert them. The validated export quantizes 224 DiT
+attention/MLP matrices and 252 Qwen3-VL language matrices; the vision encoder,
+embeddings, output head, other DiT projections, and VAE retain native precision.
+All 476 loaded matrices and scales matched their serialized values.
+
+At revision `5a117c9f3f`, DiT-only, encoder-only, and combined exports passed
+1024px/40-step generation, editing, and transparent PNG requests on B200 with
+FlashAttention, seed 42, and CFG 1. The combined export also passed TP2 with
+encoder folding and single-GPU `--layerwise-offload-components all`.
+At that revision, offload matched resident generation and transparent output
+exactly, but editing differed at 49.50 dB RGBA PSNR. Revision `f1f3366c7c` fixes
+the vision rotary initialization difference: a new 1024px/40-step comparison
+matched resident generation, editing, and transparent RGBA pixels exactly
+with all-component layerwise offload. Resident outputs were unchanged. TP2
+still changes numerical results.
+
+| Serialized FP8 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 38.35 dB | 40.94 dB |
+| Encoder | 34.46 dB | 49.19 dB |
+| Both | 34.93 dB | 41.25 dB |
+
+For the combined export, the transparent cat's alpha channel measured 32.03 dB
+PSNR and 0.81 mean absolute error on the 0–255 scale against native precision;
+individual boundary pixels can differ substantially. Online FP8 for both
+components also produced a real transparent PNG in this check. These are
+single-example comparisons, not a quality guarantee. Offline tensorwise scales
+differ from B200 online FP8's channelwise scales.
+
+### GGUF components
+
+Select **GGUF DiT**, **GGUF encoder**, or **GGUF DiT + encoder** under Server
+precision, then set the corresponding `.gguf` files under **Variables**.
+The picker uses `--component-weights-paths.transformer` and
+`--component-weights-paths.text_encoder`, retaining each component's architecture
+config from the base checkpoint. Each file must contain the entire component
+with native checkpoint tensor names. No online quantization flag is needed;
+the loader reads the quantization type from each GGUF tensor.
+
+The tested Q4_0 export quantizes the same 224 DiT and 252 language-encoder
+matrices listed above. Other tensors retain native precision, including the
+vision tower, embeddings, output head, and VAE. Its DiT and encoder files are
+3.91 and 7.03 GiB respectively. All 476 loaded packed matrices matched the
+exported bytes; sampled CUDA dequantization matched the GGUF CPU reference
+after conversion to BF16.
+
+At revision `7e0d4e9185`, DiT-only, encoder-only, and combined Q4_0 exports
+passed 1024px/40-step HTTP generation, editing, and transparent PNG output on
+B200 with FlashAttention, seed 42, and CFG 1. These are private validation
+exports, not published download targets. Use a compatible export of weights
+you are authorized to access.
+
+The combined export also passed TP2 with encoder folding. On one GPU,
+all-component layerwise offload and whole-encoder CPU offload each matched
+resident generation, editing, and transparent RGBA pixels exactly. TP2 changed
+numerical results. Quantization itself is lossy:
+
+| Q4_0 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 24.99 dB | 33.66 dB |
+| Encoder | 28.97 dB | 43.26 dB |
+| Both | 23.86 dB | 33.46 dB |
+
+The combined export's transparent cat retained alpha values from 0 to 255,
+with 66.8% of pixels at alpha 5 or below. Against native precision, its alpha
+PSNR was 21.20 dB and mean absolute error was 3.29/255; individual boundary
+pixels differed by up to 255. These single-example comparisons do not establish
+general image or cutout quality. Keep native precision when exact output is
+required.
+
+GGUF reduces weight storage; it is not a promise of lower latency. The runtime
+dequantizes packed linears before BF16 matrix multiplication. Other GGUF tensor
+types, exports, and hardware need separate validation.
+See the shared [GGUF guide](/docs/sglang-diffusion/quantization#gguf)
+for loader and parallelism constraints.
+
+### NVFP4 components
+
+Select **NVFP4 DiT**, **NVFP4 encoder**, or **NVFP4 DiT + encoder** in the
+picker, then set the component directories under **Variables**. These options
+require Blackwell; H200 and RTX 4090 cannot run this native FP4 path. B200 has
+completed the checks below. RTX PRO 6000 and RTX 5090 remain unverified for this
+model's NVFP4 exports; their FlashInfer backend defaults to `auto`, because
+TensorRT-LLM FP4 GEMM does not support SM120. Keep that default on these GPUs.
+
+Each exported directory contains its architecture config, weight shards, and
+index. The config declares `quant_method: modelopt`, `quant_algo: NVFP4`, and
+block size 16, with exclusions for native-precision layers. Use
+`--component-paths.transformer` and/or `--component-paths.text_encoder` to load
+the exported directories. Omit online quantization flags; metadata alone does
+not convert native weights into an NVFP4 checkpoint.
+
+The private validation export quantizes the same 224 DiT and 252 language
+matrices as the FP8 example. Vision, embeddings, the output head, other DiT
+projections, and VAE retain native precision. Weight quantization uses ModelOpt
+0.46.1 with max calibration; static activation scales come from six separate
+1024px/40-step requests, including two edits and one transparent generation.
+This small calibration set does not establish general quality. It does not
+use SVDQuant or AWQ. All 476 loaded packed weights, block scales, and global
+scales matched the export after the runtime's layout transforms.
+
+At revision `57b625d3e3`, each component and both together passed 1024px/40-step
+HTTP generation, editing, and transparent PNG output on B200 with
+FlashAttention, seed 42, CFG 1, and FlashInfer TensorRT-LLM FP4 GEMM. The combined
+export also passed TP2 with encoder folding. Single-GPU all-component layerwise
+offload and whole-encoder CPU offload each matched the combined resident RGBA
+pixels exactly. TP2 changed numerical results.
+
+| NVFP4 scope | Generation RGBA PSNR vs native | Edit RGBA PSNR vs native |
+| --- | --- | --- |
+| DiT | 24.97 dB | 31.56 dB |
+| Encoder | 26.48 dB | 36.63 dB |
+| Both | 19.36 dB | 29.96 dB |
+
+The combined export's transparent cat retained alpha from 0 to 255, with
+67.8% of pixels at alpha 5 or below. Against native precision, alpha PSNR was
+23.81 dB and mean absolute error was 2.22/255; some boundary pixels differed
+by 255. These are single-example comparisons of private exports, not download
+targets or quality guarantees. Native precision remains the default. See the
+shared [NVFP4 guide](/docs/sglang-diffusion/quantization#modelopt-nvfp4) for loader
+details.
+
+### LoRA and execution options
+
+LoRA uses the shared `--lora-path` and `--lora-merge-mode dynamic|merge` options
+and runtime adapter APIs. Diffusers keys prefixed with `transformer.` map to
+the native DiT. A synthetic adapter covering attention and MLP projections
+passed dynamic loading, merging, and removal on one B200 and TP2 with encoder
+folding. Both removal paths restored the base image exactly. This verifies
+adapter application and lifecycle, not the quality of a trained LoRA.
+
+Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
+Graph execution fills each request's prefix caches eagerly, then replays
+matching warmup graphs with those cache tensors as inputs. Warmup and request
+condition-prefix lengths must match, in addition to the output resolution;
+unseen shapes run eagerly. Text buckets alone cannot pad condition KV without
+changing attention semantics. FlashAttention, Sage
+attention and Torch SDPA are wired through the native attention layers;
+causal text runs use exact masked SDPA. Sage and Cache-DiT can change numerical
+results and require application-specific quality checks.
+
+See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
+for tested configurations and remaining validation boundaries. These checks
+are functional and numerical comparisons. The platform measurements above cover
+their stated HTTP workload; broader image quality is not evaluated.
