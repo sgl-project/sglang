@@ -52,11 +52,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
     is_aborted,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -64,7 +62,6 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -91,6 +88,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -257,7 +255,6 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -269,13 +266,14 @@ class PrefillBootstrapQueue:
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool
-            if transfer_draft_cache and (not _is_npu or get_pp_group().is_last_rank)
+            if transfer_draft_cache
+            and (not _is_npu or get_parallel().pp_group.is_last_rank)
             else None
         )
         num_draft_entries = 0
         if draft_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # Draft KV shares target virtual ids. Unified target KV is transferred
+            # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
@@ -315,13 +313,6 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
-
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            # V4's KVCache is organized by compression-ratio
-            # buckets rather than by layer.
-            kv_args.mla_compression_ratios = list(
-                self.token_to_kv_pool.compression_ratios
-            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -668,6 +659,7 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                self._sched_idled = True
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
@@ -709,6 +701,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self._sched_idled = True
 
             # Process the last batch
             if self.last_batch:
@@ -1004,7 +997,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Failed,
                 ):
                     logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"PP rank {get_parallel().pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
@@ -1084,7 +1077,7 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
-            f"Prefill transfer failed for request rank={self.ps.tp_rank} "
+            f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
@@ -1141,8 +1134,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
         return True
@@ -1150,7 +1142,7 @@ class SchedulerDisaggregationPrefillMixin:
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
         error_message = (
-            f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
+            f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
         is_propagated = False
@@ -1173,8 +1165,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -1415,20 +1406,10 @@ class SchedulerDisaggregationPrefillMixin:
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = (
-                    1
-                    if online
-                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
-                        128
-                    )
-                )
-                return get_dsv4_c128_state_indices(
-                    int(req.kv.req_pool_idx),
-                    c128_seq_len,
-                    online=online,
-                    ring_size=ring_size,
+            def _request_state_payload():
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                return kvcache.request_state_transfer_indices(
+                    int(req.kv.req_pool_idx), c128_seq_len
                 )
 
             state_types = (
@@ -1443,7 +1424,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1483,14 +1464,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
+            raw_kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, seg_start:seg_end
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+                    raw_kv_indices
                 )
             )
             page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1499,9 +1480,10 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            send_state_indices = state_indices if segment_is_last else None
             req.disagg_kv_sender.send(
                 page_indices,
-                state_indices if segment_is_last else None,
+                send_state_indices,
                 num_kv_tokens=seg_end - seg_start,
             )
         req.start_send_idx = end_idx
@@ -1516,8 +1498,22 @@ class SchedulerDisaggregationPrefillMixin:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
+        # The cached prefix is evictable once the KV is released. Its length
+        # (capped at what a retry can match) seeds the retry's storage baseline,
+        # so an evicted prefix is looked up in L3 once before it is recomputed.
+        yielded_prefix_len = (
+            0
+            if req.skip_radix_cache_insert
+            else min(
+                req.kv.cache_protected_len,
+                req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
+            )
+        )
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache)
+        # Mamba insertion donates the checkpoint and clears its sequence marker.
+        release_kv_cache(
+            req, self.tree_cache, is_insert=not self.tree_cache.supports_mamba()
+        )
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
@@ -1530,6 +1526,9 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         req.advance_cache_request_handle()
+        # A fresh lookup budget for the new attempt, as after a retraction.
+        req.storage_prefetch_retry_attempts = 0
+        req.storage_prefetch_last_match_len = yielded_prefix_len or None
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
