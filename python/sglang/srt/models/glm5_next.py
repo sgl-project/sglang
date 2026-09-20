@@ -46,6 +46,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    is_deepep_class_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1012,6 +1013,7 @@ class Glm5NextModel(nn.Module):
                         a2a_backend.is_deepep()
                         or a2a_backend.is_mori()
                         or a2a_backend.is_mooncake()
+                        or a2a_backend.is_deepep_v2()
                     )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
@@ -1033,7 +1035,11 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -1313,10 +1319,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        if get_moe_a2a_backend().is_deepep():
+        if is_deepep_class_backend():
             return (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
+                "Shared experts fusion is not supported when a DeepEP-family MoE "
+                "backend is enabled."
             )
         return None
 
