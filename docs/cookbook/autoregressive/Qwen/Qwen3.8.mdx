@@ -1,6 +1,6 @@
 ---
 title: Qwen3.8
-description: "Deploy Qwen3.8 with SGLang — day-0 recipes for Qwen's 2.4T-parameter (95B active) hybrid GDN/GQA Mixture-of-Experts model on NVIDIA and AMD."
+description: "Deploy Qwen3.8 with SGLang — day-0 recipes for Qwen's 2.4T-parameter (95B active) hybrid GDN/GQA Mixture-of-Experts model on NVIDIA, AMD, and Ascend NPU."
 ---
 
 ## Deployment
@@ -51,6 +51,20 @@ For how to launch either image, see [Install → Method 3: Using Docker](../../.
 
 </Tab>
 
+<Tab title="NPU">
+
+```bash Command
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+```
+
+For host and platform setup, see the
+[NPU installation guide](../../../docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[quick start guide](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start).
+
+**Weights (NPU):** Download the [Qwen/Qwen3.8-2.4T-A95B](https://www.modelscope.cn/models/Qwen/Qwen3.8-2.4T-A95B) checkpoint, or use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize a W4A8 variant. For detailed deployment instructions on Atlas 800I A3, see the [Qwen3.8-Max Ascend NPU deployment tutorial](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max).
+
+</Tab>
+
 </Tabs>
 
 </Accordion>
@@ -61,6 +75,8 @@ Pick your hardware + quantization to generate the launch command. Three of the s
 - **Balanced** — good speed with several users at once. Use for typical multi-user serving.
 - **High Throughput** — most tokens per second across many users. Best for batch jobs.
 - **DSpark** — the trained [DSpark draft model](#3-3-dspark-and-replayssm-speculative-decoding) instead of the checkpoint's built-in MTP head. Only offered where DSpark's constraints allow it (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+
+Atlas 800I A3 deployment runs across 4 nodes (32 cards / 64 dies) in PD mixed mode with W4A8 quantization. For the step-by-step multi-node tutorial, see [Qwen3.8-Max on Ascend NPU](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max).
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/Qwen/qwen3.8.jsx";
@@ -203,6 +219,17 @@ Recommended: **MI355X + MXFP4, single node, TP8**. MI350X emits the identical co
 - **`--mem-fraction-static` looks aggressive on purpose.** With the aiter backend above 8192 context SGLang multiplies it by **0.85** before allocating, so MI355X's `0.9` lands at ≈0.765 and MI300X's `1.0` at ≈0.85. Don't "fix" these downward. MI300X must stay at 1.0 or the weights stop fitting.
 - **`--disable-custom-all-reduce` belongs on every MI300X rank** — SGLang resolves it per process, so setting it on one node would leave the two pipeline stages reducing through different code paths.
 - MI300X runs `--kv-cache-dtype fp8_e4m3` with `--page-size 16`: at 8 × 192GB per node the shape is memory-bound.
+
+### Ascend NPU (Atlas 800I A3)
+
+The Atlas 800I A3 recipe deploys the W4A8 quantized checkpoint across **4 nodes (32 cards / 64 dies)** in unified PD mixed mode:
+
+- **Tensor Parallelism & Data Parallelism**: Runs `--tp-size 64` across all 64 dies (16 dies per node), combined with DP attention (`--enable-dp-attention --dp-size 4 --enable-dp-lm-head`) for balanced prefill and decode throughput.
+- **MoE Communication**: Uses DeepEP in auto mode (`--moe-a2a-backend deepep --deepep-mode auto`) with INT8 dispatch quantization (`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`) for high-bandwidth NPU-to-NPU all-to-all communication.
+- **Overlap Scheduling**: Enables plan stream overlap (`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`) and static ragged verify mode (`SGLANG_RAGGED_VERIFY_MODE=static`) for reduced execution jitter.
+- **Multi-Node Networking**: Multi-node NPU collectives use HCCL and Gloo. Pin the network interface on each node with `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME`.
+
+For the full step-by-step tutorial, see [Qwen3.8-Max on Ascend NPU](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max).
 
 ### ReplaySSM
 
