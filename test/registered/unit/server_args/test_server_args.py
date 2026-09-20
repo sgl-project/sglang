@@ -1995,6 +1995,25 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(unittest.TestCase):
+    def test_linker_mla_dedup_requires_mooncake_linker(self):
+        for enabled, linker, backend in (
+            (False, False, "mooncake"),
+            (True, True, "mooncake"),
+            (True, False, "mooncake"),
+            (True, True, "mori"),
+        ):
+            with self.subTest(enabled=enabled, linker=linker, backend=backend):
+                args = self._make_args(
+                    enable_linker_mla_dedup=enabled,
+                    enable_unified_cache_external_linker=linker,
+                    unified_cache_external_linker_backend=backend,
+                )
+                if enabled and (not linker or backend != "mooncake"):
+                    with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
@@ -2481,6 +2500,28 @@ class TestPipelineParallelCompat(CustomTestCase):
 
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
+
+    def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+
+    def test_dspark_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DSPARK", disaggregation_mode=mode
+                        )
+                    )
+
+    def test_dspark_rejects_eagle_pp_relay(self):
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="DSPARK")
+                )
 
     def test_eagle_is_allowed_on_prefill(self):
         check_pipeline_parallel_compat(

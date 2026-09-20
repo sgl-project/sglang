@@ -2,8 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
+    CustomTestCase,
     enter_scope,
     maybe_stub_sgl_kernel,
     published_topology,
@@ -237,6 +240,57 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 4, 12, False),
             ],
         )
+
+
+class TestDSparkPPOutput(CustomTestCase):
+    def test_output_ring_rebinds_dspark_state_on_each_stage(self):
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            make_next_draft_input,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        payloads = []
+        scheduler = SimpleNamespace(
+            _pp_spec_relay=False,
+            pp_group=SimpleNamespace(is_first_rank=False),
+            future_map=SimpleNamespace(
+                stash=lambda indices, value: payloads.append(value)
+            ),
+        )
+        tokens = torch.tensor([13, 29])
+        batch = SimpleNamespace(
+            return_logprob=False,
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([8, 15]),
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            spec_info=object(),
+        )
+        wire = SchedulerPPMixin._pp_prepare_tensor_dict(
+            scheduler,
+            SimpleNamespace(
+                next_token_ids=tokens,
+                next_draft_input=make_next_draft_input(
+                    bonus_tokens=tokens, new_seq_lens=batch.seq_lens
+                ),
+                logits_output=None,
+            ),
+            batch,
+        )
+        self.assertNotIn("draft_topk_p", wire)
+        result = SchedulerPPMixin._pp_prep_batch_result(
+            scheduler,
+            batch,
+            SimpleNamespace(can_run_cuda_graph=False),
+            PPProxyTensors(wire),
+        )
+        self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)
+        self.assertIs(batch.spec_info, result.next_draft_input)
+        torch.testing.assert_close(batch.spec_info.bonus_tokens, tokens)
+        torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
+        torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
+        self.assertEqual(payloads[0].hidden_states.numel(), 0)
 
 
 if __name__ == "__main__":
