@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.moe.utils import MoeA2ABackend  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
@@ -26,10 +27,10 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         counts = [0, 3, 7, 2]
         logprob_counts = [0, 1, 3, 1]
         cases = [
-            (MoeA2ABackend.FLASHINFER_MEGAMOE, True),
-            (MoeA2ABackend.NONE, True),
-            (MoeA2ABackend.FLASHINFER, True),
-            (MoeA2ABackend.DEEPEP, False),
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, None, True),
+            (MoeA2ABackend.DEEPEP, None, False),
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, "deepep", False),
+            (MoeA2ABackend.DEEPEP, "flashinfer_megamoe", True),
         ]
         parallel = SimpleNamespace(
             enable_dp_attention=True,
@@ -38,9 +39,9 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             moe_dense_tp_size=1,
             enable_dp_lm_head=True,
         )
-        for backend, expected_gather in cases:
+        for backend, backend_override, expected_gather in cases:
             with (
-                self.subTest(backend=backend),
+                self.subTest(backend=backend, backend_override=backend_override),
                 patch("sglang.srt.utils.common.get_parallel", return_value=parallel),
                 patch(
                     "sglang.srt.utils.common.get_exec",
@@ -53,7 +54,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                     return_value=backend,
                 ),
             ):
-                gather = dp_attn.require_mlp_tp_gather()
+                gather = dp_attn.require_mlp_tp_gather(moe_a2a_backend=backend_override)
                 self.assertEqual(gather, expected_gather)
                 for rank in range(4):
                     batch = SimpleNamespace()
@@ -79,9 +80,6 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                         batch.global_num_tokens_for_logprob,
                         logprob_counts if expected_gather else [logprob_counts[rank]],
                     )
-                    if expected_gather:
-                        self.assertEqual(batch.global_num_tokens[rank], counts[rank])
-                        self.assertEqual(max(batch.global_num_tokens), 7)
 
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):

@@ -32,13 +32,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _AutotuneContext:
     cache_path: Path
-    extend_num_tokens: int
-    reuse_cache: bool
     decode_num_tokens: int
+    prefill_num_tokens: int
+    reuse_cache: bool
 
 
 _active_context: _AutotuneContext | None = None
-# Native workspace pooling spans target/draft startup contexts. Keep their
+# Native workspace pooling spans startup contexts. Keep their
 # selected tactics consistent too; a cache-path change must not retune storage
 # already captured by another layer. These payloads own no weights or tensors.
 _session_winners: dict[tuple[Any, str], dict] = {}
@@ -47,15 +47,15 @@ _session_winners: dict[tuple[Any, str], dict] = {}
 @contextmanager
 def megamoe_autotune_context(
     cache_path: Path,
-    extend_num_tokens: int = 0,
+    decode_num_tokens: int,
+    prefill_num_tokens: int,
     reuse_cache: bool = True,
-    decode_num_tokens: int = 0,
 ):
     """Tune only inside the engine's collective, pre-capture startup forward."""
     global _active_context
     previous = _active_context
     _active_context = _AutotuneContext(
-        Path(cache_path), extend_num_tokens, reuse_cache, decode_num_tokens
+        Path(cache_path), decode_num_tokens, prefill_num_tokens, reuse_cache
     )
     try:
         yield
@@ -345,33 +345,18 @@ class MegaMoeTunedForward:
                 raise RuntimeError(
                     "FlashInfer MegaMoE startup tuning currently requires the full WORLD process group"
                 )
-            count = tensors.num_tokens
-            if self.bootstrap.world_size > 1:
-                count_tensor = torch.tensor(
-                    count, dtype=torch.int64, device=tensors.hidden_states.device
-                )
-                dist.all_reduce(
-                    count_tensor,
-                    op=dist.ReduceOp.MAX,
-                    group=self.bootstrap.process_group,
-                )
-                count = int(count_tensor.item())
-            maximum = self.fleet_params.max_tokens_per_rank
-            if count > maximum:
-                raise ValueError("MegaMoE tuning input exceeds configured capacity")
-            # Adaptive verification can capture more rows than the startup
-            # dummy's current draft width. Prepare those profiles eagerly too.
-            count = max(count, min(context.decode_num_tokens, maximum))
-            capacities = set(_capacities(count))
-            if context.extend_num_tokens > 0:
-                capacities.add(min(context.extend_num_tokens, maximum))
+            # The startup dummy can be much larger than captured decode batches.
+            # Keep small-N profiles bounded by decode, plus one prefill profile.
+            capacities = set(_capacities(context.decode_num_tokens))
+            capacities.add(context.prefill_num_tokens)
             for capacity in sorted(capacities):
-                if capacity not in self.workspaces:
-                    self._prepare_profile(context, mega, tensors, capacity)
+                self._prepare_profile(context, mega, tensors, capacity)
 
         count = self._common_tokens(tensors)
         capacity = next((n for n in sorted(self.workspaces) if n >= count), None)
         if capacity is not None:
             return self._forward(mega, tensors, self.workspaces[capacity])
-        self._fallback_used = True
-        return self._forward(mega, tensors)
+        raise ValueError(
+            f"MegaMoE received {count} tokens per rank, exceeding its prepared "
+            f"decode/prefill capacity {max(self.workspaces)}"
+        )
