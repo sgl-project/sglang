@@ -39,11 +39,13 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_qwen4_exp,
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
@@ -328,9 +330,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
+        hf_config = self.model_runner.model_config.hf_config
+        # Qwen4 QSA reads device tensors, not CPU attention inputs to update.
         if not (
-            is_deepseek_dsa(self.model_runner.model_config.hf_config)
-            or is_deepseek_v4(self.model_runner.model_config.hf_config)
+            is_deepseek_dsa(hf_config)
+            or is_deepseek_v4(hf_config)
+            or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
         ):
             if forward_batch.forward_mode.is_target_verify():
                 _attn = self._replay_attn_backend()

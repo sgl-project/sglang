@@ -15,11 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _make_backend(graph, records=2):
-    graph.auto_dispatch_capture = True
-    graph.graph_dispatch_mode = SimpleNamespace(
-        graph_dispatch_records=[object() for _ in range(records)]
-    )
+def _make_backend(graph):
     backend = NPUCudaGraphBackend.__new__(NPUCudaGraphBackend)
     backend._graphs = {1: graph}
     backend._outputs = {1: object()}
@@ -65,78 +61,113 @@ def test_npu_graph_waits_for_update_before_returning():
     assert result is backend._outputs[1]
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_npu_graph_zero_records_skip_update_and_replay(legacy):
-    source = torch.tensor([1.0, 2.0])
-    output = torch.zeros_like(source)
-    graph = SimpleNamespace(
-        update=Mock(side_effect=AssertionError("Empty graph must not update")),
-        replay=Mock(side_effect=lambda: output.copy_(source * 2)),
-    )
-    backend = _make_backend(graph, records=0)
-    backend._outputs[1] = output
-    for value in (3.0, 7.0):
-        source.fill_(value)
-        if legacy:
-            result = backend.replay_with_input_update(
-                1, [3], attr_name="actual_seq_lengths_kv", attr_type=torch.empty(0)
-            )
-        else:
-            result = backend.replay_with_input_update(
-                1, None, cpu_update_input=[{}, {}]
-            )
-        assert result is output
-        torch.testing.assert_close(result, torch.full_like(output, value * 2))
-    assert graph.replay.call_count == 2
-    graph.update.assert_not_called()
-    backend._device_module.set_device.assert_not_called()
-
-
 @pytest.mark.parametrize(
-    "missing", ["auto_dispatch_capture", "mode", "records", "none"]
+    "runner_kind", ["target_decode", "target_verify", "draft", "draft_extend"]
 )
-def test_npu_graph_missing_capture_state_fails_before_replay(missing):
-    graph = SimpleNamespace(update=Mock(), replay=Mock())
-    backend = _make_backend(graph)
-    if missing == "auto_dispatch_capture":
-        del graph.auto_dispatch_capture
-    elif missing == "mode":
-        del graph.graph_dispatch_mode
-    elif missing == "records":
-        del graph.graph_dispatch_mode.graph_dispatch_records
-    else:
-        graph.graph_dispatch_mode.graph_dispatch_records = None
-    with pytest.raises(RuntimeError, match="Cannot inspect NPU graph update records"):
-        backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
-    graph.update.assert_not_called()
-    graph.replay.assert_not_called()
-
-
-def test_npu_graph_without_auto_dispatch_fails_before_replay():
-    graph = SimpleNamespace(update=Mock(), replay=Mock())
-    backend = _make_backend(graph, records=0)
-    graph.auto_dispatch_capture = False
-    with pytest.raises(RuntimeError, match="auto_dispatch_capture=True"):
-        backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
-    graph.update.assert_not_called()
-    graph.replay.assert_not_called()
-
-
-def test_npu_graph_update_decision_is_per_graph():
-    empty = SimpleNamespace(update=Mock(), replay=Mock())
-    backend = _make_backend(empty, records=0)
-    nonempty = SimpleNamespace(
-        auto_dispatch_capture=True,
-        graph_dispatch_mode=SimpleNamespace(graph_dispatch_records=[object()]),
-        update=Mock(),
-        replay=Mock(),
+@pytest.mark.parametrize(
+    "architecture,qsa,dsa,skip_update",
+    [
+        ("Qwen4ExpForConditionalGeneration", True, False, True),
+        ("Qwen4ExpForCausalLMMTP", True, False, True),
+        ("Qwen4ExpForConditionalGeneration", False, False, False),
+        ("Qwen4ExpForCausalLMMTP", False, False, False),
+        ("Qwen3ForCausalLM", False, False, False),
+        ("Qwen3ForCausalLM", True, False, False),
+        ("DeepseekV32ForCausalLM", False, True, True),
+        ("GlmMoeDsaForCausalLM", False, True, True),
+        ("DeepseekV4ForCausalLM", False, False, True),
+    ],
+)
+def test_npu_graph_qwen_qsa_replay_dispatch(
+    runner_kind, architecture, qsa, dsa, skip_update
+):
+    from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
+        EAGLEDraftExtendNpuGraphRunner,
     )
-    backend._graphs[2] = nonempty
-    backend._outputs[2] = object()
-    for key in (1, 2, 1, 2):
-        result = backend.replay_with_input_update(key, None, cpu_update_input=[{}])
-        assert result is backend._outputs[key]
-    empty.update.assert_not_called()
-    assert empty.replay.call_count == 2
-    assert nonempty.update.call_count == 2
-    assert nonempty.replay.call_count == 2
+    from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
+        EAGLEDraftNpuGraphRunner,
+    )
+    from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+        NPUGraphRunner,
+    )
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    text_config = SimpleNamespace()
+    if qsa:
+        text_config = SimpleNamespace(
+            indexer_n_heads=3,
+            indexer_kv_heads=1,
+            indexer_head_dim=256,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+        )
+    config = SimpleNamespace(
+        architectures=[architecture],
+        text_config=text_config,
+        index_topk=2048 if dsa else None,
+    )
+    output = LogitsProcessorOutput(next_token_logits=torch.zeros(2, 3))
+    backend = SimpleNamespace(
+        replay=Mock(return_value=output),
+        replay_with_input_update=Mock(return_value=output),
+    )
+    runner = SimpleNamespace(
+        model_runner=SimpleNamespace(model_config=SimpleNamespace(hf_config=config)),
+        backend=backend,
+        bs=2,
+        raw_bs=1,
+        raw_num_token=1,
+        captured_req_width=4,
+        speculative_num_steps=3,
+        is_dllm=False,
+        load_batch=Mock(),
+        _make_graph_key=lambda bs: bs,
+        _get_update_attr_name=lambda: "actual_seq_lengths_kv",
+        _get_update_attr_type=lambda: [],
+        _replay_attn_backend=lambda: SimpleNamespace(forward_metadata=None),
+    )
+    lengths = torch.tensor([7], dtype=torch.int32)
+    if skip_update:
+        # Direct replay must not prepare CPU lengths, including for draft steps.
+        lengths = Mock()
+        lengths.cpu.side_effect = AssertionError("Unexpected CPU length preparation")
+        lengths.tolist.side_effect = AssertionError("Unexpected CPU length preparation")
+    forward_batch = SimpleNamespace(
+        seq_lens=lengths,
+        seq_lens_cpu=lengths,
+        needs_forward_metadata_init=lambda: True,
+        forward_mode=SimpleNamespace(
+            is_target_verify=lambda: runner_kind == "target_verify"
+        ),
+    )
+    if runner_kind.startswith("target"):
+        NPUGraphRunner.execute(runner, forward_batch)
+        runner.load_batch.assert_called_once_with(forward_batch, None)
+    elif runner_kind == "draft":
+        EAGLEDraftNpuGraphRunner._replay_graph(runner, 2, forward_batch)
+    else:
+        EAGLEDraftExtendNpuGraphRunner._replay_graph(runner, 2, forward_batch)
+
+    if skip_update:
+        backend.replay.assert_called_once_with(2, forward_batch)
+        backend.replay_with_input_update.assert_not_called()
+    else:
+        backend.replay.assert_not_called()
+        update = backend.replay_with_input_update
+        assert update.call_count == 1
+        assert update.call_args.args == (2,)
+        if runner_kind == "draft":
+            assert update.call_args.kwargs == {
+                "seq_lens": None,
+                "cpu_update_input": [
+                    {"actual_seq_lengths_kv": [8, 0]},
+                    {"actual_seq_lengths_kv": [9, 0]},
+                ],
+            }
+        else:
+            expected = [11, 0] if runner_kind == "target_verify" else [7, 0]
+            assert update.call_args.kwargs == {
+                "seq_lens": expected,
+                "attr_name": "actual_seq_lengths_kv",
+                "attr_type": [],
+            }

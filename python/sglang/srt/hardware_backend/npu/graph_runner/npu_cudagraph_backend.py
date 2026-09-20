@@ -159,28 +159,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         2. cpu_update_input: A list of {attr_name: seq_lens} dicts,
            one per speculative step.  Used by EAGLE draft runners.
         """
-        graph = self._graphs[shape_key]
-        # Read the update record count and require automatic capture to be enabled.
-        # Fail if the capture state cannot be inspected.
-        try:
-            auto_dispatch_capture = graph.auto_dispatch_capture
-            update_count = len(graph.graph_dispatch_mode.graph_dispatch_records)
-        except (AttributeError, TypeError) as e:
-            raise RuntimeError(
-                "Cannot inspect NPU graph update records; "
-                "check torch_npu graph API compatibility"
-            ) from e
-        if not auto_dispatch_capture:
-            raise RuntimeError("NPU graph updates require auto_dispatch_capture=True")
-        # With no update records, skip graph.update() and replay directly.
-        if update_count == 0:
-            graph.replay()
-            return self._outputs[shape_key]
-
         if cpu_update_input is None:
             if isinstance(attr_type, torch.Tensor):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
+
+        graph = self._graphs[shape_key]
 
         def _update():
             self._device_module.set_device(self._device_id)
