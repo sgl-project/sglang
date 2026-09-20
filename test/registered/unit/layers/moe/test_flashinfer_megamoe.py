@@ -71,6 +71,7 @@ def _load_megamoe_module(monkeypatch):
     for name, module in fake_modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
+    _load_autotune_module(monkeypatch)
     module_path = (
         Path(__file__).resolve().parents[5]
         / "python/sglang/srt/layers/moe/flashinfer_megamoe.py"
@@ -82,6 +83,251 @@ def _load_megamoe_module(monkeypatch):
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_autotune_module(monkeypatch):
+    name = "sglang.srt.layers.moe.flashinfer_megamoe_autotune"
+    path = (
+        Path(__file__).resolve().parents[5]
+        / "python/sglang/srt/layers/moe/flashinfer_megamoe_autotune.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profile_fixture(monkeypatch, world_size=1):
+    from dataclasses import dataclass
+
+    module = _load_autotune_module(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    @dataclass
+    class Tensors:
+        hidden_states: torch.Tensor
+        topk_ids: torch.Tensor
+        topk_weights: torch.Tensor
+        fc1_alpha: torch.Tensor
+        scales: torch.Tensor | None = None
+
+        @property
+        def num_tokens(self):
+            return self.hidden_states.shape[0]
+
+    tensors = Tensors(
+        torch.ones(3, 4, dtype=torch.bfloat16),
+        torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32),
+        torch.full((3, 2), 0.5, dtype=torch.float32),
+        torch.ones(4, dtype=torch.float32),
+    )
+    forward = module.MegaMoeTunedForward(
+        types.SimpleNamespace(world_size=world_size, rank=0, process_group=None),
+        types.SimpleNamespace(max_tokens_per_rank=128, num_experts=4),
+        types.SimpleNamespace(
+            megakernel=types.SimpleNamespace(knobs=None),
+            preprocess_weights=False,
+            transformed_weights=object(),
+        ),
+    )
+    calls = []
+
+    class Mega:
+        def forward(self, inputs, **kwargs):
+            calls.append((inputs, kwargs.get("workspace")))
+            return inputs.hidden_states
+
+    return module, forward, tensors, Mega(), calls
+
+
+@pytest.mark.parametrize(
+    "decode_tokens,extend_tokens,expected",
+    [(0, 0, [1, 2, 3]), (0, 128, [1, 2, 3, 128]), (8, 0, [1, 2, 4, 8])],
+)
+def test_megamoe_startup_profiles_are_prepared_once(
+    monkeypatch, tmp_path, decode_tokens, extend_tokens, expected
+):
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch)
+    prepared = []
+
+    def prepare(context, layer, inputs, capacity):
+        prepared.append(capacity)
+        forward.workspaces[capacity] = object()
+
+    monkeypatch.setattr(forward, "_prepare_profile", prepare)
+    with module.megamoe_autotune_context(
+        tmp_path / "cache.json", extend_tokens, decode_num_tokens=decode_tokens
+    ):
+        assert forward(mega, tensors) is tensors.hidden_states
+        forward(mega, tensors)
+    assert prepared == expected
+    selected = min(capacity for capacity in expected if capacity >= 3)
+    assert calls[-1][1] is forward.workspaces[selected]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    forward(mega, tensors)
+    assert prepared == expected
+    assert calls[-1][1] is forward.workspaces[selected]
+
+
+@pytest.mark.parametrize("local_tokens", [0, 1, 3])
+def test_megamoe_profile_selection_uses_all_dp_ranks(monkeypatch, local_tokens):
+    from dataclasses import replace
+
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch, world_size=4)
+    dp = types.ModuleType("sglang.srt.layers.dp_attention")
+    dp.get_dp_global_num_tokens = lambda: [0, 1, 3, 7]
+    monkeypatch.setitem(sys.modules, dp.__name__, dp)
+    tensors = replace(
+        tensors,
+        hidden_states=tensors.hidden_states[:local_tokens],
+        topk_ids=tensors.topk_ids[:local_tokens],
+        topk_weights=tensors.topk_weights[:local_tokens],
+    )
+    forward.workspaces = {1: object(), 4: object(), 8: object(), 128: object()}
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    forward(mega, tensors)
+    assert calls[-1][1] is forward.workspaces[8]
+
+
+def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch)
+    forward(mega, tensors)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    forward(mega, tensors)
+    assert [workspace for _, workspace in calls] == [None, None]
+
+
+@pytest.mark.parametrize("supports_output_view", [False, True])
+def test_megamoe_profiles_reuse_winner_across_startup_contexts(
+    monkeypatch, tmp_path, supports_output_view
+):
+    import json
+    import os
+    from dataclasses import dataclass, replace
+
+    module, _, tensors, _, _ = _profile_fixture(monkeypatch)
+    tensors = replace(
+        tensors,
+        hidden_states=tensors.hidden_states[:1],
+        topk_ids=tensors.topk_ids[:1],
+        topk_weights=tensors.topk_weights[:1],
+    )
+
+    @dataclass
+    class Config:
+        knobs: str | None = None
+        kernel_name: str = "test_backend"
+        input_norm_const: float = 1.0
+
+    @dataclass
+    class Fleet:
+        max_tokens_per_rank: int = 128
+        num_experts: int = 4
+        token_hidden_size: int = 4
+
+    @dataclass
+    class Backend:
+        megakernel: Config
+        transformed_weights: object
+        preprocess_weights: bool = False
+
+    bootstrap = types.SimpleNamespace(world_size=1, rank=0, process_group=object())
+    fleet = Fleet()
+    backend = Backend(Config(), object())
+    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    events = []
+    staged = []
+
+    class Mega:
+        def __init__(self, **kwargs):
+            self.auto = kwargs.get("backend", backend).megakernel.knobs == "auto"
+            self.supports_output_view = supports_output_view
+
+        def warmup(self, inputs, workspace=None):
+            if self.auto:
+                events.append("tune")
+                Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
+                    json.dumps(payload)
+                )
+            else:
+                assert workspace is self.workspace
+                events.append("warmup")
+
+        def destroy(self):
+            events.append("destroy")
+
+        def create_workspace(self, capacity):
+            assert capacity == 1
+            staged.append(
+                json.loads(Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).read_text())
+            )
+            self.workspace = object()
+            events.append("create")
+            return self.workspace
+
+        def forward(self, inputs, *, workspace, return_workspace_view=False):
+            assert workspace is self.workspace
+            assert return_workspace_view is supports_output_view
+            return inputs.hidden_states
+
+    fake_moe = types.ModuleType("flashinfer.moe_ep")
+    fake_moe.MoEEpMegaLayer = Mega
+    fake_autotuner = types.ModuleType("flashinfer.autotuner")
+    fake_autotuner._collect_metadata = lambda: {"runtime": "test"}
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
+
+    owners = []
+    for phase, scale in (("target", 1.0), ("draft", 2.0)):
+        phase_backend = replace(
+            backend, megakernel=replace(backend.megakernel, input_norm_const=scale)
+        )
+        forward = module.MegaMoeTunedForward(bootstrap, fleet, phase_backend)
+        mega = Mega()
+        with module.megamoe_autotune_context(
+            tmp_path / phase / "cache.json", reuse_cache=False
+        ):
+            assert forward(mega, tensors) is tensors.hidden_states
+        owners.append(mega)
+        assert os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] == "original-cache.json"
+
+    assert events == ["tune", "destroy", "create", "warmup", "create", "warmup"]
+    assert staged == [payload, payload]
+    assert owners[0].workspace is not owners[1].workspace
+
+
+@pytest.mark.parametrize("tokens", [0, 3])
+@pytest.mark.parametrize("capacity", [1, 8])
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_megamoe_profile_inputs_retain_runtime_scales(
+    monkeypatch, tokens, capacity, prequantized
+):
+    from dataclasses import replace
+
+    module, _, tensors, _, _ = _profile_fixture(monkeypatch)
+    tensors = replace(
+        tensors,
+        hidden_states=tensors.hidden_states[:tokens],
+        topk_ids=tensors.topk_ids[:tokens],
+        topk_weights=tensors.topk_weights[:tokens],
+        scales=torch.ones(tokens, 2) if prequantized else None,
+    )
+    profile = module._profile_inputs(tensors, capacity, num_experts=4)
+    assert profile.hidden_states.shape == (capacity, 4)
+    assert profile.topk_ids.shape == profile.topk_weights.shape == (capacity, 2)
+    assert profile.hidden_states.dtype == torch.bfloat16
+    assert profile.topk_ids.dtype == torch.int32
+    assert profile.topk_weights.dtype == torch.float32
+    assert profile.fc1_alpha is tensors.fc1_alpha
+    if prequantized:
+        assert profile.scales.shape == (capacity, 2)
+        assert torch.all(profile.scales == 1)
+    else:
+        assert profile.scales is None
+    assert torch.all((profile.topk_ids >= 0) & (profile.topk_ids < 4))
 
 
 def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
@@ -236,6 +482,8 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
             top_k=top_k,
             gate_up_clamp=gate_up_clamp,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            kernel_name="sm100_bf16_nvfp4_bf16_cutedsl",
+            knobs=None,
         )
 
     class Mega:
@@ -254,6 +502,7 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
     fake_moe_ep.MoEEpMegaLayer = Mega
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     # No activation-scale fields: W4A16 consumes only weight decode scales.
     layer = types.SimpleNamespace(
         layer_id=0,
@@ -299,7 +548,10 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
         ),
     )
     quant_info = module.FlashInferMegaMoeQuantInfo(
-        mega=mega, fc1_alpha=layer.g1_alphas, fc2_alpha=layer.g2_alphas
+        mega=mega,
+        mega_forward=layer._flashinfer_megamoe_forward,
+        fc1_alpha=layer.g1_alphas,
+        fc2_alpha=layer.g2_alphas,
     )
     for scale in (2.0, 3.0):
         layer.g1_alphas.fill_(scale)

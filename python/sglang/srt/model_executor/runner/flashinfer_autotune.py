@@ -94,6 +94,7 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_megamoe",
     ]
 
     from sglang.srt.layers.quantization.fp4_utils import (
@@ -277,6 +278,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            megamoe_autotune_context,
+        )
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
@@ -284,6 +288,25 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+        # MegaMoE has its own collective tuner; flashinfer.autotune() alone
+        # does not run it. Prepare immutable capacity profiles before capture.
+        # Its optional extend sweep runs expert kernels directly, including on
+        # speculative targets whose model-level dummy is TARGET_VERIFY.
+        extend_num_tokens = 0
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get() and not mr.is_draft_worker:
+            extend_num_tokens = (
+                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+            )
+        mega_context = (
+            megamoe_autotune_context(
+                cache_path=autotune_cache,
+                decode_num_tokens=mr.max_decode_logits_rows(),
+                extend_num_tokens=extend_num_tokens,
+                reuse_cache=envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get(),
+            )
+            if "flashinfer_megamoe" not in skip_ops
+            else empty_context()
+        )
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -291,6 +314,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
+            mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield
