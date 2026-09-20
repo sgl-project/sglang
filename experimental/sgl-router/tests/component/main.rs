@@ -10,5 +10,8 @@
 mod discovery;
 mod health;
 mod policies;
+mod policies_reorg;
+mod policies_reorg_load;
+mod policies_reorg_power_of_two;
 mod tokenizer;
 mod workers;
