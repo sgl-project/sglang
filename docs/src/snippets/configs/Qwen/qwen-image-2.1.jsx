@@ -39,7 +39,7 @@ const config = {
       id: "placement",
       title: "Placement",
       scope: "serve",
-      description: "Hardware selection applies its recommended placement. Stream DiT layers when the full pipeline exceeds device memory.",
+      description: "Hardware selection applies its recommended placement. Offload selected components when the full pipeline exceeds device memory.",
       learnMore: "#5-runtime-features",
       default: "resident",
       options: [
@@ -53,14 +53,14 @@ const config = {
         },
         {
           id: "offload", label: "CPU offload",
-          flags: (s) => ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : []),
-            ...(s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
-              && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
-              ? ["--dit-layerwise-resident-layers 8"] : [])],
+          flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
+            && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
+            ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
-          description: "Streams DiT layers. RTX 4090 also offloads the encoder. Its native single-output FlashAttention recipe keeps 8 DiT layers resident; batch recipes stream every layer for memory headroom. Requires sufficient host RAM.",
+          description: "RTX 4090 native single-output FlashAttention keeps the DiT and VAE resident and streams encoder layers. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder. Requires sufficient host RAM.",
         },
         {
           id: "all_offload", label: "All components layerwise",
@@ -228,7 +228,7 @@ const config = {
         {
           id: "2", label: "Up to 2 images",
           flags: ["--batching-max-size 2", "--batching-delay-ms 20"],
-          description: "Wait up to 20 ms to merge compatible queued requests. The tested RTX 4090 offload recipe benefits under concurrent load; each response takes longer.",
+          description: "Wait up to 20 ms to merge compatible queued requests. Benchmark throughput and response latency on your workload.",
         },
         {
           id: "4", label: "Up to 4 images",
@@ -339,7 +339,7 @@ const config = {
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
       const warnings = [];
-      if (s.hw === "rtx4090" && (Number(s.outputs) > 1 || (s.batching && s.batching !== "off"))) warnings.push("This recipe streams all DiT layers. Use the updated Server command if switching from the single-output recipe with 8 resident layers.");
+      if (s.hw === "rtx4090" && (Number(s.outputs) > 1 || (s.batching && s.batching !== "off"))) warnings.push("This recipe streams DiT layers for batch memory headroom. Restart with the updated Server command when changing output count or request batching.");
       if (s.batching && s.batching !== "off" && s.mode !== "text") warnings.push("Cross-request batching applies to text-to-image requests. Image edits run separately; use Outputs for multiple images in one edit request.");
       if (!serveVerified && !errors.length) warnings.push("This server combination has not completed an exact HTTP verification run.");
       if (!requestVerified && !errors.length) warnings.push("This request shape is outside the verified HTTP matrix.");
