@@ -49,6 +49,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    initialize_markov_candidate_sampler,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -202,6 +203,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
+            input_vocab_size=(
+                int(self.draft_model.input_vocab_size)
+                if getattr(self.draft_model, "has_own_embed_tokens", False)
+                else int(target_embed_rows)
+            ),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -244,7 +250,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+        if getattr(self.draft_model, "uses_own_vocab_modules", False) and not hasattr(
+            self.draft_model, "has_own_embed_tokens"
+        ):
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
@@ -261,6 +269,28 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._resolve_target_embed_tokens(target_model)
                 ),
                 lm_head=lm_head,
+            )
+
+        if not self._is_pd_prefill:
+            # Allocate persistent tables and proposal storage before the target
+            # and draft KV pools probe free memory. Capacity includes the largest
+            # graph tier as well as the scheduler's per-worker request bound.
+            max_running = get_schedule().max_running_requests
+            capacity = None
+            if max_running is not None:
+                capacity = max(1, max_running // self.ps.attn_dp_size)
+                if self._decode_graph_allowed:
+                    capacity = max(
+                        capacity, max(get_exec().graph.cuda_graph_config.decode.bs)
+                    )
+            initialize_markov_candidate_sampler(
+                model=self.draft_model,
+                draft_hf_config=self.draft_model_runner.model_config.hf_config,
+                gamma=self.gamma,
+                capacity=capacity,
+                tp_size=self.ps.tp_size,
+                markov_topk=get_spec().speculative_dspark_markov_topk,
+                markov_bias_topk=get_spec().speculative_dspark_markov_bias_topk,
             )
         self._target_hidden_projection_enabled = False
 
