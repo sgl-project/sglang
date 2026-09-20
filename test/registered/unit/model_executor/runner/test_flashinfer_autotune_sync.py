@@ -11,7 +11,6 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=57, suite="base-a-test-cpu")
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-import contextlib
 import json
 import multiprocessing
 import os
@@ -28,7 +27,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
-from sglang.srt.model_executor.runner import flashinfer_autotune as autotune_runner
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
@@ -80,12 +78,14 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
             max_running_requests=256,
             is_draft_worker=False,
         )
-        general = Mock(side_effect=lambda *_args, **_kwargs: contextlib.nullcontext())
+        general = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
         modules = {
             "flashinfer.autotuner": SimpleNamespace(
                 AutoTuner=SimpleNamespace(
                     get=lambda: SimpleNamespace(
                         get_namespaced_records=lambda _: {},
+                        load_configs=lambda _: None,
+                        save_configs=lambda _: None,
                         publish_namespaced_records=lambda *_: None,
                     )
                 ),
@@ -95,7 +95,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 set_autotune_process_group=lambda _: None,
             ),
             "sglang.srt.layers.logits_processor": SimpleNamespace(
-                autotune_dummy_run_mode=lambda **_: contextlib.nullcontext()
+                autotune_dummy_run_mode=lambda **_: nullcontext()
             ),
         }
         # The resolved chunk size is already per DP rank. Disabled chunking
@@ -124,7 +124,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         SGLANG_FLASHINFER_AUTOTUNE_CACHE="1",
                     ),
                     patch.multiple(
-                        autotune_runner,
+                        autotune,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
                         get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
                         get_exec=lambda: SimpleNamespace(
@@ -137,25 +137,23 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         ),
                     ),
                     patch.object(
-                        autotune_runner.torch.cuda,
+                        autotune.torch.cuda,
                         "current_stream",
                         return_value=Mock(),
                     ),
                     patch.object(
-                        autotune_runner.torch,
+                        autotune.torch,
                         "get_device_module",
-                        return_value=SimpleNamespace(
-                            stream=lambda _: contextlib.nullcontext()
-                        ),
+                        return_value=SimpleNamespace(stream=lambda _: nullcontext()),
                     ),
                 ):
                     general.reset_mock()
-                    with autotune_runner.flashinfer_autotune_context(
+                    with autotune.flashinfer_autotune_context(
                         runner, run_lm_head=False
                     ):
                         general.assert_called_once_with(
                             True,
-                            cache=str(cache_path),
+                            cache=None,
                             skip_ops=skip_ops,
                         )
                         context = mega_autotune._active_context
