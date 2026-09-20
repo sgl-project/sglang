@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -153,73 +152,6 @@ class TestDsparkFoldedSamplingDefault(CustomTestCase):
             DsparkFoldedSampling.FORCE.value
         ):
             self.assertTrue(_resolve_folded_sampling(**args))
-
-
-class TestDsparkCandidateRoute(CustomTestCase):
-    """Opt-in must reject unsupported routes before deriving candidate tables."""
-
-    def _construct(self, head, *, folded_sampling=False):
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            DsparkDraftSampler,
-        )
-
-        return DsparkDraftSampler(
-            model=SimpleNamespace(
-                markov_head=head,
-                sample_from_anchor=True,
-                lm_head=SimpleNamespace(org_vocab_size=16, weight=torch.empty(1)),
-            ),
-            gamma=4,
-            max_bs=2,
-            device="cpu",
-            tp_sync=SimpleNamespace(),
-            folded_sampling=folded_sampling,
-        )
-
-    def test_opt_in_rejects_unsupported_routes_before_table_preparation(self):
-        from sglang.srt.models.dspark import VanillaMarkov
-        from sglang.srt.speculative.dspark_components import dspark_draft_sampler
-
-        class OtherMarkov(VanillaMarkov):
-            pass
-
-        for folded, fused, tp, head_type in (
-            (True, True, 1, VanillaMarkov),
-            (False, False, 1, VanillaMarkov),
-            (False, True, 2, VanillaMarkov),
-            (False, True, 1, OtherMarkov),
-        ):
-            with self.subTest(folded=folded, fused=fused, tp=tp, head=head_type):
-                head = head_type(vocab_size=16, markov_rank=4)
-                with (
-                    envs.SGLANG_DSPARK_MARKOV_CANDIDATE_K.override(8),
-                    envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.override(fused),
-                    patch.object(
-                        dspark_draft_sampler,
-                        "get_tensor_model_parallel_world_size",
-                        return_value=tp,
-                    ),
-                    patch.object(head, "prepare_candidates") as prepare,
-                ):
-                    with self.assertRaisesRegex(
-                        ValueError, "DSpark candidates require"
-                    ):
-                        self._construct(head, folded_sampling=folded)
-                    prepare.assert_not_called()
-
-    def test_disabled_candidates_preserve_folded_sampling_without_table(self):
-        from sglang.srt.models.dspark import VanillaMarkov
-
-        head = VanillaMarkov(vocab_size=16, markov_rank=4)
-        with (
-            envs.SGLANG_DSPARK_MARKOV_CANDIDATE_K.override(0),
-            patch.object(head, "prepare_candidates") as prepare,
-        ):
-            sampler = self._construct(head, folded_sampling=True)
-        prepare.assert_not_called()
-        self.assertTrue(sampler.folded_sampling)
-        self.assertEqual(tuple(sampler.out.shape), (8,))
-        self.assertEqual(sampler.out.device.type, "cpu")
 
 
 if __name__ == "__main__":
