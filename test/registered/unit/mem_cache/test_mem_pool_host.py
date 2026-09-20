@@ -395,8 +395,8 @@ class TestDSAIndexerStateDecl(CustomTestCase):
         # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
         # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
         desc = dsa_indexer_state_decl(self._stub()).layout
-        self.assertEqual(desc.bytes_per_row, 132)
-        self.assertEqual(desc.page_stride_bytes(64), 8448)
+        self.assertEqual(desc.bytes_per_token_per_layer, 132)
+        self.assertEqual(desc.page_bytes(64), 8448)
         self.assertEqual(
             desc.host_bytes(page_num=284256, layer_num=5, page_size=64),
             12006973440,
@@ -417,8 +417,10 @@ class TestDSAIndexerStateDecl(CustomTestCase):
         )
         mirror = DSAIndexerPoolHost(decl, stub, anchor, pin_memory=False, is_dummy=True)
         self.assertEqual(mirror.layout, anchor.layout)
-        self.assertEqual(mirror.indexer_page_stride_size, desc.page_stride_bytes(64))
-        self.assertEqual(mirror.get_size_per_token(), desc.bytes_per_row * 5)
+        self.assertEqual(mirror.indexer_page_stride_size, desc.page_bytes(64))
+        self.assertEqual(
+            mirror.get_size_per_token(), desc.bytes_per_token_per_layer * 5
+        )
         self.assertEqual(
             desc.host_bytes(page_num=anchor.page_num, layer_num=5, page_size=64),
             anchor.page_num * mirror.indexer_layout_dim,

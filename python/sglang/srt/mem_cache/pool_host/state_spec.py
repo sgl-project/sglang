@@ -29,24 +29,18 @@ class StateKind(str, Enum):
     SWA = "swa"
 
 
-class RowFamily(str, Enum):
-    TOKEN_ROWS = "token_rows"
-    PAGE_ROWS = "page_rows"
-
-
 class StateLayout(msgspec.Struct, frozen=True, kw_only=True):
-    row_family: RowFamily
-    # token_rows: bytes per token per layer. page_rows: bytes per page per layer.
-    bytes_per_row: int
+    """Byte facts of one token-addressed state; the mirror allocates from these."""
+
+    bytes_per_token_per_layer: int
     dtype: torch.dtype
 
-    def page_stride_bytes(self, page_size: int) -> int:
-        if self.row_family is RowFamily.PAGE_ROWS:
-            return self.bytes_per_row
-        return self.bytes_per_row * page_size
+    def page_bytes(self, page_size: int) -> int:
+        """Bytes of one page of one layer."""
+        return self.bytes_per_token_per_layer * page_size
 
     def host_bytes(self, *, page_num: int, layer_num: int, page_size: int) -> int:
-        return page_num * layer_num * self.page_stride_bytes(page_size)
+        return page_num * layer_num * self.page_bytes(page_size)
 
 
 class LayerBinding(msgspec.Struct, frozen=True, kw_only=True):

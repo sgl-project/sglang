@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.state_spec import (
     HostStateDecl,
-    RowFamily,
     StateKind,
     StateLayout,
 )
@@ -83,8 +82,7 @@ def dsa_kv_state_decl(pool: DSATokenToKVPool) -> HostStateDecl:
         index_source=None,
         layout_source=None,
         layout=StateLayout(
-            row_family=RowFamily.TOKEN_ROWS,
-            bytes_per_row=pool.kv_cache_dim * pool.store_dtype.itemsize,
+            bytes_per_token_per_layer=pool.kv_cache_dim * pool.store_dtype.itemsize,
             dtype=pool.store_dtype,
         ),
         mirror=None,
@@ -101,8 +99,7 @@ def dsa_indexer_state_decl(
         index_source=PoolName.KV,
         layout_source=PoolName.KV,
         layout=StateLayout(
-            row_family=RowFamily.TOKEN_ROWS,
-            bytes_per_row=dsa_indexer_bytes_per_token_per_layer(
+            bytes_per_token_per_layer=dsa_indexer_bytes_per_token_per_layer(
                 pool.index_head_dim, pool.quant_block_size
             ),
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
@@ -148,10 +145,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
 
         # uint8 storage, so element counts below are byte counts
-        self.indexer_page_stride_size = desc.page_stride_bytes(self.page_size)
+        self.indexer_page_stride_size = desc.page_bytes(self.page_size)
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = desc.bytes_per_row * self.layer_num
+        self.size_per_token = desc.bytes_per_token_per_layer * self.layer_num
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
@@ -201,7 +198,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.clear()
 
     def get_size_per_token(self):
-        return self.decl.layout.bytes_per_row * self.layer_num
+        return self.decl.layout.bytes_per_token_per_layer * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
