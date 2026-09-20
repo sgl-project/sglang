@@ -10,16 +10,31 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
 logger = logging.getLogger(__name__)
 
+_HEREDOC_START = re.compile(
+    r"""(?<!<)<<(?!<)(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|([A-Za-z_][A-Za-z0-9_]*))"""
+)
 
-def _mask_literals(text: str) -> str:
+
+def _mask_literals(text: str, *, heredocs: bool = False) -> str:
     """Keep offsets while excluding Markdown/code literals from protocol detection."""
     masked = list(text)
     fence = quote = ""
     ticks = 0
     escaped = False
     paired_quotes = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+    pending_heredocs: list[tuple[str, bool]] = []
     offset = 0
     for line in text.splitlines(keepends=True):
+        if pending_heredocs:
+            delimiter, strip_tabs = pending_heredocs[0]
+            end_line = line.rstrip("\r\n")
+            if (end_line.lstrip("\t") if strip_tabs else end_line) == delimiter:
+                pending_heredocs.pop(0)
+            for index, char in enumerate(line):
+                if char not in "\r\n":
+                    masked[offset + index] = " "
+            offset += len(line)
+            continue
         boundary = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
         protected = bool(fence)
         if boundary and not quote and not ticks:
@@ -66,6 +81,30 @@ def _mask_literals(text: str) -> str:
             elif ticks:
                 if char not in "\r\n":
                     masked[offset + index] = " "
+            elif (
+                heredocs
+                and char == "#"
+                and (
+                    index == 0 or line[index - 1].isspace() or line[index - 1] in ";|&("
+                )
+            ):
+                for position in range(index, len(line)):
+                    if line[position] not in "\r\n":
+                        masked[offset + position] = " "
+                break
+            elif (
+                heredocs
+                and char == "<"
+                and (opener := _HEREDOC_START.match(line, index))
+            ):
+                delimiter = next(
+                    value for value in opener.groups()[1:] if value is not None
+                )
+                pending_heredocs.append((delimiter, opener[1] == "-"))
+                width = opener.end() - index
+                masked[offset + index : offset + opener.end()] = [" "] * width
+                index = opener.end()
+                continue
             elif char in paired_quotes and (
                 char in "“‘"
                 or offset + index == 0
@@ -79,6 +118,31 @@ def _mask_literals(text: str) -> str:
             index += 1
         offset += len(line)
     return "".join(masked)
+
+
+def _validate_string_parameter(name: str, value: str, *, complete: bool) -> None:
+    prefix = "</｜DSML｜parameter"
+    if prefix not in value:
+        return
+    visible = _mask_literals(value, heredocs=True)
+    for match in re.finditer(re.escape(prefix), visible):
+        previous = match.start() - 1
+        while previous >= 0 and value[previous] == "\\":
+            previous -= 1
+        if (match.start() - previous - 1) % 2:
+            continue
+        if match.end() == len(value):
+            if not complete:
+                continue
+        elif (
+            value[match.end()] == ">"
+            or value[match.end()].isalnum()
+            or value[match.end()] == "_"
+        ):
+            continue
+        raise ValueError(
+            f"Malformed DSML parameter terminator in string parameter {name!r}"
+        )
 
 
 class _BareControlValidator(HTMLParser):
@@ -206,14 +270,40 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
         if self.strict_output:
+            if invoke_content.lstrip().startswith("{"):
+                # Keep direct-JSON arguments private until their strings can be
+                # validated; do not repair or reserialize partial JSON.
+                if allow_partial:
+                    return ""
+                parameters = json.loads(invoke_content)
+                for name, value in parameters.items():
+                    if isinstance(value, str):
+                        _validate_string_parameter(name, value, complete=True)
+                return super()._parse_parameters_from_xml(invoke_content, False)
+            last_match_end = 0
             for match in re.finditer(self.parameter_regex, invoke_content, re.DOTALL):
-                if match.group(2) != "true":
+                last_match_end = match.end()
+                if match.group(2) == "true":
+                    _validate_string_parameter(
+                        match.group(1), match.group(3), complete=True
+                    )
+                else:
                     try:
                         json.loads(match.group(3).strip())
                     except json.JSONDecodeError as error:
                         raise ValueError(
                             f"Invalid JSON in DSML non-string parameter {match.group(1)!r}"
                         ) from error
+            if allow_partial:
+                partial = re.search(
+                    self.partial_parameter_regex,
+                    invoke_content[last_match_end:],
+                    re.DOTALL,
+                )
+                if partial and partial.group(2) == "true":
+                    _validate_string_parameter(
+                        partial.group(1), partial.group(3), complete=False
+                    )
         return super()._parse_parameters_from_xml(invoke_content, allow_partial)
 
     def parse_streaming_increment(

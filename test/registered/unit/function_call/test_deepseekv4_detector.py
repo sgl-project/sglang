@@ -427,6 +427,106 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "Orphan"):
                 parser.parse_stream_end()
 
+    def test_strict_string_parameter_rejects_malformed_closer_before_dispatch(self):
+        bad = f"</{DSML}parameter |"
+        command = (
+            "cat <<'JSONEOF'\n{}\nJSONEOF\n"
+            f'echo "created"{bad}\npython3 -c "print(1)"'
+        )
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="exec_command",
+                    parameters={
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                ),
+            )
+        ]
+        source = _wrapped(_invoke("exec_command", _param("cmd", "true", command)))
+        for width in [1, 2, 7, 31, len(source)]:
+            with self.subTest(width=width):
+                detector = DeepSeekV4Detector(strict_output=True)
+                arguments = ""
+                with self.assertRaisesRegex(
+                    ValueError, "Malformed DSML parameter terminator"
+                ):
+                    for start in range(0, len(source), width):
+                        result = detector.parse_streaming_increment(
+                            source[start : start + width], tools
+                        )
+                        arguments += "".join(item.parameters for item in result.calls)
+                    detector.finish(tools)
+                self.assertNotIn(bad, arguments)
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(arguments)
+        with self.assertRaisesRegex(ValueError, "Malformed DSML parameter terminator"):
+            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, tools)
+        direct_json = _wrapped(_invoke("exec_command", json.dumps({"cmd": command})))
+        with self.assertRaisesRegex(ValueError, "Malformed DSML parameter terminator"):
+            DeepSeekV4Detector(strict_output=True).detect_and_parse(direct_json, tools)
+
+    def test_string_parameter_preserves_quoted_heredoc_and_escaped_marker_literals(
+        self,
+    ):
+        marker = f"</{DSML}parameter |"
+        values = [
+            f'print("{marker}")',
+            f"Example: `{marker}`",
+            f"```xml\n{marker}\n```",
+            f"cat <<'EOF'\n{marker}\nEOF",
+            f"cat <<EOF\n{marker}\nEOF",
+            f"cat <<-EOF\n\t{marker}\n\tEOF",
+            f"cat <<'A' <<'B'\n{marker}\nA\n{marker}\nB",
+            f"# Literal example: {marker}\nprint(1)",
+            f"echo \\{marker}",
+        ]
+        for value in values:
+            source = _wrapped(_invoke("get_weather", _param("city", "true", value)))
+            for width in [1, 3, 13, len(source)]:
+                with self.subTest(value=value, width=width):
+                    detector = DeepSeekV4Detector(strict_output=True)
+                    arguments = ""
+                    for start in range(0, len(source), width):
+                        result = detector.parse_streaming_increment(
+                            source[start : start + width], self.tools
+                        )
+                        arguments += "".join(item.parameters for item in result.calls)
+                    detector.finish(self.tools)
+                    self.assertEqual(json.loads(arguments), {"city": value})
+            parsed = DeepSeekV4Detector(strict_output=True).detect_and_parse(
+                source, self.tools
+            )
+            self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
+
+    def test_new_parameter_guard_does_not_change_non_strict_behavior(self):
+        value = f'echo "created"</{DSML}parameter |\nprintf done'
+        source = _wrapped(_invoke("get_weather", _param("city", "true", value)))
+        parsed = DeepSeekV4Detector(strict_output=False).detect_and_parse(
+            source, self.tools
+        )
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
+
+    def test_strict_direct_json_waits_for_complete_validated_invoke(self):
+        detector = DeepSeekV4Detector(strict_output=True)
+        opening = f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+        calls = detector.parse_streaming_increment(
+            opening + '{"city":', self.tools
+        ).calls
+        calls += detector.parse_streaming_increment('"SF"}', self.tools).calls
+        self.assertEqual([call.name for call in calls if call.name], ["get_weather"])
+        self.assertEqual("".join(call.parameters for call in calls), "")
+        calls += detector.parse_streaming_increment(
+            f"</{DSML}invoke></{DSML}tool_calls>", self.tools
+        ).calls
+        calls += detector.finish(self.tools).calls
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls)), {"city": "SF"}
+        )
+
 
 if __name__ == "__main__":
     import unittest
