@@ -729,6 +729,39 @@ def test_sensenova_u1_sampling_adjust_scales_first_input_to_2k_long_side(tmp_pat
     assert (params.width, params.height) == (2048, 1024)
 
 
+def test_sensenova_u1_sampling_adjust_uses_preprocessed_image_size(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+
+    def load_transposed_image(path, convert_method=None):
+        assert path == str(image_path)
+        image = Image.new("RGB", (800, 1600))
+        return convert_method(image) if convert_method is not None else image
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.sample.sensenova_u1.load_image",
+        load_transposed_image,
+    )
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 2048)
+
+
 def test_sensenova_u1_sampling_adjust_preserves_explicit_size(tmp_path):
     image_path = tmp_path / "wide.png"
     Image.new("RGB", (1600, 800)).save(image_path)
@@ -1180,6 +1213,7 @@ def test_sensenova_u1_generation_stage_loads_image_path_rgba_with_white_backgrou
         width=2048,
         height=2048,
         seed=7,
+        do_resize=False,
     )
     batch = SimpleNamespace(
         prompt=sampling.prompt,

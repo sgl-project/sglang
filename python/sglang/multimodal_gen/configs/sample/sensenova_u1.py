@@ -2,8 +2,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from PIL import Image
-
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -19,9 +17,11 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     RESOLUTION_ALIGNMENT,
     SENSENOVA_U1_CFG_NORM_CHOICES,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    _flatten_rgba_to_rgb,
     has_sensenova_u1_explicit_size,
     resolve_sensenova_u1_edit_auto_size,
 )
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",
@@ -95,13 +95,12 @@ class SenseNovaU1SamplingParams(SamplingParams):
             image_path = self.image_path
 
         try:
-            image = Image.open(image_path)
+            image = load_image(image_path, convert_method=_flatten_rgba_to_rgb)
         except (OSError, TypeError, ValueError):
             return
-        with image:
-            self.width, self.height = resolve_sensenova_u1_edit_auto_size(
-                image.width, image.height
-            )
+        self.width, self.height = resolve_sensenova_u1_edit_auto_size(
+            image.width, image.height
+        )
 
     def _validate(self) -> None:
         super()._validate()

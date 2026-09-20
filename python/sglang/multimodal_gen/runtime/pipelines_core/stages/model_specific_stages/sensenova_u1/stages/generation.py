@@ -80,13 +80,12 @@ def _resize_input_to_budget(
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "y", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "n", "off"}:
-            return False
-    return bool(value)
+    raise ValueError(f"do_resize must be a boolean value, got {value!r}.")
+
+
+def _coerce_cfg_interval(value: Any) -> tuple[float, float]:
+    start, end = value
+    return float(start), float(end)
 
 
 def _image_input_to_list(image_input: Any) -> list[Image.Image]:
@@ -167,9 +166,8 @@ class SenseNovaU1GenerationOptions:
             enable_timestep_shift=bool(
                 extra.get("enable_timestep_shift", DEFAULT_ENABLE_TIMESTEP_SHIFT)
             ),
-            cfg_interval=tuple(
-                float(value)
-                for value in extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)
+            cfg_interval=_coerce_cfg_interval(
+                extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)
             ),
             t_eps=float(extra.get("t_eps", DEFAULT_T_EPS)),
             think_mode=bool(extra.get("think_mode", DEFAULT_THINK_MODE)),
