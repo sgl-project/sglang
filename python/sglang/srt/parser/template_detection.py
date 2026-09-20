@@ -585,6 +585,11 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="deepseek_v32", value="deepseekv32", predicate=_is_deepseek_v32),
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
+    # GLM-5.3 must be checked before glm47/glm45: its template also matches
+    # `_is_glm47` (it carries the `'<tool_call>' + tc.name` pattern and satisfies
+    # `_is_glm_family`), and `match_rules` returns the first hit. Listing glm53
+    # first is what routes GLM-5.3-Flash to the dedicated glm53 detector.
+    DetectionRule(name="glm53", value="glm53", predicate=_is_glm53),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
