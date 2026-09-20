@@ -219,13 +219,14 @@ class TestDSV4UnifiedFp8PdLayout(CustomTestCase):
         self.assertEqual(kv_args.state_types[-1], StateType.SWA_RING)
         self.assertEqual(kv_args.state_item_lens[-1], items)
 
-    def test_get_buf_infos_and_hicache_still_refuse(self):
+    def test_get_buf_infos_still_refuses(self):
         uni = _unified_pool(self.STAGE, fp8=True)
         with self.assertRaises(NotImplementedError):
             uni.get_buf_infos()
+        # #37778 already ships the rope host pool; PD must not re-refuse it.
         pool = _token_pool(self.STAGE, fp8=True)
-        with self.assertRaises(NotImplementedError):
-            pool.unified_region_buffers(4)
+        pool.unified_region_buffers(4)
+        self.assertIsNotNone(pool.unified_rope_region_buffers(4))
 
 
 class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
