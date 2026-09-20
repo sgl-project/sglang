@@ -90,6 +90,9 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         draft_model.write_target_hidden_kv = MethodType(
             DSparkDraftMixin.write_target_hidden_kv, draft_model
         )
+        draft_model.write_context_hidden_kv = MethodType(
+            DSparkDraftMixin.write_context_hidden_kv, draft_model
+        )
         pool = SimpleNamespace(set_kv_buffer=mock.Mock())
         injector = TargetHiddenKvInjector(
             draft_model=draft_model,
