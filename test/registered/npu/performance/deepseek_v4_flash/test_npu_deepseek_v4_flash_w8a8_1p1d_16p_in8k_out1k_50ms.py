@@ -1,3 +1,5 @@
+import os
+import subprocess
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
@@ -7,6 +9,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+from sglang.utils import wait_for_server
 
 register_npu_ci(
     est_time=3600,
@@ -26,11 +30,22 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
+    "HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+    "USE_NPU_MOE_GATING_TOP_K": "1",
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -47,6 +62,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     # MTP
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Decode node environment variables for DSV4-Flash PD-Sep deployment.
@@ -64,7 +80,15 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "USE_NPU_MOE_GATING_TOP_K": "1",
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
+    "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -79,7 +103,9 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     # MTP
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_NPU_USE_MULTI_STREAM": "1",
+    "SGLANG_NPU_USE_MULTI_STREAM": "0",
+    # PD disagg
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Prefill node launch arguments for DSV4-Flash PD-Sep.
@@ -104,13 +130,13 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ARGS = [
     "--mem-fraction-static",
     0.68,
     "--prefill-max-requests",
-    6,
+    256,
     "--max-prefill-tokens",
-    80000,
+    67000,
     "--chunked-prefill-size",
-    131072,
+    65536,
     "--max-running-requests",
-    112,
+    256,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -124,13 +150,8 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ARGS = [
     "--kv-cache-dtype",
     "bfloat16",
     "--disable-cuda-graph",
-    "--disable-radix-cache",
     "--load-balance-method",
     "round_robin",
-    "--ep-dispatch-algorithm",
-    "static",
-    "--init-expert-location",
-    "/root/.cache/modelscope/hub/models/hot_map/pd_prefill_0720.pt",
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep.
@@ -147,25 +168,20 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.75,
-    "--prefill-max-requests",
-    1,
-    "--disable-radix-cache",
-    "--chunked-prefill-size",
-    -1,
+    0.7,
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
     "ascend",
     "--max-running-requests",
-    896,
+    256,
     "--dp-size",
     16,
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
-    "auto",
+    "low_latency",
     "--quantization",
     "modelslim",
     "--enable-dp-lm-head",
@@ -174,22 +190,25 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     "--cuda-graph-bs-decode",
     1,
     2,
-    4,
-    8,
-    16,
-    24,
-    36,
-    40,
-    48,
-    # MTP (EAGLE) configuration.
-    "--speculative-algorithm",
-    "EAGLE",
-    "--speculative-num-steps",
-    2,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
     3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    # MTP (DSPARK) configuration.
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep deployment.
@@ -223,6 +242,31 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn8kOut1k50ms(
     seed = 1
     tpot = 50
     output_token_throughput = 7046
+
+    @classmethod
+    def setUpClass(cls):
+        """Launch server via `python3 -m sglang.launch_server` instead of `sglang serve`."""
+        cls._setup_per_case_output()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        env = os.environ.copy()
+        if cls.envs:
+            env.update(cls.envs)
+
+        _, host, port = cls.base_url.split(":")
+        command = [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cls.model,
+            *[str(x) for x in cls.other_args],
+            "--host",
+            host[2:],
+            "--port",
+            port,
+        ]
+        cls.process = subprocess.Popen(command, env=env)
+        wait_for_server(cls.base_url, timeout=cls.timeout, process=cls.process)
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in8k out1k."""
