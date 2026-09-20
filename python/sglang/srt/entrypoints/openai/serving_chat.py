@@ -128,20 +128,6 @@ def _configure_request_for_parsing(request, detector) -> None:
         configure(request)
 
 
-def _decode_response_parser_prefix(tokenizer, token_ids: List[int]) -> str:
-    kwargs = {
-        "skip_special_tokens": False,
-        "spaces_between_special_tokens": False,
-    }
-    try:
-        return tokenizer.decode(token_ids, **kwargs)
-    except TypeError as exc:
-        if "spaces_between_special_tokens" not in str(exc):
-            raise
-        kwargs.pop("spaces_between_special_tokens")
-        return tokenizer.decode(token_ids, **kwargs)
-
-
 def _has_incomplete_tool_call(parser, tool_index: Optional[int] = None) -> bool:
     detector = getattr(parser, "detector", parser)
     indices = getattr(detector, "incomplete_tool_call_indices", None)
@@ -1335,9 +1321,10 @@ class OpenAIServingChat(OpenAIServingBase):
             and all(isinstance(token_id, int) for token_id in prompt_ids)
             and self.tokenizer_manager.tokenizer is not None
         ):
-            return _decode_response_parser_prefix(
-                self.tokenizer_manager.tokenizer,
+            return self.tokenizer_manager.tokenizer.decode(
                 prompt_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
             )
         return ""
 
@@ -3051,20 +3038,34 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.tool_choice, ToolChoice
             )
             # For required/named tool choice: use JsonArrayParser when the
-            # detector cannot produce its native format under constraints.
-            native_parser = FunctionCallParser(
-                tools=effective_tools,
-                tool_call_parser=self.tool_call_parser,
-                tokenizer=self.tokenizer_manager.tokenizer,
-                prefix=request._response_parser_prefix,
-            )
-            if is_required and not (
-                native_parser.detector.supports_structural_tag()
-                or native_parser.detector.parses_required_natively()
-            ):
-                parser_dict[index] = JsonArrayParser()
+            # constrained output is plain JSON (detector doesn't support
+            # structural_tag or no parser configured). Use FunctionCallParser
+            # only when the detector supports structural_tag and will produce
+            # native format output.
+            if is_required:
+                use_native_parser = False
+                if self.tool_call_parser:
+                    probe = FunctionCallParser(
+                        tools=effective_tools,
+                        tool_call_parser=self.tool_call_parser,
+                        tokenizer=self.tokenizer_manager.tokenizer,
+                        prefix=request._response_parser_prefix,
+                    )
+                    use_native_parser = (
+                        probe.detector.supports_structural_tag()
+                        or probe.detector.parses_required_natively()
+                    )
+                if use_native_parser:
+                    parser_dict[index] = probe
+                else:
+                    parser_dict[index] = JsonArrayParser()
             else:
-                parser_dict[index] = native_parser
+                parser_dict[index] = FunctionCallParser(
+                    tools=effective_tools,
+                    tool_call_parser=self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
+                )
 
         parser = parser_dict[index]
 

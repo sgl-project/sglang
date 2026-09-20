@@ -2269,19 +2269,20 @@ class ReasoningParser:
 
         if prefix is None:
             prefix = getattr(request, "_response_parser_prefix", "")
-        parameters = (
-            inspect.signature(detector_class).parameters
-            if tokenizer is not None or tool_call_parser_active or prefix
-            else {}
-        )
-        if tokenizer is not None and "tokenizer" in parameters:
-            kwargs["tokenizer"] = tokenizer
+        if tokenizer is not None:
+            sig = inspect.signature(detector_class)
+            if "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
 
-        if tool_call_parser_active and "tool_call_parser_active" in parameters:
-            kwargs["tool_call_parser_active"] = True
+        if tool_call_parser_active:
+            sig = inspect.signature(detector_class)
+            if "tool_call_parser_active" in sig.parameters:
+                kwargs["tool_call_parser_active"] = True
 
-        if prefix and "prefix" in parameters:
-            kwargs["prefix"] = prefix
+        if prefix:
+            sig = inspect.signature(detector_class)
+            if "prefix" in sig.parameters:
+                kwargs["prefix"] = prefix
 
         self.detector = detector_class(**kwargs)
 

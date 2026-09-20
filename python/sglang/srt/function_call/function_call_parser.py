@@ -125,11 +125,13 @@ class FunctionCallParser:
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
-            if tokenizer is not None or prefix:
-                parameters = inspect.signature(detector_class).parameters
-                if tokenizer is not None and "tokenizer" in parameters:
+            if tokenizer is not None:
+                sig = inspect.signature(detector_class)
+                if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
-                if prefix and "prefix" in parameters:
+            if prefix:
+                sig = inspect.signature(detector_class)
+                if "prefix" in sig.parameters:
                     kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
@@ -287,16 +289,15 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        strict_requested = (
+        should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
-        should_constrain_auto = tool_choice == "auto" and strict_requested
         if isinstance(self.detector, ResponseTemplateToolDetector):
             self.detector.validate_structure_constraint_request(
                 tool_choice,
                 parallel_tool_calls,
-                strict_requested,
+                should_constrain_auto,
             )
 
         try:

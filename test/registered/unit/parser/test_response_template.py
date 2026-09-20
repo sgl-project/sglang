@@ -159,8 +159,6 @@ class TestResponseTemplateLoading(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unsupported semantic fields"):
             validate_response_template_for_serving(template)
-        with self.assertRaisesRegex(ValueError, "unsupported semantic fields"):
-            ResponseTemplateReasoningDetector(response_template=template)
 
         for field_name, update in (
             ("content", {"content": "json"}),
@@ -172,14 +170,6 @@ class TestResponseTemplateLoading(unittest.TestCase):
                 template["fields"][field_name].update(update)
                 with self.assertRaisesRegex(ValueError, "cannot be streamed"):
                     validate_response_template_for_serving(template)
-
-        template = {
-            "defaults": {"role": "assistant", "metadata": {}},
-            "start_anchor": "<assistant>",
-            "fields": {"content": {"content": "text"}},
-        }
-        with self.assertRaisesRegex(ValueError, "unsupported semantic fields"):
-            validate_response_template_for_serving(template)
 
 
 class TestGemma4ResponseTemplateParity(unittest.TestCase):
@@ -419,10 +409,6 @@ class TestResponseTemplateAdapters(unittest.TestCase):
                     request.model_copy()._response_parser_prefix,
                     PREFIX,
                 )
-
-    def test_response_template_backend_is_available_explicitly(self):
-        self.assertIn("response_template", ReasoningParser.DetectorMap)
-        self.assertIn("response_template", FunctionCallParser.ToolCallParserEnum)
 
     def test_adapters_use_checkpoint_metadata(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)

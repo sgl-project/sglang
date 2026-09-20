@@ -363,7 +363,7 @@ class BaseFormatDetector(ABC):
         return True
 
     def parses_required_natively(self) -> bool:
-        """Return True if `tool_choice="required"` must skip grammar
+        """Return True if ``tool_choice="required"`` must skip grammar
         constraints and parse the model's native output format instead."""
         return False
 

@@ -36,7 +36,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
-    _decode_response_parser_prefix,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -129,47 +128,6 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
     {%- endfor -%}
 {%- endfor -%}
 """
-
-
-class TestResponseParserPrefixDecoding(unittest.TestCase):
-    def test_disables_spacing_between_special_tokens(self):
-        class SpecialTokenTokenizer:
-            def decode(
-                self,
-                token_ids,
-                *,
-                skip_special_tokens=True,
-                spaces_between_special_tokens=True,
-            ):
-                self.options = (
-                    skip_special_tokens,
-                    spaces_between_special_tokens,
-                )
-                return (
-                    "<first> <second>"
-                    if spaces_between_special_tokens
-                    else "<first><second>"
-                )
-
-        tokenizer = SpecialTokenTokenizer()
-
-        decoded = _decode_response_parser_prefix(tokenizer, [1, 2])
-
-        self.assertEqual(decoded, "<first><second>")
-        self.assertEqual(tokenizer.options, (False, False))
-
-    def test_falls_back_for_tokenizers_without_spacing_option(self):
-        class CompatibleTokenizer:
-            def decode(self, token_ids, *, skip_special_tokens=True):
-                self.skip_special_tokens = skip_special_tokens
-                return "<first><second>"
-
-        tokenizer = CompatibleTokenizer()
-
-        decoded = _decode_response_parser_prefix(tokenizer, [1, 2])
-
-        self.assertEqual(decoded, "<first><second>")
-        self.assertFalse(tokenizer.skip_special_tokens)
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:

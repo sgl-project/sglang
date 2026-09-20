@@ -2010,20 +2010,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
-            native_parser = None
             detector_owns_format = False
             if self.tool_call_parser:
-                native_parser = FunctionCallParser(
+                probe = FunctionCallParser(
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                 )
-                detector_owns_format = self._tool_parser_owns_format(native_parser)
+                detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
                 tool_parser = JsonArrayParser()
-            else:
-                tool_parser = native_parser
+            elif self.tool_call_parser:
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                    prefix=request._response_parser_prefix,
+                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
@@ -2249,13 +2253,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             else:
                 item_status = (
                     "incomplete"
-                    if (
-                        self._status_from_finish_reason(finish_reason) != "completed"
-                        or (
-                            tool_parser is not None
-                            and _has_incomplete_tool_call(tool_parser, tool_index)
-                        )
-                    )
+                    if tool_parser is not None
+                    and _has_incomplete_tool_call(tool_parser, tool_index)
                     else "completed"
                 )
                 completed_item = ResponseFunctionToolCall(
