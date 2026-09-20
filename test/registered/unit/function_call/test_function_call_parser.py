@@ -2510,8 +2510,7 @@ class TestQwen3CoderDetector(unittest.TestCase):
         param_fragments = [call.parameters for call in result.calls if call.parameters]
 
         self.assertIn('{"location": "', "".join(param_fragments))
-        self.assertIn("Boston", param_fragments)
-        self.assertNotIn('"location": "Boston"', param_fragments)
+        self.assertLessEqual(len(param_fragments), 4)
 
         params = json.loads("".join(param_fragments))
         self.assertEqual(params["location"], "Boston")
@@ -2544,6 +2543,108 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         params = json.loads(collected_params)
         self.assertEqual(params["location"], "Boston")
+
+    def _assert_streaming_matches_non_streaming(self, text):
+        expected = self.detector.detect_and_parse(text, self.tools)
+        partitions = [[text], list(text)]
+        partitions.extend([text[:i], text[i:]] for i in range(len(text) + 1))
+        partitions.extend(
+            [text[i : i + size] for i in range(0, len(text), size)]
+            for size in (2, 3, 7, 13)
+        )
+        for chunks in partitions:
+            with self.subTest(chunks=chunks):
+                detector = Qwen3CoderDetector()
+                arguments = {}
+                names = {}
+                normal_text = ""
+                for chunk in chunks:
+                    result = detector.parse_streaming_increment(chunk, self.tools)
+                    normal_text += result.normal_text
+                    for call in result.calls:
+                        if call.name:
+                            names[call.tool_index] = call.name
+                        arguments[call.tool_index] = arguments.get(
+                            call.tool_index, ""
+                        ) + (call.parameters or "")
+                self.assertEqual(normal_text, expected.normal_text)
+                self.assertEqual(len(arguments), len(expected.calls))
+                for call in expected.calls:
+                    self.assertEqual(names[call.tool_index], call.name)
+                    self.assertEqual(
+                        json.loads(arguments[call.tool_index]),
+                        json.loads(call.parameters),
+                    )
+
+    def test_string_cleanup_preserves_business_newlines(self):
+        for value, expected in (
+            ("\n\nBoston", "\nBoston"),
+            ("Boston\n\n", "Boston\n"),
+            ("\n\nBoston\n\n", "\nBoston\n"),
+            ("\n\n\n", "\n"),
+        ):
+            for end in ("</parameter></function>", "</function>"):
+                with self.subTest(value=value, end=end):
+                    text = (
+                        "<tool_call><function=get_current_weather>"
+                        f"<parameter=location>{value}{end}</tool_call>"
+                    )
+                    result = self.detector.detect_and_parse(text, self.tools)
+                    self.assertEqual(
+                        json.loads(result.calls[0].parameters)["location"], expected
+                    )
+                    self._assert_streaming_matches_non_streaming(text)
+
+    def test_streaming_string_cleanup_is_chunk_independent(self):
+        for value in (
+            "",
+            "\n",
+            "\n\n",
+            "\n\n\n",
+            "\n\nBoston",
+            "Boston\n\n",
+            "\n\nBoston\n\n",
+            "a\n\nb",
+            "null",
+            "NULL",
+            "NuLl",
+            "\nnull\n",
+            "nullable",
+            "nullx",
+            "null\n\n",
+            "n",
+            '中文😀"\\\t\r\x00\x01<ordinary></paramX>',
+        ):
+            with self.subTest(value=value):
+                self._assert_streaming_matches_non_streaming(
+                    "<tool_call><function=get_current_weather>"
+                    f"<parameter=location>{value}</parameter>"
+                    "</function></tool_call>"
+                )
+
+    def test_streaming_mixed_parameters_and_tools_is_chunk_independent(self):
+        self._assert_streaming_matches_non_streaming(
+            "Checking.\n<tool_call><function=get_current_weather>"
+            "<parameter=location>\n\nBoston\n\n</parameter>"
+            "<parameter=days>3</parameter>"
+            "<parameter=unit>null</parameter></function></tool_call>"
+            "<tool_call><function=sql_interpreter>"
+            '<parameter=query>SELECT "name" FROM users</parameter>'
+            "<parameter=dry_run>true</parameter></function></tool_call>"
+            "<tool_call><function=TodoWrite>"
+            '<parameter=todos>[{"content": "test", "status": "pending"}]'
+            "</parameter></function></tool_call>"
+        )
+
+    def test_streaming_string_missing_end_tag_is_chunk_independent(self):
+        for suffix in (
+            "<parameter=unit>celsius</parameter></function></tool_call>",
+            "</function></tool_call>",
+        ):
+            self._assert_streaming_matches_non_streaming(
+                "<tool_call><function=get_current_weather>"
+                "<parameter=location>\n\nBoston\n\n" + suffix
+            )
 
     # ==================== Parameter Type Tests ====================
 
