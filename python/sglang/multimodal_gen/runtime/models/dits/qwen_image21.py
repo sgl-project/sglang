@@ -102,6 +102,7 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
     rope = torch.polar(torch.ones_like(angles), angles)
     return dict(
+        encoder_seq_len=len(image_slots),
         text_indices=torch.tensor(indices, device=device, dtype=torch.long),
         image_indices=torch.tensor(image_indices, device=device, dtype=torch.long),
         prefix_rope=rope[:prefix_len],
@@ -533,7 +534,9 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
             prefix = None
             if not prefix_caches[sample][0]:
                 prefix = self.txt_in(
-                    encoder_hidden_states[sample : sample + 1]
+                    encoder_hidden_states[
+                        sample : sample + 1, : layout["encoder_seq_len"]
+                    ]
                 ).index_select(1, layout["text_indices"])
                 if condition_latents is not None:
                     prefix[:, layout["image_indices"]] = self.img_in(
