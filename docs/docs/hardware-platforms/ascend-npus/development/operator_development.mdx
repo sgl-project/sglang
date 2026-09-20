@@ -37,7 +37,7 @@ sgl-kernel-npu/
 │       ├── op_host/               # Host-side code (validation, tiling, launch)
 │       │   ├── <op_name>.cpp
 │       │   └── tiling/            # Optional: tiling data
-│       └── op_kernel/             # Device-side code (Ascend C kernel on AICore)
+│       └── op_kernel/             # Device-side code (Ascend C kernel on AI Core)
 │           └── <op_name>_kernel.cpp
 ├── include/
 │   └── sgl_kenel_npu_ops.h        # C++ interface declarations
@@ -155,7 +155,7 @@ extern "C" __global__ __aicore__ void helloworld(
 
 **Key points:**
 
-- Class methods must be marked with `__aicore__`, indicating they run on AICore.
+- Class methods must be marked with `__aicore__`, indicating they run on AI Core.
 - Use `AscendC::TPipe` + `AscendC::TQue` to build a pipeline that overlaps data
   movement and computation.
 - The entry function must be declared `extern "C" __global__ __aicore__`. The
