@@ -16,11 +16,11 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=3600,
-    suite="nightly-acc-8-npu-a5-test",
+    suite="nightly-acc-8-npu-a5",
     nightly=True,
 )
 
-# TODO: Add MIMO_V2_5_PRO_FP4_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py 1
+# TODO: Add MIMO_V2_5_PRO_FP4_MODEL_PATH to test_npu_performance_utils.py and test_ascend_utils.py
 MIMO_V2_5_PRO_FP4_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
 )
