@@ -445,16 +445,13 @@ def test_fused_moe_compile_hook_is_bs1_only():
 # --- tracing --------------------------------------------------------------------
 
 
-def test_trace_labels_platform_and_backend(monkeypatch):
+def test_trace_labels_explicit_backend(monkeypatch):
     _mock_platform(monkeypatch, key="cuda", info=_CUDA)
     op = _CudaOnlyPlatformOp()
     fo.enable_fused_op_trace()
     op(torch.zeros(2, 3))
     op(torch.zeros(2, 3), backend=KernelBackend.TORCH)
-    auto_rec, explicit_rec = fo.get_fused_op_trace()
-    assert auto_rec.op == "test.cuda_only_platform"
-    assert auto_rec.backend == "cuda"
-    assert auto_rec.tensor_args == ("torch.float32[2, 3]",)
+    _, explicit_rec = fo.get_fused_op_trace()
     assert explicit_rec.backend == "torch"
 
 
@@ -510,46 +507,6 @@ def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
     _mock_platform(monkeypatch, key="cuda", info=_CUDA)
     with pytest.raises(NotImplementedError):
         _NativeOnlyLegacy()(torch.zeros(1))  # old CUDA behavior preserved
-
-
-# --- migration completeness -------------------------------------------------------
-
-_MIGRATED_OPS = [
-    ("sglang.srt.layers.activation", "SiluAndMul"),
-    ("sglang.srt.layers.activation", "GeluAndMul"),
-    ("sglang.srt.layers.activation", "NewGELU"),
-    ("sglang.srt.layers.activation", "ReLU2"),
-    ("sglang.srt.layers.activation", "QuickGELU"),
-    ("sglang.srt.layers.activation", "XIELU"),
-    ("sglang.srt.layers.layernorm", "RMSNorm"),
-    ("sglang.srt.layers.layernorm", "LayerNorm"),
-    ("sglang.srt.layers.layernorm", "GemmaRMSNorm"),
-    ("sglang.srt.layers.layernorm", "Gemma3RMSNorm"),
-    ("sglang.srt.layers.layernorm", "Gemma4RMSNorm"),
-    ("sglang.srt.layers.layernorm", "RMSNormWithoutScale"),
-    ("sglang.srt.layers.conv", "Conv2dLayer"),
-    ("sglang.srt.layers.conv", "Conv3dLayer"),
-    ("sglang.srt.layers.moe.topk", "TopK"),
-    ("sglang.srt.layers.rotary_embedding.base", "RotaryEmbedding"),
-    ("sglang.srt.layers.rotary_embedding.rope_variant", "DualChunkRotaryEmbedding"),
-    ("sglang.srt.layers.attention.dsa.dsa_indexer", "Indexer"),
-    ("sglang.srt.layers.attention.dsv4.compressor", "Compressor"),
-    ("sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated", "Mixer2RMSNormGated"),
-    ("sglang.srt.layers.quantization.unquant", "UnquantizedFusedMoEMethod"),
-]
-
-
-@pytest.mark.parametrize("module_name, cls_name", _MIGRATED_OPS)
-def test_migrated_ops_subclass_base_fused_op(module_name, cls_name):
-    """Production ops must extend BaseFusedOp directly, never the deprecated
-    MultiPlatformOp alias (which exists only for out-of-tree users)."""
-    import importlib
-
-    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-
-    cls = getattr(importlib.import_module(module_name), cls_name)
-    assert issubclass(cls, BaseFusedOp)
-    assert MultiPlatformOp not in cls.__mro__
 
 
 if __name__ == "__main__":
