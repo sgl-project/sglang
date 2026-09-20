@@ -57,21 +57,22 @@ def check_pipeline_parallel_compat(
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm is not None:
-        is_dspark_prefill = (
-            cfg.speculative_algorithm.upper() == "DSPARK"
-            and cfg.disaggregation_mode == "prefill"
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.disaggregation_mode == "prefill", (
+            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
         )
-        assert is_dspark_prefill or (
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+        )
+    elif cfg.speculative_algorithm is not None:
+        assert (
             cfg.speculative_algorithm.upper() == "EAGLE"
             and not cfg.enable_multi_layer_eagle
         ), (
             "Pipeline parallelism currently only supports EAGLE "
-            "(non-multi-layer) or DSPARK speculative decoding"
+            "(non-multi-layer) speculative decoding"
         )
-        if is_dspark_prefill:
-            pass
-        elif envs.SGLANG_ENABLE_PP_SPEC.get():
+        if envs.SGLANG_ENABLE_PP_SPEC.get():
             # The aggregate relay carries an EAGLE-shaped tree and only
             # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
             # topk_index / hidden states through RelayPayload; the gated

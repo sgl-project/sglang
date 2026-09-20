@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
 )
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
@@ -37,6 +39,7 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
     _patchify,
     _unpatchify,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -182,6 +185,31 @@ def test_latent_pack_decode_contract():
     torch.testing.assert_close(
         (decoded.float() - shift) * scale / scale + shift, decoded.float()
     )
+
+
+@pytest.mark.parametrize("outputs", [1, 2])
+def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
+    scheduler = object.__new__(Scheduler)
+    config = QwenImage21PipelineConfig()
+    scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    scheduler._batch_admission = SimpleNamespace(enabled=True)
+    assert scheduler._dynamic_batching_enabled()
+    requests = []
+    for i, prompt in enumerate(["short", "a longer prompt"]):
+        params = QwenImage21SamplingParams(
+            prompt=prompt, seed=7 + i * 10, num_outputs_per_prompt=outputs
+        )
+        requests.append(Req(request_id=f"request-{i}", sampling_params=params))
+    merged = scheduler._try_merge_generation_reqs(requests)
+    assert merged.prompt == ["short", "a longer prompt"]
+    assert merged.extra["dynamic_batch_seeds"] == [7, 17]
+    result = torch.arange(outputs * 2).reshape(-1, 1)
+    split = scheduler._split_batched_output(OutputBatch(output=result), requests)
+    assert len(split) == 2
+    torch.testing.assert_close(split[0].output, result[:outputs])
+    torch.testing.assert_close(split[1].output, result[outputs:])
+    requests[1].image_path = "reference.png"
+    assert scheduler._try_merge_generation_reqs(requests) is None
 
 
 @pytest.mark.parametrize("channels", [3, 4])

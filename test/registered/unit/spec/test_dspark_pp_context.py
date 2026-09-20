@@ -300,6 +300,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_context_only_rank_does_not_require_draft_attention_backend(self):
         target_backend = object()
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._is_context_only_pp_prefill_rank = True
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=target_backend)
@@ -311,6 +312,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_lifecycle_only_rank_does_not_allocate_draft_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
+        worker._hosts_draft = True
         worker._is_lifecycle_only_pp_prefill_rank = True
 
         worker.alloc_memory_pool(memory_pool_config=Mock())
@@ -335,6 +337,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
+        worker._hosts_draft = True
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
         worker._is_context_only_pp_prefill_rank = True
@@ -358,6 +361,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_last_pp_prefill_keeps_full_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker._draft_worker = Mock()
+        worker._hosts_draft = True
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
         worker._is_context_only_pp_prefill_rank = False
