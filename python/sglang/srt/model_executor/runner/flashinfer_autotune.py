@@ -58,6 +58,13 @@ def should_run_flashinfer_autotune(
 ) -> bool:
     """Check if flashinfer autotune should be run."""
     mr = model_runner
+    if (
+        mr.ps.pp_size > 1
+        and getattr(mr.model_config.hf_config, "model_type", None) == "deepseek_v41"
+    ):
+        # DSV4.1 PP transports sparse index and candidate state produced by the
+        # preceding stage. A standalone dummy forward cannot synthesize it.
+        return False
     if mr.device != "cuda":
         return False
     if get_exec().kernel.disable_flashinfer_autotune:

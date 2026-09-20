@@ -6,6 +6,7 @@ import pytest
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
+    _requires_eager_dsv41_pp,
     capture_decode_graph,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
@@ -13,6 +14,18 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def test_dsv41_pp_uses_eager_graph_fallback():
+    dsv41_pp = SimpleNamespace(
+        ps=SimpleNamespace(pp_size=4),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        ),
+    )
+    assert _requires_eager_dsv41_pp(dsv41_pp)
+    dsv41_pp.ps.pp_size = 1
+    assert not _requires_eager_dsv41_pp(dsv41_pp)
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():

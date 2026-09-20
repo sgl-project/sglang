@@ -931,12 +931,8 @@ class CommonKVManager(BaseKVManager):
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD layout mismatch "
                     f"({', '.join(mismatched_fields)}): both servers must "
-                    "enable DSpark with the same block size and target/draft KV "
-                    "layout. Upgrade both servers together."
-                )
-            if info.attn_tp_size != self.attn_tp_size:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                    "use the same transfer protocol, draft block size, and "
+                    "compression ratios. Upgrade both servers together."
                 )
 
         if self.dcp_size > 1:

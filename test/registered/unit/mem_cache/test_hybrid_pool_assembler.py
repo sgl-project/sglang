@@ -50,6 +50,46 @@ class _Pool:
 
 
 class TestDeviceAllocEviction(CustomTestCase):
+    def test_low_ratio_replica_loads_before_first_local_consumer(self):
+        import torch
+
+        kv_buffers = [torch.zeros(4, 256, dtype=torch.uint8) for _ in range(2)]
+        index_buffers = [torch.zeros(4, 64, 68, dtype=torch.uint8) for _ in range(2)]
+        pool = SimpleNamespace(
+            start_layer=10,
+            sources_by_ratio={2: [8, 14]},
+            kv_pools={2: SimpleNamespace(kv_buffer=kv_buffers)},
+            index_pools={
+                2: SimpleNamespace(
+                    page_size=64, index_k_with_scale_buffer=index_buffers
+                )
+            },
+        )
+        with (
+            patch.object(hybrid_pool_assembler, "DeepSeekV4PagedHostPool"),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(hybrid_pool_assembler, "_get_allocator_type"),
+            patch.object(
+                hybrid_pool_assembler,
+                "build_pool_entry",
+                side_effect=lambda **kwargs: kwargs,
+            ),
+        ):
+            entries = hybrid_pool_assembler._dsv4_low_ratio_entries(pool, 128, 4, 10)
+
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertEqual(entry["layer_mapping"], {0: 0, 4: 1})
+            mapper = hybrid_pool_assembler._make_layer_mapper(
+                entry["layer_mapping"], 10
+            )
+            self.assertEqual(mapper(0), 0)
+            self.assertEqual(mapper(4), 1)
+
     def test_swa_evicts_only_allocation_shortfall(self):
         cache = MagicMock()
         cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8

@@ -187,6 +187,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if cfg.pp_size > 1 and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.set(True)
+        logger.info(
+            "Using host-resident DeepSeek-V4.1 Engram tables for pipeline "
+            "parallelism to avoid replicating the full table on each PP rank."
+        )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -231,7 +237,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
         ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
