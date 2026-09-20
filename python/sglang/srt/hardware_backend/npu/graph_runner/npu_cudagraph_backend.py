@@ -70,6 +70,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             initializer=self._device_module.set_device,
             initargs=(self._device_id,),
         )
+        # Event of the last replay; the next rebind waits on it so the device is
+        # done reading the host-side seq_lens array before we rewrite it.
+        self._rebind_fence = None
 
     @contextmanager
     def capture_session(self, stream):
@@ -175,11 +178,18 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
+        if self._rebind_fence is not None:
+            self._rebind_fence.synchronize()
+
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
         update_future.result()
         graph.replay()
+
+        fence = self._device_module.Event()
+        fence.record()
+        self._rebind_fence = fence
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
