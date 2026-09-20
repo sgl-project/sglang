@@ -304,9 +304,8 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  # One job over the runner table below: a runner joins the stage by adding a
-  # row. `name:` keeps the per-runner job names that wait-for-jobs matches by
-  # prefix and that check-pr-test-health's h20 carve-out compares against.
+  # A runner joins a stage by adding a row. `name:` keeps the job names
+  # wait-for-jobs matches by prefix and check-pr-test-health carves h20 out of.
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]

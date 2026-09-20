@@ -40,9 +40,8 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
-  # One job over the table below: a runner or a suite joins by adding a row.
-  # `name:` reproduces the job names this workflow published before the table
-  # existed, so required checks and any name-based matching keep resolving.
+  # A runner or a suite joins by adding a row; `name:` reproduces the job names
+  # this workflow published before the table existed.
   jit-kernel-test:
     name: ${{ matrix.job_name }}
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
@@ -63,8 +62,7 @@ jobs:
           - job_name: jit-kernel-multigpu-unit-test
             runner_config: 8-gpu-h200
             suite: base-b-kernel-unit-test-8-gpu-h200
-            # The 8-GPU pool is scarce, so this one does not fast-fail out of a
-            # run that another job already failed.
+            # Alone among these, it has never run the health check.
             skip_health_check: true
           - job_name: jit-kernel-benchmark-test
             runner_config: 1-gpu-large

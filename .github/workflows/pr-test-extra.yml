@@ -160,9 +160,8 @@ jobs:
     # No `secrets: inherit`: this hosted CPU job has no secret consumer.
 
   # =============================================== extra-a / extra-b ===============================================
-  # One job over the (stage, runner_config) table below: a runner joins a stage
-  # by adding a row, and `name:` keeps the per-runner job names the stage
-  # barrier and the fast-fail carve-out match on.
+  # A runner joins a stage by adding a row; `name:` keeps the job names that
+  # wait-for-jobs and check-pr-test-health match on.
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
