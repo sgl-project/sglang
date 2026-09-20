@@ -861,6 +861,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     )
 
     def test_l3_prefetch_uses_bigram_radix_key(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchSubmission,
+        )
         from sglang.srt.mem_cache.utils import get_hash_str
 
         cache, allocator, _ = build_fixture(self.cfg)
@@ -891,23 +894,30 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             def prefetch_rate_limited(self):
                 return False
 
-            def prefetch(
+            def get_prefetch_submission(self, rid):
+                return None
+
+            def submit_prefetch(
                 self,
-                request_id,
-                new_input_tokens,
-                last_hash=None,
-                prefix_keys=None,
-                extra_pools=None,
+                handle,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                matched_prefix_tokens,
+                pool_transfers,
                 assume_stored=False,
             ):
                 self.prefetch_args = (
-                    request_id,
-                    new_input_tokens,
+                    handle,
+                    prefetch_key,
                     last_hash,
                     prefix_keys,
-                    extra_pools,
+                    matched_prefix_tokens,
+                    pool_transfers,
                 )
-                return mock.Mock()
+                return PrefetchSubmission(
+                    operation=mock.Mock(assume_stored=assume_stored)
+                )
 
         controller = FakeCacheController()
         cache.cache_controller = controller
@@ -915,7 +925,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             CacheRequestHandle("req", 0), cache.root_node_handle(), tokens
         )
 
-        _, storage_key, _, _, _ = controller.prefetch_args
+        _, storage_key, _, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
@@ -1010,6 +1020,82 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             _device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
             lock_ref,
         )
+        cache.sanity_check()
+
+    def test_buffer_backup_snapshot_preserves_raw_bigram_key_and_namespace(self):
+        """The raw N+1 bigram tokens, the bigram flag and the (extra_key,
+        cache_salt) namespace all feed the storage hash, so a snapshot that
+        drops any of them backs the node up under a key no prefetch will find.
+        The snapshot also owns its copy of the key: the backup runs detached
+        from the tree, so a caller mutating it must not reach a later one."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        expected_tokens = tuple(tokens)
+        key = RadixKey(tokens, extra_key="adapter-a", cache_salt="tenant-a")
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=key, value=value))
+        leaf_id = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+        snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.key.token_ids, tokens)
+        self.assertTrue(snapshot.key.is_bigram)
+        self.assertEqual(snapshot.key.extra_key, "adapter-a")
+        self.assertEqual(snapshot.key.cache_salt, "tenant-a")
+        self.assertEqual(snapshot.prefix_keys, [])
+
+        snapshot.key.token_ids[0] = -1
+        fresh_snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=True
+        )
+        self.assertEqual(tuple(fresh_snapshot.key.token_ids), expected_tokens)
+
+    def test_sanity_check_reads_buffer_backup_node_id_from_snapshot(self):
+        """A buffer-mode backup entry keeps its node id inside the detached
+        snapshot; sanity_check must read it from there. It used to read
+        ``entry.intent.node_id``, an attribute the intent no longer has, so the
+        idle check raised AttributeError whenever a backup was in flight."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import (
+            BufferModePipeline,
+            _UnifiedBackupIntent,
+            _UnifiedBufferBackupEntry,
+        )
+
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        value = allocator.alloc(len(tokens) - 1)
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        leaf_id = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+        snapshot = cache.tree_core.snapshot_buffer_backup(
+            leaf_id, pass_prefix_keys=False
+        )
+        self.assertIsNotNone(snapshot)
+
+        # The post-launch entry pins its node, as sanity_check requires of
+        # every in-flight backup.
+        lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline.ongoing_write_through = {
+            leaf_id: _UnifiedBufferBackupEntry(
+                intent=_UnifiedBackupIntent(snapshot=snapshot),
+                host_indices=torch.empty(0, dtype=torch.int64),
+                aux_xfers=[],
+                lock_params=lock_params,
+            )
+        }
+        cache.buffer_pipeline = pipeline
+        cache.sanity_check()
+
+        cache.buffer_pipeline = None
+        cache.dec_lock_ref(leaf_id, lock_params)
         cache.sanity_check()
 
 
@@ -1668,9 +1754,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1732,9 +1816,9 @@ class UnifiedRadixCacheSuite:
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
             cache.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+                req, is_insert=True, owned_kv_len=req.owned_kv_len()
             )
-            start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
+            start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:
@@ -1775,9 +1859,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
-            req, is_insert=False, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=False, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -1952,9 +2034,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -3704,7 +3784,7 @@ class UnifiedRadixCacheSuite:
         # Simulate polling check_hicache_events.
         # There will be a sequence of events populated from queue:
         # 1. a storage hit notification (from cc.prefetch_hit_queue).
-        # 2. a HiCacheAck, indicating the copmletion of KV pool read.
+        # 2. a HiCacheAck, indicating the completion of KV pool read.
         # 3. a HiCacheAck, indicating the completion of SWA pool read.
         # 4. a HiCacheACk, idnicating the completion of entire prefetch request.
         # We are going to stop at the exact timing-window between 3 and 4.  So we have to
@@ -4276,8 +4356,9 @@ class UnifiedRadixCacheSuite:
         cons.finish(aborted_rid, CacheRequestOutcome.ABORT)
         self.assertNotIn(aborted_rid.rid, cons.storage_prefetch_retries._pending)
 
-        # A fully-device-matched (empty-suffix) decline also arms the retry:
-        # the device match can evict while the request waits in the queue.
+        # A fully-device-matched (empty-suffix) decline issues no lookup and
+        # arms no retry; a queue-time eviction of that device match is
+        # re-queried at admission with the re-issue budget intact.
         cons.prefetch_from_storage(
             CacheRequestHandle("fully-matched", 0),
             cons.root_node_handle(),
@@ -4285,7 +4366,7 @@ class UnifiedRadixCacheSuite:
             None,
             None,
         )
-        self.assertIn("fully-matched", cons.storage_prefetch_retries._pending)
+        self.assertNotIn("fully-matched", cons.storage_prefetch_retries._pending)
         cons.sanity_check()
 
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
@@ -5115,7 +5196,9 @@ class UnifiedRadixCacheSuite:
                 CacheRequestHandle("subwin-req", 0), cons2.ongoing_prefetch
             )
             self.assertEqual(cons2._prefetch_outcome_stats["declined_too_short"], 1)
-            self.assertIn("subwin-req", cons2.storage_prefetch_retries._pending)
+            # A declined span issues no lookup, so it must not spend the
+            # re-issue budget on polls.
+            self.assertNotIn("subwin-req", cons2.storage_prefetch_retries._pending)
 
             cons2.prefetch_from_storage(
                 CacheRequestHandle("window-req", 0),
@@ -8405,9 +8488,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
-        )
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -9593,6 +9674,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
+        cache.cache_controller.pp_prefetch_decisions = {}
         walk_action = object()
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]
