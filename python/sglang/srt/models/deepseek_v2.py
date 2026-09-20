@@ -70,6 +70,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -2480,6 +2481,33 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
+@contextmanager
+def _temporarily_clear_local_token_count(
+    forward_batch: ForwardBatch, *, enabled: bool
+):
+    """Hide DP-local padding metadata while an operator sees global rows."""
+    saved_num_token_non_padded = forward_batch.num_token_non_padded
+    if enabled:
+        forward_batch.num_token_non_padded = None
+    try:
+        yield
+    finally:
+        forward_batch.num_token_non_padded = saved_num_token_non_padded
+
+
+def _moe_sees_dp_gathered_rows(
+    mlp: nn.Module, layer_scatter_modes: LayerScatterModes
+) -> bool:
+    parallel = get_parallel()
+    return (
+        isinstance(mlp, DeepseekV2MoE)
+        and parallel.enable_dp_attention
+        and parallel.attn_dp_size > 1
+        and get_moe_a2a_backend().is_none()
+        and layer_scatter_modes.mlp_mode == ScatterMode.FULL
+    )
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2712,16 +2740,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+        # The no-A2A DPA path gathers every DP rank's rows before sparse MoE.
+        # num_token_non_padded is local to each DP rank, so forwarding it here
+        # would mask a different subset of the global rows on each TP rank.
+        # The gathered MAX_LEN buffer is already padded consistently; mirror the
+        # DeepSeek-V4 path and suppress this local-only metadata while MoE sees it.
+        mlp_sees_dp_gathered_rows = _moe_sees_dp_gathered_rows(
+            self.mlp, self.layer_scatter_modes
+        )
+        with _temporarily_clear_local_token_count(
+            forward_batch, enabled=mlp_sees_dp_gathered_rows
         ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+            with get_forward().scoped(
+                fuse_mlp_allreduce=fuse_mlp_allreduce,
+                mlp_reduce_scatter=mlp_reduce_scatter,
+            ):
+                with _mlp_ctx:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
