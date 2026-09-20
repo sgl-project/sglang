@@ -363,6 +363,15 @@ class InputValidationStage(PipelineStage):
                 "Dynamic Qwen Image Edit batching currently requires "
                 "conditioning images with the same processed size."
             )
+        vae_image_sizes = batch.vae_image_sizes
+        if vae_image_sizes is not None and (
+            len(vae_image_sizes) != batch.batch_size
+            or len(set(vae_image_sizes)) != 1
+        ):
+            raise ValueError(
+                "Dynamic Qwen Image Edit batching currently requires "
+                "conditioning images with the same VAE encoding size."
+            )
 
     def forward(
         self,

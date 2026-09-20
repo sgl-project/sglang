@@ -104,11 +104,35 @@ def test_dynamic_condition_latents_merge_on_batch_dimension():
 def test_dynamic_batch_condition_images_require_one_equal_size_image_per_prompt():
     batch = SimpleNamespace(
         condition_image=[Image.new("RGB", (32, 32)), Image.new("RGB", (64, 32))],
+        vae_image_sizes=[(1024, 1024), (1024, 512)],
         batch_size=2,
     )
 
     with pytest.raises(ValueError, match="same processed size"):
         InputValidationStage._validate_dynamic_batch_condition_images(batch)
+
+
+def test_dynamic_batch_condition_images_match_vae_encoding_sizes():
+    batch = SimpleNamespace(
+        condition_image=[Image.new("RGB", (32, 32)), Image.new("RGB", (32, 32))],
+        vae_image_sizes=[(1024, 1024), (1024, 960)],
+        batch_size=2,
+    )
+
+    with pytest.raises(ValueError, match="VAE encoding size"):
+        InputValidationStage._validate_dynamic_batch_condition_images(batch)
+
+
+def test_image_batching_helper_keeps_unconditioned_requests_eligible():
+    scheduler = _scheduler()
+    scheduler.server_args.pipeline_config.supports_dynamic_batching_with_image_conditioning = (
+        lambda: True
+    )
+    unconditioned = SimpleNamespace(image_path=None)
+
+    assert scheduler._supports_dynamic_batch_image_conditioning(
+        unconditioned, unconditioned
+    )
 
 
 def test_dynamic_edit_conditioning_builds_one_shape_per_request():
