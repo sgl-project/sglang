@@ -129,10 +129,8 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
-            if prefix:
-                sig = inspect.signature(detector_class)
-                if "prefix" in sig.parameters:
-                    kwargs["prefix"] = prefix
+            if prefix and issubclass(detector_class, ResponseTemplateToolDetector):
+                kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")

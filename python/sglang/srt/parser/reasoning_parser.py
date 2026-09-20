@@ -2279,10 +2279,8 @@ class ReasoningParser:
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
 
-        if prefix:
-            sig = inspect.signature(detector_class)
-            if "prefix" in sig.parameters:
-                kwargs["prefix"] = prefix
+        if prefix and issubclass(detector_class, ResponseTemplateReasoningDetector):
+            kwargs["prefix"] = prefix
 
         self.detector = detector_class(**kwargs)
 

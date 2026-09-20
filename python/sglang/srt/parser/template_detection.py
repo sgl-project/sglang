@@ -885,8 +885,12 @@ def resolve_auto_parsers(server_args) -> None:
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
-        for attr in needs:
-            detected.setdefault(attr, None)
+        for attr, label in (
+            ("reasoning_parser", "reasoning parser"),
+            ("tool_call_parser", "tool-call parser"),
+        ):
+            if attr in needs and attr not in detected:
+                detected[attr] = None
     else:
         for attr, rules, label in (
             ("reasoning_parser", REASONING_PARSER_RULES, "reasoning parser"),

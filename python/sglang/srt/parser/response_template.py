@@ -98,6 +98,14 @@ def resolve_response_template(
     return fallback
 
 
+def configure_response_template_request(request: Any) -> None:
+    """Preserve response-template delimiters during detokenization."""
+    request.skip_special_tokens = False
+    template_kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
+    template_kwargs["spaces_between_special_tokens"] = False
+    request.chat_template_kwargs = template_kwargs
+
+
 class _ReasoningResult:
     """Duck-types `reasoning_parser.StreamingParseResult`."""
 
@@ -360,7 +368,6 @@ class ResponseTemplateStreamAdapter:
 class _ResponseTemplateParserInputMixin:
     """Preserve response-template delimiters until parsing."""
 
-    requires_response_parser_prefix = True
     response_template: dict | None = None
 
     def _load_response_template(
@@ -376,13 +383,6 @@ class _ResponseTemplateParserInputMixin:
             raise ValueError("response_template is required")
         self.response_template = template
         return template, validate_response_template_for_serving(template)
-
-    @staticmethod
-    def configure_request_for_parsing(request: Any) -> None:
-        request.skip_special_tokens = False
-        template_kwargs = dict(getattr(request, "chat_template_kwargs", None) or {})
-        template_kwargs["spaces_between_special_tokens"] = False
-        request.chat_template_kwargs = template_kwargs
 
 
 class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):

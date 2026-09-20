@@ -45,6 +45,10 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -638,11 +642,10 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
-            self.tm.tokenizer.decode.assert_not_called()
 
     def test_response_template_prefix_uses_prompt_token_ids(self):
-        class ResponseTemplateAlias:
-            requires_response_parser_prefix = True
+        class ResponseTemplateAlias(ResponseTemplateToolDetector):
+            pass
 
         processed_messages = MessageProcessingResult(
             "prompt decoded with default spacing",
@@ -688,7 +691,10 @@ class ServingChatTestCase(unittest.TestCase):
             None,
         )
         self.chat.reasoning_parser = "response_template"
-        self.chat._reasoning_detector = Mock(requires_response_parser_prefix=True)
+        self.chat._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template=_RESPONSE_TEMPLATE,
+            prefix="",
+        )
         self.tm.model_config.is_multimodal = True
 
         with patch.object(

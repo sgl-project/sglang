@@ -106,6 +106,11 @@ from sglang.srt.parser.jinja_template_utils import (
     process_content_for_template_format,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    ResponseTemplateToolDetector,
+    configure_response_template_request,
+)
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
@@ -120,12 +125,6 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
-
-
-def _configure_request_for_parsing(request, detector) -> None:
-    configure = getattr(detector, "configure_request_for_parsing", None)
-    if configure is not None:
-        configure(request)
 
 
 def _has_incomplete_tool_call(parser, tool_index: Optional[int] = None) -> bool:
@@ -1300,11 +1299,13 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
     ) -> None:
         tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
-        if getattr(
+        if isinstance(
             self._reasoning_detector,
-            "requires_response_parser_prefix",
-            False,
-        ) or getattr(tool_detector, "requires_response_parser_prefix", False):
+            ResponseTemplateReasoningDetector,
+        ) or (
+            tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        ):
             request._response_parser_prefix = self._response_parser_prefix(
                 adapted_request
             )
@@ -1395,7 +1396,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                _configure_request_for_parsing(request, parser.detector)
+                if isinstance(parser.detector, ResponseTemplateToolDetector):
+                    configure_response_template_request(request)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -2811,7 +2813,8 @@ class OpenAIServingChat(OpenAIServingBase):
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
 
-        _configure_request_for_parsing(request, self._reasoning_detector)
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            configure_response_template_request(request)
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder takes history as ``reasoning_content`` rather
