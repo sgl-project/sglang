@@ -104,6 +104,8 @@ class FusedWanRMSNormSiLU(nn.Module):
                         )
                     except Exception as exc:
                         self._post_gate.on_exception(exc, logger=logger)
+                # Unsupported layouts/dtypes still reuse the native reduction.
+                return F.silu((x / denominator) * self.scale * self.gamma + self.bias)
         # WanRMS_norm.forward (channel-first) + SiLU, same ops in the same
         # order, so the off-path stays bit-identical.
         return F.silu(F.normalize(x, dim=1) * self.scale * self.gamma + self.bias)

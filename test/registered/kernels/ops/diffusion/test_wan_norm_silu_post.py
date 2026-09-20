@@ -187,10 +187,10 @@ class TestWanNormSiLUPost(CustomTestCase):
             )
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 sliced = x[..., ::2]
-                self.assertBitsEqual(
-                    module(sliced),
-                    reference(sliced, module.gamma, module.bias, module.scale),
-                )
+                expected = reference(sliced, module.gamma, module.bias, module.scale)
+                with patch.object(wan.F, "normalize", wraps=F.normalize) as normalize:
+                    self.assertBitsEqual(module(sliced), expected)
+                    normalize.assert_not_called()
                 with patch.object(torch.compiler, "is_compiling", return_value=True):
                     self.assertBitsEqual(
                         module(x), reference(x, module.gamma, module.bias, module.scale)
