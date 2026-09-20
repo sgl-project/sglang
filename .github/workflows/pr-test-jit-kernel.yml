@@ -42,7 +42,9 @@ env:
 jobs:
   # `name:` reproduces the job names this workflow published before the table.
   jit-kernel-test:
-    name: ${{ matrix.job_name }}
+    # The job name is the suite it runs, with the stage prefix swapped for this
+    # workflow's, so a row declares a (suite, runner) pair and nothing else.
+    name: jit-kernel-${{ matrix.suite }}${{ matrix.shard }}
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
     # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
     # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
@@ -50,28 +52,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - job_name: jit-kernel-unit-test (0)
+          - suite: unit-test-1-gpu-large
             runner_config: 1-gpu-large
-            suite: base-b-kernel-unit-test-1-gpu-large
+            shard: " (0)"
             suite_args: --auto-partition-id 0 --auto-partition-size 2 --fork-worker-batch-size 20
-          - job_name: jit-kernel-unit-test (1)
+          - suite: unit-test-1-gpu-large
             runner_config: 1-gpu-large
-            suite: base-b-kernel-unit-test-1-gpu-large
+            shard: " (1)"
             suite_args: --auto-partition-id 1 --auto-partition-size 2 --fork-worker-batch-size 20
-          - job_name: jit-kernel-multigpu-unit-test
+          - suite: unit-test-1-gpu-small
+            runner_config: 1-gpu-small
+          - suite: unit-test-4-gpu-b200
+            runner_config: 4-gpu-b200
+          - suite: unit-test-8-gpu-h200
             runner_config: 8-gpu-h200
-            suite: base-b-kernel-unit-test-8-gpu-h200
             # Alone among these, it has never run the health check.
             skip_health_check: true
-          - job_name: jit-kernel-unit-test-1-gpu-small
-            runner_config: 1-gpu-small
-            suite: base-b-kernel-unit-test-1-gpu-small
-          - job_name: jit-kernel-benchmark-test
+          - suite: benchmark-test-1-gpu-large
             runner_config: 1-gpu-large
-            suite: base-b-kernel-benchmark-test-1-gpu-large
-          - job_name: jit-kernel-b200-test
-            runner_config: 4-gpu-b200
-            suite: base-b-kernel-unit-test-4-gpu-b200
     runs-on: ${{ fromJson(inputs.runs_on_map)[matrix.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -111,4 +109,4 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite ${{ matrix.suite }} ${{ matrix.suite_args }}
+          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }}
