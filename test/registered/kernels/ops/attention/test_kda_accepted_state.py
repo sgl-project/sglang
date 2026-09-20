@@ -454,7 +454,9 @@ def test_allocator_release_does_not_retain_pending_scratch(boundary):
     )
     rows = pool.alloc_rows(1)
     slots = pool.mamba_allocator.alloc(1)
-    pool.req_index_to_mamba_index_mapping[rows] = slots
+    pool.req_index_to_mamba_index_mapping[rows] = slots.to(
+        pool.req_index_to_mamba_index_mapping.dtype
+    )
     cache = pool.get_speculative_mamba2_params_all_layers()
     state = KDAAcceptedState(cache.temporal, cache.intermediate_ssm)
     pool.mamba_pool.kda_accepted_state = state
