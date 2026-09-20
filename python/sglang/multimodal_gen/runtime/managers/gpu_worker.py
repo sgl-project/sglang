@@ -706,6 +706,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
+                # the early return bypasses the success-path release below
+                self._release_request_staging()
                 return result
 
             output_batch = self._to_output_batch(result)
