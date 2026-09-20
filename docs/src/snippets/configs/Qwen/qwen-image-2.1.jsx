@@ -55,7 +55,7 @@ const config = {
           id: "offload", label: "CPU offload",
           flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
             && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
-            ? ["--performance-mode manual", "--component-residency text_encoder=layerwise-offload", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            ? ["--performance-mode manual", "--component-residency text_encoder=layerwise-offload"]
             : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
@@ -211,7 +211,7 @@ const config = {
         {
           id: "bcg", label: "Breakable CUDA Graph",
           flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
-          soft: true, softReason: "A 1024px H200 server captured its warmup graph, but tested requests fell back to eager because condition-prefix shapes differed.",
+          soft: true, softReason: "Unmatched condition-prefix shapes run eagerly. Keep eager execution for the recommended recipes.",
           description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
         },
       ],
