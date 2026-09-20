@@ -2675,6 +2675,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
+                attention_backend=None,
+                decode_attention_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2781,6 +2783,29 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
             )
+        )
+        # Kimi K3's FlashKDA path falls back to Triton for tracked prefill
+        # states, so it supports the ping-pong extra-buffer strategy.
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="flashkda"),
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+            )
+        )
+        # The mamba pass runs before FlashMLA snaps page_size to 64. With PP
+        # already disabling overlap, its explicit decode backend must still
+        # select extra_buffer rather than the page_size=1-only no_buffer mode.
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "KimiK3ForConditionalGeneration",
+                    disable_overlap_schedule=True,
+                    page_size=1,
+                    linear_attn_backend="flashkda",
+                    decode_attention_backend="flashmla",
+                )
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
         )
 
     def test_mamba_radix_cache_resolution_reads_registry_specs(self):
