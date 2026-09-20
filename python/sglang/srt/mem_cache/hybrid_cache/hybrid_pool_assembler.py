@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
-import msgspec
-
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -21,13 +19,22 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost, DSAIndexerStateDesc
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    dsa_indexer_state_decl,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.state_spec import (
+    HostStateDecl,
+    HostStatePlan,
+    LayerBinding,
+    StateKind,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
@@ -1138,11 +1145,162 @@ def build_hybrid_mamba_swa_stack(
     return host_pool_group, cache_controller
 
 
-def build_anchor_sidecar_stack(
+class DeclaredStack(NamedTuple):
+    host_pool_group: HostPoolGroup
+    cache_controller: HybridCacheController
+    plans: tuple[HostStatePlan, ...]
+
+    @property
+    def sidecars(self) -> list[SidecarPoolSpec]:
+        return [p.decl.sidecar_spec() for p in self.plans if not p.decl.is_primary]
+
+
+def _plan_declared_states(
+    *,
+    decls: tuple[HostStateDecl, ...],
+    device_pool: Any,
+    full_layer_mapping: dict[int, int],
+    transfer_layer_num: int,
+    packed_draft_device_pools: tuple[Any, ...],
+) -> tuple[HostStatePlan, ...]:
+    names = [d.name for d in decls]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate host state names: {names}")
+    primaries = [d for d in decls if d.is_primary]
+    if len(primaries) != 1 or primaries[0].kind is not StateKind.KV:
+        raise ValueError(
+            f"expected exactly one primary KV state, got {[d.name for d in primaries]}"
+        )
+    for d in decls:
+        for ref in (d.index_source, d.layout_source):
+            if ref is not None and ref not in names:
+                raise ValueError(f"{d.name} references undeclared state {ref}")
+    layers = LayerBinding(
+        transfer_to_device=full_layer_mapping, transfer_layer_num=transfer_layer_num
+    )
+    return tuple(
+        HostStatePlan(
+            decl=d,
+            device_pool=device_pool,
+            layers=layers,
+            packed_draft_device_pools=packed_draft_device_pools,
+        )
+        for d in decls
+    )
+
+
+def assemble_declared_stack(
     *,
     params: CacheInitParams,
     kv_pool: Any,
-    indexer_desc: DSAIndexerStateDesc,
+    decls: tuple[HostStateDecl, ...],
+    full_layer_mapping: dict[int, int],
+    load_cache_event,
+    storage_backend: Optional[str],
+    use_mla: bool,
+    override_kv_cache_dim: Optional[int] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> DeclaredStack:
+    """Build the anchor KV mirror plus every declared dependent state.
+
+    Packed MTP drafts keep the pre-declaration path: tail layers appended to
+    each mirror and remapped by the controller. Separate drafts are not built
+    here.
+    """
+    transfer_layer_num = len(full_layer_mapping)
+    mtp_draft_device_pools = tuple(
+        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+    )
+    # Expose packed MTP tail layers to the controller's flat transfer builder.
+    if mtp_draft_device_pools:
+        full_layer_mapping = _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
+    plans = _plan_declared_states(
+        decls=decls,
+        device_pool=kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+        packed_draft_device_pools=mtp_draft_device_pools,
+    )
+
+    # Mirrors in layout-dependency order; entries in declaration order.
+    mirrors: dict[PoolName, Any] = {}
+    pending = list(plans)
+    while pending:
+        ready = [
+            p
+            for p in pending
+            if p.decl.layout_source is None or p.decl.layout_source in mirrors
+        ]
+        if not ready:
+            raise ValueError(
+                f"unresolvable layout_source chain: {[p.decl.name for p in pending]}"
+            )
+        for plan in ready:
+            decl = plan.decl
+            if decl.is_primary:
+                mirrors[decl.name] = build_kv_host_pool(
+                    kv_pool=kv_pool,
+                    page_size=params.page_size,
+                    use_mla=use_mla,
+                    override_kv_cache_dim=override_kv_cache_dim,
+                    mtp_draft_device_pools=mtp_draft_device_pools,
+                )
+            else:
+                mirrors[decl.name] = decl.mirror.build(
+                    decl=decl,
+                    device_pool=plan.device_pool,
+                    anchor_host=mirrors[decl.layout_source],
+                    allocator_type=_get_allocator_type(),
+                )
+            pending.remove(plan)
+    entries = [
+        build_pool_entry(
+            name=plan.decl.name,
+            host_pool=mirrors[plan.decl.name],
+            device_pool=plan.device_pool,
+            layer_mapping=plan.layers.transfer_to_device,
+            transfer_layer_num=plan.layers.transfer_layer_num,
+            is_anchor=plan.decl.is_primary,
+            packed_draft_device_pools=plan.packed_draft_device_pools,
+        )
+        for plan in plans
+    ]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
+    )
+    return DeclaredStack(host_pool_group, cache_controller, plans)
+
+
+def _legacy_build_anchor_sidecar_stack(
+    *,
+    params: CacheInitParams,
+    kv_pool: Any,
+    indexer_decl: HostStateDecl,
     full_layer_mapping: dict[int, int],
     load_cache_event,
     storage_backend: Optional[str],
@@ -1153,6 +1311,8 @@ def build_anchor_sidecar_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    """Pre-declaration DSA assembly, kept only as the parity oracle for
+    assemble_declared_stack; removed once every DSA path is migrated."""
     transfer_layer_num = len(full_layer_mapping)
     mtp_draft_device_pools = tuple(
         pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
@@ -1165,12 +1325,11 @@ def build_anchor_sidecar_stack(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
     sidecar_host_pool = DSAIndexerPoolHost(
-        indexer_desc,
+        indexer_decl,
         kv_pool,
         kv_host_pool,
         allocator_type=_get_allocator_type(),
     )
-    # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
@@ -1189,7 +1348,7 @@ def build_anchor_sidecar_stack(
             packed_draft_device_pools=mtp_draft_device_pools,
         ),
         build_pool_entry(
-            name=indexer_desc.pool_name,
+            name=indexer_decl.name,
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
@@ -1301,22 +1460,19 @@ def build_full_draft_pools(
     ]
 
     if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        # Separate draft indexer: its own host mirror, but transfer indices
-        # still follow the target KV anchor.
-        indexer_desc = msgspec.structs.replace(
-            DSAIndexerStateDesc.from_device_pool(pool),
-            pool_name=PoolName.DRAFT_INDEXER,
-        )
+        # Separate draft indexer: its own host mirror laid out on the draft KV
+        # mirror, but transfer indices still follow the target KV anchor.
+        indexer_decl = dsa_indexer_state_decl(pool, name=PoolName.DRAFT_INDEXER)
         indexer_host_pool = DSAIndexerPoolHost(
-            indexer_desc,
+            indexer_decl,
             pool,
             draft_host_pool,
             allocator_type=_get_allocator_type(),
         )
-        specs.append(indexer_desc.sidecar_spec())
+        specs.append(indexer_decl.sidecar_spec())
         entries.append(
             build_pool_entry(
-                name=indexer_desc.pool_name,
+                name=indexer_decl.name,
                 host_pool=indexer_host_pool,
                 device_pool=pool,
                 layer_mapping=draft_layer_mapping,
@@ -1803,11 +1959,10 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
-        indexer_desc = DSAIndexerStateDesc.from_device_pool(full_kv_pool)
-        host_pool_group, cache_controller = build_anchor_sidecar_stack(
+        stack = assemble_declared_stack(
             params=params,
             kv_pool=full_kv_pool,
-            indexer_desc=indexer_desc,
+            decls=full_kv_pool.host_states(),
             full_layer_mapping=full_layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -1819,14 +1974,14 @@ class _DsaStrategy(StackStrategy):
             enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
-            host_pool_group=host_pool_group,
-            cache_controller=cache_controller,
+            host_pool_group=stack.host_pool_group,
+            cache_controller=stack.cache_controller,
             component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.FULL: stack.host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[indexer_desc.sidecar_spec()],
+            sidecars=stack.sidecars,
             transfer_layer_num=len(full_layer_mapping),
-            pools_desc="KV + INDEXER",
+            pools_desc=" + ".join(p.decl.name.value.upper() for p in stack.plans),
         )
 
 
@@ -1977,6 +2132,40 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
     )
 
 
+# Strategies that assemble from host_states(), so every declared state has an
+# entry by construction; a miss here is a bug, not an unsupported combination.
+_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy,)
+
+
+def _declaring_pool(kvcache: Any) -> Optional[Any]:
+    """The pool whose host_states() the stack must satisfy, or None."""
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+
+    pool = kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
+    return pool if isinstance(pool, DSATokenToKVPool) else None
+
+
+def _verify_declared_states(
+    kvcache: Any, result: StackBuildResult, strategy: StackStrategy
+) -> None:
+    pool = _declaring_pool(kvcache)
+    if pool is None:
+        return
+    entries = result.host_pool_group.entry_map
+    missing = [d.name.value for d in pool.host_states() if d.name not in entries]
+    if not missing:
+        return
+    msg = (
+        f"{type(pool).__name__} declares host states {missing} that "
+        f"{type(strategy).__name__} did not assemble"
+    )
+    if isinstance(strategy, _DECLARATION_VERIFIED_STRATEGIES):
+        raise ValueError(msg)
+    # Pre-declaration strategies: restoring KV without these states corrupts
+    # sparse attention after a host hit. Loud until the path is migrated.
+    logger.error("%s; host restore of these states is unsupported on this path", msg)
+
+
 def _apply_stack_result(
     cache: UnifiedRadixCache,
     kvcache: Any,
@@ -2034,6 +2223,7 @@ def attach_hybrid_pool_to_unified_cache(
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
+        _verify_declared_states(kvcache, result, strategy)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")
@@ -2219,10 +2409,10 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
-        host_pool_group, cache_controller = build_anchor_sidecar_stack(
+        stack = assemble_declared_stack(
             params=params,
             kv_pool=kv,
-            indexer_desc=DSAIndexerStateDesc.from_device_pool(kv),
+            decls=kv.host_states(),
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
             storage_backend=get_memory().hicache_storage_backend,
@@ -2232,6 +2422,10 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             model_name=get_serving().served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
+        )
+        host_pool_group, cache_controller = (
+            stack.host_pool_group,
+            stack.cache_controller,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

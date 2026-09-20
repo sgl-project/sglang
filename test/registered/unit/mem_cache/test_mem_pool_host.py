@@ -14,7 +14,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost, DSAIndexerStateDesc
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    dsa_indexer_state_decl,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -329,29 +332,12 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 2)
 
 
-class TestDSAIndexerStateDesc(CustomTestCase):
-    """The desc is the single source of indexer host bytes; the mirror must not
-    re-derive them."""
+class TestDSAIndexerStateDecl(CustomTestCase):
+    """The declaration is the single source of indexer host bytes; the mirror
+    must not re-derive them."""
 
-    def _desc(self):
-        return DSAIndexerStateDesc(
-            index_head_dim=128, quant_block_size=128, dtype=torch.uint8
-        )
-
-    def test_host_bytes_match_observed_allocation(self):
-        # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
-        # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
-        desc = self._desc()
-        self.assertEqual(desc.token_bytes_per_layer, 132)
-        self.assertEqual(desc.page_stride_bytes(64), 8448)
-        self.assertEqual(
-            desc.host_bytes(page_num=284256, layer_num=5, page_size=64),
-            12006973440,
-        )
-
-    def test_mirror_consumes_desc(self):
-        desc = self._desc()
-        stub = SimpleNamespace(
+    def _stub(self):
+        return SimpleNamespace(
             layer_num=5,
             layer_shard_enabled=False,
             store_dtype=torch.bfloat16,
@@ -360,7 +346,25 @@ class TestDSAIndexerStateDesc(CustomTestCase):
             end_layer=5,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
+            index_head_dim=128,
+            quant_block_size=128,
         )
+
+    def test_host_bytes_match_observed_allocation(self):
+        # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
+        # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
+        desc = dsa_indexer_state_decl(self._stub()).layout
+        self.assertEqual(desc.bytes_per_row, 132)
+        self.assertEqual(desc.page_stride_bytes(64), 8448)
+        self.assertEqual(
+            desc.host_bytes(page_num=284256, layer_num=5, page_size=64),
+            12006973440,
+        )
+
+    def test_mirror_consumes_decl(self):
+        stub = self._stub()
+        decl = dsa_indexer_state_decl(stub)
+        desc = decl.layout
         anchor = MLATokenToKVPoolHost(
             stub,
             host_to_device_ratio=2,
@@ -370,10 +374,10 @@ class TestDSAIndexerStateDesc(CustomTestCase):
             pin_memory=False,
             is_dummy=True,
         )
-        mirror = DSAIndexerPoolHost(desc, stub, anchor, pin_memory=False, is_dummy=True)
+        mirror = DSAIndexerPoolHost(decl, stub, anchor, pin_memory=False, is_dummy=True)
         self.assertEqual(mirror.layout, anchor.layout)
         self.assertEqual(mirror.indexer_page_stride_size, desc.page_stride_bytes(64))
-        self.assertEqual(mirror.get_size_per_token(), desc.token_bytes_per_layer * 5)
+        self.assertEqual(mirror.get_size_per_token(), desc.bytes_per_row * 5)
         self.assertEqual(
             desc.host_bytes(page_num=anchor.page_num, layer_num=5, page_size=64),
             anchor.page_num * mirror.indexer_layout_dim,

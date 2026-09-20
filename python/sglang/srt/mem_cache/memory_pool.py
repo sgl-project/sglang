@@ -4913,6 +4913,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
+    def host_states(self):
+        """States HiCache must mirror for this pool: KV plus the indexer sidecar."""
+        # pool_host imports this module; resolve the mirror side lazily.
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            dsa_indexer_state_decl,
+            dsa_kv_state_decl,
+        )
+
+        return (dsa_kv_state_decl(self), dsa_indexer_state_decl(self))
+
     @property
     def index_k_with_scale_buffer(self):
         # Preserve direct HiCache access while storage lives behind the facade.

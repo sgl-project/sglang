@@ -4,20 +4,28 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    StackBuildResult,
+    _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _legacy_build_anchor_sidecar_stack,
     _MambaStrategy,
     _MambaSwaStrategy,
     _split_hicache_size,
     _SwaStrategy,
+    _verify_declared_states,
+    assemble_declared_stack,
     build_full_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerStateDesc
+from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host.state_spec import HostStateDecl
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -240,7 +248,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         seen = {}
 
         def fake_indexer_host(desc, device_pool, anchor_host, *, allocator_type):
-            self.assertIsInstance(desc, DSAIndexerStateDesc)
+            self.assertIsInstance(desc, HostStateDecl)
             self.assertIs(device_pool, draft_kv_pool)
             self.assertIs(anchor_host, draft_host_pool)
             seen["desc"] = desc
@@ -264,10 +272,170 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 tree_cache=tree_cache,
             )
 
-        self.assertEqual(seen["desc"].pool_name, PoolName.DRAFT_INDEXER)
-        self.assertEqual(seen["desc"].anchor_pool, PoolName.KV)
+        self.assertEqual(seen["desc"].name, PoolName.DRAFT_INDEXER)
+        self.assertEqual(seen["desc"].index_source, PoolName.KV)
         self.assertEqual(specs[1], seen["desc"].sidecar_spec())
         self.assertEqual(entries[1].name, PoolName.DRAFT_INDEXER)
+
+
+def _dsa_pool_stub(*, layer_num: int, size: int = 4096):
+    pool = object.__new__(DSATokenToKVPool)
+    pool.layer_num = layer_num
+    pool.size = size
+    pool.start_layer = 0
+    pool.end_layer = layer_num - 1
+    pool.layer_shard_enabled = False
+    pool.store_dtype = torch.bfloat16
+    pool.kv_cache_dim = 576
+    pool.index_head_dim = 128
+    pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
+    return pool
+
+
+def _fake_mirror(layer_num: int):
+    return SimpleNamespace(
+        layer_num=layer_num,
+        layout="page_first",
+        page_size=64,
+        device="cpu",
+        size=8192,
+        logical_size=8192,
+        page_num=128,
+        mtp_draft_device_pools=(),
+        can_use_write_back_jit=False,
+    )
+
+
+def _entry_shape(group, transfer_layer_num):
+    """Everything the controller reads from a HostPoolGroup, in comparable form."""
+    return [
+        (
+            entry.name,
+            entry.is_primary_index_anchor,
+            id(entry.device_pool),
+            tuple(id(p) for p in entry.packed_draft_device_pools),
+            tuple(entry.layer_mapper(i) for i in range(-1, transfer_layer_num + 2)),
+        )
+        for entry in group.entries
+    ]
+
+
+class TestDeclaredStackParity(CustomTestCase):
+    """assemble_declared_stack must produce the same entries, layer mapping and
+    sidecars as the pre-declaration DSA assembly it replaces, with and without
+    packed MTP drafts."""
+
+    def _run(self, builder, *, pool, params, **kw):
+        anchors = []
+
+        def fake_kv_host(**kwargs):
+            anchors.append(kwargs)
+            return _fake_mirror(pool.layer_num + len(params.mtp_draft_device_pools))
+
+        def fake_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+            return _fake_mirror(anchor_host.layer_num)
+
+        with (
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", fake_kv_host),
+            patch.object(
+                hybrid_pool_assembler, "DSAIndexerPoolHost", fake_indexer_host
+            ),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", fake_indexer_host),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            out = builder(
+                params=params,
+                kv_pool=pool,
+                full_layer_mapping={i: i for i in range(pool.layer_num)},
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=True,
+                override_kv_cache_dim=pool.kv_cache_dim,
+                **kw,
+            )
+        return out, anchors
+
+    def test_matches_legacy_assembly(self):
+        for draft_layers in (0, 1):
+            with self.subTest(draft_layers=draft_layers):
+                pool = _dsa_pool_stub(layer_num=3)
+                drafts = tuple(
+                    SimpleNamespace(index_k_with_scale_buffer=[object()])
+                    for _ in range(draft_layers)
+                )
+                params = SimpleNamespace(
+                    page_size=64,
+                    mtp_draft_device_pools=drafts,
+                    token_to_kv_pool_allocator=None,
+                    tp_cache_group=None,
+                    attn_cp_cache_group=None,
+                    attn_tp_cache_group=None,
+                    pp_cache_group=None,
+                )
+                from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_state_decl
+
+                (legacy_group, _), legacy_anchor = self._run(
+                    _legacy_build_anchor_sidecar_stack,
+                    pool=pool,
+                    params=params,
+                    indexer_decl=dsa_indexer_state_decl(pool),
+                )
+                stack, new_anchor = self._run(
+                    assemble_declared_stack,
+                    pool=pool,
+                    params=params,
+                    decls=pool.host_states(),
+                )
+                transfer_layer_num = pool.layer_num + draft_layers
+                self.assertEqual(legacy_anchor, new_anchor)
+                self.assertEqual(
+                    _entry_shape(stack.host_pool_group, transfer_layer_num),
+                    _entry_shape(legacy_group, transfer_layer_num),
+                )
+                self.assertEqual(
+                    stack.sidecars, [dsa_indexer_state_decl(pool).sidecar_spec()]
+                )
+
+
+class TestDeclaredStateVerification(CustomTestCase):
+    def _result_with(self, *names):
+        group = SimpleNamespace(entry_map={n: object() for n in names})
+        return StackBuildResult(
+            host_pool_group=group, cache_controller=None, component_host_pools={}
+        )
+
+    def test_unmigrated_strategy_logs_missing_indexer(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
+            _verify_declared_states(
+                pool, self._result_with(PoolName.KV), _MambaStrategy()
+            )
+        self.assertIn("indexer", logs.output[0])
+
+    def test_migrated_strategy_raises_on_missing_indexer(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        with self.assertRaisesRegex(ValueError, "indexer"):
+            _verify_declared_states(
+                pool, self._result_with(PoolName.KV), _DsaStrategy()
+            )
+
+    def test_complete_stack_passes_silently(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        _verify_declared_states(
+            pool, self._result_with(PoolName.KV, PoolName.INDEXER), _DsaStrategy()
+        )
 
 
 if __name__ == "__main__":

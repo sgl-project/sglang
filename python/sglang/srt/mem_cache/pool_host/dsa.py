@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-import msgspec
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
@@ -16,11 +15,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    SidecarPoolSpec,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -31,6 +26,12 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+)
+from sglang.srt.mem_cache.pool_host.state_spec import (
+    HostStateDecl,
+    RowFamily,
+    StateKind,
+    StateLayout,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -53,43 +54,61 @@ if _is_cuda or _is_hip:
 logger = logging.getLogger(__name__)
 
 
-class DSAIndexerStateDesc(msgspec.Struct, frozen=True, kw_only=True):
-    """Indexer state riding on the full-KV anchor pages; single source of its
-    host byte facts and sidecar identity for mirror, entry and spec."""
+def dsa_indexer_bytes_per_token_per_layer(
+    index_head_dim: int, quant_block_size: int
+) -> int:
+    # packed index keys plus one fp32 scale per quant block, stored as uint8
+    elems = index_head_dim + index_head_dim // quant_block_size * 4
+    return elems * DSATokenToKVPool.index_k_with_scale_buffer_dtype.itemsize
 
-    index_head_dim: int
-    quant_block_size: int
-    dtype: torch.dtype
-    pool_name: PoolName = PoolName.INDEXER
-    anchor_pool: PoolName = PoolName.KV
-    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
-    @classmethod
-    def from_device_pool(cls, pool: DSATokenToKVPool) -> DSAIndexerStateDesc:
-        return cls(
-            index_head_dim=pool.index_head_dim,
-            quant_block_size=pool.quant_block_size,
+class DSAIndexerMirror:
+    def build(
+        self,
+        *,
+        decl: HostStateDecl,
+        device_pool: DSATokenToKVPool,
+        anchor_host: MLATokenToKVPoolHost,
+        allocator_type: str,
+    ) -> DSAIndexerPoolHost:
+        return DSAIndexerPoolHost(
+            decl, device_pool, anchor_host, allocator_type=allocator_type
+        )
+
+
+def dsa_kv_state_decl(pool: DSATokenToKVPool) -> HostStateDecl:
+    return HostStateDecl(
+        name=PoolName.KV,
+        kind=StateKind.KV,
+        index_source=None,
+        layout_source=None,
+        layout=StateLayout(
+            row_family=RowFamily.TOKEN_ROWS,
+            bytes_per_row=pool.kv_cache_dim * pool.store_dtype.itemsize,
+            dtype=pool.store_dtype,
+        ),
+        mirror=None,
+    )
+
+
+def dsa_indexer_state_decl(
+    pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
+) -> HostStateDecl:
+    """Indexer state riding on the full-KV pages: indices and layout both follow KV."""
+    return HostStateDecl(
+        name=name,
+        kind=StateKind.INDEXER,
+        index_source=PoolName.KV,
+        layout_source=PoolName.KV,
+        layout=StateLayout(
+            row_family=RowFamily.TOKEN_ROWS,
+            bytes_per_row=dsa_indexer_bytes_per_token_per_layer(
+                pool.index_head_dim, pool.quant_block_size
+            ),
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
-        )
-
-    @property
-    def token_bytes_per_layer(self) -> int:
-        # packed index keys plus one fp32 scale per quant block
-        elems = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
-        return elems * self.dtype.itemsize
-
-    def page_stride_bytes(self, page_size: int) -> int:
-        return self.token_bytes_per_layer * page_size
-
-    def host_bytes(self, *, page_num: int, layer_num: int, page_size: int) -> int:
-        return page_num * layer_num * self.page_stride_bytes(page_size)
-
-    def sidecar_spec(self) -> SidecarPoolSpec:
-        return SidecarPoolSpec(
-            pool_name=self.pool_name,
-            indices_from_pool=self.anchor_pool,
-            hit_policy=self.hit_policy,
-        )
+        ),
+        mirror=DSAIndexerMirror(),
+    )
 
 
 class DSAIndexerPoolHost(HostKVCache):
@@ -99,7 +118,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def __init__(
         self,
-        desc: DSAIndexerStateDesc,
+        decl: HostStateDecl,
         device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         *,
@@ -109,7 +128,8 @@ class DSAIndexerPoolHost(HostKVCache):
         is_dummy: bool = False,
     ):
         self._is_dummy = is_dummy
-        self.desc = desc
+        self.decl = decl
+        desc = decl.layout
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = anchor_host.layout
@@ -131,7 +151,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.indexer_page_stride_size = desc.page_stride_bytes(self.page_size)
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = desc.token_bytes_per_layer * self.layer_num
+        self.size_per_token = desc.bytes_per_row * self.layer_num
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
@@ -181,7 +201,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.clear()
 
     def get_size_per_token(self):
-        return self.desc.token_bytes_per_layer * self.layer_num
+        return self.decl.layout.bytes_per_row * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
