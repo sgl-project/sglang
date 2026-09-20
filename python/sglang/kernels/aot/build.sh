@@ -46,6 +46,9 @@ if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
     --use
     --bootstrap
   )
+  if [ -n "${BUILDKIT_DRIVER_OPT:-}" ]; then
+    CREATE_ARGS+=(--driver-opt "${BUILDKIT_DRIVER_OPT}")
+  fi
   if [ -n "${BUILDKITD_CONFIG:-}" ]; then
     CREATE_ARGS+=(--buildkitd-config "${BUILDKITD_CONFIG}")
   fi

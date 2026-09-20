@@ -71,6 +71,9 @@ jobs:
           chmod +x scripts/ci/cleanup_build_runner_disk.sh
           scripts/ci/cleanup_build_runner_disk.sh --required-gb 50
           cat > "${BUILDKITD_CONFIG}" <<'EOF'
+          [registry."docker.io"]
+            mirrors = ["127.0.0.1:5000"]
+
           [worker.oci]
             gc = true
             reservedSpace = "5GB"
@@ -97,6 +100,7 @@ jobs:
           NVCC_THREADS: ${{ inputs.nvcc_threads }}
           USE_CCACHE: "0"
           USE_LOCAL_BUILDX_CACHE: "0"
+          BUILDKIT_DRIVER_OPT: "network=host"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
