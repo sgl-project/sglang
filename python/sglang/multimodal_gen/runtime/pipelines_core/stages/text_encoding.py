@@ -165,8 +165,6 @@ class TextEncodingStage(ConditionEncodingStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
-        self._negative_text_cache_key = None
-        self._negative_text_cache_value = None
         self._dp_choice_logged = False
 
     def component_uses(
@@ -189,100 +187,14 @@ class TextEncodingStage(ConditionEncodingStage):
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
-        """Get the cached text embedding result or compute
-
-        this is a one-slot cache for the model-default negative prompt:
-        most requests don't override the negative prompt, the cache hit rate is considerably high
-
-        invariant: hit/miss must match across ranks -- a miss runs encode_text,
-        which may issue collectives (folding, dp encoding), so a split would
-        deadlock; keep any future eviction rank-global
-        """
-        negative_cache_key = self._build_negative_text_cache_key(
-            batch, server_args, all_indices
-        )
-        cached_negative = self._get_cached_negative_text_embedding(negative_cache_key)
-        if cached_negative is not None:
-            return cached_negative
-
-        negative_text_outputs = self.encode_text(
+        """Encode negative conditioning through the shared encoder cache."""
+        return self.encode_text(
             batch.negative_prompt,
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            max_length=batch.max_sequence_length,
         )
-        self._maybe_cache_negative_text_embedding(
-            negative_cache_key, negative_text_outputs
-        )
-        return negative_text_outputs
-
-    def _should_cache_negative_text_embedding(
-        self, batch: Req, server_args: ServerArgs
-    ) -> bool:
-        if not batch.is_warmup:
-            return True
-        return self._uses_model_default_negative_prompt(batch, server_args)
-
-    def _get_cached_negative_text_embedding(self, negative_cache_key):
-        if negative_cache_key is None:
-            return None
-        if self._negative_text_cache_key == negative_cache_key:
-            return self._negative_text_cache_value
-        return None
-
-    def _maybe_cache_negative_text_embedding(
-        self,
-        negative_cache_key,
-        negative_text_outputs,
-    ) -> None:
-
-        # skip caching if None
-        if negative_cache_key is None:
-            return
-        self._negative_text_cache_key = negative_cache_key
-        self._negative_text_cache_value = tuple(
-            tuple(value) for value in negative_text_outputs
-        )
-
-    def _build_negative_text_cache_key(
-        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
-    ):
-        """if the current req doesn't worth caching, returns None"""
-        # skip if we don't cache for current req
-        if not self._should_cache_negative_text_embedding(batch, server_args):
-            return None
-
-        # Negative text encoding changes when the template or max length changes,
-        # even if the visible negative prompt string is the same.
-        return (
-            tuple(encoder_indices),
-            self.freeze_for_dedup(batch.negative_prompt),
-            self.freeze_for_dedup(batch.prompt_template),
-            batch.max_sequence_length,
-        )
-
-    def _uses_model_default_negative_prompt(
-        self, batch: Req, server_args: ServerArgs
-    ) -> bool:
-        default_negative_prompt = self._get_model_default_negative_prompt(server_args)
-        if default_negative_prompt is None:
-            return False
-        return self._normalize_negative_prompt_for_default_match(
-            batch.negative_prompt
-        ) == self._normalize_negative_prompt_for_default_match(default_negative_prompt)
-
-    def _get_model_default_negative_prompt(self, server_args: ServerArgs) -> str | None:
-        return get_model_default_negative_prompt(
-            server_args.model_path,
-            server_args.backend,
-            server_args.model_id,
-        )
-
-    @staticmethod
-    def _normalize_negative_prompt_for_default_match(value):
-        if isinstance(value, str) and not value.isspace():
-            return value.strip()
-        return value
 
     def _append_positive_text_outputs(
         self,

@@ -60,22 +60,11 @@ def get_negative_embedding_twice(stage, server_args, first_req, second_req=None)
     )
 
 
-def test_negative_text_cache_key_tracks_encode_options():
+def test_negative_text_encoding_has_no_separate_gpu_cache():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
-
     get_negative_embedding_twice(stage, server_args, make_req())
-    assert stage.calls == 1
-
-    stage.get_or_compute_negative_text_embedding(
-        make_req(max_sequence_length=512), server_args, [0]
-    )
     assert stage.calls == 2
-
-    stage.get_or_compute_negative_text_embedding(
-        make_req(prompt_template={"template": "negative: {}"}), server_args, [0]
-    )
-    assert stage.calls == 3
 
 
 def test_component_uses_exact_encoder_precision():
@@ -97,25 +86,7 @@ def test_component_uses_exact_encoder_precision():
     ]
 
 
-def test_negative_text_cache_skips_warmup():
+def test_negative_text_encoding_warmup_does_not_seed_a_private_cache():
     stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="default negative"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
-
+    get_negative_embedding_twice(stage, make_server_args(), make_req(is_warmup=True))
     assert stage.calls == 2
-
-
-def test_negative_text_cache_keeps_default_warmup():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="bad quality"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
-
-    assert stage.calls == 1

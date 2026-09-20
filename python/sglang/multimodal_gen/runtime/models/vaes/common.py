@@ -18,6 +18,10 @@ from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_vae_encode,
+    register_conditioning_container,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_world_size,
@@ -137,6 +141,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     def _decode(self, *args, **kwargs) -> torch.Tensor:
         pass
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         batch_size, num_channels, num_frames, height, width = x.shape
         latent_num_frames = (num_frames - 1) // self.temporal_compression_ratio + 1
@@ -748,6 +753,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 # adapted from https://github.com/huggingface/diffusers/blob/e7ffeae0a191f710881d1fbde00cd6ff025e81f2/src/diffusers/models/autoencoders/vae.py#L691
+@register_conditioning_container
 class DiagonalGaussianDistribution:
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         self.parameters = parameters

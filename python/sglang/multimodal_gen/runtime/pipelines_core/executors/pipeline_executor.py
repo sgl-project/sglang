@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -54,6 +55,11 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
+        self.conditioning_cache = ConditioningCache(
+            int(server_args.conditioning_cache_max_size_mb * 1024**2)
+            if not server_args.disable_conditioning_cache
+            else 0
+        )
 
     def begin_component_residency_request(
         self,
@@ -87,7 +93,11 @@ class PipelineExecutor(ABC):
     ):
         self.begin_component_residency_request(stages, payload, server_args)
         try:
-            yield
+            with self.conditioning_cache.scope(
+                enabled=not self._is_warmup_payload(payload)
+                and not server_args.use_fsdp_inference
+            ):
+                yield
         finally:
             self.finish_component_residency_request()
 
