@@ -40,6 +40,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -327,32 +328,36 @@ def build_kv_cache(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
-    tree_cache = create_tree_cache(
-        TreeCacheBuildContext(
-            server_args=server_args,
-            params=params,
-            is_hybrid_swa=is_hybrid_swa,
-            full_tokens_per_layer=full_tokens_per_layer,
-            is_hybrid_ssm=is_hybrid_ssm,
-            is_dsa=is_dsa,
-            enable_hierarchical_cache=enable_hierarchical_cache,
-            disable_radix_cache=disable_radix_cache,
-            effective_chunked_prefill_size=effective_chunked_prefill_size,
-            tp_worker=tp_worker,
-            model_config=model_config,
-            tp_size=ps.tp_size,
-            tp_rank=ps.tp_rank,
-            tp_group=tp_group,
-        )
+    tree_context = TreeCacheBuildContext(
+        server_args=server_args,
+        params=params,
+        is_hybrid_swa=is_hybrid_swa,
+        full_tokens_per_layer=full_tokens_per_layer,
+        is_hybrid_ssm=is_hybrid_ssm,
+        is_dsa=is_dsa,
+        enable_hierarchical_cache=enable_hierarchical_cache,
+        disable_radix_cache=disable_radix_cache,
+        effective_chunked_prefill_size=effective_chunked_prefill_size,
+        tp_worker=tp_worker,
+        model_config=model_config,
+        tp_size=ps.tp_size,
+        tp_rank=ps.tp_rank,
+        tp_group=tp_group,
     )
+    with auto_size_hicache(
+        params,
+        hicache_draft_plan,
+        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+    ):
+        tree_cache = create_tree_cache(tree_context)
 
-    if (
-        enable_hierarchical_cache or retraction_backup == "host_pool"
-    ) and hicache_draft_plan is not None:
-        maybe_register_hicache_draft(
-            tree_cache=tree_cache,
-            draft_plan=hicache_draft_plan,
-        )
+        if (
+            enable_hierarchical_cache or retraction_backup == "host_pool"
+        ) and hicache_draft_plan is not None:
+            maybe_register_hicache_draft(
+                tree_cache=tree_cache,
+                draft_plan=hicache_draft_plan,
+            )
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):
