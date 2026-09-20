@@ -742,7 +742,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
-        if confidence is None:
+        # carries_confidence is False under a verify-all schedule, which reads
+        # no confidence at all; running the head there costs a forward plus its
+        # host relay for a tensor the layout discards.
+        if confidence is None and self._verify_planner.carries_confidence:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
