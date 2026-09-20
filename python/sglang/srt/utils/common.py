@@ -751,7 +751,7 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
-def get_instance_memory_status(cgroup_file : str) -> Optional[int]:
+def get_instance_memory_status(cgroup_file: str) -> Optional[int]:
     try:
         with open(cgroup_file, "r") as f:
             content = f.read().strip()
@@ -767,9 +767,13 @@ def get_instance_memory_status(cgroup_file : str) -> Optional[int]:
 def get_free_cpu_memory() -> int:
     free_cpu_memory = psutil.virtual_memory().available
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
-    instance_current_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.current")
+    instance_current_cpu_memory = get_instance_memory_status(
+        "/sys/fs/cgroup/memory.current"
+    )
     if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
-        instance_free_cpu_memory = max(0, instance_current_cpu_memory - instance_current_cpu_memory)
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
         free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
 
     return free_cpu_memory
