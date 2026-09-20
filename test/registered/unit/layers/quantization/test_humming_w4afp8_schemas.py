@@ -1,10 +1,11 @@
-"""Unit coverage for Humming W4AFP8 packing and stacked block-FP8 scale shapes."""
+"""Unit coverage for Humming schemas and input-quantization exclusions."""
 
 from __future__ import annotations
 
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -13,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.quantization import humming_utils  # noqa: E402
 from sglang.srt.layers.quantization.humming import (  # noqa: E402
     HummingConfig,
     _StackedBlockFp8CheckpointWeightSchema,
@@ -20,6 +22,116 @@ from sglang.srt.layers.quantization.humming import (  # noqa: E402
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestHummingInputExclusions(CustomTestCase):
+    def test_each_ignore_alias(self):
+        for alias in ("ignored_layers", "ignore", "modules_to_not_convert"):
+            with self.subTest(alias=alias):
+                config = {alias: ["layers.1.mlp"]}
+                self.assertTrue(
+                    humming_utils.humming_is_layer_skipped(config, "model.layers.1.mlp")
+                )
+                self.assertFalse(
+                    humming_utils.humming_is_layer_skipped(config, "model.layers.2.mlp")
+                )
+
+    def test_first_present_alias_takes_precedence(self):
+        aliases = ("ignored_layers", "ignore", "modules_to_not_convert")
+        for first in range(len(aliases) - 1):
+            config = {alias: [f"layers.{i}.mlp"] for i, alias in enumerate(aliases)}
+            for alias in aliases[:first]:
+                del config[alias]
+            for i in range(len(aliases)):
+                with self.subTest(first=aliases[first], layer=i):
+                    self.assertEqual(
+                        humming_utils.humming_is_layer_skipped(
+                            config, f"model.layers.{i}.mlp"
+                        ),
+                        i == first,
+                    )
+
+    def test_empty_or_null_alias_takes_precedence(self):
+        for alias in ("ignored_layers", "ignore"):
+            for value in ([], None):
+                with self.subTest(alias=alias, value=value):
+                    config = {alias: value, "modules_to_not_convert": ["mlp"]}
+                    self.assertFalse(
+                        humming_utils.humming_is_layer_skipped(config, "model.mlp")
+                    )
+
+    def test_missing_input_config_and_missing_exclusions(self):
+        self.assertTrue(humming_utils.humming_is_layer_skipped({}, "model.mlp"))
+        self.assertFalse(
+            humming_utils.humming_is_layer_skipped(
+                {"a_dtype": "float8e4m3"}, "model.mlp"
+            )
+        )
+
+    def test_lm_head_and_dynamic_exclusions(self):
+        self.assertTrue(
+            humming_utils.humming_is_layer_skipped({"ignore": []}, "model.lm_head")
+        )
+        config = {"dynamic": {r"-:^model\.layers\.1\.": {}, r"+:.*": {}}}
+        self.assertTrue(
+            humming_utils.humming_is_layer_skipped(config, "model.layers.1.mlp")
+        )
+        self.assertFalse(
+            humming_utils.humming_is_layer_skipped(config, "model.layers.2.mlp")
+        )
+
+    def test_moe_input_schemas_respect_exclusions(self):
+        weight_schema = SimpleNamespace(
+            convert_humming=lambda **kwargs: (weight_schema, kwargs["tensors"])
+        )
+        for alias in ("ignored_layers", "ignore", "modules_to_not_convert"):
+            config = {
+                "a_dtype": "float8e4m3",
+                "input_scale_group_size": 128,
+                alias: ["layers.1.mlp"],
+            }
+            for layer_index in (1, 2):
+                with self.subTest(alias=alias, layer=layer_index):
+                    layer = torch.nn.Module()
+                    layer.layer_name = f"model.layers.{layer_index}.mlp"
+                    layer.hidden_size = 128
+                    layer.intermediate_size_per_partition = 128
+                    layer.num_local_experts = 1
+                    layer.params_dtype = torch.bfloat16
+                    layer.with_bias = False
+                    layer.w13_weight = torch.nn.Parameter(torch.empty(1, 256, 128))
+                    layer.w2_weight = torch.nn.Parameter(torch.empty(1, 128, 128))
+                    with (
+                        patch.object(
+                            humming_utils.envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG,
+                            "get",
+                            return_value=config,
+                        ),
+                        patch.object(
+                            humming_utils.BaseWeightSchema,
+                            "from_config",
+                            return_value=weight_schema,
+                        ),
+                        patch.object(
+                            humming_utils,
+                            "get_moe_a2a_backend",
+                            return_value=SimpleNamespace(is_deepep=lambda: False),
+                        ),
+                        patch.object(humming_utils.HummingMethod, "prepare_layer_meta"),
+                        patch.object(
+                            humming_utils.HummingMethod, "transform_humming_layer"
+                        ),
+                    ):
+                        humming_utils.prepare_humming_moe_layer(layer, {})
+
+                    for sublayer in ("w13", "w2"):
+                        schema = layer.input_schemas[sublayer]
+                        if layer_index == 1:
+                            self.assertIsNone(schema.a_dtype)
+                            self.assertEqual(schema.input_scale_group_size, 0)
+                        else:
+                            self.assertEqual(str(schema.a_dtype), "float8e4m3")
+                            self.assertEqual(schema.input_scale_group_size, 128)
 
 
 class TestW4AFp8CheckpointSchema(CustomTestCase):
