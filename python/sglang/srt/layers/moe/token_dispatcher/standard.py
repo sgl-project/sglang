@@ -91,6 +91,17 @@ class StandardCombineInput(NamedTuple):
 assert isinstance(StandardCombineInput, CombineInput)
 
 
+def _map_topk_ids_to_local_experts(
+    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+) -> torch.Tensor:
+    """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    return torch.where(
+        topk_ids < 0,
+        -1,
+        local_expert_mapping[topk_ids.clamp_min(0)],
+    )
+
+
 class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
@@ -223,7 +234,9 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    topk_ids_local = _map_topk_ids_to_local_experts(
+                        topk_output.topk_ids, self.local_expert_mapping
+                    )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
