@@ -307,7 +307,7 @@ class QwenImage21Attention(nn.Module):
             v,
         )
 
-    def forward(self, x, rope, prefix, prefix_rope, segments, cache):
+    def attend_sample(self, q, k, v, rope, prefix, prefix_rope, segments, cache):
         if cache:
             kp, vp = cache["key"], cache["value"]
             prefix_output = None
@@ -319,8 +319,8 @@ class QwenImage21Attention(nn.Module):
                 mask = None
                 if not is_image:
                     mask = (
-                        torch.arange(end, device=x.device)[None, :]
-                        <= torch.arange(start, end, device=x.device)[:, None]
+                        torch.arange(end, device=q.device)[None, :]
+                        <= torch.arange(start, end, device=q.device)[:, None]
                     )
                     mask = mask[None, None]
                 outputs.append(
@@ -331,7 +331,6 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](torch.cat(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
-        q, k, v = self.project_qkv(x)
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
         if (
@@ -358,7 +357,26 @@ class QwenImage21Attention(nn.Module):
         else:
             k = apply_qk_norm_rope(k, self.norm_k, rope)
             out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
-        return self.to_out[0](out.flatten(2))[0], prefix_output
+        return out, prefix_output
+
+    def forward(self, x, ropes, prefixes, layouts, caches):
+        # batch target projections while retaining each sample's unpadded prefix
+        q, k, v = self.project_qkv(x)
+        outputs, prefix_outputs = [], []
+        for sample, layout in enumerate(layouts):
+            out, prefix_out = self.attend_sample(
+                q[sample : sample + 1],
+                k[sample : sample + 1],
+                v[sample : sample + 1],
+                ropes[sample],
+                prefixes[sample],
+                layout["prefix_rope"],
+                layout["segments"],
+                caches[sample],
+            )
+            outputs.append(out)
+            prefix_outputs.append(prefix_out)
+        return self.to_out[0](torch.cat(outputs).flatten(2))[0], prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
@@ -379,25 +397,27 @@ class QwenImage21TransformerBlock(nn.Module):
         self,
         hidden_states,
         modulation,
-        prefix_state,
+        prefix_states,
         prefix_modulation,
-        layout,
-        rope,
-        cache,
+        layouts,
+        ropes,
+        caches,
     ):
-        prefix = prefix_state.get("hidden_states")
         scale1, gate1, scale2, gate2 = modulation
-        p = None
-        if not cache:
-            ps1, pg1, ps2, pg2 = prefix_modulation
-            p = apply_modulation(prefix, self.img_norm1, ps1)
-        attention, prefix_attention = self.attn(
+        prefixes = [
+            apply_modulation(
+                state["hidden_states"], self.img_norm1, prefix_modulation[0]
+            )
+            if not cache
+            else None
+            for state, cache in zip(prefix_states, caches, strict=True)
+        ]
+        attention, prefix_attentions = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
-            rope,
-            p,
-            layout["prefix_rope"],
-            layout["segments"],
-            cache,
+            ropes,
+            prefixes,
+            layouts,
+            caches,
         )
         hidden_states = residual_gate_add(hidden_states, attention, gate1)
         hidden_states = residual_gate_add(
@@ -405,14 +425,15 @@ class QwenImage21TransformerBlock(nn.Module):
             self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
             gate2,
         )
-        if prefix_attention is not None:
-            prefix = residual_gate_add(prefix, prefix_attention, pg1)
-            prefix = residual_gate_add(
-                prefix,
-                self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
-                pg2,
-            )
-        prefix_state["hidden_states"] = prefix
+        for state, attention in zip(prefix_states, prefix_attentions, strict=True):
+            if attention is not None:
+                _, pg1, ps2, pg2 = prefix_modulation
+                prefix = residual_gate_add(state["hidden_states"], attention, pg1)
+                state["hidden_states"] = residual_gate_add(
+                    prefix,
+                    self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
+                    pg2,
+                )
         return hidden_states
 
 
@@ -505,15 +526,12 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 timestep.new_zeros(1).to(images.dtype), images.dtype
             )
             prefix_modulation = self.prepare_modulation(zero_temb)
-        outputs = []
+        if prefix_caches is None:
+            prefix_caches = [[None] * len(self.transformer_blocks) for _ in layouts]
+        prefix_states, ropes = [], []
         for sample, layout in enumerate(layouts):
-            caches = (
-                prefix_caches[sample]
-                if prefix_caches is not None
-                else [None] * len(self.transformer_blocks)
-            )
             prefix = None
-            if not caches[0]:
+            if not prefix_caches[sample][0]:
                 prefix = self.txt_in(
                     encoder_hidden_states[sample : sample + 1]
                 ).index_select(1, layout["text_indices"])
@@ -521,23 +539,20 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                     prefix[:, layout["image_indices"]] = self.img_in(
                         condition_latents[sample : sample + 1]
                     )
-            prefix_state = {"hidden_states": prefix}
-            x = images[sample : sample + 1]
-            sample_modulation = tuple(
-                value[sample : sample + 1] for value in modulation
+            prefix_states.append({"hidden_states": prefix})
+            ropes.append(layout["target_rope"][start:end])
+        # visit each block once so layerwise offload transfers weights once per batch
+        for i, block in enumerate(self.transformer_blocks):
+            images = block(
+                images,
+                modulation,
+                prefix_states,
+                prefix_modulation,
+                layouts,
+                ropes,
+                [cache[i] for cache in prefix_caches],
             )
-            for i, block in enumerate(self.transformer_blocks):
-                x = block(
-                    x,
-                    sample_modulation,
-                    prefix_state,
-                    prefix_modulation,
-                    layout,
-                    layout["target_rope"][start:end],
-                    caches[i],
-                )
-            outputs.append(self.proj_out(self.norm_out(x, temb[sample : sample + 1])))
-        output = torch.cat(outputs)
+        output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)
         return output

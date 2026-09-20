@@ -27,6 +27,10 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
 
+    def supports_dynamic_batching(self):
+        # the scheduler excludes reference-image requests from cross-request merging
+        return True
+
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
