@@ -1,3 +1,4 @@
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -126,6 +127,20 @@ def test_cache_stores_only_consumed_text_conditioning(output_type, device, monke
             "hello", args, device=device, return_attention_mask=True
         )
         assert encoder.calls == 3
+
+    # exercise the real negative-stage boundary with only one entry of capacity
+    cache = ConditioningCache(cache.bytes // 3)
+    stage.encode_text = partial(stage.encode_text, device=device)
+    calls_before = encoder.calls
+    with cache.scope(refresh=True):
+        stage.encode_text("hello", args, return_attention_mask=True)
+        stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+    with cache.scope():
+        stage.encode_text("changed positive", args, return_attention_mask=True)
+        stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+    assert encoder.calls == calls_before + 3
+    assert cache.hits == 1
+    assert cache.bytes <= cache.max_bytes
 
 
 class DummyTextEncodingStage(TextEncodingStage):
