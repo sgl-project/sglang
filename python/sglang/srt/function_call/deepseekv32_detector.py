@@ -2,9 +2,6 @@ import json
 import logging
 import re
 
-from partial_json_parser.core.exceptions import MalformedJSON
-from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -13,7 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _find_common_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +90,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        self._pending_non_string_parameter = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -122,6 +120,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
         2. Direct JSON: { "key": "value" }
         """
+        self._pending_non_string_parameter = False
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
@@ -171,17 +170,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 self.partial_parameter_regex, remaining_content, re.DOTALL
             )
 
-            if partial_match and (param_value := partial_match.group(3)):
-                param_name = partial_match.group(1)
-                if partial_match.group(2) == "true":
-                    parameters[param_name] = param_value.strip()
-                else:
-                    try:
-                        parameters[param_name] = _partial_json_loads(
-                            param_value, Allow.ALL
-                        )[0]
-                    except (json.JSONDecodeError, MalformedJSON, ValueError):
-                        parameters[param_name] = param_value.strip()
+            # Repaired partial JSON is not an append-only prefix: e.g. 12345e-3
+            # changes a previously parsed 12345 to 12.345. Wait for the closing
+            # parameter tag before serializing non-string values.
+            if partial_match:
+                if partial_match.group(2) != "true":
+                    self._pending_non_string_parameter = True
+                elif param_value := partial_match.group(3):
+                    parameters[partial_match.group(1)] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
 
@@ -376,6 +372,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
             return StreamingParseResult(normal_text=current_text)
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        if self._pending_non_string_parameter:
+            raise ValueError(
+                "Incomplete DSML non-string parameter at end of stream; "
+                "refusing to emit guessed tool arguments"
+            )
+        return super().finish(tools)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

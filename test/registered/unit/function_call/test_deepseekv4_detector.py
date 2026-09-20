@@ -1,9 +1,11 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -101,6 +103,109 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         )
 
         self.assertEqual(len(result.calls), 2)
+
+    def test_non_string_parameter_is_not_rewritten_after_streaming(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="set_config",
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": {}, "label": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        for value in [
+            "12345e-3",
+            '{"ratio":12345e-3,"enabled":true}',
+            '[{"step":"write code","ratio":12345e-3},null,false]',
+        ]:
+            text = _wrapped(
+                _invoke(
+                    "set_config",
+                    _param("value", "false", value)
+                    + _param("label", "true", "complete"),
+                )
+            )
+            expected = {"value": json.loads(value), "label": "complete"}
+            for detector_class in [DeepSeekV4Detector, DeepSeekV32Detector]:
+                source = text
+                if detector_class is DeepSeekV32Detector:
+                    source = text.replace("tool_calls", "function_calls")
+                for chunk_size in [1, 2, 3, 5, 7, 11, 23, len(source)]:
+                    with self.subTest(
+                        detector=detector_class.__name__,
+                        value=value,
+                        chunk_size=chunk_size,
+                    ):
+                        detector = detector_class()
+                        arguments = ""
+                        for start in range(0, len(source), chunk_size):
+                            result = detector.parse_streaming_increment(
+                                source[start : start + chunk_size], tools
+                            )
+                            arguments += "".join(c.parameters for c in result.calls)
+                            self.assertTrue(
+                                json.dumps(expected, ensure_ascii=False).startswith(
+                                    arguments
+                                )
+                            )
+                        self.assertEqual(json.loads(arguments), expected)
+                        self.assertEqual(
+                            arguments, detector.prev_tool_call_arr[0]["arguments"]
+                        )
+
+    def test_incomplete_non_string_parameter_does_not_emit_a_guessed_value(self):
+        detector = DeepSeekV4Detector()
+        chunks = [
+            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="false">',
+            "123",
+            "45",
+            "e-",
+            "3",
+        ]
+        calls = []
+        for chunk in chunks:
+            calls.extend(detector.parse_streaming_increment(chunk, self.tools).calls)
+        self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
+        self.assertEqual("".join(c.parameters for c in calls), "")
+        result = detector.parse_streaming_increment(
+            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>", self.tools
+        )
+        self.assertEqual(
+            json.loads("".join(c.parameters for c in result.calls)), {"city": 12.345}
+        )
+
+    def test_string_parameter_still_streams_incrementally(self):
+        detector = DeepSeekV4Detector()
+        start = (
+            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="true">San Fran'
+        )
+        first = detector.parse_streaming_increment(start, self.tools)
+        second = detector.parse_streaming_increment("cisco", self.tools)
+        prefix = "".join(c.parameters for c in first.calls + second.calls)
+        self.assertIn("San Fran", prefix)
+        final = detector.parse_streaming_increment(
+            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>", self.tools
+        )
+        self.assertEqual(
+            json.loads(prefix + "".join(c.parameters for c in final.calls)),
+            {"city": "San Francisco"},
+        )
+
+    def test_truncated_non_string_parameter_is_an_explicit_error(self):
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(
+            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="false">[1,2',
+            self.tools,
+        )
+        with self.assertRaisesRegex(ValueError, "Incomplete DSML non-string parameter"):
+            detector.finish(self.tools)
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
         """An unexpected parse error must not empty the turn, and the dropped
