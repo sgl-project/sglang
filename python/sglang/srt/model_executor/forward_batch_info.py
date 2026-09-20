@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -85,6 +86,13 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _mlp_sync_token_alignment(attn_tp_size: int, spec_info) -> int:
+    """Return an alignment that preserves TP and speculative row groups."""
+    if spec_info is None or spec_info.num_tokens_per_req <= 1:
+        return attn_tp_size
+    return math.lcm(attn_tp_size, spec_info.num_tokens_per_req)
 
 
 def _build_forward_token_modalities(
@@ -1468,11 +1476,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+        token_alignment = _mlp_sync_token_alignment(attn_tp_size, self.spec_info)
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            # The padded length must be divisible by attn_tp_size for possible
+            # reduce-scatter. Speculative forwards additionally group rows by
+            # num_tokens_per_req, so preserve that geometry after padding too.
+            # There is no reduce-scatter in LM logprob, so its length is not
+            # adjusted here.
+            global_num_tokens[i] = ceil_align(
+                global_num_tokens[i], token_alignment
+            )
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
