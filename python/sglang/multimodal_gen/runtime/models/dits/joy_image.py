@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from sglang.kernels.ops.diffusion import can_use_joint_qkv_cat, joint_qkv_cat
+from sglang.kernels.ops import diffusion as diffusion_kernels
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
@@ -63,7 +63,10 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     if (
         _JOY_QKV_CAT.disabled
         or inputs[0].numel() < 16 * 1024 * 1024
-        or not can_use_joint_qkv_cat(*inputs)
+        or not inputs[0].is_cuda
+        or torch.version.hip
+        or torch.compiler.is_compiling()
+        or not diffusion_kernels.can_use_joint_qkv_cat(*inputs)
     ):
         return reference()
     sig = (inputs[0].device, inputs[0].dtype) + tuple(
@@ -73,7 +76,7 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     if not verified and torch.cuda.is_current_stream_capturing():
         return reference()
     try:
-        out = joint_qkv_cat(*inputs)
+        out = diffusion_kernels.joint_qkv_cat(*inputs)
     except Exception as exc:
         _JOY_QKV_CAT.on_exception(exc, logger=logger)
         return reference()

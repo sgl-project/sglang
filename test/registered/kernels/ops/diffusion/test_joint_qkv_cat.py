@@ -82,7 +82,7 @@ class TestJointQKVCat(CustomTestCase):
 
     def test_unsupported_inputs_and_autograd_fallback(self):
         inputs = make_inputs(1, 13, 5, 4, 32, torch.bfloat16)
-        with patch.object(joy_image, "joint_qkv_cat") as fused:
+        with patch.object(joy_image.diffusion_kernels, "joint_qkv_cat") as fused:
             self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), reference(inputs))
             fused.assert_not_called()
         self.assertFalse(can_use_joint_qkv_cat(*inputs[:5]))
@@ -108,7 +108,9 @@ class TestJointQKVCat(CustomTestCase):
         gate = BitExactFusionGate("test", per_signature=True)
         with (
             patch.object(joy_image, "_JOY_QKV_CAT", gate),
-            patch.object(joy_image, "joint_qkv_cat", return_value=wrong) as fused,
+            patch.object(
+                joy_image.diffusion_kernels, "joint_qkv_cat", return_value=wrong
+            ) as fused,
         ):
             self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
             self.assertTrue(gate.disabled)
@@ -118,7 +120,9 @@ class TestJointQKVCat(CustomTestCase):
         with (
             patch.object(joy_image, "_JOY_QKV_CAT", gate),
             patch.object(
-                joy_image, "joint_qkv_cat", side_effect=RuntimeError("unavailable")
+                joy_image.diffusion_kernels,
+                "joint_qkv_cat",
+                side_effect=RuntimeError("unavailable"),
             ),
         ):
             self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
@@ -127,7 +131,7 @@ class TestJointQKVCat(CustomTestCase):
         with (
             patch.object(joy_image, "_JOY_QKV_CAT", gate),
             patch("torch.cuda.is_current_stream_capturing", return_value=True),
-            patch.object(joy_image, "joint_qkv_cat") as fused,
+            patch.object(joy_image.diffusion_kernels, "joint_qkv_cat") as fused,
         ):
             self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
             fused.assert_not_called()
