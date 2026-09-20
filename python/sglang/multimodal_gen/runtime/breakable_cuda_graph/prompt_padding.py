@@ -301,7 +301,9 @@ def _ensure_model_padders_registered() -> None:
     _model_padders_registered = True
     from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (  # noqa: F401
         ideogram,
+        longcat_image,
         minimax_h3,
         qwen_image,
+        sana_video,
         zimage,
     )

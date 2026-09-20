@@ -228,9 +228,9 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert (
-                        "arguments" not in obj
-                    ), "model generated both parameters and arguments"
+                    assert "arguments" not in obj, (
+                        "model generated both parameters and arguments"
+                    )
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj

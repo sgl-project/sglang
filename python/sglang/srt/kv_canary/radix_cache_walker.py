@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
 )
@@ -34,7 +33,7 @@ def walk_radix_cache_for_canary(
         return radix_cache.tree_core.walk_for_kv_canary(
             unlocked_only=unlocked_only, swa_resident_only=swa_resident_only
         )
-    if cache_type is not RadixCache and cache_type is not SWARadixCache:
+    if cache_type is not RadixCache:
         raise NotImplementedError(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
         )
@@ -133,9 +132,6 @@ def _node_is_unlocked_for_canary(
     if type(radix_cache) is RadixCache:
         return node.lock_ref == 0
 
-    if type(radix_cache) is SWARadixCache:
-        return node.full_lock_ref == 0
-
     raise NotImplementedError(
         f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
     )
@@ -146,7 +142,5 @@ def _node_is_swa_resident_for_canary(
     node: TreeNode,
     radix_cache: BasePrefixCache,
 ) -> bool:
-    if type(radix_cache) is SWARadixCache:
-        return not node.swa_tombstone
-
+    # RadixCache has no SWA tier, so every node it holds is resident.
     return True

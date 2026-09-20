@@ -16,9 +16,8 @@ import platform
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -33,6 +32,7 @@ class TestMlxLaunchBookkeeping(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         result = MagicMock()
         result.next_token_ids = None
         scheduler.tp_worker.finalize_mlx_result.return_value = result
@@ -112,6 +112,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (
             SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
         )
@@ -119,7 +120,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.request_receiver.recv_requests.side_effect = recv_side_effect
+        scheduler.ingest_requests.side_effect = recv_side_effect
         result = MagicMock()
         result.next_token_ids = None
         scheduler.tp_worker.finalize_mlx_result.return_value = result
@@ -270,13 +271,16 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.request_receiver.recv_requests.side_effect = recv_side_effect
-        # Model handle_shutdown: processing a non-empty recv batch (the
-        # ShutdownReq) flips the flag; the loop must notice at the top of the
-        # next iteration instead of polling forever.
-        scheduler.process_input_requests.side_effect = lambda reqs: (
-            setattr(scheduler, "gracefully_exit", True) if reqs else None
-        )
+        recv_requests = MagicMock(side_effect=recv_side_effect)
+
+        def ingest_requests():
+            reqs = recv_requests()
+            # Ingestion dispatches the shutdown request before the loop resumes.
+            if reqs:
+                scheduler.gracefully_exit = True
+            return reqs
+
+        scheduler.ingest_requests.side_effect = ingest_requests
         plan = MagicMock()
         plan.batch_to_run = None
         scheduler.get_next_batch_to_run.return_value = plan
@@ -297,7 +301,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         ) as synchronize:
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
-        self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
+        self.assertEqual(scheduler.ingest_requests.call_count, 1)
         synchronize.assert_called_once_with()
 
     def test_loop_exits_when_shutdown_arrives_while_paused(self):
@@ -318,7 +322,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         ) as synchronize:
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
-        self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
+        self.assertEqual(scheduler.ingest_requests.call_count, 1)
         scheduler.get_next_batch_to_run.assert_not_called()
         synchronize.assert_called_once_with()
 
