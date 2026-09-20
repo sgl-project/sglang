@@ -254,6 +254,14 @@ class DecodingStage(PipelineStage):
                         "by its VAE config.",
                         type(self.vae).__name__,
                     )
+            if server_args.pipeline_config.vae_slicing:
+                try:
+                    self.vae.enable_slicing()
+                except AttributeError:
+                    logger.warning(
+                        "--vae-slicing has no effect: %s does not support slicing.",
+                        type(self.vae).__name__,
+                    )
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)

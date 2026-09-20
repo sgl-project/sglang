@@ -48,6 +48,32 @@ class TestDecodingStageParallelism(unittest.TestCase):
 
         self.assertEqual(component_use.target_dtype, torch.float16)
 
+    def test_decode_enables_vae_slicing_only_when_configured(self):
+        for vae_slicing in (False, True):
+            vae = FakeVAE()
+            vae.weight = nn.Parameter(torch.zeros(1))
+            vae.sliced = False
+            vae.enable_slicing = lambda vae=vae: setattr(vae, "sliced", True)
+            stage = DecodingStage(vae)
+            stage.scale_and_shift = lambda latents, server_args: latents
+            server_args = SimpleNamespace(
+                disable_autocast=True,
+                enable_torch_compile=False,
+                pipeline_config=SimpleNamespace(
+                    vae_tiling=False,
+                    vae_slicing=vae_slicing,
+                    preprocess_decoding=lambda latents, server_args, vae: latents,
+                ),
+            )
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ):
+                stage.decode(
+                    torch.zeros(2, 1, 1, 2, 2), server_args, vae_dtype=torch.float32
+                )
+            self.assertIs(vae.sliced, vae_slicing)
+
     def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
         self,
     ):
