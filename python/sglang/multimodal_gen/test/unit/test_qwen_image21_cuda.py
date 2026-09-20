@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
 )
@@ -274,14 +275,22 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
     try:
         with (
             torch.no_grad(),
-            set_forward_context(None, None, Req(is_warmup=True)),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams(), is_warmup=True),
+            ),
         ):
             model(**first)
             stage._bcg_run(runner, first, model)
         assert len(runner.entries) == 1
         with (
             torch.no_grad(),
-            set_forward_context(None, None, Req(is_warmup=False)),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams()),
+            ),
         ):
             model(**second)
             expected = model(**second)
