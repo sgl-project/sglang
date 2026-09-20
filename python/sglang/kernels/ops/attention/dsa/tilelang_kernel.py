@@ -71,8 +71,17 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
-@lru_cache(maxsize=8)
-def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
+def _wave_occupancy(ctas: int, cu: int) -> float:
+    # One wavefront per producer CTA, so a grid is a whole number of waves and
+    # a wave costs the same whether or not it is full: ctas / (waves * cu).
+    waves = -(-ctas // cu)
+    return ctas / (waves * cu)
+
+
+@lru_cache(maxsize=32)
+def _pick_inner_iter(
+    seq: int, ni: int, cu: int, block_per_cu: int, head_blocks: int = 0
+) -> int:
     """
     Pick the largest valid inner_iter (power-of-two divisor of ni) that keeps
     enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
@@ -83,9 +92,29 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     it = ni
     while it >= 2:
         if it <= max_it and ni % it == 0:
-            return it
+            break
         it //= 2
-    return 1
+    else:
+        return 1
+
+    # The threshold above sizes to a CTA count, which assumes more CTAs is
+    # better. Past a couple of waves the cost is set instead by how the last
+    # wave quantizes onto the CUs, so decide the 2-vs-4 rung on that: take the
+    # higher mean occupancy, and on a tie the larger inner_iter, which writes
+    # fewer partials for the combine to read.
+    #
+    # The choice is confined to those two rungs. Splitting further pays an
+    # extra combine that this model does not price -- a pure-occupancy pick
+    # lands on 1 at seq 72 and 84 and measures 20-24% slower there.
+    #
+    # head_blocks == 0 means the caller did not state its grid's head extent,
+    # so the CTA count is unknown and the threshold above stands.
+    if head_blocks and it in (2, 4) and ni % 4 == 0:
+        grid = lambda t: seq * head_blocks * (ni // t)  # noqa: E731
+        occ4 = _wave_occupancy(grid(4), cu)
+        occ2 = _wave_occupancy(grid(2), cu)
+        return 2 if occ2 > occ4 else 4
+    return it
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -155,9 +184,9 @@ def act_quant(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.size(-1) % block_size == 0, (
-        f"Last dimension size must be divisible by block_size (block_size={block_size})"
-    )
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
     if _is_fp8_fnuz:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
@@ -272,17 +301,17 @@ def sparse_attention_fwd_kernel_v1(
     num_stages=2,
     threads=256,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
-        f"dim={dim} must be a power of 2 or a multiple of 64"
-    )
-    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"tail_dim={tail_dim} must be 0 or a power of 2"
-    )
+    assert (
+        dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0
+    ), f"dim={dim} must be a power of 2 or a multiple of 64"
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"tail_dim={tail_dim} must be 0 or a power of 2"
     has_tail = tail_dim > 0
     assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -454,15 +483,15 @@ def sparse_attention_fwd_kernel_v2(
     sm_scale: Optional[float] = None,
     block_I: int = 64,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim), (
-        f"haven't check padding correctness yet, dim={dim}"
-    )
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"haven't check padding correctness yet, dim={tail_dim}"
-    )
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -1086,9 +1115,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     threads=256,
 ):
     assert d_v == 512, f"only support d_v=512"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -1112,9 +1141,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     h_per_block = 16
     # Match bf16 partial behavior: keep fixed 16-head tiles and use
     # sliced T.copy on H0:H1 for tail handling.
-    assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
-        "num_heads must be <=16 or divisible by 16"
-    )
+    assert (
+        num_heads <= h_per_block or num_heads % h_per_block == 0
+    ), "num_heads must be <=16 or divisible by 16"
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
     batch = 1
@@ -1346,7 +1375,10 @@ def tilelang_sparse_fwd(
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            # The fp8 partial grid is (seq * ceil(heads / 16), ni // inner_iter).
+            inner_iter = _pick_inner_iter(
+                q.shape[0], ni, cu, block_per_cu, (num_heads + 15) // 16
+            )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1363,7 +1395,11 @@ def tilelang_sparse_fwd(
             else:
                 block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            # The bf16 partial grid is (seq * REPLICATE_H, ni // inner_iter),
+            # and REPLICATE_H is 1 for every head count at or below 64.
+            inner_iter = _pick_inner_iter(
+                q.shape[0], ni, cu, block_per_cu, max(1, num_heads // 64)
+            )
             kernel_partial = sparse_mla_fwd_decode_partial(
                 num_heads,
                 d_v,
@@ -1605,7 +1641,9 @@ def dpsk_v4_fp8_partial_kernel(
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
     assert topk_1 % block_I == 0
-    assert (topk_1 // block_I) % inner_iter_1 == 0, (
+    assert (
+        topk_1 // block_I
+    ) % inner_iter_1 == 0, (
         f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
     )
     assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
@@ -1614,7 +1652,9 @@ def dpsk_v4_fp8_partial_kernel(
     if is_dual:
         assert inner_iter_2 > 0, "dual-cache call requires inner_iter_2 > 0"
         assert topk_2 % block_I == 0
-        assert (topk_2 // block_I) % inner_iter_2 == 0, (
+        assert (
+            topk_2 // block_I
+        ) % inner_iter_2 == 0, (
             f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
         )
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
