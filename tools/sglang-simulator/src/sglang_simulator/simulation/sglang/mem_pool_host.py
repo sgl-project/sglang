@@ -123,6 +123,14 @@ class _PsutilProxy:
 
 def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
     """Bypass physical host-payload checks while meta allocation is active."""
+    try:
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+    except ImportError:
+        pass
+    else:
+        with host_memory_budget_scope(_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES):
+            return original_init(self, *args, **kwargs)
+
     init_globals = getattr(original_init, "__globals__", None)
     psutil_module = init_globals.get("psutil") if init_globals is not None else None
     if psutil_module is None:
