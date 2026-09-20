@@ -408,7 +408,6 @@ Measured on two Atlas 800I A3 nodes (1P1D, W4A8 + EAGLE3, single request):
 | Accuracy (EvalScope, GSM8K, limit 100) | 99% |
 | Time per output token | 35.77 ms (reference 100 ms) |
 | Mean time to first token | 8318 ms (64k prefill) |
-| Output throughput | 24.22 tok/s |
 
 <Info>
 In offline environments, add `--tokenizer $MODEL_PATH` and `--dataset-path <local ShareGPT json>` so the benchmark client does not try to download them. Some SGLang versions no longer accept the legacy `--max-attempts` flag.
