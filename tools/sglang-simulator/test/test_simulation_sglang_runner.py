@@ -107,11 +107,12 @@ def test_meta_host_memory_bypasses_cgroup_budget():
         if original_available_host_memory is None:
             del test_globals["available_host_memory_bytes"]
         else:
-            test_globals["available_host_memory_bytes"] = (
-                original_available_host_memory
-            )
+            test_globals["available_host_memory_bytes"] = original_available_host_memory
 
-    assert test_globals.get("available_host_memory_bytes") is original_available_host_memory
+    assert (
+        test_globals.get("available_host_memory_bytes")
+        is original_available_host_memory
+    )
     assert fake_available_host_memory() == 0
 
 

@@ -136,8 +136,8 @@ def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
     if proxy is not None:
         init_globals["psutil"] = proxy
     if available_host_memory is not None:
-        init_globals["available_host_memory_bytes"] = (
-            lambda: _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES
+        init_globals["available_host_memory_bytes"] = lambda: (
+            _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES
         )
     try:
         return original_init(self, *args, **kwargs)
