@@ -174,9 +174,7 @@ class TestQuickFinishStage(CustomTestCase):
 
         collector.observe_per_stage_req_latency.assert_called_once()
         stage_name, latency = collector.observe_per_stage_req_latency.call_args[0]
-        self.assertEqual(
-            stage_name, rts.RequestStage.DECODE_QUICK_FINISH.stage_name
-        )
+        self.assertEqual(stage_name, rts.RequestStage.DECODE_QUICK_FINISH.stage_name)
         self.assertAlmostEqual(latency, 0.25)
 
         trace_slice.assert_called_once_with(
