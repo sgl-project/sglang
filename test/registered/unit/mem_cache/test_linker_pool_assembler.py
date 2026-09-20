@@ -344,13 +344,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 self.assertEqual({t.name for t in resolved}, set(expected))
 
     def test_unified_deepseek_v4_fp8_ships_the_rope_half(self):
-        """Under SGLANG_DSV4_UNIFIED_KV_FP8 a row is two parallel pools.
-
-        Shipping the nope pool alone restores 512 of every 640 bytes and leaves
-        whatever rope the slot last held, which is wrong output rather than a
-        crash -- nothing downstream can catch it, because DevicePoolEntry takes
-        its row stride from the buffers it is handed.
-        """
+        """fp8 rows are two pools; shipping nope alone leaves stale rope."""
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 
         c4 = [torch.zeros((4, width), dtype=torch.uint8) for width in (5, 7)]
@@ -394,9 +388,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             kvcache.unified_rope_region_buffers.call_args_list, [call(4), call(128)]
         )
 
-        # One row index addresses both halves, so the rope entry has to carry the
-        # same layer mapping and be driven off the same source pool as the nope
-        # entry it mirrors.
+        # One row index addresses both halves: same layer mapping, same source.
         for rope_name, nope_name in (
             (PoolName.DEEPSEEK_V4_C4_ROPE, PoolName.DEEPSEEK_V4_C4),
             (PoolName.DEEPSEEK_V4_C128_ROPE, PoolName.DEEPSEEK_V4_C128),
@@ -409,8 +401,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 group.sources[rope_name], group.sources[nope_name]
             )
 
-        # A single KV transfer must expand to both halves, or a restore brings
-        # back nope without its rope.
+        # One KV transfer must expand to both halves.
         resolved = group.resolve_transfers(
             [
                 PoolTransfer(
