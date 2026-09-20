@@ -36,7 +36,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: henryx
-          password: ${{ secrets.DOCKERHUB_HENRYX_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_PRIVATE_TOKEN }}
 
       - name: Pull private image
         run: docker pull "${SOURCE_IMAGE}:${IMAGE_TAG}"
