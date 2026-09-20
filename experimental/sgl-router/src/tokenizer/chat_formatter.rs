@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dynamo_renderer::{
-    deepseek_formatter_for, may_be_fix_tool_schema, ChatTemplate, ContextMixins,
-    OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter,
+    deepseek_formatter_for, kimi_k3_formatter_for, may_be_fix_tool_schema, ChatTemplate,
+    ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt,
 };
 use minijinja::Value;
 use serde_json::Value as JsonValue;
@@ -40,18 +40,33 @@ pub struct ChatFormatter {
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
     is_deepseek_v4: bool,
+    is_kimi_k3: bool,
 }
 
 impl ChatFormatter {
+    pub(super) fn is_kimi(&self) -> bool {
+        self.is_kimi_k3
+    }
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
         let files = super::adapter::ModelFiles::open(tokenizer_path);
         let model_type = files
             .json("config.json")?
             .and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
+        if let Some(PromptFormatter::OAI(formatter)) =
+            kimi_k3_formatter_for(&model_type, &model_id.to_lowercase(), false)
+        {
+            return Ok(Some(Self {
+                formatter,
+                defaults: HashMap::new(),
+                bos_token: None,
+                is_deepseek_v4: false,
+                is_kimi_k3: true,
+            }));
+        }
         match model_type.as_deref() {
             // These require tokenization paths not yet supported by this adapter.
-            Some("inkling_mm_model" | "kimi_k3") => return Ok(None),
+            Some("inkling_mm_model") => return Ok(None),
             Some(t) if t.starts_with("deepseek_v4") => {
                 return Ok(Self::deepseek_native(model_type.as_deref(), model_id));
             }
@@ -132,6 +147,7 @@ impl ChatFormatter {
             defaults,
             bos_token,
             is_deepseek_v4: false,
+            is_kimi_k3: false,
         }))
     }
 
@@ -174,6 +190,7 @@ impl ChatFormatter {
             defaults,
             bos_token: Some("<｜begin▁of▁sentence｜>".into()),
             is_deepseek_v4,
+            is_kimi_k3: false,
         })
     }
 
@@ -231,6 +248,14 @@ impl ChatFormatter {
             }
             kwargs.entry("reasoning_effort".into()).or_insert(effort);
         }
+        if self.is_kimi_k3 {
+            if let Some(effort) = kwargs
+                .remove("reasoning_effort")
+                .filter(|v| matches!(v.as_str(), Some("low" | "high" | "max")))
+            {
+                kwargs.entry("thinking_effort".into()).or_insert(effort);
+            }
+        }
         for (key, value) in &self.defaults {
             kwargs.entry(key.clone()).or_insert_with(|| value.clone());
         }
@@ -239,8 +264,12 @@ impl ChatFormatter {
 
     /// Rendered prompt plus the assistant continuation prefix SGLang tokenizes
     /// separately (`_handle_last_assistant_message`).
-    fn render_parts(&self, request: &JsonValue) -> Result<(String, String)> {
+    fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
         let kwargs = self.template_kwargs(request)?;
+        let omit_effort = self.is_kimi_k3
+            && kwargs
+                .get("thinking_effort")
+                .is_some_and(JsonValue::is_null);
         let continuing = request["continue_final_message"] == true;
         let mut messages: Vec<JsonValue> = request["messages"]
             .as_array()
@@ -248,13 +277,31 @@ impl ChatFormatter {
             .iter()
             .map(engine_message)
             .collect();
+        if self.is_kimi_k3 {
+            for message in &mut messages {
+                neutralize_image_placeholder(&mut message["content"]);
+                if message["role"] == "assistant" {
+                    if let Some(reasoning) = message.get_mut("reasoning_content") {
+                        neutralize_image_placeholder(reasoning);
+                    }
+                    for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
+                        if let Some(args) = call
+                            .get_mut("function")
+                            .and_then(|f| f.get_mut("arguments"))
+                        {
+                            neutralize_image_placeholder(args);
+                        }
+                    }
+                }
+            }
+        }
         let mut prefix = String::new();
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
             if let Some(content) = last["content"].as_str() {
                 if continuing {
                     prefix = content.to_owned();
                     messages.pop();
-                } else {
+                } else if !self.is_kimi_k3 {
                     *last = serde_json::json!({"role": "user", "content": content});
                 }
             }
@@ -271,12 +318,18 @@ impl ChatFormatter {
         }
         let prompt = self
             .formatter
-            .render(&ChatRequest {
+            .render_prompt(&ChatRequest {
                 request,
                 messages,
                 kwargs,
+                is_kimi_k3: self.is_kimi_k3,
             })
             .context("render chat template")?;
+        let prompt = if omit_effort {
+            super::kimi::without_effort_preamble(prompt)
+        } else {
+            prompt
+        };
         Ok((prompt, prefix))
     }
 
@@ -286,7 +339,10 @@ impl ChatFormatter {
         request: &JsonValue,
     ) -> Result<Vec<u32>> {
         let (prompt, prefix) = self.render_parts(request)?;
-        let mut ids = super::adapter::encode(tokenizer, &prompt)?;
+        let mut ids = match prompt.encode_segments() {
+            Some(segments) => super::kimi::encode_segments(tokenizer, &segments)?,
+            None => super::adapter::encode(tokenizer, prompt.as_str())?,
+        };
         if !prefix.is_empty() {
             // SGLang encodes the assistant prefix separately and removes its leading BOS.
             let mut suffix = super::adapter::encode(tokenizer, &prefix)?;
@@ -304,7 +360,18 @@ impl ChatFormatter {
     /// Use `encode` for token ids to preserve continuation boundaries.
     pub fn render(&self, request: &JsonValue) -> Result<String> {
         let (prompt, prefix) = self.render_parts(request)?;
-        Ok(prompt + &prefix)
+        Ok(prompt.into_text() + &prefix)
+    }
+}
+
+fn neutralize_image_placeholder(value: &mut JsonValue) {
+    match value {
+        JsonValue::String(text) => {
+            *text = text.replace("<|kimi_image_placeholder|>", "<| kimi_image_placeholder |>")
+        }
+        JsonValue::Array(values) => values.iter_mut().for_each(neutralize_image_placeholder),
+        JsonValue::Object(values) => values.values_mut().for_each(neutralize_image_placeholder),
+        _ => {}
     }
 }
 
@@ -355,6 +422,7 @@ struct ChatRequest<'a> {
     /// Normalized copy of `request["messages"]`.
     messages: Vec<JsonValue>,
     kwargs: ChatTemplateKwargs,
+    is_kimi_k3: bool,
 }
 
 impl OAIChatLikeRequest for ChatRequest<'_> {
@@ -375,6 +443,9 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
         if tools.as_array().is_none_or(|t| t.is_empty()) {
             return None;
         }
+        if self.is_kimi_k3 {
+            return Some(Value::from_serialize(tools));
+        }
         let mut tools = tools.clone();
         // SGLang renders only the named tool for a function `tool_choice`.
         if let Some(name) = self.request["tool_choice"]["function"]["name"].as_str() {
@@ -385,6 +456,14 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
         may_be_fix_tool_schema(tools)
     }
     fn tool_choice(&self) -> Option<Value> {
+        if self.is_kimi_k3 {
+            let choice = self
+                .kwargs
+                .get("tool_choice")
+                .or_else(|| self.request.get("tool_choice"))?;
+            return matches!(choice.as_str(), Some("required" | "none"))
+                .then(|| Value::from_serialize(choice));
+        }
         self.request.get("tool_choice").map(Value::from_serialize)
     }
     fn reasoning_effort(&self) -> Option<Value> {
@@ -396,6 +475,13 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
     /// and never renders it, while dynamo-render's DeepSeek formatters would
     /// append a "## Response Format" schema preamble to the system turn.
     fn response_format(&self) -> Option<Value> {
+        if self.is_kimi_k3 {
+            return self
+                .kwargs
+                .get("response_format")
+                .or_else(|| self.request.get("response_format"))
+                .map(Value::from_serialize);
+        }
         None
     }
     fn should_add_generation_prompt(&self) -> bool {

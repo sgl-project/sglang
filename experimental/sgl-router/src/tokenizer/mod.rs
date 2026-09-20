@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod kimi;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -62,9 +63,19 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        let formatter = ChatFormatter::load(&m.id, &m.tokenizer_path);
+        let is_kimi = formatter
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(ChatFormatter::is_kimi);
+        let t = if is_kimi {
+            kimi::load(&m.tokenizer_path)?
+        } else {
+            adapter::load(&m.tokenizer_path)?
+        };
         me.inner.insert(m.id.clone(), t);
-        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
+        match formatter {
             Ok(Some(formatter)) => {
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
@@ -350,7 +361,11 @@ mod tests {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
         assert!(resolve("inkling_mm_model").is_none());
-        assert!(resolve("kimi_k3").is_none());
+        assert!(resolve("kimi_k3")
+            .unwrap()
+            .render(&request)
+            .unwrap()
+            .contains("<|open|>message"));
         assert_eq!(
             resolve("deepseek_v41").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"

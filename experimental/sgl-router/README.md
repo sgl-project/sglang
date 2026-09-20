@@ -264,6 +264,15 @@ The legacy `--cache-threshold`, `--balance-abs-threshold`, and
 one-to-one replacements; remove them and review the current `sgl-router
 --help` output when tuning Cache-Aware routing.
 
+## Kimi-K3 and image routing
+
+Kimi-K3 cache routing uses the model's native `tiktoken.model` and sibling
+`config.json` / `tokenizer_config.json`, from `--tokenizer-path` or its Hugging Face
+repository. Rendering preserves special-token boundaries. Image requests keep
+engine-side tokenization; cache-aware routing derives affinity from the first
+image reference and applies the usual admission, load, and bucket constraints.
+Image assignments share the session affinity mode and idle-eviction settings.
+
 ## License
 
 Apache-2.0.

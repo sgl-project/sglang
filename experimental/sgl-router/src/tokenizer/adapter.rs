@@ -121,7 +121,7 @@ impl ModelFiles {
         }
     }
 
-    fn path(&self, file: &str) -> Option<std::path::PathBuf> {
+    pub(super) fn path(&self, file: &str) -> Option<std::path::PathBuf> {
         let path = match &self.local_dir {
             Some(dir) => dir.join(file),
             None => {
