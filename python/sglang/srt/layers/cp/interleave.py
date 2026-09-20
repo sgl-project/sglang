@@ -112,8 +112,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         cp_size = self.cp_size
         cp_rank = self.cp_rank
         if isinstance(input_, (tuple, list)):
-            indices = range(cp_rank, len(input_), cp_size)
-            return input_[indices]
+            return input_[cp_rank::cp_size]
 
         tokens = len(input_)
         if tokens % cp_size != 0:
