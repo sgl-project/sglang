@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_group,
     get_world_size,
     model_parallel_is_initialized,
 )
@@ -180,7 +181,17 @@ class ConditioningCache:
         finally:
             _active_cache.reset(token)
 
-    def run(self, model, method, args, kwargs, compute: Callable, group=None):
+    def run(
+        self,
+        model,
+        method,
+        args,
+        kwargs,
+        compute: Callable,
+        group=None,
+        *,
+        nested=False,
+    ):
         if model not in self._models:
             self._models[model] = self._next_model
             self._next_model += 1
@@ -222,8 +233,9 @@ class ConditioningCache:
             self.bypasses += 1
             return compute()
         self.misses += 1
-        # Do not cache nested submodules as well as their enclosing encoder.
-        with self.scope(enabled=False):
+        # A VLM may reuse image features even when its joint text/image key
+        # misses. VAE delegates share one outer posterior entry instead.
+        with self.scope(enabled=nested):
             output = compute()
         try:
             size = 0
@@ -258,10 +270,30 @@ class ConditioningCache:
 
 
 def cached_encoder_call(model, args, kwargs, compute, group=None):
+    if torch.compiler.is_compiling():
+        return compute()
     cache = _active_cache.get()
     if cache is None or model.training or torch.is_grad_enabled():
         return compute()
-    return cache.run(model, "forward", args, kwargs, compute, group)
+    return cache.run(model, "forward", args, kwargs, compute, group, nested=True)
+
+
+def cached_image_features(fn):
+    """Reuse a VLM's image features independently of its text tokens."""
+
+    @wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(self, *args, **kwargs)
+        cache = _active_cache.get()
+        if cache is None or self.training or torch.is_grad_enabled():
+            return fn(self, *args, **kwargs)
+        group = get_tp_group() if model_parallel_is_initialized() else None
+        return cache.run(
+            self, fn.__name__, args, kwargs, lambda: fn(self, *args, **kwargs), group
+        )
+
+    return wrapped
 
 
 def cached_vae_encode(fn):
@@ -273,6 +305,8 @@ def cached_vae_encode(fn):
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(self, *args, **kwargs)
         cache = _active_cache.get()
         if (
             cache is None

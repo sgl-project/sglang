@@ -11,6 +11,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_image_features
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -772,8 +773,7 @@ class Gemma3ForConditionalGeneration(
             elif pixel_values.dim() != 4:
                 raise ValueError(f"Unexpected pixel_values shape: {pixel_values.shape}")
 
-            vision_outputs = self.vision_tower(pixel_values)
-            image_features = self.multi_modal_projector(vision_outputs)
+            image_features = self._encode_image_features(pixel_values)
             image_features = image_features.to(
                 device=inputs_embeds.device, dtype=inputs_embeds.dtype
             )
@@ -787,6 +787,10 @@ class Gemma3ForConditionalGeneration(
         return self.language_model.forward(
             llm_input_ids, inputs_embeds=inputs_embeds, **kwargs
         )
+
+    @cached_image_features
+    def _encode_image_features(self, pixel_values):
+        return self.multi_modal_projector(self.vision_tower(pixel_values))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         loaded_params: Set[str] = set()

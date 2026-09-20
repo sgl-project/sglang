@@ -57,6 +57,8 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_image_features
+
 logger = logging.getLogger(__name__)
 
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -910,6 +912,7 @@ class Qwen3VLModel(nn.Module):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
+    @cached_image_features
     def _get_flat_visual_features(
         self,
         pixel_values: torch.FloatTensor,

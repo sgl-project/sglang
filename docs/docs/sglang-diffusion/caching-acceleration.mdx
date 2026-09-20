@@ -8,7 +8,7 @@ SGLang can reuse exact conditioning across requests and cache intermediate denoi
 
 Native pipelines enable a CPU conditioning cache by default. Repeated inputs can reuse text embeddings (including negative prompts), image or vision-language encoder outputs, and VAE posteriors. The shared LRU holds at most **512 MiB per executor/rank**, with at most 128 entries. It does not retain cached tensors on the GPU. Oversized results are computed normally.
 
-This is most useful when generating several variations from the same prompt or reference image, especially with a layerwise-offloaded encoder. A changed edit instruction recomputes the joint vision-language embedding, while the unchanged image can still reuse its VAE posterior. Separate CLI invocations start separate processes and cannot share this cache.
+This is most useful when generating several variations from the same prompt or reference image, especially with a layerwise-offloaded encoder. A changed edit instruction recomputes the joint vision-language embedding, while the unchanged image can still reuse its vision features and VAE posterior. Separate CLI invocations start separate processes and cannot share this cache.
 
 To disable conditioning reuse:
 
@@ -35,7 +35,7 @@ The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_
 
 ### Coverage and limits
 
-The common encoder boundary covers native CLIP, T5/UMT5, Llama, Gemma 2/3, Qwen 2.5-VL, Qwen 3/3-VL, Ideogram, and MiniMax-H3 encoders, including custom pipeline stages. Hunyuan3D image encoders and the LTX-2.3 video condition encoder also participate. Native image, video, and audio VAE encode entry points cache deterministic tensors or supported posterior containers.
+The common encoder boundary covers native CLIP, T5/UMT5, Llama, Gemma 2/3, Qwen 2.5-VL, Qwen 3/3-VL, Ideogram, and MiniMax-H3 encoders, including custom pipeline stages. Qwen-VL and Gemma 3 also cache vision features independently of text. Hunyuan3D image encoders and the LTX-2.3 video condition encoder participate. Native image, video, and audio VAE encode entry points cache deterministic tensors or supported posterior containers.
 
 Stateful autoregressive calls (`use_cache=True` or existing `past_key_values`), training/autograd, unsupported tensor or output types, FSDP execution, and distributed VAE encoding bypass the new host cache. External SRT encoders and the Diffusers pipeline backend keep their own cache behavior. The global disable flag also disables existing realtime text and VLA prefix reuse; those model-specific caches otherwise retain their own memory settings.
 

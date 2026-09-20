@@ -14,6 +14,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     ConditioningCache,
+    cached_image_features,
     cached_vae_encode,
     invalidate_conditioning_caches,
 )
@@ -46,6 +47,39 @@ class VAE(torch.nn.Module):
     def encode(self, x):
         self.calls += 1
         return AutoencoderKLOutput(latent_dist=DiagonalGaussianDistribution(x.clone()))
+
+
+class VisionLanguageEncoder(Encoder):
+    def __init__(self):
+        super().__init__()
+        self.vision_calls = 0
+
+    @cached_image_features
+    def image_features(self, pixels):
+        self.vision_calls += 1
+        return pixels * 2
+
+    def forward(self, text, pixels):
+        self.calls += 1
+        return self.image_features(pixels) + text
+
+
+@torch.no_grad()
+def test_changed_instruction_reuses_vision_but_not_joint_embedding():
+    cache = ConditioningCache(4096)
+    model = VisionLanguageEncoder().eval()
+    pixels = torch.ones(4)
+    with cache.scope():
+        first = model(torch.ones(4), pixels)
+        changed = model(torch.full((4,), 2.0), pixels)
+        assert not torch.equal(first, changed)
+        assert model.calls == 2 and model.vision_calls == 1
+        torch.testing.assert_close(
+            model(torch.full((4,), 2.0), pixels), changed, rtol=0, atol=0
+        )
+        assert model.calls == 2
+        model(torch.ones(4), pixels + 1)
+        assert model.vision_calls == 2
 
 
 @torch.no_grad()
