@@ -62,17 +62,28 @@ def run_staggered_pr_traffic(base_url, num_requests=32):
     num_decode_reqs > 0 in the same round) can never pass and
     ``dllm_num_mixed_rounds`` stays 0. Staggered arrivals keep later requests
     in prefill while earlier ones are still denoising their 128-token
-    completions (>= 4 decode blocks, many rounds), which is exactly the
-    overlap the gate waits for. Prompts differ per request so prefix caching
-    cannot collapse a prefill into a no-op.
+    completions (>= 4 decode blocks, many rounds). Prompts differ per request
+    so prefix caching cannot collapse a prefill into a no-op.
+
+    The prompts must be a few hundred tokens long. Probed on 910B3: this same
+    stagger with ~15-token prompts formed 0 countable mixed rounds across 96
+    requests (as did a burst, and a long-decode-then-late-prefill pattern),
+    while padding the prompts to ~300 tokens formed 28 — prompt length, not
+    arrival shape, is what lets a prefill row coexist with decode rows in a
+    counted round.
     """
 
     def one_request(i):
         time.sleep(0.05 * i)
+        # Distinct per request (defeats prefix caching) and a few hundred
+        # tokens long (see docstring).
+        padding = " ".join(
+            f"item {i}-{j} adds {j} units to the running total;" for j in range(50)
+        )
         response = requests.post(
             f"{base_url}/generate",
             json={
-                "text": f"Question {i}: compute {i} + {i} and explain. Answer:",
+                "text": f"Question {i}: {padding} what is the final total? Answer:",
                 "sampling_params": {"temperature": 0, "max_new_tokens": 128},
             },
             timeout=300,
