@@ -2351,6 +2351,10 @@ class AiterAttnBackend(AttentionBackend):
                             new_rows = page_indices.shape[0]
                             new_cols = page_indices.shape[1]
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
+                        else:
+                            new_rows = page_indices.shape[0]
+                            new_cols = page_indices.shape[1]
+                            kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
