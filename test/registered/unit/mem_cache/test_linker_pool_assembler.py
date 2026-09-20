@@ -100,6 +100,84 @@ class TestDevicePoolEntry(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     pool.prepare_locations(indices)
 
+    def _dcp_pool(self, *, dcp_size, rows, page_size=8, rows_are_pages=False):
+        return DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((rows, 4), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=page_size,
+            rows_are_pages=rows_are_pages,
+            dcp_size=dcp_size,
+        )
+
+    def test_dcp_widened_locs_collapse_to_per_rank_rows(self):
+        # A token-addressed pool is indexed by DCP-WIDENED locs: the allocator
+        # spans [0, max_total * dcp_size) and this rank stores only the locs it
+        # owns, at row loc // dcp_size. One widened page is page_size //
+        # dcp_size physical rows here, so the page starting at widened loc 8
+        # is row 2, not row 8.
+        pool = self._dcp_pool(dcp_size=4, rows=10)
+
+        self.assertEqual(pool.prepare_locations(torch.arange(0, 8)), [0])
+        self.assertEqual(pool.prepare_locations(torch.arange(8, 16)), [2])
+        self.assertEqual(
+            pool.prepare_locations(torch.cat([torch.arange(0, 8), torch.arange(16, 24)])),
+            [0, 4],
+        )
+
+        # The byte span per page collapses with the row span; leaving it at the
+        # widened page_size would copy dcp_size times too many bytes and run
+        # into the neighbouring rows.
+        _, sizes = pool.get_page_buffer_meta(torch.arange(8, 16))
+        self.assertEqual(sizes, [4 * (8 // 4)])
+
+    def test_dcp_top_page_lands_on_the_last_valid_row(self):
+        # The geometry the widened allocator relies on: with a loc space of
+        # max_total * dcp_size paged at page_size * dcp_size, the highest page
+        # start collapses to exactly the last row the pool was padded for
+        # (max_total + page_size). One page further must be rejected -- that
+        # is the bound the pre-collapse code tripped on every run.
+        max_total, page_size, dcp_size = 8, 2, 4
+        widened_page = page_size * dcp_size
+        pool = self._dcp_pool(
+            dcp_size=dcp_size, rows=max_total + page_size, page_size=widened_page
+        )
+
+        top_start = max_total * dcp_size
+        self.assertEqual(
+            pool.prepare_locations(torch.arange(top_start, top_start + widened_page)),
+            [max_total],
+        )
+        over = top_start + widened_page
+        with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):
+            pool.prepare_locations(torch.arange(over, over + widened_page))
+
+    def test_without_collapse_a_widened_loc_runs_off_the_buffer(self):
+        # Regression guard for the original defect: the same widened loc that
+        # is in bounds once collapsed walks off the buffer when the pool is
+        # built without dcp_size, which surfaced as a soft offload failure and
+        # a silently decaying device hit rate rather than an error.
+        indices = torch.arange(32, 40)
+        with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):
+            self._dcp_pool(dcp_size=1, rows=10).prepare_locations(indices)
+        self.assertEqual(self._dcp_pool(dcp_size=4, rows=10).prepare_locations(indices), [8])
+
+    def test_slot_addressed_pool_does_not_collapse(self):
+        # The MAMBA pool is one row per state slot, addressed by slot id rather
+        # than token position, so it is not DCP-widened: the assembler builds
+        # it without dcp_size and slot ids stay their own rows. Passing a
+        # dcp_size to it is rejected by the divisibility guard below, which is
+        # the behaviour we want -- a page-addressed pool has nothing to
+        # collapse.
+        pool = self._dcp_pool(dcp_size=1, rows=10, page_size=1, rows_are_pages=True)
+        self.assertEqual(pool.prepare_locations(torch.tensor([3, 7])), [3, 7])
+
+    def test_page_size_must_be_divisible_by_dcp_size(self):
+        with self.assertRaisesRegex(ValueError, "must be a multiple of"):
+            self._dcp_pool(dcp_size=3, rows=10)
+
 
 class TestDevicePoolGroup(CustomTestCase):
     def test_resolve_transfers_expands_physical_pools(self):
@@ -455,18 +533,23 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     )
 
     def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        # _MambaStrategy used to stand in here, but it grew a
+        # build_direct_linker_pool_group when hybrid mamba landed on the
+        # linker, so it now gets as far as reading kvcache.full_kv_pool off
+        # this uninitialised mock and raises AttributeError instead of the
+        # strategy-level ValueError. _SwaStrategy is still without a builder.
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-        kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache = SWAKVPool.__new__(SWAKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "does not support the direct external linker: _SwaStrategy",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
+                components={ComponentType.FULL, ComponentType.SWA},
             )
 
 
