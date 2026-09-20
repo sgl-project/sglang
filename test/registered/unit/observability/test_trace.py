@@ -394,6 +394,40 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertEqual(len(ctx.thread_context.cur_slice_stack), 0)
         ctx.trace_req_finish(ts=3000)
 
+    def test_trace_slice_end_name_mismatch_ends_span(self):
+        """A discarded slice must still have its span ended.
+
+        Once the slice is popped nothing can reach its span again, so a span
+        left recording here is never exported. Asserting the stack depth alone
+        cannot catch that, hence the explicit end check.
+        """
+        ctx = TraceReqContext(rid="req-1")
+        ctx.trace_req_start(ts=1000)
+        ctx.trace_slice_start("prefill", level=1, ts=1500)
+        span = ctx.thread_context.cur_slice_stack[-1].span
+
+        ctx.trace_slice_end("wrong_name", level=1, ts=2000)
+
+        self.assertEqual(len(ctx.thread_context.cur_slice_stack), 0)
+        self.assertFalse(
+            span.is_recording(),
+            "the discarded slice's span must be ended, not left recording",
+        )
+        ctx.trace_req_finish(ts=3000)
+
+    def test_trace_slice_end_level_mismatch_ends_span(self):
+        """The level-mismatch half of the same branch must also end the span."""
+        ctx = TraceReqContext(rid="req-1")
+        ctx.trace_req_start(ts=1000)
+        ctx.trace_slice_start("prefill", level=1, ts=1500)
+        span = ctx.thread_context.cur_slice_stack[-1].span
+
+        ctx.trace_slice_end("prefill", level=2, ts=2000)
+
+        self.assertEqual(len(ctx.thread_context.cur_slice_stack), 0)
+        self.assertFalse(span.is_recording())
+        ctx.trace_req_finish(ts=3000)
+
     def test_trace_slice_end_with_attrs_and_thread_finish(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
