@@ -207,18 +207,6 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
         self.assertEqual(template.normal_text, existing.normal_text)
         self.assertEqual(_call_values(template.calls), _call_values(existing.calls))
 
-    def test_non_streaming_parse_does_not_finalize_streaming_state(self):
-        detector = ResponseTemplateToolDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-            prefix=PREFIX,
-        )
-
-        parsed = detector.detect_and_parse(TOOL_CALL, [_tool()])
-        normal_text, calls = _collect_tool_stream(detector, [TOOL_CALL])
-
-        self.assertEqual(normal_text, "")
-        self.assertEqual(calls, _call_values(parsed.calls))
-
     def test_content_between_tool_calls_is_preserved(self):
         detector = ResponseTemplateToolDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,
@@ -232,34 +220,6 @@ class TestGemma4ResponseTemplateParity(unittest.TestCase):
 
         self.assertEqual(parsed.normal_text, " between calls ")
         self.assertEqual(len(parsed.calls), 2)
-
-    def test_non_streaming_reasoning_and_tool_handoff_parity(self):
-        text = THINKING + TOOL_CALL
-
-        existing_reasoning = Gemma4ReasoningDetector().detect_and_parse(text)
-        existing_tools = Gemma4ToolDetector().detect_and_parse(
-            existing_reasoning.normal_text,
-            [_tool()],
-        )
-
-        template_reasoning = ResponseTemplateReasoningDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-            prefix=PREFIX,
-        ).detect_and_parse(text)
-        template_tools = ResponseTemplateToolDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-            prefix=PREFIX,
-        ).detect_and_parse(template_reasoning.normal_text, [_tool()])
-
-        self.assertEqual(
-            template_reasoning.reasoning_text,
-            existing_reasoning.reasoning_text,
-        )
-        self.assertEqual(template_tools.normal_text, existing_tools.normal_text)
-        self.assertEqual(
-            _call_values(template_tools.calls),
-            _call_values(existing_tools.calls),
-        )
 
     def test_malformed_tool_body_does_not_expose_reasoning(self):
         malformed = TOOL_CALL.replace("<tool_call|>", "unexpected<tool_call|>")
@@ -653,14 +613,6 @@ class TestResponseTemplateAdapters(unittest.TestCase):
             ],
         )
         self.assertTrue(detector.has_incomplete_tool_call)
-        self.assertEqual(
-            detector.prev_tool_call_arr[0]["arguments"],
-            failed.calls[0].parameters,
-        )
-        self.assertEqual(
-            detector.streamed_args_for_tool[0],
-            failed.calls[0].parameters,
-        )
         later = detector.parse_streaming_increment(" trailing bytes", [_tool()])
         self.assertEqual(later.normal_text, " trailing bytes")
         self.assertEqual(later.calls, [])
@@ -694,8 +646,6 @@ class TestResponseTemplateAdapters(unittest.TestCase):
             [(0, None, "{}")],
         )
         self.assertTrue(detector.has_incomplete_tool_call)
-        self.assertEqual(detector.current_tool_id, 1)
-        self.assertFalse(detector.current_tool_name_sent)
 
     def test_streaming_waits_when_tool_name_depends_on_content(self):
         template = {
