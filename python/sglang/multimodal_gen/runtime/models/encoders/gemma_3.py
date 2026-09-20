@@ -11,7 +11,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_image_features
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -788,7 +788,7 @@ class Gemma3ForConditionalGeneration(
             llm_input_ids, inputs_embeds=inputs_embeds, **kwargs
         )
 
-    @cached_image_features
+    @cached_conditioning
     def _encode_image_features(self, pixel_values):
         return self.multi_modal_projector(self.vision_tower(pixel_values))
 

@@ -175,7 +175,8 @@ class ConditioningCache:
 
     @contextmanager
     def scope(self, enabled=True):
-        token = _active_cache.set(self if enabled and self.max_bytes else None)
+        # Zero-capacity ranks still participate in encoder hit consensus.
+        token = _active_cache.set(self if enabled else None)
         try:
             yield
         finally:
@@ -196,6 +197,8 @@ class ConditioningCache:
             self._models[model] = self._next_model
             self._next_model += 1
         try:
+            if not self.max_bytes:
+                raise Uncacheable("cache disabled")
             if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
                 raise Uncacheable("stateful autoregressive encoding")
             parameter = next(model.parameters(), None)
@@ -226,9 +229,14 @@ class ConditioningCache:
             self.hits += 1
             self._entries.move_to_end(key)
             logger.debug("Conditioning cache hit: %s.%s", type(model).__name__, method)
-            return _map_output(
-                entry[0], lambda t: t.data.to(t.device, copy=True), restore=True
-            )
+            restored = {}
+
+            def restore(t):
+                if id(t) not in restored:
+                    restored[id(t)] = t.data.to(t.device, copy=True)
+                return restored[id(t)]
+
+            return _map_output(entry[0], restore, restore=True)
         if key is None:
             self.bypasses += 1
             return compute()
@@ -239,10 +247,13 @@ class ConditioningCache:
             output = compute()
         try:
             size = 0
+            seen = set()
 
             def count(t):
                 nonlocal size
-                size += t.numel() * t.element_size()
+                if id(t) not in seen:
+                    size += t.numel() * t.element_size()
+                    seen.add(id(t))
                 if type(t) is not torch.Tensor or t.requires_grad:
                     raise Uncacheable("autograd output")
                 return t
@@ -251,9 +262,6 @@ class ConditioningCache:
             if not size or size > self.max_bytes:
                 self.bypasses += 1
                 return output
-            stored = _map_output(
-                output, lambda t: _HostTensor(t.detach().to("cpu", copy=True), t.device)
-            )
         except Uncacheable:
             self.bypasses += 1
             return output
@@ -264,13 +272,29 @@ class ConditioningCache:
             _, (_, removed_size) = self._entries.popitem(last=False)
             self.bytes -= removed_size
             self.evictions += 1
+        tensors = {}
+
+        def snapshot(t):
+            if id(t) not in tensors:
+                tensors[id(t)] = _HostTensor(t.detach().to("cpu", copy=True), t.device)
+            return tensors[id(t)]
+
+        stored = _map_output(output, snapshot)
         self._entries[key] = (stored, size)
         self.bytes += size
+        logger.debug(
+            "Conditioning cache store: %s.%s, %d bytes",
+            type(model).__name__,
+            method,
+            size,
+        )
         return output
 
 
 def cached_encoder_call(model, args, kwargs, compute, group=None):
     if torch.compiler.is_compiling():
+        return compute()
+    if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
         return compute()
     cache = _active_cache.get()
     if cache is None or model.training or torch.is_grad_enabled():
@@ -278,8 +302,8 @@ def cached_encoder_call(model, args, kwargs, compute, group=None):
     return cache.run(model, "forward", args, kwargs, compute, group, nested=True)
 
 
-def cached_image_features(fn):
-    """Reuse a VLM's image features independently of its text tokens."""
+def cached_conditioning(fn):
+    """Cache a deterministic conditioning method on the current encoder TP group."""
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):

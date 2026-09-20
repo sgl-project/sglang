@@ -26,7 +26,7 @@ The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_
 
 ### Matching and correctness
 
-- Keys include the loaded encoder instance, actual input tensor contents, shapes, dtypes, masks, and autocast precision. Images are matched after model-owned preprocessing, so replacing a file at the same path cannot reuse stale pixels. Alpha is part of the VAE input.
+- Keys include the loaded encoder instance, actual input contents, shapes, dtypes, masks, and autocast precision. Image tensors and PIL images are matched by content, so replacing a file at the same path cannot reuse stale pixels. Alpha is part of the VAE input.
 - Positive and negative inputs use the same bounded cache. Different seeds can reuse conditioning; initial noise is still generated for each request.
 - VAE caching stores the posterior before sampling and normalization. Every request still calls `sample()` or `mode()` as its model requires, preserving the random-number sequence.
 - Cache hits return independent copies. In-place normalization and downstream mutations cannot change a stored entry.
@@ -36,6 +36,8 @@ The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_
 ### Coverage and limits
 
 The common encoder boundary covers native CLIP, T5/UMT5, Llama, Gemma 2/3, Qwen 2.5-VL, Qwen 3/3-VL, Ideogram, and MiniMax-H3 encoders, including custom pipeline stages. Qwen-VL and Gemma 3 also cache vision features independently of text. Hunyuan3D image encoders and the LTX-2.3 video condition encoder participate. Native image, video, and audio VAE encode entry points cache deterministic tensors or supported posterior containers.
+
+Cosmos3 has no separate text encoder: its deterministic understanding pathway caches immutable per-layer K/V results, which are copied into fresh request state. SenseNova-U1 caches reference-image vision features; its noisy-image vision path still runs at each denoising step. VLA keeps its model-owned observation/prefix cache.
 
 Stateful autoregressive calls (`use_cache=True` or existing `past_key_values`), training/autograd, unsupported tensor or output types, FSDP execution, and distributed VAE encoding bypass the new host cache. External SRT encoders and the Diffusers pipeline backend keep their own cache behavior. The global disable flag also disables existing realtime text and VLA prefix reuse; those model-specific caches otherwise retain their own memory settings.
 

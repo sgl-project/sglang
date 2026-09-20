@@ -14,7 +14,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     ConditioningCache,
-    cached_image_features,
+    cached_conditioning,
     cached_vae_encode,
     invalidate_conditioning_caches,
 )
@@ -54,7 +54,7 @@ class VisionLanguageEncoder(Encoder):
         super().__init__()
         self.vision_calls = 0
 
-    @cached_image_features
+    @cached_conditioning
     def image_features(self, pixels):
         self.vision_calls += 1
         return pixels * 2
@@ -92,6 +92,7 @@ def test_content_masks_model_identity_and_copy_isolation():
         expected = original.last_hidden_state.clone()
         original.last_hidden_state.zero_()
         hit = model(x.clone())
+        assert hit.hidden_states[0] is hit.last_hidden_state
         torch.testing.assert_close(hit.last_hidden_state, expected, rtol=0, atol=0)
         hit.hidden_states[0].zero_()
         torch.testing.assert_close(model(x).last_hidden_state, expected, rtol=0, atol=0)
@@ -108,7 +109,7 @@ def test_content_masks_model_identity_and_copy_isolation():
 
 @torch.no_grad()
 def test_lru_budget_and_oversized_outputs():
-    cache = ConditioningCache(64)
+    cache = ConditioningCache(32)
     model = Encoder().eval()
     with cache.scope():
         for value in (1, 2, 1, 3, 2):
@@ -118,7 +119,7 @@ def test_lru_budget_and_oversized_outputs():
     assert model.calls == 5  # one LRU hit, then an oversized miss
     assert cache.hits == 1
     assert cache.evictions == 2
-    assert cache.bytes == before == 64
+    assert cache.bytes == before == 32
     assert cache.bypasses == 1
 
 
@@ -179,7 +180,7 @@ def test_weight_invalidation_and_precision():
     assert cache.hits == 1
 
 
-def _rank_eviction(rank, init_method):
+def _rank_eviction(rank, init_method, disabled_rank):
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -188,7 +189,7 @@ def _rank_eviction(rank, init_method):
         timeout=timedelta(seconds=30),
     )
     try:
-        cache = ConditioningCache(1024)
+        cache = ConditioningCache(0 if disabled_rank and rank == 0 else 1024)
         model = Encoder().eval()
         group = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
         x = torch.ones(4)
@@ -204,15 +205,19 @@ def _rank_eviction(rank, init_method):
                 if attempt == 1 and rank == 0:
                     cache.clear()
                 cache.run(model, "forward", (x,), {}, compute, group)
-        assert model.calls == 2
-        assert cache.hits == 1
+        assert model.calls == (3 if disabled_rank else 2)
+        assert cache.hits == (0 if disabled_rank else 1)
     finally:
         dist.destroy_process_group()
 
 
-def test_rank_local_eviction_forces_collective_miss(tmp_path):
+@pytest.mark.parametrize("disabled_rank", [False, True])
+def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank):
     mp.spawn(
-        _rank_eviction, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2, join=True
+        _rank_eviction,
+        args=(f"file://{tmp_path / 'rendezvous'}", disabled_rank),
+        nprocs=2,
+        join=True,
     )
 
 
