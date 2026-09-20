@@ -1554,7 +1554,10 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        supported = bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        return supported and (
+            get_parallel().attn_cp_size == 1 or _prefill_graph_max_seq_len() is not None
+        )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -2818,36 +2821,56 @@ class DeepseekV4AttnBackend(
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
-        if tail is not None:
-            q_lens_cpu = tail.local_lens_cpu
-            req_global, pos_global = tail.req_global, tail.pos_global
-        else:
-            q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
-                get_parallel().attn_cp_rank,
-                get_parallel().attn_cp_size,
-            )
-            req_global = token_req_indices(forward_batch, num_tokens=total)
-            pos_global = forward_batch.positions[:total].to(torch.int64)
-        num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
+            )
+            if self._low_ratio_in_prefill_graph():
+                assert tail is None, "bounded SWA replay cannot enter prefill BCG"
+                core = self.forward_metadata.core_metadata
+                bucket = core.raw_out_loc.shape[0]
+                req_global = self.forward_metadata.low_ratio_req_indices
+                assert req_global is not None and req_global.shape[0] >= bucket
+                assert x_global.shape[0] >= bucket
+                assert forward_batch.positions.shape[0] >= bucket
+                req_global = req_global[:bucket]
+                pos_global = forward_batch.positions[:bucket].to(torch.int64)
+                x_global = x_global[:bucket]
+            else:
+                total = int(cp_meta.total_seq_lens)
+                if tail is not None:
+                    req_global, pos_global = tail.req_global, tail.pos_global
+                else:
+                    req_global = token_req_indices(forward_batch, num_tokens=total)
+                    pos_global = forward_batch.positions[:total].to(torch.int64)
+                x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            # A rank's local rows are not the batch's, so no req_rows to pass.
-            self._low_ratio_index_topk(
-                layer,
-                x[:num_local],
-                q_lora[:num_local],
-                None,
-                positions[:num_local].to(torch.int64),
-                forward_batch,
-                rows_per_request=q_lens_cpu,
-            )
+            if self._low_ratio_in_prefill_graph():
+                q = layer.indexer.queries(q_lora, layer.freqs_cis[positions])
+                w = layer.indexer.head_weights(x)
+                self._low_ratio_index_topk_captured(layer, q, w)
+            else:
+                if tail is not None:
+                    q_lens_cpu = tail.local_lens_cpu
+                else:
+                    q_lens_cpu = interleave_rows_per_request(
+                        _as_int_list(forward_batch.extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    )
+                num_local = sum(q_lens_cpu)
+                # A rank's local rows are not the batch's, so no req_rows to pass.
+                self._low_ratio_index_topk(
+                    layer,
+                    x[:num_local],
+                    q_lora[:num_local],
+                    None,
+                    positions[:num_local].to(torch.int64),
+                    forward_batch,
+                    rows_per_request=q_lens_cpu,
+                )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
