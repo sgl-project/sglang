@@ -199,7 +199,7 @@ def test_weight_invalidation_and_precision():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
 @torch.no_grad()
-def test_cuda_snapshot_finishes_before_outputs_are_mutated():
+def test_cuda_snapshot_waits_for_producing_stream_before_restore():
     cache = ConditioningCache(32 * 1024 * 1024)
     model = Encoder().eval()
     stream = torch.cuda.Stream()
@@ -211,7 +211,6 @@ def test_cuda_snapshot_finishes_before_outputs_are_mutated():
         )
         cache.run(model, "forward", (), {}, lambda: output)
         value.zero_()
-    stream.synchronize()
     restored = cache.run(model, "forward", (), {}, lambda: pytest.fail("cache miss"))
     expected = torch.arange(1024 * 1024).reshape(1024, 1024)
     assert restored.last_hidden_state is restored.hidden_states[0]

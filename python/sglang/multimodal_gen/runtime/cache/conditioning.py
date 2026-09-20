@@ -115,6 +115,17 @@ class _HostTensor:
     device: torch.device
 
 
+@dataclass
+class _CacheEntry:
+    output: object
+    size: int
+    ready: tuple[torch.cuda.Event, ...]
+
+    def wait(self):
+        for event in self.ready:
+            event.synchronize()
+
+
 def _map_output(value, tensor_fn, *, restore=False):
     if isinstance(value, _HostTensor if restore else torch.Tensor):
         return tensor_fn(value)
@@ -163,6 +174,8 @@ class ConditioningCache:
         self._next_model = 0
 
     def clear(self):
+        for entry in self._entries.values():
+            entry.wait()
         self._entries.clear()
         self.bytes = 0
 
@@ -236,6 +249,7 @@ class ConditioningCache:
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.cpu_group)
             hit = bool(flag.item())
         if hit:
+            entry.wait()
             self.hits += 1
             self._entries.move_to_end(key)
             logger.debug("Conditioning cache hit: %s.%s", type(model).__name__, method)
@@ -246,7 +260,7 @@ class ConditioningCache:
                     restored[id(t)] = t.data.to(t.device, copy=True)
                 return restored[id(t)]
 
-            return _map_output(entry[0], restore, restore=True)
+            return _map_output(entry.output, restore, restore=True)
         if key is None:
             self.bypasses += 1
             return compute()
@@ -277,10 +291,12 @@ class ConditioningCache:
             return output
         old = self._entries.pop(key, None)
         if old is not None:
-            self.bytes -= old[1]
+            old.wait()
+            self.bytes -= old.size
         while self.bytes + size > self.max_bytes or len(self._entries) >= 128:
-            _, (_, removed_size) = self._entries.popitem(last=False)
-            self.bytes -= removed_size
+            _, removed = self._entries.popitem(last=False)
+            removed.wait()
+            self.bytes -= removed.size
             self.evictions += 1
         tensors = {}
         copy_streams = {}
@@ -289,17 +305,22 @@ class ConditioningCache:
             if id(t) not in tensors:
                 if t.device.type == "cuda":
                     copy_streams[t.device] = torch.cuda.current_stream(t.device)
-                tensors[id(t)] = _HostTensor(
-                    t.detach().to("cpu", copy=True, non_blocking=t.is_cuda), t.device
-                )
+                    host = torch.empty_like(t, device="cpu", pin_memory=True)
+                    host.copy_(t.detach(), non_blocking=True)
+                else:
+                    host = t.detach().to("cpu", copy=True)
+                tensors[id(t)] = _HostTensor(host, t.device)
             return tensors[id(t)]
 
         stored = _map_output(output, snapshot)
-        # Finish all copies before publishing the entry, without synchronizing
-        # after each hidden-state tensor in an encoder output.
+        # Copies precede downstream mutations on each producing stream. Wait
+        # only before reading or freeing host storage, not on the cold path.
+        ready = []
         for stream in copy_streams.values():
-            stream.synchronize()
-        self._entries[key] = (stored, size)
+            event = torch.cuda.Event()
+            event.record(stream)
+            ready.append(event)
+        self._entries[key] = _CacheEntry(stored, size, tuple(ready))
         self.bytes += size
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",
