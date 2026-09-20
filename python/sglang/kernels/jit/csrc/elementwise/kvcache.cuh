@@ -16,6 +16,7 @@ namespace sglang {
 
 struct StoreKVCacheParams {
   const void* __restrict__ k;
+  // Null for the K-only form (kVBytes == 0), which never dereferences them.
   const void* __restrict__ v;
   void* __restrict__ k_cache;
   void* __restrict__ v_cache;
@@ -35,7 +36,9 @@ struct StoreKVCacheParams {
  * \brief Kernel to store key-value pairs into the KV cache.
  * Each element is split into multiple parts to allow parallel memory copy.
  * \tparam kKBytes The size of each key element in bytes.
- * \tparam kVBytes The size of each value element in bytes.
+ * \tparam kVBytes The size of each value element in bytes. Zero selects the
+ *         K-only form: no V tensors, no V traffic, and the V half of the copy
+ *         is discarded at compile time rather than predicated at runtime.
  * \tparam kNumThreads Threads cooperating on one KV item; a multiple of the
  *         warp size. The block shape is chosen at launch, independently.
  * \tparam kUsePDL Whether to use PDL feature.
@@ -46,8 +49,10 @@ __global__ void store_kvcache_kernel(const __grid_constant__ StoreKVCacheParams 
   using namespace device;
   static_assert(kNumThreads % kWarpThreads == 0, "TODO: support sub-warp copy for small items");
   constexpr uint32_t kNumSplit = kNumThreads / kWarpThreads;
+  static_assert(kKBytes > 0, "the K row is always copied; only V may be absent");
   // Integer division below would silently drop the remainder of every row.
   static_assert(kKBytes % kNumSplit == 0 && kVBytes % kNumSplit == 0, "the split must divide both rows exactly");
+  constexpr bool kHasV = kVBytes > 0;
   constexpr uint32_t kKSplitBytes = static_cast<uint32_t>(kKBytes) / kNumSplit;
   constexpr uint32_t kVSplitBytes = static_cast<uint32_t>(kVBytes) / kNumSplit;
 
@@ -65,19 +70,33 @@ __global__ void store_kvcache_kernel(const __grid_constant__ StoreKVCacheParams 
   PDLWaitPrimary<kUsePDL>();
   const auto index = static_cast<const TLoc*>(indices)[item_id * stride_indices];
   const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kKSplitBytes);
-  const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kVSplitBytes);
 
   using enum warp::LoadStorePattern::type;
   const auto k = warp::load_bytes<kKSplitBytes, WARP_UNIFORM_16B>(k_src);
-  const auto v = warp::load_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_src);
+  // The V half is DISCARDED, not merely skipped, when kVBytes == 0: CopyTrait
+  // static_asserts kBytes > 0, so a zero-width instantiation is ill-formed --
+  // and `v_input` is null there, so even the address arithmetic has to go.
+  [[maybe_unused]] const auto v = [&] {
+    if constexpr (kHasV) {
+      return warp::load_bytes<kVSplitBytes, WARP_UNIFORM_16B>(
+          pointer::offset(v_input, item_id * stride_v, split_id * kVSplitBytes));
+    } else {
+      // Any empty type would do; nullptr avoids declaring one. A named
+      // placeholder in `sglang::details` would be ambiguous against
+      // `device::details`, which `using namespace device` above pulls in.
+      return nullptr;
+    }
+  }();
 
   PDLTriggerSecondary<kUsePDL>();
   assert(index >= 0 && index < size_limit);
   if (index != reserved_skip_index) {
     const auto k_dst = pointer::offset(k_cache, index * stride_k_cache, split_id * kKSplitBytes);
-    const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitBytes);
     warp::store_bytes<kKSplitBytes, WARP_UNIFORM_16B>(k_dst, k);
-    warp::store_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_dst, v);
+    if constexpr (kHasV) {
+      const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitBytes);
+      warp::store_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_dst, v);
+    }
   }
 }
 
@@ -86,11 +105,40 @@ struct StoreKVCacheKernel {
   template <typename T>
   static constexpr auto store_kernel = store_kvcache_kernel<kKBytes, kVBytes, kNumThreads, kUsePDL, T>;
 
+  /// \brief Store one K row and one V row per index. Requires `kVBytes > 0`.
   static void
   run(const tvm::ffi::TensorView k,
       const tvm::ffi::TensorView v,
       const tvm::ffi::TensorView k_cache,
       const tvm::ffi::TensorView v_cache,
+      const tvm::ffi::TensorView indices,
+      const int64_t size_limit,
+      const int64_t reserved_skip_index) {
+    static_assert(kVBytes > 0, "kVBytes == 0 is the K-only form; export run_k_only instead");
+    run_impl(k, &v, k_cache, &v_cache, indices, size_limit, reserved_skip_index);
+  }
+
+  /// \brief Store one K row per index, against a pool that holds no V at all.
+  /// Requires `kVBytes == 0`; there is no V tensor to alias, so the write is
+  /// issued once, unlike passing K twice to `run`.
+  static void run_k_only(
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView k_cache,
+      const tvm::ffi::TensorView indices,
+      const int64_t size_limit,
+      const int64_t reserved_skip_index) {
+    static_assert(kVBytes == 0, "the K-only form is selected by kVBytes == 0; export run instead");
+    run_impl(k, nullptr, k_cache, nullptr, indices, size_limit, reserved_skip_index);
+  }
+
+ private:
+  /// \brief Shared body of `run` and `run_k_only`. `v` and `v_cache` are read
+  /// only when `kVBytes > 0`, and are null pointers for the K-only form.
+  static void run_impl(
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView* v,
+      const tvm::ffi::TensorView k_cache,
+      const tvm::ffi::TensorView* v_cache,
       const tvm::ffi::TensorView indices,
       const int64_t size_limit,
       const int64_t reserved_skip_index) {
@@ -118,24 +166,28 @@ struct StoreKVCacheKernel {
         .with_device(device_)
         .ensure_alignment(kAlignK)
         .verify(k);
-    TensorMatcher({B, DV})  //
-        .with_strides({-1, 1})
-        .with_dtype(dtype)
-        .with_device(device_)
-        .ensure_alignment(kAlignV)
-        .verify(v);
+    if constexpr (kVBytes > 0) {
+      TensorMatcher({B, DV})  //
+          .with_strides({-1, 1})
+          .with_dtype(dtype)
+          .with_device(device_)
+          .ensure_alignment(kAlignV)
+          .verify(*v);
+    }
     TensorMatcher({-1, DK})  //
         .with_strides({-1, 1})
         .with_dtype(dtype)
         .with_device(device_)
         .ensure_alignment(kAlignK)
         .verify(k_cache);
-    TensorMatcher({-1, DV})  //
-        .with_strides({-1, 1})
-        .with_dtype(dtype)
-        .with_device(device_)
-        .ensure_alignment(kAlignV)
-        .verify(v_cache);
+    if constexpr (kVBytes > 0) {
+      TensorMatcher({-1, DV})  //
+          .with_strides({-1, 1})
+          .with_dtype(dtype)
+          .with_device(device_)
+          .ensure_alignment(kAlignV)
+          .verify(*v_cache);
+    }
     TensorMatcher({B})  //
         .with_strides({-1})
         .with_dtype<int32_t, int64_t>(idx_dtype)
@@ -146,25 +198,35 @@ struct StoreKVCacheKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto device = device_.unwrap();
     CHECK_HOST(kKBytes == dtype_size * DK.unwrap());
-    CHECK_HOST(kVBytes == dtype_size * DV.unwrap());
+    if constexpr (kVBytes > 0) {
+      CHECK_HOST(kVBytes == dtype_size * DV.unwrap());
+    }
 
     if (batch_size == 0) return;
 
-    const auto params = StoreKVCacheParams{
+    // The V fields stay null/zero for the K-only form, whose kernel never
+    // reads them; `v` and `v_cache` are null pointers there.
+    auto params = StoreKVCacheParams{
         .k = k.data_ptr(),
-        .v = v.data_ptr(),
+        .v = nullptr,
         .k_cache = k_cache.data_ptr(),
-        .v_cache = v_cache.data_ptr(),
+        .v_cache = nullptr,
         .indices = indices.data_ptr(),
         .stride_k_bytes = k.stride(0) * dtype_size,
-        .stride_v_bytes = v.stride(0) * dtype_size,
+        .stride_v_bytes = 0,
         .stride_k_cache_bytes = k_cache.stride(0) * dtype_size,
-        .stride_v_cache_bytes = v_cache.stride(0) * dtype_size,
+        .stride_v_cache_bytes = 0,
         .stride_indices = indices.stride(0),
         .batch_size = batch_size,
         .size_limit = size_limit,
         .reserved_skip_index = reserved_skip_index,
     };
+    if constexpr (kVBytes > 0) {
+      params.v = v->data_ptr();
+      params.v_cache = v_cache->data_ptr();
+      params.stride_v_bytes = v->stride(0) * dtype_size;
+      params.stride_v_cache_bytes = v_cache->stride(0) * dtype_size;
+    }
 
     const auto kernel = idx_dtype.is_type<int32_t>() ? store_kernel<int32_t> : store_kernel<int64_t>;
     const auto total_warps = batch_size * kNumSplit;
