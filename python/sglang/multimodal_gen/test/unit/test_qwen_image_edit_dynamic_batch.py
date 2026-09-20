@@ -35,32 +35,34 @@ def _request(request_id, prompt, image_path, *, width=1024):
     return Req(request_id=request_id, sampling_params=params)
 
 
-def test_scheduler_merges_distinct_single_image_edit_requests():
+def test_scheduler_merges_same_source_single_image_edit_requests():
     scheduler = _scheduler()
     requests = [
-        _request("first", "turn it red", "first.png"),
-        _request("second", "turn it blue", "second.png"),
+        _request("first", "turn it red", "source.png"),
+        _request("second", "turn it blue", "source.png"),
     ]
 
     merged = scheduler._try_merge_generation_reqs(requests)
 
     assert merged is not None
     assert merged.prompt == ["turn it red", "turn it blue"]
-    assert merged.image_path == ["first.png", "second.png"]
+    assert merged.image_path == ["source.png", "source.png"]
     assert merged.extra["dynamic_batch_image_conditioning"] is True
 
 
-def test_scheduler_rejects_multi_reference_and_mismatched_output_shape():
+def test_scheduler_rejects_multi_reference_mismatched_source_or_output_shape():
     scheduler = _scheduler()
     single = _request("first", "turn it red", "first.png")
     multiple = _request("second", "turn it blue", ["a.png", "b.png"])
     different_width = _request("third", "turn it green", "third.png", width=768)
     multiple_outputs = _request("fourth", "make it purple", "fourth.png")
     multiple_outputs.num_outputs_per_prompt = 2
+    different_source = _request("fifth", "turn it orange", "second.png")
 
     assert scheduler._try_merge_generation_reqs([single, multiple]) is None
     assert scheduler._try_merge_generation_reqs([single, different_width]) is None
     assert scheduler._try_merge_generation_reqs([single, multiple_outputs]) is None
+    assert scheduler._try_merge_generation_reqs([single, different_source]) is None
 
 
 def test_only_standard_qwen_image_edit_opts_in():

@@ -461,20 +461,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         exclude_num_outputs = (
             self.server_args.pipeline_config.supports_sequential_dit_inference()
         )
-        image_batching_checker = getattr(
-            self.server_args.pipeline_config,
-            "supports_dynamic_batching_with_image_conditioning",
-            None,
-        )
-        supports_image_batching = bool(
-            callable(image_batching_checker) and image_batching_checker()
-        )
         return [
             (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
             for f in sp_fields
             if not f.metadata.get("batch_sig_exclude", False)
             and not (exclude_num_outputs and f.name == "num_outputs_per_prompt")
-            and not (supports_image_batching and f.name == "image_path")
         ]
 
     def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
