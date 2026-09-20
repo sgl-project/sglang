@@ -30,6 +30,9 @@ def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int, num_threads: int) ->
         if k_row_bytes % num_threads != 0 or v_row_bytes % num_threads != 0:
             return _jit_kvcache_module(k_row_bytes, v_row_bytes, num_threads)
         k_bytes = k_row_bytes / num_threads
+        # v_row_bytes == 0 is the K-only form. Both terms below then fall away
+        # on their own -- 0 % 8 == 0 holds vacuously and the width sum reduces
+        # to K -- so the heuristic needs no branch of its own.
         v_bytes = v_row_bytes / num_threads
         # increase threads if row is too large
         while k_bytes % 8 == 0 and v_bytes % 8 == 0 and (k_bytes + v_bytes) >= 64:
@@ -40,11 +43,20 @@ def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int, num_threads: int) ->
         return _jit_kvcache_module(k_row_bytes, v_row_bytes, num_threads)
 
     args = make_cpp_args(k_row_bytes, v_row_bytes, num_threads, is_arch_support_pdl())
+    # v_row_bytes == 0 selects the K-only specialisation. Its two entry points
+    # are mutually exclusive by static_assert, so a module exports exactly the
+    # one its template arguments admit -- exporting both would make every
+    # ordinary store_cache user compile a kernel they never call.
+    wrapper = (
+        ("store_k_cache", f"StoreKVCacheKernel<{args}>::run_k_only")
+        if v_row_bytes == 0
+        else ("store_cache", f"StoreKVCacheKernel<{args}>::run")
+    )
     return load_jit(
         "kvcache",
         *args,
         cuda_files=["elementwise/kvcache.cuh"],
-        cuda_wrappers=[("store_cache", f"StoreKVCacheKernel<{args}>::run")],
+        cuda_wrappers=[wrapper],
     )
 
 
@@ -62,6 +74,25 @@ def can_use_store_cache(
         logger.warning(
             f"Failed to load JIT KV-Cache kernel with "
             f"k_row_bytes={k_row_bytes} v_row_bytes={v_row_bytes}: {e}"
+        )
+        return False
+
+
+@cache_once
+def can_use_store_k_cache(k_row_bytes: int, num_threads: int = 0) -> bool:
+    """Whether the JIT store_k_cache kernel can serve this row width.
+
+    Distinct from ``can_use_store_cache``, which reads ``v_row_bytes=0`` as
+    "symmetric" and substitutes ``k_row_bytes``; here a K-only pool genuinely
+    has no V half, and the zero reaches the template as the K-only marker.
+    """
+    try:
+        _jit_kvcache_module(k_row_bytes, 0, num_threads)
+        return True
+    except Exception as e:
+        logger.warning(
+            f"Failed to load JIT K-only cache kernel with "
+            f"k_row_bytes={k_row_bytes}: {e}"
         )
         return False
 
@@ -114,6 +145,52 @@ def store_cache(
         v,
         k_cache,
         v_cache,
+        indices,
+        size_limit,
+        reserved_skip_index,
+    )
+
+
+@register_custom_op(mutates_args=["k_cache"])
+def store_k_cache(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    row_bytes: int = 0,
+    num_split: int = 0,
+    size_limit: int = 0,
+    reserved_skip_index: int = 0,
+) -> None:
+    """Store key tensors into a key-only cache at specified indices.
+
+    For pools that hold no value half at all (e.g. the MiniMax sparse-attention
+    index cache). Passing ``k`` twice to :func:`store_cache` would express the
+    same write, but it aliases two pointers the kernel declares ``__restrict__``
+    and issues the store twice to one address; this form does neither.
+
+    Args:
+        k (torch.Tensor): Key tensor of shape (batch_size, H * D).
+        k_cache (torch.Tensor): Key cache tensor of shape (num_pages, H * D).
+        indices (torch.Tensor): Indices tensor of shape (batch_size,).
+        row_bytes (int): Key row width in bytes. Inferred from k when 0.
+        num_split (int): Warps cooperating on one row. A heuristic picks it
+            when 0; it is the only knob here that exists purely for tuning.
+        size_limit (int): Valid slot bound (cache row count = real slots + the
+            reserved padding slot); an index outside [0, size_limit) fails fast
+            (device assert) instead of an illegal memory access. Defaults to the
+            cache row count when 0.
+        reserved_skip_index (int): If nonnegative, writes targeting this index
+            are skipped. Defaults to the reserved CUDA-graph padding slot 0;
+            pass -1 to disable skipping.
+    """
+    row_bytes = row_bytes or k.shape[-1] * k.element_size()
+    module = _jit_kvcache_module(row_bytes, 0, num_split * _WARP_THREADS)
+    if size_limit <= 0:
+        size_limit = k_cache.shape[0]
+    module.store_k_cache(
+        k,
+        k_cache,
         indices,
         size_limit,
         reserved_skip_index,
