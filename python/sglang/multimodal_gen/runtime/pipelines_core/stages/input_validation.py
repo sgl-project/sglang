@@ -442,6 +442,10 @@ class InputValidationStage(PipelineStage):
                     condition_image_width,
                     condition_image_height,
                 )
+                if batch.extra.get("dynamic_batch_image_conditioning"):
+                    batch.extra["dynamic_batch_condition_image_sizes"] = [
+                        image.size for image in batch.condition_image
+                    ]
             else:
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
@@ -458,6 +462,19 @@ class InputValidationStage(PipelineStage):
                 self.preprocess_condition_image(
                     batch, server_args, condition_image_width, condition_image_height
                 )
+
+                if batch.extra.get("dynamic_batch_image_conditioning"):
+                    processed_sizes = [image.size for image in batch.condition_image]
+                    if len(processed_sizes) != batch.batch_size:
+                        raise ValueError(
+                            "Dynamic Qwen Image Edit batching requires exactly one "
+                            "conditioning image per prompt."
+                        )
+                    if len(set(processed_sizes)) != 1:
+                        raise ValueError(
+                            "Dynamic Qwen Image Edit batching currently requires "
+                            "conditioning images with the same processed size."
+                        )
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720

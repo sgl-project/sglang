@@ -430,6 +430,14 @@ class PipelineConfig:
         """Return whether one request may participate in dynamic batching."""
         return True
 
+    def supports_dynamic_batching_with_image_conditioning(self) -> bool:
+        """Return whether distinct single-image requests may be batched together."""
+        return False
+
+    def merge_condition_image_latents(self, image_latents, batch):
+        """Merge independently encoded conditioning images for this request."""
+        return torch.cat(image_latents, dim=1)
+
     def supports_disaggregation(self) -> bool:
         """Return whether multi-service disaggregated deployment is supported."""
 

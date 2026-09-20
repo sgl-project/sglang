@@ -940,7 +940,7 @@ class ImageVAEEncodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            for image in images:
+            for image_index, image in enumerate(images):
                 image = self.preprocess(
                     image,
                 ).to(get_local_torch_device(), dtype=torch.float32)
@@ -993,6 +993,10 @@ class ImageVAEEncodingStage(PipelineStage):
                 generator = batch.generator
                 if generator is None:
                     raise ValueError("Generator must be provided")
+                if batch.extra.get("dynamic_batch_image_conditioning") and isinstance(
+                    generator, list
+                ):
+                    generator = generator[image_index]
 
                 sample_mode = (
                     server_args.pipeline_config.vae_config.encode_sample_mode()
@@ -1032,7 +1036,9 @@ class ImageVAEEncodingStage(PipelineStage):
                 )
                 all_image_latents.append(image_latent)
 
-        batch.image_latent = torch.cat(all_image_latents, dim=1)
+        batch.image_latent = server_args.pipeline_config.merge_condition_image_latents(
+            all_image_latents, batch
+        )
         if condition_latents is not None:
             prepare_condition_image_latent_ids(condition_latents, batch)
 
