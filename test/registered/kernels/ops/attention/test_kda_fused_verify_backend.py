@@ -147,6 +147,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             retrieve_next_token=None,
             retrieve_next_sibling=None,
             retrieve_parent_token=None,
+            has_direct_parent=False,
+            tree_depths=None,
+            tree_max_depth=0,
         )
         backend.verify_intermediate_state_indices = torch.arange(
             slots.numel(), device="cuda", dtype=torch.int32
