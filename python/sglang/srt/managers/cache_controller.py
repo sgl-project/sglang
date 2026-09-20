@@ -749,8 +749,8 @@ class HiCacheController:
         )
 
     def reset(self):
-        # Shared with detach: bounded joins plus the queue wakeups a prefetch
-        # thread parked on a rank collective needs to observe the stop.
+        # Reuse detach's queue wakeups and bounded joins, and fail if any
+        # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
 
         self.write_queue.clear()
