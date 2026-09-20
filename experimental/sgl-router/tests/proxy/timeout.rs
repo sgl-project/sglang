@@ -77,7 +77,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -111,6 +111,19 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8_lossy(&bytes);
+    // A hung worker is the most common hard worker failure there is, so it must
+    // land in `outcome="error"` — the series a per-worker error-ratio alert
+    // watches. Deriving the outcome from the 504 status instead would silently
+    // reclassify it as `cancelled` and blind that alert.
+    assert!(
+        ctx.metrics
+            .render()
+            .lines()
+            .any(|l| l.starts_with("sgl_router_worker_requests_total{")
+                && l.contains(r#"outcome="error""#)),
+        "an upstream timeout must be counted outcome=error, not cancelled:\n{}",
+        ctx.metrics.render(),
+    );
     assert!(
         body_str.contains("\"code\":\"upstream_timeout\""),
         "body: {body_str}"
