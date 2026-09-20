@@ -100,6 +100,19 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
+        info = KVArgsRegisterInfo.from_zmq(
+            msg
+            + [
+                b"",
+                struct.pack("Q", 128),
+                pack_state_component_types([StateType.SWA]),
+            ]
+        )
+        self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.dst_state_component_types, [StateType.SWA])
 
     def test_int_lists_roundtrip(self):
         cases = [

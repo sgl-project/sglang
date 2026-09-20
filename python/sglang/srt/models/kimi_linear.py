@@ -717,6 +717,12 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+        ):
+            aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
@@ -737,19 +743,11 @@ class KimiLinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
-            proxy_tensors = {
-                "hidden_states": hidden_states,
-                "residual": residual,
-            }
-            if self.dspark_layers_to_capture is not None:
-                if aux_hidden_states:
-                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
-                        aux_hidden_states, dim=-1
-                    )
-                else:
-                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
-                        hidden_states.shape[0], 0
-                    )
+            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux_hidden_states:
+                proxy_tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
             return PPProxyTensors(proxy_tensors)
         else:
             if hidden_states.shape[0] != 0:
@@ -795,18 +793,19 @@ class KimiLinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        local_layer_ids = [
-            int(layer_id)
-            for layer_id in layer_ids
-            if self.model.start_layer <= int(layer_id) < self.model.end_layer
-        ]
-        self.capture_aux_hidden_states = bool(local_layer_ids)
-        self.model.dspark_layers_to_capture = local_layer_ids or None
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(

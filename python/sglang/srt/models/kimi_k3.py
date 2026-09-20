@@ -3047,6 +3047,18 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+        ):
+            if "dspark_hidden_states" in pp_proxy_tensors.tensors:
+                aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
+            if self.start_layer - 1 in self.dspark_layers_to_capture:
+                aux_hidden_states.append(
+                    self._dspark_capture_stream(
+                        self.start_layer - 1, hidden_states, residual, attn_res
+                    )
+                )
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -3065,34 +3077,25 @@ class KimiK3LinearModel(nn.Module):
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
+                and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, residual, attn_res)
                 )
 
         if not self.pp_group.is_last_rank:
-            proxy_tensors = {
-                "hidden_states": hidden_states,
-                "residual": residual,
-            }
-            if self.dspark_layers_to_capture is not None:
-                if aux_hidden_states:
-                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
-                        aux_hidden_states, dim=-1
-                    )
-                else:
-                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
-                        hidden_states.shape[0], 0
-                    )
             assert not sp_sharded
             if attn_res is not None:
                 if residual is not None:
                     # Materialize the delayed MLP add: the wire carries the
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
-                    proxy_tensors["hidden_states"] = hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-                proxy_tensors["residual"] = residual
+            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}
+            if aux_hidden_states:
+                proxy_tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
             return PPProxyTensors(proxy_tensors)
 
         if hidden_states.shape[0] != 0:
@@ -3217,18 +3220,19 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer - 1 for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        local_layer_ids = [
-            int(layer_id)
-            for layer_id in layer_ids
-            if self.model.start_layer <= int(layer_id) < self.model.end_layer
-        ]
-        self.capture_aux_hidden_states = bool(local_layer_ids)
-        self.model.dspark_layers_to_capture = local_layer_ids or None
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -3710,6 +3714,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             raise AttributeError("lm_head is not available in encoder-only mode")
         return self.language_model.lm_head
+
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_pp_proxy_dspark_hidden_size()
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
