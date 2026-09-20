@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Union
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -70,6 +71,18 @@ class CandidateMasks(CandidateMetadata):
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
 
 
+class PrefillCandidateBlocks(CandidateMetadata, msgspec.Struct):
+    request_blocks: List[torch.Tensor]
+
+    def tail(self, lengths: List[int]) -> PrefillCandidateBlocks:
+        return PrefillCandidateBlocks(
+            request_blocks=[
+                blocks[blocks.shape[0] - length :]
+                for blocks, length in zip(self.request_blocks, lengths)
+            ]
+        )
+
+
 def published_masks(candidate) -> CandidateMasks:
     assert isinstance(candidate, CandidateMasks), "candidate masks missing"
     return candidate
@@ -91,18 +104,15 @@ def mask_topk_scores(
     return indices.masked_fill(~valid, -1)
 
 
-def select_candidate_blocks(
+def _candidate_block_topk(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
     topk_blocks: int,
     block_size: int,
-) -> torch.Tensor:
-    """Level one of the two-level top-k: a bool mask over positions keeping the
-    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
-    in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
+) -> torch.return_types.topk:
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
 
@@ -111,8 +121,50 @@ def select_candidate_blocks(
         torch.arange(num_blocks, device=logits.device) == last, torch.inf
     )
 
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
+    return scores.topk(min(topk_blocks, num_blocks), dim=-1)
+
+
+def select_candidate_block_ids(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    top = _candidate_block_topk(
+        logits=logits,
+        compress_lens=compress_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
     )
+    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+def candidate_block_mask(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    top = _candidate_block_topk(
+        logits=logits,
+        compress_lens=compress_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
+    )
+    width = logits.shape[-1]
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(-1, top.indices, top.values > -torch.inf)
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
