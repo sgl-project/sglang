@@ -203,14 +203,7 @@ def handle_decode_context_parallelism(server_args: Any):
         return
 
     model_config = model_config_of(server_args)
-    if not is_deepseek_dsa(model_config.hf_config):
-        return
-    if cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "DSA decode context parallelism does not support speculative decoding "
-            "yet; remove --speculative-algorithm or set --dcp-size 1."
-        )
-    if (
+    if is_deepseek_dsa(model_config.hf_config) and (
         not get_platform().is_cuda
         or model_config.qk_rope_head_dim != 0
         or cfg.dsa_prefill_backend != "tilelang"

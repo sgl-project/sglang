@@ -18,6 +18,7 @@ register_cuda_ci(est_time=2400, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
+    spec_args = ()
     gsm8k_num_examples = 200
     gsm8k_score_threshold = 0.90
 
@@ -60,6 +61,7 @@ class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
                 "128",
                 "--cuda-graph-max-bs-decode",
                 "8",
+                *cls.spec_args,
             ],
         )
 
@@ -105,6 +107,19 @@ class TestGLM53FlashDCP(GSM8KMixin, CustomTestCase):
                 )
             cached = self._needle(wave, 2)
             self.assertGreater(cached["meta_info"]["cached_tokens"], 0)
+
+
+class TestGLM53FlashDCPEagle(TestGLM53FlashDCP):
+    spec_args = (
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "6",
+    )
 
 
 if __name__ == "__main__":

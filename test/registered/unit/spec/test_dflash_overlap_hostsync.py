@@ -231,6 +231,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             )
 
         runner = SimpleNamespace(
+            is_draft_worker=False,
             server_args=SimpleNamespace(speculative_attention_mode=spec_mode),
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,

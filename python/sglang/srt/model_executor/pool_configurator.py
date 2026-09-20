@@ -228,9 +228,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
+                    target_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        * kvc.ps.attn_dcp_size
                     )
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
@@ -240,13 +243,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    dcp_size = kvc.ps.attn_dcp_size
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * dcp_size
                     )
-                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
+                    draft_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=draft_num_layers,
+                            allocate_all_layers=True,
+                        )
+                        * dcp_size
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:

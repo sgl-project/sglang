@@ -423,7 +423,8 @@ class KVCacheConfigurator:
         return get_schedule().page_size * self.loc_space_scale
 
     def _replicated_dsa_indexer_size(self, size: int) -> int:
-        return size * get_parallel().attn_dcp_size
+        scale = get_parallel().attn_dcp_size // self.loc_space_scale
+        return size * scale
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
@@ -1685,6 +1686,7 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
+            dcp_replicated=self.loc_space_scale > 1,
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -1894,6 +1896,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    dcp_replicated=self.loc_space_scale > 1,
                     index_buf_size=self._replicated_dsa_indexer_size(
                         max_total_num_tokens
                     ),
