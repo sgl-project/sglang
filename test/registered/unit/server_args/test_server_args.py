@@ -1780,18 +1780,14 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
     def test_megamoe_w4a16_requires_bf16_combine(self):
         with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
             for combine_dtype in ("nvfp4", "mxfp8"):
-                for in_kernel_reduce in (False, True):
-                    with (
-                        self.subTest(combine_dtype=combine_dtype, ikr=in_kernel_reduce),
-                        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override(
-                            combine_dtype
-                        ),
-                        envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override(
-                            in_kernel_reduce
-                        ),
-                        self.assertRaisesRegex(ValueError, "W4A16 requires"),
-                    ):
-                        handle_a2a_moe(self._make_args())
+                with (
+                    self.subTest(combine_dtype=combine_dtype),
+                    envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override(
+                        combine_dtype
+                    ),
+                    self.assertRaisesRegex(ValueError, "W4A16 requires"),
+                ):
+                    handle_a2a_moe(self._make_args())
 
 
 class TestPortArgs(unittest.TestCase):

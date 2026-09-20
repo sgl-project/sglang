@@ -68,16 +68,17 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
 
 
 class TestMegaMoEAutotuneStartup(CustomTestCase):
-    def test_context_bridges_extend_policy(self):
+    def test_context_bridges_profile_limits(self):
         from sglang.srt.layers.moe import flashinfer_megamoe_autotune as mega_autotune
 
         runner = SimpleNamespace(
             device="cuda",
-            is_draft_worker=False,
-            spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
             tp_group=SimpleNamespace(world_size=1),
             forward_stream=Mock(),
-            max_decode_logits_rows=lambda: 256,
+            # Adaptive decode's maximum may exceed the local prefill chunk.
+            max_decode_logits_rows=Mock(return_value=8192),
+            max_running_requests=256,
+            is_draft_worker=False,
         )
         general = Mock(side_effect=lambda *_args, **_kwargs: contextlib.nullcontext())
         modules = {
@@ -91,32 +92,38 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 autotune_dummy_run_mode=lambda **_: contextlib.nullcontext()
             ),
         }
-        # Speculative targets still request the direct expert EXTEND sweep;
-        # drafts request decode profiles only. Skip-op suppresses this bridge.
+        # The resolved chunk size is already per DP rank. Disabled chunking
+        # uses the scheduler's prefill ceiling; skip-op suppresses the bridge.
         cases = [
-            (False, False, False, 0),
-            (True, False, False, 4096),
-            (True, True, False, 0),
-            (True, False, True, None),
+            (4096, False, False, 4096),
+            (-1, False, False, 16384),
+            (4096, True, False, None),
+            (4096, False, True, None),
         ]
         previous = mega_autotune._active_context
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "rank.json"
-            for extend, draft, skip, expected_tokens in cases:
+            for chunk_size, skip, draft, expected_tokens in cases:
+                runner.is_draft_worker = draft
                 skip_ops = {"flashinfer_megamoe"} if skip else set()
                 with (
-                    self.subTest(extend=extend, draft=draft, skip=skip),
+                    self.subTest(chunk_size=chunk_size, skip=skip, draft=draft),
                     patch.dict(sys.modules, modules),
                     patch.dict(
                         os.environ,
-                        SGLANG_FLASHINFER_AUTOTUNE_EXTEND=str(extend),
                         SGLANG_FLASHINFER_AUTOTUNE_CACHE="1",
                     ),
                     patch.multiple(
                         autotune_runner,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
                         get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
-                        max_prefill_buffer_tokens=lambda: 4096,
+                        get_exec=lambda: SimpleNamespace(
+                            moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
+                        ),
+                        get_eager_max_batch_size=lambda bs: bs,
+                        get_schedule=lambda: SimpleNamespace(
+                            chunked_prefill_size=chunk_size, max_prefill_tokens=16384
+                        ),
                     ),
                     patch.object(
                         autotune_runner.torch.cuda,
@@ -131,7 +138,6 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         ),
                     ),
                 ):
-                    runner.is_draft_worker = draft
                     general.reset_mock()
                     with autotune_runner.flashinfer_autotune_context(
                         runner, run_lm_head=False
@@ -142,13 +148,18 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             skip_ops=skip_ops,
                         )
                         context = mega_autotune._active_context
-                        if skip:
+                        if expected_tokens is None:
                             self.assertIs(context, previous)
                         else:
                             self.assertIsNot(context, previous)
                             self.assertEqual(context.cache_path, cache_path)
-                            self.assertEqual(context.decode_num_tokens, 256)
-                            self.assertEqual(context.extend_num_tokens, expected_tokens)
+                            runner.max_decode_logits_rows.assert_called_with(
+                                min_batch_size=256
+                            )
+                            self.assertEqual(context.decode_num_tokens, 8192)
+                            self.assertEqual(
+                                context.prefill_num_tokens, expected_tokens
+                            )
                             self.assertTrue(context.reuse_cache)
                     self.assertIs(mega_autotune._active_context, previous)
 

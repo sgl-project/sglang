@@ -3869,9 +3869,7 @@ def require_mlp_tp_gather():
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import (
-        get_moe_a2a_backend,
-    )
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:

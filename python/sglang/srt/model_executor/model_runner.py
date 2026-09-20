@@ -845,8 +845,8 @@ class ModelRunner:
         dllm_config = DllmConfig.from_server_args(self.server_args)
         return dllm_config.block_size if dllm_config is not None else 1
 
-    def max_decode_logits_rows(self) -> int:
-        """Rows the shared logits buffer needs."""
+    def max_decode_logits_rows(self, min_batch_size: int = 0) -> int:
+        """Decode rows across graph buckets and an optional eager batch bound."""
         # Resolution can turn speculative_adaptive off, so the effective value
         # lives in the bags while the startup record keeps the CLI input.
         spec = get_spec()
@@ -865,7 +865,8 @@ class ModelRunner:
                 num_draft_tokens=draft_tokens
             )
             capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
-            max_rows = max(max_rows, max(capture_bs) * num_tokens_per_req)
+            batch_size = max(max(capture_bs), min_batch_size)
+            max_rows = max(max_rows, batch_size * num_tokens_per_req)
         return max_rows
 
     @property

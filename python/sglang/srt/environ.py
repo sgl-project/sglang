@@ -1086,8 +1086,6 @@ class Envs:
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
-    # MegaMoE instead tunes capacity profiles with expert-only forwards,
-    # including on speculative targets, before serving graph capture.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
 
     # ===================================================================

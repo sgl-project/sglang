@@ -124,7 +124,7 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
 
     @dataclass
     class Fleet:
-        max_tokens_per_rank: int = 128
+        max_tokens_per_rank: int = 4
         num_experts: int = 4
         token_hidden_size: int = 4
 
@@ -156,13 +156,12 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
 
 
 @pytest.mark.parametrize(
-    "decode_tokens,extend_tokens,expected",
-    [(0, 0, [1, 2, 3]), (0, 128, [1, 2, 3, 128]), (8, 0, [1, 2, 4, 8])],
+    "decode_tokens,expected", [(3, [1, 2, 3, 128]), (8, [1, 2, 4, 8, 128])]
 )
 def test_megamoe_startup_profiles_are_prepared_once(
-    monkeypatch, tmp_path, decode_tokens, extend_tokens, expected
+    monkeypatch, tmp_path, decode_tokens, expected
 ):
-    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch)
+    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch, num_tokens=96)
     prepared = []
 
     def prepare(context, layer, inputs, capacity):
@@ -171,17 +170,21 @@ def test_megamoe_startup_profiles_are_prepared_once(
 
     monkeypatch.setattr(forward, "_prepare_profile", prepare)
     with module.megamoe_autotune_context(
-        tmp_path / "cache.json", extend_tokens, decode_num_tokens=decode_tokens
+        tmp_path / "cache.json", decode_tokens, prefill_num_tokens=128
     ):
         assert forward(mega, tensors) is tensors.hidden_states
-        forward(mega, tensors)
+    # Bounds may exceed the bootstrap fleet. A large initial dummy must not
+    # create intermediate prefill profiles.
     assert prepared == expected
-    selected = min(capacity for capacity in expected if capacity >= 3)
-    assert calls[-1][1] is forward.workspaces[selected]
+    assert calls[-1][1] is forward.workspaces[128]
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    forward(mega, tensors)
-    assert prepared == expected
-    assert calls[-1][1] is forward.workspaces[selected]
+    for count, selected in ((2, 2), (decode_tokens, decode_tokens), (32, 128)):
+        inputs = module._profile_inputs(tensors, count, num_experts=4)
+        forward(mega, inputs)
+        assert prepared == expected
+        assert calls[-1][1] is forward.workspaces[selected]
+    with pytest.raises(ValueError, match="exceeding its prepared"):
+        forward(mega, module._profile_inputs(tensors, 129, num_experts=4))
 
 
 @pytest.mark.parametrize("local_tokens", [0, 3])
@@ -259,7 +262,7 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 
     owners = []
-    for phase, scale in (("target", 1.0), ("draft", 2.0)):
+    for phase, scale in (("first", 1.0), ("second", 2.0)):
         phase_backend = replace(
             first.backend,
             megakernel=replace(first.backend.megakernel, input_norm_const=scale),
@@ -269,7 +272,10 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_
         )
         mega = Mega()
         with module.megamoe_autotune_context(
-            tmp_path / phase / "cache.json", reuse_cache=False
+            tmp_path / phase / "cache.json",
+            decode_num_tokens=1,
+            prefill_num_tokens=1,
+            reuse_cache=False,
         ):
             assert forward(mega, tensors) is tensors.hidden_states
         owners.append(mega)
