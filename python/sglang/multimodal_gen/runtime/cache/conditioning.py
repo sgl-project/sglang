@@ -37,12 +37,17 @@ _live_caches = weakref.WeakSet()
 _weights_epoch = 0
 
 
-def invalidate_conditioning_caches():
+def invalidate_conditioning_caches(modules=None):
     """Invalidate before weight mutations, including partially failed updates."""
     global _weights_epoch
     _weights_epoch += 1
+    parameters = (
+        None
+        if modules is None
+        else {id(p) for module in modules for p in module.parameters()}
+    )
     for cache in _live_caches:
-        cache.clear()
+        cache.invalidate(parameters)
 
 
 def conditioning_weights_epoch():
@@ -120,6 +125,7 @@ class _CacheEntry:
     output: object
     size: int
     ready: tuple[torch.cuda.Event, ...]
+    owner: int
 
     def wait(self):
         for event in self.ready:
@@ -178,6 +184,23 @@ class ConditioningCache:
             entry.wait()
         self._entries.clear()
         self.bytes = 0
+
+    def invalidate(self, parameters):
+        if parameters is None:
+            self.clear()
+            return
+        # shared parameters invalidate both owners, including nested encoders
+        owners = {
+            identity
+            for model, identity in self._models.items()
+            if isinstance(model, torch.nn.Module)
+            and any(id(p) in parameters for p in model.parameters())
+        }
+        for key, entry in list(self._entries.items()):
+            if entry.owner in owners:
+                entry.wait()
+                self.bytes -= entry.size
+                del self._entries[key]
 
     def stats(self):
         return dict(
@@ -320,7 +343,9 @@ class ConditioningCache:
             event = torch.cuda.Event()
             event.record(stream)
             ready.append(event)
-        self._entries[key] = _CacheEntry(stored, size, tuple(ready))
+        self._entries[key] = _CacheEntry(
+            stored, size, tuple(ready), self._identity(model)
+        )
         self.bytes += size
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",

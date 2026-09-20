@@ -197,6 +197,27 @@ def test_weight_invalidation_and_precision():
     assert cache.hits == 1
 
 
+@torch.no_grad()
+def test_scoped_invalidation_preserves_independent_encoders_and_shared_weights():
+    cache = ConditioningCache(1024)
+    independent = Encoder().eval()
+    nested = Encoder().eval()
+    alias = Encoder().eval()
+    alias.weight = nested.weight
+    transformer = torch.nn.ModuleList([nested])
+    x = torch.ones(4)
+    with cache.scope():
+        for model in (independent, nested, alias):
+            model(x)
+        invalidate_conditioning_caches([transformer])
+        nested.weight.fill_(2)
+        assert torch.equal(independent(x).last_hidden_state, x)
+        assert torch.equal(nested(x).last_hidden_state, x * 2)
+        assert torch.equal(alias(x).last_hidden_state, x * 2)
+    assert (independent.calls, nested.calls, alias.calls) == (1, 2, 2)
+    assert cache.bytes <= cache.max_bytes
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
 @torch.no_grad()
 def test_cuda_snapshot_waits_for_producing_stream_before_restore():

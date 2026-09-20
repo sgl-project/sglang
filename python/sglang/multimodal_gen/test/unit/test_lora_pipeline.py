@@ -7,6 +7,7 @@ import pytest
 import torch
 from prometheus_client import CollectorRegistry
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -86,6 +87,35 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
         "adapter",
         "second",
     ]
+
+
+@pytest.mark.parametrize("operation", ["set", "merge", "unmerge", "deactivate"])
+@torch.no_grad()
+def test_lora_mutations_preserve_independent_conditioning(operation):
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+    pipeline.modules["transformer"].add_module("linear", layer)
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    encoder = torch.nn.Linear(2, 2).eval()
+    cache = ConditioningCache(1024)
+    x = torch.ones(1, 2)
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", merge_mode="dynamic")
+        cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+        if operation == "set":
+            pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        elif operation == "merge":
+            pipeline.merge_lora_weights()
+        elif operation == "unmerge":
+            pipeline.unmerge_lora_weights()
+        else:
+            pipeline.deactivate_lora_weights()
+        cached = cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+    torch.testing.assert_close(cached, encoder(x), rtol=0, atol=0)
+    assert cache.hits == 1
+    assert cache.misses == 3
 
 
 def test_merge_cache_only_accepts_cpu_backed_weights():
