@@ -70,6 +70,10 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub session_affinity_mode: SessionAffinityMode,
     /// `--worker-queue-limit`. `None` disables the queue gate entirely.
     pub worker_queue_limit: Option<u64>,
+    /// `--saturation-queue-floor`. `None` disables the saturation pin.
+    pub saturation_queue_floor: Option<u64>,
+    /// `--min-load-choices`: sample size for the min-load capacity fallback.
+    pub min_load_choices: usize,
 }
 
 /// The queue-gate blind warn is sampled: it fires on a per-request path, and
@@ -77,6 +81,13 @@ pub(crate) struct PrefillSelectionInputs<'a> {
 /// is steady-state, so 1-in-64 is plenty to surface it without log flooding.
 const QUEUE_GATE_BLIND_LOG_SAMPLE: u64 = 64;
 static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The saturation-pin info log is sampled for the same reason as the
+/// queue-gate blind warn: it fires on a per-request path and the condition
+/// (a saturated fleet) persists for many requests, so 1-in-64 surfaces it
+/// without log flooding.
+const SATURATION_PIN_LOG_SAMPLE: u64 = 64;
+static SATURATION_PIN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Maps the queue-gate audit of a Cache-Aware selection that produced no
 /// winner onto its decision label. Pure so every boundary is pinned by unit
@@ -354,21 +365,52 @@ impl<'a> Selector<'a> {
             prefill_pressure_source = cache_decision.prefill_pressure_source,
             "cache candidate winner",
         );
-        inputs
-            .metrics
-            .record_policy_decision("cache_aware", "cache_candidate");
-        inputs.metrics.record_cache_aware_decision(
-            &inputs.model_id.0,
-            if cache_decision.queue_gate_fell_back {
-                // The gate removed every owner and nowhere in the fleet is
-                // unqueued, so the prefix was kept rather than traded for a
-                // wait that cannot be dodged. Booked as saturation, never as
-                // a plain hit.
-                CacheAwareDecision::AllQueued
-            } else {
-                CacheAwareDecision::CacheHit
-            },
+        inputs.metrics.record_policy_decision(
+            "cache_aware",
+            prefill_policy_reason(
+                PolicyKind::CacheAware,
+                ProposalKind::CacheAffinity,
+                decision.reason,
+                inputs.session_id.is_some_and(|value| !value.is_empty()),
+                true,
+            ),
         );
+        if decision.reason == DecisionReason::SaturationPin {
+            // The pin books the saturation label because it always means
+            // affinity was kept under a queueing fleet. It does not retire
+            // the off-owner draw in `run`: when every gate-rejected owner
+            // also fails capacity admission the pin yields no decision, and
+            // the fallback records the same label from an off-owner landing.
+            inputs
+                .metrics
+                .record_cache_aware_decision(&inputs.model_id.0, CacheAwareDecision::AllQueued);
+            if SATURATION_PIN_LOG_COUNTER
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .is_multiple_of(SATURATION_PIN_LOG_SAMPLE)
+            {
+                tracing::info!(
+                    model = %&inputs.model_id.0,
+                    worker = %decision.selected.url,
+                    saturation_queue_floor = inputs.saturation_queue_floor,
+                    worker_queue_limit = inputs.worker_queue_limit,
+                    "fleet saturated, keeping affinity with a queueing prefix owner \
+                     instead of diverting",
+                );
+            }
+        } else {
+            inputs.metrics.record_cache_aware_decision(
+                &inputs.model_id.0,
+                if cache_decision.queue_gate_fell_back {
+                    // The gate removed every owner and nowhere in the fleet is
+                    // unqueued, so the prefix was kept rather than traded for a
+                    // wait that cannot be dodged. Booked as saturation, never
+                    // as a plain hit.
+                    CacheAwareDecision::AllQueued
+                } else {
+                    CacheAwareDecision::CacheHit
+                },
+            );
+        }
         Some(decision.selected)
     }
 
@@ -441,6 +483,7 @@ impl<'a> Selector<'a> {
                     inputs.request_input_tokens,
                     snapshot,
                     inputs.worker_queue_limit,
+                    inputs.min_load_choices,
                 )
             } else {
                 resolve_prefill_admitted(
@@ -525,6 +568,7 @@ fn prefill_policy_reason(
         PolicyKind::CacheAware => match (proposal, decision) {
             (_, DecisionReason::CacheCandidate)
             | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
+            (_, DecisionReason::SaturationPin) => "saturation_pin",
             (_, DecisionReason::Primary) => "no_cache_candidate",
             (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
             (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
@@ -540,6 +584,7 @@ fn prefill_policy_reason(
             DecisionReason::BackupPressureGuard => "pressure_backup",
             DecisionReason::RangeFallback => "range_fallback",
             DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
+            DecisionReason::SaturationPin => "saturation_pin",
         },
     }
 }
@@ -784,6 +829,8 @@ mod tests {
             load_snapshot,
             workers,
             worker_queue_limit: None,
+            saturation_queue_floor: None,
+            min_load_choices: 2,
             ttft_slo_ms: None,
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,

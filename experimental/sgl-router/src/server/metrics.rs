@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
@@ -65,15 +66,22 @@
 //!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
 //!   all selections: a diverted curve skewing high means the gate is trading
 //!   large cached prefixes for short waits.
-//! - `all_queued` — the queue gate removed every owner AND every worker in
-//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
-//!   is the saturation signal for traffic the gate acted on, keyed on
-//!   saturation rather than on where the request landed: usually the request
-//!   kept its prefix, but when the re-admitted owners are also out of KV
-//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
-//!   saturation in the one state where it matters most. It deliberately
-//!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
-//!   must not absorb it, or a fully saturated fleet reads as a healthy one.
+//! - `all_queued` — the queue gate removed every owner and no diversion could
+//!   dodge a wait. Two conditions draw it. Without `--saturation-queue-floor`
+//!   it means every worker in the prefill fleet is queueing at or above
+//!   `--worker-queue-limit`. With a floor set, the saturation pin also draws
+//!   it on the weaker condition the floor names: no fleet worker reads
+//!   strictly below the floor. Since the floor may be lower than the limit, a
+//!   floor well under the limit widens this label to fleets that still hold
+//!   gate-admissible workers — read it against the configured floor, not as
+//!   "every worker is over the limit". It is keyed on saturation rather than
+//!   on where the request landed: usually the request kept its prefix, but
+//!   when the owners it would keep are also out of KV capacity it lands
+//!   off-owner and still books here. Reporting that case as `cache_miss`
+//!   would hide the saturation in the one state where it matters most. It
+//!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
+//!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
+//!   healthy one.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -131,21 +139,90 @@ const OVERLAP_BLOCK_BUCKETS: &[f64] = &[
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
+///
+/// The split exists so `outcome="error"` means *this worker failed*, matching
+/// what [`crate::proxy`]'s `breaker_outcome` counts as a fault. A request can
+/// fail for reasons that say nothing about the worker's health — the caller sent
+/// something invalid, or the worker was merely at capacity — and folding those
+/// into `error` makes the per-worker error ratio fire on client mistakes and on
+/// exactly the backpressure the circuit breaker deliberately tolerates.
 #[derive(Debug, Clone, Copy)]
 pub enum RequestOutcome {
     Success,
+    /// The worker answered and rejected the request as invalid (a 4xx other than
+    /// 429). The caller's fault, not the worker's.
+    ClientError,
+    /// The worker was responsive but at capacity (429 / 503). Not a fault — the
+    /// same judgement `breaker_outcome` makes when it declines to open the
+    /// breaker on these statuses.
+    Backpressure,
+    /// The worker failed to serve the request: a 5xx fault, a transport failure,
+    /// a timeout, or a body that never completed.
     Error,
+    /// The router cancelled the request itself — today only the stale-request
+    /// deadline. Never derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 
 impl RequestOutcome {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::ClientError => "client_error",
+            Self::Backpressure => "backpressure",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+/// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
+/// status.
+///
+/// Deriving from the status rather than from `Result::Ok`/`Err` is what keeps a
+/// forwarded worker error honest: a worker 4xx/5xx the router proxies is an
+/// `Ok(Response)` at the handler, so keying off `Ok` credits it as a success.
+///
+/// This never returns [`RequestOutcome::Cancelled`]. A status cannot identify a
+/// router-side cancellation: a 504 is produced by the stale-request deadline, by
+/// the router's own upstream timeout, and by a worker 504 forwarded unchanged,
+/// and only the caller holding the `ApiError` can tell them apart. Callers that
+/// know they cancelled the request say so explicitly instead.
+pub fn outcome_from_status(status: u16) -> RequestOutcome {
+    match status {
+        200..=299 => RequestOutcome::Success,
+        // Responsive but at capacity. Listed before the 4xx arm so 429 lands
+        // here rather than in `ClientError`.
+        429 | 503 => RequestOutcome::Backpressure,
+        400..=499 => RequestOutcome::ClientError,
+        _ => RequestOutcome::Error,
+    }
+}
+
+/// Routing context a handler attaches to its `Response` (via response
+/// extensions) so the outermost access-log middleware can describe a dispatch it
+/// cannot see itself.
+///
+/// Attached today only by `chat_completions`. There is no compile-time
+/// obligation to attach one — any handler that dispatches to a worker must do so
+/// or its access-log line names no worker and falls back to a status-derived
+/// outcome. A line with empty `worker`/`model` is therefore normal, not a bug:
+/// it means the request was rejected before dispatch, or reached a route that
+/// does not dispatch at all.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext {
+    /// The worker the client-visible response actually came from. In PD mode
+    /// that is the decode worker, not the policy-selected prefill worker.
+    pub worker_url: String,
+    pub model_id: String,
+    /// Whether the client asked for an SSE stream. Only the handler knows this
+    /// (it is a body field, not a header or a route), and it separates
+    /// time-to-last-byte from time-to-headers when reading `latency_ms`.
+    pub streaming: bool,
+    /// The outcome the handler recorded for this request. Carried so the log
+    /// line and `worker_requests_total` cannot disagree — the middleware can
+    /// only see the status, which cannot express a router-side cancellation.
+    pub outcome: RequestOutcome,
 }
 
 /// Final outcome of a 2xx SSE stream.
@@ -321,9 +398,8 @@ pub struct MetricsRegistry {
     // never answered, which `worker_requests_total` (post-dispatch) can't see.
     requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
-    // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
-    // dispatch, so blind to pre-dispatch drops; kept per-worker for the
-    // routing-convergence tests.
+    // Per-worker dispatch outcomes. Recorded after dispatch, so blind to
+    // pre-dispatch drops; kept per-worker for the routing-convergence tests.
     worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
@@ -346,6 +422,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -561,8 +638,8 @@ impl MetricsRegistry {
     }
 
     /// Bump the edge counter `responses_total{route,method,status_code}`. Called
-    /// at the middleware, so it captures every outcome — incl. early-exit
-    /// 400/413/503 that the old per-handler site skipped.
+    /// at the middleware, so it captures every response — including early-exit
+    /// 400/413/503s that never reach a handler.
     pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
         let key = EdgeResponseKey {
             route: route.to_owned(),
@@ -726,19 +803,31 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
-    /// router's chat encoder failed: a chat request (`messages`) on a model with
-    /// a chat encoder that did not yield engine-equivalent ids. That request
-    /// silently fell back to engine-side tokenization, defeating the offload —
-    /// the actionable "offload broken" signal. It stays at ~0 in healthy
-    /// operation and climbs only on a real tokenizer problem; successful
-    /// forwards and expected omissions (tools / multimodal / thinking, whose
-    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
-    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    /// Count formatter failures only for chats eligible for `input_ids`
+    /// forwarding. Requests excluded by the guard are expected fallbacks.
+    /// Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sampling_contract_rejections_total{param}`.
+    ///
+    /// Recorded when the fleet-wide sampling contract refuses a request under
+    /// `--sampling-param-conflict reject`. This is the rollout gauge for the
+    /// flag: it answers "how much client traffic is the contract turning away,
+    /// and on which parameter" — which is otherwise unanswerable, because the
+    /// rejection reaches the client as a 400 like any other. `param` is a
+    /// wire name from a fixed enum, so the label set is bounded.
+    pub fn record_sampling_contract_rejection(&self, param: &'static str) {
+        let mut guard = self.sampling_contract_rejections_total.lock();
+        let counter = guard
+            .entry(param)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -781,7 +870,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // worker_requests_total — per-worker dispatch outcomes (formerly requests_total)
+        // worker_requests_total — per-worker dispatch outcomes
         out.push_str(
             "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
         );
@@ -1170,7 +1259,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-formatter model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();
@@ -1183,6 +1272,26 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // sampling_contract_rejections_total
+        out.push_str(
+            "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
+        );
+        out.push_str("# TYPE sgl_router_sampling_contract_rejections_total counter\n");
+        let guard = self.sampling_contract_rejections_total.lock();
+        let mut entries: Vec<(&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        for (param, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sampling_contract_rejections_total{{param=\"{}\"}} {}\n",
+                escape_label(param),
                 value,
             ));
         }
@@ -1738,5 +1847,64 @@ mod tests {
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
         );
+    }
+    /// The contract's rollout gauge: absent until a request is actually
+    /// refused, then keyed by the parameter that refused it.
+    #[test]
+    fn sampling_contract_rejections_are_keyed_by_param() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_sampling_contract_rejections_total counter"));
+        assert!(
+            !out.contains("sgl_router_sampling_contract_rejections_total{"),
+            "must emit no series before the first rejection"
+        );
+
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("top_p");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 2"#),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 1"#),
+            "got:\n{out}"
+        );
+    }
+
+    /// The status → outcome mapping is the single definition shared by the
+    /// access log and `worker_requests_total`, so a silent change here corrupts
+    /// both surfaces at once. Pin every class, including the boundaries.
+    #[test]
+    fn outcome_from_status_maps_every_class() {
+        let cases = [
+            (200, "success"),
+            (204, "success"),
+            (299, "success"),
+            // Backpressure is listed before the 4xx arm, so 429 must not fall
+            // through to client_error.
+            (429, "backpressure"),
+            (503, "backpressure"),
+            (400, "client_error"),
+            (404, "client_error"),
+            (499, "client_error"),
+            (500, "error"),
+            (502, "error"),
+            // A 504 is NOT a cancellation: the router's own upstream timeout and
+            // a worker's forwarded 504 both land here, and only the caller
+            // holding the `ApiError` can tell a real stale-cancel apart.
+            (504, "error"),
+            (199, "error"),
+            (300, "error"),
+        ];
+        for (status, want) in cases {
+            assert_eq!(
+                outcome_from_status(status).as_str(),
+                want,
+                "status {status} must map to `{want}`",
+            );
+        }
     }
 }
