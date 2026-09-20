@@ -24,6 +24,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
+# Prefill busy time is charged launch -> result, so the result clock matters too.
+RESULT_TIMESTAMPS = tuple(ts + 0.1 for ts in LAUNCH_TIMESTAMPS)
 PP_MODULE = "sglang.srt.managers.scheduler_pp_mixin"
 PDMUX_MODULE = "sglang.srt.multiplex.multiplexing_mixin"
 
@@ -274,7 +276,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            scheduler._record_step_counters(batch, result)
+            # Prefill accounting reads the clock again when the result lands.
+            with patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=RESULT_TIMESTAMPS[batch.forward_iter - 1],
+            ):
+                scheduler._record_step_counters(batch, result)
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
@@ -287,28 +294,46 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
-        expected_intervals = [
-            LAUNCH_TIMESTAMPS[1] - LAUNCH_TIMESTAMPS[0],
-            LAUNCH_TIMESTAMPS[3] - LAUNCH_TIMESTAMPS[2],
-        ]
-        if not after_idle:
-            expected_intervals.append(LAUNCH_TIMESTAMPS[2] - LAUNCH_TIMESTAMPS[1])
-        expected_samples = len(expected_intervals)
-        expected_busy_us = round(sum(expected_intervals) * 1_000_000)
         if mode == ForwardMode.EXTEND:
-            self.assertEqual(scheduler.total_prefill_busy_us, expected_busy_us)
+            # Every prefill is charged from its own launch, chained forward from
+            # the previous prefill's result. An idle gap breaks the chain, so the
+            # idle span is charged to nobody.
+            expected_intervals = [
+                RESULT_TIMESTAMPS[0] - LAUNCH_TIMESTAMPS[0],
+                RESULT_TIMESTAMPS[1] - RESULT_TIMESTAMPS[0],
+                RESULT_TIMESTAMPS[2]
+                - (LAUNCH_TIMESTAMPS[2] if after_idle else RESULT_TIMESTAMPS[1]),
+                RESULT_TIMESTAMPS[3] - RESULT_TIMESTAMPS[2],
+            ]
             self.assertEqual(
-                scheduler.total_prefill_uncached_tokens, expected_samples * 1024
+                scheduler.total_prefill_busy_us,
+                sum(int(interval * 1e6) for interval in expected_intervals),
+            )
+            # Every prefill contributes its tokens; only the span is gap-aware.
+            self.assertEqual(
+                scheduler.total_prefill_uncached_tokens,
+                len(LAUNCH_TIMESTAMPS) * 1024,
             )
         else:
-            self.assertEqual(scheduler.decode_moment_totals[0], expected_samples)
-            self.assertEqual(scheduler.decode_moment_totals[2], expected_busy_us)
+            # Decode keeps launch-to-launch cadence and drops non-contiguous steps.
+            expected_intervals = [
+                LAUNCH_TIMESTAMPS[1] - LAUNCH_TIMESTAMPS[0],
+                LAUNCH_TIMESTAMPS[3] - LAUNCH_TIMESTAMPS[2],
+            ]
+            if not after_idle:
+                expected_intervals.append(LAUNCH_TIMESTAMPS[2] - LAUNCH_TIMESTAMPS[1])
+            self.assertEqual(scheduler.decode_moment_totals[0], len(expected_intervals))
+            self.assertEqual(
+                scheduler.decode_moment_totals[2],
+                round(sum(expected_intervals) * 1_000_000),
+            )
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
+        scheduler._prev_prefill_end_ts = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
