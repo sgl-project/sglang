@@ -1553,6 +1553,11 @@ class Envs:
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     # Fused mapping for SM90 32-head, ratio-1/2 static target verification.
     SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Fused mapping for SM90 32-head, ratio-1/2 static target verification.
+    SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Persistent prefix scoring and length-aware TopK; requires GROUPED_INDEXER.
+    # Equal-score cutoff ties can select different positions than PyTorch.
+    SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

@@ -3542,6 +3542,70 @@ class DeepseekV4AttnBackend(
             and table.dim() == 2
             and table.stride(1) == 1
         )
+        use_length_aware = (
+            use_grouped
+            and envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.get()
+            and q.shape[1] == 32
+            and 0 < indexer.index_topk <= 2048
+            and (
+                not indexer.is_candidate_source
+                or (
+                    0 < indexer.candidate_topk_blocks <= 2048
+                    and indexer.candidate_block_size in (1, 2, 4, 8, 16, 32, 64, 128)
+                )
+            )
+        )
+        if use_length_aware:
+            from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
+                candidate_mask,
+                prefix_logits,
+                publish_topk,
+                select_prefix_topk,
+            )
+
+            visible = lens.clamp(0, lmax).to(torch.int32).contiguous()
+            request = req.to(torch.int64).contiguous()
+            consumer = indexer.uses_candidates and not indexer.is_candidate_source
+            consume = None
+            if consumer:
+                consume = published_masks(self.forward_metadata.candidate_metadata).mask
+                assert consume is not None and consume.shape[0] == bs
+                assert consume.shape[1] >= lmax and consume.stride(1) == 1
+            s = prefix_logits(
+                q,
+                weights,
+                self.req_to_token,
+                request,
+                visible,
+                table,
+                table.shape[1] // 68,
+                ratio,
+                lmax,
+                consume,
+            )
+            if indexer.is_candidate_source:
+                self.forward_metadata.candidate_metadata = CandidateMasks(
+                    mask=candidate_mask(
+                        s,
+                        visible,
+                        lmax,
+                        indexer.candidate_topk_blocks,
+                        indexer.candidate_block_size,
+                    )
+                )
+            idx = select_prefix_topk(s, visible, min(indexer.index_topk, lmax))
+            publish_topk(
+                idx,
+                s,
+                visible,
+                request,
+                self.req_to_token,
+                page_indices,
+                raw_indices,
+                ratio,
+                consumer,
+            )
+            return
         slots = None
         if use_grouped:
             from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
