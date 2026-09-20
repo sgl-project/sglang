@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -388,15 +389,8 @@ class CommonKVManager(BaseKVManager):
             return
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
-        max_tokens = max_prefill_buffer_tokens()
-        if max_tokens <= 0:
-            max_tokens = get_schedule().max_prefill_tokens
-        # Cached-prefix transfers can exceed a compute chunk. Publish the
-        # allocation's limit to the sender so the scheduler splits those sends.
-        page_size = self.kv_args.page_size
-        if max_tokens <= 0:
-            raise ValueError("PD DCP pack buffer must hold at least one source page")
-        max_tokens = (max_tokens + page_size - 1) // page_size * page_size
+        max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
