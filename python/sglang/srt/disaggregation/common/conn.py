@@ -31,12 +31,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     get_dsv41_spec_layout,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
-)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -197,8 +192,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.attn_dp_size = get_attention_dp_size()
-        self.attn_dp_rank = get_attention_dp_rank()
+        self.attn_dp_size = parallel.attn_dp_size
+        self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = (
             1 if get_parallel().enable_dp_attention else get_parallel().dp_size
         )
@@ -263,7 +258,7 @@ class CommonKVManager(BaseKVManager):
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
-            self.pp_group = get_pp_group()
+            self.pp_group = get_parallel().pp_group
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -1063,7 +1058,7 @@ class CommonKVManager(BaseKVManager):
                 "multi-node prefill mode."
             )
 
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         synced_port = world_group.broadcast_object(local_port, src=0)
         if synced_port != local_port:
             logger.info(
@@ -1115,7 +1110,7 @@ class CommonKVManager(BaseKVManager):
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
-            topology_rows = get_world_group().all_gather_object(payload)
+            topology_rows = get_parallel().world_group.all_gather_object(payload)
             # Every scheduler contributes a topology row. Only the scheduler
             # ranks that own a Rust listener populate their local registry.
             if self.kv_args.rust_http_port is None:
@@ -1270,11 +1265,17 @@ class CommonKVManager(BaseKVManager):
             )
 
         # Regular MLA PP slicing
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
         # Decode pp size should be equal to prefill pp size or 1
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
+        # A plain MLA pool registers one region per layer ascending, addressed as
+        # layer_id - start_layer, so this stage occupies [start, start + n_src) of a
+        # peer that registered the whole model. Pointer view: get_mla_kv_ptrs_with_pp.
+        start_layer = self.kv_args.prefill_start_layer
+        return start_layer, start_layer + n_src
 
     def _mla_slice_ptrs_for_pp(
         self,
