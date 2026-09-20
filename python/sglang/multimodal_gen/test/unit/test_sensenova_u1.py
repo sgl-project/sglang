@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from PIL import Image
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,

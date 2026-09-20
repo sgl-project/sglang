@@ -6,17 +6,18 @@ from typing import List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
 import transformers
-from sglang.multimodal_gen.configs.sensenova_u1 import (
-    DEFAULT_IMG_CFG_SCALE,
-    SenseNovaGuidanceProfile,
-    derive_guidance_profile,
-)
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_IMG_CFG_SCALE,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
+)
 
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template

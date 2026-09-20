@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
