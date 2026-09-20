@@ -272,6 +272,37 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         self.assertTrue(torch.equal(module.bf16_weight, original_bf16_weight))
         self.assertTrue(torch.equal(module.bf16_buffer, original_bf16_buffer))
 
+    def test_temporary_module_fp32_dtype_restores_original_storage(self):
+        module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        original_ptr = module.weight.data_ptr()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertNotEqual(module.weight.data_ptr(), original_ptr)
+
+        self.assertEqual(module.weight.dtype, torch.bfloat16)
+        self.assertEqual(module.weight.data_ptr(), original_ptr)
+
+    def test_temporary_modules_fp32_dtype_rolls_back_on_conversion_error(self):
+        first = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        second = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        original_ptr = first.weight.data_ptr()
+        original_cache = precision._module_fp32_cache
+
+        def fail_on_second_call(module):
+            if module is second:
+                raise RuntimeError("conversion failed")
+            return original_cache(module)
+
+        with mock.patch.object(
+            precision, "_module_fp32_cache", side_effect=fail_on_second_call
+        ):
+            with self.assertRaisesRegex(RuntimeError, "conversion failed"):
+                with temporary_modules_fp32_dtype([first, second]):
+                    pass
+
+        self.assertEqual(first.weight.dtype, torch.bfloat16)
+        self.assertEqual(first.weight.data_ptr(), original_ptr)
+
     def test_temporary_module_fp32_dtype_cache_excludes_fp32_state(self):
         class MixedDtypeModule(torch.nn.Module):
             def __init__(self):
