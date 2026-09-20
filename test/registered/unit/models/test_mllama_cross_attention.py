@@ -17,8 +17,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models.mllama import MllamaForConditionalGeneration
-from sglang.srt.models.mllama_utils import build_mllama_cross_attention_mask
+from sglang.srt.models.mllama import (
+    MllamaForConditionalGeneration,
+    build_mllama_cross_attention_mask,
+)
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.mlama import MllamaImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
