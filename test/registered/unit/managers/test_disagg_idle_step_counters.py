@@ -24,6 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
+PREFILL_DURATION = 0.0625
 PP_MODULE = "sglang.srt.managers.scheduler_pp_mixin"
 PDMUX_MODULE = "sglang.srt.multiplex.multiplexing_mixin"
 
@@ -274,7 +275,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            scheduler._record_step_counters(batch, result)
+            with patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=batch.launch_ts + PREFILL_DURATION,
+            ):
+                scheduler._record_step_counters(batch, result)
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
@@ -296,9 +301,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         expected_samples = len(expected_intervals)
         expected_busy_us = round(sum(expected_intervals) * 1_000_000)
         if mode == ForwardMode.EXTEND:
+            expected_busy_us += round(
+                PREFILL_DURATION * (2 if after_idle else 1) * 1_000_000
+            )
             self.assertEqual(scheduler.total_prefill_busy_us, expected_busy_us)
             self.assertEqual(
-                scheduler.total_prefill_uncached_tokens, expected_samples * 1024
+                scheduler.total_prefill_uncached_tokens, len(LAUNCH_TIMESTAMPS) * 1024
             )
         else:
             self.assertEqual(scheduler.decode_moment_totals[0], expected_samples)
@@ -309,6 +317,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
+        scheduler._prev_prefill_end_ts = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
