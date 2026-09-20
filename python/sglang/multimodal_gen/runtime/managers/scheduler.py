@@ -632,9 +632,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             "supports_dynamic_batching_with_image_conditioning",
             None,
         )
+        image_paths = [getattr(req, "image_path", None) for req in reqs]
+        if all(image_path is None for image_path in image_paths):
+            return True
         if not callable(checker) or not checker():
-            return all(getattr(req, "image_path", None) is None for req in reqs)
-        return all(isinstance(getattr(req, "image_path", None), str) for req in reqs)
+            return False
+        return all(isinstance(image_path, str) for image_path in image_paths)
 
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
