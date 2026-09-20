@@ -511,7 +511,10 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         return type(self) is QwenImageEditPipelineConfig
 
     def supports_dynamic_batching_for_request(self, batch) -> bool:
-        return isinstance(batch.image_path, str)
+        return (
+            isinstance(batch.image_path, str)
+            and max(1, int(batch.num_outputs_per_prompt or 1)) == 1
+        )
 
     def prepare_image_processor_kwargs(self, batch, neg=False):
         kwargs = super().prepare_image_processor_kwargs(batch, neg=neg)
