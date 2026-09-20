@@ -11,6 +11,7 @@ on:
           - 'all'
           - publish
           - publish-gfx1250
+          - image2lmsysorg
       gpu_arch:
         description: 'Select which ROCm 10 GPU arch to build'
         required: false
@@ -20,6 +21,10 @@ on:
           - 'all'
           - gfx942-rocm1000
           - gfx950-rocm1000
+      ImageName:
+        description: 'Image tag to copy from the private repository to lmsysorg/sglang-rocm (required for image2lmsysorg)'
+        required: false
+        type: string
   schedule:
     - cron: '0 12 * * *'
 
@@ -117,6 +122,49 @@ jobs:
         run: |
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+
+  image2lmsysorg:
+    name: AMD Image2lmsysorg
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch' && inputs.job_select == 'image2lmsysorg'
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    env:
+      SOURCE_IMAGE: henryx/xsgl
+      TARGET_IMAGE: lmsysorg/sglang-rocm
+      IMAGE_TAG: ${{ inputs.ImageName }}
+    steps:
+      - name: Validate ImageName
+        shell: bash
+        run: |
+          if [[ -z "$IMAGE_TAG" ]]; then
+            echo "::error::ImageName is required when job_select is image2lmsysorg"
+            exit 1
+          fi
+
+          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker tag: $IMAGE_TAG"
+            exit 1
+          fi
+
+      - name: Login to private Docker Hub repository
+        uses: docker/login-action@v3
+        with:
+          username: henryx
+          password: ${{ secrets.DOCKERHUB_HENRYX_TOKEN }}
+
+      - name: Pull private image
+        run: docker pull "${SOURCE_IMAGE}:${IMAGE_TAG}"
+
+      - name: Login to lmsysorg Docker Hub repository
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image to lmsysorg/sglang-rocm
+        run: |
+          docker tag "${SOURCE_IMAGE}:${IMAGE_TAG}" "${TARGET_IMAGE}:${IMAGE_TAG}"
+          docker push "${TARGET_IMAGE}:${IMAGE_TAG}"
 
   # gfx1250 (MI45x) runs on the same schedule as the pair above but stays a
   # separate job: no MI450 runner pool consumes the image, so a bring-up build
