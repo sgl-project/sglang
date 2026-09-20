@@ -1,6 +1,7 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// Recipes follow the Muse Spark 1.2 deployment specification; hardware
-// placeholders intentionally have no cells until launch recipes are available.
+// NVIDIA recipes follow the Muse Spark 1.2 deployment specification.
+// MI355X cells are the ROCm aiter + FlyDSL profile (MXFP4 TEP 4/8, BF16
+// TEP 8). H200 and Xeon remain placeholders with no cells.
 export const config = {
   modelName: "Muse Spark 1.2",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
@@ -14,7 +15,18 @@ export const config = {
       id: "quant",
       title: "Quantization",
       options: [
-        { id: "nvfp4", label: "NVFP4" },
+        {
+          id: "nvfp4",
+          label: "NVFP4",
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "NVFP4 is the NVIDIA recipe; MI355X uses Quark MXFP4 or BF16.",
+        },
+        {
+          id: "mxfp4",
+          label: "MXFP4",
+          disabled: (s) => s.hw !== "mi355x",
+          disableReason: "Quark MXFP4 is the MI355X recipe; NVIDIA cells use NVFP4 or BF16.",
+        },
         { id: "bf16", label: "BF16" },
       ],
     },
@@ -43,6 +55,8 @@ export const config = {
           id: "on",
           label: "On",
           flags: ["--enable-layernorm-sp", "--enable-megamoe-for-layernorm-sp"],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "Layernorm SP + Prefill MegaMoE is a NVIDIA recipe; it is not part of the MI355X launch.",
         },
         { id: "off", label: "Off" },
       ],
@@ -70,6 +84,8 @@ export const config = {
             "--speculative-draft-attention-backend fa4",
             "--speculative-num-draft-tokens 6",
           ],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "Dflash V2 with fa4 draft attention is not validated on MI355X.",
         },
         { id: "off", label: "Off" },
       ],
@@ -78,9 +94,16 @@ export const config = {
       id: "mmTransport",
       title: "Multimodal Feature Transport",
       default: "cpu",
+      showWhen: (s) => s.hw !== "mi355x",
       options: [
         { id: "cpu", label: "CPU", flags: ["--mm-feature-transport cpu"] },
-        { id: "cuda_ipc", label: "Cuda IPC", flags: ["--mm-feature-transport cuda_ipc"] },
+        {
+          id: "cuda_ipc",
+          label: "Cuda IPC",
+          flags: ["--mm-feature-transport cuda_ipc"],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "CUDA IPC feature transport is NVIDIA-only; keep CPU on MI355X.",
+        },
       ],
     },
     {
@@ -93,6 +116,8 @@ export const config = {
           id: "prefill",
           label: "Prefill Node",
           flags: ["--disaggregation-mode prefill", "--disaggregation-transfer-backend mooncake"],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "Prefill/decode disaggregation is not part of the validated MI355X recipe.",
           env: (s) => s.hw === "gb300" ? [
             "NCCL_NVLS_ENABLE=1",
             "NCCL_MNNVL_ENABLE=1",
@@ -109,6 +134,8 @@ export const config = {
           id: "decode",
           label: "Decode Node",
           flags: ["--disaggregation-mode decode", "--disaggregation-transfer-backend mooncake"],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "Prefill/decode disaggregation is not part of the validated MI355X recipe.",
           env: (s) => s.hw === "gb300" ? [
             "NCCL_NVLS_ENABLE=1",
             "NCCL_MNNVL_ENABLE=1",
@@ -134,6 +161,8 @@ export const config = {
           flags: (s) => s.pdMode === "decode" ? [] : [
             "--enable-hierarchical-cache", "--hicache-size 200",
           ],
+          disabled: (s) => s.hw === "mi355x",
+          disableReason: "HiCache is not part of the validated MI355X recipe.",
         },
         { id: "off", label: "Off" },
       ],
@@ -155,12 +184,14 @@ export const config = {
 
   modelNames: {
     nvfp4: "meta-models/Muse-Spark-1.2-816B-A42B-NVFP4-open",
+    mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
     bf16: "meta-models/Muse-Spark-1.2-816B-A42B-open",
   },
   dockerImages: {
     b300: "lmsysorg/sglang:muse-spark-1.2",
     gb300: "lmsysorg/sglang:muse-spark-1.2",
     b200: "lmsysorg/sglang:muse-spark-1.2",
+    mi355x: "lmsysorg/sglang-rocm:muse-spark-1.2",
   },
   dockerHostNetworkWhen: (s) => s.pdMode !== "collocated",
   placeholders: {
@@ -312,6 +343,67 @@ export const config = {
         "--ep-size 8",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // MI355X ROCm — page-16 aiter attention + FlyDSL MoE. MXFP4 runs TEP 4 or
+    // TEP 8; BF16 is TEP 8 only. Do not copy NVIDIA overlays (Dflash V2 /
+    // MegaMoE / CUDA IPC / Mooncake PD / HiCache) onto these cells.
+    {
+      match: { hw: "mi355x", quant: "mxfp4", tep: "4" },
+      nnodes: 1,
+      env: [
+        "SGLANG_USE_AITER=1",
+        "SGLANG_USE_AITER_UNIFIED_ATTN=1",
+        "MUSE_MOE_BACKEND=flydsl",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 4",
+        "--ep-size 4",
+        "--attention-backend aiter",
+        "--page-size 16",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "mxfp4", tep: "8" },
+      nnodes: 1,
+      env: [
+        "SGLANG_USE_AITER=1",
+        "SGLANG_USE_AITER_UNIFIED_ATTN=1",
+        "MUSE_MOE_BACKEND=flydsl",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--page-size 16",
+        "--mem-fraction-static 0.90",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "bf16", tep: "8" },
+      nnodes: 1,
+      env: [
+        "SGLANG_USE_AITER=1",
+        "SGLANG_USE_AITER_UNIFIED_ATTN=1",
+        "MUSE_MOE_BACKEND=flydsl",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--dtype bfloat16",
+        "--attention-backend aiter",
+        "--page-size 16",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
