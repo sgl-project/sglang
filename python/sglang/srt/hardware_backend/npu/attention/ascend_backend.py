@@ -857,17 +857,12 @@ class AscendAttnBackend(AttentionBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
-            # length; refresh the graph-bound list from that CPU tensor.
-            # Other spec algorithms keep the capture-time list (graph_runner
-            # recomputes it): gathering seq_lens[:bs] here would force a D2H
-            # sync for models (e.g. DSA+MTP) whose replay path is otherwise
-            # sync-free.
-            if _is_dflash_verify(spec_info):
-                if seq_lens_cpu is not None:
-                    kv_lens = seq_lens_cpu[:bs]
-                else:
-                    kv_lens = seq_lens[:bs]
-                metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
+            # length; other spec algorithms already added the draft tokens above.
+            if _is_dflash_verify(spec_info) and seq_lens_cpu is not None:
+                kv_lens = seq_lens_cpu[:bs]
+            else:
+                kv_lens = seq_lens[:bs]
+            metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
