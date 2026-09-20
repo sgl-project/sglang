@@ -12,6 +12,7 @@ User datasets must not contain simulator metadata.
 """
 
 import argparse
+import asyncio
 import contextlib
 import json
 import os
@@ -35,8 +36,12 @@ _ORIGINAL_AIOHTTP_REQUEST = None
 _ORIGINAL_CALCULATE_METRICS = serving.calculate_metrics
 _ORIGINAL_GET_REQUEST = serving.get_request
 _ORIGINAL_RUN_BENCHMARK = serving.run_benchmark
+_ORIGINAL_WRAP_MULTI_TURN = serving.wrap_multi_turn_request_func
 _SIMULATOR_MODE = "offline"
 _USE_TRACE_TIMESTAMPS = False
+_SESSION_PER_CONVERSATION = False
+_BASE_URL = ""
+_CLOSE_SESSION_TIMEOUT_S = 30.0
 
 
 def _metrics_path() -> Path:
@@ -72,6 +77,55 @@ class _DurationReplacingStream:
         return self.target.flush()
 
 
+def _set_session_id(request: DatasetRow, session_id: str) -> None:
+    """Tag a conversation so all of its rounds share one radix-native session."""
+    extra_request_body = dict(request.extra_request_body or {})
+    extra_request_body["session_id"] = session_id
+    request.extra_request_body = extra_request_body
+
+
+async def _close_session(session_id: str) -> None:
+    """Release a session's KV once its last round has returned.
+
+    Bounded by a timeout on purpose. The simulator orders a close behind every
+    turn of its session, so a turn that never reports completion would other-
+    wise hang the whole benchmark here rather than in the scheduler, where the
+    cause is visible. Losing a close costs KV that the run is about to discard;
+    hanging costs the run.
+    """
+    if not _BASE_URL:
+        return
+    timeout = aiohttp.ClientTimeout(total=_CLOSE_SESSION_TIMEOUT_S)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{_BASE_URL}/close_session", json={"session_id": session_id}
+            ) as response:
+                response.raise_for_status()
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+        print(f"WARNING: close_session failed for {session_id}: {exc}")
+
+
+def simulator_wrap_multi_turn_request_func(request_func, backend: str):
+    """Close each conversation's session after its final round.
+
+    Nothing else in the benchmark stack issues a close, so without this the
+    server only ever sees lazily auto-opened sessions (`ensure_session_
+    generation`) that stay referenced for the whole run.
+    """
+    inner = _ORIGINAL_WRAP_MULTI_TURN(request_func, backend=backend)
+
+    async def f(request_func_input, pbar=None):
+        session_id = (request_func_input.extra_request_body or {}).get("session_id")
+        try:
+            return await inner(request_func_input, pbar=pbar)
+        finally:
+            if session_id is not None:
+                await _close_session(session_id)
+
+    return f
+
+
 def _set_simulation_metadata(
     request: DatasetRow, *, created_time_ms: float, total_request: int
 ) -> None:
@@ -105,6 +159,9 @@ async def simulator_get_request(
         return
 
     total_request = len(input_requests)
+    if _SESSION_PER_CONVERSATION:
+        for index, request in enumerate(input_requests):
+            _set_session_id(request, f"sim-conv-{index}")
     if use_trace_timestamps:
         if any(request.timestamp is None for request in input_requests):
             raise ValueError(
@@ -136,8 +193,17 @@ async def simulator_get_request(
             created_time_ms += np.random.exponential(1.0 / request_rate) * 1000.0
 
 
+# `/generate` nests sampling under `sampling_params`; the OpenAI chat schema is
+# flat and carries `custom_params` at the top level (protocol.py ChatCompletionRequest),
+# so the metadata lands in the same place on the scheduler either way.
+# Multi-turn replay (`wrap_multi_turn_request_func`) only runs on chat backends.
+_SUPPORTED_BACKENDS = {"sglang", "sglang-oai-chat"}
+_CHAT_URL_REGEX = r"/v1/chat/completions(?:\?.*)?$"
+_DEFAULT_HIJACK_URL_REGEX = rf"(?:/generate(?:\?.*)?$)|(?:{_CHAT_URL_REGEX})"
+
+
 def install_aiohttp_json_hijack(
-    *, hijack_url_regex: Optional[str] = r"/generate(?:\?.*)?$"
+    *, hijack_url_regex: Optional[str] = _DEFAULT_HIJACK_URL_REGEX
 ) -> None:
     """Move transient metadata into the already-built sampling parameters."""
     global _ORIGINAL_AIOHTTP_REQUEST
@@ -145,6 +211,7 @@ def install_aiohttp_json_hijack(
         return
 
     pattern = re.compile(hijack_url_regex) if hijack_url_regex else None
+    chat_pattern = re.compile(_CHAT_URL_REGEX)
     _ORIGINAL_AIOHTTP_REQUEST = aiohttp.ClientSession._request
 
     async def patched_request(self, method, url, **kwargs):
@@ -152,8 +219,11 @@ def install_aiohttp_json_hijack(
             payload = kwargs.get("json")
             if isinstance(payload, dict) and "simulation" in payload:
                 simulation = payload.pop("simulation")
-                sampling_params = payload.setdefault("sampling_params", {})
-                custom_params = sampling_params.setdefault("custom_params", {})
+                if chat_pattern.search(str(url)):
+                    custom_params = payload.setdefault("custom_params", {})
+                else:
+                    sampling_params = payload.setdefault("sampling_params", {})
+                    custom_params = sampling_params.setdefault("custom_params", {})
                 custom_params["simulation"] = simulation
                 kwargs["json"] = payload
         return await _ORIGINAL_AIOHTTP_REQUEST(self, method, url, **kwargs)
@@ -196,10 +266,12 @@ def _replace_output_file_duration(
 
 
 def simulator_run_benchmark(args: argparse.Namespace):
-    global _USE_TRACE_TIMESTAMPS
-    if args.backend != "sglang":
+    global _USE_TRACE_TIMESTAMPS, _BASE_URL
+    _BASE_URL = (getattr(args, "base_url", "") or "").rstrip("/")
+    if args.backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
-            "benchmark/simulator/bench_serving.py requires --backend sglang"
+            "benchmark/simulator/bench_serving.py requires --backend one of "
+            f"{sorted(_SUPPORTED_BACKENDS)}"
         )
     if args.dataset_name == "mooncake":
         raise ValueError(
@@ -228,7 +300,14 @@ def _extract_simulator_args(argv: list[str]) -> tuple[str, list[str]]:
         default="offline",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--simulator-session-per-conversation",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args, remaining = parser.parse_known_args(argv)
+    global _SESSION_PER_CONVERSATION
+    _SESSION_PER_CONVERSATION = args.simulator_session_per_conversation
     return args.simulator_mode, remaining
 
 
@@ -265,6 +344,7 @@ def cli_main() -> None:
     serving.get_request = simulator_get_request
     serving.calculate_metrics = simulator_calculate_metrics
     serving.run_benchmark = simulator_run_benchmark
+    serving.wrap_multi_turn_request_func = simulator_wrap_multi_turn_request_func
     install_aiohttp_json_hijack()
 
     print(f"SGLang Simulator benchmark mode: {_SIMULATOR_MODE.upper()}")
