@@ -5,9 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.dp_prefill_spec import DPPrefillSpecPlan
+from sglang.srt.speculative.dp_spec_prefill_coordination import (
+    DPSpecPrefillCoordinationPlan,
+)
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,14 +18,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 WORKER_MODULE = "sglang.srt.speculative.eagle_worker_v2"
-PLAN_MODULE = "sglang.srt.speculative.dp_prefill_spec"
 
 
 def make_plan():
-    return DPPrefillSpecPlan(
-        counts=(4096, 32, 0, 512, 7, 1, 19, 0),
-        logprob_counts=(1, 32, 0, 2, 7, 1, 19, 0),
-        prefills=(True, False, False, True, False, False, False, False),
+    return DPSpecPrefillCoordinationPlan(
+        counts=[4096, 32, 0, 512, 7, 1, 19, 0],
+        logprob_counts=[1, 32, 0, 2, 7, 1, 19, 0],
+        prefills=torch.tensor([1, 0, 0, 1, 0, 0, 0, 0]),
         draft_width=1,
         verify_width=4,
     )
@@ -32,21 +34,21 @@ def make_batch(counts, logprobs):
     return SimpleNamespace(
         global_num_tokens=list(counts),
         global_num_tokens_for_logprob=list(logprobs),
-        dp_prefill_spec_phase=None,
+        dp_spec_prefill_coordination_applied=False,
         is_extend_in_batch=False,
         can_run_decode_cuda_graph=True,
         can_run_dp_prefill_cuda_graph=True,
     )
 
 
-class TestDPPrefillSpecPlan(unittest.TestCase):
+class TestDPSpecPrefillCoordinationPlan(unittest.TestCase):
     def setUp(self):
         self.plan = make_plan()
 
     def test_target_preserves_prefill_counts_and_scales_decode(self):
         expected = (
-            (4096, 128, 0, 512, 28, 4, 76, 0),
-            (1, 128, 0, 2, 28, 4, 76, 0),
+            [4096, 128, 0, 512, 28, 4, 76, 0],
+            [1, 128, 0, 2, 28, 4, 76, 0],
         )
         self.assertEqual(self.plan.phase_counts("target"), expected)
         self.assertEqual(self.plan.phase_counts("draft_extend"), expected)
@@ -54,7 +56,7 @@ class TestDPPrefillSpecPlan(unittest.TestCase):
     def test_prefill_ranks_contribute_zero_draft_tokens(self):
         self.assertEqual(
             self.plan.phase_counts("draft"),
-            ((0, 32, 0, 0, 7, 1, 19, 0),) * 2,
+            ([0, 32, 0, 0, 7, 1, 19, 0],) * 2,
         )
 
     def test_uniform_or_idle_steps_are_not_heterogeneous(self):
@@ -66,7 +68,9 @@ class TestDPPrefillSpecPlan(unittest.TestCase):
         ]:
             with self.subTest(counts=counts, prefills=prefills):
                 self.assertFalse(
-                    DPPrefillSpecPlan(counts, counts, prefills, 1, 4).heterogeneous
+                    DPSpecPrefillCoordinationPlan(
+                        list(counts), list(counts), torch.tensor(prefills), 1, 4
+                    ).heterogeneous
                 )
         self.assertTrue(self.plan.heterogeneous)
 
@@ -87,38 +91,28 @@ class TestDPPrefillSpecPlan(unittest.TestCase):
                         self.plan.apply(batch, phase, rank)
                         self.assertEqual(
                             batch.global_num_tokens,
-                            [tokens[rank]] if local_only else list(tokens),
+                            [tokens[rank]] if local_only else tokens,
                         )
                         self.assertEqual(
                             batch.global_num_tokens_for_logprob,
-                            [logprobs[rank]] if local_only else list(logprobs),
+                            [logprobs[rank]] if local_only else logprobs,
                         )
-                        self.assertEqual(batch.dp_prefill_spec_phase, phase)
+                        self.assertTrue(batch.dp_spec_prefill_coordination_applied)
                         self.assertTrue(batch.is_extend_in_batch)
                         self.assertFalse(batch.can_run_decode_cuda_graph)
                         self.assertFalse(batch.can_run_dp_prefill_cuda_graph)
 
-    def test_invalid_metadata_is_rejected(self):
-        for args in [
-            ((1,), (), (True,), 1, 4),
-            ((), (), (), 1, 4),
-            ((-1,), (0,), (False,), 1, 4),
-            ((1,), (-1,), (False,), 1, 4),
-            ((1,), (1,), (False,), 0, 4),
-            ((1,), (1,), (False,), 1, 0),
-        ]:
-            with self.subTest(args=args), self.assertRaises(ValueError):
-                DPPrefillSpecPlan(*args)
+    def test_invalid_phase_and_group_width_are_rejected(self):
         with self.assertRaises(ValueError):
             self.plan.phase_counts("unknown")
         with self.assertRaises(ValueError):
             self.plan.apply(make_batch([1, 2], [1, 2]), "target", 0)
 
-    def test_gather_resets_phase_and_restores_pure_decode_flags(self):
+    def test_gather_resets_coordination_and_restores_pure_decode_flags(self):
         for local_only in (False, True):
             with self.subTest(local_only=local_only):
                 batch = make_batch([128], [128])
-                batch.dp_prefill_spec_phase = "draft_extend"
+                batch.dp_spec_prefill_coordination_applied = True
                 info = SimpleNamespace(
                     num_tokens=32,
                     num_tokens_for_logprob=32,
@@ -132,23 +126,24 @@ class TestDPPrefillSpecPlan(unittest.TestCase):
                     can_run_prefill_cuda_graph=False,
                     prefill_cuda_graph_max_prefix_len=0,
                 )
-                with patch(f"{PLAN_MODULE}.ENABLED", True):
+                with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):
                     _update_gather_batch(batch, info, not local_only)
-                self.assertIsNone(batch.dp_prefill_spec_phase)
+                self.assertFalse(batch.dp_spec_prefill_coordination_applied)
                 self.assertEqual(
                     batch.global_num_tokens, [32] if local_only else [32, 7]
                 )
-                self.assertEqual(
-                    batch.dp_prefill_spec_metadata, ((32, 7), (32, 7), (False, False))
-                )
+                counts, logprobs, prefills = batch.dp_spec_prefill_coordination_metadata
+                self.assertIs(counts, info.global_num_tokens)
+                self.assertIs(logprobs, info.global_num_tokens_for_logprob)
+                torch.testing.assert_close(prefills, info.tp0_info_cpu[:, 3])
                 self.assertTrue(batch.can_run_decode_cuda_graph)
                 self.assertFalse(batch.is_extend_in_batch)
 
     def test_forward_metadata_scales_only_raw_counts(self):
-        for phase in (None, "target", "draft_extend"):
-            with self.subTest(phase=phase):
+        for applied in (False, True):
+            with self.subTest(applied=applied):
                 batch = make_batch([4096, 128], [1, 128])
-                batch.dp_prefill_spec_phase = phase
+                batch.dp_spec_prefill_coordination_applied = applied
                 forward = object.__new__(ForwardBatch)
                 forward.spec_info = object()
                 with patch(
@@ -156,14 +151,14 @@ class TestDPPrefillSpecPlan(unittest.TestCase):
                     return_value=([16384, 512], [4, 512]),
                 ) as scale:
                     forward.init_mlp_sync_metadata(batch, "cpu")
-                self.assertEqual(scale.call_count, int(phase is None))
+                self.assertEqual(scale.call_count, int(not applied))
                 self.assertEqual(
                     forward.global_num_tokens_cpu,
-                    [16384, 512] if phase is None else [4096, 128],
+                    [16384, 512] if not applied else [4096, 128],
                 )
 
 
-class TestDPPrefillSpecWorker(unittest.TestCase):
+class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
     def test_prefill_decode_and_idle_ranks_follow_the_same_phase_order(self):
         plan = make_plan()
         for rank in range(8):
@@ -201,9 +196,9 @@ class TestDPPrefillSpecWorker(unittest.TestCase):
                 verify_input = object()
 
                 def record(phase, current):
-                    self.assertEqual(current.dp_prefill_spec_phase, phase)
+                    self.assertTrue(current.dp_spec_prefill_coordination_applied)
                     self.assertEqual(
-                        tuple(current.global_num_tokens), plan.phase_counts(phase)[0]
+                        current.global_num_tokens, plan.phase_counts(phase)[0]
                     )
                     self.assertFalse(current.can_run_decode_cuda_graph)
                     self.assertFalse(current.can_run_dp_prefill_cuda_graph)
@@ -273,7 +268,7 @@ class TestDPPrefillSpecWorker(unittest.TestCase):
                                 side_effect=lambda *args: contextlib.nullcontext(),
                             )
                         )
-                    actual = worker._forward_dp_prefill_spec(
+                    actual = worker._forward_dp_spec_prefill_coordination(
                         batch,
                         plan,
                         lambda value: events.append("publish"),
@@ -296,23 +291,42 @@ class TestDPPrefillSpecWorker(unittest.TestCase):
             return_value=SimpleNamespace(attn_dp_rank=0),
         ):
             with self.assertRaisesRegex(RuntimeError, "Local mixed"):
-                worker._forward_dp_prefill_spec(batch, make_plan(), None, None, None)
+                worker._forward_dp_spec_prefill_coordination(
+                    batch, make_plan(), None, None, None
+                )
+
+    def test_disabled_feature_retains_existing_dispatch_without_phase_metadata(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.enable_dp_spec_prefill_coordination = False
+        worker._forward_prefill_batch = MagicMock(return_value=object())
+        worker._forward_dp_spec_prefill_coordination = MagicMock()
+        batch = SimpleNamespace(
+            is_extend_in_batch=True,
+            forward_mode=ForwardMode.DECODE,
+        )
+        result = worker.forward_batch_generation(batch)
+        self.assertIs(result, worker._forward_prefill_batch.return_value)
+        worker._forward_dp_spec_prefill_coordination.assert_not_called()
 
     def test_uniform_prefill_retains_existing_dispatch(self):
         worker = object.__new__(EAGLEWorkerV2)
+        worker.enable_dp_spec_prefill_coordination = True
         worker.topk = 1
         worker.speculative_num_draft_tokens = 4
         worker._forward_prefill_batch = MagicMock(return_value=object())
-        worker._forward_dp_prefill_spec = MagicMock()
+        worker._forward_dp_spec_prefill_coordination = MagicMock()
         batch = SimpleNamespace(
             is_extend_in_batch=True,
             forward_mode=ForwardMode.EXTEND,
-            dp_prefill_spec_metadata=((4096, 0), (1, 0), (True, False)),
+            dp_spec_prefill_coordination_metadata=(
+                [4096, 0],
+                [1, 0],
+                torch.tensor([1, 0]),
+            ),
         )
-        with patch(f"{WORKER_MODULE}.DP_PREFILL_SPEC_ENABLED", True):
-            result = worker.forward_batch_generation(batch)
+        result = worker.forward_batch_generation(batch)
         self.assertIs(result, worker._forward_prefill_batch.return_value)
-        worker._forward_dp_prefill_spec.assert_not_called()
+        worker._forward_dp_spec_prefill_coordination.assert_not_called()
 
 
 if __name__ == "__main__":

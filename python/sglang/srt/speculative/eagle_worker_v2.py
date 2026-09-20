@@ -74,9 +74,8 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 )
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
-from sglang.srt.speculative.dp_prefill_spec import ENABLED as DP_PREFILL_SPEC_ENABLED
-from sglang.srt.speculative.dp_prefill_spec import (
-    DPPrefillSpecPlan,
+from sglang.srt.speculative.dp_spec_prefill_coordination import (
+    DPSpecPrefillCoordinationPlan,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -1302,28 +1301,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        if DP_PREFILL_SPEC_ENABLED:
-            supported = (
-                server_args.enable_dp_attention
-                and server_args.dp_size == server_args.tp_size == server_args.ep_size
-                and server_args.dp_size > 1
-                and server_args.pp_size == 1
-                and server_args.moe_a2a_backend == "megamoe"
-                and server_args.attention_backend == "dsv4"
-                and not server_args.enable_mixed_chunk
-                and not get_spec().speculative_adaptive
-                and not server_args.enable_two_batch_overlap
-                and self.topk == 1
-                and self.speculative_num_steps == 3
-                and self.speculative_num_draft_tokens == 4
-                and self.speculative_algorithm == SpeculativeAlgorithm.EAGLE
-            )
-            if not supported:
-                raise ValueError(
-                    "Experimental DP prefill/spec supports only DSV4 MegaMoE "
-                    "DP=TP=EP>1, PP1, fixed EAGLE3/topk1/width4, no local "
-                    "mixed chunks, adaptive speculation or two-batch overlap"
-                )
+        self.enable_dp_spec_prefill_coordination = (
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        )
+        # Coordination for other speculative algorithms is not implemented yet.
+        if (
+            self.enable_dp_spec_prefill_coordination
+            and self.speculative_algorithm != SpeculativeAlgorithm.EAGLE
+        ):
+            raise ValueError("DP spec/prefill coordination requires EAGLE")
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
@@ -1414,20 +1400,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if DP_PREFILL_SPEC_ENABLED and batch.is_extend_in_batch:
-            if batch.dp_prefill_spec_metadata is None:
-                raise RuntimeError("Missing DP prefill/spec metadata")
-            plan = DPPrefillSpecPlan(
-                *batch.dp_prefill_spec_metadata,
-                draft_width=self.topk,
-                verify_width=self.speculative_num_draft_tokens,
-            )
-            if plan.heterogeneous:
-                return self._forward_dp_prefill_spec(
-                    batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
-                )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            return self._forward_prefill_batch(batch, on_publish, pp_proxy_tensors)
+            if not (
+                batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
+            ):
+                return self._forward_prefill_batch(batch, on_publish, pp_proxy_tensors)
+            else:
+                if batch.dp_spec_prefill_coordination_metadata is None:
+                    raise RuntimeError("Missing DP spec/prefill coordination metadata")
+                plan = DPSpecPrefillCoordinationPlan(
+                    *batch.dp_spec_prefill_coordination_metadata,
+                    draft_width=self.topk,
+                    verify_width=self.speculative_num_draft_tokens,
+                )
+                if not plan.heterogeneous:
+                    return self._forward_prefill_batch(
+                        batch, on_publish, pp_proxy_tensors
+                    )
+                else:
+                    return self._forward_dp_spec_prefill_coordination(
+                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                    )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
@@ -1537,7 +1530,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def _forward_prefill_batch(
-        self, batch, on_publish=None, pp_proxy_tensors=None, dp_plan=None
+        self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
         # Target prefill
         target_capture_mode = (
@@ -1563,8 +1556,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self._draft_worker is None:
             return batch_output
 
-        if dp_plan is not None:
-            dp_plan.apply(batch, "draft_extend", get_parallel().attn_dp_rank)
+        if coordination_plan is not None:
+            coordination_plan.apply(batch, "draft_extend", get_parallel().attn_dp_rank)
 
         # Draft prefill
         with (
@@ -1581,7 +1574,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             return batch_output
 
-    def _forward_dp_prefill_spec(
+    def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
     ):
         """Run draft, target, and draft-extend with each rank's local mode."""
@@ -1628,7 +1621,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         plan.apply(batch, "target", rank)
         if is_prefill:
             result = self._forward_prefill_batch(
-                batch, on_publish, pp_proxy_tensors, dp_plan=plan
+                batch, on_publish, pp_proxy_tensors, coordination_plan=plan
             )
             # Pin the temporary idle tensors through the overlap lifetime.
             result.extra_keep_alive_refs = list(result.extra_keep_alive_refs or ()) + [

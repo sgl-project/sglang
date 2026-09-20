@@ -5,7 +5,9 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.dp_spec_overlap_kit import DPSpecOverlapKit
+from sglang.test.kits.dp_spec_prefill_coordination_kit import (
+    DPSpecPrefillCoordinationKit,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -26,7 +28,7 @@ register_cuda_ci(est_time=112, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
-class TestEAGLE3EngineDPAttention(DPSpecOverlapKit, CustomTestCase):
+class TestEAGLE3EngineDPAttention(DPSpecPrefillCoordinationKit, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN

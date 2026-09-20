@@ -2431,8 +2431,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_forward_mode: Optional[ForwardMode] = None
 
     # Experimental full-DP metadata, populated from the existing scheduler gather.
-    dp_prefill_spec_metadata: Optional[tuple] = None
-    dp_prefill_spec_phase: Optional[str] = None
+    dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
     is_extend_in_batch: bool = False
@@ -3750,8 +3750,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
-            dp_prefill_spec_metadata=self.dp_prefill_spec_metadata,
-            dp_prefill_spec_phase=self.dp_prefill_spec_phase,
+            dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,

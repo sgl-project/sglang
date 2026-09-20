@@ -533,7 +533,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_pooled_hidden_states: bool = False
 
     # For DP attention
-    dp_prefill_spec_phase: Optional[str] = None
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
@@ -808,7 +807,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
 
         assert batch.global_num_tokens_for_logprob is not None
-        if self.spec_info is not None and batch.dp_prefill_spec_phase is None:
+        if (
+            self.spec_info is not None
+            and not batch.dp_spec_prefill_coordination_applied
+        ):
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 
             global_num_tokens, global_num_tokens_for_logprob = (
@@ -919,7 +921,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_positions=batch.replace_positions,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
-            dp_prefill_spec_phase=batch.dp_prefill_spec_phase,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
@@ -1458,9 +1459,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
-        if self.dp_prefill_spec_phase is not None:
-            # Preserve each rank's forward mode on heterogeneous steps.
-            dp_padding_mode = DpPaddingMode.SUM_LEN
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,

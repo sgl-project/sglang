@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 
-class DPSpecOverlapKit:
+class DPSpecPrefillCoordinationKit:
     dp_size = 2
     dp_prefill_lines = 1536
 
