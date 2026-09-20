@@ -8,6 +8,8 @@ SGLang can reuse exact conditioning across requests and cache intermediate denoi
 
 Native pipelines enable a CPU conditioning cache by default. Repeated inputs can reuse text embeddings (including negative prompts), image or vision-language encoder outputs, and VAE posteriors. The shared LRU holds at most **512 MiB per executor/rank**, with at most 128 entries. It does not retain cached tensors on the GPU. Oversized results are computed normally.
 
+Hits restore outputs to their original devices. This can change peak GPU allocation even though entries live on the CPU; measure memory as well as latency when using a tight VRAM budget.
+
 This is most useful when generating several variations from the same prompt or reference image, especially with a layerwise-offloaded encoder. A changed edit instruction recomputes the joint vision-language embedding, while the unchanged image can still reuse its vision features and VAE posterior. Separate CLI invocations start separate processes and cannot share this cache.
 
 To disable conditioning reuse:
