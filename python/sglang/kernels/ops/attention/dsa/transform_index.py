@@ -194,6 +194,9 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
+    # transform_index_page_table_decode_kernel hardcodes TOPK=2048: it addresses
+    # rows as req_id * TOPK instead of by stride, and tl.arange(0, TOPK) needs a
+    # power of two. Other widths must fail loudly rather than read wrong rows.
     assert topk_indices.shape[1] == 2048
     qo_len = topk_indices.shape[0]
     if result is None:
@@ -220,7 +223,10 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    # No topk-width constraint: the kernel below takes TOPK from
+    # topk_indices.shape[1], masks the trailing block and receives both strides
+    # as arguments. Widths other than 2048 are real -- a kpool indexer emits
+    # index_topk + index_kpool - 1 columns. Decode is 2048-only by construction.
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:

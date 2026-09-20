@@ -33,9 +33,11 @@ class TestDSATransformIndex(CustomTestCase):
         )
         return columns.unsqueeze(0) + row_bias
 
-    def _make_topk(self, rows: int, context_length: int) -> torch.Tensor:
+    def _make_topk(
+        self, rows: int, context_length: int, topk_width: int = TOPK
+    ) -> torch.Tensor:
         topk = (
-            torch.arange(TOPK, dtype=torch.int64, device=self.device)
+            torch.arange(topk_width, dtype=torch.int64, device=self.device)
             .remainder(context_length)
             .repeat(rows, 1)
         )
@@ -55,7 +57,7 @@ class TestDSATransformIndex(CustomTestCase):
     ) -> torch.Tensor:
         real_num_tokens = sum(extend_lens_cpu)
         expected = torch.full(
-            (output_num_tokens, TOPK),
+            (output_num_tokens, topk_indices.shape[1]),
             -1,
             dtype=torch.int32,
             device=self.device,
@@ -127,6 +129,7 @@ class TestDSATransformIndex(CustomTestCase):
         page_table_is_expanded: bool,
         topk_padding: int = 0,
         output_padding: int = 0,
+        topk_width: int = TOPK,
     ) -> None:
         real_num_tokens = sum(extend_lens_cpu)
         page_table_rows = (
@@ -135,7 +138,9 @@ class TestDSATransformIndex(CustomTestCase):
         topk_num_tokens = real_num_tokens + topk_padding
         output_num_tokens = topk_num_tokens + output_padding
         page_table = self._make_page_table(page_table_rows, context_length)
-        topk_indices = self._make_topk(topk_num_tokens, context_length)
+        topk_indices = self._make_topk(
+            topk_num_tokens, context_length, topk_width=topk_width
+        )
         expected = self._expected(
             page_table,
             topk_indices,
@@ -153,6 +158,22 @@ class TestDSATransformIndex(CustomTestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_prefill_topk_widths_other_than_2048(self):
+        # A kpool indexer emits index_topk + index_kpool - 1 columns, so 2048 is
+        # not the only legal width: GLM-5.3-Flash (index_topk=2048, index_kpool=4,
+        # index_kpool_always_select_tail) produces 2051. The widths below are
+        # picked against BLOCK_TOPK=256: 2051 is the real one and leaves 3 live
+        # columns in the trailing block, 2049 leaves exactly 1, and 1024 is an
+        # exact multiple with no trailing block and no lower bound at 2048.
+        for topk_width in (2051, 2049, 1024):
+            with self.subTest(topk_width=topk_width):
+                self._check_case(
+                    [2, 1],
+                    8192,
+                    page_table_is_expanded=False,
+                    topk_width=topk_width,
+                )
 
     def test_prefill_uses_dedicated_kernel(self):
         extend_lens_cpu = [2, 1]
