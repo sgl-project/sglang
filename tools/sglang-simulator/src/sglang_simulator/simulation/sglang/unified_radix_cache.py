@@ -1,4 +1,5 @@
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation.manager import StateManager
 
 
 class C_UnifiedRadixCacheHook(BaseHook):
@@ -32,3 +33,17 @@ class C_UnifiedRadixCacheHook(BaseHook):
             return result
 
         target.check_hicache_events = wrapped_check_hicache_events
+
+        # KV eviction is the mechanism session references reorder, but the count
+        # is only returned to the allocator and never reported. Accumulate it so
+        # a run can show whether eviction fired at all.
+        def count_evicted(method):
+            def wrapped(self, *args, **kwargs):
+                result = method(self, *args, **kwargs)
+                StateManager.inc_evicted_tokens(result.num_tokens_evicted)
+                return result
+
+            return wrapped
+
+        target.evict = count_evicted(target.evict)
+        target.evict_for_alloc = count_evicted(target.evict_for_alloc)

@@ -2,6 +2,7 @@ import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.sglang.utils import (
+    resolve_filler_token_id,
     resolve_model_info,
     resolve_scheduler_config,
 )
@@ -55,6 +56,7 @@ class C_ModelRunnerHook(BaseHook):
             self.weight_load_mem_usage = 0
             self.load_config = None
             self.loader = _make_mock_model_loader(type(self))
+            self.filler_token_id = resolve_filler_token_id(self.server_args)
 
             if ConfigManager.get_model_info() is None:
                 ConfigManager.set_model_info(resolve_model_info(self.model_config))
@@ -78,8 +80,9 @@ class C_ModelRunnerHook(BaseHook):
 
         def wrapped_sample(self, *args, **kwargs):
             logits = args[0]
-            return torch.ones(
+            return torch.full(
                 size=(logits.next_token_logits.shape[0],),
+                fill_value=self.filler_token_id,
                 device=self.device,
                 dtype=torch.int64,
             )

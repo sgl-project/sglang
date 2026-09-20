@@ -128,3 +128,32 @@ def resolve_model_info(model_config: "ModelConfig") -> ModelInfo:
         raise ValueError(
             f"The attention type of `{model_config.attention_arch}` is not supported now."
         )
+
+
+def resolve_filler_token_id(server_args: "ServerArgs") -> int:
+    """Return the token id the simulated sampler emits for every output token.
+
+    Multi-turn benchmarks feed each answer back as history text, which the next
+    request re-tokenizes. A token that BPE-merges with its own repetition would
+    shrink every later prompt: token id 1 is a double quote on Llama-3.1 and the
+    doubled quote is also in the vocab, so a T-token answer came back as ~T/2
+    history tokens. A leading-space word never merges with itself.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        server_args.tokenizer_path, trust_remote_code=server_args.trust_remote_code
+    )
+    probe_length = 64
+    for text in (" the", " and", " data", " token"):
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            continue
+        probe = tokenizer.decode(token_ids * probe_length, skip_special_tokens=True)
+        if len(tokenizer.encode(probe, add_special_tokens=False)) == probe_length:
+            return token_ids[0]
+
+    raise ValueError(
+        f"No repetition-stable filler token for {server_args.tokenizer_path}. "
+        "Simulated multi-turn history would be shorter than the generated output."
+    )
