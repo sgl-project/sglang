@@ -285,11 +285,19 @@ def _publish_tile_blocks(
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
         scores = logits[rows, :lc]
-        scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
-            -torch.inf,
-        )
-        ids = select_candidate_block_ids(
+        select_blocks = select_candidate_block_ids
+        if logits.is_cuda and not torch.version.hip:
+            from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+                select_prefill_candidate_block_ids,
+            )
+
+            select_blocks = select_prefill_candidate_block_ids
+        else:
+            scores.masked_fill_(
+                torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
+                -torch.inf,
+            )
+        ids = select_blocks(
             logits=scores,
             compress_lens=lens[rows, None],
             topk_blocks=topk_blocks,
