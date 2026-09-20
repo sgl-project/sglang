@@ -1054,10 +1054,30 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        if sampled_tokens.ndim != 2 or int(sampled_tokens.shape[0]) != bs:
+            raise ValueError(
+                "DSpark confidence expects sampled_tokens shaped [bs, gamma], "
+                f"got anchor bs={bs} and sampled_tokens={tuple(sampled_tokens.shape)}."
+            )
+        # speculative_num_draft_tokens may override the checkpoint block_size,
+        # so the live proposal width is the sampled block's gamma rather than
+        # self.gamma (which records the checkpoint default).
+        runtime_gamma = int(sampled_tokens.shape[1])
+        expected_rows = bs * runtime_gamma
+        if x_post_hc.ndim < 2 or int(x_post_hc.shape[0]) != expected_rows:
+            raise ValueError(
+                "DSpark confidence hidden rows must match the live proposal "
+                f"geometry: expected bs * gamma = {bs} * {runtime_gamma} = "
+                f"{expected_rows}, got shape {tuple(x_post_hc.shape)}."
+            )
+        x_post_hc = x_post_hc.reshape(bs, runtime_gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [
+                    anchor_tokens.reshape(-1, 1),
+                    sampled_tokens[:, : runtime_gamma - 1],
+                ],
+                dim=1,
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
