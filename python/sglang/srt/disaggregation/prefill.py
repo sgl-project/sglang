@@ -1458,8 +1458,7 @@ class SchedulerDisaggregationPrefillMixin:
                 get_schedule().chunked_prefill_size, page_size
             )
         if transfer_chunk_tokens is not None:
-            # DCP packing also has a bounded buffer, even without hetero-TP
-            # staging. A cache hit reduces compute but not the missing KV range.
+            # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(
                 start_idx,
                 end_idx,
