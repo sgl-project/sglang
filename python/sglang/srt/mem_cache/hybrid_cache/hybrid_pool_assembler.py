@@ -1171,10 +1171,21 @@ def _plan_declared_states(
         raise ValueError(
             f"expected exactly one primary KV state, got {[d.name for d in primaries]}"
         )
+    primary = primaries[0].name
     for d in decls:
-        for ref in (d.index_source, d.layout_source):
-            if ref is not None and ref not in names:
-                raise ValueError(f"{d.name} references undeclared state {ref}")
+        if d.is_primary:
+            continue
+        # HostPoolGroup resolves sidecar indices from one real source, so no
+        # self-reference and no sidecar-to-sidecar chains.
+        if d.index_source != primary:
+            raise ValueError(
+                f"{d.name}.index_source must be the primary state {primary}, "
+                f"got {d.index_source}"
+            )
+        if d.layout_source is None or d.layout_source == d.name:
+            raise ValueError(f"{d.name}.layout_source must name another state")
+        if d.layout_source not in names:
+            raise ValueError(f"{d.name} references undeclared state {d.layout_source}")
     layers = LayerBinding(
         transfer_to_device=full_layer_mapping, transfer_layer_num=transfer_layer_num
     )
@@ -2430,6 +2441,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
+        radix_cache.sidecar_pool_specs = stack.sidecars
         logger.info(
             "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
             "transfer_layer_num=%s",

@@ -278,32 +278,44 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries[1].name, PoolName.DRAFT_INDEXER)
 
 
-def _dsa_pool_stub(*, layer_num: int, size: int = 4096):
+def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = None):
+    """DSATokenToKVPool shape without CUDA. ``shard=(rank, size)`` marks the pool
+    layer-sharded with rank owning a contiguous local layer range."""
     pool = object.__new__(DSATokenToKVPool)
     pool.layer_num = layer_num
     pool.size = size
     pool.start_layer = 0
     pool.end_layer = layer_num - 1
-    pool.layer_shard_enabled = False
     pool.store_dtype = torch.bfloat16
+    pool.kv_lora_rank = 512
+    pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
     pool.index_head_dim = 128
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
+    pool.layer_shard_enabled = shard is not None
+    if shard is not None:
+        from sglang.srt.layers.cp.utils import get_layer_shard_range
+
+        rank, shard_size = shard
+        pool.layer_shard_size = shard_size
+        pool._owned_local_layer_range = lambda: get_layer_shard_range(
+            rank, shard_size, layer_num
+        )
     return pool
 
 
-def _fake_mirror(layer_num: int):
-    return SimpleNamespace(
-        layer_num=layer_num,
-        layout="page_first",
-        page_size=64,
-        device="cpu",
-        size=8192,
-        logical_size=8192,
-        page_num=128,
-        mtp_draft_device_pools=(),
-        can_use_write_back_jit=False,
-    )
+def _mirror_shape(host):
+    shape = {
+        "size": host.size,
+        "page_num": host.page_num,
+        "layer_num": host.layer_num,
+        "size_per_token": host.size_per_token,
+        "layout": host.layout,
+    }
+    if isinstance(host, pool_host_dsa.DSAIndexerPoolHost):
+        shape["indexer_page_stride_size"] = host.indexer_page_stride_size
+        shape["indexer_layout_dim"] = host.indexer_layout_dim
+    return shape
 
 
 def _entry_shape(group, transfer_layer_num):
@@ -315,33 +327,53 @@ def _entry_shape(group, transfer_layer_num):
             id(entry.device_pool),
             tuple(id(p) for p in entry.packed_draft_device_pools),
             tuple(entry.layer_mapper(i) for i in range(-1, transfer_layer_num + 2)),
+            _mirror_shape(entry.host_pool),
         )
         for entry in group.entries
     ]
 
 
 class TestDeclaredStackParity(CustomTestCase):
-    """assemble_declared_stack must produce the same entries, layer mapping and
-    sidecars as the pre-declaration DSA assembly it replaces, with and without
-    packed MTP drafts."""
+    """assemble_declared_stack must build the same mirrors (real dummy host
+    pools: size, page_num, layers, byte stride), entries, layer mapping,
+    sidecars and controller arguments as the pre-declaration DSA assembly."""
 
-    def _run(self, builder, *, pool, params, **kw):
-        anchors = []
+    def _run(self, builder, *, pool, params, full_layer_mapping, **kw):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-        def fake_kv_host(**kwargs):
-            anchors.append(kwargs)
-            return _fake_mirror(pool.layer_num + len(params.mtp_draft_device_pools))
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
-        def fake_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
-            return _fake_mirror(anchor_host.layer_num)
+        def dummy_kv_host(**kwargs):
+            return MLATokenToKVPoolHost(
+                kwargs["kv_pool"],
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=kwargs["page_size"],
+                layout="page_first",
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=kwargs["override_kv_cache_dim"],
+                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
+            )
 
+        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+            return real_indexer_host(
+                decl,
+                device_pool,
+                anchor_host,
+                allocator_type=allocator_type,
+                pin_memory=False,
+                is_dummy=True,
+            )
+
+        controller = MagicMock()
         with (
-            patch.object(hybrid_pool_assembler, "build_kv_host_pool", fake_kv_host),
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
             patch.object(
-                hybrid_pool_assembler, "DSAIndexerPoolHost", fake_indexer_host
+                hybrid_pool_assembler, "DSAIndexerPoolHost", dummy_indexer_host
             ),
-            patch.object(pool_host_dsa, "DSAIndexerPoolHost", fake_indexer_host),
-            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", controller),
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
@@ -358,22 +390,33 @@ class TestDeclaredStackParity(CustomTestCase):
             out = builder(
                 params=params,
                 kv_pool=pool,
-                full_layer_mapping={i: i for i in range(pool.layer_num)},
+                full_layer_mapping=dict(full_layer_mapping),
                 load_cache_event=None,
                 storage_backend=None,
                 use_mla=True,
                 override_kv_cache_dim=pool.kv_cache_dim,
                 **kw,
             )
-        return out, anchors
+        (call,) = controller.call_args_list
+        controller_args = (call.args[2], dict(call.kwargs))  # page_size, kwargs
+        return out, controller_args
 
     def test_matches_legacy_assembly(self):
-        for draft_layers in (0, 1):
-            with self.subTest(draft_layers=draft_layers):
-                pool = _dsa_pool_stub(layer_num=3)
+        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_state_decl
+
+        cases = {
+            "identity": dict(shard=None, mapping={0: 0, 1: 1, 2: 2}, drafts=0),
+            "packed_draft": dict(shard=None, mapping={0: 0, 1: 1, 2: 2}, drafts=1),
+            "sharded_permuted": dict(
+                shard=(0, 2), mapping={0: 1, 1: 2, 2: 0}, drafts=0
+            ),
+        }
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                pool = _dsa_pool_stub(layer_num=3, shard=case["shard"])
                 drafts = tuple(
                     SimpleNamespace(index_k_with_scale_buffer=[object()])
-                    for _ in range(draft_layers)
+                    for _ in range(case["drafts"])
                 )
                 params = SimpleNamespace(
                     page_size=64,
@@ -384,29 +427,90 @@ class TestDeclaredStackParity(CustomTestCase):
                     attn_tp_cache_group=None,
                     pp_cache_group=None,
                 )
-                from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_state_decl
-
-                (legacy_group, _), legacy_anchor = self._run(
+                (legacy_group, _), legacy_ctrl = self._run(
                     _legacy_build_anchor_sidecar_stack,
                     pool=pool,
                     params=params,
+                    full_layer_mapping=case["mapping"],
                     indexer_decl=dsa_indexer_state_decl(pool),
                 )
-                stack, new_anchor = self._run(
+                stack, new_ctrl = self._run(
                     assemble_declared_stack,
                     pool=pool,
                     params=params,
+                    full_layer_mapping=case["mapping"],
                     decls=pool.host_states(),
                 )
-                transfer_layer_num = pool.layer_num + draft_layers
-                self.assertEqual(legacy_anchor, new_anchor)
+                transfer_layer_num = len(case["mapping"]) + case["drafts"]
                 self.assertEqual(
                     _entry_shape(stack.host_pool_group, transfer_layer_num),
                     _entry_shape(legacy_group, transfer_layer_num),
                 )
+                self.assertEqual(new_ctrl, legacy_ctrl)
+                # target transfer layers exclude packed tail layers
+                self.assertEqual(
+                    new_ctrl[1]["transfer_layer_num"], len(case["mapping"])
+                )
                 self.assertEqual(
                     stack.sidecars, [dsa_indexer_state_decl(pool).sidecar_spec()]
                 )
+
+
+class TestDeclaredStatePlanning(CustomTestCase):
+    """Sidecar indices resolve from one primary source in HostPoolGroup, so the
+    planner must reject self-references and sidecar chains up front."""
+
+    def _plan(self, decls):
+        return hybrid_pool_assembler._plan_declared_states(
+            decls=decls,
+            device_pool=object(),
+            full_layer_mapping={0: 0},
+            transfer_layer_num=1,
+            packed_draft_device_pools=(),
+        )
+
+    def test_rejects_self_referencing_index_source(self):
+        import msgspec
+
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_states()
+        bad = msgspec.structs.replace(indexer, index_source=PoolName.INDEXER)
+        with self.assertRaisesRegex(ValueError, "index_source"):
+            self._plan((kv, bad))
+
+    def test_rejects_self_referencing_layout_source(self):
+        import msgspec
+
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_states()
+        bad = msgspec.structs.replace(indexer, layout_source=PoolName.INDEXER)
+        with self.assertRaisesRegex(ValueError, "layout_source"):
+            self._plan((kv, bad))
+
+    def test_accepts_dsa_declaration(self):
+        plans = self._plan(_dsa_pool_stub(layer_num=1).host_states())
+        self.assertEqual([p.decl.name for p in plans], [PoolName.KV, PoolName.INDEXER])
+
+
+class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
+    """HiRadixCache's per-request transfers must come from the assembled
+    sidecar specs, not from a model-type table beside them."""
+
+    def test_extra_pools_follow_sidecar_specs(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, SidecarPoolSpec
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        cache = object.__new__(HiRadixCache)
+        cache.cache_controller = MagicMock(spec=HybridCacheController)
+        cache.kv_cache = _dsa_pool_stub(layer_num=1)
+        cache.sidecar_pool_specs = [
+            SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        ]
+        (transfer,) = cache._get_extra_pools()["extra_pools"]
+        self.assertEqual(transfer.name, PoolName.INDEXER)
+        self.assertEqual(transfer.indices_from_pool, PoolName.KV)
+        self.assertEqual(transfer.hit_policy, PoolHitPolicy.ALL_PAGES)
 
 
 class TestDeclaredStateVerification(CustomTestCase):

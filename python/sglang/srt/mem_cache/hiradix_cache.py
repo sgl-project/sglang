@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PrefetchTimeoutConfig,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -143,6 +144,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
+        # Filled from the declared stack; drives _get_extra_pools for migrated paths.
+        self.sidecar_pool_specs: list[SidecarPoolSpec] = []
         if isinstance(self.kv_cache, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
@@ -813,7 +816,19 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, DSATokenToKVPool) or (
+        if self.sidecar_pool_specs:
+            return {
+                "extra_pools": [
+                    PoolTransfer(
+                        name=spec.pool_name,
+                        hit_policy=spec.hit_policy,
+                        indices_from_pool=spec.indices_from_pool,
+                    )
+                    for spec in self.sidecar_pool_specs
+                ]
+            }
+        # MiniMax sparse has not migrated to declared states yet.
+        if (
             isinstance(self.kv_cache, MiniMaxSparseKVPool)
             and self.kv_cache.index_k_pool is not None
         ):
@@ -823,8 +838,7 @@ class HiRadixCache(RadixCache):
                 indices_from_pool=PoolName.KV,
             )
             return {"extra_pools": [pool]}
-        else:
-            return {}
+        return {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
