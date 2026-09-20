@@ -49,8 +49,9 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
 `b200-cirrascale1-0123` has separate E2E references of 1574.32 ms for
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
-`qwen_image_2512_modelopt_nvfp4_t2i`. Only this measured runner is matched;
-other Cirrascale runners retain the defaults until calibrated.
+`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 runners below also
+have separate references. Other Cirrascale runners retain the defaults until
+calibrated.
 
 Historical jobs on this runner, all using driver 580.126.20, already recorded
 the slower timings before this PR's changes, with unchanged B200 case definitions:
@@ -69,6 +70,30 @@ failed-item retry policy. Historical green jobs did not enforce the new E2E
 guard; their recorded timings, not their green status, support these references.
 This does not identify the underlying host/GPU contention mechanism. Loading,
 other metrics, other cases, and other runner references remain unchanged.
+
+### Cirrascale 3 historical CI references
+
+Match `b200-cirrascale3-0123` and `b200-cirrascale3-4567` separately, without
+extending the override to unmeasured runners. Their two NVFP4 case definitions,
+sampling configuration and model implementations are unchanged in the historical
+comparisons below. These are warmed request timings, not model download or load
+times. The independent PRs did not include this PR's E2E guard changes.
+
+| PR / CI job | Runner suffix | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
+| --- | --- | ---: | ---: |
+| [#40265](https://github.com/sgl-project/sglang/actions/runs/35437052621/job/105881489389) | `3-0123` | 1470.24 | 35377.30 |
+| [#39206, earlier head](https://github.com/sgl-project/sglang/actions/runs/35433818034/job/105873136034) | `3-0123` | 1471.59 | 17894.49 |
+| [#40293](https://github.com/sgl-project/sglang/actions/runs/35433914839/job/105879952157) | `3-4567` | 1547.77 | 17346.65 |
+| [#39983](https://github.com/sgl-project/sglang/actions/runs/35448201646/job/105999591501) | `3-4567` | 1471.19 | 18294.78 |
+| [#40374](https://github.com/sgl-project/sglang/actions/runs/35465121078/job/105956031846) | `3-4567` | 1500.43 | 18433.93 |
+
+The earlier #39206 row uses the minimum of its seven attempts, not their noisy
+maximum. Apply the same minimum-observed rule per runner across these records:
+1470.24 / 17894.49 ms for `3-0123`, and 1471.19 / 17346.65 ms for `3-4567`.
+Keep the 25% tolerance and all other metrics unchanged. In particular, the
+35-second historical Qwen outlier still fails; it is not a new reference.
+These records establish a pre-existing runner-specific mismatch with the Verda
+reference, not the underlying cause of contention or a claim that all runs pass.
 
 ## Initial loading references
 
