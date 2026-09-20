@@ -19,7 +19,7 @@ const config = {
       id: "weights",
       title: "Checkpoint weights",
       scope: "base",
-      description: "One checkpoint serves generation and editing. Set its authorized local path under Variables.",
+      description: "One checkpoint serves generation and editing. Set its Hugging Face repository or local path under Variables.",
       default: "default",
       options: [{ id: "default", label: "Qwen-Image 2.1", flags: [] }],
     },
@@ -55,7 +55,7 @@ const config = {
           id: "offload", label: "CPU offload",
           flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
             && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
-            ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            ? ["--performance-mode manual", "--component-residency text_encoder=layerwise-offload", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
             : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
@@ -80,7 +80,7 @@ const config = {
       options: [
         {
           id: "platform", label: "Automatic", recommended: true,
-          flags: (s) => [`--attention-backend ${platformAttention(s) === "sdpa" ? "torch_sdpa" : "fa"}`],
+          flags: (s) => s.hw === "b200" ? ["--attention-backend fa"] : [],
           description: "Uses SDPA on RTX PRO 6000 and RTX 5090, and FlashAttention on the other listed GPUs.",
         },
         { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000 and RTX 5090." },
@@ -169,7 +169,7 @@ const config = {
       learnMore: "#5-runtime-features",
       default: "auto",
       options: [
-        { id: "auto", label: "Auto", flags: ["--encoder-parallel auto"], recommended: true },
+        { id: "auto", label: "Auto", recommended: true },
         { id: "replicate", label: "Replicate", flags: ["--encoder-parallel replicate"], soft: true, softReason: "Explicit replication has not been verified for this server recipe." },
         { id: "fold", label: "Fold", flags: ["--encoder-parallel fold"], soft: true, softReason: "Native encoder TP and full-checkpoint TP2 × SP2 editing passed on B200. Requires node-local P2P; this HTTP recipe is unverified." },
       ],
@@ -224,7 +224,7 @@ const config = {
       learnMore: "#batching",
       default: "off",
       options: [
-        { id: "off", label: "Off", recommended: true, flags: ["--batching-max-size 1"], description: "Recommended for interactive latency. Resident H200, B200, and RTX PRO 6000 batching did not materially improve throughput in the measured workload." },
+        { id: "off", label: "Off", recommended: true, description: "Recommended for interactive latency. Resident H200, B200, and RTX PRO 6000 batching did not materially improve throughput in the measured workload." },
         {
           id: "2", label: "Up to 2 images",
           flags: ["--batching-max-size 2", "--batching-delay-ms 20"],
@@ -333,9 +333,10 @@ const config = {
           || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
           || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
       const world = Number(s.nodes) * Number(s.gpus_per_node);
-      const flags = ['--model-path "{{MODEL_PATH}}"', "--model-id Qwen-Image-2.1", `--num-gpus ${world}`];
+      const flags = ['--model-path "{{MODEL_PATH}}"'];
+      if (world > 1) flags.push(`--num-gpus ${world}`);
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
-      flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
+      if (world > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
       const warnings = [];
@@ -365,7 +366,7 @@ const config = {
 
   modelNames: { default: "Qwen-Image-2.1" },
   placeholders: {
-    MODEL_PATH: { target: "command", label: "Authorized checkpoint directory", default: "/models/qwen-image-2.1" },
+    MODEL_PATH: { target: "command", label: "Checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1" },
     FP8_DIT_PATH: { target: "command", label: "Serialized FP8 DiT directory", default: "/models/qwen-image-2.1-fp8/transformer" },
     FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
     GGUF_DIT_PATH: { target: "command", label: "GGUF DiT file", default: "/models/qwen-image-2.1-gguf/transformer-Q4_0.gguf" },
@@ -393,16 +394,17 @@ const config = {
         : "Combine the subjects from Picture 1 and Picture 2 into one coherent scene, preserving their appearance.",
     };
     const request = {
-      model: "{{MODEL_NAME}}", prompt: prompts[s.mode], n: Number(s.outputs),
-      size: `${s.resolution}x${s.resolution}`, num_inference_steps: Number(s.steps),
-      guidance_scale: 1, seed: 42, generator_device: "cpu",
+      prompt: prompts[s.mode], generator_device: "cpu",
       output_format: "png", response_format: "b64_json",
-      background: transparent ? "transparent" : "auto",
     };
+    if (Number(s.outputs) !== 1) request.n = Number(s.outputs);
+    if (s.resolution !== "1024") request.size = `${s.resolution}x${s.resolution}`;
+    if (Number(s.steps) !== 40) request.num_inference_steps = Number(s.steps);
+    if (transparent) request.background = "transparent";
     if (s.mode === "text") {
       return `curl -sS --fail-with-body http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
   -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify({ ...request, enable_cache_dit: false }, null, 2)}'`;
+  -d '${JSON.stringify(request, null, 2)}'`;
     }
     const fields = Object.entries(request).map(([key, value]) => `  --form-string '${key}=${value}'`);
     fields.push('  -F "image[]=@{{INPUT_IMAGE}};type=image/png"');
