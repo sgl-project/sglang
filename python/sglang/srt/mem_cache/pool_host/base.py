@@ -3,12 +3,14 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -26,6 +28,21 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+_host_memory_budget: ContextVar[Optional[int]] = ContextVar(
+    "hicache_host_memory_budget", default=None
+)
+
+
+@contextmanager
+def host_memory_budget_scope(budget_bytes: int):
+    """Book every pool built inside against one snapshot, not re-sampled psutil."""
+    token = _host_memory_budget.set(budget_bytes)
+    try:
+        yield
+    finally:
+        _host_memory_budget.reset(token)
 
 
 def ranks_per_host() -> int:
@@ -48,14 +65,23 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
-def host_memory_budget_bytes() -> int:
+def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
-    psutil reports the whole machine, so co-located ranks each see the same free
-    memory; without the split every rank sizes its pool against all of it and
-    the host is oversubscribed by the number of ranks it holds.
+    Bound machine availability by the visible cgroup limits before splitting
+    among local ranks. Independent engines with separate container budgets
+    therefore size against their own remaining allowance.
+
+    Inside host_memory_budget_scope, requested_bytes is booked against the
+    snapshot when it fits; the allowance before booking is returned.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    available = _host_memory_budget.get()
+    if available is not None:
+        if requested_bytes <= available:
+            _host_memory_budget.set(available - requested_bytes)
+        return available
+
+    free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
     return free // ranks_per_host()
 
 
@@ -172,7 +198,7 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
