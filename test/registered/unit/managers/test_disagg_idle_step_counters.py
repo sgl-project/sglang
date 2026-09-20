@@ -34,6 +34,11 @@ class _BeforeModelForward(Exception):
     pass
 
 
+def total_us(intervals):
+    """Sum the way the scheduler does: one truncation per recorded step."""
+    return sum(int(interval * 1e6) for interval in intervals)
+
+
 def load_mlx_scheduler_module():
     # Run the real Python loop on CPU without importing a Metal runtime. Use a
     # private module name so this cannot replace the installed MLX scheduler.
@@ -244,17 +249,63 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                     2 if chained else 0,
                 )
 
+    def test_split_prefill_is_charged_once_from_its_first_chunk(self):
+        # A split prefill spans several run_batch calls but yields one result,
+        # so only its first chunk may set the burst's start and its idle flag.
+        scheduler = self.make_scheduler([])
+        scheduler._sched_idled = True
+        batch = self.make_batch(ForwardMode.SPLIT_PREFILL)
+        for split_index, launch_ts in enumerate((0.0, 0.2, 0.4)):
+            batch.split_index = split_index
+            self.launch_batch(scheduler, batch, launch_ts)
+
+        self.assertEqual(scheduler.forward_ct, 3)
+        self.assertEqual(batch.forward_iter, 3)
+        # The later chunks leave the first chunk's start and flag alone.
+        self.assertEqual(batch.split_prefill_start, (1, 0.0))
+        self.assertTrue(batch.after_idle_gap)
+
+        self.record_result(scheduler, batch, 0.5)
+        # One charge for the whole burst: first chunk's launch to the result.
+        self.assertEqual(scheduler.total_prefill_busy_us, total_us([0.5 - 0.0]))
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
+
+    def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
+        # An overlapped launch can precede the previous prefill's result. A mode
+        # switch in between breaks contiguity, and the span already charged to
+        # the earlier prefill must not be charged a second time.
+        scheduler = self.make_scheduler([])
+        prefill = self.make_batch(ForwardMode.EXTEND)
+        decode = self.make_batch(ForwardMode.DECODE, extend_num_tokens=None)
+        next_prefill = self.make_batch(ForwardMode.EXTEND)
+        # Both later batches launch while the first prefill is still in flight.
+        self.launch_batch(scheduler, prefill, 0.0)
+        self.launch_batch(scheduler, decode, 0.5)
+        self.launch_batch(scheduler, next_prefill, 0.6)
+
+        self.record_result(scheduler, prefill, 1.0)
+        self.record_result(scheduler, decode, 1.1)
+        self.record_result(scheduler, next_prefill, 1.5)
+
+        # 0.6 -> 1.0 already belongs to the first prefill, so the second one is
+        # charged from that result rather than from its own launch.
+        self.assertEqual(scheduler.total_prefill_busy_us, total_us([1.0, 0.5]))
+        self.assertEqual(scheduler.total_prefill_uncached_tokens, 2 * 1024)
+        # The decode broke contiguity, so it contributes no timing sample.
+        self.assertEqual(scheduler.decode_moment_totals[0], 0)
+
+    def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
+        return ScheduleBatch(
+            reqs=[SimpleNamespace(rid="request", finished=Mock(return_value=False))],
+            forward_mode=mode,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            launch_ts=launch_ts,
+            extend_num_tokens=extend_num_tokens,
+        )
+
     def make_batches(self, mode):
         return [
-            ScheduleBatch(
-                reqs=[
-                    SimpleNamespace(rid="request", finished=Mock(return_value=False))
-                ],
-                forward_mode=mode,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                launch_ts=launch_ts,
-                extend_num_tokens=1024,
-            )
+            self.make_batch(mode, launch_ts=launch_ts)
             for launch_ts in LAUNCH_TIMESTAMPS
         ]
 
@@ -265,23 +316,15 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def run_batch(batch, pp_proxy_tensors=None):
             # Exercise the real timestamp, iteration, and flag handoff. Only
             # model execution is stopped, at the scripted pre-forward hook.
-            with patch(
-                "sglang.srt.managers.scheduler.time.monotonic",
-                return_value=batch.launch_ts,
-            ):
-                with self.assertRaises(_BeforeModelForward):
-                    Scheduler.run_batch(scheduler, batch, pp_proxy_tensors)
+            self.launch_batch(scheduler, batch, batch.launch_ts, pp_proxy_tensors)
             return GenerationBatchResult()
 
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            # Prefill accounting reads the clock again when the result lands.
-            with patch(
-                "sglang.srt.managers.scheduler.time.monotonic",
-                return_value=RESULT_TIMESTAMPS[batch.forward_iter - 1],
-            ):
-                scheduler._record_step_counters(batch, result)
+            self.record_result(
+                scheduler, batch, RESULT_TIMESTAMPS[batch.forward_iter - 1], result
+            )
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
@@ -295,9 +338,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
         if mode == ForwardMode.EXTEND:
-            # Every prefill is charged from its own launch, chained forward from
-            # the previous prefill's result. An idle gap breaks the chain, so the
-            # idle span is charged to nobody.
+            # A contiguous prefill is charged from the previous prefill's result.
+            # The first prefill, or one after an idle gap, is charged from its own
+            # launch, so the idle span is charged to nobody.
             expected_intervals = [
                 RESULT_TIMESTAMPS[0] - LAUNCH_TIMESTAMPS[0],
                 RESULT_TIMESTAMPS[1] - RESULT_TIMESTAMPS[0],
@@ -306,8 +349,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 RESULT_TIMESTAMPS[3] - RESULT_TIMESTAMPS[2],
             ]
             self.assertEqual(
-                scheduler.total_prefill_busy_us,
-                sum(int(interval * 1e6) for interval in expected_intervals),
+                scheduler.total_prefill_busy_us, total_us(expected_intervals)
             )
             # Every prefill contributes its tokens; only the span is gap-aware.
             self.assertEqual(
@@ -324,8 +366,24 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 expected_intervals.append(LAUNCH_TIMESTAMPS[2] - LAUNCH_TIMESTAMPS[1])
             self.assertEqual(scheduler.decode_moment_totals[0], len(expected_intervals))
             self.assertEqual(
-                scheduler.decode_moment_totals[2],
-                round(sum(expected_intervals) * 1_000_000),
+                scheduler.decode_moment_totals[2], total_us(expected_intervals)
+            )
+
+    def launch_batch(self, scheduler, batch, launch_ts, pp_proxy_tensors=None):
+        """Run the real run_batch bookkeeping, stopping at the pre-forward hook."""
+        with patch(
+            "sglang.srt.managers.scheduler.time.monotonic", return_value=launch_ts
+        ):
+            with self.assertRaises(_BeforeModelForward):
+                Scheduler.run_batch(scheduler, batch, pp_proxy_tensors)
+
+    def record_result(self, scheduler, batch, result_ts, result=None):
+        """Prefill accounting reads the clock again when the result lands."""
+        with patch(
+            "sglang.srt.managers.scheduler.time.monotonic", return_value=result_ts
+        ):
+            scheduler._record_step_counters(
+                batch, GenerationBatchResult() if result is None else result
             )
 
     def make_scheduler(self, schedule):
