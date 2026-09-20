@@ -633,6 +633,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
+    chunked_prefill_ct: int = 0
     last_decode_finish_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
@@ -808,7 +809,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         stage = RequestStage.PREFILL_CHUNKED_FORWARD
         self.observe_per_stage_req_latency(stage, ts - last_time)
-        self.trace_slice(stage, last_time, ts)
+        # Chunked prefill emits one slice per chunk, all with the same name, so a
+        # trace cannot tell the first chunk from the seventh without an ordinal.
+        # Counted like decode_ct: zero-based and monotonic for the request.
+        attrs = {"chunked_prefill_ct": self.chunked_prefill_ct}
+        self.trace_slice(stage, last_time, ts, attrs)
+        self.chunked_prefill_ct += 1
 
     def set_prefill_finished_time(self, ts=None):
         ts = ts or time.perf_counter()
