@@ -112,6 +112,7 @@ These fusion families mount under both `quality="extra-high"` and
 | `apply_group_norm_silu` | Triton | close | `GroupNorm + SiLU`, NCHW-contiguous |
 | `group_norm_silu_4d`, `group_norm_silu_rows` | Triton | close | channels-last GroupNorm(+SiLU); what lets a VAE decoder run channels_last end to end with no `nchwToNhwc` transposes |
 | `wan_rmsnorm_silu` | Triton | close | Wan VAE `channels_last_3d` RMSNorm + SiLU |
+| `wan_norm_silu_post` | JIT CUDA | bit-exact, first-sight verified | Wan VAE FP32 divide, scale, affine, and SiLU after the unchanged native L2 reduction; dense NCDHW and `channels_last_3d` |
 
 ### adaLN modulation and gating
 
@@ -206,7 +207,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
-| Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
+| Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=extra-high` or `quality=high` |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
 | FLUX.2 VAE / HunyuanVAE / latent upsampler | GroupNorm + SiLU (channels-last two-pass for FLUX.2) |
 
