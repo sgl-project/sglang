@@ -278,13 +278,22 @@ class ConditioningCache:
             self.bytes -= removed_size
             self.evictions += 1
         tensors = {}
+        copy_streams = {}
 
         def snapshot(t):
             if id(t) not in tensors:
-                tensors[id(t)] = _HostTensor(t.detach().to("cpu", copy=True), t.device)
+                if t.device.type == "cuda":
+                    copy_streams[t.device] = torch.cuda.current_stream(t.device)
+                tensors[id(t)] = _HostTensor(
+                    t.detach().to("cpu", copy=True, non_blocking=t.is_cuda), t.device
+                )
             return tensors[id(t)]
 
         stored = _map_output(output, snapshot)
+        # Finish all copies before publishing the entry, without synchronizing
+        # after each hidden-state tensor in an encoder output.
+        for stream in copy_streams.values():
+            stream.synchronize()
         self._entries[key] = (stored, size)
         self.bytes += size
         logger.debug(

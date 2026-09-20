@@ -197,6 +197,30 @@ def test_weight_invalidation_and_precision():
     assert cache.hits == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
+@torch.no_grad()
+def test_cuda_snapshot_finishes_before_outputs_are_mutated():
+    cache = ConditioningCache(32 * 1024 * 1024)
+    model = Encoder().eval()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        value = torch.arange(1024 * 1024, device="cuda").reshape(1024, 1024)
+        output = BaseEncoderOutput(
+            last_hidden_state=value,
+            hidden_states=(value, value.T, value[::2, ::2]),
+        )
+        cache.run(model, "forward", (), {}, lambda: output)
+        value.zero_()
+    stream.synchronize()
+    restored = cache.run(model, "forward", (), {}, lambda: pytest.fail("cache miss"))
+    expected = torch.arange(1024 * 1024).reshape(1024, 1024)
+    assert restored.last_hidden_state is restored.hidden_states[0]
+    for actual, reference in zip(
+        restored.hidden_states, (expected, expected.T, expected[::2, ::2]), strict=True
+    ):
+        torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
 @torch.no_grad()
 def test_cuda_graph_capture_bypasses_host_cache():
