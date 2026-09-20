@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -1404,10 +1405,27 @@ class UMBPStore(HiCacheStorage):
 
         components = getattr(host_pool, "components", None)
         if pool_name == PoolName.MAMBA:
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
+            # Deferred: mamba.py pulls in triton via memory_pool.py, which a
+            # CPU-only unit test importing this module should not need.
+            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+            if isinstance(host_pool, MambaPoolHost):
+                conv_num = len(host_pool.conv_buffer)
+                suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
+                if host_pool.temporal_state_elem_size > 0:
+                    suffixes = [f"_{mha_suffix}_temporal"] + suffixes
+            elif isinstance(host_pool, DevicePoolEntry):
+                # The direct linker's mamba DevicePoolEntry packs every conv
+                # buffer plus the temporal state into one stored object per
+                # page (packed=True, see linker_pool_assembler.py's
+                # _build_mamba_device_pool_group), so this side always has
+                # exactly one object regardless of component count.
+                suffixes = [f"_{mha_suffix}_temporal"]
+            else:
+                raise ValueError(
+                    f"Unsupported UMBP mamba host_pool type for pool "
+                    f"{pool_name}: {type(host_pool).__name__}"
+                )
         elif components is not None and len(components) == 1:
             suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
