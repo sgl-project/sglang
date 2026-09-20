@@ -191,25 +191,30 @@ def align_tensor_to_module_dtype(
 def _restore_module_value_state(cache):
     with torch.no_grad():
         for param, value in cache["parameters"].values():
-            param.data = value.to(device=param.device)
+            param.data = value
         for buffer, value in cache["buffers"].values():
-            buffer.data = value.to(device=buffer.device)
+            buffer.data = value
 
 
 def _module_fp32_cache(module):
     cache = {"parameters": {}, "buffers": {}}
 
-    with torch.no_grad():
-        for name, param in module.named_parameters(recurse=True):
-            if param.is_floating_point() and param.dtype != torch.float32:
-                value = param.detach().clone()
-                cache["parameters"][name] = (param, value)
-                param.data = value.to(dtype=torch.float32)
-        for name, buffer in module.named_buffers(recurse=True):
-            if buffer.is_floating_point() and buffer.dtype != torch.float32:
-                value = buffer.detach().clone()
-                cache["buffers"][name] = (buffer, value)
-                buffer.data = value.to(dtype=torch.float32)
+    try:
+        with torch.no_grad():
+            for name, param in module.named_parameters(recurse=True):
+                if param.is_floating_point() and param.dtype != torch.float32:
+                    value = param.data
+                    cache["parameters"][name] = (param, value)
+                    param.data = value.to(dtype=torch.float32)
+            for name, buffer in module.named_buffers(recurse=True):
+                if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                    value = buffer.data
+                    cache["buffers"][name] = (buffer, value)
+                    buffer.data = value.to(dtype=torch.float32)
+    except BaseException:
+        _restore_module_value_state(cache)
+        cache.clear()
+        raise
 
     return cache
 
@@ -251,12 +256,14 @@ def temporary_modules_fp32_dtype(
     the exact original dtype/value state after the context exits.
     """
     enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
-    caches = []
-
-    for module, is_enabled in zip(modules, enabled_list):
-        caches.append(_module_fp32_cache(module) if is_enabled else None)
+    if len(enabled_list) != len(modules):
+        raise ValueError("enabled must have one entry per module")
+    caches = [None] * len(modules)
 
     try:
+        for index, (module, is_enabled) in enumerate(zip(modules, enabled_list)):
+            if is_enabled:
+                caches[index] = _module_fp32_cache(module)
         yield modules
     finally:
         for cache, is_enabled in zip(caches, enabled_list):

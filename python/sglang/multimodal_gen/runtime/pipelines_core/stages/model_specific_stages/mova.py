@@ -1027,6 +1027,11 @@ class MOVADecodingStage(PipelineStage):
             assert audio_vae is not None
             self.audio_vae = audio_vae
             # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+            audio_latents = (
+                batch.audio_latents.float()
+                if current_platform.device_type == "cpu"
+                else batch.audio_latents
+            )
             autocast_ctx = (
                 torch.autocast(
                     device_type=current_platform.device_type, dtype=torch.float32
@@ -1035,7 +1040,7 @@ class MOVADecodingStage(PipelineStage):
                 else temporary_module_fp32_dtype(self.audio_vae)
             )
             with autocast_ctx:
-                audio = self.audio_vae.decode(batch.audio_latents)
+                audio = self.audio_vae.decode(audio_latents)
         output_batch = OutputBatch(
             output=video,
             audio=audio,
