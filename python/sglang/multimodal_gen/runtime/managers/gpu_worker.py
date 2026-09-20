@@ -67,6 +67,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    DiffusionMetrics,
+    init_metrics,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -74,7 +78,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+    initialize_current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
@@ -214,6 +221,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     A worker that executes the model on a single GPU.
     """
 
+    metrics: DiffusionMetrics | None = None
+
     def __init__(
         self,
         local_rank: int,
@@ -230,6 +239,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
+        self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
@@ -260,6 +270,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+        self._update_lora_metrics()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -1458,14 +1469,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(
-            lora_nickname,
-            lora_path,
-            target,
-            strength,
-            merge_mode=merge_mode,
-            lora_alpha=lora_alpha,
-        )
+        try:
+            self.pipeline.set_lora(
+                lora_nickname,
+                lora_path,
+                target,
+                strength,
+                merge_mode=merge_mode,
+                lora_alpha=lora_alpha,
+            )
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1480,7 +1494,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.merge_lora_weights(target, strength)
+        try:
+            self.pipeline.merge_lora_weights(target, strength)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1492,8 +1509,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.unmerge_lora_weights(target)
+        try:
+            self.pipeline.unmerge_lora_weights(target)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
+
+    def _update_lora_metrics(self) -> None:
+        if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
+            self.metrics.update_lora(self.pipeline.get_lora_status())
 
     def list_loras(self) -> OutputBatch:
         """
@@ -1552,9 +1576,14 @@ def run_scheduler_process(
     pipe_writer: mp.connection.Connection,
 ) -> None:
     """Run a rank's scheduler and report readiness to the launching process."""
+    # Idempotent safeguard for direct callers; process bootstraps already
+    # initialized the platform before this module was imported.
+    initialize_current_platform()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():
