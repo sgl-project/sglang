@@ -35,9 +35,12 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
+    get_schedule,
     get_serving,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -181,6 +184,7 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         self._dcp_pack_buffers = None
+        self._dcp_pack_max_tokens: Optional[int] = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -385,12 +389,16 @@ class CommonKVManager(BaseKVManager):
             return
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
+        max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),
             dcp_size,
+            max_tokens,
         )
+        self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -1540,6 +1548,19 @@ class CommonKVSender(BaseKVSender):
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        if self.kv_mgr._dcp_pack_max_tokens is None:
+            return None
+        for peer, info in self.kv_mgr.transfer_infos.get(
+            self.bootstrap_room, {}
+        ).items():
+            if (
+                not info.is_dummy
+                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
+            ):
+                return self.kv_mgr._dcp_pack_max_tokens
+        return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk

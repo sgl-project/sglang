@@ -39,7 +39,7 @@ const config = {
       id: "placement",
       title: "Placement",
       scope: "serve",
-      description: "Hardware selection applies its recommended placement. Stream DiT layers when the full pipeline exceeds device memory.",
+      description: "Hardware selection applies its recommended placement. Offload selected components when the full pipeline exceeds device memory.",
       learnMore: "#5-runtime-features",
       default: "resident",
       options: [
@@ -48,16 +48,19 @@ const config = {
           recommendedWhen: (s) => ["h200", "b200", "rtxpro6000"].includes(s.hw),
           disabled: (s) => ["rtx5090", "rtx4090"].includes(s.hw) && Number(s.gpus_per_node) === 1,
           disableReason: "The full resident pipeline exceeds one consumer GPU's memory. Select CPU offload.",
-          flags: (s) => [Number(s.gpus_per_node) === 1 ? "--performance-mode speed" : "--performance-mode manual"],
+          flags: ["--performance-mode speed"],
           description: "Keep all components on the GPU. Recommended for H200, B200, and RTX PRO 6000 96GB. RTX 5090 and RTX 4090 need offload.",
         },
         {
           id: "offload", label: "CPU offload",
-          flags: (s) => ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
+          flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
+            && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
+            ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
-          description: "Streams DiT layers. RTX 4090 also offloads the encoder between requests to leave room for image editing. Requires sufficient host RAM.",
+          description: "RTX 4090 native single-output FlashAttention keeps the DiT and VAE resident and streams encoder layers. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder. Requires sufficient host RAM.",
         },
         {
           id: "all_offload", label: "All components layerwise",
@@ -207,9 +210,32 @@ const config = {
         { id: "eager", label: "Eager", recommended: true },
         {
           id: "bcg", label: "Breakable CUDA Graph",
-          flags: ["--enable-breakable-cuda-graph true", "--warmup-resolutions 512x512", "--bcg-text-buckets 64"],
-          soft: true, softReason: "Only a matching 512px CLI warmup was verified. Other prompts or image prefixes can fall back to eager.",
-          description: "Captures a 512px warmup. Text buckets do not pad condition KV; this is not a guaranteed replay recipe.",
+          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
+          soft: true, softReason: "A 1024px H200 server captured its warmup graph, but tested requests fell back to eager because condition-prefix shapes differed.",
+          description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
+        },
+      ],
+    },
+    {
+      id: "batching",
+      title: "Request batching",
+      scope: "serve",
+      description: "Merge compatible text-to-image requests. Image edits run separately; Outputs controls multiple images within one request. Batching preserves native precision but can change floating-point rounding and output pixels.",
+      learnMore: "#batching",
+      default: "off",
+      options: [
+        { id: "off", label: "Off", recommended: true, flags: ["--batching-max-size 1"], description: "Recommended for interactive latency. Resident H200, B200, and RTX PRO 6000 batching did not materially improve throughput in the measured workload." },
+        {
+          id: "2", label: "Up to 2 images",
+          flags: ["--batching-max-size 2", "--batching-delay-ms 20"],
+          description: "Wait up to 20 ms to merge compatible queued requests. Benchmark throughput and response latency on your workload.",
+        },
+        {
+          id: "4", label: "Up to 4 images",
+          flags: ["--batching-max-size 4", "--batching-delay-ms 20"],
+          soft: (s) => ["rtx4090", "rtx5090"].includes(s.hw),
+          softReason: "Four-image batches have not been verified on this GPU and can exceed its memory.",
+          description: "Larger batches increase activation memory and individual request latency.",
         },
       ],
     },
@@ -257,12 +283,14 @@ const config = {
     resource: {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [
-        { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
-        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
-        { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
+        { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
+        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
+        { id: "b200-2-tp", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
+        { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
+        { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1, 2, 4], default: true },
         { id: "rtxpro6000-1-offload", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"] },
         { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
-        { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
+        { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
       ],
       autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
       validateTopology: (s, topology) => {
@@ -293,10 +321,14 @@ const config = {
         && entry.ulysses_degree === topology.ulysses_degree && entry.ring_degree === topology.ring_degree);
       const serveVerified = !!recipe && errors.length === 0 && s.encoder === "auto"
         && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
-        && s.execution === "eager" && s.vae === "full";
+        && s.execution === "eager" && s.vae === "full"
+        && (!s.batching || s.batching === "off" || ((recipe.batchSizes || [1]).includes(Number(s.batching))
+          && (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s))));
       // Exact HTTP workloads from the validation matrix, not blanket quality coverage.
       const requestVerified = serveVerified
-        && ((["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
+        && ((recipe.batchSizes && (Number(s.outputs) === 1 || (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s)))
+            && ["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && recipe.batchSizes.includes(Number(s.outputs)))
+          || (["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
             && (["h200", "rtxpro6000"].includes(s.hw) || s.mode === "text" || s.background === "scene"))
           || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
           || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
@@ -307,6 +339,8 @@ const config = {
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
       const warnings = [];
+      if (s.hw === "rtx4090" && (Number(s.outputs) > 1 || (s.batching && s.batching !== "off"))) warnings.push("This recipe streams DiT layers for batch memory headroom. Restart with the updated Server command when changing output count or request batching.");
+      if (s.batching && s.batching !== "off" && s.mode !== "text") warnings.push("Cross-request batching applies to text-to-image requests. Image edits run separately; use Outputs for multiple images in one edit request.");
       if (!serveVerified && !errors.length) warnings.push("This server combination has not completed an exact HTTP verification run.");
       if (!requestVerified && !errors.length) warnings.push("This request shape is outside the verified HTTP matrix.");
       return {

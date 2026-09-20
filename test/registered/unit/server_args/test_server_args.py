@@ -2501,6 +2501,28 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
 
+    def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+
+    def test_dspark_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DSPARK", disaggregation_mode=mode
+                        )
+                    )
+
+    def test_dspark_rejects_eagle_pp_relay(self):
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="DSPARK")
+                )
+
     def test_eagle_is_allowed_on_prefill(self):
         check_pipeline_parallel_compat(
             self._cfg(speculative_algorithm="EAGLE"),
