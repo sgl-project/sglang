@@ -16,8 +16,8 @@ Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prer
 then install this integration from its source checkout with
 `uv pip install -e "python[diffusion]"`. The picker uses `Qwen/Qwen-Image-2.1`;
 you can also set a local checkpoint directory under **Variables**. The recipes
-target NVIDIA CUDA on Linux; the picker selects a tested single-GPU recipe for
-the full checkpoint.
+target NVIDIA CUDA on Linux; the picker marks which single-GPU workloads have
+been verified with the full checkpoint.
 
 <Deployment config={config} />
 

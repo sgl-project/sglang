@@ -289,7 +289,7 @@ const config = {
         { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1, 2, 4], default: true },
         { id: "rtxpro6000-1-offload", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"] },
-        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
+        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true, unverified: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
@@ -321,7 +321,7 @@ const config = {
         && entry.nodes === Number(s.nodes) && entry.gpus_per_node === Number(s.gpus_per_node)
         && entry.placement === s.placement && entry.tp_size === topology.tp_size
         && entry.ulysses_degree === topology.ulysses_degree && entry.ring_degree === topology.ring_degree);
-      const serveVerified = !!recipe && errors.length === 0 && s.encoder === "auto"
+      const serveVerified = !!recipe && !recipe.unverified && errors.length === 0 && s.encoder === "auto"
         && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
         && s.execution === "eager" && s.vae === "full"
         && (!s.batching || s.batching === "off" || ((recipe.batchSizes || [1]).includes(Number(s.batching))
@@ -344,7 +344,9 @@ const config = {
       const warnings = [];
       if (s.hw === "rtx4090" && (Number(s.outputs) > 1 || (s.batching && s.batching !== "off"))) warnings.push("This recipe streams DiT layers for batch memory headroom. Restart with the updated Server command when changing output count or request batching.");
       if (s.batching && s.batching !== "off" && s.mode !== "text") warnings.push("Cross-request batching applies to text-to-image requests. Image edits run separately; use Outputs for multiple images in one edit request.");
-      if (!serveVerified && !errors.length) warnings.push("This server combination has not completed an exact HTTP verification run.");
+      if (!serveVerified && !errors.length) warnings.push(s.hw === "rtx5090"
+        ? "This RTX 5090 recipe has not been retested with the updated checkpoint."
+        : "This server combination has not completed an exact HTTP verification run.");
       if (!requestVerified && !errors.length) warnings.push("This request shape is outside the verified HTTP matrix.");
       return {
         match: { hw: s.hw }, nnodes: Number(s.nodes), verified: serveVerified, flags,
