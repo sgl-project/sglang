@@ -15,9 +15,12 @@ import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
+    get_tp_group,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -614,16 +617,6 @@ class TextEncodingStage(ConditionEncodingStage):
             dp_group = self._text_encode_dp_group(
                 server_args, encoder_config, input_ids.shape[0], text_encoder
             )
-            if dp_group is not None:
-                outputs = _data_parallel_text_encode(
-                    lambda kw: self._forward_text_encoder(text_encoder, kw),
-                    encoder_forward_kwargs,
-                    dp_group,
-                )
-            else:
-                outputs = self._forward_text_encoder(
-                    text_encoder, encoder_forward_kwargs
-                )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
@@ -632,9 +625,47 @@ class TextEncodingStage(ConditionEncodingStage):
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
             if "return_attention_mask" in postprocess_sig.parameters:
                 postprocess_kwargs["return_attention_mask"] = return_attention_mask
-            postprocess_result = postprocess_func(
-                outputs, text_inputs, **postprocess_kwargs
-            )
+
+            def encode_conditioning():
+                if dp_group is not None:
+                    outputs = _data_parallel_text_encode(
+                        lambda kw: self._forward_text_encoder(text_encoder, kw),
+                        encoder_forward_kwargs,
+                        dp_group,
+                    )
+                else:
+                    outputs = self._forward_text_encoder(
+                        text_encoder, encoder_forward_kwargs
+                    )
+                return (
+                    postprocess_func(outputs, text_inputs, **postprocess_kwargs),
+                    server_args.pipeline_config.get_text_encoder_pooler_output(
+                        outputs, i
+                    ),
+                )
+
+            if dp_group is None and isinstance(text_encoder, TextEncoder):
+                cache_group = text_encoder._encoder_tp_group
+                if cache_group is None and model_parallel_is_initialized():
+                    cache_group = get_tp_group()
+                # Cache the consumed conditioning, not every intermediate layer.
+                # The stage namespace separates pipeline postprocessing contracts.
+                postprocess_result, pooled_output = cached_encoder_call(
+                    text_encoder,
+                    (encoder_forward_kwargs, dict(text_inputs)),
+                    {
+                        "encoder_index": i,
+                        "return_attention_mask": return_attention_mask,
+                    },
+                    encode_conditioning,
+                    cache_group,
+                    namespace=self,
+                    nested=False,
+                )
+            else:
+                # Batch-DP keeps caching inside each encoder copy so every rank
+                # still enters the output gather, including on a cache hit.
+                postprocess_result, pooled_output = encode_conditioning()
             prompt_embeds_mask = None
             prompt_seq_lens = None
             if isinstance(postprocess_result, TextConditioningOutput):
@@ -662,9 +693,6 @@ class TextEncodingStage(ConditionEncodingStage):
 
             embeds_list.append(prompt_embeds)
 
-            pooled_output = server_args.pipeline_config.get_text_encoder_pooler_output(
-                outputs, i
-            )
             if pooled_output is not None:
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 

@@ -176,6 +176,12 @@ class ConditioningCache:
             bytes=self.bytes,
         )
 
+    def _identity(self, owner):
+        if owner not in self._models:
+            self._models[owner] = self._next_model
+            self._next_model += 1
+        return self._models[owner]
+
     @contextmanager
     def scope(self, enabled=True, *, refresh=False):
         # Zero-capacity ranks still participate in encoder hit consensus.
@@ -197,10 +203,8 @@ class ConditioningCache:
         group=None,
         *,
         nested=False,
+        namespace=None,
     ):
-        if model not in self._models:
-            self._models[model] = self._next_model
-            self._next_model += 1
         try:
             if not self.max_bytes:
                 raise Uncacheable("cache disabled")
@@ -209,7 +213,8 @@ class ConditioningCache:
             parameter = next(model.parameters(), None)
             precision = str(parameter.dtype) if parameter is not None else None
             key = (
-                self._models[model],
+                self._identity(model),
+                self._identity(namespace) if namespace is not None else None,
                 method,
                 precision,
                 torch.is_autocast_enabled("cuda"),
@@ -317,7 +322,9 @@ def _inference_cache(model):
     return cache
 
 
-def cached_encoder_call(model, args, kwargs, compute, group=None):
+def cached_encoder_call(
+    model, args, kwargs, compute, group=None, *, namespace=None, nested=True
+):
     cache = _inference_cache(model)
     if (
         cache is None
@@ -325,7 +332,16 @@ def cached_encoder_call(model, args, kwargs, compute, group=None):
         or kwargs.get("past_key_values") is not None
     ):
         return compute()
-    return cache.run(model, "forward", args, kwargs, compute, group, nested=True)
+    return cache.run(
+        model,
+        "forward",
+        args,
+        kwargs,
+        compute,
+        group,
+        nested=nested,
+        namespace=namespace,
+    )
 
 
 def cached_conditioning(fn):
