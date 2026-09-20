@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
 from sglang.srt.utils.common import get_eager_max_batch_size
@@ -305,8 +306,12 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             )
             mega_context = megamoe_autotune_context(
                 cache_path=autotune_cache,
-                decode_num_tokens=mr.max_decode_logits_rows(
-                    min_batch_size=get_eager_max_batch_size(mr.max_running_requests)
+                decode_num_tokens=max(
+                    mr.max_decode_logits_rows(),
+                    get_eager_max_batch_size(mr.max_running_requests)
+                    * mr.decode_num_tokens_per_req(
+                        num_draft_tokens=max_speculative_num_draft_tokens()
+                    ),
                 ),
                 prefill_num_tokens=prefill_num_tokens,
                 reuse_cache=envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get(),
