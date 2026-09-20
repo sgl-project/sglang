@@ -65,7 +65,6 @@ class LLaDAImageTextEncoderRunner:
         tokenizer,
         server_args: ServerArgs,
     ) -> None:
-        import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_parallel_state
         import sglang.srt.distributed.parallel_state as srt_parallel_state
         from sglang.srt.distributed.parallel_state_wrapper import ParallelState
         from sglang.srt.managers.tp_worker import TpModelWorker
@@ -111,12 +110,13 @@ class LLaDAImageTextEncoderRunner:
         )
         with use_context(self.runtime_context):
             # The diffusion runtime mirrors its TP group into the srt globals.
-            # Clear it so the worker can install the encoder's real srt groups,
+            # Detach the groups without clearing the encoder context's ranks,
             # then restore the mirror and keep the encoder group for forwards.
             saved_srt_tp = srt_parallel_state._TP
             saved_srt_attn_tp = srt_parallel_state._ATTN_TP
             try:
-                mm_parallel_state._clear_srt_tp_group()
+                srt_parallel_state._TP = None
+                srt_parallel_state._ATTN_TP = None
                 self.worker = TpModelWorker(
                     server_args=srt_args,
                     gpu_id=gpu_id,

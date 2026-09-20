@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 
 partial_json_parser = types.ModuleType("partial_json_parser")
@@ -192,12 +193,16 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         method.process_weights_after_loading(layer)
 
-        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
+        scale_factor = 2 if is_fp8_fnuz() else 1
+        expected_weight = weight
+        if is_fp8_fnuz():
+            expected_weight = (weight.float() / 2).to(torch.float8_e4m3fnuz)
+        torch.testing.assert_close(layer.weight, expected_weight.t(), rtol=0, atol=0)
         torch.testing.assert_close(
             layer.weight_scale,
-            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
+            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]) * scale_factor,
         )
-        torch.testing.assert_close(layer.input_scale, torch.tensor(1.0))
+        torch.testing.assert_close(layer.input_scale, torch.tensor(float(scale_factor)))
 
     def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
         method = ModelOptFp8LinearMethod(
