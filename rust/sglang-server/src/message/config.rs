@@ -119,6 +119,9 @@ pub struct ServerArgs {
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
     /// frames.
     pub skip_tokenizer_init: bool,
+    /// Start accepting health checks immediately instead of waiting for the
+    /// main process's startup warmup request to finish.
+    pub skip_server_warmup: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -171,6 +174,7 @@ impl ServerArgs {
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
+        skip_server_warmup,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -202,6 +206,7 @@ impl ServerArgs {
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
+        skip_server_warmup: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -231,6 +236,7 @@ impl ServerArgs {
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
+            skip_server_warmup,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -268,6 +274,7 @@ impl Default for ServerArgs {
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
+            skip_server_warmup: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
@@ -310,7 +317,9 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     from_py_object,
     module = "sglang.srt.rust_extensions._server"
 )]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Lowercase to match the values Python reports for the same field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
     Null,
@@ -322,6 +331,8 @@ pub enum DisaggregationMode {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
+    /// Authoritative HF model type, used to select a native chat formatter.
+    pub model_type: Option<String>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -344,18 +355,20 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
+        model_type: Option<String>,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
             is_multimodal,
             default_sampling_params,
+            model_type,
         }
     }
 }
@@ -365,6 +378,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             context_len: 2048,
+            model_type: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),
@@ -605,6 +619,14 @@ mod tests {
         };
         assert_eq!(sa.bind(), "[::]:30001");
         assert_eq!(ServerArgs::default().bind(), "127.0.0.1:30000");
+    }
+
+    #[test]
+    fn disaggregation_mode_wire_values_match_python() {
+        let json = |m| serde_json::to_string(&m).unwrap();
+        assert_eq!(json(DisaggregationMode::Null), "\"null\"");
+        assert_eq!(json(DisaggregationMode::Prefill), "\"prefill\"");
+        assert_eq!(json(DisaggregationMode::Decode), "\"decode\"");
     }
 
     #[test]

@@ -58,6 +58,7 @@ def _build_swa_tree(
     kv_size_swa: int = 32,
     sliding_window_size: int = 4,
     enable_kv_cache_events: bool = False,
+    swa_req_ring_size: int | None = None,
 ):
     head_num = 8
     head_dim = 128
@@ -88,6 +89,7 @@ def _build_swa_tree(
         full_attention_layer_ids=full_attention_layer_ids,
         device=device,
     )
+    kv_pool.swa_req_ring_size = swa_req_ring_size
     allocator = SWATokenToKVPoolAllocator(
         size=kv_size,
         size_swa=kv_size_swa,
@@ -96,6 +98,7 @@ def _build_swa_tree(
         device=device,
         kvcache=kv_pool,
         need_sort=False,
+        req_to_token_pool=req_to_token_pool,
     )
     tree = SWARadixCache(
         params=CacheInitParams(
@@ -794,7 +797,7 @@ class TestSWA(unittest.TestCase):
         req.extra_key = None
         req.cache_salt = None
         req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
+        req.lock_receipt = DecLockRefParams()
         req.kv.swa_evicted_seqlen = 0
         req.kv.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
@@ -810,9 +813,7 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
-        )
+        tree.cache_finished_req(req, is_insert=True, owned_kv_len=req._kv_committed_len)
 
         self.assertEqual(captured["prev_prefix_len"], req.kv.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -832,7 +833,7 @@ class TestSWA(unittest.TestCase):
         req2.extra_key = None
         req2.cache_salt = None
         req2.last_node = tree.root_node
-        req2.swa_uuid_for_lock = None
+        req2.lock_receipt = DecLockRefParams()
         req2.kv.swa_evicted_seqlen = 0
         req2.kv.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
@@ -846,7 +847,7 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_segment = wrapped_free_segment
         tree.cache_finished_req(
-            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+            req2, is_insert=False, owned_kv_len=req2._kv_committed_len
         )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
@@ -1234,6 +1235,125 @@ class TestSWAPeerMappedContract(CustomTestCase):
             self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "paged allocation kernels need CUDA")
+class TestSWAReqRingFree(CustomTestCase):
+    PS = 256
+
+    def _allocated_ring(self):
+        ps = self.PS
+        _, allocator, req_pool = _build_swa_tree(
+            is_eagle=False,
+            page_size=ps,
+            req_size=2,
+            max_context_len=4 * ps,
+            kv_size=4 * ps,
+            kv_size_swa=2 * ps,
+            swa_req_ring_size=ps,
+        )
+        self.assertTrue(allocator.swa_req_ring)
+        self.assertIsNotNone(req_pool.alloc_rows(1))
+        device = allocator.device
+        prefix_cpu = torch.tensor([0], dtype=torch.int64)
+        seq_cpu = torch.tensor([2 * ps], dtype=torch.int64)
+        # Use the real ring allocation paths: only FULL pages are allocated.
+        indices = allocator.alloc_extend(
+            prefix_cpu.to(device),
+            prefix_cpu,
+            seq_cpu.to(device),
+            seq_cpu,
+            torch.tensor([-1], dtype=torch.int64, device=device),
+            2 * ps,
+        )
+        self.assertIsNotNone(indices)
+        decoded = allocator.alloc_decode(
+            (seq_cpu + 1).to(device), seq_cpu + 1, indices[-1:]
+        )
+        self.assertIsNotNone(decoded)
+        indices = torch.cat((indices, decoded))
+        self.assertTrue(torch.all(allocator.full_to_swa_index_mapping[indices] == 0))
+        self.assertEqual(allocator.full_available_size(), ps)
+        return allocator, indices
+
+    def test_swa_only_frees_leave_the_paged_pool_untouched(self):
+        for segment in (False, True):
+            for grouped in (False, True):
+                with self.subTest(segment=segment, grouped=grouped):
+                    allocator, indices = self._allocated_ring()
+                    swa_pages = (
+                        allocator.swa_attn_allocator.get_all_free_pages().clone()
+                    )
+                    swa_available = allocator.swa_available_size()
+                    if grouped:
+                        allocator.free_group_begin()
+                    if segment:
+                        allocator.free_swa_segment(indices, start_pos=0)
+                    else:
+                        allocator.free_swa(indices)
+                    self.assertEqual(allocator.swa_free_group, [])
+                    self.assertEqual(allocator.swa_page_ids_group, [])
+                    if grouped:
+                        allocator.free_group_end()
+                    self.assertTrue(
+                        torch.equal(
+                            allocator.swa_attn_allocator.get_all_free_pages(), swa_pages
+                        )
+                    )
+                    self.assertEqual(allocator.swa_available_size(), swa_available)
+                    self.assertEqual(allocator.full_available_size(), self.PS)
+                    self.assertTrue(
+                        torch.all(allocator.full_to_swa_index_mapping[indices] == 0)
+                    )
+
+    def test_combined_frees_still_release_full_pages(self):
+        for segment in (False, True):
+            for grouped in (False, True):
+                with self.subTest(segment=segment, grouped=grouped):
+                    allocator, indices = self._allocated_ring()
+                    swa_pages = (
+                        allocator.swa_attn_allocator.get_all_free_pages().clone()
+                    )
+                    if grouped:
+                        allocator.free_group_begin()
+                    if segment:
+                        allocator.free_segment(indices, start_pos=0)
+                    else:
+                        allocator.free(indices)
+                    if grouped:
+                        self.assertEqual(allocator.full_available_size(), self.PS)
+                        allocator.free_group_end()
+                    self.assertEqual(
+                        allocator.full_available_size(), allocator.size_full
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            allocator.swa_attn_allocator.get_all_free_pages(), swa_pages
+                        )
+                    )
+                    full_pages = allocator.full_attn_allocator.get_all_free_pages()
+                    self.assertTrue(torch.all(full_pages > 0))
+                    self.assertEqual(torch.unique(full_pages).numel(), 4)
+
+    def test_swa_only_frees_do_not_synchronize(self):
+        allocator, indices = self._allocated_ring()
+        peers = allocator.full_to_swa_index_mapping[indices]
+        if _sync_error(lambda: peers[peers > 0]) is None:
+            self.skipTest("sync debug mode does not flag a data-dependent shape here")
+
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            for grouped in (False, True):
+                with self.subTest(grouped=grouped):
+                    if grouped:
+                        allocator.free_group_begin()
+                    self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
+                    self.assertIsNone(
+                        _sync_error(
+                            lambda: allocator.free_swa_segment(indices, start_pos=0)
+                        )
+                    )
+                    if grouped:
+                        self.assertIsNone(_sync_error(allocator.free_group_end))
+
+
 class TestSWAPageRepsFree(CustomTestCase):
     """page_size > 1: with a start position the SWA side frees one representative
     per page instead of expanding, filtering and dedup'ing through torch.unique."""
@@ -1246,6 +1366,86 @@ class TestSWAPageRepsFree(CustomTestCase):
 
     def _sizes(self, allocator):
         return allocator.full_available_size(), allocator.swa_available_size()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a tensor with is_cuda=True")
+    def test_free_swa_segment_npu_uses_reference_path(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                _, allocator, _ = _build_swa_tree(
+                    is_eagle=False,
+                    page_size=page_size,
+                    kv_size=8 * page_size,
+                    kv_size_swa=8 * page_size,
+                )
+                available_before = allocator.swa_available_size()
+                full_indices = _swa_alloc(allocator, page_size)
+                self.assertTrue(full_indices.is_cuda)
+
+                # transfer_to_npu makes NPU tensors report is_cuda=True as well.
+                with (
+                    patch("sglang.srt.mem_cache.allocator.swa._is_npu", True),
+                    patch(
+                        "sglang.srt.mem_cache.allocator.swa.get_and_clear_swa_pages",
+                        side_effect=AssertionError("NPU free reached Triton"),
+                    ),
+                ):
+                    allocator.free_swa_segment(full_indices[:1], start_pos=0)
+
+                self.assertEqual(allocator.swa_available_size(), available_before)
+                self.assertTrue(
+                    torch.all(allocator.full_to_swa_index_mapping[full_indices] == 0)
+                )
+
+    def test_free_swa_segment_debug_rejects_invalid_page_mappings(self):
+        page_size = 4
+
+        def leading_hole(mapping, full_indices, _swa_indices):
+            mapping[full_indices[0]] = 0
+
+        def multiple_peers(mapping, full_indices, swa_indices):
+            mapping[full_indices[2:page_size]] = swa_indices[
+                page_size + 2 : 2 * page_size
+            ]
+
+        def duplicate_peer(mapping, full_indices, swa_indices):
+            mapping[full_indices[page_size : 2 * page_size]] = swa_indices[:page_size]
+
+        def duplicate_representative(_mapping, full_indices, _swa_indices):
+            full_indices[-page_size:] = full_indices[:page_size]
+
+        for name, mutate, num_tokens in (
+            ("leading_hole", leading_hole, page_size),
+            ("multiple_peers", multiple_peers, page_size),
+            ("duplicate_peer", duplicate_peer, 2 * page_size),
+            # At page size 4, representatives 0 and 64 belong to separate programs.
+            ("duplicate_representative", duplicate_representative, 65 * page_size),
+        ):
+            with self.subTest(name=name):
+                num_allocated_tokens = max(2 * page_size, num_tokens)
+                kv_size = max(8 * page_size, num_allocated_tokens)
+                _, allocator, _ = _build_swa_tree(
+                    is_eagle=False,
+                    page_size=page_size,
+                    kv_size=kv_size,
+                    kv_size_swa=kv_size,
+                )
+                full_indices = _swa_alloc(allocator, num_allocated_tokens)
+                mapping = allocator.full_to_swa_index_mapping
+                swa_indices = mapping[full_indices].clone()
+                mutate(mapping, full_indices, swa_indices)
+                allocator.swa_attn_allocator.debug_mode = True
+
+                # Exercise debug validation without CI's fatal async assertion.
+                with (
+                    patch.dict(
+                        "os.environ",
+                        {"SGLANG_INVARIANT_CHECK": str(int(InvariantCheckLevel.OFF))},
+                    ),
+                    self.assertRaisesRegex(
+                        AssertionError, "swa pages do not match the mapped pages"
+                    ),
+                ):
+                    allocator.free_swa_segment(full_indices[:num_tokens], start_pos=0)
 
     def test_segment_free_releases_the_mapped_pages_for_every_tail(self):
         ps = self.PS
@@ -1322,7 +1522,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         req.cache_salt = None
         req.kv.cache_protected_len = 0
         req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
+        req.lock_receipt = DecLockRefParams()
         req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
         req.kv.swa_evicted_seqlen = evicted
 
@@ -1343,7 +1543,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
 
         # Finishing drops the locks, which sanity_check needs; the accounting
         # must survive the re-walk.
-        tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
+        tree.cache_finished_req(req, owned_kv_len=num_tokens)
         self.assertEqual(allocator.swa_available_size(), swa_before)
         self.assertEqual(
             tree.swa_evictable_size_ + tree.swa_protected_size_,

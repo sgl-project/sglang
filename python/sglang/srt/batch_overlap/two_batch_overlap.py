@@ -760,6 +760,7 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
@@ -810,6 +811,7 @@ class TboForwardBatchPreparer:
                 # The child runs the same forward, so it keeps the parent's
                 # sharding verdict; its counts above are already per-child.
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
+                encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
