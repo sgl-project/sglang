@@ -615,6 +615,150 @@ def test_failed_layerwise_allocation_refunds_only_unallocated_allowance(monkeypa
     assert budget.committed_bytes == 64
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("fallback", [None, "register", "shared_storage"])
+def test_consolidated_host_copy_order_and_fallback(
+    monkeypatch, source_device, fallback
+):
+    numel = layerwise_offload_mod._REGISTER_MIN_BYTES // 4
+    expected = torch.arange(numel, dtype=torch.float32)
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(expected.to(source_device).clone())
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4
+    )
+    register = layerwise_offload_mod._pin_in_place
+    registrations = []
+
+    def observe_registration(tensor):
+        if (
+            source_device == "cpu"
+            and fallback != "shared_storage"
+            and not registrations
+        ):
+            torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+        registrations.append(tensor.data_ptr())
+        return False if fallback == "register" else register(tensor)
+
+    monkeypatch.setattr(layerwise_offload_mod, "_pin_in_place", observe_registration)
+    if fallback == "shared_storage":
+        monkeypatch.setattr(layerwise_offload_mod, "_shared_storage", lambda _: None)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    assert registrations
+    host_alias = manager._consolidated_cpu_weights[0][torch.float32].detach()
+    assert host_alias.is_pinned()
+    assert host_alias.untyped_storage().nbytes() == numel * 4
+    torch.testing.assert_close(host_alias, expected, rtol=0, atol=0)
+    assert budget.committed_bytes == numel * 4
+    manager.load_all_layers()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(block.weight.cpu(), expected, rtol=0, atol=0)
+    manager.remove_forward_hooks()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert budget.committed_bytes == numel * 4
+    del host_alias, manager, model, block
+    gc.collect()
+    assert budget.committed_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cpu_copy_failure_returns_unregistered_pin_allowance(monkeypatch):
+    numel = layerwise_offload_mod._REGISTER_MIN_BYTES // 4
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(torch.ones(numel))
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4 + 64
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    original_copy = torch.Tensor.copy_
+
+    def fail_copy(target, source, *args, **kwargs):
+        if target.device.type == "cpu" and source.numel() == numel:
+            raise RuntimeError("CPU weight copy failed")
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
+    with pytest.raises(RuntimeError, match="CPU weight copy failed"):
+        manager.initialize()
+    gc.collect()
+    assert budget.committed_bytes == 64
+    assert block.weight.numel() == numel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "source_device,numel,registration_failure",
+    [
+        ("cpu", 4, False),
+        ("cuda", layerwise_offload_mod._REGISTER_MIN_BYTES // 4, False),
+        ("cpu", layerwise_offload_mod._REGISTER_MIN_BYTES // 4, True),
+    ],
+)
+def test_pinned_copy_failure_retains_lease_for_live_alias(
+    monkeypatch, source_device, numel, registration_failure
+):
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(torch.ones(numel, device=source_device))
+    model.blocks = torch.nn.ModuleList([block])
+    budget = host_memory_budget.HostPinBudget(
+        available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + numel * 4 + 64
+    )
+    assert budget.request(component_name="other", weight_bytes=64)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        initialize=False,
+        pin_cpu_memory=True,
+        pin_budget=budget,
+    )
+    if registration_failure:
+        monkeypatch.setattr(layerwise_offload_mod, "_pin_in_place", lambda _: False)
+    original_copy = torch.Tensor.copy_
+    aliases = []
+
+    def fail_pinned_copy(target, source, *args, **kwargs):
+        if target.device.type == "cpu" and target.is_pinned():
+            aliases.append(target.detach())
+            raise RuntimeError("pinned weight copy failed")
+        return original_copy(target, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_pinned_copy)
+    with pytest.raises(RuntimeError, match="pinned weight copy failed"):
+        manager.initialize()
+    assert len(aliases) == 1
+    assert aliases[0].is_pinned()
+    assert budget.committed_bytes == 64 + numel * 4
+    assert block.weight.numel() == numel
+    aliases.clear()
+    gc.collect()
+    assert budget.committed_bytes == 64
+
+
 def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
