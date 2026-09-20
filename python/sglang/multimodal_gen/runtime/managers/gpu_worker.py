@@ -724,6 +724,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
                 self._materialize_output_transport(output_batch, req, save_output_paths)
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            self._release_request_staging()
 
             collect_perf = (
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -780,6 +781,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            self._release_request_staging()
             # clean cache if OOM
             if not current_platform.is_cpu():
                 torch.get_device_module().empty_cache()
@@ -1076,6 +1078,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         IPC_A2A.drop_staging()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
+
+    def _release_request_staging(self) -> None:
+        """Release A2A staging buffers that would otherwise outlive the request.
+
+        The Ulysses and IPC all-to-all staging caches hold grow-only backing
+        allocations sized for the largest message seen so far, and nothing
+        releases them at a request boundary (only the warmup-probe path
+        does). After one large-shaped request, every later request keeps
+        those sizes pinned as live memory for the rest of the server's life.
+        Releasing here is safe: all of the request's collectives have
+        completed, and the next request's first collective re-allocates the
+        shapes it needs, so within-request reuse is preserved.
+        """
+        if current_platform.is_cpu() or current_platform.is_mps():
+            return
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+            IPC_A2A,
+        )
+        from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
+
+        IPC_A2A.drop_staging()
+        drop_a2a_staging_buffers()
 
     def _record_output_peak_memory(
         self, output_batch: OutputBatch, *, is_warmup: bool = False
