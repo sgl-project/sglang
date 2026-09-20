@@ -299,10 +299,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
-        # Static capture width.
-        self.captured_req_width = model_runner.decode_num_tokens_per_req(
+        # Static capture widths. Most algorithms use one width; adaptive
+        # uniform verify plugins may capture several exact widths in one runner.
+        default_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )
+        capture_req_widths = (
+            model_runner.spec_algorithm.get_cuda_graph_capture_req_widths(
+                self.speculative_num_draft_tokens, model_runner.is_draft_worker
+            )
+        )
+        self.capture_req_widths = tuple(
+            sorted(
+                {
+                    int(width)
+                    for width in capture_req_widths
+                    if width is not None and int(width) > 0
+                }
+            )
+        )
+        # Non-speculative decode has no draft-token count; its registry default
+        # therefore returns ``(None,)`` even though decode_num_tokens_per_req()
+        # correctly resolves the ordinary one-token width. Preserve that
+        # established path while still validating explicit plugin widths.
+        if not self.capture_req_widths and default_req_width is not None:
+            self.capture_req_widths = (int(default_req_width),)
+        if not self.capture_req_widths:
+            raise ValueError("decode CUDA Graph capture widths must be positive")
+        if default_req_width not in self.capture_req_widths:
+            raise ValueError(
+                f"default decode width {default_req_width} is absent from capture "
+                f"widths {self.capture_req_widths}"
+            )
+        self.captured_req_width = max(self.capture_req_widths)
+        self.adaptive_req_widths = len(self.capture_req_widths) > 1
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -587,14 +617,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, attention_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        attention_variant=None,
+        req_width=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             attention_variant=attention_variant,
+            req_width=req_width if self.adaptive_req_widths else None,
         )
+
+    def _runtime_req_width(self, forward_batch: ForwardBatch) -> int:
+        spec_info = forward_batch.spec_info
+        width = (
+            int(spec_info.num_tokens_per_req)
+            if spec_info is not None and spec_info.num_tokens_per_req > 0
+            else self.captured_req_width
+        )
+        return width
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
@@ -705,6 +750,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Let speculative algorithms reject graph replay for runtime constraints
+        # that are not represented by the static shape key.
+        if not self.model_runner.spec_algorithm.can_run_cuda_graph(
+            forward_batch, is_draft_worker=self.model_runner.is_draft_worker
+        ):
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -722,12 +774,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
-        spec_info = forward_batch.spec_info
-        if (
-            spec_info is not None
-            and spec_info.num_tokens_per_req > 0
-            and spec_info.num_tokens_per_req != self.captured_req_width
-        ):
+        req_width = self._runtime_req_width(forward_batch)
+        if req_width not in self.capture_req_widths:
             return False
 
         if self.require_mlp_tp_gather:
@@ -744,6 +792,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.disable_padding
                 else None
             ),
+            req_width=req_width,
         )
 
         is_bs_supported = (
@@ -947,6 +996,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        req_width: Optional[int] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -960,8 +1010,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         bs = size
         buffers: DecodeInputBuffers = self.buffers
+        if req_width is None:
+            req_width = self.captured_req_width
         if num_tokens is None:
-            num_tokens = bs * self.captured_req_width
+            num_tokens = bs * req_width
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -1025,7 +1077,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = self.get_spec_info(num_tokens, req_width=req_width)
         self.capture_hidden_mode = get_required_capture_hidden_mode(
             self.capture_hidden_mode,
             spec_info,
@@ -1211,22 +1263,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
-                    self._set_profile_trace_tag(
-                        bs, stream_idx, variant_label, attention_variant
-                    )
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=get_parallel().tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
+                    for req_width in reversed(self.capture_req_widths):
+                        self._set_profile_trace_tag(
+                            bs, stream_idx, variant_label, attention_variant
                         )
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * req_width,
+                            tp_group=get_parallel().tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                                req_width=req_width,
+                            )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1236,8 +1290,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        req_width: Optional[int] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        if req_width is None:
+            req_width = self.captured_req_width
+        num_tokens = size * req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1247,7 +1304,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs, stream_idx=stream_idx, num_tokens=num_tokens, req_width=req_width
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1339,6 +1396,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     attention_variant,
+                    req_width=req_width,
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1393,6 +1451,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         is_ragged = ragged_layout is not None
+        req_width = self._runtime_req_width(forward_batch)
 
         self.deepep_adapter.replay()
 
@@ -1410,7 +1469,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._ragged_graph_size
                 if is_ragged
                 else self._capture_graph_size(
-                    bs=self.bs, num_tokens=self.bs * self.captured_req_width
+                    bs=self.bs, num_tokens=self.bs * req_width
                 )
             )
             if is_ragged:
@@ -1453,7 +1512,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, attention_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                attention_variant,
+                req_width=req_width,
             )
             return
 
@@ -1477,13 +1540,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
-            raw_num_token = raw_bs * self.captured_req_width
+            raw_num_token = raw_bs * req_width
             if self.require_mlp_tp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
                 bs = self._pad_to_bucket(raw_bs, self.capture_bs)
-            padded_num_tokens = bs * self.captured_req_width
+            padded_num_tokens = bs * req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
@@ -1567,6 +1630,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 fb_view,
                 (
                     bs,
+                    req_width,
                     str(self.capture_forward_mode),
                     str(fb_view.actual_forward_mode),
                 ),
@@ -1587,7 +1651,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variant = self._resolve_attention_variant(forward_batch, bs)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, attention_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            attention_variant,
+            req_width=req_width,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1678,8 +1746,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Optional eager tail executed after graph replay and inside its timer."""
         return output
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, *, req_width: Optional[int] = None):
+        if req_width is None:
+            req_width = self.captured_req_width
         spec_info = None
+        custom_builder = getattr(
+            self.model_runner.spec_algorithm,
+            "create_cuda_graph_verify_input",
+            None,
+        )
+        if custom_builder is not None:
+            spec_info = custom_builder(
+                custom_mask=self.buffers.custom_mask,
+                num_tokens_per_req=req_width,
+                is_draft_worker=self.model_runner.is_draft_worker,
+            )
+            if spec_info is not None:
+                return spec_info
+
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()

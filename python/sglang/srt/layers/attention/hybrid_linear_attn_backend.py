@@ -108,11 +108,16 @@ class MambaAttnBackendBase(AttentionBackend):
         self.replayssm_write_pos_list = None
         self.replayssm_force_flush_list = None
         self.query_start_loc_list = []
-        self.retrieve_next_token_list = []
-        self.retrieve_next_sibling_list = []
-        self.retrieve_parent_token_list = []
+        # Target-verify graph metadata must be isolated by both padded batch
+        # size and request width. Reusing one [bs, max_width] tensor across
+        # 17/33/49/65-node graphs changes strides and leaves stale columns.
+        self.retrieve_next_token_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self.retrieve_next_sibling_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self.retrieve_parent_token_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self.tree_depth_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
-        self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_verify_query_start_locs: dict[int, torch.Tensor] = {}
+        self._cuda_graph_max_bs = 0
         self.conv_states_shape: tuple[int, int] = None
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
@@ -171,6 +176,8 @@ class MambaAttnBackendBase(AttentionBackend):
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
+        tree_depths = None
+        tree_max_depth = 0
         track_conv_indices = None
         track_ssm_h_src = None
         track_chunk_idx = None
@@ -300,8 +307,20 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
-                    # None during dummy run
-                    if retrieve_next_token is not None:
+                    # UBTree supplies direct parent indices. Other EAGLE tree
+                    # implementations retain the conv-produced scratch buffer.
+                    direct_parent = getattr(
+                        forward_batch.spec_info, "retrieve_parent_token", None
+                    )
+                    if direct_parent is not None:
+                        retrieve_parent_token = direct_parent
+                        tree_depths = getattr(
+                            forward_batch.spec_info, "tree_depths", None
+                        )
+                        tree_max_depth = int(
+                            getattr(forward_batch.spec_info, "max_tree_depth", 0)
+                        )
+                    elif retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
@@ -350,6 +369,11 @@ class MambaAttnBackendBase(AttentionBackend):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
+            tree_depths=tree_depths,
+            tree_max_depth=tree_max_depth,
+            has_direct_parent=bool(
+                getattr(forward_batch.spec_info, "uses_direct_parent", False)
+            ),
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -403,12 +427,18 @@ class MambaAttnBackendBase(AttentionBackend):
         ):
             return
         bs_without_pad = spec_info.retrieve_next_token.shape[0]
-        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
-            spec_info.retrieve_next_token
+        width = int(spec_info.draft_token_num)
+        retrieve_next_token, retrieve_next_sibling, retrieve_parent_token, tree_depths = (
+            self._get_verify_graph_buffers(cuda_graph_bs, width)
         )
-        self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
-            spec_info.retrieve_next_sibling
-        )
+        retrieve_next_token[:bs_without_pad].copy_(spec_info.retrieve_next_token)
+        retrieve_next_sibling[:bs_without_pad].copy_(spec_info.retrieve_next_sibling)
+        direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+        if direct_parent is not None:
+            retrieve_parent_token[:bs_without_pad].copy_(direct_parent)
+            live_depths = getattr(spec_info, "tree_depths", None)
+            if live_depths is not None:
+                tree_depths[:bs_without_pad].copy_(live_depths)
 
     def _init_track_conv_indices(
         self,
@@ -613,6 +643,7 @@ class MambaAttnBackendBase(AttentionBackend):
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
         draft_token_num = max_num_tokens // max_bs
+        self._cuda_graph_max_bs = max_bs
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
         self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
@@ -639,31 +670,12 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
             )
-            self.retrieve_next_token_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
-                )
-            )
-            self.retrieve_next_sibling_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
-                )
-            )
-            self.retrieve_parent_token_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
-                )
-            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
-        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
-            0,
-            max_bs * draft_token_num + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        # Seed the maximum-width entry. Smaller adaptive widths are allocated
+        # before their graph capture by _get_verify_graph_buffers().
+        self._get_verify_graph_buffers(max_bs, draft_token_num)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert max_num_tokens % max_bs == 0, (
@@ -681,6 +693,46 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
+
+    def _get_verify_graph_buffers(
+        self, bs: int, draft_token_num: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (int(bs), int(draft_token_num))
+        if key not in self.retrieve_next_token_buffers:
+            shape = key
+            self.retrieve_next_token_buffers[key] = torch.zeros(
+                shape, dtype=torch.int32, device=self.device
+            )
+            self.retrieve_next_sibling_buffers[key] = torch.zeros(
+                shape, dtype=torch.int32, device=self.device
+            )
+            self.retrieve_parent_token_buffers[key] = torch.zeros(
+                shape, dtype=torch.int32, device=self.device
+            )
+            self.tree_depth_buffers[key] = torch.zeros(
+                shape, dtype=torch.int32, device=self.device
+            )
+        if draft_token_num not in self.cached_cuda_graph_verify_query_start_locs:
+            max_bs = max(bs, self._cuda_graph_max_bs)
+            self.cached_cuda_graph_verify_query_start_locs[draft_token_num] = (
+                torch.arange(
+                    0,
+                    max_bs * draft_token_num + 1,
+                    step=draft_token_num,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+        return (
+            self.retrieve_next_token_buffers[key],
+            self.retrieve_next_sibling_buffers[key],
+            self.retrieve_parent_token_buffers[key],
+            self.tree_depth_buffers[key],
+        )
+
+    def _verify_query_start_loc(self, bs: int, draft_token_num: int) -> torch.Tensor:
+        self._get_verify_graph_buffers(bs, draft_token_num)
+        return self.cached_cuda_graph_verify_query_start_locs[draft_token_num][: bs + 1]
 
     def _capture_metadata(
         self,
@@ -702,7 +754,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
             else:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                    self._verify_query_start_loc(bs, spec_info.draft_token_num)
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -726,13 +778,23 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
         if forward_mode.is_target_verify() and self.topk > 1:
-            # retrieve_* are None during capture, so skip the copy.
+            # retrieve_* are None during capture, so skip the copy. Each width
+            # gets exact-shape buffers whose pointers are baked into its graph.
+            width = int(spec_info.draft_token_num)
+            retrieve_next_token, retrieve_next_sibling, retrieve_parent_token, tree_depths = (
+                self._get_verify_graph_buffers(bs, width)
+            )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
-                retrieve_next_token=self.retrieve_next_token_list[bs - 1],
-                retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
-                retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                tree_depths=tree_depths,
+                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
+                has_direct_parent=bool(
+                    getattr(spec_info, "uses_direct_parent", False)
+                ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -898,11 +960,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                    self._verify_query_start_loc(bs, spec_info.draft_token_num)
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                    self._verify_query_start_loc(
+                        bs - num_padding, spec_info.draft_token_num
+                    )
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
@@ -917,19 +981,39 @@ class MambaAttnBackendBase(AttentionBackend):
                 and getattr(spec_info, "retrieve_next_token", None) is not None
             ):
                 bs_without_pad = spec_info.retrieve_next_token.shape[0]
-                self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                width = int(spec_info.draft_token_num)
+                retrieve_next_token, retrieve_next_sibling, retrieve_parent_token, tree_depths = (
+                    self._get_verify_graph_buffers(bs, width)
+                )
+                retrieve_next_token[:bs_without_pad].copy_(
                     spec_info.retrieve_next_token
                 )
-                self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                retrieve_next_sibling[:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
+                )
+                direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+                if direct_parent is not None:
+                    retrieve_parent_token[:bs_without_pad].copy_(direct_parent)
+                    live_depths = getattr(spec_info, "tree_depths", None)
+                    if live_depths is not None:
+                        tree_depths[:bs_without_pad].copy_(live_depths)
+            else:
+                width = int(spec_info.draft_token_num)
+                retrieve_next_token, retrieve_next_sibling, retrieve_parent_token, tree_depths = (
+                    self._get_verify_graph_buffers(bs, width)
                 )
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
-                retrieve_next_token=self.retrieve_next_token_list[bs - 1],
-                retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
-                retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                tree_depths=tree_depths,
+                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
+                has_direct_parent=bool(
+                    getattr(spec_info, "uses_direct_parent", False)
+                ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )

@@ -535,6 +535,12 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        # UBTree KDA factorized verify stores raw per-node recurrence inputs in
+        # request-local scratch rows until sampling selects the committed path.
+        tree_rawv: Optional[torch.Tensor] = None
+        tree_rawk: Optional[torch.Tensor] = None
+        tree_g: Optional[torch.Tensor] = None
+        tree_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -673,6 +679,14 @@ class MambaPool:
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
+        )
+        self.factorized_kda_tree = bool(
+            not _is_npu
+            and not _is_cpu
+            and cache_params.is_kda
+            and speculative_eagle_topk is not None
+            and speculative_eagle_topk > 1
+            and speculative_num_draft_tokens in (49, 65)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
@@ -860,6 +874,32 @@ class MambaPool:
                         device=device,
                     )
 
+            tree_rawv = tree_rawk = tree_g = tree_beta = None
+            if self.factorized_kda_tree:
+                hv, v_dim, k_dim = temporal_state_shape
+                h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
+                tree_width = speculative_num_draft_tokens
+                tree_rawv = torch.zeros(
+                    (num_mamba_layers, spec_state_size + 1, hv, tree_width, v_dim),
+                    dtype=conv_dtype,
+                    device=device,
+                )
+                tree_rawk = torch.zeros(
+                    (num_mamba_layers, spec_state_size + 1, h_k, tree_width, k_dim),
+                    dtype=conv_dtype,
+                    device=device,
+                )
+                tree_g = torch.zeros(
+                    (num_mamba_layers, spec_state_size + 1, hv, tree_width, k_dim),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                tree_beta = torch.zeros(
+                    (num_mamba_layers, spec_state_size + 1, hv, tree_width),
+                    dtype=torch.float32,
+                    device=device,
+                )
+
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
@@ -876,7 +916,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or self.factorized_kda_tree:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -973,6 +1013,10 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    tree_rawv=tree_rawv,
+                    tree_rawk=tree_rawk,
+                    tree_g=tree_g,
+                    tree_beta=tree_beta,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
