@@ -304,8 +304,8 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  # A runner joins a stage by adding a row. `name:` keeps the job names
-  # wait-for-jobs matches by prefix and check-pr-test-health carves h20 out of.
+  # `name:` is load-bearing: wait-for-jobs gates a stage by job-name prefix,
+  # and check-pr-test-health carves h20 out by the same name.
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
@@ -431,9 +431,8 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  # Separate from base-c-test only because `needs` cannot vary per matrix row:
-  # the aarch64 stage takes the aarch64 build, and neither table should wait on
-  # the other architecture's.
+  # Separate only because `needs` cannot vary per matrix row: this stage takes
+  # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]

@@ -40,8 +40,7 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
-  # A runner or a suite joins by adding a row; `name:` reproduces the job names
-  # this workflow published before the table existed.
+  # `name:` reproduces the job names this workflow published before the table.
   jit-kernel-test:
     name: ${{ matrix.job_name }}
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
