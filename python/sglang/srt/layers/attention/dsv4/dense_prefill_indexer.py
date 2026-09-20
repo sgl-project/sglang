@@ -14,6 +14,8 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.utils.common import ceil_align
 
+# TODO: harmya - use a per-forward mqa_logits_budget_bytes() budget that also
+# leaves room for candidate masks and block-selection scratch.
 _SCORE_BUDGET_BYTES = 2 << 30
 
 
