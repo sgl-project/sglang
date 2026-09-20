@@ -15,7 +15,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 
 # Import to register custom ops for torch.compile compatibility
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
     is_tensor_in_symmetric_mempool,
@@ -34,6 +33,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
@@ -817,7 +817,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # The deferred path returns FlashInfer's permuted/padded GEMM2
             # materialization and must not allocate the ordinary final output.
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
                     hidden_states.shape[0],
@@ -943,7 +943,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],
@@ -1083,7 +1083,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     )
     if symm_output is None:
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 num_tokens,
@@ -1401,7 +1401,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         ):
             symm_output = _provided
         else:
-            with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not _symm_required
+            ):
                 symm_output = torch.empty(
                     num_tokens,
                     hidden_size,
@@ -1567,7 +1569,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         if use_routed_topk:
             assert runner_config.top_k is not None, (
                 "runner_config.top_k is required for flashinfer_trtllm_routed."
