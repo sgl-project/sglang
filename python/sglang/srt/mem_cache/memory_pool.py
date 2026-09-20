@@ -754,8 +754,33 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
+                if _is_npu and not cache_params.is_kda:
+                    # NPU GDN (Qwen3.5 / Qwen3.6) spec verify works on the
+                    # [.., HV, K, V] handedness:
+                    #   * AscendGDNAttnBackend / AscendHybridLinearAttnBackend
+                    #     reshape the per-draft scratch as
+                    #     (-1, num_value_heads, head_k_dim, head_v_dim);
+                    #   * move_intermediate_cache() (sgl_kernel_npu), which commits
+                    #     the accepted prefix back into the live state, walks each
+                    #     (heads, K, V) block with a hardcoded element order -- it
+                    #     is *not* stride aware, so it silently writes the state
+                    #     transposed once this tensor is handed out untransposed.
+                    #
+                    # Kimi-K3 (KDA) is deliberately excluded: the change that
+                    # dropped this transpose also migrated the KDA kernels to the
+                    # "canonical contiguous [N, H, V, K] layout"
+                    # (ascend_kda_backend.py) and its commit kernel,
+                    # move_intermediate_cache_kda(), is stride aware, so K3 keeps
+                    # the untransposed [.., HV, V, K] tensor.
+                    temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = (
+                        *temporal_state_shape[:-2],
+                        temporal_state_shape[-1],
+                        temporal_state_shape[-2],
+                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V] (NPU GDN)
+                #        [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K] (otherwise)
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
