@@ -13,7 +13,12 @@ import msgspec
 import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
+from sglang.srt.arg_groups import (
+    parallel_hook,
+    pd_disaggregation_hook,
+    serving_hook,
+    validation_hook,
+)
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
@@ -68,6 +73,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallel_compat,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -182,6 +188,94 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertTrue(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
+
+    def test_megamoe_rejects_two_batch_overlap(self):
+        # The fused kernel has no dispatch/combine split for the TBO ops to call.
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                enable_two_batch_overlap=True,
+            )
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                args.resolve_once()
+
+    def test_megamoe_requires_sm90_or_sm100(self):
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM90"):
+                args.resolve_once()
+        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "CUDA"):
+                args.resolve_once()
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    def test_megamoe_token_budget_must_cover_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=16384,
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8192
+            ):
+                with self.assertRaisesRegex(ValueError, "required_per_rank=16384"):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                16384
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
+
+        for arch in (
+            "InternS2PreviewForConditionalGeneration",
+            "MellumForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "DeepseekV4ForCausalLM",
+        ):
+            self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
+        # MXFP4 DeepSeek-family models keep their runtime fallback.
+        self.assertFalse(mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, None))
+        # NVFP4 experts are repacked at load: every model is checked.
+        self.assertTrue(
+            mega_moe_needs_token_budget(
+                "DeepseekV3ForCausalLM", {"quant_algo": "NVFP4"}, None
+            )
+        )
+        self.assertTrue(
+            mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, "modelopt_fp4")
+        )
+
+    def test_megamoe_decode_tokens_per_rank_follows_graph_bs_and_draft_tokens(self):
+        # cuda_graph_config only exists on a GPU host; use a stand-in view.
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_decode_tokens_per_rank
+
+        def view(max_bs, algorithm=None, draft_tokens=None, cg=True):
+            return SimpleNamespace(
+                cuda_graph_config=(
+                    SimpleNamespace(decode=SimpleNamespace(max_bs=max_bs))
+                    if cg
+                    else None
+                ),
+                speculative_algorithm=algorithm,
+                speculative_num_draft_tokens=draft_tokens,
+            )
+
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, "EAGLE", 4)), 1024)
+        # Draft tokens only count under a speculative algorithm.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
@@ -1901,6 +1995,25 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(unittest.TestCase):
+    def test_linker_mla_dedup_requires_mooncake_linker(self):
+        for enabled, linker, backend in (
+            (False, False, "mooncake"),
+            (True, True, "mooncake"),
+            (True, False, "mooncake"),
+            (True, True, "mori"),
+        ):
+            with self.subTest(enabled=enabled, linker=linker, backend=backend):
+                args = self._make_args(
+                    enable_linker_mla_dedup=enabled,
+                    enable_unified_cache_external_linker=linker,
+                    unified_cache_external_linker_backend=backend,
+                )
+                if enabled and (not linker or backend != "mooncake"):
+                    with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
@@ -2362,6 +2475,137 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
         self.assertEqual(config.get_capture_sizes(), [32, 64])
         self.assertEqual(config.compiler, "eager")
+
+
+class TestPipelineParallelCompat(CustomTestCase):
+    """Features supported with `pipeline-parallel-size > 1`."""
+
+    _SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
+
+    @staticmethod
+    def _cfg(**overrides):
+        cfg = dict(
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="prefill",
+            min_free_slots_delay=None,
+        )
+        cfg.update(overrides)
+        return SimpleNamespace(**cfg)
+
+    def test_overlap_schedule_must_be_off(self):
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_no_speculative_decoding_is_fine(self):
+        check_pipeline_parallel_compat(self._cfg())
+
+    def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+
+    def test_dspark_is_rejected_outside_pd_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="DSPARK", disaggregation_mode=mode
+                        )
+                    )
+
+    def test_dspark_rejects_eagle_pp_relay(self):
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="DSPARK")
+                )
+
+    def test_eagle_is_allowed_on_prefill(self):
+        check_pipeline_parallel_compat(
+            self._cfg(speculative_algorithm="EAGLE"),
+            model_architecture=self._SUPPORTED_ARCH,
+        )
+
+    def test_eagle_is_rejected_outside_prefill(self):
+        for mode in ("decode", "null"):
+            with self.subTest(disaggregation_mode=mode):
+                with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(
+                            speculative_algorithm="EAGLE", disaggregation_mode=mode
+                        ),
+                        model_architecture=self._SUPPORTED_ARCH,
+                    )
+
+    def test_eagle_is_rejected_for_unsupported_model(self):
+        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM/Qwen3.5 models"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE"),
+                model_architecture="LlamaForCausalLM",
+            )
+
+    def test_supported_architectures(self):
+        for architecture in (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=architecture,
+                )
+
+    def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
+        cfg = self._cfg(
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="null",
+            speculative_adaptive=False,
+            enable_dp_attention=False,
+        )
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            check_pipeline_parallel_compat(cfg, model_architecture="LlamaForCausalLM")
+            with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=self._SUPPORTED_ARCH,
+                )
+
+    def test_nextn_resolves_to_eagle_and_is_allowed(self):
+        """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
+        validation hook runs, so the check only ever sees the resolved name."""
+        check_pipeline_parallel_compat(
+            self._cfg(speculative_algorithm="eagle"),
+            model_architecture=self._SUPPORTED_ARCH,
+        )
+
+    def test_non_eagle_speculative_algorithms_are_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE3"),
+                model_architecture=self._SUPPORTED_ARCH,
+            )
+
+    def test_multi_layer_eagle_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE", enable_multi_layer_eagle=True),
+                model_architecture=self._SUPPORTED_ARCH,
+            )
+
+    def test_min_free_slots_delay_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "min-free-slots-delay"):
+            check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
 
 
 class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
