@@ -400,6 +400,37 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def test_dsa_maps_sparse_indexer_layers(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.start_layer = 10
+        kvcache.layer_num = 5
+        kvcache.indexer_layer_ids = (10, 12, 14)
+        kvcache.kv_buffer = [
+            torch.zeros((8, 3), dtype=torch.uint8) for _ in range(kvcache.layer_num)
+        ]
+        indexer_buffers = [
+            torch.zeros((4, 7 + index), dtype=torch.uint8) for index in range(3)
+        ]
+        kvcache.index_key_cache = SimpleNamespace(buffer=indexer_buffers)
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=()),
+            components={ComponentType.FULL},
+        )
+
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(indexer.layer_mapping, {0: 0, 2: 1, 4: 2})
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([0], 1))
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([0], 3))
+        for layer, buffer_index in indexer.layer_mapping.items():
+            pointers, _, _ = indexer.get_prepared_layer_range_meta([0], layer)
+            self.assertEqual(pointers, [[indexer_buffers[buffer_index].data_ptr()]])
+
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""
         from sglang.srt.speculative import base_spec_worker as spec
