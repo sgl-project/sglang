@@ -72,23 +72,22 @@ def _flux2_strided_qknorm_rope_kernel(
     rstd = tl.math.rsqrt(mean_square + EPS)
     w = tl.load(w_ptr + dims)
     normalized = (x * rstd * w).to(y_ptr.dtype.element_ty).to(tl.float32)
-    partner = tl.gather(
-        normalized, tl.broadcast_to(dims ^ 1, (BLOCK_ROWS, 128)), axis=1
-    )
+    even, odd = tl.split(tl.reshape(normalized, (BLOCK_ROWS, 64, 2)))
     pos = rows // HEADS % TOKENS
-    cos = tl.load(
-        cache_ptr + pos * CACHE_STRIDE + dims // 2, mask=rows < ROWS, other=0.0
-    )
+    half = tl.arange(0, 64)[None, :]
+    cos = tl.load(cache_ptr + pos * CACHE_STRIDE + half, mask=rows < ROWS, other=0.0)
     sin = tl.load(
-        cache_ptr + pos * CACHE_STRIDE + 64 + dims // 2, mask=rows < ROWS, other=0.0
+        cache_ptr + pos * CACHE_STRIDE + 64 + half, mask=rows < ROWS, other=0.0
     )
     # FlashInfer rounds the sine product before the cosine multiply-add.
     # A subtraction from +0 can canonicalize signed zeros. Flip the IEEE
     # sign bit explicitly, matching FlashInfer's even-lane negation.
-    partner_bits = partner.to(tl.int32, bitcast=True)
-    sign = (dims % 2 == 0).to(tl.int32) << 31
-    signed_partner = (partner_bits ^ sign).to(tl.float32, bitcast=True)
-    rotated = tl.fma(normalized, cos, signed_partner * sin)
+    negative_odd = (odd.to(tl.int32, bitcast=True) ^ -2147483648).to(
+        tl.float32, bitcast=True
+    )
+    rotated_even = tl.fma(even, cos, negative_odd * sin)
+    rotated_odd = tl.fma(odd, cos, even * sin)
+    rotated = tl.reshape(tl.join(rotated_even, rotated_odd), (BLOCK_ROWS, 128))
     tl.store(y_ptr + rows * 128 + dims, rotated, mask=rows < ROWS)
 
 
