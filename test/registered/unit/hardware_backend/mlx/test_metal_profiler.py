@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
@@ -267,6 +268,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
                     torch.mps.profiler, "metal_capture", return_value=capture_ctx
                 ),
                 mock_patch("torch.distributed.barrier"),
+                get_parallel().override(tp_rank=0, pp_size=1, moe_ep_size=1),
             ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)
