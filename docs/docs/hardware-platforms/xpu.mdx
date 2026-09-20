@@ -54,6 +54,20 @@ pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
 
 ### Install Using Docker
 
+It is recommended to use Docker for setting up the SGLang environment.
+
+#### Pull from Docker Hub
+
+Pull the prebuilt docker image of SGLang package releases from `lmsysorg/sglang` repository.
+The [XPU image tags](https://hub.docker.com/r/lmsysorg/sglang/tags?name=xpu) end with `xpu` suffix.
+The image pulling command is like:
+
+```bash Command
+docker pull lmsysorg/sglang:v0.5.20-xpu
+```
+
+#### Build from Dockerfile
+
 [The SGLang XPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xpu.Dockerfile) is provided to facilitate the installation.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
 
