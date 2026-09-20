@@ -75,7 +75,7 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # only meaningful when backend == full. max_context_size is shared by the
 # breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
-    Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler", "max_seq_len"),
     Phase.PREFILL: (
         "backend",
         "max_bs",
@@ -114,8 +114,12 @@ class PhaseConfig:
     # chunk variants and chooses the smallest one covering a batch. None uses
     # the scheduler's aggregate chunked_prefill_size token budget.
     full_prefill_prefix_chunk_tokens: Optional[int] = None
-    # Prefill only: a batch whose longest sequence exceeds this replays eagerly, and
-    # backends that capture context-wide work size it. None defers to token buckets.
+    # A batch whose longest sequence exceeds this replays eagerly, and backends
+    # that capture context-wide work size it. None defers to token buckets
+    # (prefill) or to the pool width, i.e. --context-length (decode). Decode-side
+    # it decouples the captured width from the servable context, which is what
+    # stops a long-context deployment from paying a capacity-sized indexer scan
+    # on every decode step.
     max_seq_len: Optional[int] = None
 
 

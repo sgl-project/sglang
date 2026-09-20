@@ -1002,6 +1002,12 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
 
 
+def _decode_graph_max_seq_len() -> Optional[int]:
+    from sglang.srt.runtime_context import get_exec
+
+    return get_exec().graph.cuda_graph_config.decode.max_seq_len
+
+
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
@@ -1212,6 +1218,8 @@ class DeepseekV4AttnBackend(
             getattr(cfg, "candidate_block_size", 0),
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        # None keeps the historical behavior: decode is captured at pool width.
+        self._decode_graph_max_seq_len = _decode_graph_max_seq_len()
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
@@ -1591,6 +1599,27 @@ class DeepseekV4AttnBackend(
             return True
         return int(seq_lens_cpu.max().item()) <= max_seq_len
 
+    @property
+    def decode_graph_max_seq_len(self) -> int:
+        """Width the decode graph -- and therefore the decode indexer -- is sized to.
+
+        Defaults to the pool width (``--context-length``). Setting
+        ``graph.cuda_graph_config.decode.max_seq_len`` narrows it so the indexer
+        scans live-scale columns instead of the configured maximum. The capture
+        width cannot vary per batch, so a batch whose live context exceeds this
+        must not replay the graph; :meth:`can_run_decode_graph` routes it to
+        eager instead.
+        """
+        return self._decode_graph_max_seq_len or self.MAX_SEQ_LEN_FOR_CAPTURE
+
+    def can_run_decode_graph(self, forward_batch: ForwardBatch) -> bool:
+        if self._decode_graph_max_seq_len is None:
+            return True
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+            return True
+        return int(seq_lens_cpu.max().item()) <= self._decode_graph_max_seq_len
+
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
@@ -1942,7 +1971,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.decode_graph_max_seq_len,
             out_loc=out_cache_loc,
             need_compress=True,
             num_groups=bs,
@@ -1999,7 +2028,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.decode_graph_max_seq_len,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -2269,7 +2298,7 @@ class DeepseekV4AttnBackend(
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        chosen_max_seq_len = self.decode_graph_max_seq_len
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
             actual_max_seq_len = seq_lens_cpu.max().item()

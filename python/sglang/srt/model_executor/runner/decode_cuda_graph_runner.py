@@ -649,6 +649,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # A backend whose captured width is narrower than the servable context
+        # (e.g. DSV4 with graph.cuda_graph_config.decode.max_seq_len) cannot
+        # replay a graph whose context-shaped metadata is too narrow for the
+        # live batch, so it opts those batches out to eager.
+        if not self.attn_backend.can_run_decode_graph(forward_batch):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
