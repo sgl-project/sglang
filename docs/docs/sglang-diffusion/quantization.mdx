@@ -780,7 +780,7 @@ component directories through `--component-paths.transformer` and
 generation, editing, transparent RGBA, offload, and TP2 checks. These checks
 do not cover arbitrary exports or RTX 5090. See its
 [cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#nvfp4-components) for
-calibration scope and image/alpha error measurements.
+component-loading instructions and hardware requirements.
 
 ### Notes
 
@@ -936,8 +936,8 @@ The MiniMax-H3 measurements do not validate other quantization types, the
 
 Qwen-Image 2.1's Q4_0 exports use the base component configs and native tensor
 names. Its [cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#gguf-components)
-documents the tested matrix selection, offload modes, TP2, and image/alpha
-differences against native precision. These private exports establish loading
+describes how to load compatible component files and choose precision settings.
+These private exports establish loading
 and execution compatibility, not general output quality or compatibility with
 other GGUF exports.
 
