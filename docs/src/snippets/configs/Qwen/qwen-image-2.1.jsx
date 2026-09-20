@@ -210,7 +210,7 @@ const config = {
         { id: "eager", label: "Eager", recommended: true },
         {
           id: "bcg", label: "Breakable CUDA Graph",
-          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
+          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`],
           soft: true, softReason: "Unmatched condition-prefix shapes run eagerly. Keep eager execution for the recommended recipes.",
           description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
         },
