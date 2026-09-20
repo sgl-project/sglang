@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    derive_attention_ranks,
     derive_attention_widths,
     get_device,
     get_exec,
@@ -349,15 +350,12 @@ def compute_dp_attention_world_info(
         dp_size=dp_size,
         enable_dp_attention=enable_dp_attention,
     )
-    attn_tp_rank = tp_rank % attn_tp_size
-
-    if not enable_dp_attention:
-        attn_dp_rank = 0
-    else:
-        # Rank layout is (dp, cp, tp) where tp is the fastest-changing dim:
-        # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
-        attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
-
+    attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+        tp_rank=tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=attn_cp_size,
+        enable_dp_attention=enable_dp_attention,
+    )
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
