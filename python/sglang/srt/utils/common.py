@@ -484,7 +484,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = get_available_cpu_memory() - psutil.virtual_memory().used
+        total_free_memory = get_free_cpu_memory()
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -751,39 +751,28 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
-def get_available_cpu_memory():
-    # Try to retrieve CPU memory limit from /sys/fs/cgroup/memory.max
-    # If no legal value returned, fallback to querying psutil.virtual_memory().total
+def get_instance_memory_status(cgroup_file : str) -> Optional[int]:
     try:
-        with open("/sys/fs/cgroup/memory.max", "r") as f:
-            content = f.read().strip().lower()
-            # Match a number followed optionally by a unit (e.g., "512m", "2gb", "1024", "512b", "1024bytes")
-            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content)
+        with open(cgroup_file, "r") as f:
+            content = f.read().strip()
             # "max" or other non memory size content will be skipped
-            if not match:
+            if not content.isdigit():
                 raise ValueError
 
-            value_str, unit = match.groups()
-            value = int(value_str)
-
-            # Map units to their respective multiplier (binary/1024-based)
-            # If no unit or unit is 'b'/'bytes', the value is already in bytes (multiplier = 1)
-            if unit and unit not in ("b", "bytes"):
-                multipliers = {
-                    "k": 1024,
-                    "kb": 1024,
-                    "m": 1024**2,
-                    "mb": 1024**2,
-                    "g": 1024**3,
-                    "gb": 1024**3,
-                    "t": 1024**4,
-                    "tb": 1024**4,
-                }
-                value *= multipliers[unit]
-            return value
-
+            return int(content)
     except (PermissionError, FileNotFoundError, ValueError):
-        return psutil.virtual_memory().total
+        return None
+
+
+def get_free_cpu_memory() -> int:
+    free_cpu_memory = psutil.virtual_memory().available
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    instance_current_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.current")
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(0, instance_current_cpu_memory - instance_current_cpu_memory)
+        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
+
+    return free_cpu_memory
 
 
 def get_cpu_memory_capacity():
@@ -792,9 +781,13 @@ def get_cpu_memory_capacity():
         return None
     n_numa_node: int = len(get_cpu_ids_by_node())
     if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        # Avoid ZeroDivisionError in case NUMA config cannot be determined
         n_numa_node = 1
-    per_numa_mem = get_available_cpu_memory() / n_numa_node
+    total_cpu_memory = psutil.virtual_memory().total
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    if instance_max_cpu_memory is not None:
+        total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
+    per_numa_mem = total_cpu_memory / n_numa_node
     # Retrieved value in Byte, need MB
     return float(per_numa_mem // (1 << 20))
 
