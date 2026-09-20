@@ -22,14 +22,14 @@ the hardware picker selects a tested single-GPU recipe for the full checkpoint.
 
 Use **Setup** to select text-to-image, single-image editing, or multi-image
 editing. **Server** controls placement, attention, encoder scheduling, VAE
-tiling, and graph execution. **Request** controls the background, resolution,
+tiling, graph execution, and request batching. **Request** controls the background, resolution,
 steps, and output count. Set reference PNG paths under **Variables**; edits
 upload files from the machine running cURL, so they need not exist on the server.
 
 Hardware selection applies the recommended placement for that GPU. H200,
 B200, and RTX PRO 6000 96GB keep weights resident; RTX 5090 and RTX 4090 use
 offload to fit the full pipeline.
-Custom two- and four-GPU topologies and unverified feature combinations remain selectable and are labeled
+Untested topologies and feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
 currently uses the Python/source command; no published Docker image is verified.
 
@@ -47,7 +47,117 @@ for i, item in enumerate(json.loads(Path("response.json").read_text())["data"]):
 PY
 ```
 
-### Platform measurements
+### Current native recipes
+
+The picker defaults use native BF16/FP32 precision, exact attention, eager
+execution, and full-image VAE decoding. The table below uses checkpoint
+`840b4adb1e2c21c7d77967203188b55b678c535f` and source `1f89064b419`,
+measured on 2026-09-20. These are the best configurations among the tested
+candidates for this workload, not a claim of a global optimum.
+
+| GPU | Single-output recipe | Generation median | Edit median | Request-phase peak |
+| --- | --- | --- | --- | --- |
+| H200 141GB | Resident / FlashAttention | 4.48 s | 5.29 s | 38.4 GiB |
+| B200 192GB | Resident / FlashAttention | 2.46 s | 3.02 s | 38.5 GiB |
+| RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
+| RTX 4090 24GB | DiT offload, 8 resident layers, encoder CPU offload / FlashAttention | 23.25 s | 24.63 s | 23.1 GiB |
+
+Each shape uses two 1024px/40-step warmups, then five generation and five edit
+requests; the RTX 4090 8-layer candidate uses three measured requests per mode.
+All use seed 42, CFG 1, CPU noise, and one RGBA PNG per request. HTTP time
+includes encoding and PNG serialization, excluding startup. Memory is the peak
+sampled every 0.2 seconds during these requests, excluding startup. The H200, B200, and
+RTX PRO 6000 batch-matrix servers use a ceiling of four images and a 20 ms batching
+window; the single-output 4090 candidate has dynamic batching off.
+PyTorch is 2.13.0+cu130, Transformers 5.12.1, and Diffusers 0.37.0; native
+conditioning explicitly preserves the reference's Transformers 4.57.3 semantics.
+
+FlashAttention beats SDPA on H200 (4.48 vs 4.91 s generation; 5.29 vs 6.23 s
+editing) and B200 (2.46 vs 2.91 s; 3.02 vs 4.03 s). SDPA uses three measured
+requests after two warmups. On RTX 4090, retaining eight DiT layers reduces
+generation from 24.50 to 23.25 s and editing from 25.19 to 24.63 s. Its generation,
+editing, transparent generation, and transparent-input editing pixels match
+the fully streamed recipe exactly in this comparison. The tradeoff is a larger
+request-phase peak: 19.9 to 23.1 GiB.
+
+On RTX PRO 6000, resident weights are faster than DiT offload: 8.03 vs 10.24 s
+for generation and 9.63 vs 10.59 s for editing. Offload lowers the request-phase
+peak from 38.4 to 25.3 GiB; its timings use two warmups and three measurements.
+
+The picker applies the 8-layer flag only to a native, eager, single-output
+RTX 4090 FlashAttention recipe with request batching off. Multiple outputs or
+request batching select the fully streamed recipe instead; use the updated
+**Server** command when switching. Multi-reference and other untested shapes
+remain marked Unverified.
+
+The RTX 5090 recipe retains its earlier validation below; it has not been rerun
+with this checkpoint. Both RTX 5090 and RTX PRO 6000 map FA selection to SDPA, so those
+labels do not represent two different attention kernels.
+
+A 1024px H200 BCG server captured its warmup graph, but these prompts and image
+prefixes missed that signature and ran eagerly. Text buckets do not pad this
+model's condition KV layout. Keep eager execution as the default; declaring a
+resolution alone does not establish graph replay or a speedup.
+
+### Batching
+
+Keep **Request batching → Off** for interactive use. For a concurrent
+text-to-image workload on one RTX 4090, the tested two-image server command is:
+
+```bash Command
+sglang serve \
+  --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
+  --num-gpus 1 --ulysses-degree 1 --encoder-parallel auto \
+  --performance-mode manual \
+  --dit-layerwise-offload true --text-encoder-cpu-offload true \
+  --attention-backend fa \
+  --batching-max-size 2 --batching-delay-ms 20 \
+  --host 0.0.0.0 --port 30010
+```
+
+Send requests concurrently to use dynamic batching. The merge limit counts
+output images, including each request's `n`; a client that waits for one
+response before sending the next does not supply concurrent work. Image-edit
+requests are not merged across requests. Set **Outputs** (the HTTP `n` field)
+to produce multiple images within one generation or edit request.
+
+| GPU | Generation, 1 / 2 / 4 outputs | Editing, 1 / 2 / 4 outputs | Recommendation |
+| --- | --- | --- | --- |
+| H200 | 4.48 / 9.13 / 18.32 s | 5.29 / 10.60 / 21.13 s | Off; no throughput gain |
+| B200 | 2.46 / 5.17 / 9.91 s | 3.02 / 5.98 / 12.04 s | Off; no material throughput gain |
+| RTX PRO 6000 | 8.03 / 16.19 / 32.55 s | 9.63 / 19.08 / 38.11 s | Off; no material throughput gain |
+| RTX 4090 | 23.25 / 38.33 / untested | 24.63 / 44.01 / untested | Off for latency; consider 2 for throughput |
+
+The H200/B200/RTX PRO 6000 and two-output 4090 measurements use five requests after two
+warmups per shape. The one-output 4090 numbers use the faster 8-layer recipe
+above with three measurements; batches stream all DiT layers. Against that
+single-output recipe, two outputs improve 4090 generation throughput by about
+**21%** and editing throughput by about **12%**, while increasing request latency.
+Two concurrent 4090 generation requests complete in **39.75 s** wall time
+(median of three rounds with different prompts and seeds). Concurrent 2/4-request
+batches did not improve resident H200/B200/RTX PRO 6000 throughput. All measurements use
+the checkpoint, software, 1024px/40-step settings, and HTTP timing scope above.
+Transparent generation and transparent-input editing also passed for these
+batch sizes, with alpha values from 0 to 255.
+
+Each sample retains its own condition-prefix KV cache, prompt, seed, and output
+position. DiT target projections and MLPs run as a batch, and layerwise offload
+transfers each block once per batch. This amortizes transfers on consumer GPUs.
+Resident weights do not incur those transfers, so batching is not automatically
+faster there. Full-checkpoint TP2 and Ulysses2 generation, editing, alpha, and
+dynamic two-request batching also passed on two B200s; those are functional
+checks, not latency recommendations for every multi-GPU topology.
+
+Batching retains native BF16/FP32 precision but changes GEMM shapes and
+floating-point rounding. Batched images are **not guaranteed to match singleton
+pixels**, even with the same seeds. Use one output and leave request batching
+off when reproducing a singleton image exactly. Quantization, SageAttention,
+and approximate denoising caches remain separate options. Larger batches and
+other prompts need their own memory and throughput measurements. See
+[Inference batching](/docs/sglang-diffusion/dynamic_batching) for admission rules
+and batch metrics.
+
+### Earlier platform measurements
 
 The following four-platform comparison and the fusion measurements below precede
 the training-template and VAE normalization corrections in `c2a31b2693c`;
@@ -89,10 +199,11 @@ this complete recipe passed generation, editing, and transparent PNG output.
 
 These are measurements of this small workload, not universal latency or image
 quality guarantees. Different prompts, reference sizes, batching, and software
-versions can change memory use and latency. Multi-reference and batched request
-recipes retain their separate H200 verification scope in the picker.
+versions can change memory use and latency. Multi-reference recipes retain their
+separate H200 verification scope. See [Batching](#batching) for the current
+multi-output and concurrent-request matrix.
 
-### RTX PRO 6000 Blackwell 96GB
+### Earlier RTX PRO 6000 Blackwell 96GB measurements
 
 The recommended single-GPU command keeps all weights resident and selects Torch
 SDPA. This is the 96GB Blackwell Server Edition (SM120). This runtime also maps
@@ -265,9 +376,9 @@ The model predicts continuous alpha values, including partly transparent edges.
 No thresholding or background-removal postprocessing is applied. Transparent
 generation and transparent-input editing were compared against the reference
 at 1024 × 1024 and 40 steps; that check does not guarantee perfect cutouts for
-every prompt. Transparent generation and single-image editing also passed on
-the recommended one-H200 and one-RTX PRO 6000 servers at that resolution and
-step count, with one output per request.
+every prompt. The updated checkpoint also passed transparent generation and
+transparent-input editing on H200, B200, RTX PRO 6000, and RTX 4090. See
+[Batching](#batching) for the tested output counts and two-B200 topologies.
 
 ## 4. Offline requests
 
@@ -531,7 +642,10 @@ passed dynamic loading, merging, and removal on one B200 and TP2 with encoder
 folding. Both removal paths restored the base image exactly. This verifies
 adapter application and lifecycle, not the quality of a trained LoRA.
 
-Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
+Cache-DiT hooks operate on target-image transformer blocks; two-output generation,
+editing, transparent generation, and transparent-input editing passed with it
+enabled on B200 at 1024px/40 steps. This is a functional check of an approximate
+cache, not a lossless recipe. Breakable CUDA
 Graph execution fills each request's prefix caches eagerly, then replays
 matching warmup graphs with those cache tensors as inputs. Warmup and request
 condition-prefix lengths must match, in addition to the output resolution;

@@ -93,7 +93,11 @@ sglang generate --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
 Add `--image-path /path/to/input.png` for editing. Dimensions must be multiples
 of 32. Full-checkpoint generation and editing have been tested on H200; see the
 [model cookbook](../../../docs/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1.mdx)
-for component requirements and optimization boundaries.
+for component requirements and optimization boundaries. Compatible text-to-image
+requests support opt-in dynamic batching with `--batching-max-size 2` when
+serving. Image edits are not merged across requests; use `n` for multiple
+outputs within an edit request. Batching can improve offload throughput, but
+changes floating-point rounding and is not always faster with resident weights.
 
 ### Component residency
 
