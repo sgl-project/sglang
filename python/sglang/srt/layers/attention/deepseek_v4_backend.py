@@ -3131,7 +3131,27 @@ class DeepseekV4AttnBackend(
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
-                self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+                group_size = 1
+                if (
+                    envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not self.is_dspark_draft
+                    and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+                    and self.forward_metadata.late_layer_tail is None
+                    and self.speculative_num_draft_tokens is not None
+                    and self.speculative_num_draft_tokens > 1
+                    and forward_batch.spec_info.draft_token_num
+                    == self.speculative_num_draft_tokens
+                    and req.shape[0]
+                    == forward_batch.batch_size * self.speculative_num_draft_tokens
+                    and x.shape[0] == q_lora.shape[0] == req.shape[0]
+                ):
+                    # Only static verify guarantees fixed request-major groups.
+                    # Do not read GPU request ids or lengths during graph capture.
+                    group_size = self.speculative_num_draft_tokens
+                self._low_ratio_index_topk_sm90_decode(
+                    layer, x, q_lora, req, pos, group_size=group_size
+                )
         elif (
             self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
         ):
@@ -3472,7 +3492,9 @@ class DeepseekV4AttnBackend(
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.
-    def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk_sm90_decode(
+        self, layer, x, q_lora, req, pos, *, group_size=1
+    ) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3502,17 +3524,52 @@ class DeepseekV4AttnBackend(
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
-        j = torch.arange(lmax, device=pos.device)
-        valid = j[None, :] < lens[:, None]
-        slots = (
-            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
-            // ratio
-        )
-        slots = slots.masked_fill(~valid, 0)
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        s = fp4_index_logits_decode(
-            q, weights, slots, lens, table, table.shape[1] // 68
+        use_grouped = (
+            envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+            and group_size > 1
+            and ratio in (1, 2)
+            and q.is_cuda
+            and torch.version.cuda is not None
+            and torch.cuda.get_device_capability(q.device)[0] == 9
+            and q.dtype == weights.dtype == torch.bfloat16
+            and q.shape[1:] == (32, 128)
+            and q.is_contiguous()
+            and weights.is_contiguous()
+            and self.req_to_token.dtype == torch.int32
+            and self.req_to_token.stride(1) == 1
+            and table.dtype == torch.uint8
+            and table.dim() == 2
+            and table.stride(1) == 1
         )
+        slots = None
+        if use_grouped:
+            from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+                fp4_index_logits_mapped_sm90,
+            )
+
+            s = fp4_index_logits_mapped_sm90(
+                q,
+                weights,
+                self.req_to_token,
+                req.to(torch.int64).contiguous(),
+                lens.to(torch.int64).contiguous(),
+                table,
+                table.shape[1] // 68,
+                ratio,
+                lmax,
+            )
+        else:
+            j = torch.arange(lmax, device=pos.device)
+            valid = j[None, :] < lens[:, None]
+            slots = (
+                self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
+                // ratio
+            )
+            slots = slots.masked_fill(~valid, 0)
+            s = fp4_index_logits_decode(
+                q, weights, slots, lens, table, table.shape[1] // 68
+            )
         if indexer.is_candidate_source:
             mask = select_candidate_blocks(
                 s,
@@ -3533,11 +3590,30 @@ class DeepseekV4AttnBackend(
         if indexer.uses_candidates and not indexer.is_candidate_source:
             idx = mask_topk_scores(s, idx)
             idx = idx.masked_fill(idx < 0, lmax)
+        if use_grouped and 0 < k <= 1024:
+            from sglang.kernels.ops.attention.dsv4.sm90_fp4_topk import sort_map_topk
+
+            # Keep TopK selection unchanged, but combine the selected-position
+            # sort, visibility mask, physical mapping and output casts/stores.
+            sort_map_topk(
+                idx, lens, req, self.req_to_token, page_indices, raw_indices, ratio
+            )
+            return
         idx = idx.sort(dim=-1).values
         reach = idx < lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
-        ).to(torch.int32)
+        if slots is None:
+            # Map only the selected positions; the opt-in logits path does not
+            # materialize a rows x lmax slots matrix. Candidate-masked indices
+            # may equal lmax and are clamped before the masked result is stored.
+            selected_slots = (
+                self.req_to_token[req[:, None], idx.clamp_max(lmax - 1) * ratio].to(
+                    torch.int64
+                )
+                // ratio
+            )
+        else:
+            selected_slots = slots.gather(1, idx.clamp_max(lmax - 1))
+        page_indices[:bs, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
         if raw_indices is not None:
             raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
