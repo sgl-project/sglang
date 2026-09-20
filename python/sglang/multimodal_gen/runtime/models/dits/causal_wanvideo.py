@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import (
     BlockMask,
-    create_block_mask,
     flex_attention,
 )
 
@@ -23,10 +22,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs"
 )
-import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_world_size,
+    get_tp_rank,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
@@ -38,8 +42,13 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    tensor_parallel_rms_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -59,6 +68,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 
@@ -73,12 +83,17 @@ class CausalWanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
+        head_dim: int | None = None,
+        head_start: int = 0,
     ) -> None:
-        assert dim % num_heads == 0
+        if head_dim is None:
+            assert dim % num_heads == 0
+            head_dim = dim // num_heads
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
+        self.head_start = head_start
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.qk_norm = qk_norm
@@ -167,10 +182,14 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
+            if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                return self.attn(roped_query, roped_key, v)
+
             cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=v,
                 current_chunk_start=current_start,
+                cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
             )
             x = self.attn(
@@ -202,23 +221,72 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        use_megatron_tp = getattr(
+            self, "_use_megatron_tp", type(self) is CausalWanTransformerBlock
+        )
+        if use_megatron_tp:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_q", prefix),
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_k", prefix),
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_v", prefix),
+            )
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+            self.to_out = RowParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=add_prefix("to_out", prefix),
+            )
+            # megatron-style tp shards the weight (qkv) column-wise, effectively splitting the attention heads
+            tp_size = get_tp_world_size()
+            self.local_num_heads = divide(num_heads, tp_size)
+            head_start = get_tp_rank() * self.local_num_heads
+        else:
+            self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+            self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+            self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+            self.to_out = ReplicatedLinear(
+                dim, dim, bias=True, quant_config=quant_config
+            )
+            tp_size = 1
+            self.local_num_heads = num_heads
+            head_start = 0
+        dim_head = dim // num_heads
         self.attn1 = CausalWanSelfAttention(
             dim,
-            num_heads,
+            self.local_num_heads,
             local_attn_size=local_attn_size,
             sink_size=sink_size,
             qk_norm=qk_norm,
             eps=eps,
+            head_dim=dim_head,
+            head_start=head_start,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
         self.local_attn_size = local_attn_size
-        dim_head = dim // num_heads
+        self.dim_head = dim_head
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(dim_head, eps=eps)
             self.norm_k = RMSNorm(dim_head, eps=eps)
@@ -229,6 +297,9 @@ class CausalWanTransformerBlock(nn.Module):
         else:
             print("QK Norm type not supported")
             raise Exception
+        self.tp_rmsnorm = (
+            use_megatron_tp and qk_norm == "rms_norm_across_heads" and tp_size > 1
+        )
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=True, dtype=torch.float32
@@ -306,13 +377,19 @@ class CausalWanTransformerBlock(nn.Module):
         value, _ = self.to_v(norm_hidden_states)
 
         if self.norm_q is not None:
-            query = self.norm_q(query)
+            if self.tp_rmsnorm:
+                query = tensor_parallel_rms_norm(query, self.norm_q)
+            else:
+                query = self.norm_q(query)
         if self.norm_k is not None:
-            key = self.norm_k(key)
+            if self.tp_rmsnorm:
+                key = tensor_parallel_rms_norm(key, self.norm_k)
+            else:
+                key = self.norm_k(key)
 
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         attn_output = self.attn1(
             query,
@@ -334,9 +411,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -348,9 +426,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -361,9 +440,8 @@ class CausalWanTransformerBlock(nn.Module):
 
 
 class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = WanVideoConfig()._compile_conditions
-    _supported_attention_backends = WanVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -442,8 +520,10 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         # Causal-specific
         self.block_mask = None
-        self.num_frame_per_block = config.arch_config.num_frames_per_block
-        assert self.num_frame_per_block <= 3
+        self.num_frame_per_block = self.config.num_frames_per_block
+        # Block size is bounded only by the causal block-mask construction, which
+        # supports any positive value.
+        assert self.num_frame_per_block >= 1
         self.independent_first_frame = False
 
         self.__post_init__()
@@ -451,79 +531,6 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = [
             "blocks",
         ]
-
-    @staticmethod
-    def _prepare_blockwise_causal_attn_mask(
-        device: torch.device | str,
-        num_frames: int = 21,
-        frame_seqlen: int = 1560,
-        num_frame_per_block=1,
-        local_attn_size=-1,
-    ) -> BlockMask:
-        """
-        we will divide the token sequence into the following format
-        [1 latent frame] [1 latent frame] ... [1 latent frame]
-        We use flexattention to construct the attention mask
-        """
-        total_length = num_frames * frame_seqlen
-
-        # we do right padding to get to a multiple of 128
-        padded_length = math.ceil(total_length / 128) * 128 - total_length
-
-        ends = torch.zeros(
-            total_length + padded_length, device=device, dtype=torch.long
-        )
-
-        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
-        frame_indices = torch.arange(
-            start=0,
-            end=total_length,
-            step=frame_seqlen * num_frame_per_block,
-            device=device,
-        )
-
-        for tmp in frame_indices:
-            ends[tmp : tmp + frame_seqlen * num_frame_per_block] = (
-                tmp + frame_seqlen * num_frame_per_block
-            )
-
-        def attention_mask(b, h, q_idx, kv_idx):
-            if local_attn_size == -1:
-                return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
-            else:
-                return (
-                    (kv_idx < ends[q_idx])
-                    & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))
-                ) | (q_idx == kv_idx)
-            # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
-
-        block_mask = create_block_mask(
-            attention_mask,
-            B=None,
-            H=None,
-            Q_LEN=total_length + padded_length,
-            KV_LEN=total_length + padded_length,
-            _compile=False,
-            device=device,
-        )
-
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(
-                f" cache a block wise causal mask with block size of {num_frame_per_block} frames"
-            )
-            print(block_mask)
-
-        # import imageio
-        # import numpy as np
-        # from torch.nn.attention.flex_attention import create_mask
-
-        # mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
-        #                    padded_length, KV_LEN=total_length + padded_length, device=device)
-        # import cv2
-        # mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
-        # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
-
-        return block_mask
 
     def forward(
         self,

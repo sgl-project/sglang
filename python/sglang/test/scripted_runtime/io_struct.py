@@ -8,7 +8,6 @@ from typing import Any, Tuple, Union
 
 @dataclass(frozen=True, slots=True)
 class RunScript:
-
     fn_path: str
     args: Tuple[Any, ...] = ()
 
@@ -30,20 +29,18 @@ class ScriptSucceeded:
 
 @dataclass(frozen=True, slots=True)
 class ScriptFailed:
-
     traceback: str
 
 
 @dataclass(frozen=True, slots=True)
 class OutOfBandError:
-
     traceback: str
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
 
     @classmethod
-    def from_json(cls, text: str) -> "OutOfBandError":
+    def from_json(cls, text: str) -> OutOfBandError:
         return cls(**json.loads(text))
 
 

@@ -41,22 +41,25 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
+    done = [False] * len(handles)
     for _ in range(max_steps):
-        if all(h.finished for h in handles):
+        for i, h in enumerate(handles):
+            done[i] = done[i] or h.finished
+        if all(done):
             return
         yield
     raise AssertionError(
         f"run_until_all_finished: not all reqs finished after {max_steps} "
-        f"steps (finished={[h.finished for h in handles]})"
+        f"steps (finished={done})"
     )
 
 
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]
-    assert all(
-        x == token for x in prompt_tokens
-    ), "warmup_radix supports only uniform prompts"
+    assert all(x == token for x in prompt_tokens), (
+        "warmup_radix supports only uniform prompts"
+    )
     handle = t.start_req(
         prompt_len=len(prompt_tokens), max_new_tokens=1, prompt_token=token
     )
@@ -64,6 +67,12 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
 
 
 BALLAST_MAX_NEW_TOKENS: int = 30000
+
+SMALL_KV_POOL_MAX_TOTAL_TOKENS: int = 4096
+
+SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS: int = 512
+
+SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
@@ -117,9 +126,9 @@ def advance_to_decode_step(
     r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
 ):
     for _ in range(max_steps):
-        assert (
-            not r.finished
-        ), f"req finished before reaching decode step {target_output_len}"
+        assert not r.finished, (
+            f"req finished before reaching decode step {target_output_len}"
+        )
         req = r.req
         if req is not None and len(req.output_ids) >= target_output_len:
             return

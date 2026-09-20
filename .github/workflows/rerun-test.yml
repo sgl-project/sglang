@@ -51,16 +51,37 @@ on:
         required: false
         type: string
         default: ""
+      full_jit_kernel_tests:
+        description: "Sweep jit_kernel tests over their full parameter grids, the way scheduled suites do. Off matches the per-commit stages, which is what a rerun resolves to when a file is registered on both."
+        required: false
+        type: boolean
+        default: false
+      refresh_precision_baseline:
+        description: "Force-refresh the nightly precision baseline. Restricted by the slash-command handler to the precision test on trusted in-repo PRs."
+        required: false
+        type: boolean
+        default: false
 
+# Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
-  FORCE_REBUILD_DEEPEP: '1'
+  NCCL_NVLS_ENABLE: "0"
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.full_jit_kernel_tests && '1' || '0' }}
+  IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
+  SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+  SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+  SGLANG_PRECISION_HF_READ_ONLY: ${{ inputs.refresh_precision_baseline && '0' || '1' }}
+  SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.refresh_precision_baseline && '1' || '0' }}
+  SGLANG_PRECISION_COMMIT: ${{ inputs.pr_head_sha || github.sha }}
 
+# Every job below sets its own `permissions`, which replaces rather than merges
+# with a workflow-level block -- so keep the floor here minimal and grant per job.
 permissions:
-  actions: write
   contents: read
   issues: read
 
@@ -80,6 +101,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
@@ -98,17 +122,47 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          # Public-read-only PAT: the checkout above leaves no job token for the
+          # install script's github.com clones. Unset -> anonymous.
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
+          fi
+          # Fail fast on an empty install_script. `bash <empty>` is a silent
+          # no-op that "succeeds" without installing sglang, so the test step
+          # then dies with `ModuleNotFoundError: No module named 'sglang'`.
+          # /rerun-test resolves install_script from runner_configs.yml; a manual
+          # workflow_dispatch must pass it explicitly (it can't be derived from
+          # runs_on, which can be shared across runner configs).
+          if [ -z "${{ inputs.install_script }}" ]; then
+            echo "::error::install_script is required for cuda mode (empty would silently skip installing sglang). Pass e.g. scripts/ci/cuda/ci_install_dependency.sh"
+            exit 1
           fi
           bash ${{ inputs.install_script }}
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
+          if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then
+            expected="registered/debug_utils/test_nightly_precision_regression.py"
+            if [[ "${{ inputs.mode }}" != "cuda" \
+               || "${{ inputs.runs_on }}" != "8-gpu-h200" \
+               || -n "${{ inputs.pr_head_sha }}" \
+               || "$TEST_COMMAND" != "$expected" ]]; then
+              echo "::error::Precision baseline refresh only accepts $expected on 8-gpu-h200"
+              exit 1
+            fi
+          fi
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
@@ -116,7 +170,7 @@ jobs:
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             cmds+=("$cmd")
-          done <<< "${{ inputs.test_command }}"
+          done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
@@ -127,7 +181,15 @@ jobs:
             echo "Begin ($i/$total): python3 $cmd"
             echo "."
             file_start=$SECONDS
-            (cd test/ && python3 $cmd -f) || exit 1
+            # base-a perf tests (fwd_occupancy) need async assert off; match
+            # _pr-test-stage.yml's base-a carve-out.
+            test_file="${cmd%% *}"
+            test_file="${test_file%%::*}"
+            async_assert=true
+            if grep -qE 'register_cuda_ci\(.*stage[[:space:]]*=[[:space:]]*"base-a"' "test/$test_file" 2>/dev/null; then
+              async_assert=false
+            fi
+            (cd test/ && SGLANG_ENABLE_ASYNC_ASSERT=$async_assert python3 $cmd -f) || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -154,6 +216,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
@@ -169,8 +234,12 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CI_CLONE }}
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
@@ -214,13 +283,21 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # The image ships ~65G free and the suite peaks around 30G; deleting
+          # these trees is ~1M unlinks (~80s), so only pay it when actually low.
+          avail_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "${avail_gb}" -lt 40 ]; then
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
           df -h
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
@@ -244,9 +321,16 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Worth the most of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir and every dispatch compiled cold. Its
+      # setup-python pins the same 3.10 the modules were built against.
+      - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
+
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
       - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 

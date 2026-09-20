@@ -25,6 +25,7 @@ from sglang.srt.configs.mamba_utils import (
     mamba2_state_dtype,
 )
 from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu
 
 logger = logging.get_logger(__name__)
@@ -285,20 +286,26 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         if _is_cpu:
-            world_size = get_attention_tp_size()
+            world_size = get_parallel().attn_tp_size
             adjust_tp_num_heads_if_necessary(self, world_size, False)
 
+        # GDN conv_state == cat([query, key, value]); each sub-block is
+        # head-sharded independently across attn-TP, so record the full
+        # (unsharded) sub-block dims for correct PD transfer between prefill and
+        # decode with different attn_tp_size (see _send_mamba_state_slice).
+        key_dim = self.linear_key_head_dim * self.linear_num_key_heads
+        value_dim = self.linear_value_head_dim * self.linear_num_value_heads
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
+            conv_shard_groups=[key_dim, key_dim, value_dim],
         )
 
         return Mamba2CacheParams(

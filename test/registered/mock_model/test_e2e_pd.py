@@ -7,7 +7,8 @@ from typing import ClassVar, Dict, List
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.violation_log_utils import assert_no_violation_in_log
 from sglang.test.mock_model.utils import (
     MOCK_MODEL_PATH,
@@ -18,14 +19,15 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=266, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=165, stage="extra-a", runner_config="2-gpu-large-amd")
 
 # DO NOT pass --disable-cuda-graph in canary e2e tests.  The canary kernel
 # must run inside the cuda graph alongside the real attn kernel; disabling the
 # full graph silently bypasses the only path that exercises that invariant
 # end-to-end.
 #
-# --disable-piecewise-cuda-graph is REQUIRED by canary: install_canary
+# --cuda-graph-backend-prefill=disabled is REQUIRED by canary: install_canary
 # (api.py) asserts it, and the SingleForwardManager design depends on it.
 # mock_model_server_args() already passes it; do not remove it.
 _NUM_PROMPTS = 32
@@ -128,6 +130,13 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
         self.assert_no_canary_violation()
 
 
+@unittest.skipIf(
+    is_hip(),
+    "ROCm: PD full-real-data KV checksum intermittently trips a "
+    "verify_real_kv_hash canary violation on the decode-side transferred prefix "
+    "(see https://github.com/sgl-project/sglang/issues/28971). The baseline PD "
+    "canary test above stays enabled on AMD.",
+)
 class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 

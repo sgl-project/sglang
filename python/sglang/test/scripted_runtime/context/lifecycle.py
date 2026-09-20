@@ -10,6 +10,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.test.scripted_runtime.context.http_post import (
     _http_post_and_await_recv_msg,
+    _http_post_fire_and_forget,
 )
 
 if TYPE_CHECKING:
@@ -17,8 +18,16 @@ if TYPE_CHECKING:
 
 
 def _await_control(
-    ctx: "ScriptedContext", *, path: str, json, expect_type: type
+    ctx: ScriptedContext,
+    *,
+    path: str,
+    json,
+    expect_type: type,
+    await_arrival: bool = True,
 ) -> None:
+    if not await_arrival:
+        _http_post_fire_and_forget(ctx, path=path, json=json)
+        return
     _http_post_and_await_recv_msg(
         ctx,
         path=path,
@@ -29,7 +38,7 @@ def _await_control(
 
 
 def pause_generation(
-    ctx: "ScriptedContext", *, mode: Literal["retract", "in_place"]
+    ctx: ScriptedContext, *, mode: Literal["retract", "in_place"]
 ) -> None:
     _await_control(
         ctx,
@@ -39,7 +48,7 @@ def pause_generation(
     )
 
 
-def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> None:
+def continue_generation(ctx: ScriptedContext, *, torch_empty_cache: bool) -> None:
     _await_control(
         ctx,
         path="/continue_generation",
@@ -48,7 +57,7 @@ def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> N
     )
 
 
-def abort_all(ctx: "ScriptedContext") -> None:
+def abort_all(ctx: ScriptedContext) -> None:
     _await_control(
         ctx,
         path="/abort_request",
@@ -57,16 +66,17 @@ def abort_all(ctx: "ScriptedContext") -> None:
     )
 
 
-def abort(ctx: "ScriptedContext", *, rid: str) -> None:
+def abort(ctx: ScriptedContext, *, rid: str, await_arrival: bool = True) -> None:
     _await_control(
         ctx,
         path="/abort_request",
         json={"rid": rid, "abort_all": False},
         expect_type=AbortReq,
+        await_arrival=await_arrival,
     )
 
 
-def flush_cache(ctx: "ScriptedContext") -> None:
+def flush_cache(ctx: ScriptedContext) -> None:
     _await_control(
         ctx,
         path="/flush_cache",

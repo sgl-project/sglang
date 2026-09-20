@@ -24,7 +24,7 @@ register_amd_ci(est_time=1500, suite="nightly-perf-8-gpu-grok1-int4", nightly=Tr
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -57,7 +57,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 # Model and tokenizer paths can be overridden via environment variables
 GROK1_MODEL_PATH = os.environ.get("GROK1_MODEL_PATH", "amd/grok-1-W4A8KV8")
 GROK1_TOKENIZER_PATH = os.environ.get("GROK1_TOKENIZER_PATH", "Xenova/grok-1-tokenizer")
-PROFILE_DIR = "performance_profiles_grok1_int4"
+RESULT_DIR = "performance_results_grok1_int4"
 
 
 class TestNightlyGrok1INT4Performance(unittest.TestCase):
@@ -97,8 +97,8 @@ class TestNightlyGrok1INT4Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_grok1_int4(self):
@@ -119,7 +119,6 @@ class TestNightlyGrok1INT4Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,  # Disable profiling for AMD tests
             )
             results = result_tuple[0]
             success = result_tuple[1]

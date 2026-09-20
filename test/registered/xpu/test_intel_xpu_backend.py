@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=600, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
 
 
 def intel_xpu_benchmark(
@@ -57,7 +57,6 @@ def intel_xpu_benchmark(
 
 
 class TestIntelXPUBackend(CustomTestCase):
-
     @intel_xpu_benchmark(min_throughput=10, mem_fraction_static="0.3")
     def test_latency_qwen_model(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
@@ -73,12 +72,14 @@ class TestIntelXPUBackend(CustomTestCase):
         [
             "--json-model-override-args",
             '{"num_hidden_layers": 4}',
-            "--decode-attention-backend",
+            "--attention-backend",
             "intel_xpu",
+            "--moe-runner-backend",
+            "triton",  # FP8 is not yet supported in sgl-kernel
         ],
         min_throughput=32,
     )
-    def test_mla_decode_attention_backend(self):
+    def test_mla_models_with_intel_xpu_attention_backend(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
 

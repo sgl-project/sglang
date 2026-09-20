@@ -76,7 +76,7 @@ MI35X_GPT_OSS_MODELS = [
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
     ModelConfig(
@@ -97,7 +97,7 @@ MI35X_GPT_OSS_MODELS = [
         ],
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
 ]
@@ -196,9 +196,9 @@ class TestGptOssEvalMI35x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

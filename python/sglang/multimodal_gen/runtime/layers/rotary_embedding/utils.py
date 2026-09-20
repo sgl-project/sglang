@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.diffusion import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
@@ -63,6 +63,34 @@ def _apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
     else:
         return apply_rotary_embedding(x, cos, sin, interleaved)
+
+
+def _apply_rotary_emb_complex(
+    x: torch.Tensor,  # [b, s, h, d]
+    freqs: torch.Tensor,  # [s, 1, d // 2]
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:  # [b, s, h, d]
+    """
+    Apply complex rotary positional embeddings designed for interleaved=True, neox_style=False.
+    Works by mathematically mapping the complex multiplication
+    (a + ib) * (cos + isin) to the interleaved layout.
+
+    Args:
+        x: Input activation tensor in bf16/fp16.
+            Shape: [batch, num_tokens, num_heads, head_size]
+        freqs: Complex-valued frequency tensor, real/imag parts in `dtype`.
+            Shape: [num_tokens, 1, head_size // 2]
+        dtype: Intermediate real dtype for the complex multiply.
+
+    Returns:
+        torch.Tensor: The same shape and dtype as x.
+    """
+    b, s, h, d = x.shape
+
+    x_complex = torch.view_as_complex(x.to(dtype).reshape(b, s, h, d // 2, 2))
+    x_out = torch.view_as_real(x_complex * freqs)
+    x_out = x_out.view(b, s, h, d)
+    return x_out.to(x.dtype)
 
 
 @debug_kernel_api
@@ -128,6 +156,15 @@ def apply_flashinfer_rope_qk_inplace(
             cos = cos_sin_cache[positions, :half_size].to(q.dtype)
             sin = cos_sin_cache[positions, half_size:].to(q.dtype)
 
+        if current_platform.is_npu():
+            q_flat = q.reshape(bsz * seqlen, q_heads, d)
+            k_flat = k.reshape(bsz * seqlen, k_heads, d)
+            q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+            k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
+            return q_rot.view(bsz, seqlen, q_heads, d), k_rot.view(
+                bsz, seqlen, k_heads, d
+            )
+
         def apply_rope_prefix(x: torch.Tensor, num_heads: int) -> torch.Tensor:
             x_flat = x.reshape(bsz * seqlen, num_heads, d)
             x_rot = x_flat[..., :rope_dim]
@@ -159,7 +196,7 @@ def apply_flashinfer_rope_qk_inplace(
             raise ValueError("positions must be a 1D Tensor")
         if positions.numel() != bsz * seqlen:
             raise ValueError(
-                f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
+                f"positions length must be bsz*seqlen={bsz * seqlen}, got {positions.numel()}"
             )
         positions = positions.to(device=q.device, dtype=torch.long)
 

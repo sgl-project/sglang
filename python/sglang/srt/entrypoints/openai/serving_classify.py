@@ -19,8 +19,8 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
-            else self.tokenizer_manager.server_args.model_path
+            else self.tokenizer_manager.model_path
         )
         if not self.id2label:
             raise ValueError("id2label mapping is missing")

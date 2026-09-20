@@ -21,7 +21,7 @@ class CFGBranch:
     is_conditional: bool
     kwargs: dict[str, Any]
 
-    def configure_batch(self, batch: "Req") -> None:
+    def configure_batch(self, batch: Req) -> None:
         """Set batch state before this branch's forward pass.
 
         Override for richer per-branch context (e.g. a branch index instead of
@@ -43,14 +43,17 @@ class CFGPolicy:
     """
 
     branches: list[CFGBranch] = field(default_factory=list)
+    # Gather predictions before combining when a model needs the same bf16
+    # rounding as serial CFG. The default retains legacy WAN all-reduce outputs.
+    parallel_uses_serial_arithmetic: bool = False
 
     def build(
         self,
-        batch: "Req",
+        batch: Req,
         image_kwargs: dict[str, Any],
         pos_cond_kwargs: dict[str, Any],
         neg_cond_kwargs: dict[str, Any],
-    ) -> "CFGPolicy":
+    ) -> CFGPolicy:
         """Return a new policy with branches populated.
 
         Called once before the denoising loop.  The returned policy is
@@ -66,7 +69,7 @@ class CFGPolicy:
     def combine(
         self,
         predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
-        batch: "Req",
+        batch: Req,
         cfg_scale: float,
         pipeline_config: Any,
         *,
@@ -83,7 +86,7 @@ class CFGPolicy:
             return predictions[0]
         pos_t = _wrap(predictions[0])
         neg_t = _wrap(predictions[1])
-        if cfg_parallel:
+        if cfg_parallel and not self.parallel_uses_serial_arithmetic:
             # Match the old CFG-parallel calculation: multiply the positive
             # prediction by cfg_scale and the negative prediction by
             # (1 - cfg_scale) before adding them. The serial CFG formula is
@@ -117,7 +120,7 @@ def _unwrap(
 def _apply_cfg_postprocess(
     noise_pred: torch.Tensor,
     noise_pred_cond: torch.Tensor,
-    batch: "Req",
+    batch: Req,
     pipeline_config: Any,
 ) -> torch.Tensor:
     if batch.cfg_normalization and float(batch.cfg_normalization) > 0:

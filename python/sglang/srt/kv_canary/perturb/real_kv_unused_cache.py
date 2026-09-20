@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional[ForwardBatch],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
-    radix_cache: Optional["BasePrefixCache"],
+    radix_cache: Optional[BasePrefixCache],
     swa_window_size: int,
     sweep_interval: int,
     outer_step_counter: int,
@@ -114,7 +114,7 @@ def run(
 
 def _pick_sweep_slot_for_group(
     *,
-    radix_cache: Optional["BasePrefixCache"],
+    radix_cache: Optional[BasePrefixCache],
     group: CanaryBufferGroup,
     swa_window_size: int,
 ) -> Optional[int]:

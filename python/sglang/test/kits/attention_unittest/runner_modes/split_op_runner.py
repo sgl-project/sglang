@@ -3,16 +3,16 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    enable_piecewise_cuda_graph,
-)
-from sglang.srt.compilation.piecewise_context_manager import (
-    set_forward_context as piecewise_forward_context,
-)
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    enable_tc_piecewise_cuda_graph as enable_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    set_tc_piecewise_forward_context as piecewise_forward_context,
+)
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
@@ -223,14 +223,13 @@ def _make_static_forward_batch(raw_batch, static_num_tokens: int, device: str):
             dim=0,
         )
 
-    raw_batch.num_token_non_padded_cpu = raw_num_tokens
+    raw_batch.global_num_token_non_padded_cpu = raw_num_tokens
     return replace(
         raw_batch,
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        padded_static_len=static_num_tokens,
-        num_token_non_padded_cpu=raw_num_tokens,
+        global_num_token_non_padded_cpu=raw_num_tokens,
     )
 
 

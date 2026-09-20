@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=290, stage="nightly", runner_config="4-gpu-h100")
 register_amd_ci(
     est_time=300,
     suite="nightly-amd-4-gpu",
@@ -90,10 +90,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -150,10 +147,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -296,7 +290,7 @@ def _run_e2e_scenario(
     print(f"Comparator debug output: {debug_file}")
 
     assert result.returncode == 0, (
-        f"Comparator failed (rc={result.returncode}). " f"Debug output: {debug_file}"
+        f"Comparator failed (rc={result.returncode}). Debug output: {debug_file}"
     )
 
 
@@ -325,7 +319,7 @@ def _run_server_and_generate(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
     ]
     if extra_server_args:

@@ -9,24 +9,41 @@ import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
 
-from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DistilledDiTConfig,
+    Ideogram4DiTConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.ideogram import (
     IDEOGRAM4_PRESETS,
+    Ideogram4FastSamplingParams,
+    Ideogram4InstantSamplingParams,
     Ideogram4SamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType, get_module_role
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    _maybe_shard_bitsandbytes_4bit_quant_state,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     FP8_WEIGHT_DTYPE,
+    W8A8_FP8_GEMM_ENV,
+    WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
+    WeightOnlyFP8RowParallelLinear,
     dequantize_rowwise_fp8_weight,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -40,15 +57,37 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
 )
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    hf_to_custom_state_dict,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
+    Ideogram4ColumnParallelLinear,
+    Ideogram4MergedColumnParallelLinear,
+    Ideogram4RMSNorm,
+    Ideogram4RowParallelLinear,
     Ideogram4Transformer2DModel,
+    _gate_residual,
+    _norm_scale,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
 )
+from sglang.multimodal_gen.runtime.pipelines.ideogram import (
+    Ideogram4FastPipeline,
+    _resolve_ideogram4_distilled_components_path,
+    _resolve_ideogram4_unconditional_transformer_weights_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+    DenoisingStepState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ideogram import (
     IMAGE_POSITION_OFFSET,
     LLM_TOKEN_INDICATOR,
@@ -62,6 +101,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
@@ -110,11 +150,35 @@ class FakeIdeogramPipeline:
         }
 
 
+class FakeBnbQuantState:
+    def __init__(
+        self,
+        absmax,
+        shape=None,
+        code=None,
+        blocksize=None,
+        quant_type=None,
+        dtype=None,
+        offset=None,
+        state2=None,
+    ):
+        self.absmax = absmax
+        self.shape = shape
+        self.code = code
+        self.blocksize = blocksize
+        self.quant_type = quant_type
+        self.dtype = dtype
+        self.offset = offset
+        self.state2 = state2
+        self.nested = state2 is not None
+
+
 def _fake_server_args(cfg=None):
     return SimpleNamespace(
         pipeline_config=cfg or Ideogram4PipelineConfig(),
         comfyui_mode=False,
         enable_torch_compile=False,
+        enable_breakable_cuda_graph=False,
         attention_backend="torch_sdpa",
         enable_layerwise_nvtx_marker=False,
         model_loaded={"transformer": True},
@@ -122,6 +186,9 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        component_precisions={},
+        kv_gather_degree=1,
+        sp_split_auto=False,
     )
 
 
@@ -130,6 +197,30 @@ def _fake_ideogram_pipeline(transformer, unconditional_transformer):
 
 
 class TestIdeogram4(unittest.TestCase):
+    def test_lossless_norm_postprocess_preserves_cpu_reference(self):
+        norm = Ideogram4RMSNorm(16, eps=1e-5)
+        x = torch.randn(1, 7, 16)
+        update = torch.randn_like(x)
+        scale = torch.randn(1, 1, 16)
+        gate = torch.randn_like(scale)
+
+        self.assertTrue(
+            torch.equal(_norm_scale(x, scale, norm, False), norm(x) * (1 + scale))
+        )
+        self.assertTrue(
+            torch.equal(
+                _gate_residual(update, gate, x, norm, False),
+                x + torch.tanh(gate) * norm(update),
+            )
+        )
+        self.assertEqual(set(norm.state_dict()), {"weight"})
+
+    def test_ideogram_dit_supports_layerwise_offload(self):
+        self.assertTrue(
+            issubclass(Ideogram4Transformer2DModel, LayerwiseOffloadableModuleMixin)
+        )
+        self.assertEqual(Ideogram4Transformer2DModel.layer_names, ["layers"])
+
     def test_registry_resolves_model_index_class_name(self):
         get_model_info.cache_clear()
         _get_config_info.cache_clear()
@@ -149,6 +240,104 @@ class TestIdeogram4(unittest.TestCase):
             ):
                 os.mkdir(f"{tmpdir}/{subdir}")
             info = get_model_info(tmpdir, backend="sglang")
+        self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
+        self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
+        self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+
+    def test_registry_resolves_comfy_nvfp4_repo_to_native_pipeline(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        info = get_model_info("Comfy-Org/Ideogram-4", backend="sglang")
+
+        self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Nvfp4Pipeline")
+        self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
+        self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+
+    def test_registry_resolves_fal_distilled_repos_to_native_pipelines(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        fast = get_model_info("fal/ideogram-v4-fast", backend="sglang")
+        instant = get_model_info("fal/ideogram-v4-instant", backend="sglang")
+
+        self.assertEqual(fast.pipeline_cls.__name__, "Ideogram4FastPipeline")
+        self.assertIs(fast.pipeline_config_cls, Ideogram4DistilledPipelineConfig)
+        self.assertIs(fast.sampling_param_cls, Ideogram4FastSamplingParams)
+        self.assertEqual(instant.pipeline_cls.__name__, "Ideogram4InstantPipeline")
+        self.assertIs(instant.pipeline_config_cls, Ideogram4DistilledPipelineConfig)
+        self.assertIs(instant.sampling_param_cls, Ideogram4InstantSamplingParams)
+
+    def test_fal_distilled_pipeline_resolves_component_only_repo(self):
+        pipeline = object.__new__(Ideogram4FastPipeline)
+        pipeline.model_path = "fal/ideogram-v4-fast"
+        pipeline._distilled_transformer_path = None
+        server_args = SimpleNamespace(component_paths={})
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.ideogram.snapshot_download",
+                return_value="/cache/fast",
+            ) as download,
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.ideogram._resolve_ideogram4_distilled_components_path",
+                return_value="/cache/components",
+            ),
+        ):
+            transformer = pipeline._resolve_component_path(
+                server_args, "transformer", "transformer"
+            )
+            vae = pipeline._resolve_component_path(server_args, "vae", "vae")
+
+        self.assertEqual(transformer, "/cache/fast/transformer")
+        self.assertEqual(vae, "/cache/components/vae")
+        self.assertNotIn("unconditional_transformer", pipeline._required_config_modules)
+        download.assert_called_once_with(
+            repo_id="fal/ideogram-v4-fast",
+            allow_patterns=["transformer/*"],
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            max_workers=8,
+        )
+
+    def test_fal_distilled_pipeline_downloads_pinned_shared_components(self):
+        _resolve_ideogram4_distilled_components_path.cache_clear()
+        try:
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines.ideogram.snapshot_download",
+                return_value="/cache/components",
+            ) as download:
+                path = _resolve_ideogram4_distilled_components_path()
+        finally:
+            _resolve_ideogram4_distilled_components_path.cache_clear()
+
+        self.assertEqual(path, "/cache/components")
+        download.assert_called_once_with(
+            repo_id="ideogram-ai/ideogram-4-nf4-diffusers",
+            revision="1874bc70267ba2c823a7239e1d70dd308c8d64dc",
+            allow_patterns=[
+                "model_index.json",
+                "scheduler/*",
+                "text_encoder/*",
+                "tokenizer/*",
+                "vae/*",
+            ],
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            max_workers=8,
+        )
+
+    def test_registry_resolves_official_nf4_repo_to_native_pipeline(self):
+        get_model_info.cache_clear()
+        _get_config_info.cache_clear()
+
+        with patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={
+                "_class_name": "Ideogram4Pipeline",
+                "_diffusers_version": "0.0.0",
+            },
+        ):
+            info = get_model_info("ideogram-ai/ideogram-4-nf4", backend="sglang")
+
         self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
         self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
         self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
@@ -193,7 +382,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             torch.manual_seed(0)
             batch_size, seq_len, num_heads, head_dim = 2, 5, 2, 8
@@ -278,6 +472,17 @@ class TestIdeogram4(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown Ideogram 4 preset"):
             Ideogram4SamplingParams(preset="V4_FAST")
 
+    def test_ideogram_distilled_sampling_defaults(self):
+        fast = Ideogram4FastSamplingParams()
+        instant = Ideogram4InstantSamplingParams()
+
+        self.assertEqual(fast.preset, "V4_FAST_20")
+        self.assertEqual(fast.num_inference_steps, 20)
+        self.assertEqual(fast.guidance_scale, 1.0)
+        self.assertEqual(instant.preset, "V4_INSTANT_8")
+        self.assertEqual(instant.num_inference_steps, 8)
+        self.assertEqual(instant.guidance_scale, 1.0)
+
     def test_ideogram_sampling_params_merge_recomputes_preset_fields(self):
         target = Ideogram4SamplingParams()
         user = Ideogram4SamplingParams(
@@ -305,6 +510,9 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
+            component_weights_paths={},
+            component_quantizations={},
+            component_quantization_ignored_layers={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -312,6 +520,51 @@ class TestIdeogram4(unittest.TestCase):
         self.assertIsNot(component_args, server_args)
         self.assertIsNone(component_args.transformer_weights_path)
         self.assertIsNone(component_args.nunchaku_config)
+
+    def test_transformer_component_uses_per_component_weights_override(self):
+        server_args = SimpleNamespace(
+            transformer_weights_path=(
+                "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
+            ),
+            nunchaku_config={"enabled": True},
+            component_weights_paths={
+                "unconditional_transformer": (
+                    "/ckpt/diffusion_models/"
+                    "ideogram4_unconditional_nvfp4_mixed.safetensors"
+                )
+            },
+            component_quantizations={"unconditional_transformer": "fp8"},
+            component_quantization_ignored_layers={
+                "unconditional_transformer": ["lm_head"]
+            },
+        )
+
+        component_args = _server_args_for_transformer_component(
+            server_args,
+            "unconditional_transformer",
+        )
+
+        self.assertIsNot(component_args, server_args)
+        self.assertEqual(
+            component_args.transformer_weights_path,
+            "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
+        )
+        self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
+        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
+
+    def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
+        self.assertEqual(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
+            ),
+            "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
+        )
+        self.assertIsNone(
+            _resolve_ideogram4_unconditional_transformer_weights_path(
+                "/ckpt/custom_transformer.safetensors"
+            )
+        )
 
     def test_ideogram_denoiser_does_not_request_dtype_cast(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -339,6 +592,25 @@ class TestIdeogram4(unittest.TestCase):
             ],
         )
         self.assertTrue(all(use.target_dtype is None for use in uses))
+
+    def test_ideogram_distilled_denoiser_uses_one_transformer(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(_fake_server_args())
+            transformer = FakeIdeogramTransformer()
+            stage = Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=None,
+                pipeline=_fake_ideogram_pipeline(transformer, None),
+            )
+            uses = stage.component_uses(_fake_server_args(), "stage")
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual([use.component_name for use in uses], ["transformer"])
+        self.assertIsNone(stage._dual_transformer_execution_mode())
 
     def test_ideogram_stages_inherit_common_stage_bases(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -500,12 +772,12 @@ class TestIdeogram4(unittest.TestCase):
             ["transformer", "unconditional_transformer"],
         )
 
-    def test_ideogram_attention_backend_is_passed_from_config(self):
+    def test_ideogram_attention_backend_is_declared_by_runtime_model(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         config = Ideogram4DiTConfig()
         self.assertEqual(
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
         prev_args = server_args_module._global_server_args
@@ -522,7 +794,7 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(
             model.supported_attention_backends,
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
         )
         self.assertEqual(
             model.layers[0].attention.attn.backend,
@@ -535,7 +807,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -553,6 +830,345 @@ class TestIdeogram4(unittest.TestCase):
             tuple(state["layers.0.attention.qkv.weight"].shape), (13824, 4608)
         )
         self.assertEqual(state["layers.0.attention.qkv.weight"].dtype, FP8_WEIGHT_DTYPE)
+
+    def test_distilled_ideogram_dit_uses_unquantized_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with patch(
+                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                return_value=1,
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DistilledDiTConfig(), {}
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertIsInstance(model.input_proj.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(
+            model.layers[0].attention.qkv.quant_method, UnquantizedLinearMethod
+        )
+        state = model.state_dict()
+        self.assertEqual(tuple(state["input_proj.weight"].shape), (4608, 128))
+        self.assertNotIn("input_proj.weight_scale", state)
+        self.assertNotIn("layers.0.attention.qkv.weight_scale", state)
+
+    def test_distilled_ideogram_maps_diffusers_attention_weights(self):
+        mapping = get_param_names_mapping(
+            Ideogram4DistilledDiTConfig().arch_config.param_names_mapping
+        )
+        weights = [
+            ("layers.0.attention.to_q.weight", torch.full((2, 2), 1.0)),
+            ("layers.0.attention.to_k.weight", torch.full((2, 2), 2.0)),
+            ("layers.0.attention.to_v.weight", torch.full((2, 2), 3.0)),
+            ("layers.0.attention.to_out.0.weight", torch.full((2, 2), 4.0)),
+        ]
+
+        mapped, _ = hf_to_custom_state_dict(iter(weights), mapping)
+
+        torch.testing.assert_close(
+            mapped["layers.0.attention.qkv.weight"],
+            torch.cat([weight for _, weight in weights[:3]], dim=0),
+        )
+        torch.testing.assert_close(mapped["layers.0.attention.o.weight"], weights[3][1])
+
+    def test_distilled_ideogram_dit_uses_tp_unquantized_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DistilledDiTConfig(), {}
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertIsInstance(model.input_proj, Ideogram4ColumnParallelLinear)
+        self.assertIsInstance(
+            model.layers[0].attention.qkv, Ideogram4MergedColumnParallelLinear
+        )
+        self.assertIsInstance(model.layers[0].attention.o, Ideogram4RowParallelLinear)
+        self.assertIsInstance(model.input_proj.quant_method, UnquantizedLinearMethod)
+        self.assertEqual(tuple(model.input_proj.weight.shape), (2304, 128))
+        self.assertEqual(
+            tuple(model.layers[0].attention.qkv.weight.shape), (6912, 4608)
+        )
+        self.assertEqual(tuple(model.layers[0].attention.o.weight.shape), (4608, 2304))
+
+    def test_ideogram_dit_uses_tp_fp8_linears_when_tp_is_initialized(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(Ideogram4DiTConfig(), {})
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertIsInstance(model.input_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertEqual(tuple(model.input_proj.weight.shape), (2304, 128))
+        self.assertEqual(
+            tuple(model.layers[0].attention.qkv.weight.shape), (6912, 4608)
+        )
+
+    def test_ideogram_dit_nvfp4_quant_config_uses_native_fp4_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=[
+                "input_proj",
+                "llm_cond_proj",
+                "t_embedding.*",
+                "adaln_proj",
+                "layers.*.adaln_modulation",
+                "final_layer.*",
+            ],
+        )
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DiTConfig(),
+                        {},
+                        quant_config=quant_config,
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(model.layers[0].attention.qkv.prefix, "layers.0.attention.qkv")
+        self.assertIsInstance(
+            model.layers[0].attention.qkv.quant_method,
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(model.input_proj.quant_method, UnquantizedLinearMethod)
+
+        state = model.state_dict()
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight"].shape),
+            (13824, 2304),
+        )
+        self.assertEqual(state["layers.0.attention.qkv.weight"].dtype, torch.uint8)
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight_scale"].shape),
+            (13824, 288),
+        )
+        self.assertEqual(
+            state["layers.0.attention.qkv.weight_scale"].dtype,
+            FP8_WEIGHT_DTYPE,
+        )
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.weight_scale_2"].shape),
+            (1,),
+        )
+        self.assertEqual(
+            tuple(state["layers.0.attention.qkv.input_scale"].shape),
+            (1,),
+        )
+
+    def test_ideogram_dit_tp_nvfp4_uses_megatron_parallel_quant_linears(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.ideogram.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
+            ):
+                with torch.device("meta"):
+                    model = Ideogram4Transformer2DModel(
+                        Ideogram4DiTConfig(),
+                        {},
+                        quant_config=quant_config,
+                    )
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertFalse(model.layers[0].attention.qkv.gather_output)
+        self.assertEqual(
+            tuple(model.layers[0].attention.qkv.weight.shape), (6912, 2304)
+        )
+        self.assertIsInstance(
+            model.layers[0].attention.qkv.quant_method,
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(model.layers[0].attention.o, Ideogram4RowParallelLinear)
+        self.assertTrue(model.layers[0].attention.o.input_is_parallel)
+        self.assertFalse(model.layers[0].feed_forward.w1.gather_output)
+        self.assertFalse(model.layers[0].feed_forward.w3.gather_output)
+        self.assertIsInstance(
+            model.layers[0].feed_forward.w2, Ideogram4RowParallelLinear
+        )
+        self.assertTrue(model.layers[0].feed_forward.w2.input_is_parallel)
+
+    def test_bitsandbytes_tp_quant_state_uses_local_output_shard(self):
+        param = torch.nn.Parameter(
+            torch.empty(8, 1, dtype=torch.uint8), requires_grad=False
+        )
+        param.bnb_full_shape = (4, 8)
+        param.bnb_local_shape = (2, 8)
+        param.bnb_output_shard_start = 2
+        param.bnb_input_shard_start = 0
+        quant_state = FakeBnbQuantState(
+            absmax=torch.arange(8, dtype=torch.float32),
+            shape=torch.Size((4, 8)),
+            code=torch.ones(16, dtype=torch.float32),
+            blocksize=4,
+            quant_type="nf4",
+            dtype=torch.bfloat16,
+        )
+
+        sharded = _maybe_shard_bitsandbytes_4bit_quant_state(param, quant_state)
+
+        self.assertEqual(sharded.shape, torch.Size((2, 8)))
+        torch.testing.assert_close(sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+
+    def test_assign_load_preserves_bitsandbytes_tp_attrs(self):
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty(8, 1, dtype=torch.uint8), requires_grad=False
+                )
+                self.weight.bnb_full_shape = (4, 8)
+                self.weight.bnb_local_shape = (2, 8)
+                self.weight.bnb_output_shard_start = 2
+                self.weight.bnb_input_shard_start = 0
+
+        model = TinyModule()
+        load_model_from_full_model_state_dict(
+            model,
+            iter([("weight", torch.ones(8, 1, dtype=torch.uint8))]),
+            torch.device("cpu"),
+            param_dtype=None,
+            strict=True,
+            param_names_mapping=lambda name: (name, None, None),
+        )
+
+        self.assertEqual(model.weight.bnb_full_shape, (4, 8))
+        self.assertEqual(model.weight.bnb_local_shape, (2, 8))
+        self.assertEqual(model.weight.bnb_output_shard_start, 2)
+        self.assertEqual(model.weight.bnb_input_shard_start, 0)
 
     def test_missing_weight_only_fp8_scale_is_fatal(self):
         with torch.device("meta"):
@@ -604,6 +1220,24 @@ class TestIdeogram4(unittest.TestCase):
         self.assertEqual(model.weight.dtype, FP8_WEIGHT_DTYPE)
         self.assertEqual(model.weight_scale.dtype, torch.float32)
 
+    def test_weight_only_fp8_w8a8_gemm_defaults_to_off(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "0"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_env_opt_in(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False)
+
+        self.assertTrue(model.enable_fused_w8a8)
+
+    def test_weight_only_fp8_w8a8_gemm_explicit_flag_overrides_env(self):
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}):
+            model = WeightOnlyFP8Linear(3, 2, bias=False, enable_fused_w8a8=False)
+
+        self.assertFalse(model.enable_fused_w8a8)
+
     def test_ideogram_text_encoder_post_config_hook_preserves_local_arch(self):
         config = Ideogram4TextEncoderConfig()
         config.arch_config.architectures = ["RemoteQwen3VLTextModel"]
@@ -613,6 +1247,27 @@ class TestIdeogram4(unittest.TestCase):
             config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
         )
         self.assertTrue(config.arch_config.ideogram_fp8_weight_only)
+        self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.requires_gpu_resident_text_encoder)
+
+    def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
+        config = Ideogram4TextEncoderConfig()
+        config.update_model_arch(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                }
+            }
+        )
+
+        self.assertEqual(
+            config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
+        )
+        self.assertTrue(config.arch_config.ideogram_bnb_4bit_weight_only)
+        self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
+        self.assertTrue(config.arch_config.requires_gpu_resident_text_encoder)
 
     def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
         config = Ideogram4TextEncoderConfig()
@@ -633,20 +1288,131 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
-            with torch.device("meta"):
+            with (
+                patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
+                torch.device("meta"),
+            ):
                 encoder = IdeogramQwen3VLTextEncoder(config)
         finally:
             set_global_server_args(prev_args)
-        self.assertTrue(
-            any(isinstance(module, WeightOnlyFP8Linear) for module in encoder.modules())
-        )
+        fp8_linears = [
+            module
+            for module in encoder.modules()
+            if isinstance(module, WeightOnlyFP8Linear)
+        ]
+        self.assertTrue(fp8_linears)
+        self.assertTrue(all(not module.enable_fused_w8a8 for module in fp8_linears))
         self.assertFalse(
             any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
         )
 
-    def test_denoise_and_decode_shape_smoke(self):
+    def test_ideogram_text_encoder_tp_fp8_uses_megatron_parallel_linears(self):
+        config = Ideogram4TextEncoderConfig()
+        config.post_diffusers_config_update()
+        config.arch_config.text_config = Qwen3VLTextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=4,
+            max_position_embeddings=64,
+            pad_token_id=0,
+        )
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
+            )
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.model_parallel_is_initialized",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.get_tp_world_size",
+                    return_value=2,
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8.get_tp_group",
+                    return_value=fake_tp_group,
+                ),
+            ):
+                with torch.device("meta"):
+                    encoder = IdeogramQwen3VLTextEncoder(config)
+        finally:
+            set_global_server_args(prev_args)
+
+        layer = encoder.language_model.layers[0]
+        self.assertEqual(layer.self_attn.num_heads, 2)
+        self.assertEqual(layer.self_attn.num_key_value_heads, 2)
+        self.assertIsInstance(layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.self_attn.q_proj.gather_output)
+        self.assertIsInstance(layer.self_attn.o_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.self_attn.o_proj.input_is_parallel)
+        self.assertTrue(layer.self_attn.o_proj.reduce_results)
+        self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.mlp.gate_proj.gather_output)
+        self.assertIsInstance(layer.mlp.up_proj, WeightOnlyFP8ColumnParallelLinear)
+        self.assertFalse(layer.mlp.up_proj.gather_output)
+        self.assertIsInstance(layer.mlp.down_proj, WeightOnlyFP8RowParallelLinear)
+        self.assertTrue(layer.mlp.down_proj.input_is_parallel)
+        self.assertTrue(layer.mlp.down_proj.reduce_results)
+
+    def test_ideogram_nf4_text_encoder_is_replicated_under_tp(self):
+        config = Ideogram4TextEncoderConfig()
+        config.update_model_arch(
+            {
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                }
+            }
+        )
+        config.arch_config.text_config = Qwen3VLTextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            pad_token_id=0,
+        )
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.encoders.ideogram.BitsAndBytesConfig.from_config",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.models.encoders.ideogram.Qwen3VLTextModel"
+            ) as text_model,
+        ):
+            text_model.return_value = torch.nn.Identity()
+            IdeogramQwen3VLTextEncoder(config)
+
+        self.assertFalse(text_model.call_args.kwargs["use_tensor_parallel"])
+
+    def test_denoise_and_decode_shape_check(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         cfg = Ideogram4PipelineConfig()
@@ -697,6 +1463,127 @@ class TestIdeogram4(unittest.TestCase):
             set_global_server_args(prev_args)
 
         self.assertEqual(tuple(decoded.output.shape), (1, 3, 2, 2))
+
+    def test_ideogram_bcg_padded_positive_output_is_cropped(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+        cfg = Ideogram4PipelineConfig()
+        args = _fake_server_args(cfg)
+        device = get_local_torch_device()
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(args)
+            transformer = FakeIdeogramTransformer()
+            unconditional_transformer = FakeIdeogramTransformer()
+            stage = Ideogram4DenoisingStage(
+                transformer=transformer,
+                unconditional_transformer=unconditional_transformer,
+                pipeline=_fake_ideogram_pipeline(
+                    transformer, unconditional_transformer
+                ),
+            )
+            batch = Req(
+                sampling_params=Ideogram4SamplingParams(
+                    prompt="11 12",
+                    height=256,
+                    width=512,
+                    preset="V4_TURBO_12",
+                    suppress_logs=True,
+                )
+            )
+            batch.prompt_embeds = [torch.zeros(1, 3, 8, device=device)]
+            batch.extra["ideogram4"] = {
+                "max_text_tokens": 1,
+                "num_image_tokens": 2,
+                "position_ids": torch.zeros(1, 3, 3, dtype=torch.long, device=device),
+                "segment_ids": torch.ones(1, 3, dtype=torch.long, device=device),
+                "indicator": torch.tensor(
+                    [
+                        [
+                            LLM_TOKEN_INDICATOR,
+                            OUTPUT_IMAGE_INDICATOR,
+                            OUTPUT_IMAGE_INDICATOR,
+                        ]
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                ),
+            }
+            ctx = DenoisingContext(
+                scheduler=None,
+                extra_step_kwargs={},
+                target_dtype=torch.float32,
+                autocast_enabled=False,
+                timesteps=torch.tensor([0], device=device),
+                num_inference_steps=1,
+                num_warmup_steps=0,
+                image_kwargs={},
+                pos_cond_kwargs={},
+                neg_cond_kwargs={},
+                latents=torch.zeros(1, 2, 128, device=device),
+                boundary_timestep=None,
+                z=None,
+                reserved_frames_mask=None,
+                seq_len=None,
+                guidance=torch.ones(1, device=device),
+                is_warmup=False,
+                extra={
+                    "ideogram4_schedule_values": torch.tensor(
+                        [1.0, 0.0], device=device
+                    ),
+                    "ideogram4_schedule_deltas": torch.tensor([1.0], device=device),
+                    "ideogram4_guidance_schedule": torch.tensor([1.0], device=device),
+                    "ideogram4_text_z_padding": torch.zeros(1, 1, 128, device=device),
+                    "ideogram4_attn_mask": torch.ones(
+                        1, 3, dtype=torch.bool, device=device
+                    ),
+                    "ideogram4_attn_mask_meta": None,
+                    "ideogram4_neg_position_ids": torch.zeros(
+                        1, 2, 3, dtype=torch.long, device=device
+                    ),
+                    "ideogram4_neg_segment_ids": torch.ones(
+                        1, 2, dtype=torch.long, device=device
+                    ),
+                    "ideogram4_neg_indicator": torch.full(
+                        (1, 2),
+                        OUTPUT_IMAGE_INDICATOR,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    "ideogram4_neg_attn_mask": torch.ones(
+                        1, 2, dtype=torch.bool, device=device
+                    ),
+                    "ideogram4_neg_attn_mask_meta": None,
+                    "ideogram4_neg_llm_features": torch.zeros(1, 2, 8, device=device),
+                },
+            )
+            step = DenoisingStepState(
+                step_index=0,
+                t_host=torch.tensor(0),
+                t_device=torch.tensor(0, device=device),
+                t_int=0,
+                current_model=transformer,
+                current_guidance_scale=None,
+                attn_metadata=None,
+            )
+
+            def fake_run(current_model, call_kwargs):
+                if current_model is transformer:
+                    out = torch.zeros(1, 5, 128, device=device)
+                    out[:, 1:3] = 4.0
+                    out[:, 3:] = 99.0
+                    return out
+                return torch.ones(1, 2, 128, device=device)
+
+            with patch.object(stage, "_run_ideogram_transformer", side_effect=fake_run):
+                stage._run_denoising_step(ctx, step, batch, args)
+        finally:
+            set_global_server_args(prev_args)
+
+        self.assertEqual(tuple(ctx.latents.shape), (1, 2, 128))
+        self.assertTrue(
+            torch.allclose(ctx.latents, torch.full((1, 2, 128), 4.0, device=device))
+        )
 
     def test_text_input_builder_matches_official_layout(self):
         prev_args = None

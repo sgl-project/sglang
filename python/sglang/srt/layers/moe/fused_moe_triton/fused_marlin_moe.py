@@ -2,7 +2,10 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -11,8 +14,71 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
-    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+
+
+@triton.jit
+def _tl_tanh(x):
+    return 2.0 * tl.sigmoid(2.0 * x) - 1.0
+
+
+@triton.jit
+def _situ_and_mul_kernel(
+    x_ptr,  # [M, 2N] gate;up halves (non-interleaved)
+    out_ptr,  # [M, N]
+    N,
+    situ_beta,
+    linear_beta,
+    stride_xm,
+    stride_om,
+    BLOCK_N: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < N
+    base = x_ptr + pid_m * stride_xm
+    gate = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(base + N + offs, mask=mask, other=0.0).to(tl.float32)
+    gate = situ_beta * _tl_tanh(gate / situ_beta) * tl.sigmoid(gate)
+    if HAS_LINEAR_BETA:
+        up = linear_beta * _tl_tanh(up / linear_beta)
+    out = gate * up
+    tl.store(
+        out_ptr + pid_m * stride_om + offs,
+        out.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def situ_and_mul(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    situ_beta: float,
+    linear_beta: Optional[float],
+) -> None:
+    """SiTU gated activation (Kimi K3), fused into one elementwise kernel:
+    out = situ_beta*tanh(gate/situ_beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+    where x = [gate; up] halves along the last dim.
+    """
+    M, N2 = x.shape
+    N = N2 // 2
+    assert output.shape == (M, N)
+    BLOCK_N = 1024
+    grid = (M, triton.cdiv(N, BLOCK_N))
+    _situ_and_mul_kernel[grid](
+        x,
+        output,
+        N,
+        float(situ_beta),
+        float(linear_beta) if linear_beta is not None else 0.0,
+        x.stride(0),
+        output.stride(0),
+        BLOCK_N=BLOCK_N,
+        HAS_LINEAR_BETA=linear_beta is not None,
+    )
 
 
 def get_scalar_type(
@@ -53,6 +119,18 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def swiglu_gpt_oss_sigmoid_alpha_contiguous(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    gemm1_alpha: float,
+    gemm1_limit: float,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d].clamp(max=gemm1_limit)
+    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
+    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -73,12 +151,15 @@ def fused_marlin_moe(
     w2_zeros: Optional[torch.Tensor] = None,
     w1_global_scale: Optional[torch.Tensor] = None,
     w2_global_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
 ) -> torch.Tensor:
@@ -113,9 +194,9 @@ def fused_marlin_moe(
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
-    assert hidden_states.shape[1] == w2.shape[2] // (
-        num_bits // 2
-    ), "Hidden size mismatch w2"
+    assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
+        "Hidden size mismatch w2"
+    )
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
@@ -140,12 +221,12 @@ def fused_marlin_moe(
             f"activations, got {hidden_states.dtype}"
         )
     elif not is_nvfp4_marlin:
-        assert (
-            hidden_states.dtype == w1_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
-        assert (
-            hidden_states.dtype == w2_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+        assert hidden_states.dtype == w1_scale.dtype, (
+            f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+        )
+        assert hidden_states.dtype == w2_scale.dtype, (
+            f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+        )
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -162,9 +243,25 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, global_num_experts
-    )
+    if (
+        M == 1
+        and topk <= 32
+        and expert_map is None
+        # The JIT kernel is int32-only; torch-native topk emits int64 -- let
+        # that (test-only) shape take the generic path instead of casting.
+        and topk_ids.dtype == torch.int32
+    ):
+        # Single-token decode: top-k ids are distinct, so alignment is a
+        # single-warp sort instead of the align + count_and_sort kernel pair.
+        from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
+            topk_ids, block_size_m
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, block_size_m, global_num_experts
+        )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (
@@ -189,7 +286,8 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache13 = torch.empty(
+    # Marlin skips masked expert rows, so their shared cache must start at zero.
+    intermediate_cache13 = torch.zeros(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -208,7 +306,7 @@ def fused_marlin_moe(
         hidden_states,
         intermediate_cache1,
         w1,
-        None,  # b_bias_or_none
+        w1_bias,
         w1_scale,
         w1_global_scale,
         w1_zeros,
@@ -233,7 +331,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and clamp_limit is not None:
+    if activation == "silu" and is_gated and gemm1_alpha is not None:
+        if clamp_limit is None:
+            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        swiglu_gpt_oss_sigmoid_alpha_contiguous(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, gemm1_n),
+            gemm1_alpha,
+            clamp_limit,
+        )
+    elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
@@ -241,6 +348,13 @@ def fused_marlin_moe(
         )
     elif activation == "silu" and is_gated:
         silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "situ" and is_gated:
+        situ_and_mul(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, gemm1_n),
+            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
+            linear_beta=clamp_limit,
+        )
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:
@@ -255,7 +369,7 @@ def fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        None,  # b_bias_or_none
+        w2_bias,
         w2_scale,
         w2_global_scale,
         w2_zeros,
@@ -280,10 +394,28 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
-    output = hidden_states if inplace else torch.empty_like(hidden_states)
+    output = zero_copy_context.get_moe_output(hidden_states)
+    if output is None:
+        output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        return torch.sum(intermediate_cache3, dim=1, out=output)
+        # Top-k weights (incl. routed scaling) are already applied above via
+        # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
+        # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
+        # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
+        # reduce_kernel torch.sum dispatches to (~6.7us).
+        if (
+            intermediate_cache3.dtype == torch.bfloat16
+            and intermediate_cache3.is_contiguous()
+            and output.is_contiguous()
+            and intermediate_cache3.shape[-1] % 8 == 0
+        ):
+            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(intermediate_cache3, output)
+        else:
+            moe_sum_reduce(intermediate_cache3, output, 1.0)
+        return output
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0

@@ -24,6 +24,7 @@ from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
@@ -51,10 +52,12 @@ def pynccl_allreduce(
 
 def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
     graph_input = inp_randn.clone()
+    graph_input_snapshot = inp_randn.clone()
     with graph_capture() as graph_capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
             for _ in range(graph_loop):
+                graph_input.copy_(graph_input_snapshot)
                 graph_out = func(graph_input)
 
     graph.replay()
@@ -222,3 +225,7 @@ if __name__ == "__main__":
         prof_dir = f"prof/msccl"
         os.makedirs(prof_dir, exist_ok=True)
         ctx.export_chrome_trace(f"{prof_dir}/trace_rank{dist.get_rank()}.json.gz")
+
+    pymscclpp_comm.destroy()
+    dist.barrier()
+    cleanup_dist_env_and_memory()

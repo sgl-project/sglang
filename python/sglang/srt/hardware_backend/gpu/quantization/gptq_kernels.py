@@ -40,14 +40,10 @@ def _unsupported_kernel(*args, **kwargs):
     raise RuntimeError("GPTQ CUDA kernels are unavailable on the current platform.")
 
 
-gptq_gemm = _unsupported_kernel
 gptq_marlin_repack = _unsupported_kernel
-gptq_shuffle = _unsupported_kernel
 
 try:
-    from sgl_kernel import gptq_gemm, gptq_shuffle
-
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 except Exception:
     pass
 
@@ -82,54 +78,8 @@ def gptq_marlin_moe_repack(
     return output
 
 
-class GPTQLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
-        self.quant_config = quant_config
-        self.use_shuffle = True
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # for torch.compile
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-
-        # exllama needs to shuffle the weight after the weight is loaded
-        # here we do the shuffle on first forward pass
-        if self.use_shuffle:
-            if self.quant_config.desc_act:
-                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
-            else:
-                layer.g_idx.data = torch.empty(
-                    (0,), dtype=torch.int, device=layer.g_idx.device
-                )
-            gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
-        reshaped_x = x.reshape(-1, x.shape[-1])
-
-        output = gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            self.use_shuffle,
-            self.quant_config.weight_bits,
-        )
-        if bias is not None:
-            output.add_(bias)
-        return output.reshape(out_shape)
-
-
 class GPTQMarlinLinearKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -160,7 +110,6 @@ class GPTQMarlinLinearKernel:
             layer: torch.nn.Module, name: Optional[str], fn: Callable
         ) -> None:
             if name is not None and getattr(layer, name, None) is not None:
-
                 old_param = getattr(layer, name)
                 new_param = fn(old_param)
                 # replace the parameter with torch.nn.Parameter for TorchDynamo
@@ -270,7 +219,7 @@ class GPTQMarlinLinearKernel:
 
 
 class GPTQMarlinMoEKernel:
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+    def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -355,7 +304,7 @@ class GPTQMarlinMoEKernel:
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
@@ -364,8 +313,8 @@ class GPTQMarlinMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
             w2_qweight=layer.w2_qweight,

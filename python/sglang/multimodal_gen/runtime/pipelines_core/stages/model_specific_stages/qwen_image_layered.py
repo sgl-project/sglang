@@ -12,11 +12,12 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import align_tensor_to_module_dtype
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 logger = init_logger(__name__)
 
@@ -53,6 +54,14 @@ def _seq_lens_from_optional_mask(
     if prompt_embeds_mask is None:
         return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
     return [int(x) for x in prompt_embeds_mask.sum(dim=1).tolist()]
+
+
+def _resolve_layered_image_path(image_path: str | list[str]) -> str:
+    if isinstance(image_path, str):
+        return image_path
+    if isinstance(image_path, list) and image_path:
+        return image_path[0]
+    raise ValueError("Qwen-Image-Layered requires a non-empty image_path.")
 
 
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus.calculate_dimensions
@@ -155,7 +164,6 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         processor,
         transformer,
         scheduler,
-        model_path,
         vae_dtype: torch.dtype,
         text_encoder_dtype: torch.dtype,
     ) -> None:
@@ -163,15 +171,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae = vae.to(dtype=vae_dtype)
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
-        if text_encoder is None:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-
-            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder"
-            )
-        self.text_encoder = text_encoder.to(
-            device=get_local_torch_device(), dtype=self.text_encoder_dtype
-        )
+        self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -276,11 +276,12 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             padding=True,
             return_tensors="pt",
         ).to(device)
-        encoder_hidden_states = self.text_encoder(
-            input_ids=txt_tokens.input_ids,
-            attention_mask=txt_tokens.attention_mask,
-            output_hidden_states=True,
-        )
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            encoder_hidden_states = self.text_encoder(
+                input_ids=txt_tokens.input_ids,
+                attention_mask=txt_tokens.attention_mask,
+                output_hidden_states=True,
+            )
         hidden_states = encoder_hidden_states.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(
             hidden_states, txt_tokens.attention_mask
@@ -368,6 +369,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None
             self.vae = vae
+            image = align_tensor_to_module_dtype(image, self.vae)
             if isinstance(generator, list):
                 image_latents = [
                     retrieve_latents(
@@ -422,7 +424,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         image_latents = None
         if image is not None:
-            image = image.to(device=device, dtype=dtype)
+            image = align_tensor_to_module_dtype(image, self.vae, device=device)
             if image.shape[1] != self.latent_channels:
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
@@ -488,7 +490,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         generator = batch.generator
 
         assert batch.image_path is not None
-        image = load_image(batch.image_path[0])
+        image = load_image(_resolve_layered_image_path(batch.image_path))
         image = image.convert("RGBA")
         image_size = image.size
         resolution = server_args.pipeline_config.resolution
@@ -502,6 +504,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         multiple_of = self.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
+        batch.width = width
+        batch.height = height
 
         # if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
         image = self.image_processor.resize(image, calculated_height, calculated_width)
@@ -510,7 +514,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image, calculated_height, calculated_width
         )
         image = image.unsqueeze(2)
-        image = image.to(dtype=self.vae_dtype)
+        image = align_tensor_to_module_dtype(image, self.vae, device=device)
 
         prompt = batch.prompt
         with self.use_declared_component(
@@ -567,7 +571,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         # 5. Prepare timesteps
         scheduler = self.scheduler
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
-        image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -582,8 +585,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         negative_txt_seq_lens = _seq_lens_from_optional_mask(
             negative_prompt_embeds, negative_prompt_embeds_mask
         )
-        is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
-
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.prompt_seq_lens = [txt_seq_lens]
