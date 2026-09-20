@@ -1208,6 +1208,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        if self._requires_response_template_detokenization(request):
+            configure_response_template_request(request)
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1310,6 +1312,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request
             )
 
+    def _requires_response_template_detokenization(self, request) -> bool:
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            return True
+
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return (
+            request.tool_choice != "none"
+            and bool(self._effective_tools(request))
+            and tool_detector is not None
+            and issubclass(tool_detector, ResponseTemplateToolDetector)
+        )
+
     def _response_parser_prefix(self, adapted_request: GenerateReqInput) -> str:
         prompt = getattr(adapted_request, "text", None)
         if isinstance(prompt, str):
@@ -1396,8 +1410,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                if isinstance(parser.detector, ResponseTemplateToolDetector):
-                    configure_response_template_request(request)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -2812,9 +2824,6 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
-
-        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
-            configure_response_template_request(request)
 
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder takes history as ``reasoning_content`` rather

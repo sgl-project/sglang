@@ -697,14 +697,20 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.tm.model_config.is_multimodal = True
 
+        def process_messages(request, _):
+            self.assertIsNone(request.chat_template_kwargs)
+            return processed_messages
+
         with patch.object(
             self.chat,
             "_process_messages",
-            return_value=processed_messages,
+            side_effect=process_messages,
         ):
-            _, request = self.chat._convert_to_internal_request(self.basic_req)
+            adapted, request = self.chat._convert_to_internal_request(self.basic_req)
 
         self.assertEqual(request._response_parser_prefix, "exact engine prompt")
+        self.assertFalse(request.skip_special_tokens)
+        self.assertFalse(adapted.sampling_params["spaces_between_special_tokens"])
         self.tm.tokenizer.decode.assert_not_called()
 
     def test_chat_applies_pd_header_overrides(self):
