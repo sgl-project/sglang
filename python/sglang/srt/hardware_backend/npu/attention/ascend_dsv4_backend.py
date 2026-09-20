@@ -1559,6 +1559,12 @@ class DeepseekV4AscendAttnBackend(
         fm = ctx.fm
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         if ctx.ragged_layout is not None:
+            verify_seq_lens_cpu = ctx.final_seq_lens_cpu
+            verify_seq_lens_cpu = torch.where(
+                ctx.live_seq_lens_cpu > 0,
+                verify_seq_lens_cpu,
+                ctx.live_seq_lens_cpu,
+            )
             self._fill_ragged_verify_positions_cmp_padding_one(
                 positions=ctx.forward_batch.positions,
                 dst=fm.positions_cmp_padding_c4,
