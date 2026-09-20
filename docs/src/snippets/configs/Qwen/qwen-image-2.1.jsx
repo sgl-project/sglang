@@ -210,7 +210,7 @@ const config = {
         { id: "eager", label: "Eager", recommended: true },
         {
           id: "bcg", label: "Breakable CUDA Graph",
-          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
+          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`],
           soft: true, softReason: "A 1024px H200 server captured its warmup graph, but tested requests fell back to eager because condition-prefix shapes differed.",
           description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
         },
