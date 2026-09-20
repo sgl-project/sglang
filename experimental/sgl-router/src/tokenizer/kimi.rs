@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kimi's segmented encoding preserves control tokens and Python's chunk boundaries.
+//! Model-file loading and parity guards for Dynamo's native Kimi support.
 
 use anyhow::{Context, Result};
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
@@ -33,64 +33,25 @@ pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
     Ok(Arc::new(tokenizer))
 }
 
-// The pinned renderer defaults a null effort to max; the engine omits its preamble.
-pub fn without_effort_preamble(
-    prompt: dynamo_renderer::RenderedPrompt,
-) -> dynamo_renderer::RenderedPrompt {
-    if prompt
-        .as_str()
-        .starts_with("<|open|>message role=\"system\" type=\"thinking-effort\"")
-    {
-        if let Some(segments) = prompt.segments() {
-            if let Some(end) = segments
-                .iter()
-                .position(|s| s.allow_special && s.text == "<|end_of_msg|>")
-            {
-                return dynamo_renderer::RenderedPrompt::segmented(segments[end + 1..].to_vec());
-            }
-        }
-    }
-    prompt
-}
-
-pub fn encode_segments(tokenizer: &Tokenizer, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>> {
-    let mut chunks = Vec::new();
+/// Python splits long segments before BPE; the pinned native backend does not.
+/// Leave those requests to the engine until Dynamo implements matching chunking.
+/// This only checks eligibility; Dynamo owns all encoding and segment handling.
+pub fn validate_native_segments(segments: &[EncodeSegment<'_>]) -> Result<()> {
     for segment in segments {
-        let mut outer_start = 0;
-        for (count, (offset, _)) in segment.text.char_indices().enumerate() {
-            if count > 0 && count % 400_000 == 0 {
-                split_runs(
-                    &segment.text[outer_start..offset],
-                    segment.allow_special,
-                    &mut chunks,
-                );
-                outer_start = offset;
-            }
-        }
-        split_runs(
-            &segment.text[outer_start..],
-            segment.allow_special,
-            &mut chunks,
-        );
-    }
-    Ok(tokenizer.encode_segments(&chunks)?.token_ids().to_vec())
-}
-
-fn split_runs<'a>(text: &'a str, special: bool, chunks: &mut Vec<EncodeSegment<'a>>) {
-    let (mut start, mut length, mut was_space) = (0, 0, false);
-    for (offset, ch) in text.char_indices() {
-        let space = ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch);
-        length = if space == was_space { length + 1 } else { 1 };
-        was_space = space;
-        if length > 25_000 {
-            chunks.push(EncodeSegment::new(&text[start..offset], special));
-            start = offset;
-            length = 1;
+        let (mut run, mut was_space) = (0, false);
+        for (count, ch) in segment.text.chars().enumerate() {
+            anyhow::ensure!(
+                count < 400_000,
+                "Kimi segment requires engine-side chunking"
+            );
+            // Python str.isspace() also includes these four control characters.
+            let space = ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch);
+            run = if space == was_space { run + 1 } else { 1 };
+            was_space = space;
+            anyhow::ensure!(run <= 25_000, "Kimi text run requires engine-side chunking");
         }
     }
-    if start < text.len() {
-        chunks.push(EncodeSegment::new(&text[start..], special));
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -107,6 +68,12 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/kimi_k3/prompts.json"))
                 .unwrap();
         for case in cases {
+            // Dynamo 5.1.2 defaults null effort to max; Python omits the preamble.
+            // Keep the reference case, but reject encoding instead of rewriting output.
+            if case["name"] == "no_effort" {
+                assert!(formatter.encode(&tokenizer, &case["request"]).is_err());
+                continue;
+            }
             let expected: Vec<u32> = serde_json::from_value(case["token_ids"].clone()).unwrap();
             assert_eq!(
                 formatter.encode(&tokenizer, &case["request"]).unwrap(),
@@ -118,21 +85,24 @@ mod tests {
     }
 
     #[test]
-    fn python_whitespace_and_unicode_chunk_boundaries() {
-        let text = format!("{}\u{1c}{}", "x".repeat(20_000), "y".repeat(20_000));
-        let mut chunks = Vec::new();
-        split_runs(&text, false, &mut chunks);
-        assert_eq!(chunks.len(), 1);
-        let text = "界".repeat(25_001);
-        chunks.clear();
-        split_runs(&text, false, &mut chunks);
-        assert_eq!(
-            chunks
-                .iter()
-                .map(|c| c.text.chars().count())
-                .collect::<Vec<_>>(),
-            [25_000, 1]
-        );
-        assert!(chunks.iter().all(|c| !c.allow_special));
+    fn long_segments_fall_back_without_reimplementing_python_chunking() {
+        let path = "tests/fixtures/kimi_k3/tiktoken.model";
+        let tokenizer = load(path).unwrap();
+        let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
+        // Boundaries count Unicode characters, and Python treats U+001C as whitespace.
+        for (text, supported) in [
+            ("界".repeat(25_000), true),
+            ("界".repeat(25_001), false),
+            (" ".repeat(25_001), false),
+            (
+                format!("{}\u{1c}{}", "x".repeat(20_000), "y".repeat(20_000)),
+                true,
+            ),
+            ("x ".repeat(200_000), true),
+            (format!("{}x", "x ".repeat(200_000)), false),
+        ] {
+            let request = serde_json::json!({"messages": [{"role": "user", "content": text}]});
+            assert_eq!(formatter.encode(&tokenizer, &request).is_ok(), supported);
+        }
     }
 }

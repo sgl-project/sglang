@@ -401,7 +401,7 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
 }
 
 #[tokio::test]
-async fn kimi_ids_preserve_control_boundaries_and_images_stay_on_engine() {
+async fn kimi_native_ids_preserve_control_boundaries() {
     let mock = MockWorker::start(vec![]).await;
     let mut cfg = config();
     cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
@@ -412,50 +412,38 @@ async fn kimi_ids_preserve_control_boundaries_and_images_stay_on_engine() {
     assert_eq!(send(ctx.clone(), request).await, StatusCode::OK);
     assert_eq!(captured(&mock)["input_ids"], json!(expected));
 
-    let image = json!({"rid":"kimi-image","model":MODEL,"messages":[{"role":"user","content":[
-        {"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
-    ]}]});
-    assert_eq!(send(ctx.clone(), image.clone()).await, StatusCode::OK);
-    assert_eq!(captured(&mock), image);
+    // User-supplied control spellings must remain ordinary text; only the
+    // renderer's structural markers become special token IDs.
+    let tokenizers = ctx.tokenizers.get(MODEL).unwrap();
+    let marker = tokenizers.encode("<|open|>").unwrap().token_ids()[0];
+    let baseline = ctx
+        .tokenizers
+        .encode_chat(
+            MODEL,
+            &json!({
+                "messages": [{"role": "user", "content": "ordinary text"}]
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        expected.iter().filter(|&&id| id == marker).count(),
+        baseline.iter().filter(|&&id| id == marker).count()
+    );
 }
 
 #[tokio::test]
-async fn cache_aware_image_affinity_works_without_indexer_hits() {
-    let first = MockWorker::start(vec![]).await;
-    let second = MockWorker::start(vec![]).await;
+async fn kimi_native_parity_gaps_keep_engine_tokenization() {
+    let mock = MockWorker::start(vec![]).await;
     let mut cfg = config();
-    cfg.model.policy = PolicyKind::CacheAware;
-    cfg.model.affinity = Some(Default::default());
-    let ctx = build_ctx_with_config(first.url.clone(), cfg);
-    ctx.registry
-        .add(WorkerSpec {
-            id: WorkerId(second.url.clone()),
-            url: second.url.clone(),
-            mode: WorkerMode::Plain,
-            model_ids: vec![ModelId(MODEL.into())],
-            bootstrap_port: None,
-        })
-        .unwrap();
-    let mut request = json!({"model":MODEL,"messages":[{"role":"user","content":[
-        {"type":"image_url","image_url":{"url":"image-a"}}
-    ]}]});
-    assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
-    let picked_first = first.captured.lock().unwrap().last_body.is_some();
-    request["messages"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"role":"user","content":"another question"}));
-    for _ in 0..12 {
-        first.captured.lock().unwrap().last_body = None;
-        second.captured.lock().unwrap().last_body = None;
+    cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    for request in [
+        json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"thinking": true, "thinking_effort": null}}),
+        json!({"model": MODEL, "messages": [{"role": "user", "content": "x".repeat(25_001)}]}),
+    ] {
+        assert!(ctx.tokenizers.encode_chat(MODEL, &request).is_none());
         assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
-        assert_eq!(
-            first.captured.lock().unwrap().last_body.is_some(),
-            picked_first
-        );
-        assert_eq!(
-            second.captured.lock().unwrap().last_body.is_some(),
-            !picked_first
-        );
+        assert_eq!(captured(&mock), request);
     }
 }

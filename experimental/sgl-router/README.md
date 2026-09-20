@@ -211,14 +211,16 @@ Detailed content-format parity coverage follows in #39133.
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
-## Kimi-K3 and image routing
+## Kimi-K3
 
-Kimi-K3 cache routing uses the model's native `tiktoken.model` and sibling
-`config.json` / `tokenizer_config.json`, from `--tokenizer-path` or its Hugging Face
-repository. Rendering preserves special-token boundaries. Image requests keep
-engine-side tokenization; cache-aware routing derives affinity from the first
-image reference and applies the usual admission, load, and bucket constraints.
-Image assignments share the session affinity mode and idle-eviction settings.
+Kimi-K3 uses the pinned Dynamo native formatter and segmented tokenizer, loading
+`tiktoken.model` and sibling `config.json` / `tokenizer_config.json` from
+`--tokenizer-path` or its Hugging Face repository. Segmented encoding preserves
+the distinction between protocol markers and literal control spellings in text.
+The existing input-ID forwarding guards still apply. Requests with null
+`thinking_effort`, segments over 400,000 characters, or whitespace/non-whitespace
+runs over 25,000 characters fall back to engine-side tokenization because the
+pinned Dynamo versions do not match Python for those cases.
 
 ## HTTP/2
 

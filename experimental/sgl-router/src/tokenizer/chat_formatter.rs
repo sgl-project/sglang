@@ -266,10 +266,15 @@ impl ChatFormatter {
     /// separately (`_handle_last_assistant_message`).
     fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
         let kwargs = self.template_kwargs(request)?;
-        let omit_effort = self.is_kimi_k3
-            && kwargs
-                .get("thinking_effort")
-                .is_some_and(JsonValue::is_null);
+        // Dynamo 5.1.2 interprets null effort as max, unlike the Python engine.
+        // Keep the original request on the engine instead of patching native output.
+        anyhow::ensure!(
+            !self.is_kimi_k3
+                || !kwargs
+                    .get("thinking_effort")
+                    .is_some_and(JsonValue::is_null),
+            "Kimi null thinking effort requires engine-side tokenization"
+        );
         let continuing = request["continue_final_message"] == true;
         let mut messages: Vec<JsonValue> = request["messages"]
             .as_array()
@@ -325,11 +330,6 @@ impl ChatFormatter {
                 is_kimi_k3: self.is_kimi_k3,
             })
             .context("render chat template")?;
-        let prompt = if omit_effort {
-            super::kimi::without_effort_preamble(prompt)
-        } else {
-            prompt
-        };
         Ok((prompt, prefix))
     }
 
@@ -340,7 +340,12 @@ impl ChatFormatter {
     ) -> Result<Vec<u32>> {
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
-            Some(segments) => super::kimi::encode_segments(tokenizer, &segments)?,
+            Some(segments) => {
+                if self.is_kimi_k3 {
+                    super::kimi::validate_native_segments(&segments)?;
+                }
+                tokenizer.encode_segments(&segments)?.token_ids().to_vec()
+            }
             None => super::adapter::encode(tokenizer, prompt.as_str())?,
         };
         if !prefix.is_empty() {
@@ -364,6 +369,8 @@ impl ChatFormatter {
     }
 }
 
+// SGLang escapes this reserved spelling even in plain text. Match request
+// normalization before native rendering; this does not enable image routing.
 fn neutralize_image_placeholder(value: &mut JsonValue) {
     match value {
         JsonValue::String(text) => {
