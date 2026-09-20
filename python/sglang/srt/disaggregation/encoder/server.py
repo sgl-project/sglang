@@ -2371,10 +2371,9 @@ class MMEncoder:
                 failed = []
                 for i, result in enumerate(results):
                     url = all_tasks[i][1]  # Retrieve URL associated with the task
-                    # A cancelled send delivered nothing either, and
-                    # CancelledError is not an Exception. Outer cancellation
-                    # never lands here: gather re-raises it instead of
-                    # returning, so only a per-destination cancel shows up.
+                    # A cancelled send delivered nothing, and CancelledError
+                    # is not an Exception; outer cancellation re-raises out of
+                    # gather rather than landing here.
                     if isinstance(result, BaseException):
                         logger.error(f"Failed to send to {url}: {result!r}")
                         failed.append(url)
@@ -2384,9 +2383,6 @@ class MMEncoder:
                     failure = f"delivery failed for {failed}"
 
             if failure is not None:
-                # Returning normally here would report a request whose
-                # embedding reached nobody as a success, to both the HTTP
-                # caller and the encoder_requests_total metric.
                 raise MMError(
                     f"[{req_id}] embedding delivery failed: {failure}",
                     code=failure_code,

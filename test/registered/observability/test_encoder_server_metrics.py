@@ -62,10 +62,8 @@ class TestEncoderServerMetrics(CustomTestCase):
             self.assertEqual(health.status_code, 200)
 
             req_id = f"metrics-probe-{uuid.uuid4().hex}"
-            # A scheduler registers its receive URL concurrently with /encode,
-            # never before it: the encoder only creates the request state when
-            # /encode dispatches, so a serial register-then-encode would block
-            # the registration until its own timeout and drop it.
+            # A scheduler registers concurrently with /encode, never before
+            # it: the request state only exists once /encode dispatches.
             with ThreadPoolExecutor(max_workers=1) as pool:
                 registration = pool.submit(
                     requests.post,
@@ -94,8 +92,8 @@ class TestEncoderServerMetrics(CustomTestCase):
                 registration_response = registration.result(
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                 )
-            # Both halves must succeed: /encode returning 200 while the
-            # registration failed would mean the embedding went nowhere.
+            # A 200 from /encode alone does not prove the embedding reached
+            # anyone; the registration is the other half of that contract.
             self.assertEqual(registration_response.status_code, 200)
             self.assertEqual(response.status_code, 200)
 
