@@ -222,6 +222,23 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
 @torch.no_grad()
+def test_cuda_cache_hit_does_not_wait_for_unrelated_gpu_work():
+    cache = ConditioningCache(4096)
+    model = Encoder().eval()
+    value = torch.arange(64, device="cuda")
+    cache.run(model, "forward", (), {}, lambda: value)
+    torch.cuda.synchronize()
+    # a negative-prompt hit must not synchronize the preceding positive encode
+    torch.cuda._sleep(250_000_000)
+    pending = torch.cuda.Event()
+    pending.record()
+    restored = cache.run(model, "forward", (), {}, lambda: pytest.fail("cache miss"))
+    assert not pending.query()
+    torch.testing.assert_close(restored, value, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+@torch.no_grad()
 def test_cuda_graph_capture_bypasses_host_cache():
     cache = ConditioningCache(1024)
     model = Encoder().cuda().eval()
