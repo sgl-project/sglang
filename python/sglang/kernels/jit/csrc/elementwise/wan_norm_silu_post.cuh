@@ -15,6 +15,7 @@
 
 namespace sglang {
 
+/// \brief Fuse FP32 divide, scale, affine, and SiLU without changing aten's L2 reduction.
 template <typename X, typename A, bool kChannelsLast>
 __global__ void wan_norm_silu_post_kernel(
     const X* __restrict__ input,
@@ -65,6 +66,8 @@ __global__ void wan_norm_silu_post_kernel(
   }
 }
 
+/// \brief Launch normalization post-ops for dense NCDHW or channels-last storage.
+/// \param denominator Native FP32 L2 norm, clamped to the normalization epsilon.
 template <typename X, typename A, bool kChannelsLast>
 void wan_norm_silu_post(
     tvm::ffi::TensorView input,

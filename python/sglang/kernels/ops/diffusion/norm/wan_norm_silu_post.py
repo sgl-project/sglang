@@ -22,6 +22,7 @@ def _module(x_dtype, affine_dtype, channels_last):
 def can_use_wan_norm_silu_post(x, denominator, gamma, bias=None):
     if (
         not x.is_cuda
+        or torch.version.hip is not None
         or torch.is_grad_enabled()
         or x.requires_grad
         or x.ndim != 5
