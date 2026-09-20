@@ -72,18 +72,14 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-New and renamed non-kernel tests use this layout:
-
-```text
-test/registered/<kind>/<subsystem>/test_*.py
-```
-
-`<kind>` is one of `unit`, `e2e`, `accuracy`, `perf`, or `stress`. Kernel tests
-use `test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
+Directories under `test/registered/` group tests by topic and are free-form
+(`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...); unit tests cover one srt
+module, so they mirror the source tree under `unit/`. What a test costs, which
+stage gates it and which runner it needs are declared by its `register_*_ci`
+call -- including hardware, which is expressed by one or more `register_*_ci`
+calls and never by a new top-level directory. Kernel tests use
+`test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
 plural `kernels` root.
-Hardware is expressed by one or more `register_*_ci` calls, never by creating a
-new top-level hardware directory. The admission checker applies the layout and
-kind/suite contract incrementally while legacy paths are migrated.
 
 Diffusion workflows also enter through `test/run_suite.py`; registered bridge
 files preserve their case-level pytest partitioning until the remaining
