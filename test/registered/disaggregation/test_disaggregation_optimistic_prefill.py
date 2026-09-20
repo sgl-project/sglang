@@ -355,16 +355,8 @@ class TestOptimisticPrefillMambaAdmission(CustomTestCase):
 
 
 class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
-    """Optimistic retry cleanup must not treat the donated Mamba checkpoint
-    as a second donation.
-
-    Bug mechanism: the retry path first inserts the unfinished prefix, which
-    donates the tracked checkpoint and clears ``mamba_last_track_seqlen``.
-    Releasing with ``is_insert=True`` afterwards re-enters the donation path
-    with the cleared marker, inserting a zero-length radix entry that pins a
-    clone of the request's live state. Releasing with ``is_insert=False``
-    retains the donated prefix/checkpoint and frees only the uncached tail
-    and the request-owned Mamba buffers.
+    """An optimistic-prefill retry leaves the donated prefix and exactly one
+    Mamba checkpoint in the tree -- not zero, and not a second pinned clone.
     """
 
     SIZE = 128
@@ -374,7 +366,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
 
     def _setup_mamba_tree(self):
         server_args = ServerArgs(model_path="dummy", page_size=1)
-        # The Mamba tree component reads mamba_cache_chunk_size, whose property
+        # The mamba component reads mamba_cache_chunk_size, whose property
         # otherwise loads the HF config for the dummy model.
         server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
         set_global_server_args_for_scheduler(server_args)
@@ -434,8 +426,8 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
-                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
                 enable_mamba_extra_buffer=True,
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             )
         )
         return tree, allocator, req_to_token_pool
@@ -480,8 +472,6 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 scheduler, req
             )
 
-        # The donated prefix and exactly one checkpoint stay in the tree; the
-        # old double-donation path either asserts or pins a second state.
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", self.PROMPT)))
