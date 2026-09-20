@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
@@ -26,6 +27,47 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
+
+
+class ModelOutputTrace:
+    """Output-only decoded-text deltas, before reasoning/tool parsing."""
+
+    def __init__(self, targets: List[logging.Logger], model: str):
+        self.targets = targets
+        self.model = model
+        self.previous: Dict[Tuple[str, int], str] = {}
+        self.sequences: Dict[Tuple[str, int], int] = {}
+
+    def record(self, out: dict, index: int = 0) -> None:
+        text = out.get("text")
+        if not isinstance(text, str):
+            logger.warning("Model output trace skipped a non-text generation result")
+            return
+        meta = out["meta_info"]
+        rid = meta["id"]
+        key = (rid, index)
+        previous = self.previous.get(key, "")
+        append = text.startswith(previous)
+        sequence = self.sequences.get(key, 0) + 1
+        finish = meta.get("finish_reason")
+        log_json(
+            self.targets,
+            "model.output.before_parsers",
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "rid": rid,
+                "index": index,
+                "sequence": sequence,
+                "model": self.model,
+                "operation": "append" if append else "replace",
+                "text": text[len(previous) :] if append else text,
+                "completion_tokens": meta.get("completion_tokens"),
+                "finish_type": finish.get("type") if isinstance(finish, dict) else None,
+            },
+        )
+        self.previous[key] = text
+        self.sequences[key] = sequence
+
 
 _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
@@ -58,6 +100,14 @@ class RequestLogger:
             self._compute_metadata()
         )
         self.targets = self._setup_targets()
+        output_trace_dir = envs.SGLANG_MODEL_OUTPUT_TRACE_DIR.get()
+        self.output_trace_targets = (
+            create_log_targets(
+                targets=[output_trace_dir], name_prefix=__name__ + ".model_output"
+            )
+            if output_trace_dir
+            else []
+        )
 
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
@@ -65,6 +115,11 @@ class RequestLogger:
         return create_log_targets(
             targets=self.log_requests_target, name_prefix=__name__
         )
+
+    def start_model_output_trace(self, model: str) -> Optional[ModelOutputTrace]:
+        if not self.output_trace_targets:
+            return None
+        return ModelOutputTrace(self.output_trace_targets, model)
 
     def configure(
         self,

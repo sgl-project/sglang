@@ -1768,6 +1768,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        output_trace = (
+            self.tokenizer_manager.request_logger.start_model_output_trace(
+                request.model
+            )
+            if envs.SGLANG_MODEL_OUTPUT_TRACE_DIR.get()
+            else None
+        )
 
         # State tracking for streaming
         is_firsts = {}
@@ -1811,6 +1818,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if output_trace is not None:
+                    output_trace.record(content, index)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]
@@ -2181,6 +2190,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 output_ids=output_ids,
             )
 
+        output_trace = (
+            self.tokenizer_manager.request_logger.start_model_output_trace(
+                request.model
+            )
+            if envs.SGLANG_MODEL_OUTPUT_TRACE_DIR.get()
+            else None
+        )
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None
@@ -2195,6 +2211,10 @@ class OpenAIServingChat(OpenAIServingBase):
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+            if output_trace is not None:
+                output_trace.record(
+                    {"text": text, "meta_info": ret_item["meta_info"]}, idx
+                )
 
             # Handle reasoning content
             reasoning_text = None
