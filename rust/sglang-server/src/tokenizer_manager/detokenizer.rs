@@ -755,4 +755,155 @@ mod tests {
                 .is_none()
         );
     }
+    /// Minimal WordLevel tokenizer: `<unk>`, hello(1), world(2), hi(3),
+    /// there(4). Written to a temp file because dynamo's loader is file-based;
+    /// the suffix keeps parallel tests from sharing a path.
+    fn word_tokenizer(suffix: &str) -> dynamo_tokenizers::Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "hello": 1, "world": 2, "hi": 3, "there": 4},
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "sglang-server-echo-{}-{suffix}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).expect("fixture writes");
+        dynamo_tokenizers::Tokenizer::from_file(path.to_str().unwrap())
+            .expect("fixture tokenizer loads")
+    }
+
+    /// A token-ID prompt goes through real registration + the detokenizer
+    /// worker, is decoded to prompt text, attaches to the first generation
+    /// frame only, and that frame reaches Completion rendering with the echoed
+    /// prompt prepended exactly once.
+    #[tokio::test]
+    async fn token_id_echo_reaches_completion_rendering() {
+        use crate::api_server::core::generate::RequestTiming;
+        use crate::api_server::core::openai::completions::{
+            CompletionFrameShaper, CompletionRenderingOptions, completion_event_stream,
+            completion_sse_payload,
+        };
+        use crate::api_server::core::test_utils::{plan, senders};
+        use futures::StreamExt;
+
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let (sink_tx, sink_rx) = mpsc::channel::<ResponseItem>(8);
+        let worker = DetokenizerWorker::new(
+            0,
+            detok_rx,
+            DetokenizerBackend::Dynamo(word_tokenizer("echo")),
+            abort_tx,
+        );
+        std::thread::spawn(move || worker.run());
+
+        let rid = Rid::from("echo");
+        detok_tx
+            .send(DetokMsg::Register {
+                rid: rid.clone(),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                // The prompt is token ids, exactly as a token-ID Completion
+                // request with `echo=true` submits it.
+                prompt: Some(PromptSource::TokenIds(vec![1, 2])),
+            })
+            .unwrap();
+
+        let options = CompletionRenderingOptions {
+            response_id: "cmpl-echo".into(),
+            model: "model".into(),
+            created: 1,
+            echo: true,
+            want_logprobs: false,
+            n: 1,
+            enable_cache_report: false,
+            weight_version: None,
+        };
+        let stream = completion_event_stream(
+            plan(
+                vec![(rid.clone(), sink_rx, RequestTiming::new())],
+                senders(),
+            ),
+            CompletionFrameShaper::new(1, options, false, false),
+        );
+        futures::pin_mut!(stream);
+
+        detok_tx
+            .send(DetokMsg::Chunks(vec![ChunkEvent {
+                rid: rid.clone(),
+                token_ids: vec![3], // "hi"
+                ..Default::default()
+            }]))
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&completion_sse_payload(stream.next().await.unwrap())).unwrap();
+        assert_eq!(first["choices"][0]["text"], "hello worldhi");
+
+        detok_tx
+            .send(DetokMsg::Chunks(vec![ChunkEvent {
+                rid: rid.clone(),
+                token_ids: vec![4], // "there"
+                finish_reason: Some(
+                    serde_json::from_value(serde_json::json!({"type": "stop", "matched": "</s>"}))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            }]))
+            .unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(&completion_sse_payload(stream.next().await.unwrap())).unwrap();
+        assert_eq!(
+            terminal["choices"][0]["text"].as_str().unwrap().trim(),
+            "there",
+            "the prompt must not be echoed a second time"
+        );
+        assert!(stream.next().await.is_none());
+        drop(detok_tx);
+    }
+
+    /// A token-ID prompt the backend cannot decode (skip mode) fails at
+    /// registration: the worker aborts the scheduler work before notifying the
+    /// sink, and there is no duplicate abort.
+    #[test]
+    fn token_id_prompt_decode_failure_aborts_before_notifying() {
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ResponseItem>(4);
+        let worker = DetokenizerWorker::new(0, detok_rx, DetokenizerBackend::Skip, abort_tx);
+        std::thread::spawn(move || worker.run());
+
+        detok_tx
+            .send(DetokMsg::Register {
+                rid: Rid::from("1"),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                prompt: Some(PromptSource::TokenIds(vec![1, 2])),
+            })
+            .unwrap();
+
+        let abort = abort_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("registration failure aborts");
+        assert!(matches!(abort, AbortSource::Detok(rid) if rid == Rid::from("1")));
+        let error = sink_rx.blocking_recv().expect("failure notification");
+        assert!(matches!(error, ResponseItem::Error(_)));
+        assert!(
+            abort_rx.try_recv().is_err(),
+            "no duplicate abort after the sink error"
+        );
+        drop(detok_tx);
+    }
 }

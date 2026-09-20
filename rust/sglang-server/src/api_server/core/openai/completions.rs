@@ -305,6 +305,9 @@ pub(crate) fn completion_response_value(
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
         );
+        // Python's completion choice always carries `logprobs` (null when the
+        // request did not ask for them).
+        choice.entry("logprobs").or_insert(serde_json::Value::Null);
         if let Some(logprobs) = choice
             .get_mut("logprobs")
             .and_then(serde_json::Value::as_object_mut)
@@ -649,7 +652,7 @@ mod tests {
     use super::{
         ChoiceExtensions, CompletionFrameShaper, CompletionRenderingOptions, PromptSpec,
         completion_event_stream, completion_logprobs, completion_prompt_specs,
-        completion_response_value, unary_completion,
+        completion_response_value, completion_sse_payload, unary_completion,
     };
     use crate::api_server::core::event::CoreEvent;
     use crate::api_server::core::openai::UsageDetails;
@@ -1324,5 +1327,110 @@ mod tests {
             trailer["usage"]["prompt_tokens_details"]["cached_tokens"],
             3
         );
+    }
+    /// Python's completion choice always carries `logprobs` (null when the
+    /// request did not ask for them).
+    #[tokio::test]
+    async fn completion_choice_carries_null_logprobs_when_disabled() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "a", true)).await.unwrap();
+        let value = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect("unary completion succeeds");
+        assert!(value["choices"][0].get("logprobs").is_some());
+        assert!(value["choices"][0]["logprobs"].is_null());
+    }
+    /// Echo prepends the prompt text on each choice's first chunk only.
+    #[test]
+    fn stream_echo_prepends_prompt_once_per_choice() {
+        let mut shaper = CompletionFrameShaper::new(
+            2,
+            CompletionRenderingOptions {
+                echo: true,
+                ..completion_options()
+            },
+            false,
+            false,
+        );
+        let event = |text: &str, prompt: Option<&str>| ChunkEvent {
+            text: text.into(),
+            extras: prompt.map(|prompt| {
+                Box::new(ChunkExtras {
+                    prompt_text: Some(prompt.into()),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        };
+        let item = |frame: CoreEvent<serde_json::Value>| match frame {
+            CoreEvent::Item(value) => value,
+            CoreEvent::ItemError(_) => panic!("unexpected rendering error"),
+        };
+        for (choice, prompt) in [(0usize, "P0"), (1, "P1")] {
+            let first = item(
+                shaper
+                    .frame(choice, event("a", Some(prompt)), 1, true)
+                    .unwrap(),
+            );
+            let second = item(shaper.frame(choice, event("b", None), 2, false).unwrap());
+            assert_eq!(first["choices"][0]["text"], format!("{prompt}a"));
+            assert_eq!(
+                second["choices"][0]["text"], "b",
+                "echo belongs to the first chunk only"
+            );
+        }
+    }
+
+    /// Worker failures carried on a committed SSE stream are in-band errors in
+    /// the nested envelope: validation maps to 400, an actual detokenization
+    /// failure to 500.
+    #[tokio::test]
+    async fn sse_item_errors_use_in_band_envelope_with_mapped_status() {
+        use crate::utils::error::Error;
+
+        for (error, code, error_type) in [
+            (
+                Error::Validation("bad input".into()),
+                400,
+                "BadRequestError",
+            ),
+            (
+                Error::Internal("detokenization failed".into()),
+                500,
+                "InternalServerError",
+            ),
+        ] {
+            let (choice, tx) = planned("r0");
+            tx.send(ResponseItem::Error(error)).await.unwrap();
+            let stream = completion_event_stream(
+                plan(vec![choice], senders()),
+                CompletionFrameShaper::new(1, completion_options(), false, false),
+            );
+            futures::pin_mut!(stream);
+            let frame = completion_sse_payload(stream.next().await.expect("error frame"));
+            let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(value["error"]["object"], "error");
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["type"], error_type);
+            assert!(stream.next().await.is_none(), "the error ends the response");
+        }
+    }
+
+    /// A unary worker failure keeps the error's mapped HTTP status (not every
+    /// failure collapses to 400).
+    #[tokio::test]
+    async fn unary_worker_failure_keeps_mapped_status() {
+        use crate::utils::error::Error;
+
+        let (choice, tx) = planned("r0");
+        tx.send(ResponseItem::Error(Error::Internal(
+            "detokenization failed".into(),
+        )))
+        .await
+        .unwrap();
+        let error = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect_err("worker failure must surface");
+        assert_eq!(error.http_code, 500);
     }
 }

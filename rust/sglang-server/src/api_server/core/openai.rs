@@ -88,21 +88,41 @@ pub(crate) fn weight_metadata_value(
     metadata
 }
 
-/// The OpenAI error payload — the body shape every OpenAI-compatible surface
-/// answers errors with, regardless of transport framing.
-pub(crate) fn error_payload_value(code: u16, message: &str) -> serde_json::Value {
-    let error_type = if code == 401 {
+/// The machine-readable `type` Python's OpenAI errors carry for a status:
+/// serving failures default to `BadRequestError`, 5xx to
+/// `InternalServerError`, 401 to `AuthenticationError`.
+pub(crate) fn error_type(code: u16) -> &'static str {
+    if code == 401 {
         "AuthenticationError"
     } else if (500..600).contains(&code) {
         "InternalServerError"
     } else {
         "BadRequestError"
-    };
+    }
+}
+
+/// Python's unary `ErrorResponse` body: a FLAT object whose `object` field is
+/// `"error"` (`serving_base.create_error_response` dumps the model directly —
+/// only the SSE frame nests under `error`).
+pub(crate) fn unary_error_value(code: u16, message: &str, error_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "object": "error",
+        "message": message,
+        "type": error_type,
+        "param": null,
+        "code": code,
+    })
+}
+
+/// The OpenAI error payload — the in-band SSE frame shape every
+/// OpenAI-compatible surface answers streamed errors with (Python
+/// `create_streaming_error_response` nests under `error`).
+pub(crate) fn error_payload_value(code: u16, message: &str) -> serde_json::Value {
     serde_json::json!({
         "error": {
             "object": "error",
             "message": message,
-            "type": error_type,
+            "type": error_type(code),
             "param": null,
             "code": code,
         }

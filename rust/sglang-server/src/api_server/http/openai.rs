@@ -24,23 +24,42 @@ use crate::api_server::core::openai::completions::{
 };
 use crate::api_server::core::openai::models::model_card;
 use crate::api_server::core::openai::tools::dynamo_tool_choice;
-use crate::api_server::core::openai::{error_payload_value, unix_seconds_u32};
+use crate::api_server::core::openai::{
+    error_payload_value, error_type, unary_error_value, unix_seconds_u32,
+};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
-/// Form an OpenAI error response: unary → `code` plus the JSON `body`,
-/// streaming → 200 with one SSE error frame + `[DONE]`.
+/// Form an OpenAI error response. Serving/validation failures: unary → the
+/// flat `ErrorResponse` JSON (Python `create_error_response`), a committed
+/// stream → 200 with one nested SSE error frame + `[DONE]` (Python
+/// `create_streaming_error_response`).
 pub(super) fn openai_error(
     code: StatusCode,
     message: impl Into<String>,
     stream: bool,
 ) -> super::response::HttpResponse {
+    let message = message.into();
+    if stream {
+        error_response(code, error_payload_value(code.as_u16(), &message), true)
+    } else {
+        error_response(
+            code,
+            unary_error_value(code.as_u16(), &message, error_type(code.as_u16())),
+            false,
+        )
+    }
+}
+
+/// Request-body validation failures (Python's `RequestValidationError`
+/// handler): the flat envelope with the HTTP phrase as `type`.
+pub(super) fn openai_request_error(message: impl Into<String>) -> super::response::HttpResponse {
     error_response(
-        code,
-        error_payload_value(code.as_u16(), &message.into()),
-        stream,
+        StatusCode::BAD_REQUEST,
+        unary_error_value(400, &message.into(), "Bad Request"),
+        false,
     )
 }
 
@@ -67,7 +86,7 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
     let request = match read_json::<CreateChatCompletionRequest, _>(req).await {
         Ok(request) => request,
         Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text, false);
+            return openai_request_error(rejection.body_text);
         }
     };
     if request.model != state.server_args.served_model_name {
@@ -265,7 +284,7 @@ pub(in crate::api_server) async fn completions<B: http_body::Body>(
     let request = match read_json::<CreateCompletionRequest, _>(req).await {
         Ok(request) => request,
         Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text, false);
+            return openai_request_error(rejection.body_text);
         }
     };
     let stream = request.stream.unwrap_or(false);
@@ -541,19 +560,71 @@ mod tests {
         let unary = openai_error(StatusCode::BAD_REQUEST, "bad input", false);
         assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
         let value = body_json(unary).await;
-        assert_eq!(value["error"]["message"], "bad input");
-        assert_eq!(value["error"]["type"], "BadRequestError");
-        assert_eq!(value["error"]["code"], 400);
-        assert!(value["error"]["param"].is_null());
+        // Python's unary ErrorResponse is FLAT (`object` says "error").
+        assert_eq!(value["object"], "error");
+        assert_eq!(value["message"], "bad input");
+        assert_eq!(value["type"], "BadRequestError");
+        assert_eq!(value["code"], 400);
+        assert!(value["param"].is_null());
+        assert!(value.get("error").is_none(), "unary errors are not nested");
 
         let streamed = openai_error(StatusCode::BAD_REQUEST, "bad input", true);
         assert_eq!(streamed.status(), StatusCode::OK);
         let bytes = streamed.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         let frame = first_sse_frame(&text);
+        // The in-band SSE frame is nested, matching Python's
+        // `create_streaming_error_response`.
         assert_eq!(frame["error"]["message"], "bad input");
         assert_eq!(frame["error"]["type"], "BadRequestError");
         assert!(text.contains("[DONE]"));
+    }
+
+    /// Request-validation failures answer Python's flat envelope: HTTP 400,
+    /// `object: "error"`, status-derived `type`, `param: null`, `code: 400`.
+    /// Completion rejects a negative `max_tokens` at request parse (`"Bad
+    /// Request"`, like Python's FastAPI validation handler); Chat's unsigned
+    /// field rejects at parse too, while Python chat rejects later in sampling
+    /// validation (`"BadRequestError"`) — the status/envelope match, and the
+    /// type-string difference is recorded in the tracker.
+    #[tokio::test]
+    async fn openai_validation_errors_use_python_flat_envelope() {
+        let cases = [
+            (
+                "/v1/completions",
+                json!({"model": "model", "prompt": "hi", "max_tokens": -1}),
+                "Bad Request",
+                "completion max_tokens=-1",
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -1}),
+                "Bad Request",
+                "chat max_tokens=-1 (parse rejection: unsigned field)",
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 0}),
+                "BadRequestError",
+                "chat n=0 validation",
+            ),
+            (
+                "/v1/completions",
+                json!({"model": "model", "prompt": ""}),
+                "BadRequestError",
+                "completion empty prompt",
+            ),
+        ];
+        for (path, body, expected_type, label) in cases {
+            let response = post_json(app(app_state(senders())), path, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let value = body_json(response).await;
+            assert_eq!(value["object"], "error", "{label}");
+            assert_eq!(value["type"], expected_type, "{label}");
+            assert_eq!(value["code"], 400, "{label}");
+            assert!(value["param"].is_null(), "{label}");
+            assert!(value.get("error").is_none(), "{label}");
+        }
     }
 
     #[tokio::test]
@@ -656,7 +727,10 @@ mod tests {
 
         let unary = post_json(app(app_state(senders())), "/v1/completions", body(false)).await;
         assert_eq!(unary.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body_json(unary).await["error"]["code"], 503);
+        let unary_body = body_json(unary).await;
+        assert_eq!(unary_body["code"], 503);
+        assert_eq!(unary_body["type"], "InternalServerError");
+        assert!(unary_body.get("error").is_none(), "unary errors are flat");
 
         let streamed = post_json(app(app_state(senders())), "/v1/completions", body(true)).await;
         assert_eq!(streamed.status(), StatusCode::OK);

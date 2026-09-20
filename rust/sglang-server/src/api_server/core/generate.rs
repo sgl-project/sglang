@@ -1113,63 +1113,106 @@ mod tests {
     /// identical scripted streams through both, frames compared as JSON trees
     /// (e2e_latency normalized — the two runs time independently) and errors
     /// compared field-for-field with their batch index.
+    ///
+    /// Each send is followed by one poll, so nonterminal cumulative frames are
+    /// consumed before `Done` arrives and the coalesced branch actually runs
+    /// (a fully queued fixture bypasses it).
     #[tokio::test]
     async fn typed_shaper_matches_json_shaper() {
         use sglang_api_types::api::v1::generate_stream_item::Item;
 
+        let channels = || {
+            let (tx0, rx0) = mpsc::channel(8);
+            let (tx1, rx1) = mpsc::channel(8);
+            let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
+            (vec![tx0, tx1], receivers)
+        };
+        let bad = || ResponseItem::Error(crate::utils::error::Error::Validation("bad".into()));
+
         for (incremental, with_index) in [(false, false), (true, true), (false, true)] {
-            let script = |txs: &[tokio::sync::mpsc::Sender<ResponseItem>]| {
-                let a = txs[0].clone();
-                let b = txs[1].clone();
-                async move {
-                    a.send(frame(10, "He")).await.unwrap();
-                    a.send(frame(10, "llo")).await.unwrap();
-                    a.send(done(10, "!")).await.unwrap();
-                    b.send(ResponseItem::Error(crate::utils::error::Error::Validation(
-                        "bad".into(),
-                    )))
-                    .await
-                    .unwrap();
-                }
-            };
-            let run = |shaperless: bool| {
-                let (tx0, rx0) = mpsc::channel(8);
-                let (tx1, rx1) = mpsc::channel(8);
-                let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
-                (vec![tx0, tx1], receivers, shaperless)
+            let json_frames = {
+                let (txs, receivers) = channels();
+                let stream = generation_event_stream(GeneratePlan {
+                    incremental,
+                    is_batch: with_index,
+                    ..plan(receivers, senders())
+                });
+                futures::pin_mut!(stream);
+                let mut frames = Vec::new();
+                txs[0].send(frame(10, "He")).await.unwrap();
+                frames.push(parse(&stream.next().await.expect("first frame")));
+                txs[0].send(frame(10, "llo")).await.unwrap();
+                frames.push(parse(&stream.next().await.expect("second frame")));
+                txs[0].send(done(10, "!")).await.unwrap();
+                frames.push(parse(&stream.next().await.expect("terminal frame")));
+                txs[1].send(bad()).await.unwrap();
+                frames.push(parse(&stream.next().await.expect("error frame")));
+                drop(txs);
+                assert!(
+                    stream.next().await.is_none(),
+                    "stream ends after the script"
+                );
+                frames
             };
 
-            let (txs, receivers, _) = run(true);
-            script(&txs).await;
-            drop(txs);
-            let json_frames: Vec<String> = generation_event_stream(GeneratePlan {
-                incremental,
-                is_batch: with_index,
-                ..plan(receivers, senders())
-            })
-            .collect()
-            .await;
+            // Intermediate content, running counts, and the batch index are all
+            // real, not just the terminal frame. Incremental frames are deltas;
+            // cumulative frames carry the folded text.
+            let expected_text = if incremental {
+                ["He", "llo", "!"]
+            } else {
+                ["He", "Hello", "Hello!"]
+            };
+            assert_eq!(json_frames[0]["text"], expected_text[0]);
+            assert_eq!(json_frames[0]["meta_info"]["completion_tokens"], 1);
+            assert_eq!(json_frames[1]["text"], expected_text[1]);
+            assert_eq!(json_frames[1]["meta_info"]["completion_tokens"], 2);
+            assert_eq!(json_frames[2]["text"], expected_text[2]);
+            assert_eq!(json_frames[2]["meta_info"]["completion_tokens"], 3);
+            assert_eq!(
+                json_frames[2]["meta_info"]["finish_reason"]["type"],
+                "length"
+            );
+            assert_eq!(
+                json_frames[0]
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64),
+                with_index.then_some(0u64)
+            );
 
-            let (txs, receivers, _) = run(false);
-            script(&txs).await;
-            drop(txs);
-            let typed_frames: Vec<sglang_api_types::api::v1::GenerateStreamItem> =
-                generation_event_stream_with(
+            let typed_frames = {
+                let (txs, receivers) = channels();
+                let stream = generation_event_stream_with(
                     GeneratePlan {
                         incremental,
                         is_batch: with_index,
                         ..plan(receivers, senders())
                     },
                     PbFrameShaper,
-                )
-                .collect()
-                .await;
+                );
+                futures::pin_mut!(stream);
+                let mut frames = Vec::new();
+                txs[0].send(frame(10, "He")).await.unwrap();
+                frames.push(stream.next().await.expect("first frame"));
+                txs[0].send(frame(10, "llo")).await.unwrap();
+                frames.push(stream.next().await.expect("second frame"));
+                txs[0].send(done(10, "!")).await.unwrap();
+                frames.push(stream.next().await.expect("terminal frame"));
+                txs[1].send(bad()).await.unwrap();
+                frames.push(stream.next().await.expect("error frame"));
+                drop(txs);
+                assert!(
+                    stream.next().await.is_none(),
+                    "stream ends after the script"
+                );
+                frames
+            };
 
             assert_eq!(json_frames.len(), typed_frames.len(), "frame counts");
             for (json, typed) in json_frames.iter().zip(&typed_frames) {
-                let mut want: serde_json::Value = serde_json::from_str(json).unwrap();
                 match typed.item.as_ref().expect("typed item present") {
                     Item::Frame(f) => {
+                        let mut want = json.clone();
                         let mut got = serde_json::to_value(f).unwrap();
                         // The two runs time independently; pin presence, drop value.
                         let w = want["meta_info"]["e2e_latency"].take();
@@ -1179,10 +1222,10 @@ mod tests {
                     }
                     Item::Error(e) => {
                         let body = e.error.as_ref().expect("error body");
-                        assert_eq!(want["error"]["message"], body.message.as_str());
-                        assert_eq!(want["error"]["code"], body.code);
+                        assert_eq!(json["error"]["message"], body.message.as_str());
+                        assert_eq!(json["error"]["code"], body.code);
                         assert_eq!(
-                            want.get("index").and_then(serde_json::Value::as_u64),
+                            json.get("index").and_then(serde_json::Value::as_u64),
                             e.index.map(u64::from),
                             "error index"
                         );

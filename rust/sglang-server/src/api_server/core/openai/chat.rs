@@ -300,7 +300,8 @@ pub(crate) async fn unary_chat(
         };
         #[allow(deprecated)]
         let message = ChatCompletionResponseMessage {
-            content: (!content.is_empty()).then_some(ChatCompletionMessageContent::Text(content)),
+            // Python always emits `content` as a string (`text if text else ""`).
+            content: Some(ChatCompletionMessageContent::Text(content)),
             refusal: None,
             tool_calls,
             role: Role::Assistant,
@@ -332,11 +333,30 @@ pub(crate) async fn unary_chat(
         usage: None,
     };
     // Add the native matched stop per choice; Dynamo's `ChatChoice` has no slot
-    // for it. Python always emits the key, null when nothing matched.
+    // for it. Python always emits the key, null when nothing matched. The
+    // message shape is aligned with Python's `ChatMessage`: `tool_calls` is
+    // always present (null when none) with a per-call `index`, and its
+    // logprobs have no `refusal` key.
     let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
     if let Some(choices) = value["choices"].as_array_mut() {
         for (choice, matched_stop) in choices.iter_mut().zip(&matched_stops) {
             choice["matched_stop"] = matched_stop.clone().unwrap_or(serde_json::Value::Null);
+            if let Some(message) = choice.get_mut("message") {
+                match message["tool_calls"].as_array_mut() {
+                    Some(calls) => {
+                        for (index, call) in calls.iter_mut().enumerate() {
+                            call["index"] = serde_json::json!(index);
+                        }
+                    }
+                    None => message["tool_calls"] = serde_json::Value::Null,
+                }
+            }
+            if let Some(logprobs) = choice
+                .get_mut("logprobs")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                logprobs.remove("refusal");
+            }
         }
     }
     value["usage"] = usage_value(
@@ -863,6 +883,13 @@ fn chat_chunk_value(
     }
     if let Some(choice) = value["choices"].get_mut(0) {
         choice["matched_stop"] = matched_stop.unwrap_or(serde_json::Value::Null);
+        // Python's chat logprobs carry only `content`.
+        if let Some(logprobs) = choice
+            .get_mut("logprobs")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            logprobs.remove("refusal");
+        }
     }
     value
 }
@@ -941,7 +968,8 @@ pub(crate) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
             bytes: Some(token.as_bytes().to_vec()),
             token,
             logprob,
-            token_id: u32::try_from(token_id).ok(),
+            // Python's `ChatCompletionTokenLogprob` has no `token_id` field.
+            token_id: None,
             top_logprobs,
         });
     }
@@ -1199,7 +1227,9 @@ mod tests {
         let logprobs = chat_logprobs(Some(&extras));
         let token = &logprobs.content.unwrap()[0];
         assert_eq!(token.token, "x");
-        assert_eq!(token.token_id, Some(7));
+        // Python's chat logprob has no `token_id` field; the dynamo field stays
+        // None so it is omitted on the wire.
+        assert_eq!(token.token_id, None);
         assert_eq!(token.top_logprobs.len(), 2);
         assert_eq!(token.top_logprobs[1].token, "y");
     }
@@ -1906,5 +1936,116 @@ mod tests {
             )
         };
         assert_eq!(trailer_usage["prompt_tokens_details"]["cached_tokens"], 3);
+    }
+    /// Python's `ChatMessage`/`ChoiceLogprobs` presence rules: content is
+    /// always a string (empty stopped output included), `tool_calls` is always
+    /// present (null when none) with a per-call `index`, there is no `refusal`
+    /// on the message or logprobs, and logprob tokens have no `token_id`.
+    #[tokio::test]
+    async fn unary_chat_message_and_logprobs_presence_match_python() {
+        // Empty stopped content still serializes as ""; tool_calls is null.
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "", true)).await.unwrap();
+        let value = unary_chat(plan(vec![choice], senders()), chat_options())
+            .await
+            .expect("unary chat succeeds");
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["content"], "");
+        assert!(message.get("tool_calls").is_some());
+        assert!(message["tool_calls"].is_null());
+        assert!(message.get("refusal").is_none());
+        assert!(message["reasoning_content"].is_null());
+
+        // Populated logprobs: no `refusal`, no `token_id`.
+        let (choice, tx) = planned("r0");
+        let mut frame = chunk("r0", "answer", true);
+        if let ResponseItem::Done(event) = &mut frame {
+            event.extras = Some(Box::new(ChunkExtras {
+                out_lp_val: vec![-0.25],
+                out_lp_idx: vec![7],
+                out_lp_txt: vec!["x".into()],
+                ..Default::default()
+            }));
+        }
+        tx.send(frame).await.unwrap();
+        let value = unary_chat(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                want_logprobs: true,
+                ..chat_options()
+            },
+        )
+        .await
+        .expect("unary chat succeeds");
+        let logprobs = &value["choices"][0]["logprobs"];
+        assert!(logprobs.get("refusal").is_none());
+        assert_eq!(logprobs["content"][0]["token"], "x");
+        assert!(logprobs["content"][0].get("token_id").is_none());
+
+        // Populated tool calls carry the per-call index.
+        let (choice, tx) = planned("r0");
+        tx.send(chunk(
+            "r0",
+            r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            true,
+        ))
+        .await
+        .unwrap();
+        let value = unary_chat(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                parser: Some("llama3_json".into()),
+                ..chat_options()
+            },
+        )
+        .await
+        .expect("unary chat succeeds");
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["content"], "");
+        assert_eq!(message["tool_calls"][0]["index"], 0);
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+    /// Each Chat choice emits its role before its own first output/error; all
+    /// roles do not have to precede all content.
+    #[test]
+    fn chat_role_preludes_stay_per_choice() {
+        use crate::api_server::core::generate::FrameShaper;
+
+        let mut shaper = super::ChatStreamFrameShaper {
+            response_id: "chatcmpl-test".into(),
+            model: "model".into(),
+            created: 1,
+            want_logprobs: false,
+            reasoning_splitters: Vec::new(),
+            prelude_emitted: vec![false; 2],
+            state: std::sync::Arc::new(std::sync::Mutex::new(super::ChatStreamState::new(2))),
+            service_tier: None,
+        };
+        let indexed = |frame: &super::Annotated<super::CreateChatCompletionStreamResponse>| {
+            frame.data.as_ref().expect("data frame").choices[0].index
+        };
+        let role = |frame: &super::Annotated<super::CreateChatCompletionStreamResponse>| {
+            frame.data.as_ref().expect("data frame").choices[0]
+                .delta
+                .role
+        };
+
+        // Choice 1 errors first: its role precedes its own error.
+        let frames = shaper.item_error(500, "boom", Some(1));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(indexed(&frames[0]), 1);
+        assert_eq!(role(&frames[0]), Some(super::Role::Assistant));
+        assert!(frames[1].data.is_none() && frames[1].error.is_some());
+
+        // Choice 0's first output emits choice 0's role, not choice 1's.
+        let output = ChunkEvent {
+            text: "hi".into(),
+            ..Default::default()
+        };
+        let frames = shaper.delta(output, &super::OutputAccumulator::default(), "", Some(0));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(indexed(&frames[0]), 0);
+        assert_eq!(role(&frames[0]), Some(super::Role::Assistant));
     }
 }
