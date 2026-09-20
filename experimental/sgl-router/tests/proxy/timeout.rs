@@ -7,7 +7,8 @@
 //! Without a configured `.timeout(...)` on the reqwest client, a stalled
 //! backend hangs the axum handler future forever and the test harness
 //! would just timeout. We assert here that the router returns a fast,
-//! clean 502 (`upstream_timeout`) instead.
+//! clean 504 (`upstream_timeout`) instead — a timeout is a gateway timeout,
+//! the same status class as the stale-deadline cancel.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -38,6 +39,7 @@ fn config(_worker_url: &str) -> Config {
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -75,7 +77,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -102,13 +104,26 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         elapsed < Duration::from_secs(1),
         "router must short-circuit on upstream timeout; elapsed {elapsed:?}"
     );
-    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
         "upstream_timeout"
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8_lossy(&bytes);
+    // A hung worker is the most common hard worker failure there is, so it must
+    // land in `outcome="error"` — the series a per-worker error-ratio alert
+    // watches. Deriving the outcome from the 504 status instead would silently
+    // reclassify it as `cancelled` and blind that alert.
+    assert!(
+        ctx.metrics
+            .render()
+            .lines()
+            .any(|l| l.starts_with("sgl_router_worker_requests_total{")
+                && l.contains(r#"outcome="error""#)),
+        "an upstream timeout must be counted outcome=error, not cancelled:\n{}",
+        ctx.metrics.render(),
+    );
     assert!(
         body_str.contains("\"code\":\"upstream_timeout\""),
         "body: {body_str}"
