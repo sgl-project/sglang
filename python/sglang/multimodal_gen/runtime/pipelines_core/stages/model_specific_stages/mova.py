@@ -11,16 +11,10 @@ Sequence Parallelism (SP) Support:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
-<<<<<<< HEAD
-=======
-import os
-<<<<<<< HEAD
 from typing import Iterator
->>>>>>> 9b8a1b9af4 (fix MOVA errors)
-=======
->>>>>>> 8d4af1f2ea (opt codes)
 
 import torch
 import torch.nn as nn
@@ -78,14 +72,11 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
-<<<<<<< HEAD
-from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
-=======
 from sglang.multimodal_gen.runtime.utils.precision import (
     temporary_module_fp32_dtype,
     temporary_modules_fp32_dtype,
 )
->>>>>>> 8d4af1f2ea (opt codes)
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     resolve_torch_compile_kwargs,
@@ -93,6 +84,22 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _module_in_fp32(*modules: nn.Module, enabled: bool) -> Iterator[None]:
+    """Temporarily cast modules to float32, restoring original dtype on exit."""
+    if not enabled:
+        yield
+        return
+    original_dtypes = [next(m.parameters()).dtype for m in modules]
+    for m in modules:
+        m.float()
+    try:
+        yield
+    finally:
+        for m, dtype in zip(modules, original_dtypes):
+            m.to(dtype)
 
 
 class MOVALatentPreparationStage(PipelineStage):
