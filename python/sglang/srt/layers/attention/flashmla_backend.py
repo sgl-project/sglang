@@ -591,6 +591,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             num_total_tokens = q.shape[0]
             real_bs = self.forward_metadata.block_kv_indices.shape[0]
             num_tokens_per_req = self.speculative_num_steps + 1
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and forward_batch.spec_algorithm.is_dspark()
+            ):
+                num_tokens_per_req = forward_batch.spec_info.draft_token_num
             strip_pad = (
                 forward_batch.forward_mode.is_draft_extend_v2()
                 or forward_batch.forward_mode.is_target_verify()
