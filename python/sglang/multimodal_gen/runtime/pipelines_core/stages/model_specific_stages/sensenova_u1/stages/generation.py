@@ -107,9 +107,9 @@ def _image_input_to_list(image_input: Any) -> list[Image.Image]:
 
 
 def _load_edit_images(batch: Req) -> list[Image.Image]:
-    images = _image_input_to_list(getattr(batch, "condition_image", None))
+    images = _image_input_to_list(getattr(batch, "image_path", None))
     if not images:
-        images = _image_input_to_list(getattr(batch, "image_path", None))
+        images = _image_input_to_list(getattr(batch, "condition_image", None))
     return images
 
 

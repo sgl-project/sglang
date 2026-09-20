@@ -1167,7 +1167,9 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "think_mode" not in cli_args
 
 
-def test_sensenova_u1_input_validation_loads_rgba_with_white_background(tmp_path):
+def test_sensenova_u1_generation_stage_loads_image_path_rgba_with_white_background(
+    tmp_path,
+):
     image_path = tmp_path / "transparent.png"
     image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
     image.putpixel((1, 0), (255, 0, 0, 255))
@@ -1179,20 +1181,26 @@ def test_sensenova_u1_input_validation_loads_rgba_with_white_background(tmp_path
         height=2048,
         seed=7,
     )
-    batch = Req(
-        sampling_params=sampling,
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=None,
+        image_path=str(image_path),
         extra=sampling.build_request_extra(),
+        metrics=None,
     )
-    server_args = SimpleNamespace(
-        pipeline_config=SenseNovaU1PipelineConfig(),
-        enable_cfg_parallel=False,
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
     )
 
-    InputValidationStage().forward(batch, server_args)
-
-    assert isinstance(batch.condition_image, list)
-    assert len(batch.condition_image) == 1
-    loaded = batch.condition_image[0]
+    loaded = model.it2i_calls[0]["images"][0]
     assert loaded.mode == "RGB"
     assert loaded.getpixel((0, 0)) == (255, 255, 255)
     assert loaded.getpixel((1, 0)) == (255, 0, 0)

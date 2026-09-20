@@ -11,7 +11,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_THINK_MODE,
     RESOLUTION_ALIGNMENT,
-    _flatten_rgba_to_rgb,
 )
 
 
@@ -92,9 +91,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     def prepare_calculated_size(self, image):
         del image
         return None
-
-    def condition_image_convert_method(self):
-        return _flatten_rgba_to_rgb
 
     def supports_dynamic_batching(self):
         return True
