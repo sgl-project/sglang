@@ -216,3 +216,11 @@ Keep eager execution as the default. Breakable CUDA Graph replay requires
 matching resolution and condition-prefix length; unseen shapes run eagerly.
 Text buckets alone do not guarantee replay. SageAttention and Cache-DiT can
 change numerical results and require quality checks for your workload.
+
+### Cache-DiT
+
+Enable `--enable-cache-dit true` or `SGLANG_CACHE_DIT_ENABLED=true`. 2.1 prefix
+KV is per layer: each block slices caches by `_layer_id`. Cache-DiT wraps
+`transformer_blocks` and forwards the same extras to every layer; without that
+slice, later layers reuse layer 0 and the image collapses to color noise.
+See the [Cache-DiT guide](/docs/sglang-diffusion/cache_dit).
