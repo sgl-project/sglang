@@ -117,6 +117,22 @@ class TestWanNormSiLUPost(CustomTestCase):
                 )
 
     @torch.inference_mode()
+    def test_nonintegral_channel_scale_and_zero_norm(self):
+        for channels in (96, 512):
+            for layout in (torch.contiguous_format, torch.channels_last_3d):
+                module = self.module(channels, bias=True)
+                x = torch.randn(
+                    2, channels, 1, 5, 12, device="cuda", dtype=torch.bfloat16
+                ).to(memory_format=layout)
+                x[0].zero_()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    self.assertBitsEqual(
+                        module(x), reference(x, module.gamma, module.bias, module.scale)
+                    )
+                    self.assertTrue(module._post_gate.verified)
+                    self.assertFalse(module._post_gate.disabled)
+
+    @torch.inference_mode()
     def test_graph_replay_recomputes_norm_and_affine(self):
         for layout in (torch.contiguous_format, torch.channels_last_3d):
             module = self.module(bias=True)
