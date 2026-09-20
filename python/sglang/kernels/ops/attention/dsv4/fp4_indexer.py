@@ -6,6 +6,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+from sglang.srt.runtime_context import get_platform
 
 INDEX_HEAD_DIM = 128
 # One index-K slot: 64 packed e2m1 bytes and four ue8m0 block exponents.
@@ -133,6 +134,56 @@ def _quantize_fp4_indexer_kernel(
 
 
 @triton.jit
+def _quantize_fp4_indexer_rows(
+    x,
+    x_fp4,
+    x_sf,
+    M,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N == 128 and GROUP_N == 32)
+    # Each reduction covers one scale group. Keep its values for packing,
+    # avoiding four masked full-row reductions and a second input load.
+    group = tl.program_id(0) * BLOCK_M * 4 + tl.arange(0, BLOCK_M * 4)
+    offs = tl.arange(0, GROUP_N)
+    values = tl.load(
+        x + group[:, None].to(tl.int64) * GROUP_N + offs[None, :],
+        group[:, None] < M * 4,
+        0,
+    ).to(tl.float32)
+    amax = tl.max(tl.abs(values), axis=1)
+    exp = _ceil_ue8m0_exp(tl.maximum(amax / 6.0, 1.0e-4))
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    v0, v1 = tl.split(
+        tl.reshape(values / scale[:, None], (BLOCK_M * 4, GROUP_N // 2, 2))
+    )
+    if RNE:
+        code0 = _fp4_e2m1_code_rne(v0)
+        code1 = _fp4_e2m1_code_rne(v1)
+    else:
+        code0 = _fp4_e2m1_code(v0)
+        code1 = _fp4_e2m1_code(v1)
+    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    tl.store(
+        x_fp4
+        + group[:, None].to(tl.int64) * (GROUP_N // 2)
+        + tl.arange(0, GROUP_N // 2)[None, :],
+        packed,
+        group[:, None] < M * 4,
+    )
+    # The four exponents occupy disjoint bytes, so integer sum packs them.
+    shifts = tl.arange(0, 4) * 8
+    packed_sf = tl.sum(
+        tl.reshape(exp.to(tl.uint32), (BLOCK_M, 4)) << shifts[None, :], axis=1
+    )
+    token_id = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    tl.store(x_sf + token_id, packed_sf.to(tl.int32), token_id < M)
+
+
+@triton.jit
 def _store_fp4_index_k_cache_kernel(
     k_fp4,
     k_sf,
@@ -169,7 +220,20 @@ def quantize_fp4_indexer_tensor(
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
     x_sf = torch.empty((x.shape[0],), device=x.device, dtype=torch.int32)
-    if x.shape[0] > 0:
+    if x.shape[0] >= 4096 and get_platform().is_blackwell:
+        # Independent rows share a CTA to avoid one block per 128 values.
+        _quantize_fp4_indexer_rows[(triton.cdiv(x.shape[0], 8),)](
+            x,
+            x_fp4,
+            x_sf,
+            x.shape[0],
+            8,
+            BLOCK_N=128,
+            GROUP_N=32,
+            RNE=rne,
+            num_warps=4,
+        )
+    elif x.shape[0] > 0:
         _quantize_fp4_indexer_kernel[(x.shape[0],)](
             x,
             x_fp4,
