@@ -642,10 +642,23 @@ passed dynamic loading, merging, and removal on one B200 and TP2 with encoder
 folding. Both removal paths restored the base image exactly. This verifies
 adapter application and lifecycle, not the quality of a trained LoRA.
 
-Cache-DiT hooks operate on target-image transformer blocks; two-output generation,
-editing, transparent generation, and transparent-input editing passed with it
-enabled on B200 at 1024px/40 steps. This is a functional check of an approximate
-cache, not a lossless recipe. Breakable CUDA
+### Cache-DiT
+
+2.1 prefix KV is per layer. Cache-DiT wraps `transformer_blocks` into one
+`UnifiedBlocks` call; the native loop must rebind each inner block to that
+layer's cache. Without the bind, step 0 overwrites every layer's prefix KV and
+the image collapses to color noise.
+
+Enable it per request with `--enable-cache-dit true`, or export
+`SGLANG_CACHE_DIT_ENABLED=true` as the server default. Optional knobs go in
+`--cache-dit-params` or `SGLANG_CACHE_DIT_*`. See the shared
+[Cache-DiT guide](/docs/sglang-diffusion/cache_dit).
+
+Two-output generation, editing, transparent generation, and transparent-input
+editing passed with Cache-DiT enabled on B200 at 1024px/40 steps. This is a
+functional check of an approximate cache, not a lossless recipe.
+
+Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
 Graph execution fills each request's prefix caches eagerly, then replays
 matching warmup graphs with those cache tensors as inputs. Warmup and request
 condition-prefix lengths must match, in addition to the output resolution;
