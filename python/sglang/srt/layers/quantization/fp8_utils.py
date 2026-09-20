@@ -652,6 +652,10 @@ def prepare_xpu_block_scale_for_scaled_mm(
     linear_fn: Callable,
 ) -> torch.Tensor:
     """Materialize the XPU block scale layout consumed by scaled_mm once."""
+    # Keep logical [N-blocks, K-blocks] shape, but use
+    # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+    # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+    # This avoids a per-forward contiguous/copy in either path.
     if (
         linear_fn is not torch_w8a8_block_fp8_linear
         or not isinstance(block_size, (list, tuple))

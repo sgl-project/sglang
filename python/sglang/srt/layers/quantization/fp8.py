@@ -1045,7 +1045,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
             if _is_xpu:
+                # Enable per-token dynamic activation quantization for XPU rowwise GEMM.
                 self.use_per_token_if_dynamic = True
+                # Pre-materialize [N, 1] transpose-contiguous scale layout to avoid
+                # per-forward transpose/contiguous copies in torch._scaled_mm.
                 if layer.weight_scale.ndim == 2 and layer.weight_scale.shape[0] == 1:
                     with torch.no_grad():
                         layer.weight_scale.set_(
