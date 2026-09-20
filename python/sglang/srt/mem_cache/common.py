@@ -284,11 +284,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.kv.mamba_pool_idx = None
         return
 
-    effective_kv_committed_len = req.effective_kv_committed_len()
+    owned_kv_len = req.owned_kv_len()
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
+        owned_kv_len=owned_kv_len,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
@@ -297,7 +297,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if not req.kv.holds_kv:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
