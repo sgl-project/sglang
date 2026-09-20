@@ -86,22 +86,44 @@ class TestLingBotModulation(CustomTestCase):
                         x.zero_().neg_()
                     scale = torch.randn((shape[0], shape[2]), device="cuda")
                     shift = torch.randn_like(scale)
+                    raw = try_fused_fp32_layernorm_bf16(x, scale, shift, 1e-6)
+                    reference = native_modulation(x, scale, shift)
+                    block = make_sites(shape[-1])
                     self.assert_bits(
-                        try_fused_fp32_layernorm_bf16(x, scale, shift, 1e-6),
-                        native_modulation(x, scale, shift),
+                        block._fp32_norm(x, scale[:, None, None], shift[:, None, None]),
+                        reference,
                     )
+                    exact = torch.equal(
+                        raw.view(torch.int16), reference.view(torch.int16)
+                    )
+                    self.assertEqual(block._norm1_modulation_gate.disabled, not exact)
+                    self.assertEqual(block._norm1_modulation_gate.verified, exact)
+                    # Raw reduction equivalence was validated on Hopper. Other
+                    # Torch/device dispatches may differ (B200, D=2240); the
+                    # production site must exercise its live exactness gate.
+                    if torch.cuda.get_device_capability() == (9, 0):
+                        self.assert_bits(raw, reference)
                     weight, bias = (
                         scale[:1].expand(shape[0], -1),
                         shift[:1].expand(shape[0], -1),
                     )
-                    self.assert_bits(
-                        try_fused_fp32_layernorm_bf16(
-                            x, weight, bias, 1e-6, affine=True
-                        ),
-                        F.layer_norm(
-                            x.float(), (shape[-1],), weight[0], bias[0], 1e-6
-                        ).bfloat16(),
+                    raw = try_fused_fp32_layernorm_bf16(
+                        x, weight, bias, 1e-6, affine=True
                     )
+                    reference = F.layer_norm(
+                        x.float(), (shape[-1],), weight[0], bias[0], 1e-6
+                    ).bfloat16()
+                    norm = block.self_attn_residual_norm.norm
+                    norm.weight.copy_(weight[0])
+                    norm.bias.copy_(bias[0])
+                    self.assert_bits(block._fp32_norm(x), reference)
+                    exact = torch.equal(
+                        raw.view(torch.int16), reference.view(torch.int16)
+                    )
+                    self.assertEqual(block._cross_norm_gate.disabled, not exact)
+                    self.assertEqual(block._cross_norm_gate.verified, exact)
+                    if torch.cuda.get_device_capability() == (9, 0):
+                        self.assert_bits(raw, reference)
 
     @torch.inference_mode()
     def test_camera_rounding_finite_bf16_and_replay(self):
