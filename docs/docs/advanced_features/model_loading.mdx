@@ -47,6 +47,10 @@ Set with `--load-format`:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Load weights in the safetensors format.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>instanttensor</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Load Safetensors weights quickly with InstantTensor's distributed loading and pipelined prefetching.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>pt</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Load weights in the PyTorch <code>.bin</code> format.</td>
     </tr>
@@ -100,6 +104,24 @@ Set with `--load-format`:
     </tr>
   </tbody>
 </table>
+
+## Load with InstantTensor
+
+InstantTensor provides high-performance loading for Safetensors checkpoints through distributed loading and pipelined prefetching. Install the optional dependency:
+
+```bash
+pip install "sglang[instanttensor]"
+```
+
+Enable it explicitly when you launch the server:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.6-35B-A3B \
+  --load-format instanttensor
+```
+
+For tensor-parallel and multi-node deployments, InstantTensor uses SGLang's initialized distributed process group. The standard `auto` and `safetensors` paths remain unchanged.
 
 ## Model loader extra config
 

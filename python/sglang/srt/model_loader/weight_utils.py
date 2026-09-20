@@ -57,6 +57,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -1161,6 +1162,43 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over Safetensors weights with InstantTensor."""
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            "Please install InstantTensor via `pip install instanttensor`."
+        ) from e
+
+    distributed = torch.distributed.is_initialized()
+    if distributed:
+        world_group = get_parallel().world_group
+        process_group = world_group.device_group if world_group.world_size > 1 else None
+    else:
+        process_group = None
+
+    device = current_platform.get_device(torch.cuda.current_device())
+    enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    with instanttensor.safe_open(
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+    ) as f:
+        yield from tqdm(
+            f.tensors(),
+            total=len(f.keys()),
+            desc="Loading safetensors using InstantTensor",
+            disable=not enable_tqdm,
+            mininterval=1,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        )
 
 
 def fastsafetensors_weights_iterator(

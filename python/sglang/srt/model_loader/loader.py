@@ -116,6 +116,7 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -473,9 +474,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif (
-            load_format == LoadFormat.SAFETENSORS
-            or load_format == LoadFormat.FASTSAFETENSORS
+        elif load_format in (
+            LoadFormat.SAFETENSORS,
+            LoadFormat.FASTSAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -614,6 +616,8 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_folder,
                 hf_weights_files,
             )
+        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            weights_iterator = instanttensor_weights_iterator(hf_weights_files)
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints

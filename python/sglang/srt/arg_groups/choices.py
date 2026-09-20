@@ -10,6 +10,7 @@ LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
     "safetensors",
+    "instanttensor",
     "npcache",
     "dummy",
     "sharded_state",
