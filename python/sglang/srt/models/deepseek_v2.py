@@ -2629,6 +2629,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
+    """The first stage embeds inputs; the last supplies the EAGLE draft."""
+    return pp_group.is_first_rank or (
+        pp_group.is_last_rank and speculative_algorithm is not None
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2654,7 +2661,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
-        if self.pp_group.is_first_rank:
+        if pp_stage_needs_embedding(self.pp_group, get_spec().speculative_algorithm):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

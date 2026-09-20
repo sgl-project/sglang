@@ -187,6 +187,14 @@ class BaseSpecWorker(ABC):
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
 
+    def requires_dp_attention_eager_forward(self, batch) -> bool:
+        """Return whether this rank must avoid the draft graph this step.
+
+        DP attention folds this vote into its existing metadata collective so
+        every rank in the MLP/EP cohort selects the same draft execution path.
+        """
+        return False
+
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         if self.draft_worker is None:

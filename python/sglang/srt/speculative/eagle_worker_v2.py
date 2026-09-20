@@ -1160,6 +1160,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    def requires_dp_attention_eager_forward(self, batch: ScheduleBatch) -> bool:
+        """Keep seedless IndexShare draft fallback consistent across DP ranks."""
+        if self._draft_worker is None:
+            return False
+        if not self._draft_worker.seed_dsa_topk_from_draft_extend:
+            return False
+
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return False
+
+        # FutureMap resolves overlap inputs after the scheduler-side vote. Its
+        # availability flag already reflects a merged seeded/seedless batch,
+        # while the currently materialized tensor may still be stale.
+        if getattr(draft_input, "future_indices", None) is not None:
+            has_seed = getattr(draft_input, "future_dsa_topk_indices_available", False)
+        else:
+            has_seed = getattr(draft_input, "dsa_topk_indices", None) is not None
+        return not has_seed
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

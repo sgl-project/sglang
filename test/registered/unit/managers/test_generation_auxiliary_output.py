@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -562,6 +563,44 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
     assert torch.equal(output_result.auxiliary_host_output.values, device_output.values)
     assert all("sampling_observer_output" not in key for key in tensors)
     receiver.future_map.stash.assert_called_once()
+
+
+def test_pipeline_parallel_dsa_seed_round_trip():
+    dsa_seed = torch.tensor([[3, 7, 11]], dtype=torch.int32)
+    draft_input = EagleDraftInput(
+        topk_p=torch.ones((1, 1), dtype=torch.float32),
+        topk_index=torch.tensor([[5]], dtype=torch.int64),
+        hidden_states=torch.ones((1, 4), dtype=torch.float32),
+        dsa_topk_indices=dsa_seed,
+    )
+    result = GenerationBatchResult(
+        next_token_ids=torch.tensor([7]),
+        next_draft_input=draft_input,
+    )
+    batch = SimpleNamespace(
+        return_logprob=False,
+        req_pool_indices=torch.tensor([3]),
+        input_ids=torch.tensor([5]),
+    )
+
+    tensors = Scheduler._pp_prepare_tensor_dict(
+        object.__new__(Scheduler), result, batch
+    )
+    assert torch.equal(tensors["draft_dsa_topk_indices"], dsa_seed)
+
+    receiver = object.__new__(Scheduler)
+    receiver.pp_group = SimpleNamespace(is_first_rank=False)
+    receiver.future_map = SimpleNamespace(stash=Mock())
+    output_result = Scheduler._pp_prep_batch_result(
+        receiver,
+        batch,
+        PPBatchMetadata(can_run_cuda_graph=True),
+        PPProxyTensors(tensors),
+    )
+
+    assert torch.equal(output_result.next_draft_input.dsa_topk_indices, dsa_seed)
+    payload = receiver.future_map.stash.call_args.args[1]
+    assert torch.equal(payload.dsa_topk_indices, dsa_seed)
 
 
 def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():

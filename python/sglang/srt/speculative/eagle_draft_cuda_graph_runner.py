@@ -329,7 +329,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.require_mlp_sync:
             is_bs_supported = (
-                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+                is_bs_supported
+                and forward_batch.can_run_decode_cuda_graph
+                and forward_batch.can_run_dp_draft_cuda_graph
             )
 
         return is_bs_supported
