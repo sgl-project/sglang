@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -31,7 +31,6 @@ class DevicePoolEntry:
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
-        index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
         dcp_size: int = 1,
     ):
         self.name = name
@@ -41,7 +40,6 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
-        self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
         # Token-addressed indices arrive as DCP-WIDENED locs: the allocator
         # spans [0, max_total * dcp_size) and each rank stores only the locs it
@@ -89,7 +87,7 @@ class DevicePoolEntry:
         return self.kv_buffer
 
     def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return self._index_mapper(indices) if self._index_mapper else indices
+        return indices
 
     def _rows(self, indices: torch.Tensor) -> list[int]:
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
