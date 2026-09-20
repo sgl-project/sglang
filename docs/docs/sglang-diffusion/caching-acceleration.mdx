@@ -35,7 +35,7 @@ The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_
 
 ### Coverage and limits
 
-The common encoder boundary covers native CLIP, T5/UMT5, Llama, Gemma 2/3, Qwen 2.5-VL, Qwen 3/3-VL, Ideogram, and MiniMax-H3 encoders, including custom pipeline stages. Qwen-VL and Gemma 3 also cache vision features independently of text. Hunyuan3D image encoders and the LTX-2.3 video condition encoder participate. Native image, video, and audio VAE encode entry points cache deterministic tensors or supported posterior containers.
+The common encoder boundary covers native CLIP, T5/UMT5, Llama, Mistral 3, Gemma 2/3, Qwen 2.5-VL, Qwen 3/3-VL, Ideogram, and MiniMax-H3 encoders, including custom pipeline stages. Qwen-VL and Gemma 3 also cache vision features independently of text. Hunyuan3D image encoders and the LTX-2.3 video condition encoder participate. Native image, video, and audio VAE encode entry points cache deterministic tensors or supported posterior containers.
 
 Cosmos3 has no separate text encoder: its deterministic understanding pathway caches immutable per-layer K/V results, which are copied into fresh request state. SenseNova-U1 caches reference-image vision features; its noisy-image vision path still runs at each denoising step. VLA keeps its model-owned observation/prefix cache.
 

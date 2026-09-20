@@ -128,7 +128,7 @@ def test_vla_prefix_respects_disable_and_weight_invalidation(disabled, capacity)
         conditioning_cache_max_size_mb=capacity,
         pipeline_config=SimpleNamespace(enable_global_prefix_cache=True),
     )
-    batch = Req(extra={"vla": {}})
+    batch = Req(prompt="pick up the cube", extra={"vla": {}})
     key, cached = stage.get_cached_context(batch, args, None)
     assert cached is None
     if disabled or capacity == 0:
