@@ -1544,7 +1544,17 @@ class CommonKVSender(BaseKVSender):
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
     def get_max_transfer_tokens(self) -> Optional[int]:
-        return self.kv_mgr._dcp_pack_max_tokens
+        if self.kv_mgr._dcp_pack_max_tokens is None:
+            return None
+        for peer, info in self.kv_mgr.transfer_infos.get(
+            self.bootstrap_room, {}
+        ).items():
+            if (
+                not info.is_dummy
+                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
+            ):
+                return self.kv_mgr._dcp_pack_max_tokens
+        return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
