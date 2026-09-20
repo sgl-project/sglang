@@ -524,11 +524,11 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
     scheduler.enable_dp_attention = False
     batch = SimpleNamespace(
-        split_index=0,
         forward_mode=SimpleNamespace(
             is_prebuilt=lambda: False,
             is_split_prefill=lambda: True,
         ),
+        split_index=0,
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
