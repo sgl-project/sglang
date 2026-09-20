@@ -346,13 +346,18 @@ class TestXPUFP8Linear(CustomTestCase):
             weight_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
             / torch.finfo(torch.float8_e4m3fn).max
         )
+        block_method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        self.assertFalse(block_method.use_per_token_if_dynamic)
+
         layer = torch.nn.Module()
         layer.logical_widths = [N]
         layer.weight = torch.nn.Parameter(weight_bf16, requires_grad=False)
         layer.orig_dtype = torch.bfloat16
         layer.input_scale = None
         method.cutlass_fp8_supported = True
-        self.assertTrue(method.use_per_token_if_dynamic)
+        self.assertFalse(method.use_per_token_if_dynamic)
         method.process_weights_after_loading(layer)
         self.assertTrue(method.use_per_token_if_dynamic)
         weight = layer.weight

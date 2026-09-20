@@ -529,7 +529,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self.quant_config.is_checkpoint_fp8_serialized
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
-        self.use_per_token_if_dynamic = _is_xpu
+        self.use_per_token_if_dynamic = False
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -1044,13 +1044,13 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-            if (
-                _is_xpu
-                and layer.weight_scale.ndim == 2
-                and layer.weight_scale.shape[0] == 1
-            ):
-                with torch.no_grad():
-                    layer.weight_scale.set_(layer.weight_scale.data.t().contiguous())
+            if _is_xpu:
+                self.use_per_token_if_dynamic = True
+                if layer.weight_scale.ndim == 2 and layer.weight_scale.shape[0] == 1:
+                    with torch.no_grad():
+                        layer.weight_scale.set_(
+                            layer.weight_scale.data.t().contiguous()
+                        )
 
             if _is_cpu:
                 assert _is_cpu_amx_available, (
