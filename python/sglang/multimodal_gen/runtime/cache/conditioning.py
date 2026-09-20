@@ -125,7 +125,7 @@ def _map_output(value, tensor_fn, *, restore=False):
         return type(value)(
             **{
                 field.name: _map_output(
-                    getattr(value, field.name), tensor_fn, restore=restore
+                    vars(value)[field.name], tensor_fn, restore=restore
                 )
                 for field in fields(value)
             }

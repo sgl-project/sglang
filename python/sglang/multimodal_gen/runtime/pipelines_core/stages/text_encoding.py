@@ -9,7 +9,6 @@ This module contains implementations of prompt encoding stages for diffusion pip
 
 import inspect
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import torch
@@ -100,18 +99,6 @@ def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
         attentions=_gather_seq(local_out.attentions),
         attention_mask=_gather(local_out.attention_mask),
     )
-
-
-@lru_cache(maxsize=1)
-def get_model_default_negative_prompt(
-    model_path: str, backend: Any, model_id: str | None
-):
-    from sglang.multimodal_gen.registry import get_model_info
-
-    model_info = get_model_info(model_path, backend=backend, model_id=model_id)
-    if model_info is None:
-        return None
-    return model_info.sampling_param_cls().negative_prompt
 
 
 @dataclass(frozen=True)

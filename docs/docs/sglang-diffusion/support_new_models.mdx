@@ -169,15 +169,17 @@ Use the model's Diffusers pipeline, official implementation, or
 If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
 LTX, extend that implementation before starting from an empty file.
 
-## Choose a Pipeline Shape
-
-### Conditioning reuse
+## Conditioning reuse
 
 Use the native `TextEncoder` / `ImageEncoder` base classes (or `EncoderTensorParallelMixin`) and call encoders through `encoder(...)`. This preserves the shared conditioning cache, module hooks, and encoder TP/folding group. A replicated custom encoder can use `ConditioningEncoderMixin`; do not apply it to a module with hidden mutable state or random sampling in `forward()`.
 
 For a custom VAE, apply `cached_vae_encode` only to the deterministic encode method returning a tensor or posterior. Keep posterior sampling, normalization, initial noise, scheduler state, and request-specific KV dictionaries outside that boundary. Unsupported outputs bypass caching; explicitly register a tensor-only posterior container with `register_conditioning_container` when needed. Never register an autoregressive cache or a session object as a posterior container.
 
+For integrated models without a separate encoder, use `cached_conditioning` on a pure conditioning method, as in Cosmos3's understanding pathway or SenseNova-U1's reference-image features. Every rank in the current encoder TP group must enter that method together. Do not decorate the noisy-image or denoising path.
+
 Test cache-on versus cache-off with identical seeds, changed prompts/masks/reference pixels (including alpha), downstream in-place mutations, changed weights, and rank-local eviction under supported parallel groups. Include the new model in the [conditioning cache coverage](/docs/sglang-diffusion/caching-acceleration#coverage-and-limits).
+
+## Choose a Pipeline Shape
 
 SGLang-Diffusion uses `ComposedPipelineBase` to wire stages together. Most
 native pipelines should choose the least invasive stage shape that preserves the

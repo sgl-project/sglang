@@ -39,7 +39,7 @@ The common encoder boundary covers native CLIP, T5/UMT5, Llama, Gemma 2/3, Qwen 
 
 Cosmos3 has no separate text encoder: its deterministic understanding pathway caches immutable per-layer K/V results, which are copied into fresh request state. SenseNova-U1 caches reference-image vision features; its noisy-image vision path still runs at each denoising step. VLA keeps its model-owned observation/prefix cache.
 
-Stateful autoregressive calls (`use_cache=True` or existing `past_key_values`), training/autograd, unsupported tensor or output types, FSDP execution, and distributed VAE encoding bypass the new host cache. External SRT encoders and the Diffusers pipeline backend keep their own cache behavior. The global disable flag also disables existing realtime text and VLA prefix reuse; those model-specific caches otherwise retain their own memory settings.
+Stateful autoregressive calls (`use_cache=True` or existing `past_key_values`), training/autograd, unsupported tensor or output types, FSDP execution, and distributed VAE encoding bypass the new host cache. Library fallback encoders outside the native boundaries, external SRT encoders, and the Diffusers pipeline backend keep their own cache behavior. The global disable flag also disables existing realtime text and VLA prefix reuse; those model-specific caches otherwise retain their own memory settings.
 
 Joint vision-language embeddings depend on both the prompt and image. The cache does not reuse a previous turn's combined embedding when either changes, and does not carry mutable denoising KV state between requests.
 

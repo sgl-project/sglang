@@ -1,14 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    ConditioningCache,
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import Cosmos3LanguageModel
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
+    RealtimeTextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
+    VLAPrefixEncodingStage,
+)
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 
 
 class UndLayer(torch.nn.Module):
@@ -71,3 +87,56 @@ def test_sensenova_caches_references_but_runs_noisy_vision_each_step():
             model.extract_feature(pixels, gen_model=True)
     assert model.vision_model.calls == 1
     assert model.fm_modules["vision_model_mot_gen"].calls == 2
+
+
+@pytest.mark.parametrize("disabled, capacity", [(False, 512), (True, 512), (False, 0)])
+def test_realtime_text_respects_disable_and_weight_invalidation(
+    monkeypatch, disabled, capacity
+):
+    calls = []
+
+    def encode(self, batch, server_args):
+        calls.append(batch.prompt)
+        batch.prompt_embeds = [torch.ones(1)]
+        return batch
+
+    monkeypatch.setattr(TextEncodingStage, "forward", encode)
+    stage = RealtimeTextEncodingStage([], [])
+    session = RealtimeSession()
+    args = SimpleNamespace(
+        disable_conditioning_cache=disabled,
+        conditioning_cache_max_size_mb=capacity,
+    )
+    for _ in range(2):
+        stage.forward(Req(prompt="a cat", session=session), args)
+    expected = 2 if disabled or capacity == 0 else 1
+    assert len(calls) == expected
+    invalidate_conditioning_caches()
+    stage.forward(Req(prompt="a cat", session=session), args)
+    assert len(calls) == expected + 1
+
+
+@pytest.mark.parametrize("disabled, capacity", [(False, 512), (True, 512), (False, 0)])
+def test_vla_prefix_respects_disable_and_weight_invalidation(disabled, capacity):
+    stage = VLAPrefixEncodingStage.__new__(VLAPrefixEncodingStage)
+    stage.policy_model = Mock()
+    stage.policy_model.build_prefix_cache_key.return_value = "observation"
+    entries = {}
+    stage.prefix_cache = entries
+    args = SimpleNamespace(
+        disable_conditioning_cache=disabled,
+        conditioning_cache_max_size_mb=capacity,
+        pipeline_config=SimpleNamespace(enable_global_prefix_cache=True),
+    )
+    batch = Req(extra={"vla": {}})
+    key, cached = stage.get_cached_context(batch, args, None)
+    assert cached is None
+    if disabled or capacity == 0:
+        assert key is None
+        stage.policy_model.build_prefix_cache_key.assert_not_called()
+    else:
+        context = object()
+        entries[key] = context
+        assert stage.get_cached_context(batch, args, None)[1] is context
+        invalidate_conditioning_caches()
+        assert stage.get_cached_context(batch, args, None)[1] is None

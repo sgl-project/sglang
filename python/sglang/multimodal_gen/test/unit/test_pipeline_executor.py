@@ -14,11 +14,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
 )
 from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _RecordingExecutor(PipelineExecutor):
     def __init__(self):
-        super().__init__(server_args=SimpleNamespace())
+        super().__init__(server_args=_server_args())
         self.single_inference_mode = None
         self.group_inference_mode = None
         self.single_grad_enabled = None
@@ -47,6 +48,8 @@ class _TestServerArgs(SimpleNamespace):
 def _server_args(**overrides):
     values = {
         "use_fsdp_inference": False,
+        "disable_conditioning_cache": ServerArgs.disable_conditioning_cache,
+        "conditioning_cache_max_size_mb": ServerArgs.conditioning_cache_max_size_mb,
         "component_modes": {},
     }
     values.update(overrides)
