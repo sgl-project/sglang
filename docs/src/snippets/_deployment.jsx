@@ -2014,7 +2014,7 @@ export const Deployment = ({ config, benchmarks }) => {
       const options = visibleOptions(dim, sel);
       const currentOption = selectedOption(dim);
       return (
-        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+        <section className={["sgd-builder-context", className].filter(Boolean).join(" ")} aria-live={direct ? undefined : "polite"}>
           <div className="sgd-builder-context-heading">
             <div>
               <span>{direct ? dim.title : `${dim.title} options`}</span>

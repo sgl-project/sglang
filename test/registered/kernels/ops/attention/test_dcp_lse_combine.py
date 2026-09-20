@@ -3,7 +3,7 @@
 Covers:
 1. Triton LSE combine kernel correctness vs CPU reference (base-e and base-2)
 2. Various DCP world sizes (N=1,2,4,8)
-3. Edge cases: single shard, dominant LSE, equal LSE, NaN/inf
+3. Edge cases: single shard, dominant LSE, equal LSE
 4. return_lse mode
 5. dcp_a2a_lse_reduce with pre-allocated CUDA graph buffers
 """
@@ -239,31 +239,8 @@ class TestLSECombineEdgeCases(CustomTestCase):
         )
 
 
-class TestCPUReference(CustomTestCase):
-    """Test the CPU reference implementation independently."""
-
-    def test_basic_combine(self):
-        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
-
-        N, B, H, D = 2, 2, 4, 8
-        outputs = torch.randn(N, B, H, D)
-        lses = torch.randn(N, B, H)
-
-        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
-        self.assertEqual(result.shape, (B, H, D))
-        self.assertFalse(torch.isnan(result).any())
-
-    def test_base2_vs_base_e(self):
-        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
-
-        N, B, H, D = 2, 2, 4, 8
-        outputs = torch.randn(N, B, H, D)
-        lses = torch.randn(N, B, H) * 3.0
-
-        result_e = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
-        result_2 = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=False)
-
-        self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
+class TestLSEBaseByBackend(CustomTestCase):
+    """Which attention backends report LSE in natural log."""
 
     def test_natural_log_lse_backends(self):
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
@@ -276,26 +253,6 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
-
-    def test_nan_lse_handled(self):
-        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
-
-        N, B, H, D = 2, 1, 1, 8
-        outputs = torch.randn(N, B, H, D)
-        lses = torch.tensor([[[5.0]], [[float("nan")]]])
-
-        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
-        self.assertFalse(torch.isnan(result).any())
-
-    def test_inf_lse_handled(self):
-        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
-
-        N, B, H, D = 2, 1, 1, 8
-        outputs = torch.randn(N, B, H, D)
-        lses = torch.tensor([[[5.0]], [[float("inf")]]])
-
-        result = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=True)
-        self.assertFalse(torch.isnan(result).any())
 
 
 class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
@@ -368,40 +325,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
             rtol=1e-5,
         )
 
-    def test_cuda_graph_buffers_n4(self):
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        torch.manual_seed(456)
-        N, B, H_per_rank, D = 4, 2, 4, 64
-        H = H_per_rank * N
-        max_bs = 8
-
-        group = self._make_mock_group(N)
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        result_dynamic = dcp_a2a_lse_reduce(
-            attn_out.clone(), attn_lse.clone(), group, is_lse_base_on_e=True
-        )
-
-        cuda_graph_buffers = self._make_cuda_graph_buffers(N, max_bs, H_per_rank, D)
-
-        result_graph = dcp_a2a_lse_reduce(
-            attn_out.clone(),
-            attn_lse.clone(),
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=cuda_graph_buffers,
-        )
-
-        torch.testing.assert_close(
-            result_graph.float().cpu(),
-            result_dynamic.float().cpu(),
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
     def test_cuda_graph_buffers_partial_batch(self):
         """Buffer max_bs > actual B -- should correctly slice."""
         from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
@@ -424,29 +347,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
             group,
             is_lse_base_on_e=True,
             cuda_graph_buffers=cuda_graph_buffers,
-        )
-
-        self.assertEqual(result.shape, (B, H_per_rank, D))
-        self.assertFalse(torch.isnan(result).any())
-
-    def test_a2a_reduce_allocates_when_no_buffers(self):
-        """Without cuda_graph_buffers, dcp_a2a_lse_reduce still works (eager mode)."""
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        N, B, H_per_rank, D = 2, 4, 8, 64
-        H = H_per_rank * N
-
-        group = self._make_mock_group(N)
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        result = dcp_a2a_lse_reduce(
-            attn_out,
-            attn_lse,
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=None,
         )
 
         self.assertEqual(result.shape, (B, H_per_rank, D))

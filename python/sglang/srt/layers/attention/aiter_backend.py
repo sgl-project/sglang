@@ -3617,6 +3617,9 @@ class AiterAttnBackend(AttentionBackend):
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             page_table = self.forward_metadata.kv_indices
+            qo_indptr = self.forward_metadata.qo_indptr
+            if qo_indptr is None:
+                qo_indptr = self.qo_indptr
             if (
                 layer.sliding_window_size is not None
                 and layer.sliding_window_size > -1
@@ -3635,7 +3638,7 @@ class AiterAttnBackend(AttentionBackend):
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
                 page_table,
                 self.forward_metadata.max_q_len,
