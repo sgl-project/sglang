@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -55,9 +55,12 @@ def test_scheduler_rejects_multi_reference_and_mismatched_output_shape():
     single = _request("first", "turn it red", "first.png")
     multiple = _request("second", "turn it blue", ["a.png", "b.png"])
     different_width = _request("third", "turn it green", "third.png", width=768)
+    multiple_outputs = _request("fourth", "make it purple", "fourth.png")
+    multiple_outputs.num_outputs_per_prompt = 2
 
     assert scheduler._try_merge_generation_reqs([single, multiple]) is None
     assert scheduler._try_merge_generation_reqs([single, different_width]) is None
+    assert scheduler._try_merge_generation_reqs([single, multiple_outputs]) is None
 
 
 def test_only_standard_qwen_image_edit_opts_in():
