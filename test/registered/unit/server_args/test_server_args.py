@@ -189,6 +189,94 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_megamoe_rejects_two_batch_overlap(self):
+        # The fused kernel has no dispatch/combine split for the TBO ops to call.
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                enable_two_batch_overlap=True,
+            )
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                args.resolve_once()
+
+    def test_megamoe_requires_sm90_or_sm100(self):
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM90"):
+                args.resolve_once()
+        with override_platform(is_cuda=False, is_sm90=False, is_sm100=False):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "CUDA"):
+                args.resolve_once()
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    def test_megamoe_token_budget_must_cover_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=16384,
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                8192
+            ):
+                with self.assertRaisesRegex(ValueError, "required_per_rank=16384"):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                16384
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
+
+        for arch in (
+            "InternS2PreviewForConditionalGeneration",
+            "MellumForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "DeepseekV4ForCausalLM",
+        ):
+            self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
+        # MXFP4 DeepSeek-family models keep their runtime fallback.
+        self.assertFalse(mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, None))
+        # NVFP4 experts are repacked at load: every model is checked.
+        self.assertTrue(
+            mega_moe_needs_token_budget(
+                "DeepseekV3ForCausalLM", {"quant_algo": "NVFP4"}, None
+            )
+        )
+        self.assertTrue(
+            mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, "modelopt_fp4")
+        )
+
+    def test_megamoe_decode_tokens_per_rank_follows_graph_bs_and_draft_tokens(self):
+        # cuda_graph_config only exists on a GPU host; use a stand-in view.
+        from sglang.srt.arg_groups.mega_moe_hook import mega_moe_decode_tokens_per_rank
+
+        def view(max_bs, algorithm=None, draft_tokens=None, cg=True):
+            return SimpleNamespace(
+                cuda_graph_config=(
+                    SimpleNamespace(decode=SimpleNamespace(max_bs=max_bs))
+                    if cg
+                    else None
+                ),
+                speculative_algorithm=algorithm,
+                speculative_num_draft_tokens=draft_tokens,
+            )
+
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, "EAGLE", 4)), 1024)
+        # Draft tokens only count under a speculative algorithm.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
+
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
@@ -1907,6 +1995,25 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(unittest.TestCase):
+    def test_linker_mla_dedup_requires_mooncake_linker(self):
+        for enabled, linker, backend in (
+            (False, False, "mooncake"),
+            (True, True, "mooncake"),
+            (True, False, "mooncake"),
+            (True, True, "mori"),
+        ):
+            with self.subTest(enabled=enabled, linker=linker, backend=backend):
+                args = self._make_args(
+                    enable_linker_mla_dedup=enabled,
+                    enable_unified_cache_external_linker=linker,
+                    unified_cache_external_linker_backend=backend,
+                )
+                if enabled and (not linker or backend != "mooncake"):
+                    with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
