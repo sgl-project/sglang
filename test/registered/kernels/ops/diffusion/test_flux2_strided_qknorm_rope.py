@@ -77,7 +77,7 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                             packed.view(torch.int16), original.view(torch.int16)
                         )
                     )
-                    if torch.cuda.get_device_capability() == (9, 0):
+                    if can_use_flux2_strided_qknorm_rope(q, k, qn.weight, kn.weight, cache):
                         self.assertTrue(gate.verified)
                         self.assertFalse(gate.disabled)
                         self.assert_bits(
