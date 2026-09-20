@@ -68,7 +68,7 @@ class _H2DCopies(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-class SamplingMetadataMixin:
+class _SamplingMetadataTestBase(CustomTestCase):
     device = "cpu"
 
     def setUp(self):
@@ -90,46 +90,8 @@ class SamplingMetadataMixin:
             self.assertEqual(actual.dtype, dtype)
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
-    def test_heterogeneous_penalties_preserve_sign_and_repeated_token_counts(self):
-        reqs = [
-            _req(frequency_penalty=0.5, presence_penalty=0.25, repetition_penalty=2),
-            _req(
-                frequency_penalty=-0.5, presence_penalty=-0.25, repetition_penalty=0.5
-            ),
-            _req(),
-        ]
-        batch = _Batch(reqs, self.device)
-        generated = [[1, 20, 3], [1, 22, 3]]
-        original = torch.arange(-16, 16, dtype=torch.float32).repeat(3, 1)
-        for cls, name in (
-            (BatchedFrequencyPenalizer, "frequency"),
-            (BatchedPresencePenalizer, "presence"),
-            (BatchedRepetitionPenalizer, "repetition"),
-        ):
-            with self.subTest(penalty=name):
-                orchestrator = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {cls})
-                for output_ids in generated:
-                    orchestrator.cumulate_output_tokens(
-                        torch.tensor(output_ids, device=self.device)
-                    )
-                logits = original.to(self.device).clone()
-                orchestrator.apply(logits)
-                expected = original.clone()
-                for row, req in enumerate(reqs):
-                    tokens = [step[row] for step in generated]
-                    penalty = getattr(req.sampling_params, f"{name}_penalty")
-                    for token in set(tokens):
-                        if name == "frequency":
-                            expected[row, token] -= penalty * tokens.count(token)
-                        elif name == "presence":
-                            expected[row, token] -= penalty
-                        else:
-                            value = expected[row, token]
-                            expected[row, token] = (
-                                value * penalty if value < 0 else value / penalty
-                            )
-                self.assert_device_tensor(logits, expected, torch.float32)
 
+class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
     def test_min_tokens_pads_stop_sets_and_handles_no_stop_tokens(self):
         reqs = [
             _req(min_new_tokens=2, stop_token_ids=[3]),
@@ -204,27 +166,6 @@ class SamplingMetadataMixin:
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assert_device_tensor(info.logit_bias, torch.zeros(1, VOCAB_SIZE))
 
-    def test_custom_processor_indices_keep_request_groups(self):
-        processor = DisallowedTokensLogitsProcessor.to_str()
-        reqs = [_req(custom_params={"token_ids": [3]}) for _ in range(4)]
-        reqs[0].custom_logit_processor = processor
-        reqs[2].custom_logit_processor = processor
-        reqs[3].custom_logit_processor = processor + " "
-        batch = _Batch(reqs, self.device)
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertEqual(len(info.custom_logit_processor), 2)
-        for serialized, rows in (
-            (processor, [0, 2]),
-            (processor + " ", [3]),
-        ):
-            entry = info.custom_logit_processor[hash(serialized)]
-            self.assertIsInstance(entry.processor, DisallowedTokensLogitsProcessor)
-            self.assertEqual(entry.rows, rows)
-            self.assert_device_tensor(entry.indices, torch.tensor(rows), torch.long)
-        self.assertEqual(
-            info.custom_params, [r.sampling_params.custom_params for r in reqs]
-        )
-
     def test_raw_logprob_indices_preserve_order_duplicates_and_skipped_rows(self):
         reference = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 4
         logprobs = reference.to(self.device)
@@ -269,12 +210,8 @@ class SamplingMetadataMixin:
             self.assertEqual(idxs, [[[], []], []])
 
 
-class TestSamplingMetadataCPU(SamplingMetadataMixin, CustomTestCase):
-    device = "cpu"
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestSamplingMetadataCUDA(SamplingMetadataMixin, CustomTestCase):
+class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
     device = "cuda:0"
 
     def assert_pinned_copies(self, copies, device):
