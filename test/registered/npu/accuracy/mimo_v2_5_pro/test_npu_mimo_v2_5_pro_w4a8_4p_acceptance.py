@@ -28,7 +28,7 @@ MIMO_V2_5_PRO_FP4_MODEL_PATH = (
 MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
 )
-SHAREGPT_DATASET_PATH = "/tmp/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_DATASET_PATH = "/root/.cache/modelscope/hub/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 MIMO_V2_5_PRO_FP4_4P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
