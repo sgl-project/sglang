@@ -86,6 +86,7 @@ def _prefill_queue(sched):
 def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
+        token_to_kv_pool_allocator=MagicMock(),
         retracted_queue=[],
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),

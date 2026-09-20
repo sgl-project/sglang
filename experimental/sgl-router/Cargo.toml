@@ -24,17 +24,12 @@ unused_qualifications = "warn"
 [dependencies]
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
 dynamo-tokenizers = "=1.8.1"
-# Prepare the Dynamo renderer dependency for the following migration.
+# Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
+# template-less models like DeepSeek-V4) so cache-aware routing hashes the same
+# tokens the engine caches.
 dynamo-renderer = "=5.1.2"
-# Chat-template rendering for cache-aware routing, retained until the
-# renderer migration replaces it: the engine caches tokens AFTER applying the
-# model's chat template, so the router must render the same template before
-# hashing or its token_ids diverge from the engine's stored blocks. `pycompat`
-# supplies the Python str/dict methods HF templates call; `chrono` backs
-# `strftime_now`.
-minijinja = { version = "2.24", features = ["loop_controls", "json"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# `OAIChatLikeRequest` speaks minijinja values.
+minijinja = "2.24"
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
@@ -54,7 +49,7 @@ axum = { version = "0.8", features = ["macros", "tracing", "http2"] }
 # `Frame`/`SizeHint` are not re-exported through `axum::body`.
 http-body = "1"
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "catch-panic"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
@@ -88,6 +83,12 @@ uuid = { version = "1", features = ["v4"] }
 # `python/sglang/srt/disaggregation/kv_events.py`.
 parking_lot = "0.12"
 rmp-serde = "1"
+# FxHash for the KV-event radix tree's integer-keyed maps (i64 block
+# hashes, u64 node ids), off the routing hot path's SipHash cost. The
+# keys are client-derivable, not trusted; what bounds a collision attack
+# is that planting a key costs a real request — see the DoS note in
+# src/policies/kv_events/tree.rs.
+rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
@@ -103,6 +104,9 @@ http-body-util = "0.1"
 # rather than as an unresolved import in a test.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Capture the router's `tracing` access log in tests. Also a runtime dep, but
+# integration tests are a separate crate and need it declared here too.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

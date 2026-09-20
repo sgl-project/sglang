@@ -736,12 +736,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         # publishing a record rather than by standing one in.
         reset_context()
         publish(
-            ServerArgs(model_path="dummy", startup_weight_load_mode=mode),
+            ServerArgs(
+                model_path="dummy",
+                startup_weight_load_mode=mode,
+                pp_size=pp_size,
+            ),
             role="scheduler",
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
-        scheduler.ps = SimpleNamespace(pp_size=pp_size)
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker
@@ -812,6 +815,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                     stream=stream_context, Stream=lambda priority: schedule_stream
                 ),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
+                side_effect=lambda: trace.append("borrow_prewarm"),
+            ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
@@ -830,6 +837,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -857,6 +865,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "prewarm",
                 "stream_exit",
                 "resize",
@@ -872,6 +881,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "attention",
                 "capture",
                 "stream_enter",
+                "borrow_prewarm",
                 "draft_prewarm",
                 "stream_exit",
                 "resize",
