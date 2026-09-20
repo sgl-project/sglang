@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import torch
@@ -130,7 +129,6 @@ class StagingBuffer:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
-        pool_already_active: bool = False,
     ):
         self.size_bytes = size_bytes
         self.device = device
@@ -138,18 +136,13 @@ class StagingBuffer:
         self._gather_stream: Optional[torch.cuda.Stream] = None
 
         torch.cuda.set_device(gpu_id)
-        pool_ctx = (
-            torch.cuda.use_mem_pool(custom_mem_pool)
-            if custom_mem_pool is not None and not pool_already_active
-            else nullcontext()
-        )
-        with pool_ctx:
+        if custom_mem_pool is not None:
+            with torch.cuda.use_mem_pool(custom_mem_pool):
+                self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+            alloc_method = "custom_mem_pool (cuMemCreate)"
+        else:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-        alloc_method = (
-            "custom_mem_pool (cuMemCreate)"
-            if custom_mem_pool is not None
-            else "cudaMalloc"
-        )
+            alloc_method = "cudaMalloc"
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(

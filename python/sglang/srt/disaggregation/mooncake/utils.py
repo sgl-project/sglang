@@ -63,7 +63,14 @@ def init_mooncake_custom_mem_pool(
                     f"Unsupported custom mem pool type: {custom_mem_pool_type}"
                 )
 
-            custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+            # MemPool binds to the *current* device at construction. Callers
+            # may run on a non-main thread (e.g. the PD bootstrap thread) whose
+            # current device is still 0, which would register the custom
+            # allocator on the wrong device: later use_mem_pool() on `device`
+            # then creates a plain cudaMalloc pool under the same id and
+            # trips the CUDACachingAllocator use_count assert on re-entry.
+            with torch.cuda.device(device):
+                custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
             logger.debug(
                 f"Initialized custom memory pool: {custom_mem_pool_type} on device {device}"
             )
