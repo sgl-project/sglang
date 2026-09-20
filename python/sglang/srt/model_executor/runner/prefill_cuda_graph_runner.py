@@ -105,6 +105,22 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
+
+
+def _is_full_graph_backend(backend: Any) -> bool:
+    return (
+        isinstance(backend, FullCudaGraphBackend)
+        or getattr(backend, "__class__", None).__name__ == "FullXPUGraphBackend"
+    )
+
+
+def _is_full_or_bcg_backend(backend: Any) -> bool:
+    return (
+        isinstance(backend, (BreakableCudaGraphBackend, FullCudaGraphBackend))
+        or getattr(backend, "__class__", None).__name__ == "FullXPUGraphBackend"
+    )
+
+
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -456,18 +472,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = _is_full_graph_backend(self.backend)
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
+            if hasattr(model_runner.attn_backend, "init_cuda_graph_state"):
+                model_runner.attn_backend.init_cuda_graph_state(
+                    self.max_bs, self.max_num_tokens
+                )
 
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
-        self._capture_lora = self.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
-        )
+        self._capture_lora = self.enable_lora and _is_full_or_bcg_backend(self.backend)
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
                 max_num_tokens=self.max_num_tokens,
@@ -485,7 +503,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
+            self._is_full_backend
+            and not get_schedule().disable_chunked_prefix_cache
+            and getattr(
+                model_runner.attn_backend,
+                "supports_full_cuda_graph_chunked_prefix",
+                False,
+            )
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -526,7 +550,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -588,7 +612,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
@@ -1178,6 +1202,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            padded_view.extend_start_loc = s["extend_start_loc"][:r]
+            padded_view.num_padding = r - bs
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
