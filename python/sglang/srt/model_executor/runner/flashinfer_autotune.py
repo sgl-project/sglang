@@ -292,8 +292,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             tuner.load_configs(str(autotune_cache))
         mega_context = empty_context()
         if (
-            not mr.is_draft_worker
-            and get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+            get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+            and not mr.is_draft_worker
             and "flashinfer_megamoe" not in skip_ops
         ):
             # The chunk size is already per DP rank. Prepare one prefill profile
