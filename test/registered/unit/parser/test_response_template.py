@@ -468,6 +468,48 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertFalse(sampling_params["spaces_between_special_tokens"])
         self.assertFalse(sampling_params["no_stop_trim"])
 
+    def test_xml_inline_strictness_follows_template(self):
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "tool_calls": {
+                    "open": "<call>",
+                    "close": "</call>",
+                    "content": "xml-inline",
+                    "content_args": {
+                        "tag_pattern": r"<(?P<key>\w+)>(?P<value>.*?)</\1>",
+                    },
+                    "transform": {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{content}",
+                        },
+                    },
+                },
+            },
+        }
+        text = "<call>ignored<city>Paris</city></call>"
+
+        permissive = ResponseTemplateToolDetector(
+            response_template=template,
+            prefix="<assistant>",
+        ).detect_and_parse(text, [_tool()])
+        self.assertEqual(permissive.normal_text, "")
+        self.assertEqual(
+            _call_values(permissive.calls),
+            [("get_weather", {"city": "Paris"})],
+        )
+
+        strict_template = copy.deepcopy(template)
+        strict_template["fields"]["tool_calls"]["content_args"]["strict"] = True
+        strict = ResponseTemplateToolDetector(
+            response_template=strict_template,
+            prefix="<assistant>",
+        ).detect_and_parse(text, [_tool()])
+        self.assertEqual(strict.normal_text, text)
+        self.assertEqual(strict.calls, [])
+
     def test_reasoning_requires_explicit_enable_without_template_policy(self):
         detector = ResponseTemplateReasoningDetector(
             response_template=GEMMA4_RESPONSE_TEMPLATE,

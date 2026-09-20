@@ -106,12 +106,6 @@ class _ReasoningResult:
         self.reasoning_text = reasoning_text
 
 
-def _prepare_streaming_field(field: dict[str, Any]) -> None:
-    field["optional"] = True
-    if field.get("content") == "xml-inline":
-        field.setdefault("content_args", {})["strict"] = True
-
-
 def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(template)
     fields = result["fields"]
@@ -123,13 +117,13 @@ def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
             "content_args": {"strip": False},
         }
     for field in fields.values():
-        _prepare_streaming_field(field)
+        field["optional"] = True
     return result
 
 
 def _tool_extraction_template(template: dict[str, Any]) -> dict[str, Any]:
     tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
-    _prepare_streaming_field(tool_field)
+    tool_field["optional"] = True
     anchor_name = (
         "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
     )
