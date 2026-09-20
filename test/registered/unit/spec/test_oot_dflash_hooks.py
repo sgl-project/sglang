@@ -57,9 +57,8 @@ class TestOOTDFlashHooks(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(f"{HOOK_MODULE}.attention_backends_of", return_value=(None, None)),
         ):
-            # Call the resolver directly: handle_speculative_decoding also
-            # resolves the algorithm alias, which reads the draft model's HF
-            # config over the network.
+            # Call the resolver directly: the full hook also resolves the
+            # algorithm alias, which loads the draft HF config over the network.
             _resolve_dflash_draft_attention_backend(args)
         # Resolvers declare into the stash; they never write the field.
         return resolution_result(args, "speculative_draft_attention_backend")
