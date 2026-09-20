@@ -57,7 +57,7 @@ class LayerBinding(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     transfer_to_device: dict[int, int]
-    transfer_layer_num: int
+    transfer_layer_id_max: int
 
 
 class MirrorAdapter(Protocol):

@@ -13,10 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -33,27 +35,7 @@ namespace sglang {
 
 using Vec = int4;
 
-inline uint32_t next_pow2(uint32_t x) noexcept {
-  --x;
-  x |= x >> 1;
-  x |= x >> 2;
-  x |= x >> 4;
-  x |= x >> 8;
-  x |= x >> 16;
-  return x + 1;
-}
-
 namespace moe {
-
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
-  int original = v;
-#pragma unroll
-  for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-    int n = __shfl_up_sync(mask, v, offset);
-    if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
-  }
-  return v - original;
-}
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -187,14 +169,14 @@ __global__ void moe_align_block_size_kernel(
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid & (WARP_SIZE - 1);
   const int num_warps_for_scan = (scan_size + WARP_SIZE - 1) / WARP_SIZE;
-  const int warp_sum = warp_exclusive_scan(padded_count) + padded_count;
+  const int warp_sum = device::warp::inclusive_sum<32>(padded_count);
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_sum;
   __syncthreads();
 
   // warp0 accumulate all the block's prefix sum
   if (tid < WARP_SIZE) {
     int val = (tid < num_warps_for_scan) ? warp_sums[tid] : 0;
-    int incl = warp_exclusive_scan(val) + val;
+    int incl = device::warp::inclusive_sum<32>(val);
     warp_sums[tid] = incl;
   }
   __syncthreads();
@@ -213,13 +195,13 @@ __global__ void moe_align_block_size_kernel(
 
   // Perform 2 level exclusive-prefix-sum to scan_buf
   int v = (tid < scan_size) ? scan_buf[tid] : 0;
-  int pre = warp_exclusive_scan(v);
+  int pre = device::warp::inclusive_sum<32>(v) - v;
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
   __syncthreads();
 
   if (warp_id == 0) {
     int val = (lane_id < num_warps_for_scan) ? warp_sums[lane_id] : 0;
-    warp_sums[lane_id] = warp_exclusive_scan(val);
+    warp_sums[lane_id] = device::warp::inclusive_sum<32>(val) - val;
   }
   __syncthreads();
 
@@ -409,7 +391,7 @@ __global__ void moe_align_block_size_kernel_v2(
   }
 
   // Level 1: intra-warp exclusive scan on thread_sum
-  int32_t warp_prefix = warp_exclusive_scan(thread_sum);
+  int32_t warp_prefix = device::warp::inclusive_sum<32>(thread_sum) - thread_sum;
   int32_t warp_total = warp_prefix + thread_sum;
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = warp_total;
   __syncthreads();
@@ -418,7 +400,7 @@ __global__ void moe_align_block_size_kernel_v2(
   const int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
   if (tid < WARP_SIZE) {
     int val = (tid < num_warps) ? warp_sums[tid] : 0;
-    warp_sums[tid] = warp_exclusive_scan(val);
+    warp_sums[tid] = device::warp::inclusive_sum<32>(val) - val;
   }
   __syncthreads();
 
@@ -510,7 +492,7 @@ struct MoeAlignBlockSizeKernel {
           pad_sorted_token_ids,
           (int32_t)max_num_tokens_padded);
     } else if (num_experts <= 1024) {
-      const size_t scan_size = next_pow2(num_experts);
+      const size_t scan_size = host::round_up_pow2(static_cast<uint32_t>(num_experts));
       const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
 
       auto align_kernel = moe::moe_align_block_size_kernel<scalar_t>;

@@ -170,7 +170,7 @@ class DSAIndexerPoolHost(HostKVCache):
         requested_bytes = desc.host_bytes(
             page_num=self.page_num, layer_num=self.layer_num, page_size=self.page_size
         )
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
