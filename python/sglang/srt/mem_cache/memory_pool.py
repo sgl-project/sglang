@@ -45,6 +45,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
+    set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -2985,7 +2986,14 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
-        if cache_k.dtype != self.dtype:
+        # use fused kernel instead of quantizing and writing in separate operations
+        if cache_k.dtype != self.dtype and self.store_dtype == torch.float8_e4m3:
+            set_kv_buffer_prefix_valid_tiled_fp8[grid](
+                    cache_k,
+                    cache_v,
+
+                    )
+        else:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
