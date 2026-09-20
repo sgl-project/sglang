@@ -83,7 +83,11 @@ def _flux2_strided_qknorm_rope_kernel(
         cache_ptr + pos * CACHE_STRIDE + 64 + dims // 2, mask=rows < ROWS, other=0.0
     )
     # FlashInfer rounds the sine product before the cosine multiply-add.
-    signed_partner = tl.where(dims % 2 == 0, -partner, partner)
+    # A subtraction from +0 can canonicalize signed zeros. Flip the IEEE
+    # sign bit explicitly, matching FlashInfer's even-lane negation.
+    partner_bits = partner.to(tl.int32, bitcast=True)
+    sign = (dims % 2 == 0).to(tl.int32) << 31
+    signed_partner = (partner_bits ^ sign).to(tl.float32, bitcast=True)
     rotated = tl.fma(normalized, cos, signed_partner * sin)
     tl.store(y_ptr + rows * 128 + dims, rotated, mask=rows < ROWS)
 

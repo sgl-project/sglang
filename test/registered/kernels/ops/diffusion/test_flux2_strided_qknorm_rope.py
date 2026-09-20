@@ -60,7 +60,7 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
     @torch.inference_mode()
     def test_native_shapes_magnitudes_and_untouched_packed_input(self):
         torch.manual_seed(42)
-        for batch, tokens in [(1, 1), (1, 17), (2, 257), (1, 4608)]:
+        for batch, tokens in [(1, 17), (2, 257), (1, 4608)]:
             packed, q, k, qn, kn, cache = inputs(batch, tokens)
             for magnitude in (0.005, 1.0, 200.0):
                 with self.subTest(batch=batch, tokens=tokens, magnitude=magnitude):
@@ -77,7 +77,9 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                             packed.view(torch.int16), original.view(torch.int16)
                         )
                     )
-                    if can_use_flux2_strided_qknorm_rope(q, k, qn.weight, kn.weight, cache):
+                    if can_use_flux2_strided_qknorm_rope(
+                        q, k, qn.weight, kn.weight, cache
+                    ):
                         self.assertTrue(gate.verified)
                         self.assertFalse(gate.disabled)
                         self.assert_bits(
@@ -89,6 +91,23 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                     else:
                         self.assertFalse(gate.verified)
                         self.assertFalse(gate.disabled)
+
+    @torch.inference_mode()
+    def test_contiguous_singleton_preserves_original_inplace_path(self):
+        packed, q, k, qn, kn, cache = inputs(1, 1)
+        original = packed.clone()
+        rq, rk, _ = original[:, :, : 3 * 3072].chunk(3, dim=-1)
+        expected = reference(
+            rq.unflatten(-1, (24, 128)), rk.unflatten(-1, (24, 128)), qn, kn, cache
+        )
+        gate = BitExactFusionGate("test singleton", per_signature=True)
+        with patch.object(flux_2, "_FLUX2_STRIDED_QK_ROPE", gate):
+            actual = flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None)
+        self.assert_bits(actual, expected)
+        self.assertTrue(
+            torch.equal(packed.view(torch.int16), original.view(torch.int16))
+        )
+        self.assertFalse(gate.verified)
 
     @torch.inference_mode()
     def test_changed_inputs_weights_cache_and_graph_replay(self):
