@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from sglang.kernels.ops.diffusion import can_use_joint_qkv_cat, joint_qkv_cat
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
@@ -47,6 +49,40 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 _MODULATION_FACTOR = 6
+_JOY_QKV_CAT = BitExactFusionGate(
+    "Joy image/text QKV concatenation", per_signature=True
+)
+
+
+def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def reference():
+        return tuple(torch.cat((inputs[i], inputs[i + 3]), dim=1) for i in range(3))
+
+    if _JOY_QKV_CAT.disabled or not can_use_joint_qkv_cat(*inputs):
+        return reference()
+    sig = (inputs[0].device, inputs[0].dtype) + tuple(
+        (tuple(x.shape), tuple(x.stride())) for x in inputs
+    )
+    verified = _JOY_QKV_CAT.is_verified(sig)
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return reference()
+    try:
+        out = joint_qkv_cat(*inputs)
+    except Exception as exc:
+        _JOY_QKV_CAT.on_exception(exc, logger=logger)
+        return reference()
+    if verified:
+        return out
+    return _JOY_QKV_CAT.accept_or_fallback(
+        out,
+        reference(),
+        sig=sig,
+        equal=lambda actual, expected: all(
+            torch.equal(a.view(torch.int16), b.view(torch.int16))
+            for a, b in zip(actual, expected, strict=True)
+        ),
+        logger=logger,
+    )
 
 
 def fused_add_gate(
@@ -315,9 +351,9 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q, txt_k = txt_q.to(txt_v), txt_k.to(txt_v)
 
         # Attention
-        joint_query = torch.cat([img_q, txt_q], dim=1)
-        joint_key = torch.cat([img_k, txt_k], dim=1)
-        joint_value = torch.cat([img_v, txt_v], dim=1)
+        joint_query, joint_key, joint_value = _joy_joint_qkv(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v
+        )
         attn = self.attn(
             joint_query,
             joint_key,
