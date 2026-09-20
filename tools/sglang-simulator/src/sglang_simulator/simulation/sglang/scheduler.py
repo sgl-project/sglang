@@ -15,6 +15,10 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.session_requests import (
+    SessionRequestClassifier,
+)
+from sglang_simulator.simulation.sglang.session_timeline import SessionTimeline
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -82,6 +86,11 @@ class C_SglangPrefillAdderHook(BaseHook):
         target.add_one_req = wrapped_add_one_req
 
 
+def _request_finished(rid: str) -> bool:
+    req_stats = request_stats_manager.get_req_stats(rid)
+    return len(req_stats.gen_token_latencies) >= req_stats.output_length
+
+
 class ReqDispatcher:
     _instance = None
     _initialized = False
@@ -97,14 +106,18 @@ class ReqDispatcher:
 
         self.mode = mode
         # If the simulation mode is `BLOCKING`, all requests are released immediately.
-        # If the simulation mode is `OFFLINE`, only control requests, such as `flush_cache`
-        # and `server_info`, are released immediately.
+        # If the simulation mode is `OFFLINE`, only timeline-independent control
+        # requests, such as `flush_cache` and `server_info`, are released immediately.
         self.immediate_release_requests = []
         self.future_queue: list[
             tuple[float, int, Any]
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
+        self.session_requests = SessionRequestClassifier()
+        self.session_timeline = SessionTimeline(
+            is_request_finished=_request_finished
+        )
 
     @staticmethod
     def simulation_created_time_s(simulation_args: dict) -> float:
@@ -122,11 +135,40 @@ class ReqDispatcher:
         self.immediate_release_requests.clear()
         self.future_queue.clear()
         self.offline_recv_all_requests = False
+        leaked = self.session_timeline.pending_session_ids()
+        if leaked:
+            # Reaching here means a turn never reported completion, so the close
+            # never settled. Surface it: silently dropping the close would look
+            # identical to a session that correctly released its KV.
+            logger.warning(
+                "Discarding %d held session close(s) at reset; their turns never "
+                "finished: %s",
+                len(leaked),
+                ", ".join(sorted(set(leaked))),
+            )
+        self.session_timeline.reset()
+
+    def _hold_session_requests(self, reqs: list) -> list:
+        """Take session lifecycle requests out of `reqs`, returning the rest."""
+        remaining = []
+        for req in reqs:
+            if self.session_requests.is_close(req):
+                self.session_timeline.hold_close(session_id=req.session_id, req=req)
+            else:
+                remaining.append(req)
+        return remaining
+
+    def _sessions_with_pending_turns(self) -> set[str]:
+        sessions = set()
+        for _, _, req in self.future_queue:
+            sessions |= self.session_requests.session_ids_of(req)
+        return sessions
 
     def add(self, reqs: list):
         if self.mode == SimulationMode.BLOCKING:
             self.immediate_release_requests.extend(reqs)
         elif self.mode == SimulationMode.OFFLINE:
+            reqs = self._hold_session_requests(reqs)
             if self.offline_recv_all_requests:
                 self.immediate_release_requests.extend(reqs)
                 return
@@ -135,7 +177,7 @@ class ReqDispatcher:
             time.sleep(0.05)  # waiting requests
 
             for req in reqs:
-                if req.__class__.__name__ == "TokenizedGenerateReqInput":
+                if self.session_requests.carries_generate_req(req):
                     gen_requests.append(req)
                 else:
                     # Such as: /profile_start, /flush_cache, etc.
@@ -186,6 +228,15 @@ class ReqDispatcher:
         recv_reqs = []
 
         recv_reqs.extend(self.immediate_release_requests)
+        # A request admitted after the simulation started arrives now, whatever
+        # timestamp it carries. Multi-turn replay reuses one row's metadata for
+        # every round, so later turns would otherwise report the preceding turns'
+        # execution as their own queueing delay.
+        live_arrivals = (
+            {id(req) for req in self.immediate_release_requests}
+            if self.offline_recv_all_requests
+            else set()
+        )
         self.immediate_release_requests.clear()
 
         if self.mode == SimulationMode.OFFLINE and self.offline_recv_all_requests:
@@ -198,12 +249,26 @@ class ReqDispatcher:
                 recv_reqs.append(req)
                 heapq.heappop(self.future_queue)
 
-        now = time.time()
         for req in recv_reqs:
-            if req.__class__.__name__ in [
-                "BatchTokenizedGenerateReqInput",
-                "TokenizedGenerateReqInput",
-            ]:
+            session_id = self.session_requests.session_id_of(req)
+            if session_id is not None:
+                self.session_timeline.note_dispatched(
+                    session_id=session_id, rid=req.rid
+                )
+
+        if self.mode == SimulationMode.OFFLINE and self.session_timeline.has_pending():
+            # Guarded: `_sessions_with_pending_turns` walks the whole future
+            # queue, and wall time spent here is charged to the simulated clock
+            # as CPU overhead. Sessionless runs must not pay for it.
+            recv_reqs.extend(
+                self.session_timeline.take_settled_closes(
+                    self._sessions_with_pending_turns()
+                )
+            )
+
+        now = time.time()
+        for outer_req in recv_reqs:
+            for req in self.session_requests.iter_generate_reqs(outer_req):
                 simulation_args = None
                 if req.sampling_params.custom_params is not None:
                     simulation_args = req.sampling_params.custom_params.get(
@@ -216,6 +281,7 @@ class ReqDispatcher:
                     simulation_args = {}
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
+                req_stats.session_id = self.session_requests.session_id_of(req)
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
 
@@ -226,13 +292,21 @@ class ReqDispatcher:
                     req_stats.last_event_time = req_stats.created_time
                     req_stats.queue_start = now
                 elif self.mode == SimulationMode.OFFLINE:
-                    req_stats.created_time = self.simulation_created_time_s(
-                        simulation_args
-                    )
+                    is_live_arrival = id(req) in live_arrivals
+                    if is_live_arrival:
+                        req_stats.created_time = StateManager.get_global_clock()
+                    else:
+                        req_stats.created_time = self.simulation_created_time_s(
+                            simulation_args
+                        )
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
+                    # Skipped for live arrivals: a later turn reuses the first
+                    # turn's metadata, so its stale `queue_start` would wind the
+                    # global clock backwards and make every in-flight request's
+                    # latency negative.
                     queue_start = simulation_args.get("queue_start")
-                    if queue_start is not None:
+                    if queue_start is not None and not is_live_arrival:
                         StateManager.set_global_clock(queue_start)
                     req_stats.queue_start = StateManager.get_global_clock()
 
