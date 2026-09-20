@@ -148,3 +148,56 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuickFinishStage(CustomTestCase):
+    """`DECODE_QUICK_FINISH` is declared with `metrics_is_observed=True`.
+
+    `set_quick_finish_time()` must report it before `set_completion_time()` calls
+    `TraceReqContext.abort()`, which clears the thread context and makes every
+    later slice a no-op.
+    """
+
+    def _stats(self):
+        stats = rts.SchedulerReqTimeStats()
+        stats.enable_metrics = True
+        stats.last_forward_entry_time = 1.0
+        return stats
+
+    def test_quick_finish_reports_its_stage(self):
+        stats = self._stats()
+        collector = mock.Mock()
+        stats.metrics_collector = collector
+
+        with mock.patch.object(stats, "trace_slice") as trace_slice:
+            stats.set_quick_finish_time(ts=1.25)
+
+        collector.observe_per_stage_req_latency.assert_called_once()
+        stage_name, latency = collector.observe_per_stage_req_latency.call_args[0]
+        self.assertEqual(
+            stage_name, rts.RequestStage.DECODE_QUICK_FINISH.stage_name
+        )
+        self.assertAlmostEqual(latency, 0.25)
+
+        trace_slice.assert_called_once_with(
+            rts.RequestStage.DECODE_QUICK_FINISH, 1.0, 1.25
+        )
+
+    def test_stage_is_reported_before_the_context_is_aborted(self):
+        stats = self._stats()
+        stats.metrics_collector = mock.Mock()
+        calls = []
+
+        with mock.patch.object(
+            stats, "trace_slice", side_effect=lambda *a, **k: calls.append("slice")
+        ):
+            with mock.patch.object(
+                stats,
+                "set_completion_time",
+                side_effect=lambda *a, **k: calls.append("completion"),
+            ):
+                stats.set_quick_finish_time(ts=1.25)
+
+        # `set_completion_time()` aborts the trace context, so a slice recorded
+        # after it would be dropped.
+        self.assertEqual(calls, ["slice", "completion"])
