@@ -39,7 +39,6 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1628,7 +1627,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 

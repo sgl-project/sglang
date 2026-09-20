@@ -35,8 +35,11 @@ class Memory(msgspec.Struct):
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
-                "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first. See "
+                "stands for Segmented Least Recently Used, 'priority' evicts "
+                "lower-priority requests first, and 'tlru' stands for "
+                "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
+                "a conversation that cannot affect tail TTFT before falling back "
+                "to LRU. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
@@ -52,10 +55,13 @@ class Memory(msgspec.Struct):
         Arg(
             help=(
                 "Tuning parameters for --radix-eviction-policy, as a json object "
-                "passed to the policy as keyword arguments. Only 'slru' takes any "
-                "today: protected_threshold (int, default 2), e.g. "
-                "'{\"protected_threshold\": 4}'. An unrecognized key fails at "
-                "startup, naming the key and the policy. See "
+                "passed to the policy as keyword arguments. 'slru' takes "
+                "protected_threshold (int, default 2), e.g. "
+                "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
+                "next_prompt_estimate (ints, tokens), e.g. "
+                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                "unrecognized key fails at startup, naming the key and the "
+                "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
                 "for the full parameter list."
             ),
@@ -82,10 +88,8 @@ class Memory(msgspec.Struct):
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends. PD disaggregation is supported over mooncake at equal "
-        "attention TP with pp=1; not yet compatible with hierarchical / "
-        "host-tiered KV cache, prefill cuda-graph capture, or speculative "
-        "decoding other than DSPARK.",
+        "backends. Supported PD-disaggregation and speculative-decoding "
+        "configurations are validated at startup.",
     ] = False
     enable_session_radix_cache: A[
         bool,
@@ -115,6 +119,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_host_memory_fraction: A[
+        Optional[float],
+        "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
+    ] = 0.8
     hicache_write_policy: A[
         str,
         Arg(
@@ -212,6 +220,10 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    enable_linker_mla_dedup: A[
+        bool,
+        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
