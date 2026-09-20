@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -24,6 +25,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
+        s.disaggregation_mode = DisaggregationMode.NULL
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)

@@ -14,7 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -53,8 +53,8 @@ class GrammarManager:
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
-        self.pp_rank = scheduler.ps.pp_rank
-        self.pp_size = scheduler.ps.pp_size
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
         self.pp_group = scheduler.pp_group
         self.grammar_pp_sync_work_list = []
 
