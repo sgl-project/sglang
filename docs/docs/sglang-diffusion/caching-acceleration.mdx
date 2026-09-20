@@ -8,7 +8,7 @@ SGLang can reuse exact conditioning across requests and cache intermediate denoi
 
 Native pipelines enable a CPU conditioning cache by default. Repeated inputs can reuse text embeddings (including negative prompts), image or vision-language encoder outputs, and VAE posteriors. The shared LRU holds at most **512 MiB per executor/rank**, with at most 128 entries. It does not retain cached tensors on the GPU. Oversized results are computed normally.
 
-The standard text encoding stage stores the embeddings, masks, sequence lengths, and pooled outputs consumed by the pipeline, rather than all intermediate encoder hidden states. Custom stages and batch-DP encoding retain caching at the native encoder boundary.
+The standard text encoding stage stores postprocessed conditioning and pooled outputs, including masks and sequence lengths supplied by the model's postprocessor, rather than all intermediate encoder hidden states. It matches tokenizer inputs on the CPU to avoid copying token IDs back from the GPU. Custom stages and batch-DP encoding retain caching at the native encoder boundary.
 
 Hits restore outputs to their original devices. This can change peak GPU allocation even though entries live on the CPU; measure memory as well as latency when using a tight VRAM budget.
 
