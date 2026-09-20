@@ -274,10 +274,14 @@ fn build_app_context(
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
     let block_size_oracle = engine_state.block_size_oracle();
-    let proxy = Arc::new(
-        Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
-            .context("build proxy client")?,
-    );
+    let mut proxy = Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
+        .context("build proxy client")?;
+    proxy.stream_timeouts = sgl_router::proxy::sse::StreamTimeouts {
+        idle: Duration::from_secs(config.proxy.stream_idle_timeout_secs),
+        send_stall: Duration::from_secs(config.proxy.stream_send_stall_secs),
+        total: Duration::from_secs(config.proxy.stream_total_timeout_secs),
+    };
+    let proxy = Arc::new(proxy);
 
     let mut app_context = AppContext::with_router_inflight_load(
         config.clone(),

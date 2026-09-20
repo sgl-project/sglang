@@ -264,6 +264,14 @@ The legacy `--cache-threshold`, `--balance-abs-threshold`, and
 one-to-one replacements; remove them and review the current `sgl-router
 --help` output when tuning Cache-Aware routing.
 
+## Streaming cleanup
+
+Streaming cleanup uses `--request-timeout-secs` while waiting for response headers,
+then `--stream-idle-timeout-secs` (180), `--stream-send-stall-secs` (180), and
+`--stream-total-timeout-secs` (3600). All stream timeout values must be positive.
+Unfinished plain-mode requests with a single request ID are aborted on the engine;
+PD transfers and caller-supplied batches retain their existing cancellation behavior.
+
 ## License
 
 Apache-2.0.

@@ -4,7 +4,7 @@
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -59,54 +59,26 @@ impl ErrorEventScanner {
     }
 }
 
-/// Bridge a byte stream into an axum Body that streams chunks unchanged.
-///
-/// Spawns one tokio task per stream so the handler can return immediately.
-/// Uses a **bounded** 64-slot channel so `tx.send().await` naturally
-/// backpressures the upstream read when the client (axum Body consumer) falls
-/// behind — an unbounded channel would buffer hundreds of MB for a slow client
-/// receiving a long completion.
-///
-/// # Backpressure note
-/// The channel bound of 64 absorbs short bursts while still limiting
-/// worst-case outstanding bytes to 64 × chunk_size (typically a few MB).
-///
-/// # Client disconnect
-/// When the axum Body is dropped the receiver is closed; `tx.send()` then
-/// returns `Err`, which breaks the loop — no upstream bytes are read after the
-/// client disconnects.
-///
-/// # Panic safety
-/// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
-/// upstream stream panics, we surface a loud `io::Error` to the client; without
-/// this, the body would EOF cleanly and clients couldn't distinguish that from
-/// success — the worst failure class (truncated output that looks complete).
-///
-/// # Stream guards
-/// When `stream_guards` is `Some`, the value is **moved into the spawned task**
-/// and held for the entire body lifetime.  It is dropped only when the SSE
-/// pump finishes (stream exhausted, client disconnects, or upstream errors).
-/// The opaque `Box<dyn Send + 'static>` accepts any drop-only payload — most
-/// commonly a tuple of [`crate::workers::LoadGuard`] and
-/// [`crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard`]. The proxy does not
-/// inspect the value; it relies entirely on `Drop` semantics, so callers can
-/// pack arbitrary cleanup state in. Pass `None` for callers that manage the
-/// guard externally (e.g. non-streaming paths where the handler itself is the
-/// guard scope).
-///
-/// # Completion hook
-/// When `on_complete` is `Some`, it runs exactly once when the pump task
-/// finishes with the transport, SSE error-event, and client-disconnect state.
-///
-/// # First-byte hook
-/// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
-/// the first `Ok` chunk is read from the upstream stream — i.e. time to first
-/// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
-/// arrives. `forward_streaming_to` passes a closure that records
-/// `sgl_router_ttft_seconds` for successful streaming responses.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamTimeouts {
+    pub idle: Duration,
+    pub send_stall: Duration,
+    pub total: Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(180),
+            send_stall: Duration::from_secs(180),
+            total: Duration::from_secs(3600),
+        }
+    }
+}
+
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
-    stream_guards: Option<Box<dyn Send + 'static>>,
+    guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Body
@@ -114,85 +86,110 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
+    bytes_stream_to_body_with_timeouts(
+        stream,
+        guards,
+        on_complete,
+        on_first_byte,
+        StreamTimeouts::default(),
+    )
+}
+
+/// Bounded forwarding with a separate terminal error, so a full queue cannot hide failure.
+pub fn bytes_stream_to_body_with_timeouts<S, E>(
+    mut stream: S,
+    guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
+    mut on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    timeouts: StreamTimeouts,
+) -> Body
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let tx_for_panic = tx.clone();
-        let outcome = Arc::new(parking_lot::Mutex::new(StreamEnd {
+        let mut end = StreamEnd {
             transport_ok: true,
             saw_error_event: false,
             client_disconnect: false,
-        }));
-        let outcome_setter = Arc::clone(&outcome);
-        // `None` once an error event is found — the scan is done for good.
-        let mut scanner = Some(ErrorEventScanner::default());
-        let pump = AssertUnwindSafe(async move {
-            // Hold the guards for the task's lifetime — dropped when this
-            // block exits (stream done or client disconnect).  Leading
-            // underscore suppresses the "unused variable" lint while
-            // keeping intent explicit.
-            let _hold = stream_guards;
-            let mut on_first_byte = on_first_byte;
-            let mut s = stream;
-            while let Some(chunk) = s.next().await {
-                let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
-                    let msg = e.to_string();
-                    tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
-                    std::io::Error::other(msg)
-                });
-                let is_err_chunk = item.is_err();
-                match &item {
-                    Ok(bytes) => {
-                        // TTFT hook: at most once (`take()`); an error-first
-                        // stream never produced a token, so it stays unfired.
-                        if let Some(hook) = on_first_byte.take() {
-                            hook();
-                        }
-                        if scanner.as_mut().is_some_and(|scanner| scanner.feed(bytes)) {
-                            outcome_setter.lock().saw_error_event = true;
-                            scanner = None;
-                        }
+        };
+        let mut scanner = ErrorEventScanner::default();
+        let deadline = tokio::time::Instant::now() + timeouts.total;
+        let pump = async {
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    _ = tx.closed() => { end.client_disconnect = true; return Ok(()); }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        end.transport_ok = false;
+                        return Err(std::io::Error::other("SSE total timeout"));
                     }
-                    Err(_) => outcome_setter.lock().transport_ok = false,
-                }
-                if tx.send(item).await.is_err() {
-                    // Receiver dropped. If we were about to ship an upstream
-                    // error there's nothing left to report; otherwise this is
-                    // a clean client-side disconnect — log at debug since it's
-                    // not a router-side fault.
-                    if !is_err_chunk {
-                        tracing::debug!("SSE client disconnected mid-stream");
-                        outcome_setter.lock().client_disconnect = true;
+                    chunk = tokio::time::timeout(timeouts.idle, stream.next()) => chunk,
+                };
+                let bytes = match chunk {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(Ok(bytes))) => bytes,
+                    other => {
+                        end.transport_ok = false;
+                        let message = match other {
+                            Ok(Some(Err(e))) => e.to_string(),
+                            _ => "SSE upstream idle timeout".to_owned(),
+                        };
+                        return Err(std::io::Error::other(message));
                     }
-                    break;
+                };
+                if let Some(hook) = on_first_byte.take() {
+                    hook();
                 }
-                if is_err_chunk {
-                    // Surfaced upstream error to client; stop reading.
-                    break;
+                if !end.saw_error_event {
+                    end.saw_error_event = scanner.feed(&bytes);
+                }
+                let send_deadline = deadline.min(tokio::time::Instant::now() + timeouts.send_stall);
+                match tokio::time::timeout_at(send_deadline, tx.send(Ok(bytes))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        end.client_disconnect = true;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // A slow consumer is not a worker fault.
+                        end.client_disconnect = true;
+                        return Err(std::io::Error::other("SSE downstream stalled"));
+                    }
                 }
             }
-        });
-        let pump_result = pump.catch_unwind().await;
-        let panicked = pump_result.is_err();
-        if let Err(panic_payload) = pump_result {
-            let msg = panic_payload
-                .downcast_ref::<&'static str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            tracing::error!(error = %msg, "SSE pump task panicked");
-            let _ = tx_for_panic
-                .send(Err(std::io::Error::other(format!(
-                    "SSE pump panicked: {msg}"
-                ))))
-                .await;
-        }
+        };
+        let result = match AssertUnwindSafe(pump).catch_unwind().await {
+            Ok(result) => result,
+            Err(payload) => {
+                end.transport_ok = false;
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                Err(std::io::Error::other(format!(
+                    "SSE pump panicked: {message}"
+                )))
+            }
+        };
         if let Some(hook) = on_complete {
-            let mut end = *outcome.lock();
-            end.transport_ok &= !panicked;
             hook(end);
         }
+        drop(guards);
+        let _ = terminal_tx.send(result);
     });
-    Body::from_stream(ReceiverStream::new(rx))
+    let terminal = futures::stream::once(async {
+        match terminal_rx.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(Err(error)),
+            Err(_) => Some(Err(std::io::Error::other("SSE pump cancelled"))),
+        }
+    })
+    .filter_map(futures::future::ready);
+    Body::from_stream(ReceiverStream::new(rx).chain(terminal))
 }
 
 #[cfg(test)]
@@ -201,6 +198,118 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use http_body_util::BodyExt;
+
+    fn timed_body<S>(
+        stream: S,
+        timeouts: StreamTimeouts,
+    ) -> (Body, tokio::sync::oneshot::Receiver<StreamEnd>)
+    where
+        S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body_with_timeouts(
+            stream,
+            None,
+            Some(Box::new(move |end| {
+                let _ = tx.send(end);
+            })),
+            None,
+            timeouts,
+        );
+        (body, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_disconnect_releases_guards_without_waiting_for_upstream() {
+        struct Release(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::pending::<Result<Bytes, std::io::Error>>(),
+            Some(Box::new(Release(Some(tx)))),
+            None,
+            None,
+        );
+        tokio::task::yield_now().await;
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(1), rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_is_a_visible_upstream_failure() {
+        let (body, end) = timed_body(
+            stream::pending(),
+            StreamTimeouts {
+                idle: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        assert!(body
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("idle timeout"));
+        let end = end.await.unwrap();
+        assert!(!end.transport_ok);
+        assert!(!end.client_disconnect);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_queue_does_not_block_cleanup_or_hide_terminal_error() {
+        let chunks = stream::repeat_with(|| Ok(Bytes::from_static(b"chunk")));
+        let (body, end) = timed_body(
+            chunks,
+            StreamTimeouts {
+                send_stall: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        let end = end.await.unwrap();
+        assert!(end.client_disconnect);
+        assert!(end.transport_ok);
+        assert!(body
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("downstream stalled"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_timeout_stops_a_stream_that_keeps_producing() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if tx.send(Ok(Bytes::from_static(b"chunk"))).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (body, end) = timed_body(
+            ReceiverStream::new(rx),
+            StreamTimeouts {
+                idle: Duration::from_millis(200),
+                total: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        assert!(body
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("total timeout"));
+        assert!(!end.await.unwrap().transport_ok);
+    }
 
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {
@@ -431,7 +540,7 @@ mod tests {
         // Give the pump generous time to make additional polls if its break is
         // broken. Healthy code: pump fills the 64-slot channel, then on the
         // next iteration tx.send().await detects receiver-drop and breaks.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let final_polls = polls.load(Ordering::SeqCst);
         assert!(
             final_polls <= 70,

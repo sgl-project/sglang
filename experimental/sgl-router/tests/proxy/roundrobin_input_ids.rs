@@ -108,7 +108,14 @@ fn without_forwarding(mut cfg: Config, policy: PolicyKind) -> Config {
 
 async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
     assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
-    assert_eq!(captured(mock), *request);
+    let mut forwarded = captured(mock);
+    assert!(forwarded
+        .as_object_mut()
+        .unwrap()
+        .remove("rid")
+        .unwrap()
+        .is_string());
+    assert_eq!(forwarded, *request);
     assert!(!ctx
         .metrics
         .render()
