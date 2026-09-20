@@ -323,6 +323,7 @@ class DiffusionTestCase:
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
+    expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
