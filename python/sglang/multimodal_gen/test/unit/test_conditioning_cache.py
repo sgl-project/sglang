@@ -220,7 +220,7 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
         torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
 @torch.no_grad()
 def test_cuda_cache_hit_does_not_wait_for_unrelated_gpu_work():
     cache = ConditioningCache(4096)

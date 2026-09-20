@@ -257,7 +257,7 @@ class ConditioningCache:
 
             def restore(t):
                 if id(t) not in restored:
-                    restored[id(t)] = t.data.to(t.device, copy=True)
+                    restored[id(t)] = t.data.to(t.device, copy=True, non_blocking=True)
                 return restored[id(t)]
 
             return _map_output(entry.output, restore, restore=True)

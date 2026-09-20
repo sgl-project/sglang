@@ -597,7 +597,10 @@ class TextEncodingStage(ConditionEncodingStage):
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
-            ).to(target_device)
+            )
+            # hash the CPU tokens, without waiting for preceding GPU encoders
+            cache_inputs = dict(text_inputs)
+            text_inputs = text_inputs.to(target_device, non_blocking=True)
 
             input_ids = text_inputs["input_ids"]
             attention_mask = (
@@ -652,10 +655,11 @@ class TextEncodingStage(ConditionEncodingStage):
                 # The stage namespace separates pipeline postprocessing contracts.
                 postprocess_result, pooled_output = cached_encoder_call(
                     text_encoder,
-                    (encoder_forward_kwargs, dict(text_inputs)),
+                    (cache_inputs,),
                     {
                         "encoder_index": i,
                         "return_attention_mask": return_attention_mask,
+                        "device": str(target_device),
                     },
                     encode_conditioning,
                     cache_group,
