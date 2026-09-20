@@ -199,11 +199,6 @@ class ResponseParser:
         """Boundary between the prompt prefix and generated text."""
         return self._prefix_end
 
-    @property
-    def consumed_offset(self) -> int:
-        """End of the input represented by emitted events."""
-        return self._pos
-
     def _event(self, event_type: str, field: str, start: int, end: int, **kwargs) -> dict:
         return {
             "type": event_type,

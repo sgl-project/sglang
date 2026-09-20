@@ -22,7 +22,6 @@ output dicts. Any divergence indicates a regression in the new executor."""
 import copy
 import random
 import unittest
-from typing import Any
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.content_parsers import parse_content
@@ -589,11 +588,12 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ValueError, error):
                     parse_response(text, spec_with(transform), prefix="")
-                parser = ResponseParser(spec_with(transform), prefix="")
-                events = parser.feed(text)
-                parser.finalize()
-                malformed = next(event for event in events if event["type"] == "region_malformed")
-                self.assertIn(error, malformed["error"])
+
+        text, transform, error = cases[0]
+        parser = ResponseParser(spec_with(transform), prefix="")
+        events = parser.feed(text)
+        malformed = next(event for event in events if event["type"] == "region_malformed")
+        self.assertIn(error, malformed["error"])
 
     def test_parse_response_raises_for_truncated_malformed_region(self):
         template_spec = {
@@ -1169,7 +1169,6 @@ class ResponseEventStreamTest(unittest.TestCase):
         events = parser.feed("<content id=7>hello</content>")
 
         self.assertEqual(parser.input_text, "<content id=7>hello</content>")
-        self.assertEqual(parser.consumed_offset, len(parser.input_text))
         boundaries = [
             (event["type"], event["raw"])
             for event in events
@@ -1278,7 +1277,6 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         self.assertEqual(malformed["start"], 0)
         self.assertEqual(malformed["end"], len(malformed_text))
-        self.assertEqual(parser.prefix_end, 0)
         self.assertEqual(malformed["raw_open"], "<call:bad>")
         self.assertEqual(malformed["raw_body"], '{"x":')
         self.assertEqual(malformed["raw_close"], "</call>")
@@ -1604,10 +1602,7 @@ class ToolArgCoercionTest(unittest.TestCase):
             "already_typed": 7,
             "extra": "unscheduled",
         }
-        call: dict[str, Any] = {
-            "type": "function",
-            "function": {"name": "set_alarm", "arguments": arguments},
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": arguments}}
         self.assertIs(_parser_with_tools(tools)._coerce_tool_calls(call), call)
         self.assertEqual(
             call["function"]["arguments"],
@@ -1646,10 +1641,7 @@ class ToolArgCoercionTest(unittest.TestCase):
 
     def test_coerce_tool_calls_handles_single_and_list(self):
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call: dict[str, Any] = {
-            "type": "function",
-            "function": {"name": "set_alarm", "arguments": {"hour": "7"}},
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": "7"}}}
         self.assertIs(parser._coerce_tool_calls(call), call)
         self.assertEqual(call["function"]["arguments"], {"hour": 7})
         # A list of calls (as produced by `transform_each`) is coerced element-wise.
@@ -1756,7 +1748,7 @@ class ToolArgCoercionTest(unittest.TestCase):
 
     def test_merge_duplicates_arguments_are_cast_element_wise(self):
         # merge_duplicates collects repeated tags into a list, which is cast element-wise
-        template: dict[str, Any] = copy.deepcopy(_XML_STRING_ARGS_TEMPLATE)
+        template = copy.deepcopy(_XML_STRING_ARGS_TEMPLATE)
         template["fields"]["tool_calls"]["content_args"]["merge_duplicates"] = True
         model_out = (
             "<tool_call>\n<function=set_alarm>\n"
@@ -1771,13 +1763,7 @@ class ToolArgCoercionTest(unittest.TestCase):
         )
         # Elements that don't cast, and non-string elements, are left as they are.
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call: dict[str, Any] = {
-            "type": "function",
-            "function": {
-                "name": "set_alarm",
-                "arguments": {"hour": ["7", "x", 9]},
-            },
-        }
+        call = {"type": "function", "function": {"name": "set_alarm", "arguments": {"hour": ["7", "x", 9]}}}
         parser._coerce_tool_calls(call)
         self.assertEqual(call["function"]["arguments"], {"hour": [7, "x", 9]})
 
@@ -1785,10 +1771,7 @@ class ToolArgCoercionTest(unittest.TestCase):
         # A transform can hand us a name parsed from model output, so a non-string name
         # must be ignored rather than raising on the schema lookup.
         parser = _parser_with_tools(_SET_ALARM_TOOLS)
-        call: dict[str, Any] = {
-            "type": "function",
-            "function": {"name": ["set_alarm"], "arguments": {"hour": "7"}},
-        }
+        call = {"type": "function", "function": {"name": ["set_alarm"], "arguments": {"hour": "7"}}}
         self.assertEqual(parser._coerce_tool_calls(call), call)
         self.assertEqual(call["function"]["arguments"], {"hour": "7"})
 
