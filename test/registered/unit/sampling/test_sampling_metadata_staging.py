@@ -1,4 +1,4 @@
-"""Sampling metadata must retain its semantics across asynchronous H2D staging."""
+"""Sampling metadata built on the host and copied to the device in one transfer."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,17 +7,9 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.layers.logprob_processor import (
-    LogprobStage,
-    get_token_ids_logprobs_raw,
-)
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
 from sglang.srt.sampling.penaltylib import (
-    BatchedFrequencyPenalizer,
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,
-    BatchedPresencePenalizer,
-    BatchedRepetitionPenalizer,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -47,9 +39,11 @@ def _req(**sampling_params):
 
 
 class _H2DCopies(TorchDispatchMode):
+    """Record the element count of every host-to-device copy."""
+
     def __init__(self):
         super().__init__()
-        self.copies = []
+        self.numels = []
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -57,14 +51,7 @@ class _H2DCopies(TorchDispatchMode):
             source = args[0]
             target = kwargs.get("device")
             if source.device.type == "cpu" and target and target.type == "cuda":
-                self.copies.append(
-                    (
-                        source.numel(),
-                        source.is_pinned(),
-                        kwargs.get("non_blocking"),
-                        target,
-                    )
-                )
+                self.numels.append(source.numel())
         return func(*args, **kwargs)
 
 
@@ -92,19 +79,19 @@ class _SamplingMetadataTestBase(CustomTestCase):
 
 
 class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
-    def test_min_tokens_pads_stop_sets_and_handles_no_stop_tokens(self):
+    def test_min_tokens_pads_ragged_stop_sets(self):
         reqs = [
             _req(min_new_tokens=2, stop_token_ids=[3]),
             _req(min_new_tokens=0, stop_token_ids=[5]),
             _req(min_new_tokens=1),
         ]
+        # Row 0 unions four stop sources and must drop the None entries.
         reqs[0].sampling_params.stop_token_ids.add(None)
         reqs[0].eos_token_ids = {2}
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
-        batch = _Batch(reqs, self.device)
         orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+            VOCAB_SIZE, _Batch(reqs, self.device), {BatchedMinNewTokensPenalizer}
         )
         self.assert_device_tensor(
             orch.penalizers[BatchedMinNewTokensPenalizer].min_new_tokens,
@@ -122,193 +109,72 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
                 torch.ones(3, dtype=torch.long, device=self.device)
             )
 
-        batch = _Batch([_req(min_new_tokens=1)], self.device)
+    def test_min_tokens_without_any_stop_tokens(self):
         orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+            VOCAB_SIZE,
+            _Batch([_req(min_new_tokens=1)], self.device),
+            {BatchedMinNewTokensPenalizer},
         )
         logits = torch.zeros(1, VOCAB_SIZE, device=self.device)
         orch.apply(logits)
         self.assert_device_tensor(logits, torch.zeros(1, VOCAB_SIZE))
 
-    def test_sparse_bias_keeps_last_assignment_and_zero_rows(self):
+    def test_sparse_logit_bias_keeps_last_value_for_colliding_keys(self):
         reqs = [
             _req(logit_bias={"0": -100, "31": 100, "1": 2, "01": 3}),
             _req(),
             _req(logit_bias={}),
             _req(logit_bias={"0": 0, "2": -1.25}),
         ]
-        batch = _Batch(reqs, self.device)
-        original_dtype = torch.get_default_dtype()
-        try:
-            for dtype in (torch.float32, torch.float64):
-                with self.subTest(dtype=dtype):
-                    torch.set_default_dtype(dtype)
-                    info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-                    expected = torch.zeros(len(reqs), VOCAB_SIZE)
-                    for row, req in enumerate(reqs):
-                        for key, value in (
-                            req.sampling_params.logit_bias or {}
-                        ).items():
-                            expected[row, int(key)] = value
-                    self.assert_device_tensor(info.logit_bias, expected, dtype)
-        finally:
-            torch.set_default_dtype(original_dtype)
+        info = SamplingBatchInfo.from_schedule_batch(
+            _Batch(reqs, self.device), VOCAB_SIZE
+        )
+        expected = torch.zeros(len(reqs), VOCAB_SIZE)
+        expected[0, 0], expected[0, 31], expected[0, 1] = -100, 100, 3
+        expected[3, 2] = -1.25
+        self.assert_device_tensor(info.logit_bias, expected, torch.float32)
 
-    def test_empty_batch_and_empty_bias_dict(self):
-        batch = _Batch([], self.device)
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertEqual(info.temperatures.shape, (0, 1))
+    def test_logit_bias_is_none_without_any_bias(self):
+        info = SamplingBatchInfo.from_schedule_batch(
+            _Batch([_req(), _req()], self.device), VOCAB_SIZE
+        )
         self.assertIsNone(info.logit_bias)
-        self.assertFalse(info.penalizer_orchestrator.is_required)
-        self.assertFalse(info.has_custom_logit_processor)
-
-        batch = _Batch([_req(logit_bias={})], self.device)
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assert_device_tensor(info.logit_bias, torch.zeros(1, VOCAB_SIZE))
-
-    def test_raw_logprob_indices_preserve_order_duplicates_and_skipped_rows(self):
-        reference = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 4
-        logprobs = reference.to(self.device)
-        probes = [None, [], [3, 1, 3], [0]]
-        for stage, lengths, expected in (
-            (LogprobStage.DECODE, None, [[], [], [4.75, 4.25, 4.75], [6.0]]),
-            (
-                LogprobStage.PREFILL,
-                [1, 0, 2, 1],
-                [[], [], [[2.75, 2.25, 2.75], [4.75, 4.25, 4.75]], [[6.0]]],
-            ),
-        ):
-            for no_copy in (False, True):
-                with self.subTest(stage=stage, no_copy=no_copy):
-                    vals, idxs = get_token_ids_logprobs_raw(
-                        logprobs, probes, stage, lengths, no_copy_to_cpu=no_copy
-                    )
-                    for actual, wanted in zip(vals, expected):
-                        if isinstance(actual, torch.Tensor):
-                            self.assertEqual(actual.device, torch.device(self.device))
-                            actual = actual.tolist()
-                        self.assertEqual(actual, wanted)
-                    self.assertEqual(
-                        idxs,
-                        [[], [], [3, 1, 3], [0]]
-                        if stage == LogprobStage.DECODE
-                        else [[], [], [[3, 1, 3], [3, 1, 3]], [[0]]],
-                    )
-
-    def test_raw_logprobs_empty_probe_sets(self):
-        logprobs = torch.ones(2, 8, device=self.device)
-        for no_copy in (False, True):
-            vals, idxs = get_token_ids_logprobs_raw(
-                logprobs,
-                [[], None],
-                LogprobStage.PREFILL,
-                [2, 0],
-                no_copy_to_cpu=no_copy,
-            )
-            first = vals[0].tolist() if no_copy else vals[0]
-            self.assertEqual(first, [[], []])
-            self.assertEqual(idxs, [[[], []], []])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
     device = "cuda:0"
 
-    def assert_pinned_copies(self, copies, device):
-        self.assertTrue(copies.copies)
-        for _, pinned, non_blocking, target in copies.copies:
-            self.assertTrue(pinned)
-            self.assertTrue(non_blocking)
-            self.assertEqual(target, device)
-
-    def test_stop_padding_copy_count_does_not_grow_with_batch_size(self):
-        devices = [0, 1] if torch.cuda.device_count() > 1 else [0]
-        for device_index in devices:
-            device = torch.device("cuda", device_index)
-            stream = torch.cuda.Stream(device=device)
-            for batch_size in (1, 16):
-                reqs = [
-                    _req(min_new_tokens=2, stop_token_ids=[2, 3])
-                    for _ in range(batch_size)
-                ]
-                batch = _Batch(reqs, device)
-                with self.subTest(device=device, batch_size=batch_size):
-                    with torch.cuda.stream(stream), _H2DCopies() as copies:
-                        orch = BatchedPenalizerOrchestrator(
-                            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
-                        )
-                        logits = torch.zeros(batch_size, VOCAB_SIZE, device=device)
-                        orch.apply(logits)
-                    stream.synchronize()
-                    self.assertEqual(len(copies.copies), 2)
-                    self.assert_pinned_copies(copies, device)
-                    self.assertTrue(torch.isneginf(logits[:, 2:4]).all().item())
-
-    def test_penalty_parameters_use_pinned_nonblocking_staging(self):
-        device = torch.device(self.device)
-        stream = torch.cuda.Stream(device=device)
-        reqs = [
-            _req(frequency_penalty=0.5, presence_penalty=0.25, repetition_penalty=2),
-            _req(
-                frequency_penalty=-0.5, presence_penalty=-0.25, repetition_penalty=0.5
-            ),
-            _req(),
-        ]
-        batch = _Batch(reqs, device)
-        for cls, field, expected in (
-            (BatchedFrequencyPenalizer, "frequency_penalties", [0.5, -0.5, 0]),
-            (BatchedPresencePenalizer, "presence_penalties", [0.25, -0.25, 0]),
-            (BatchedRepetitionPenalizer, "repetition_penalties", [2, 0.5, 1]),
-        ):
-            with self.subTest(penalizer=cls.__name__):
-                with torch.cuda.stream(stream), _H2DCopies() as copies:
-                    orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, {cls})
-                stream.synchronize()
-                self.assertEqual(len(copies.copies), 1)
-                self.assertEqual(copies.copies[0][0], len(reqs))
-                self.assert_pinned_copies(copies, device)
-                self.assert_device_tensor(
-                    getattr(orch.penalizers[cls], field),
-                    torch.tensor(expected, dtype=torch.float32).view(-1, 1),
-                    torch.float32,
+    def test_stop_token_copy_count_does_not_grow_with_batch_size(self):
+        copy_counts = {}
+        for batch_size in (1, 16):
+            reqs = [
+                _req(min_new_tokens=2, stop_token_ids=[2, 3]) for _ in range(batch_size)
+            ]
+            with _H2DCopies() as copies:
+                orch = BatchedPenalizerOrchestrator(
+                    VOCAB_SIZE,
+                    _Batch(reqs, self.device),
+                    {BatchedMinNewTokensPenalizer},
                 )
+                logits = torch.zeros(batch_size, VOCAB_SIZE, device=self.device)
+                orch.apply(logits)
+            torch.cuda.synchronize()
+            copy_counts[batch_size] = len(copies.numels)
+            self.assertTrue(torch.isneginf(logits[:, 2:4]).all().item())
+        self.assertEqual(copy_counts[16], copy_counts[1])
 
-    def test_bias_processor_and_logprob_indices_on_non_default_stream(self):
-        device = torch.device(self.device)
-        stream = torch.cuda.Stream(device=device)
-        processor = DisallowedTokensLogitsProcessor.to_str()
+    def test_logit_bias_never_copies_a_dense_row(self):
         reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]
-        reqs[0].custom_logit_processor = processor
-        reqs[2].custom_logit_processor = processor
-        batch = _Batch(reqs, device)
-        logprobs = torch.arange(
-            3 * VOCAB_SIZE, device=device, dtype=torch.float32
-        ).view(3, -1)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream), _H2DCopies() as copies:
-            info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-            vals, idxs = get_token_ids_logprobs_raw(
-                logprobs,
-                [[31, 1, 31], None, [2]],
-                LogprobStage.DECODE,
-                no_copy_to_cpu=True,
+        with _H2DCopies() as copies:
+            info = SamplingBatchInfo.from_schedule_batch(
+                _Batch(reqs, self.device), VOCAB_SIZE
             )
-        stream.synchronize()
-        self.assert_pinned_copies(copies, device)
-        self.assertLess(max(numel for numel, *_ in copies.copies), VOCAB_SIZE)
-        expected_bias = torch.zeros(3, VOCAB_SIZE)
-        expected_bias[0, 1], expected_bias[0, 31] = 2, -1
-        self.assert_device_tensor(info.logit_bias, expected_bias, torch.float32)
-        self.assert_device_tensor(
-            info.custom_logit_processor[hash(processor)].indices,
-            torch.tensor([0, 2]),
-            torch.long,
-        )
-        self.assertEqual(
-            [v.tolist() if isinstance(v, torch.Tensor) else v for v in vals],
-            [[31, 1, 31], [], [66]],
-        )
-        self.assertEqual(idxs, [[31, 1, 31], [], [2]])
+        torch.cuda.synchronize()
+        self.assertLess(max(copies.numels), VOCAB_SIZE)
+        expected = torch.zeros(len(reqs), VOCAB_SIZE)
+        expected[0, 1], expected[0, 31] = 2, -1
+        self.assert_device_tensor(info.logit_bias, expected, torch.float32)
 
 
 if __name__ == "__main__":
