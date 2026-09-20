@@ -148,7 +148,12 @@ def calc_session_metrics(requests: list[RequestStats]) -> dict:
     }
 
 
-def calc_metrics(requests: list[RequestStats]) -> dict:
+def calc_metrics(
+    requests: list[RequestStats],
+    *,
+    evicted_tokens: int = 0,
+    evict_calls: int = 0,
+) -> dict:
     ttfts = []
     tpots = []
     itls = []
@@ -280,5 +285,7 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "max_output_tokens_per_s": max_output_tokens_per_s,
         "max_concurrent_requests": max_concurrent_requests,
         "time_cost": -1,  # Updated by external benchmark caller
+        "evicted_tokens": evicted_tokens,
+        "evict_calls": evict_calls,
         **calc_session_metrics(requests),
     }

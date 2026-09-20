@@ -86,11 +86,6 @@ class C_SglangPrefillAdderHook(BaseHook):
         target.add_one_req = wrapped_add_one_req
 
 
-def _request_finished(rid: str) -> bool:
-    req_stats = request_stats_manager.get_req_stats(rid)
-    return len(req_stats.gen_token_latencies) >= req_stats.output_length
-
-
 class ReqDispatcher:
     _instance = None
     _initialized = False
@@ -114,10 +109,25 @@ class ReqDispatcher:
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
-        self.session_requests = SessionRequestClassifier()
+        # Constructed on first use, never here: `REQ_DISPATCHER` is a class-body
+        # attribute built at module import, and the classifier imports io_struct.
+        # Importing SGLang before the hooks install leaves its classes unhooked,
+        # and the required-hook check then refuses to start the server.
+        self._session_requests = None
         self.session_timeline = SessionTimeline(
-            is_request_finished=_request_finished
+            is_request_finished=self._request_finished
         )
+
+    @staticmethod
+    def _request_finished(rid: str) -> bool:
+        req_stats = request_stats_manager.get_req_stats(rid)
+        return len(req_stats.gen_token_latencies) >= req_stats.output_length
+
+    @property
+    def session_requests(self) -> SessionRequestClassifier:
+        if self._session_requests is None:
+            self._session_requests = SessionRequestClassifier()
+        return self._session_requests
 
     @staticmethod
     def simulation_created_time_s(simulation_args: dict) -> float:
@@ -580,9 +590,14 @@ class C_SchedulerHook(BaseHook):
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
-                    0.0,
+                last_real_time_ts = StateManager.get_last_real_time_ts()
+                # 0 means no batch has run since the last reset, so there is no
+                # elapsed host time to charge yet. Differencing against it would
+                # step the simulated clock by a whole Unix epoch.
+                cpu_overhead = (
+                    max(now - last_real_time_ts - blocked_l2_wall_dur, 0.0)
+                    if last_real_time_ts
+                    else 0.0
                 )
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
@@ -645,7 +660,11 @@ class C_SchedulerHook(BaseHook):
                     item.queue_end -= min_created_time
                     item.last_event_time -= min_created_time
 
-                metrics = calc_metrics(stats)
+                metrics = calc_metrics(
+                    stats,
+                    evicted_tokens=StateManager.get_evicted_tokens(),
+                    evict_calls=StateManager.get_evict_calls(),
+                )
                 metrics["time_cost"] = (
                     time.time() - StateManager.get_last_flush_time_ts()
                 )
