@@ -1607,6 +1607,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # ROCm: issue the indexer's wk and weights_proj as one GEMM. This is only
+    # the GEMM half of SGLANG_DISABLE_DSA_INDEXER_FUSION's counterpart on CUDA
+    # -- the Hadamard rotation and the fused CUDA kernels are not part of it.
+    SGLANG_ROCM_FUSE_INDEXER_GEMM = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

@@ -199,9 +199,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (hidden_size & (hidden_size - 1)) == 0, (
-        "Hidden size must be a power of 2 for Hadamard transform."
-    )
+    assert (
+        hidden_size & (hidden_size - 1)
+    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
@@ -250,6 +250,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
+        # ROCm takes only the GEMM half: wk and weights_proj read the same
+        # hidden state and are issued back to back, and at decode row counts
+        # they are 94% and 99% launch overhead, so merging them saves a launch.
+        #
+        # Not bit-identical to the two calls: the tuned table picks a different
+        # kernel for N=160 than for N=128, so the K reduction associates
+        # differently. Measured against an fp32 reference the merged key is the
+        # more accurate of the two (55.3-55.7 dB against 45.7-47.9 dB over
+        # M in [4, 96]); the head gates match to the same SNR, bitwise equal at
+        # most row counts but not all.
+        #
+        # The rest of use_dsa_indexer_fusion does not come along: it also drops
+        # the Hadamard rotation (a numerics change that interacts with the fp8
+        # index-K cache) and routes into CUDA-only fused kernels.
+        self.merge_indexer_gemm = (
+            _is_hip
+            and not self.use_dsa_indexer_fusion
+            and envs.SGLANG_ROCM_FUSE_INDEXER_GEMM.get()
+            and not is_neox_style
+        )
+        # Whether the one merged param exists in place of wk + weights_proj.
+        self.indexer_wk_is_merged = (
+            self.use_dsa_indexer_fusion or self.merge_indexer_gemm
+        )
+        # Only the CUDA fusion drops the rotation.
+        self.fusion_skips_rotation = self.use_dsa_indexer_fusion
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -272,7 +298,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             prefix=add_prefix("wq_b", prefix),
         )
 
-        if self.use_dsa_indexer_fusion:
+        if self.indexer_wk_is_merged:
             self.wk_weights_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim + self.n_heads,
@@ -389,14 +415,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights_raw * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-    def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _fused_k_weights(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
+        # aiter (ROCm gfx95) hands the indexer the 3-tuple (fp8, scale, bf16)
+        # from fused_rms_fp8_group_quant; the merged param is bf16, so take the
+        # passthrough tensor -- the same one weights_proj already consumed.
+        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+            x = x[2]
         kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        # Fusion drops the (logit-preserving) Hadamard rotation; without it the
-        # index-K cache here matches the fused path that decode reads back.
-        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+        # The CUDA fusion drops the (logit-preserving) Hadamard rotation; without
+        # it the index-K cache there matches the fused path decode reads back.
+        # The ROCm GEMM merge keeps the rotation, so its cache is unchanged.
+        return x if self.fusion_skips_rotation else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # topk_transform selects every valid page slot when kv_len <= index_topk;
@@ -457,7 +489,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                if self.use_dsa_indexer_fusion:
+                if self.indexer_wk_is_merged:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
                     key, _ = self.wk(x)
@@ -476,7 +508,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            if self.use_dsa_indexer_fusion:
+            if self.indexer_wk_is_merged:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
@@ -526,8 +558,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         x: torch.Tensor,
         positions: torch.Tensor,
     ):
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        # self.wk does not exist once the two projections share one param.
+        key = (
+            self._fused_k_weights(x)[0] if self.indexer_wk_is_merged else self.wk(x)[0]
+        )
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -541,7 +575,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = k_rope
         _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        key = rotate_activation(key)
+        key = self._maybe_rotate(key)
 
         return key
 
@@ -760,13 +794,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert page_size % 16 == 0, (
-                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
-                )
+                assert (
+                    page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
             else:
-                assert page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
-                )
+                assert (
+                    page_size == 1
+                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         elif _is_xpu:
             assert page_size in (
                 64,
@@ -1070,13 +1104,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert page_size % 16 == 0, (
-                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
-                )
+                assert (
+                    page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
             else:
-                assert page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
-                )
+                assert (
+                    page_size == 1
+                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
             if _is_xpu:
                 assert page_size in (
@@ -1203,13 +1237,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert seq_lens_expanded.shape[0] == q_offset, (
-            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
-        )
+        assert (
+            seq_lens_expanded.shape[0] == q_offset
+        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
         if global_topk_offset is not None:
-            assert global_topk_offset.shape[0] >= q_offset, (
-                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
-            )
+            assert (
+                global_topk_offset.shape[0] >= q_offset
+            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
 
         start = 0
         while start < q_offset:
@@ -1535,7 +1569,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
         # absent then; short-circuit before touching it.
-        weights_proj_lora = not self.use_dsa_indexer_fusion and getattr(
+        weights_proj_lora = not self.indexer_wk_is_merged and getattr(
             self.weights_proj, "set_lora", False
         )
 
@@ -1588,7 +1622,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if not self.use_dsa_indexer_fusion:
+            if not self.indexer_wk_is_merged:
                 if weights_proj_lora:
                     weights = self.weights_proj(x)[0].float() * self.n_heads**-0.5
                 else:
@@ -1605,7 +1639,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            if self.use_dsa_indexer_fusion:
+            if self.indexer_wk_is_merged:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
@@ -1688,7 +1722,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 x_for_gate = x
 
             if in_piecewise_or_breakable_cuda_graph:
-                if self.use_dsa_indexer_fusion:
+                if self.indexer_wk_is_merged:
                     weights = scale_head_gate_graph(
                         weights_raw,
                         self.n_heads**-0.5,
@@ -1705,7 +1739,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         self.softmax_scale,
                         q_scale,
                     )
-            elif self.use_dsa_indexer_fusion:
+            elif self.indexer_wk_is_merged:
                 weights = self._scale_head_gates(weights_raw, q_scale)
             elif weights_proj_lora:
                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
