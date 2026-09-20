@@ -123,7 +123,24 @@ def test_lru_budget_and_oversized_outputs():
     assert cache.bypasses == 1
 
 
-@pytest.mark.parametrize("bypass", ["disabled", "warmup", "training", "grad", "ar"])
+@torch.no_grad()
+def test_warmup_executes_nested_encoders_and_seeds_serving_cache():
+    cache = ConditioningCache(4096)
+    model = VisionLanguageEncoder().eval()
+    text, pixels = torch.ones(4), torch.ones(4)
+    with cache.scope():
+        expected = model(text, pixels)
+        with cache.scope(refresh=True):
+            model(text, pixels)
+            model(text, pixels)
+        assert model.calls == model.vision_calls == 3
+        torch.testing.assert_close(model(text, pixels), expected, rtol=0, atol=0)
+        assert model.calls == model.vision_calls == 3
+        model(text + 1, pixels)
+        assert model.calls == 4 and model.vision_calls == 3
+
+
+@pytest.mark.parametrize("bypass", ["disabled", "inactive", "training", "grad", "ar"])
 def test_bypass(bypass):
     cache = ConditioningCache(0 if bypass == "disabled" else 1024)
     model = Encoder().eval()
@@ -132,7 +149,7 @@ def test_bypass(bypass):
     kwargs = {"use_cache": True} if bypass == "ar" else {}
     with (
         torch.set_grad_enabled(bypass == "grad"),
-        cache.scope(enabled=bypass != "warmup"),
+        cache.scope(enabled=bypass != "inactive"),
     ):
         model(torch.ones(4), **kwargs)
         model(torch.ones(4), **kwargs)

@@ -29,6 +29,9 @@ logger = init_logger(__name__)
 _active_cache: ContextVar["ConditioningCache | None"] = ContextVar(
     "conditioning_cache", default=None
 )
+_refresh_cache: ContextVar[bool] = ContextVar(
+    "refresh_conditioning_cache", default=False
+)
 _container_types: set[type] = {DiagonalGaussianDistribution}
 _live_caches = weakref.WeakSet()
 _weights_epoch = 0
@@ -174,12 +177,14 @@ class ConditioningCache:
         )
 
     @contextmanager
-    def scope(self, enabled=True):
+    def scope(self, enabled=True, *, refresh=False):
         # Zero-capacity ranks still participate in encoder hit consensus.
         token = _active_cache.set(self if enabled else None)
+        refresh_token = _refresh_cache.set(refresh or _refresh_cache.get())
         try:
             yield
         finally:
+            _refresh_cache.reset(refresh_token)
             _active_cache.reset(token)
 
     def run(
@@ -218,7 +223,7 @@ class ConditioningCache:
         except Uncacheable:
             key = None
         entry = self._entries.get(key)
-        hit = entry is not None
+        hit = entry is not None and not _refresh_cache.get()
         if group is not None and group.world_size > 1:
             # Encoders may issue TP/folding collectives. A rank-local eviction
             # must never leave another rank returning early from the encoder.

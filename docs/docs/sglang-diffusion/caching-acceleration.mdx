@@ -33,7 +33,7 @@ The same settings are accepted by `DiffGenerator.from_pretrained()` as `disable_
 - VAE caching stores the posterior before sampling and normalization. Every request still calls `sample()` or `mode()` as its model requires, preserving the random-number sequence.
 - Cache hits return independent copies. In-place normalization and downstream mutations cannot change a stored entry.
 - Encoder TP and folding groups agree on hits before skipping collective work. Weight updates and LoRA changes invalidate the cache, including failed updates that may have modified weights.
-- Warmup bypasses this cache. Compare disabled, cold, and repeated-input latency separately when benchmarking.
+- Warmup always executes encoders and refreshes their entries, so it still primes kernels while subsequent requests can reuse conditioning such as the model-default negative prompt. Compare disabled, cold, and repeated-input latency separately when benchmarking.
 
 ### Coverage and limits
 

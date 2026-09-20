@@ -94,8 +94,8 @@ class PipelineExecutor(ABC):
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             with self.conditioning_cache.scope(
-                enabled=not self._is_warmup_payload(payload)
-                and not server_args.use_fsdp_inference
+                enabled=not server_args.use_fsdp_inference,
+                refresh=self._is_warmup_payload(payload),
             ):
                 yield
         finally:
