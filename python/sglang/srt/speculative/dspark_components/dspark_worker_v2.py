@@ -74,6 +74,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    draft_pp_context,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
@@ -165,7 +166,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with self._draft_context():
+        with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -428,7 +429,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        with self._draft_context():
+        with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
@@ -463,7 +464,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context():
+        with draft_pp_context(), self._draft_context():
             if capture_decode_cuda_graph:
                 # Keep the draft model graph enabled when folded proposal is
                 # disabled, but do not capture the proposal head as a tail

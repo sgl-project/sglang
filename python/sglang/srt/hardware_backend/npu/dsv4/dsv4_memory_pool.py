@@ -483,7 +483,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         item = self.layer_mapping[layer_id]
         ratio = item.compress_ratio
         if ratio == 0:
-            return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+            return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if ratio == 4:
             return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
         if ratio == 128:
@@ -507,9 +507,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         shape becomes (num_tokens, 1, dim).
         """
         self.wait_layer_transfer(layer_id)
-        # Index by RAW layer_id, not compress_layer_id (a per-bucket counter that
-        # would collide across ratios). swa_kv_pool is sized layer_num=total_layers.
-        kv = self.swa_kv_pool.kv_buffer[layer_id]
+        # Index by PP-stage-local layer_id, not compress_layer_id (a per-bucket
+        # counter that would collide across ratios). swa_kv_pool is sized
+        # layer_num=stage_layer_num (only this PP stage's layers).
+        kv = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
@@ -554,8 +555,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         (num_pages, page_size, 1, dim) so we flatten the first two dims and
         index_put.
         """
-        # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
-        buf = self.swa_kv_pool.kv_buffer[layer_id]
+        # Index by PP-stage-local layer_id (see get_swa_buffer).
+        buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if is_npu_arch35():
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
