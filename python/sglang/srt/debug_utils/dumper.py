@@ -1739,7 +1739,7 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["moe_tp_size"] = parallel.moe_tp_size
             info["moe_dp_rank"] = parallel.moe_dp_rank
             info["moe_dp_size"] = self._dp_attn.get_moe_cp_size()
-        except (AttributeError, AssertionError, ValueError):
+        except (AttributeError, AssertionError, ValueError, RuntimeError):
             info["distributed_error"] = True
 
         try:
@@ -1747,11 +1747,12 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
             info["attn_tp_rank"] = parallel.attn_tp_rank
             info["attn_tp_size"] = parallel.attn_tp_size
-            info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
-            info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
+            info["attn_dp_rank"] = parallel.attn_dp_rank
+            info["attn_dp_size"] = parallel.attn_dp_size
             info["attn_cp_rank"] = parallel.attn_cp_rank
             info["attn_cp_size"] = parallel.attn_cp_size
-        except (AttributeError, AssertionError, ValueError):
+        # An unstamped topology name raises RuntimeError.
+        except (AttributeError, AssertionError, ValueError, RuntimeError):
             info["dp_attention_error"] = True
 
         return info

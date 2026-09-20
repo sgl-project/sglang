@@ -74,10 +74,10 @@ node.component_data[ComponentType.MAMBA]  # MambaComponent data
 | `../unified_cache/unified_tree_core.py` | `UnifiedTreeCore` — the tree, LRUs, and size counters; `UnifiedTreeNode`, `UnifiedLRUList` |
 | `../unified_cache/unified_tree_core_interface.py` | `UnifiedTreeCoreInterface`, `NodeId` — the tree/cache boundary contract |
 | `../unified_cache/cache_action.py` | Deferred `CacheAction`/`ComponentAction` types emitted by the tree |
-| `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
-| `full_component.py` | `FullComponent` — standard full-attention KV cache component |
-| `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
-| `mamba_component.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
+| `base.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
+| `full.py` | `FullComponent` — standard full-attention KV cache component |
+| `swa.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
+| `mamba.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
 | `../hybrid_cache/hybrid_cache_controller.py` | `HybridCacheController` — HiCache multi-pool controller (L1 GPU → L2 CPU, optional L3 storage) |
 | `__init__.py` | Re-exports: `ComponentType`, `ComponentData`, `TreeComponent`, `FullComponent`, `SWAComponent`, `MambaComponent` |
 
@@ -228,14 +228,14 @@ receipt proves were taken. The eventual full release must pass
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, owned_kv_len: int)`
 
 Cache a completed request's KV data into the tree.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
+| **Inputs** | `req` — the finished request; `is_insert` — insert the owned range into the tree (True) or free it (False); `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache` |
 | **Output** | `None` |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
@@ -276,7 +276,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 
 ## TreeComponent Hook Reference
 
-Each component implements these hooks. See `tree_component.py` for the ABC and docstrings.
+Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 ### Match Phase
 

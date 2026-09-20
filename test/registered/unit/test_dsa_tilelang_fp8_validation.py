@@ -87,6 +87,16 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
             override_platform(is_npu=False, is_xpu=False, is_hip=False),
         ):
             self.assertEqual(_dsa_split_backend_resolution(make_view()), {})
+            # Recognizing NoPE geometry must not silently change backend defaults.
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    make_view(dsa_prefill_backend=None, dsa_decode_backend=None)
+                ),
+                {
+                    "dsa_prefill_backend": "flashmla_kv",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
             for options in (
                 {"rank": 256},
                 {"rope": 64},

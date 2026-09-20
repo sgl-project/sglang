@@ -221,41 +221,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
   /*
-   * From csrc/speculative
-   */
-  m.def(
-      "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
-      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, Tensor draft_probs, "
-      "float threshold_single, float threshold_acc, "
-      "bool deterministic) -> ()");
-  m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
-
-  m.def(
-      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
-      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor target_predict) -> ()");
-  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
-
-  m.def(
-      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
-      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "int batch_size, int draft_token_num) -> ()");
-  m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
-
-  m.def(
-      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
-      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
-      "()");
-  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
-
-  m.def(
-      "segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int batch_size, "
-      "int cuda_stream) -> ()");
-  m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
-
-  /*
    * From csrc/kvcacheio
    */
   m.def(
@@ -302,6 +267,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
       "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
+  m.def("get_device_accessible_ptr(Tensor tensor, int device_index) -> int", &get_device_accessible_ptr);
   m.def(
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");

@@ -42,6 +42,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -350,12 +351,18 @@ def _fused_rope_cat_and_cache(
         and attn.current_attention_backend == "aiter"
         else kv_cache_dtype
     )
+    kv_pool = get_token_to_kv_pool()
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    # AITER reads slot_mapping with stride 1, including on the resident path.
+    out_cache_loc = out_cache_loc.contiguous()
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
         k_nope,
         k_pe,
-        get_token_to_kv_pool().get_key_buffer(attn.attn_mqa.layer_id),
+        kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
         out_cache_loc,
         positions,
         attn.rotary_emb.cos_cache,
@@ -591,23 +598,33 @@ class DeepseekMLARocmForwardMixin:
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        if (
-            self.rotary_emb is not None
-            and (not fuse_rope_for_trtllm_mla)
-            and (not self._skip_rope_for_dsa_tilelang_fused())
-            and (not self._skip_rope_for_aiter_fused_mla())
+
+        force_rope_for_aiter_dcp_decode = (
+            get_parallel().dcp_enabled
             and (
-                not _use_aiter
-                or not _is_gfx95_supported
-                or self.use_dsa
-                # Non-fused, non-specialized attention backends (e.g. Triton) run
-                # the cat path in forward_absorb_core and need RoPE applied here;
-                # only the aiter fused MLA path and the specialized MLA backends
-                # defer RoPE to their own kernels.
-                or (
-                    self.current_attention_backend
-                    not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
-                    and self.current_attention_backend != "aiter"
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        )
+        if self.rotary_emb is not None and (
+            force_rope_for_aiter_dcp_decode
+            or (
+                (not fuse_rope_for_trtllm_mla)
+                and (not self._skip_rope_for_dsa_tilelang_fused())
+                and (not self._skip_rope_for_aiter_fused_mla())
+                and (
+                    not _use_aiter
+                    or not _is_gfx95_supported
+                    or self.use_dsa
+                    or (
+                        self.current_attention_backend
+                        not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+                        and self.current_attention_backend != "aiter"
+                    )
                 )
             )
         ):
@@ -622,18 +639,23 @@ class DeepseekMLARocmForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                # Assemble the full sequence into dcp_kv_buffer, which the
+                # backend attends over instead of the sharded local cache.
+                if (
+                    forward_batch.attn_dcp_metadata is not None
+                    and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+                ):
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -763,6 +785,38 @@ class DeepseekMLARocmForwardMixin:
                             else {}
                         ),
                     )
+        elif (
+            _use_aiter
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and get_parallel().dcp_enabled
+        ):
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            if llama_4_scaling is not None:
+                q[..., : self.kv_lora_rank] *= llama_4_scaling
+            get_token_to_kv_pool().set_mla_kv_buffer(
+                self.attn_mqa,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
+            )
+            if forward_batch.forward_mode.is_target_verify():
+                k_window = torch.cat([k_nope, k_pe], dim=-1)
+                v_window = k_nope
+            else:
+                k_window = None
+                v_window = None
+            attn_output, lse = self.attn_mqa_for_dcp_decode(
+                q,
+                k_window,
+                v_window,
+                forward_batch,
+                save_kv_cache=False,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
         else:
             if self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
