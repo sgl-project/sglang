@@ -223,15 +223,50 @@ class TestDensePrefillIndexer(CustomTestCase):
                             [q for q, _ in request_lengths],
                         )
 
-    def test_empty_queries(self):
-        inputs = make_inputs([(0, 0), (0, 17)])
-        selected, candidates = dense_prefill_indexer.dense_prefill_topk(
-            **inputs, publish_candidates=True, candidates=None
-        )
-        self.assertEqual(tuple(selected.shape), (0, 512))
-        self.assertEqual(
-            [tuple(b.shape) for b in candidates.request_blocks], [(0, 0), (0, 2)]
-        )
+    def test_empty_queries_or_context(self):
+        for request_lengths, shape, block_shapes in (
+            ([], (0, 512), []),
+            ([(0, 0)], (0, 512), [(0, 0)]),
+            ([(0, 0), (0, 17)], (0, 512), [(0, 0), (0, 2)]),
+            ([(1, 0)], (1, 512), [(1, 0)]),
+        ):
+            with self.subTest(request_lengths=request_lengths):
+                inputs = make_inputs(request_lengths)
+                selected, candidates = dense_prefill_indexer.dense_prefill_topk(
+                    **inputs, publish_candidates=True, candidates=None
+                )
+                torch.testing.assert_close(
+                    selected, torch.full(shape, -1, dtype=torch.int32, device="cuda")
+                )
+                self.assertEqual(
+                    [tuple(b.shape) for b in candidates.request_blocks], block_shapes
+                )
+
+    def test_score_budget_includes_allocation_padding(self):
+        from deep_gemm import fp8_fp4_mqa_logits
+
+        inputs = make_inputs([(13, 257)])
+        expected = dense_scores(inputs)
+        for budget in (32 << 10, 28 << 10, 8 << 10):
+            with self.subTest(budget=budget):
+                allocations = []
+
+                def checked_logits(*args, **kwargs):
+                    before = torch.cuda.memory_allocated()
+                    logits = fp8_fp4_mqa_logits(*args, **kwargs)
+                    allocations.append(torch.cuda.memory_allocated() - before)
+                    return logits
+
+                with (
+                    patch.object(dense_prefill_indexer, "_SCORE_BUDGET_BYTES", budget),
+                    patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
+                ):
+                    selected, _ = dense_prefill_indexer.dense_prefill_topk(
+                        **inputs, publish_candidates=True, candidates=None
+                    )
+                self.assertTrue(allocations)
+                self.assertLessEqual(max(allocations), budget)
+                self.assert_topk(inputs, selected, expected)
 
     def test_score_memory_is_bounded(self):
         for context, limit_gib in ((65536, 3), (65535, 5)):

@@ -8,6 +8,11 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     mask_topk_scores,
     select_candidate_block_ids,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_row_bytes,
+    mqa_logits_rows_per_chunk,
+)
+from sglang.srt.utils.common import ceil_align
 
 _SCORE_BUDGET_BYTES = 2 << 30
 
@@ -48,10 +53,23 @@ def dense_prefill_topk(
                 )
             )
         row += query_length
-    width = (max((n for _, n in request_lengths), default=0) + 3) // 4 * 4
-    step = max(1, _SCORE_BUDGET_BYTES // max(4 * width, 1))
-    for offset in range(0, row if width else 0, step):
-        rows = slice(offset, min(offset + step, row))
+    width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
+    if row == 0 or width == 0:
+        return selected, published
+    row_alignment = 128 // q[0].shape[1]
+    rows_per_chunk = mqa_logits_rows_per_chunk(
+        num_rows=ceil_align(row, row_alignment),
+        row_bytes=mqa_logits_row_bytes(width),
+        budget_bytes=_SCORE_BUDGET_BYTES,
+    )
+    if rows_per_chunk is None:
+        rows_per_chunk = row
+    else:
+        rows_per_chunk = max(
+            row_alignment, rows_per_chunk // row_alignment * row_alignment
+        )
+    for offset in range(0, row, rows_per_chunk):
+        rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
             q=(q[0][rows], q[1][rows]),
             kv=kv,
