@@ -59,7 +59,7 @@ class TestJointQKVCat(CustomTestCase):
                     self.assert_bits_equal(out[1:], saved)
 
     def test_changed_input_graph_replay(self):
-        inputs = make_inputs(2, 257, 13, 8, 128, torch.bfloat16)
+        inputs = make_inputs(2, 2048, 13, 32, 128, torch.bfloat16)
         gate = BitExactFusionGate("test", per_signature=True)
         with patch.object(joy_image, "_JOY_QKV_CAT", gate):
             self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), reference(inputs))
@@ -82,6 +82,9 @@ class TestJointQKVCat(CustomTestCase):
 
     def test_unsupported_inputs_and_autograd_fallback(self):
         inputs = make_inputs(1, 13, 5, 4, 32, torch.bfloat16)
+        with patch.object(joy_image, "joint_qkv_cat") as fused:
+            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), reference(inputs))
+            fused.assert_not_called()
         self.assertFalse(can_use_joint_qkv_cat(*inputs[:5]))
         self.assertFalse(can_use_joint_qkv_cat(*(x.float() for x in inputs)))
         self.assertFalse(can_use_joint_qkv_cat(*(x[..., ::2] for x in inputs)))
@@ -98,7 +101,7 @@ class TestJointQKVCat(CustomTestCase):
             self.assertTrue(torch.equal(value.grad, torch.ones_like(value)))
 
     def test_gate_mismatch_exception_and_unverified_capture(self):
-        inputs = make_inputs(1, 13, 5, 4, 32, torch.bfloat16)
+        inputs = make_inputs(1, 4096, 5, 32, 128, torch.bfloat16)
         expected = reference(inputs)
         wrong = tuple(x.clone() for x in expected)
         wrong[0].view(torch.int16)[0, 0, 0, 0] ^= 1

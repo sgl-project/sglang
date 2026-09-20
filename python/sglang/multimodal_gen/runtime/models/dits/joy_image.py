@@ -58,7 +58,13 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     def reference():
         return tuple(torch.cat((inputs[i], inputs[i + 3]), dim=1) for i in range(3))
 
-    if _JOY_QKV_CAT.disabled or not can_use_joint_qkv_cat(*inputs):
+    # Below 32 MiB per image tensor, eager dispatch costs more than the copy
+    # saves. Keep small resolutions and short sequence-parallel shards native.
+    if (
+        _JOY_QKV_CAT.disabled
+        or inputs[0].numel() < 16 * 1024 * 1024
+        or not can_use_joint_qkv_cat(*inputs)
+    ):
         return reference()
     sig = (inputs[0].device, inputs[0].dtype) + tuple(
         (tuple(x.shape), tuple(x.stride())) for x in inputs
