@@ -1,0 +1,280 @@
+"""Unit tests for PLaMo3 families of models"""
+
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.configs.plamo3 import Plamo3Config, is_full_attn
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.plamo3 import (
+    Plamo3Decoder,
+    Plamo3ForCausalLM,
+    Plamo3Model,
+    Plamo3RMSNorm,
+)
+from sglang.srt.models.registry import ModelRegistry
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestPlamo3Config(CustomTestCase):
+    def _make(self, **overrides):
+        defaults = dict(
+            hidden_size=64,
+            num_hidden_layers=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            window_size=128,
+            sliding_window_pattern=4,
+            intermediate_size=128,
+            vocab_size=64,
+        )
+        defaults.update(overrides)
+        return Plamo3Config(**defaults)
+
+    def test_model_type(self):
+        self.assertEqual(Plamo3Config.model_type, "plamo3")
+
+    def test_default_architectures_matches_upstream(self):
+        cfg = self._make()
+        self.assertIsNone(cfg.architectures)
+
+    def test_is_full_attn_pattern(self):
+        # sliding_window_pattern=4: full attn at layers 3, 7, 11, ...
+        self.assertFalse(is_full_attn(4, 0))
+        self.assertFalse(is_full_attn(4, 1))
+        self.assertFalse(is_full_attn(4, 2))
+        self.assertTrue(is_full_attn(4, 3))
+        self.assertTrue(is_full_attn(4, 7))
+
+    def test_interleaved_sliding_window_layout(self):
+        cfg = self._make(num_hidden_layers=8, sliding_window_pattern=4)
+        self.assertEqual(len(cfg.interleaved_sliding_window), 8)
+        # Layers 3 and 7 are full attention (None), rest are windowed.
+        expected = [128, 128, 128, None, 128, 128, 128, None]
+        self.assertEqual(cfg.interleaved_sliding_window, expected)
+
+    def test_interleaved_sliding_window_is_derived(self):
+        cfg = self._make(num_hidden_layers=4, sliding_window_pattern=2)
+        self.assertNotIn("interleaved_sliding_window", cfg.to_dict())
+        cfg.window_size = 64
+        self.assertEqual(cfg.interleaved_sliding_window, [64, None, 64, None])
+
+    def test_sliding_window_alias(self):
+        cfg = self._make(window_size=256)
+        self.assertEqual(cfg.sliding_window, 256)
+
+    def test_legacy_rope_global_theta(self):
+        cfg = self._make(rope_global_theta=777_777)
+        self.assertEqual(cfg.rope_theta, 777_777)
+        self.assertFalse(hasattr(cfg, "rope_global_theta"))
+
+    def test_legacy_sliding_window(self):
+        for value in (256, [256, 256, None, 256]):
+            with self.subTest(value=value):
+                self.assertEqual(self._make(sliding_window=value).window_size, 256)
+
+    def test_scale_embedding_default(self):
+        self.assertFalse(self._make().scale_embedding)
+
+    def test_layer_types(self):
+        cfg = self._make(num_hidden_layers=8, sliding_window_pattern=4)
+        self.assertEqual(
+            cfg.layer_types,
+            [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+
+    def test_layers_block_type(self):
+        cfg = self._make(num_hidden_layers=4)
+        self.assertEqual(cfg.layers_block_type, ["attention"] * 4)
+
+    def test_rope_parameters_default_when_factor_is_one(self):
+        cfg = self._make(rope_scaling_factor=1)
+        self.assertEqual(
+            cfg.rope_parameters,
+            {
+                "full_attention": {
+                    "rope_theta": cfg.rope_theta,
+                    "rope_type": "default",
+                },
+                "sliding_attention": {
+                    "rope_theta": cfg.rope_local_theta,
+                    "rope_type": "default",
+                },
+            },
+        )
+
+    def test_rope_parameters_yarn_dict(self):
+        cfg = self._make(
+            rope_scaling_factor=64.0,
+            initial_context_length=4096,
+            max_position_embeddings=262144,
+        )
+        self.assertEqual(
+            cfg.rope_parameters,
+            {
+                "full_attention": {
+                    "rope_theta": cfg.rope_theta,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "factor": 64.0,
+                    "original_max_position_embeddings": 4096,
+                    "rope_type": "yarn",
+                    "truncate": False,
+                },
+                "sliding_attention": {
+                    "rope_theta": cfg.rope_local_theta,
+                    "rope_type": "default",
+                },
+            },
+        )
+
+    def test_rope_parameters_requires_initial_context_length(self):
+        with self.assertRaises(AssertionError):
+            self._make(rope_scaling_factor=64.0, initial_context_length=None)
+
+    def test_default_rope_rejects_initial_context_length(self):
+        with self.assertRaises(AssertionError):
+            self._make(rope_scaling_factor=1, initial_context_length=4096)
+
+    def test_rope_local_base_freq(self):
+        cfg = self._make(rope_local_theta=12345)
+        self.assertEqual(cfg.rope_local_base_freq, 12345)
+
+
+class TestPlamo3Registry(CustomTestCase):
+    def test_resolve_model_cls(self):
+        model_cls, arch = ModelRegistry.resolve_model_cls(["Plamo3ForCausalLM"])
+        self.assertIs(model_cls, Plamo3ForCausalLM)
+        self.assertEqual(arch, "Plamo3ForCausalLM")
+
+    def test_packed_modules_mapping_preserves_fused_checkpoint_names(self):
+        self.assertEqual(
+            Plamo3ForCausalLM.packed_modules_mapping,
+            {
+                "qkv_proj": ["qkv_proj"],
+                "gate_up_proj": ["gate_up_proj"],
+            },
+        )
+
+
+class TestPlamo3RMSNorm(CustomTestCase):
+    def test_checkpoint_weight_is_preserved(self):
+        norm = Plamo3RMSNorm(4, offset=0.2)
+        loaded_weight = torch.tensor([0.1, -0.1, 0.0, 0.3])
+
+        default_weight_loader(norm.weight, loaded_weight)
+
+        torch.testing.assert_close(norm.state_dict()["weight"], loaded_weight)
+
+    def test_forward_matches_reference(self):
+        norm = Plamo3RMSNorm(
+            4,
+            eps=1e-6,
+            offset=0.2,
+        ).float()
+        loaded_weight = torch.tensor([0.1, -0.1, 0.0, 0.3])
+        norm.weight.data.copy_(loaded_weight)
+        x = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
+
+        expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+        expected *= loaded_weight + 0.2
+
+        torch.testing.assert_close(norm(x), expected)
+
+
+class TestPlamo3Embedding(CustomTestCase):
+    def test_scale_embedding_matches_upstream(self):
+        model = Plamo3Model.__new__(Plamo3Model)
+        torch.nn.Module.__init__(model)
+        model.config = Plamo3Config(
+            hidden_size=4,
+            scale_embedding=True,
+        )
+        model.embed_tokens = torch.nn.Embedding(2, 4)
+        torch.nn.init.ones_(model.embed_tokens.weight)
+
+        embeddings = model.embed_input_ids(torch.tensor([0, 1]))
+
+        torch.testing.assert_close(embeddings, torch.full((2, 4), 2.0))
+
+
+class _AddOneDecoderLayer(torch.nn.Module):
+    def forward(self, positions, hidden_states, forward_batch, residual=None, **kwargs):
+        hidden_states = hidden_states + 1
+        return hidden_states, hidden_states
+
+
+class TestPlamo3Eagle3(CustomTestCase):
+    @staticmethod
+    def _make_target(*, is_last_rank: bool = True, num_layers: int = 12):
+        return SimpleNamespace(
+            config=Plamo3Config(num_hidden_layers=num_layers),
+            model=SimpleNamespace(
+                pp_group=SimpleNamespace(is_last_rank=is_last_rank),
+                layers_to_capture=[],
+            ),
+            capture_aux_hidden_states=False,
+        )
+
+    def test_default_eagle3_capture_layers(self):
+        target = self._make_target(num_layers=12)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target)
+
+        self.assertTrue(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [2, 6, 9])
+
+    def test_explicit_eagle3_capture_layers_use_output_indices(self):
+        target = self._make_target(num_layers=12)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target, [0, 4, 11])
+
+        self.assertTrue(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [1, 5, 12])
+
+    def test_non_last_pp_rank_does_not_capture(self):
+        target = self._make_target(is_last_rank=False)
+
+        Plamo3ForCausalLM.set_eagle3_layers_to_capture(target)
+
+        self.assertFalse(target.capture_aux_hidden_states)
+        self.assertEqual(target.model.layers_to_capture, [])
+
+    def test_decoder_returns_requested_hidden_states(self):
+        decoder = Plamo3Decoder.__new__(Plamo3Decoder)
+        torch.nn.Module.__init__(decoder)
+        decoder.layers = torch.nn.ModuleList([_AddOneDecoderLayer() for _ in range(4)])
+        decoder.start_layer = 0
+        decoder.end_layer = 4
+
+        hidden_states, residual, aux_hidden_states = decoder(
+            positions=torch.empty(0),
+            hidden_states=torch.zeros(1, 2),
+            forward_batch=None,
+            layers_to_capture={1, 3, 4},
+        )
+
+        torch.testing.assert_close(hidden_states, torch.full((1, 2), 4.0))
+        torch.testing.assert_close(residual, hidden_states)
+        self.assertEqual(len(aux_hidden_states), 3)
+        for actual, expected in zip(aux_hidden_states, (1.0, 3.0, 4.0)):
+            torch.testing.assert_close(actual, torch.full((1, 2), expected))
+
+
+if __name__ == "__main__":
+    unittest.main()
