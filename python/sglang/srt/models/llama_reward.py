@@ -58,9 +58,9 @@ class LlamaForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "LlamaForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
@@ -74,7 +74,7 @@ class LlamaForSequenceClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        return LlamaForCausalLM.load_weights(self, weights)
+        return LlamaForCausalLM._legacy_load_weights(self, weights)
 
 
 class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassification):
@@ -110,9 +110,9 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "LlamaForSequenceClassification is only used for embedding"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)
         weights = self.weights(hidden_states)

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
@@ -21,7 +22,6 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -235,9 +235,9 @@ class FourierRotaryEmbedding(nn.Module):
                 / self.rotary_dim
             )
         )
-        assert (
-            inv_freq[:-1] > inv_freq[1:]
-        ).all(), "Expected inv_freq to be in decreasing order"
+        assert (inv_freq[:-1] > inv_freq[1:]).all(), (
+            "Expected inv_freq to be in decreasing order"
+        )
         inv_freq_idx_selected = torch.ones_like(inv_freq, dtype=torch.bool)
         if self.num_inv_freq is not None:
             inv_freq_idx_selected[self.num_inv_freq :] = False
@@ -302,9 +302,9 @@ class FourierRotaryEmbedding(nn.Module):
             dtype=query.dtype
         )
         cos, sin = cos_sin.chunk(2, dim=-1)
-        assert (
-            query.dim() == key.dim() == 3
-        ), "Expected query key (seq_len, heads, head_dim)"
+        assert query.dim() == key.dim() == 3, (
+            "Expected query key (seq_len, heads, head_dim)"
+        )
         assert cos.dim() <= 3 and sin.dim() <= 3
         need_reshape = False
         if cos.dim() == 3:
@@ -535,7 +535,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -581,7 +580,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 class Llama4VisionRotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -675,7 +673,7 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         return cache
 
 
-class DualChunkRotaryEmbedding(MultiPlatformOp):
+class DualChunkRotaryEmbedding(BaseFusedOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(
@@ -752,6 +750,11 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
             (q_inter_freqs.cos(), q_inter_freqs.sin()), dim=-1
         ).to(dtype=self.dtype, device=self.device)
         return q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache
+
+    def forward_native(self, *args, **kwargs):
+        # This op overrides forward() directly; there is no separate
+        # pure-torch reference path.
+        raise NotImplementedError("DualChunkRotaryEmbedding has no native path")
 
     def forward(
         self,

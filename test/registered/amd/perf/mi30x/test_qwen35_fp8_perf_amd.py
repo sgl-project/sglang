@@ -24,7 +24,7 @@ register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-qwen35-fp8", nightly=Tr
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -56,7 +56,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 QWEN35_FP8_MODEL_PATH = os.environ.get(
     "QWEN35_FP8_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B-FP8"
 )
-PROFILE_DIR = "performance_profiles_qwen35_fp8"
+RESULT_DIR = "performance_results_qwen35_fp8"
 
 
 class TestNightlyQwen35Fp8Performance(unittest.TestCase):
@@ -94,8 +94,8 @@ class TestNightlyQwen35Fp8Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_qwen35_fp8(self):
@@ -114,7 +114,6 @@ class TestNightlyQwen35Fp8Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

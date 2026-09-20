@@ -343,7 +343,7 @@ def run_evaluation(args):
         print("\n" + "=" * 20 + " Sample Predictions " + "=" * 20)
         num_to_show = min(args.print_n, len(results))
         for i in range(num_to_show):
-            print(f"Sample {i+1}:")
+            print(f"Sample {i + 1}:")
             print(f"  REF: {references[i]}")
             print(f"  PRED: {predictions[i]}")
             print("-" * 40)

@@ -8,12 +8,12 @@ import pybase64
 import requests
 from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # image
@@ -60,7 +60,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def get_vision_request_kwargs(self):
         return self.get_request_kwargs()
@@ -95,9 +95,9 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
             "art",
         ]
         for check_word in check_list:
-            assert (
-                check_word in text.lower()
-            ), f"audio_response: ｜{text}｜ should contain ｜{check_word}｜"
+            assert check_word in text.lower(), (
+                f"audio_response: ｜{text}｜ should contain ｜{check_word}｜"
+            )
 
     def prepare_audio_messages(self, prompt, audio_file_name):
         messages = [
@@ -215,15 +215,79 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
 
+    def test_image_prefix_cache_reuse(self):
+        """Image prefix (radix) cache correctness across requests.
+
+        Repeating an identical image must reuse the multimodal prefix without
+        changing the output, and a different image must NOT reuse the first
+        image's KV. This guards against image-token pad_value / feature-hash
+        regressions that would silently serve a cached *wrong* image's KV
+        (a correctness bug invisible to single-request tests). Pure greedy
+        request-level checks: no extra server flags, radix cache is on by
+        default.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        def describe(url: str) -> str:
+            response = client.chat.completions.create(
+                model="default",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": url}},
+                            {
+                                "type": "text",
+                                "text": "Describe this image in one sentence.",
+                            },
+                        ],
+                    },
+                ],
+                temperature=0,
+                max_tokens=32,
+                **(self.get_vision_request_kwargs()),
+            )
+            assert response.usage.prompt_tokens > 0
+            content = response.choices[0].message.content
+            assert isinstance(content, str) and content
+            return content
+
+        # miss -> compute, then hit -> reuse the identical image's prefix
+        first = describe(IMAGE_MAN_IRONING_URL)
+        repeat = describe(IMAGE_MAN_IRONING_URL)
+        # a different image must be computed on its own, not reuse `first`'s KV
+        other = describe(IMAGE_SGL_LOGO_URL)
+        # the original image again, after a different one occupied the cache
+        first_again = describe(IMAGE_MAN_IRONING_URL)
+
+        self.assertEqual(
+            first,
+            repeat,
+            "Repeating an identical image changed the output; image prefix "
+            "reuse broke greedy determinism.",
+        )
+        self.assertEqual(
+            first,
+            first_again,
+            "The identical image after a different one changed the output; "
+            "image KV was cross-contaminated across requests.",
+        )
+        self.assertNotEqual(
+            first,
+            other,
+            "A different image produced an identical description; a wrong "
+            "image's KV may have been reused from the prefix cache.",
+        )
+
     def verify_single_image_response(self, response):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
 
         # `driver` is for gemma-3-it
-        assert (
-            "man" in text or "person" or "driver" in text
-        ), f"text: {text}, should contain man, person or driver"
+        assert any(keyword in text for keyword in ("man", "person", "driver")), (
+            f"text: {text}, should contain man, person or driver"
+        )
         assert (
             "cab" in text
             or "taxi" in text
@@ -313,9 +377,9 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert (
-            "man" in text or "cab" in text
-        ), f"text: {text}, should contain man or cab"
+        assert "man" in text or "cab" in text, (
+            f"text: {text}, should contain man or cab"
+        )
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -365,9 +429,9 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "taxi" in text
             or "car" in text
         ), f"text: {text}, should contain man, cab, SUV, taxi or car"
-        assert (
-            "logo" in text or '"S"' in text or "SG" in text or "graphic" in text
-        ), f"text: {text}, should contain logo, S or SG or graphic"
+        assert "logo" in text or '"S"' in text or "SG" in text or "graphic" in text, (
+            f"text: {text}, should contain logo, S or SG or graphic"
+        )
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -530,16 +594,20 @@ class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "speaker" in video_response
             or "presenter" in video_response
             or "hand" in video_response
-        ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response or 'presenter' or 'hand' in video_response"
+        ), (
+            f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response or 'presenter' or 'hand' in video_response"
+        )
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
             or "hold" in video_response
-        ), f"video_response: {video_response}, should contain 'present', 'examine', 'display', or 'hold'"
-        assert (
-            "black" in video_response or "dark" in video_response
-        ), f"video_response: {video_response}, should contain 'black' or 'dark'"
+        ), (
+            f"video_response: {video_response}, should contain 'present', 'examine', 'display', or 'hold'"
+        )
+        assert "black" in video_response or "dark" in video_response, (
+            f"video_response: {video_response}, should contain 'black' or 'dark'"
+        )
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 

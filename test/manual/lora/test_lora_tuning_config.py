@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.lora.triton_ops.lora_tuning_config import (
+from sglang.kernels.ops.gemm.lora_tuning_config import (
     DEFAULT_EXPAND_CONFIG,
     DEFAULT_SHRINK_CONFIG,
     get_lora_config_file_name,
@@ -15,7 +15,7 @@ from sglang.srt.lora.triton_ops.lora_tuning_config import (
     get_lora_shrink_config,
 )
 
-_MODULE = "sglang.srt.lora.triton_ops.lora_tuning_config"
+_MODULE = "sglang.kernels.ops.gemm.lora_tuning_config"
 
 # Shared fixture
 _TUNED_CONFIGS = {
@@ -88,7 +88,7 @@ class TestConfigSelection(unittest.TestCase):
 
     def setUp(self):
         get_lora_configs.cache_clear()
-        from sglang.srt.lora.triton_ops import lora_tuning_config
+        from sglang.kernels.ops.gemm import lora_tuning_config
 
         lora_tuning_config._logged_configs.clear()
 
