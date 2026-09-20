@@ -335,7 +335,7 @@ class SchedulerDllmMixin:
         """
         running_bs = len(running_batch.reqs)
         new_slots_needed = sum(
-            1 for req in adder.can_run_list if req.req_pool_idx is None
+            1 for req in adder.can_run_list if req.kv.req_pool_idx is None
         )
         admission_budget = min(
             self.get_num_allocatable_reqs(running_bs + len(adder.can_run_list)),
