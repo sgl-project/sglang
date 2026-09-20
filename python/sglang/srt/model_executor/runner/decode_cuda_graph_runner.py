@@ -115,10 +115,14 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_capture_token_buckets,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_cuda_graph_batch_size_alignment,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -521,9 +525,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
-        assert buckets and buckets[0] > 0, f"{buckets=}"
-        return buckets
+        return build_ragged_capture_token_buckets(
+            request_buckets=get_exec().graph.cuda_graph_config.decode.bs,
+            max_num_requests=self.max_bs,
+            num_tokens_per_req=self.captured_req_width,
+            token_alignment=get_cuda_graph_batch_size_alignment(),
+        )
+
+    def _capture_shape_keys(self) -> list[int]:
+        return (
+            self.capture_num_tokens
+            if self.capture_num_tokens is not None
+            else self.capture_bs
+        )
+
+    def _capture_shape_geometry(self, shape_key: int) -> tuple[int, int]:
+        if self.ragged_verify_mode:
+            return self._ragged_capture_slots(shape_key), shape_key
+        return shape_key, shape_key * self.captured_req_width
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -777,7 +796,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             os.makedirs(trace_dir, exist_ok=True)
 
             # Track which BS is currently being captured for trace file naming
-            self._profile_bs_list = list(reversed(self.capture_bs))
+            self._profile_bs_list = list(reversed(self._capture_shape_keys()))
             self._profile_bs_idx = 0
 
             def on_trace_ready(prof):
@@ -1075,9 +1094,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Reverse so cuda graphs share memory better.
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(self._capture_shape_keys())))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(self._capture_shape_keys())
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
@@ -1088,7 +1107,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
-        for bs in capture_range:
+        for shape_key in capture_range:
+            bs, num_tokens = self._capture_shape_geometry(shape_key)
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -1096,7 +1116,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({bs=} {num_tokens=} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -1106,11 +1126,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
+                        num_tokens=num_tokens,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
                         self.capture_one_shape(
-                            bs,
+                            shape_key,
                             forward,
                             stream_idx,
                             variant_label,
@@ -1126,8 +1146,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
-        bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
+        bs, num_tokens = self._capture_shape_geometry(size)
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:

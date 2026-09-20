@@ -4,7 +4,9 @@ import torch
 
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
+    build_ragged_capture_token_buckets,
     build_ragged_target_verify_geometry,
+    round_up_grid,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -126,6 +128,52 @@ class TestCaptureVerifyLens(CustomTestCase):
             build_capture_verify_lens(num_tokens=64, num_slots=4, num_draft_tokens=8)
         with self.assertRaises(ValueError):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
+
+
+class TestRaggedCaptureTokenBuckets(CustomTestCase):
+    _REQUEST_BUCKETS = list(range(1, 9)) + list(range(10, 33, 2))
+
+    def test_cp8_width7_captures_small_runtime_keys(self):
+        buckets = build_ragged_capture_token_buckets(
+            request_buckets=self._REQUEST_BUCKETS,
+            max_num_requests=32,
+            num_tokens_per_req=7,
+            token_alignment=8,
+        )
+
+        self.assertEqual(buckets[0], 8)
+        self.assertEqual(buckets[-1], 224)
+        self.assertIn(40, buckets)
+        self.assertEqual(round_up_grid(7, buckets), 8)
+        self.assertEqual(round_up_grid(35, buckets), 40)
+
+    def test_every_runtime_key_has_enough_captured_slots(self):
+        max_num_requests = 32
+        width = 7
+        buckets = build_ragged_capture_token_buckets(
+            request_buckets=self._REQUEST_BUCKETS,
+            max_num_requests=max_num_requests,
+            num_tokens_per_req=width,
+            token_alignment=8,
+        )
+
+        for bs in range(1, max_num_requests + 1):
+            for total_tokens in range(bs, bs * width + 1):
+                key = round_up_grid(total_tokens, buckets)
+                capture_slots = min(key, max_num_requests)
+                self.assertIn(key, buckets)
+                self.assertGreaterEqual(capture_slots, bs)
+                self.assertLessEqual(key, capture_slots * width)
+
+    def test_unaligned_mode_preserves_request_derived_tiers(self):
+        buckets = build_ragged_capture_token_buckets(
+            request_buckets=[1, 2, 4, 8],
+            max_num_requests=8,
+            num_tokens_per_req=7,
+            token_alignment=1,
+        )
+
+        self.assertEqual(buckets, [7, 14, 28, 56])
 
 
 if __name__ == "__main__":

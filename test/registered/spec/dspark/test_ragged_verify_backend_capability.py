@@ -39,5 +39,39 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
                 self.assertTrue(backend.supports_ragged_verify_graph)
 
 
+class TestRaggedVerifyCaptureGeometry(CustomTestCase):
+    def test_capture_iterates_token_keys_without_width_multiplication(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.capture_num_tokens = [8, 16, 40, 224]
+        runner.capture_bs = [8, 16, 24, 32]
+        runner.max_bs = 32
+        runner.captured_req_width = 7
+
+        self.assertEqual(runner._capture_shape_keys(), [8, 16, 40, 224])
+        self.assertEqual(runner._capture_shape_geometry(8), (8, 8))
+        self.assertEqual(runner._capture_shape_geometry(40), (32, 40))
+        self.assertEqual(runner._capture_shape_geometry(224), (32, 224))
+
+    def test_static_capture_keeps_request_key_semantics(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.capture_num_tokens = None
+        runner.capture_bs = [8, 16, 24, 32]
+        runner.max_bs = 32
+        runner.captured_req_width = 7
+
+        self.assertEqual(runner._capture_shape_keys(), [8, 16, 24, 32])
+        self.assertEqual(runner._capture_shape_geometry(8), (8, 56))
+
+
 if __name__ == "__main__":
     unittest.main()

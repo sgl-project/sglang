@@ -43,6 +43,55 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
+def build_ragged_capture_token_buckets(
+    *,
+    request_buckets: Sequence[int],
+    max_num_requests: int,
+    num_tokens_per_req: int,
+    token_alignment: int,
+) -> list[int]:
+    """Convert request graph buckets into aligned compact-token buckets.
+
+    Compact verify keys graphs by packed token count, not request count. Build
+    each token tier from the unfiltered request grid so small request batches
+    remain representable even when the uniform ``bs * width`` alignment filter
+    would discard them (for example, width 7 under CP8).
+    """
+    if max_num_requests < 1:
+        raise ValueError(f"max_num_requests must be positive, got {max_num_requests}")
+    if num_tokens_per_req < 1:
+        raise ValueError(
+            f"num_tokens_per_req must be positive, got {num_tokens_per_req}"
+        )
+    if token_alignment < 1:
+        raise ValueError(f"token_alignment must be positive, got {token_alignment}")
+
+    candidates = {int(bs) for bs in request_buckets}
+    if any(bs < 1 for bs in candidates):
+        raise ValueError(f"request buckets must be positive, got {request_buckets}")
+    candidates = {bs for bs in candidates if bs <= max_num_requests}
+    candidates.add(max_num_requests)
+
+    max_num_tokens = max_num_requests * num_tokens_per_req
+    if max_num_tokens % token_alignment != 0:
+        raise ValueError(
+            "the maximum ragged graph shape must satisfy token alignment: "
+            f"{max_num_requests=} * {num_tokens_per_req=} is not divisible by "
+            f"{token_alignment=}"
+        )
+
+    return sorted(
+        {
+            min(
+                ((bs * num_tokens_per_req + token_alignment - 1) // token_alignment)
+                * token_alignment,
+                max_num_tokens,
+            )
+            for bs in candidates
+        }
+    )
+
+
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     verify_lens: torch.Tensor
     graph_num_tokens: int
