@@ -1451,12 +1451,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                if gate_val.numel() == attn_output.numel():
-                    attn_output = npu_fused_sigmoid_mul(
-                        attn_output, gate_val.contiguous()
-                    )
-                else:
-                    attn_output.mul_(torch.sigmoid(gate_val))
+                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
         output, _ = self.o_proj(attn_output)
         return output
