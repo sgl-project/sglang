@@ -18,6 +18,7 @@ class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
+    INSTANTTENSOR = "instanttensor"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
@@ -50,6 +51,8 @@ class LoadConfig:
             not available.
         "pt" will load the weights in the pytorch bin format.
         "safetensors" will load the weights in the safetensors format.
+        "instanttensor" will load Safetensors weights using InstantTensor's
+            high-performance distributed loader.
         "npcache" will load the weights in pytorch format and store
             a numpy cache to speed up the loading.
         "dummy" will initialize the weights with random values, which is
