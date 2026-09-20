@@ -445,7 +445,7 @@ class ModelRunner:
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
-        set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
+        set_offloader(create_offloader(dp_rank=get_parallel().dp_rank))
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
@@ -481,7 +481,7 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-        if self.ps.pp_size > 1:
+        if get_parallel().pp_size > 1:
             if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
                 assert self.support_pp, (
                     "Pipeline Parallel is not compatible with this model."
@@ -647,8 +647,8 @@ class ModelRunner:
             from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
 
             init_ms_distributed(
-                world_size=self.ps.tp_size * self.ps.pp_size,
-                rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                world_size=self.ps.tp_size * get_parallel().pp_size,
+                rank=self.ps.tp_size * get_parallel().pp_rank + self.ps.tp_rank,
                 local_rank=self.gpu_id,
                 port=self.dist_port,
             )
@@ -667,8 +667,8 @@ class ModelRunner:
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
-            moe_ep_size=self.ps.moe_ep_size,
-            moe_ep_rank=self.ps.moe_ep_rank,
+            moe_ep_size=get_parallel().moe_ep_size,
+            moe_ep_rank=get_parallel().moe_ep_rank,
         )
 
         self.maybe_init_dwdp()
@@ -683,7 +683,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,
@@ -708,7 +707,7 @@ class ModelRunner:
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
             return
-        expert_rank = self.ps.moe_ep_rank + (
+        expert_rank = get_parallel().moe_ep_rank + (
             get_parallel().ep_join_rank_offset
             if get_exec().moe.is_ep_scale_joiner
             else 0
@@ -767,8 +766,8 @@ class ModelRunner:
         self.expert_backup_client = (
             ExpertBackupClient(
                 model_config=self.model_config,
-                moe_ep_size=self.ps.moe_ep_size,
-                moe_ep_rank=self.ps.moe_ep_rank,
+                moe_ep_size=get_parallel().moe_ep_size,
+                moe_ep_rank=get_parallel().moe_ep_rank,
                 get_model=lambda: self.model,
             )
             if (
@@ -803,16 +802,16 @@ class ModelRunner:
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
-            pp_size=self.ps.pp_size,
-            pp_rank=self.ps.pp_rank,
+            pp_size=get_parallel().pp_size,
+            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
-            pp_size=self.ps.pp_size,
-            pp_rank=self.ps.pp_rank,
+            pp_size=get_parallel().pp_size,
+            pp_rank=get_parallel().pp_rank,
             start_layer=self.layer_info.start_layer,
         )
 
@@ -891,6 +890,14 @@ class ModelRunner:
             page_size=self.page_size or 1,
             device=self.device,
         )
+
+    def max_shared_logits_buffer_rows(self) -> int:
+        """Maximum rows in the persistent logits buffer used by graph runners.
+
+        This includes outputs produced inside a graph as well as eager logits
+        tails that reuse the runner-owned buffer after graph replay.
+        """
+        return self.max_decode_logits_rows()
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -972,7 +979,7 @@ class ModelRunner:
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
-                pp_size=self.ps.pp_size,
+                pp_size=get_parallel().pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
@@ -1149,8 +1156,8 @@ class ModelRunner:
         check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=self.ps.tp_size,
-            moe_ep_size=self.ps.moe_ep_size,
-            moe_dp_size=self.ps.moe_dp_size,
+            moe_ep_size=get_parallel().moe_ep_size,
+            moe_dp_size=get_parallel().moe_dp_size,
         )
 
     def init_torch_distributed(self):
@@ -1285,7 +1292,7 @@ class ModelRunner:
             is_draft_worker=self.is_draft_worker,
             tp_size=self.ps.tp_size,
             tp_rank=self.ps.tp_rank,
-            pp_rank=self.ps.pp_rank,
+            pp_rank=get_parallel().pp_rank,
         )
 
         if dumper.may_enable:
@@ -1572,7 +1579,7 @@ class ModelRunner:
         dp_size = 1 if get_parallel().enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             numa_index=self.gpu_id,
-            world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
+            world_size=dp_size * self.ps.tp_size * get_parallel().pp_size,
         )
 
     def apply_torch_tp(self):

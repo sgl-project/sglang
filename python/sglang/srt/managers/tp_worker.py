@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -388,8 +387,8 @@ class TpModelWorker(BaseTpWorker):
         self.device = self.model_runner.device
 
         # Init nccl groups
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        self.pp_group = get_parallel().pp_group
+        self.world_group = get_parallel().world_group
 
         # Sync random seed across TP workers.
         # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
@@ -419,7 +418,7 @@ class TpModelWorker(BaseTpWorker):
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.ps.tp_size * get_parallel().pp_rank + self.ps.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -452,7 +451,8 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            self.model_runner.effective_max_total_num_tokens
+            * get_parallel().attn_dcp_size
             - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
@@ -579,7 +579,8 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            self.model_runner.effective_max_total_num_tokens
+            * get_parallel().attn_dcp_size
             - 1,
         )
         return (
