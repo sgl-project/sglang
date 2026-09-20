@@ -68,6 +68,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -78,6 +79,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -126,17 +128,8 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
-        # Refused only once there is something to record. A pass that declares
-        # nothing is a validation, and `check_server_args` runs those again on
-        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
-        # back the same instance while the context still holds it, and
-        # refusing on identity alone would fail that launch.
-        # Only a non-empty return is a declaration. An empty one is a
-        # validation and may run on the published instance -- see above -- so it
-        # must not reach the guard in `declare_resolution`.
-        if declared:
-            declare_resolution(server_args, fn.__qualname__, **declared)
-            validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
+        declare_resolution(server_args, fn.__qualname__, **declared)
+        validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -145,8 +138,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     The stash *is* the resolution result: the bags are projected from it,
     `resolution_result` answers from it, and no field is written. A resolver
     reading a field another resolver may have decided must read `resolving_view`
-    (or `resolved_view(server_args)`), which
-    `test_resolution_reads_the_declarations` pins.
+    (or `resolved_view(server_args)`).
 
     Every declaration goes through here, whenever it is made: inside
     ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
@@ -443,6 +435,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -484,6 +477,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
@@ -494,6 +488,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
@@ -1016,7 +1014,17 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = model_config_of(view).hf_config.architectures[0]
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and get_platform().is_blackwell
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1034,6 +1042,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
@@ -1425,6 +1434,32 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    if view.dcp_comm_backend is not None:
+        return {}
+    if view.dcp_size <= 1:
+        return {"dcp_comm_backend": "ag_rs"}
+    platform = get_platform()
+    if is_fi_a2a_supported(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    ):
+        backend = "fi_a2a"
+    elif platform.is_cuda or platform.is_hip:
+        backend = "a2a"
+    else:
+        backend = "ag_rs"
+    logger.info(
+        "DCP (dcp_size=%d) selects communication backend %r.",
+        view.dcp_size,
+        backend,
+    )
+    return {"dcp_comm_backend": backend}
+
+
+@register_post_process
 def _tp_lm_head_all_to_all_default(view: Any) -> dict:
     """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
 
@@ -1780,6 +1815,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
+    # Unified arenas are fully backed before capture and cannot resize afterward.
+    if cfg.enable_unified_memory:
+        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:
@@ -1846,7 +1884,10 @@ def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
+
+    Records with a registered ceiling provider (see
+    ``register_prefill_buffer_ceiling``) answer through it."""
     cfg = resolving_view(server_args)
     chunked = (
         cfg.chunked_prefill_size
@@ -1856,7 +1897,10 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     tokens = chunked
     if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
         tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
-    return tokens
+    record = server_args
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        record = record_of(server_args)
+    return prefill_buffer_ceiling_of(record, tokens)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch_npu
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
@@ -76,6 +77,11 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             kv_dtype = torch.bfloat16
         self.kv_cache_total_dim = kv_dim
+        # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
+        # For example: kernel_page_size * kv_dim * sizeof(bf16).
+        self.bytes_per_page_padded = (
+            self.kernel_page_size * kv_dim * torch.bfloat16.itemsize
+        )
         # Writes are flat-indexed by loc; kernel_page_size controls the physical
         # page layout exposed to the NPU operators.
         npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
@@ -113,6 +119,7 @@ class NPUCompressStatePool(CompressStatePool):
         enable_memory_saver: bool,
         ratio: int,
         ring_size: int,
+        request_scoped: bool,
         swa_page_size: int,
     ):
         assert ratio in (
@@ -134,6 +141,7 @@ class NPUCompressStatePool(CompressStatePool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             online=False,
+            request_scoped=request_scoped,
             swa_page_size=swa_page_size,
             state_cache_page_size=ring_size,
         )
@@ -284,6 +292,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         enable_memory_saver: bool,
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
+        kv_layout: KVLayout = KVLayout.V4,
     ) -> NPUDeepSeekV4SingleKVPool:
         # NPU does not use the HiSparse c4 device pool; fail loud if someone
         # enables it so the silent layout mismatch surfaces at init.
@@ -291,6 +300,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "enable_hisparse is not supported on the NPU DSV4 KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
+        # The V4.1 fp8 / fp4 page layouts are CUDA FlashMLA formats.
+        assert kv_layout is KVLayout.V4, f"NPU pools do not support {kv_layout}"
         # Full/SWA use the global page size, C4 uses its native compressed page,
         # and C128 has an independent physical page size.
         is_c4_pool = page_size * 4 == global_page_size
@@ -347,6 +358,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
+            request_scoped=ratio == 128,
             swa_page_size=self.swa_page_size,
         )
 
@@ -374,6 +386,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """Main PD buffers addressed by the full KV page id."""
+        if self.c4_kv_pool is None:
+            # A draft pool whose layers are all uncompressed has no c4 buffers.
+            return [], [], []
         indexer_pool = self._indexer_pool(4)
         buffers = (
             self.c4_kv_pool.kv_buffer
@@ -464,10 +479,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # ------------------------------------------------------------------
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         ratio = item.compress_ratio
         if ratio == 0:
-            return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+            return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if ratio == 4:
             return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
         if ratio == 128:
@@ -490,9 +506,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         flatten across (num_pages, page_size) and gather the matching tokens —
         shape becomes (num_tokens, 1, dim).
         """
-        # Index by RAW layer_id, not compress_layer_id (a per-bucket counter that
-        # would collide across ratios). swa_kv_pool is sized layer_num=total_layers.
-        kv = self.swa_kv_pool.kv_buffer[layer_id]
+        self.wait_layer_transfer(layer_id)
+        # Index by PP-stage-local layer_id, not compress_layer_id (a per-bucket
+        # counter that would collide across ratios). swa_kv_pool is sized
+        # layer_num=stage_layer_num (only this PP stage's layers).
+        kv = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
@@ -510,6 +528,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         from_indexer=True branch returns the dedicated quantized K buffer that
         ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
         """
+        self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         if item.compress_ratio == 0:
             return None
@@ -536,8 +555,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         (num_pages, page_size, 1, dim) so we flatten the first two dims and
         index_put.
         """
-        # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
-        buf = self.swa_kv_pool.kv_buffer[layer_id]
+        # Index by PP-stage-local layer_id (see get_swa_buffer).
+        buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if is_npu_arch35():
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return

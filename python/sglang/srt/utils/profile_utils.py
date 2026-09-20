@@ -18,7 +18,7 @@ from sglang.srt.model_executor.step_span_utils import (
     set_detailed_annotations_enabled,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -358,15 +358,15 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
-            filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
+            filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
             # Only add other ranks if parallelism is enabled (size > 1)
             if self.ps.dp_size > 1:
-                filename_parts.append(f"DP-{self.ps.dp_rank}")
-            if self.ps.pp_size > 1:
-                filename_parts.append(f"PP-{self.ps.pp_rank}")
-            if self.ps.moe_ep_size > 1:
-                filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
+                filename_parts.append(f"DP-{get_parallel().dp_rank}")
+            if get_parallel().pp_size > 1:
+                filename_parts.append(f"PP-{get_parallel().pp_rank}")
+            if get_parallel().moe_ep_size > 1:
+                filename_parts.append(f"EP-{get_parallel().moe_ep_rank}")
 
             filename = (
                 (self.output_prefix + "-" if self.output_prefix else "")
@@ -396,7 +396,7 @@ class _ProfilerMemory(_ProfilerConcreteBase):
             self.output_dir,
             (self.output_prefix + "-" if self.output_prefix else "")
             + str(time.time())
-            + f"-TP-{self.ps.tp_rank}-memory"
+            + f"-TP-{get_parallel().tp_rank}-memory"
             + self.output_suffix
             + ".pickle",
         )
@@ -426,10 +426,13 @@ class _ProfilerRPD(_ProfilerConcreteBase):
 
         self.rpd_profile_path = os.path.join(
             self.output_dir,
-            "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
+            "rpd-"
+            + str(time.time())
+            + f"-TP-{get_parallel().tp_rank}"
+            + ".trace.json.gz",
         )
 
-        if self.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             import sqlite3
 
             from rocpd.schema import RocpdSchema
@@ -454,14 +457,17 @@ class _ProfilerRPD(_ProfilerConcreteBase):
         self.rpd_profiler.flush()
 
         torch.distributed.barrier(self.cpu_group)
-        if self.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
 
 
 def build_step_span_name(
-    forward_batch: ForwardBatch, detailed_annotations: bool | None = None
+    forward_batch: ForwardBatch,
+    detailed_annotations: bool | None = None,
+    *,
+    is_draft_worker: bool = False,
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
@@ -469,17 +475,27 @@ def build_step_span_name(
     build_detailed_annotation_suffix) when enabled. detailed_annotations
     defaults to the process-wide toggle (detailed_annotations_enabled, set
     by the profiler manager); pass an explicit bool to override (e.g. in tests).
+
+    The target-verify step is labeled ``VERIFY``; every step a draft model
+    runner emits is labeled ``DRAFT`` (some draft paths borrow the TARGET_VERIFY
+    mode, so the mode name alone cannot tell the two models apart).
     """
     if detailed_annotations is None:
         detailed_annotations = detailed_annotations_enabled()
 
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
+    if is_draft_worker:
+        stage = "DRAFT"
+    elif mode == ForwardMode.TARGET_VERIFY:
+        stage = "VERIFY"
+    else:
+        stage = mode.name
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        base = f"step[EXTEND bs={bs} toks={ext_toks}"
+        base = f"step[{stage} bs={bs} toks={ext_toks}"
     else:
-        base = f"step[{mode.name} bs={bs}"
+        base = f"step[{stage} bs={bs}"
 
     if detailed_annotations:
         suffix = build_detailed_annotation_suffix(forward_batch)

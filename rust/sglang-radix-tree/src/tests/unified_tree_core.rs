@@ -990,13 +990,13 @@ fn split_updates_the_leaf_sets() {
 }
 
 #[test]
-fn split_readmits_aux_lru_cells() {
+fn split_preserves_aux_lru_position() {
     let mut tc = core();
     tc.register_component_(Arc::new(SwaComponentForTest));
     let c = split_setup(&mut tc);
     tc.arena.node_mut(c).values[SWA.idx()].value = Some(Tensor::from_slice(&[0i64]));
     tc.device_lru_list_mut(SWA).insert_mru(c);
-    // A second listed node makes the child's detach-and-readmit observable.
+    // A newer node must stay ahead of the unmatched suffix after the split.
     let root = tc.arena.root();
     let s = tc
         .arena
@@ -1009,10 +1009,10 @@ fn split_readmits_aux_lru_cells() {
         .unwrap();
     tc.device_lru_list_mut(SWA).insert_mru(s);
     let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
-    // The child re-enters the SWA LRU at MRU; the value-less prefix node does not.
+    // The child stays cold; the value-less prefix node does not enter the LRU.
     assert!(tc.device_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.device_lru_list(SWA).in_list(Some(new_node)));
-    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(s));
+    assert_eq!(tc.device_lru_list(SWA).get_lru_where(|_| true), Some(c));
 }
 
 #[test]
@@ -1158,7 +1158,7 @@ fn unevict_restores_the_value_and_the_leaf_sets() {
         .set_device_value(p, FULL, Tensor::from_slice(&[0i64]));
     tc.evictable_device_leaves.add(p);
     let mut fresh = Tensor::from_slice(&[20i64]);
-    tc.unevict_node_on_insert_(c, &fresh);
+    tc.unevict_node_on_insert_(c, &fresh, /* session_id = */ None);
     assert_eq!(tc.evictable_size_(FULL), 1);
     assert!(tc.evictable_device_leaves.contains(c));
     assert!(!tc.evictable_device_leaves.contains(p));
@@ -1187,7 +1187,11 @@ fn unevict_panics_on_a_node_that_still_has_its_value() {
         .unwrap();
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    tc.unevict_node_on_insert_(a, &Tensor::from_slice(&[1i64]));
+    tc.unevict_node_on_insert_(
+        a,
+        &Tensor::from_slice(&[1i64]),
+        /* session_id = */ None,
+    );
 }
 
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
@@ -1289,6 +1293,25 @@ fn match_prefix_splits_on_a_partial_match() {
         tc.arena.node(a).parent(),
         tc.arena.resolve(prefix_node).expect("live test node")
     );
+}
+
+#[test]
+fn match_full_device_prefix_is_read_only_and_accounts_the_pinned_node() {
+    let mut tc = core();
+    let (a, _b) = matched_chain(&mut tc);
+
+    let (matched_len, node_id, pinned_len) =
+        tc.match_full_device_prefix(&vec![1, 9], KeyNamespaceRef::new(None, None));
+
+    assert_eq!(matched_len, 1);
+    assert_eq!(node_id, tc.arena.node(a).id);
+    assert_eq!(pinned_len, 2);
+    assert_eq!(tc.arena.node(a).key, vec![1, 2]);
+
+    tc.inc_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 1);
+    tc.dec_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 0);
 }
 
 #[test]
@@ -1863,8 +1886,10 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }
@@ -2742,6 +2767,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -2754,11 +2780,37 @@ fn insert_coalesces_parent_linked_block_stores() {
             .hash_value,
         Some(hashes)
     );
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
+fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    let mut params = insert_params(&key, &[10, 11, 12, 13]);
+    params.session_id = Some("session-a");
+    tc.insert(&params);
+
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key,
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+            session_id: Some(Arc::from("session-a")),
+        }]
+    );
+}
+
+#[test]
+fn namespaced_event_hashes_are_sparse_and_removed_with_the_node() {
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
     tc.insert(&insert_params_in_namespace(
@@ -2773,8 +2825,8 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         .match_prefix(&match_params_in_namespace(&key, None, Some("tenant-a")))
         .best_match_node_id;
     let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
-    assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
-    assert_eq!(
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(
         tc.arena.node(leaf_idx).hash_value,
         Some(crate::node::get_hash_str::<Vec<i64>>(&key, None, 2))
     );
@@ -2790,7 +2842,7 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     tc.evict_device_end(FULL);
     tc.take_events();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 
     tc.insert(&insert_params_in_namespace(
         &key,
@@ -2798,13 +2850,49 @@ fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
         None,
         Some("tenant-a"),
     ));
-    assert!(!tc.salted_event_hashes.is_empty());
+    assert!(!tc.namespaced_event_hashes.is_empty());
     tc.reset();
-    assert!(tc.salted_event_hashes.is_empty());
+    assert!(tc.namespaced_event_hashes.is_empty());
 }
 
 #[test]
-fn salted_event_hashes_survive_node_split() {
+fn extra_key_nodes_publish_token_only_event_hashes() {
+    // Events omit extra_key; storage includes it.
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[10, 11, 12, 13],
+        Some("lora-a"),
+        None,
+    ));
+    let token_only = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: token_only
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key.clone(),
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+            cache_salt: None,
+            session_id: None,
+        }]
+    );
+
+    let leaf = tc
+        .match_prefix(&match_params_in_namespace(&key, Some("lora-a"), None))
+        .best_match_node_id;
+    let leaf_idx = tc.arena.resolve(leaf).expect("live test node");
+    assert_eq!(tc.namespaced_event_hashes[&leaf].len(), 2);
+    assert_ne!(tc.arena.node(leaf_idx).hash_value, Some(token_only));
+}
+
+#[test]
+fn namespaced_event_hashes_survive_node_split() {
     let mut tc = events_core(2);
     let original = vec![1, 2, 3, 4];
     tc.insert(&insert_params_in_namespace(
@@ -2820,7 +2908,7 @@ fn salted_event_hashes_survive_node_split() {
             Some("tenant-a"),
         ))
         .best_match_node_id;
-    let original_hashes = tc.salted_event_hashes[&original_leaf].clone();
+    let original_hashes = tc.namespaced_event_hashes[&original_leaf].clone();
     tc.take_events();
 
     let branch = vec![1, 2, 5, 6];
@@ -2844,8 +2932,14 @@ fn salted_event_hashes_survive_node_split() {
         .node(tc.arena.resolve(split_child).expect("live test node"))
         .parent();
     let split_parent = tc.arena.node(split_parent_idx).id;
-    assert_eq!(tc.salted_event_hashes[&split_parent], original_hashes[..1]);
-    assert_eq!(tc.salted_event_hashes[&split_child], original_hashes[1..]);
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_parent],
+        original_hashes[..1]
+    );
+    assert_eq!(
+        tc.namespaced_event_hashes[&split_child],
+        original_hashes[1..]
+    );
 }
 
 #[test]
@@ -2863,9 +2957,9 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
             )
             .unwrap();
     }
-    assert!(tc.salted_event_hashes.is_empty());
-    tc.ensure_salted_event_hashes_(parent);
-    assert_eq!(tc.salted_event_hashes.len(), 1100);
+    assert!(tc.namespaced_event_hashes.is_empty());
+    tc.ensure_namespaced_event_hashes_(parent);
+    assert_eq!(tc.namespaced_event_hashes.len(), 1100);
 }
 
 #[test]
@@ -2878,6 +2972,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -2888,6 +2983,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Gpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -2898,6 +2994,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -2908,6 +3005,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 1,
         medium: StorageMedium::Cpu,
         cache_salt: None,
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -2950,6 +3048,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
+        session_id: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -2958,6 +3057,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         block_size: 2,
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
+        session_id: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
 }
@@ -3010,8 +3110,10 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
     let hashes = crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, None, 1);
@@ -3027,6 +3129,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3050,6 +3153,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3105,6 +3209,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3124,6 +3229,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             block_size: 1,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
 }
@@ -3212,6 +3318,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             block_size: 2,
             medium: StorageMedium::Gpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -3293,6 +3400,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             block_size: 2,
             medium: StorageMedium::Cpu,
             cache_salt: None,
+            session_id: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -3589,6 +3697,41 @@ fn insert_host_attaches_a_host_only_leaf_under_the_root() {
             .contains(tc.arena.resolve(new_node).expect("live test node"))
     );
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn insert_host_publishes_a_host_store_event() {
+    // A storage-prefetch refill has no write-through ack to publish it.
+    let mut tc = events_core(2);
+    let root = tc.arena.root();
+    let key = vec![1i64, 2, 7, 8];
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&key, None, 2);
+    let result = tc
+        .insert_host(
+            tc.arena.node(root).id,
+            /* extra_key = */ None,
+            key.clone(),
+            Tensor::from_slice(&[100i64, 101, 102, 103]),
+            hashes.clone(),
+        )
+        .expect("live test node");
+    assert!(!result.host_insert_dropped);
+    assert!(result.inserted_host_node.is_some());
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: key,
+            block_size: 2,
+            medium: StorageMedium::Cpu,
+            cache_salt: None,
+            session_id: None,
+        }]
+    );
 }
 
 #[test]
@@ -4222,6 +4365,7 @@ fn fallible_node_boundaries_reject_stale_handles() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
@@ -7676,33 +7820,6 @@ fn sanity_check_reports_a_cyclic_child_map_without_hanging() {
     tc.sanity_check(&[], &[]);
 }
 
-#[test]
-#[should_panic(expected = "host LRU mismatch")]
-fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
-    let mut tc = sane_tree();
-    let leaf = tc
-        .match_prefix(&match_params(&vec![1, 2, 9]))
-        .best_match_node_id;
-    let parent = tc
-        .arena
-        .node(tc.arena.resolve(leaf).expect("live test node"))
-        .parent();
-    tc.register_component_(Arc::new(SwaComponentForTest));
-    // The arena was built Full-only; give the root the stub's lock too.
-    tc.arena.node_mut(tc.arena.root()).values[SWA.idx()].lock_ref = 1;
-    tc.arena
-        .node_mut(parent)
-        .state_mut_(ValueSlotIdx::host(FULL))
-        .value = Some(Tensor::from_slice(&[10i64, 11]));
-    let leaf_node = tc
-        .arena
-        .node_mut(tc.arena.resolve(leaf).expect("live test node"));
-    leaf_node.state_mut_(ValueSlotIdx::host(FULL)).value = Some(Tensor::from_slice(&[30i64]));
-    leaf_node.state_mut_(ValueSlotIdx::host(SWA)).value = Some(Tensor::from_slice(&[30i64]));
-    leaf_node.state_mut_(ValueSlotIdx::host(SWA)).lock_ref = 1;
-    tc.sanity_check(&[], &[]);
-}
-
 // A backed-up leaf whose unlocked Swa value is host-only (no device value).
 fn host_only_aux_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let leaf = tc
@@ -7743,6 +7860,17 @@ fn sanity_check_accepts_an_unlocked_host_only_value_in_the_lru() {
 fn sanity_check_detects_a_host_only_value_missing_from_the_lru() {
     let mut tc = sane_tree();
     host_only_aux_leaf(&mut tc);
+    tc.sanity_check(&[], &[]);
+}
+
+// A host lock delists its node: missing from the LRU is the in-flight state.
+#[test]
+fn sanity_check_accepts_a_host_locked_value_missing_from_the_lru() {
+    let mut tc = sane_tree();
+    let leaf = host_only_aux_leaf(&mut tc);
+    tc.arena
+        .node_mut(leaf)
+        .set_lock_ref_(ValueSlotIdx::host(SWA), 1);
     tc.sanity_check(&[], &[]);
 }
 
@@ -8357,8 +8485,10 @@ fn sequence_insert_params<'k>(
         mamba_value,
         prev_prefix_len,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }

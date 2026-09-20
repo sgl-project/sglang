@@ -35,11 +35,6 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.kernels.ops.attention.dsa_metadata import (
-    fused_dsa_decode_metadata,
-    fused_dsa_draft_extend_metadata,
-    fused_dsa_target_verify_metadata,
-)
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -50,8 +45,6 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
-    get_dsa_index_topk,
-    is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -65,6 +58,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
+    DSAMetadataManagementMixin,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -88,7 +84,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
@@ -301,6 +296,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
 
 
 class DeepseekSparseAttnBackend(
+    DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     AttentionBackend,
@@ -339,6 +335,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
+        self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -1523,8 +1520,10 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
-                fused_dsa_decode_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_decode_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1563,7 +1562,9 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
@@ -1576,7 +1577,7 @@ class DeepseekSparseAttnBackend(
                 ):
                     paged_mqa_ctx_lens_2d = metadata.paged_mqa_ctx_lens_2d
 
-                fused_dsa_target_verify_metadata(
+                self._fused_verify_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1659,8 +1660,10 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1:
-                fused_dsa_draft_extend_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
                     req_pool_indices=req_pool_indices,
@@ -1811,125 +1814,7 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        # Track whether fused kernel succeeded
-        fused_kernel_succeeded = False
-
-        # Use fused CUDA kernel for all copy operations
-        if not _is_hip:
-            try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
-                    fused_metadata_copy_cuda,
-                )
-
-                # Map forward_mode to integer enum
-                if forward_mode.is_decode_or_idle():
-                    mode_int = 0  # DECODE
-                elif forward_mode.is_target_verify():
-                    mode_int = 1  # TARGET_VERIFY
-                else:
-                    raise ValueError(f"Unsupported forward_mode: {forward_mode}")
-
-                # Prepare FlashMLA tensors if needed
-                flashmla_num_splits_src = None
-                flashmla_num_splits_dst = None
-                flashmla_metadata_src = None
-                flashmla_metadata_dst = None
-                if precomputed.flashmla_metadata is not None:
-                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
-                    flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
-                    flashmla_metadata_src = (
-                        precomputed.flashmla_metadata.flashmla_metadata
-                    )
-                    flashmla_metadata_dst = metadata.flashmla_metadata.flashmla_metadata
-
-                # Call fused kernel
-                fused_metadata_copy_cuda(
-                    # Source tensors
-                    precomputed.cache_seqlens,
-                    precomputed.cu_seqlens_k,
-                    precomputed.page_indices,
-                    precomputed.dsa_cache_seqlens,
-                    precomputed.seqlens_expanded,
-                    precomputed.dsa_cu_seqlens_k,
-                    precomputed.real_page_table,
-                    flashmla_num_splits_src,
-                    flashmla_metadata_src,
-                    # Destination tensors
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table_1,
-                    metadata.dsa_cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded,
-                    metadata.dsa_cu_seqlens_k,
-                    (
-                        metadata.real_page_table
-                        if precomputed.real_page_table is not None
-                        else None
-                    ),
-                    flashmla_num_splits_dst,
-                    flashmla_metadata_dst,
-                    # Parameters
-                    mode_int,
-                    bs,
-                    precomputed.max_len,
-                    precomputed.max_seqlen_k,
-                    precomputed.seqlens_expanded_size,
-                )
-
-                # Successfully used fused kernel
-                fused_kernel_succeeded = True
-
-            except ImportError:
-                print(
-                    "Warning: Fused metadata copy kernel not available, falling back to individual copies."
-                )
-            except Exception as e:
-                print(
-                    f"Warning: Fused metadata copy kernel failed with error: {e}, falling back to individual copies."
-                )
-
-        # Fallback to individual copy operations if the fused kernel is unavailable
-        # or fails at runtime.
-        if not fused_kernel_succeeded:
-            # Copy basic seqlens
-            metadata.cache_seqlens_int32.copy_(precomputed.cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(precomputed.cu_seqlens_k[1:])
-
-            # Mode-specific copy logic
-            if forward_mode.is_decode_or_idle():
-                # Decode mode
-                metadata.page_table_1[:, : precomputed.max_len].copy_(
-                    precomputed.page_indices
-                )
-                metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-                # seqlens_expanded is same as cache_seqlens (already copied)
-
-            elif forward_mode.is_target_verify():
-                # Target verify mode
-                metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
-                    precomputed.page_indices
-                )
-                metadata.dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
-                metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-
-            # Copy DSA cu_seqlens
-            size = precomputed.seqlens_expanded_size
-            metadata.dsa_cu_seqlens_k[1 : 1 + size].copy_(
-                precomputed.dsa_cu_seqlens_k[1 : 1 + size]
-            )
-
-            # Copy real page table
-            if precomputed.real_page_table is not None:
-                rows, cols = precomputed.real_page_table.shape
-                metadata.real_page_table[:rows, :cols].copy_(
-                    precomputed.real_page_table
-                )
-
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
+        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
 
         # Refresh the schedule because stale shape decomposition can deadlock
         # DeepGEMM paged MQA.
@@ -3787,6 +3672,20 @@ class DeepseekSparseAttnMultiStepBackend:
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             forward_mode=ForwardMode.DECODE,
         )
+
+        if self.attn_backends[0].experimental_kpool_metadata_fusion:
+            first = self.attn_backends[0]
+            first.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                bs=bs, precomputed=precomputed, forward_mode=ForwardMode.DECODE
+            )
+            for backend in self.attn_backends[1 : self.speculative_num_steps - 1]:
+                backend._copy_replay_metadata_from_sibling(
+                    src_backend=first,
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
+            return
 
         # Use multi-backend fused copy when we have 3 or more backends
         # This is 3x faster than calling the single-backend copy 3 times
