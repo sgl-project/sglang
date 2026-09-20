@@ -75,8 +75,8 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
             device="cuda",
             tp_group=SimpleNamespace(world_size=1),
             forward_stream=Mock(),
-            # Adaptive decode's maximum may exceed the local prefill chunk.
-            max_decode_logits_rows=Mock(return_value=8192),
+            max_decode_logits_rows=Mock(),
+            decode_num_tokens_per_req=Mock(),
             max_running_requests=256,
             is_draft_worker=False,
         )
@@ -94,17 +94,21 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
         }
         # The resolved chunk size is already per DP rank. Disabled chunking
         # uses the scheduler's prefill ceiling; skip-op suppresses the bridge.
+        # (chunk, skip, draft, graph rows, maximum MTP width, decode, prefill)
         cases = [
-            (4096, False, False, 4096),
-            (-1, False, False, 16384),
-            (4096, True, False, None),
-            (4096, False, True, None),
+            (4096, False, False, 128 * 6, 6, 256 * 6, 4096),
+            (-1, False, False, 8192, 6, 8192, 16384),
+            (4096, False, False, 4096, 32, 8192, 4096),
+            (4096, True, False, 128 * 6, 6, None, None),
+            (4096, False, True, 128 * 6, 6, None, None),
         ]
         previous = mega_autotune._active_context
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "rank.json"
-            for chunk_size, skip, draft, expected_tokens in cases:
+            for chunk_size, skip, draft, graph_rows, width, decode, prefill in cases:
                 runner.is_draft_worker = draft
+                runner.max_decode_logits_rows.return_value = graph_rows
+                runner.decode_num_tokens_per_req.return_value = width
                 skip_ops = {"flashinfer_megamoe"} if skip else set()
                 with (
                     self.subTest(chunk_size=chunk_size, skip=skip, draft=draft),
@@ -121,6 +125,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
                         ),
                         get_eager_max_batch_size=lambda bs: bs,
+                        max_speculative_num_draft_tokens=lambda: width,
                         get_schedule=lambda: SimpleNamespace(
                             chunked_prefill_size=chunk_size, max_prefill_tokens=16384
                         ),
@@ -148,18 +153,17 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             skip_ops=skip_ops,
                         )
                         context = mega_autotune._active_context
-                        if expected_tokens is None:
+                        if prefill is None:
                             self.assertIs(context, previous)
                         else:
                             self.assertIsNot(context, previous)
                             self.assertEqual(context.cache_path, cache_path)
-                            runner.max_decode_logits_rows.assert_called_with(
-                                min_batch_size=256
+                            runner.max_decode_logits_rows.assert_called_with()
+                            runner.decode_num_tokens_per_req.assert_called_with(
+                                num_draft_tokens=width
                             )
-                            self.assertEqual(context.decode_num_tokens, 8192)
-                            self.assertEqual(
-                                context.prefill_num_tokens, expected_tokens
-                            )
+                            self.assertEqual(context.decode_num_tokens, decode)
+                            self.assertEqual(context.prefill_num_tokens, prefill)
                             self.assertTrue(context.reuse_cache)
                     self.assertIs(mega_autotune._active_context, previous)
 

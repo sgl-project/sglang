@@ -49,13 +49,6 @@ class TestModelRunnerDecodeRows(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(runner.max_decode_logits_rows(), 72)
-                # Eager batches can exceed the largest captured graph, and
-                # still need the widest adaptive candidate's token count.
-                runner.cuda_graph_bs = [128]
-                self.assertEqual(runner.max_decode_logits_rows(), 128 * 6)
-                self.assertEqual(
-                    runner.max_decode_logits_rows(min_batch_size=256), 256 * 6
-                )
 
 
 if __name__ == "__main__":
