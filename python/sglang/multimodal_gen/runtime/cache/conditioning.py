@@ -291,13 +291,25 @@ class ConditioningCache:
         return output
 
 
-def cached_encoder_call(model, args, kwargs, compute, group=None):
+def _inference_cache(model):
     if torch.compiler.is_compiling():
-        return compute()
-    if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
-        return compute()
+        return None
     cache = _active_cache.get()
     if cache is None or model.training or torch.is_grad_enabled():
+        return None
+    # graph capture cannot hash or copy CUDA values through host memory
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return None
+    return cache
+
+
+def cached_encoder_call(model, args, kwargs, compute, group=None):
+    cache = _inference_cache(model)
+    if (
+        cache is None
+        or kwargs.get("use_cache")
+        or kwargs.get("past_key_values") is not None
+    ):
         return compute()
     return cache.run(model, "forward", args, kwargs, compute, group, nested=True)
 
@@ -307,10 +319,8 @@ def cached_conditioning(fn):
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return fn(self, *args, **kwargs)
-        cache = _active_cache.get()
-        if cache is None or self.training or torch.is_grad_enabled():
+        cache = _inference_cache(self)
+        if cache is None:
             return fn(self, *args, **kwargs)
         group = get_tp_group() if model_parallel_is_initialized() else None
         return cache.run(
@@ -329,15 +339,8 @@ def cached_vae_encode(fn):
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return fn(self, *args, **kwargs)
-        cache = _active_cache.get()
-        if (
-            cache is None
-            or self.training
-            or torch.is_grad_enabled()
-            or (model_parallel_is_initialized() and get_world_size() > 1)
-        ):
+        cache = _inference_cache(self)
+        if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
             return fn(self, *args, **kwargs)
         # Tiling and slicing can change numerical results without changing x.
         settings = {

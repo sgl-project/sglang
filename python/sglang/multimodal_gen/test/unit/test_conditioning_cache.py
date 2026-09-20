@@ -180,6 +180,25 @@ def test_weight_invalidation_and_precision():
     assert cache.hits == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+@torch.no_grad()
+def test_cuda_graph_capture_bypasses_host_cache():
+    cache = ConditioningCache(1024)
+    model = Encoder().cuda().eval()
+    x = torch.ones(4, device="cuda")
+    with cache.scope():
+        model(x)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = model(x)
+        x.fill_(3)
+        graph.replay()
+        torch.testing.assert_close(output.last_hidden_state, x, rtol=0, atol=0)
+    assert model.calls == 2
+    assert cache.hits == 0
+
+
 def _rank_eviction(rank, init_method, disabled_rank):
     dist.init_process_group(
         "gloo",
