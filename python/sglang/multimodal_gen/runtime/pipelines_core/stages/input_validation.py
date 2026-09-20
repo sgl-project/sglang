@@ -346,6 +346,24 @@ class InputValidationStage(PipelineStage):
             batch.width = final_w
             batch.height = final_h
 
+    @staticmethod
+    def _validate_dynamic_batch_condition_images(batch: Req):
+        """Validate the one-image-per-prompt shape contract before VAE encoding."""
+        processed_images = batch.condition_image
+        if not isinstance(processed_images, list):
+            processed_images = [processed_images]
+        processed_sizes = [image.size for image in processed_images]
+        if len(processed_sizes) != batch.batch_size:
+            raise ValueError(
+                "Dynamic Qwen Image Edit batching requires exactly one "
+                "conditioning image per prompt."
+            )
+        if len(set(processed_sizes)) != 1:
+            raise ValueError(
+                "Dynamic Qwen Image Edit batching currently requires "
+                "conditioning images with the same processed size."
+            )
+
     def forward(
         self,
         batch: Req,
@@ -463,18 +481,8 @@ class InputValidationStage(PipelineStage):
                     batch, server_args, condition_image_width, condition_image_height
                 )
 
-                if batch.extra.get("dynamic_batch_image_conditioning"):
-                    processed_sizes = [image.size for image in batch.condition_image]
-                    if len(processed_sizes) != batch.batch_size:
-                        raise ValueError(
-                            "Dynamic Qwen Image Edit batching requires exactly one "
-                            "conditioning image per prompt."
-                        )
-                    if len(set(processed_sizes)) != 1:
-                        raise ValueError(
-                            "Dynamic Qwen Image Edit batching currently requires "
-                            "conditioning images with the same processed size."
-                        )
+            if batch.extra.get("dynamic_batch_image_conditioning"):
+                self._validate_dynamic_batch_condition_images(batch)
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
