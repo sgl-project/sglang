@@ -34,7 +34,6 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
