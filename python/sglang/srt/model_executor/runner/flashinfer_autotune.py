@@ -305,7 +305,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 else schedule.max_prefill_tokens
             )
             mega_context = megamoe_autotune_context(
-                cache_path=autotune_cache,
                 decode_num_tokens=max(
                     mr.max_decode_logits_rows(),
                     get_eager_max_batch_size(mr.max_running_requests)
@@ -314,7 +313,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                     ),
                 ),
                 prefill_num_tokens=prefill_num_tokens,
-                reuse_cache=envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get(),
             )
         with (
             _autotune_process_group(sync_group),

@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+from bisect import bisect_left
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
+from functools import cached_property
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -31,40 +33,53 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _AutotuneContext:
-    cache_path: Path
     decode_num_tokens: int
     prefill_num_tokens: int
-    reuse_cache: bool
+    directory: Path
+    records: dict
+    staged_profiles: dict[str, Path] = field(default_factory=dict)
+    dirty: bool = False
 
 
 _active_context: _AutotuneContext | None = None
 # Native workspace pooling spans startup contexts. Keep their
 # selected tactics consistent too; a cache-path change must not retune storage
 # already captured by another layer. These payloads own no weights or tensors.
-_session_winners: dict[tuple[Any, str], dict] = {}
+_session_winners: dict[tuple[Any, int, str], dict] = {}
+_CACHE_NAMESPACE = "sglang_flashinfer_megamoe"
 
 
 @contextmanager
 def megamoe_autotune_context(
-    cache_path: Path,
     decode_num_tokens: int,
     prefill_num_tokens: int,
-    reuse_cache: bool = True,
 ):
-    """Tune only inside the engine's collective, pre-capture startup forward."""
+    """Prepare profiles inside the engine's pre-capture FlashInfer autotune pass."""
+    from flashinfer.autotuner import AutoTuner
+
     global _active_context
+    tuner = AutoTuner.get()
     previous = _active_context
-    _active_context = _AutotuneContext(
-        Path(cache_path), decode_num_tokens, prefill_num_tokens, reuse_cache
-    )
-    try:
-        yield
-    finally:
-        _active_context = previous
+    with TemporaryDirectory(prefix="sglang-megamoe-") as directory:
+        context = _AutotuneContext(
+            decode_num_tokens,
+            prefill_num_tokens,
+            Path(directory),
+            tuner.get_namespaced_records(_CACHE_NAMESPACE),
+        )
+        _active_context = context
+        try:
+            yield
+        finally:
+            _active_context = previous
+            if context.dirty:
+                tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
 
 
 @contextmanager
 def _native_cache(path: Path):
+    # Native AUTO exposes its winner through this file; generic autotune owns
+    # persistence. Each geometry is staged once per startup context.
     name = "FLASHINFER_MOE_EP_KNOB_CACHE"
     previous = os.environ.get(name)
     os.environ[name] = str(path)
@@ -150,6 +165,7 @@ class MegaMoeTunedForward:
         self.backend = backend
         self.workspaces: dict[int, Any] = {}
         self._fallback_used = False
+        self._profile_capacities: tuple[int, ...] = ()
 
     def _common_tokens(self, tensors) -> int:
         if self.bootstrap.world_size == 1:
@@ -163,16 +179,8 @@ class MegaMoeTunedForward:
             )
         return max(counts, default=0)
 
-    def _metadata(self, capacity: int) -> dict:
-        from flashinfer.autotuner import _collect_metadata
-
-        if self.bootstrap.world_size > 1:
-            import torch.distributed as dist
-
-            members = dist.get_process_group_ranks(self.bootstrap.process_group)
-        else:
-            members = [self.bootstrap.rank]
-
+    @cached_property
+    def _geometry_key(self) -> str:
         config = {}
         for item in fields(self.backend.megakernel):
             # Per-layer scale values do not change the pooled kernel geometry.
@@ -187,18 +195,19 @@ class MegaMoeTunedForward:
             value = getattr(self.backend.megakernel, item.name)
             if not isinstance(value, torch.Tensor):
                 config[item.name] = value
-        return {
-            "version": 1,
-            "runtime": _collect_metadata(),
-            "torch": torch.__version__,
-            "mega_use_ncu": os.environ.get("MEGA_USE_NCU", "0"),
-            "config": config,
-            "ep_members": members,
-            "world_size": self.bootstrap.world_size,
-            "hidden": self.fleet_params.token_hidden_size,
-            "num_experts": self.fleet_params.num_experts,
-            "capacity": capacity,
-        }
+        # The enclosing flashinfer.autotune context validates runtime/compiler
+        # metadata. This key only adds the MegaMoE configuration and geometry.
+        return json.dumps(
+            {
+                "torch": torch.__version__,
+                "mega_use_ncu": os.environ.get("MEGA_USE_NCU", "0"),
+                "config": config,
+                "world_size": self.bootstrap.world_size,
+                "hidden": self.fleet_params.token_hidden_size,
+                "num_experts": self.fleet_params.num_experts,
+            },
+            sort_keys=True,
+        )
 
     def _require_all_ranks(self, success: bool, message: str) -> None:
         if self.bootstrap.world_size > 1:
@@ -222,105 +231,97 @@ class MegaMoeTunedForward:
         dist.broadcast_object_list(values, group=group, group_src=0)
         return values[0]
 
-    def _prepare_profile(self, context, mega, tensors, capacity: int) -> None:
+    def _tune(self, tensors, capacity: int, native_path: Path):
         from flashinfer.moe_ep import MoEEpMegaLayer
 
-        metadata = self._metadata(capacity)
-        digest = hashlib.sha256(
-            json.dumps(metadata, sort_keys=True).encode()
-        ).hexdigest()
-        key = (self.bootstrap.process_group, digest)
-        directory = context.cache_path.with_suffix(".megamoe") / digest
-        directory.mkdir(parents=True, exist_ok=True)
-        # SGLang's parent path is rank-local; keep native writes isolated too.
-        native_path = directory / f"rank{self.bootstrap.rank}.{os.getpid()}.native.json"
-        cache_path = directory / f"rank{self.bootstrap.rank}.json"
+        backend = replace(
+            self.backend, megakernel=replace(self.backend.megakernel, knobs="auto")
+        )
+        temporary = MoEEpMegaLayer(
+            bootstrap=self.bootstrap,
+            fleet_params=replace(self.fleet_params, max_tokens_per_rank=capacity),
+            weights=None,
+            backend=backend,
+        )
+        payload = None
+        try:
+            temporary.warmup(tensors)
+            if self.bootstrap.rank == 0:
+                try:
+                    payload = json.loads(native_path.read_text())
+                except (OSError, ValueError):
+                    pass
+        finally:
+            temporary.destroy()
+        payload = self._broadcast(payload)
+        if not _valid_native_cache(payload):
+            raise RuntimeError("MegaMoE autotune did not record its selected tactic")
+        return payload
+
+    def _prepare_profile(self, mega, tensors, capacity: int) -> None:
+        context = _active_context
+        assert context is not None
+        profile_key = f"{self._geometry_key}:{capacity}"
         profile_inputs = _profile_inputs(
             tensors, capacity, self.fleet_params.num_experts
         )
-        payload = _session_winners.get(key)
-        if payload is None:
-            if self.bootstrap.rank == 0 and context.reuse_cache:
-                try:
-                    saved = json.loads(cache_path.read_text())
-                    if saved.get("metadata") == metadata and _valid_native_cache(
-                        saved.get("native_cache")
-                    ):
-                        payload = saved["native_cache"]
-                except (OSError, ValueError, KeyError, AttributeError):
-                    pass
-            payload = self._broadcast(payload)
-            if payload is None:
-                with _native_cache(native_path):
-                    native_path.unlink(missing_ok=True)
-                    temporary = MoEEpMegaLayer(
-                        bootstrap=self.bootstrap,
-                        fleet_params=replace(
-                            self.fleet_params, max_tokens_per_rank=capacity
-                        ),
-                        weights=None,
-                        backend=replace(
-                            self.backend,
-                            megakernel=replace(self.backend.megakernel, knobs="auto"),
-                        ),
-                    )
-                    try:
-                        temporary.warmup(profile_inputs)
-                        if self.bootstrap.rank == 0:
-                            try:
-                                recorded = json.loads(native_path.read_text())
-                                if _valid_native_cache(recorded):
-                                    payload = recorded
-                            except (OSError, ValueError):
-                                pass
-                    finally:
-                        temporary.destroy()
-                payload = self._broadcast(payload)
-                if payload is None:
-                    raise RuntimeError(
-                        "MegaMoE autotune did not record its selected tactic"
-                    )
-                source = "tuned"
-            else:
-                source = "cache hit"
-            _session_winners[key] = payload
-            if self.bootstrap.rank == 0:
-                logger.info(
-                    "MegaMoE %s: capacity=%s, knobs=%s",
-                    source,
-                    capacity,
-                    payload["entries"][0]["knobs"],
-                )
-            try:
-                pending = cache_path.with_suffix(f".{os.getpid()}.tmp")
-                pending.write_text(
-                    json.dumps({"metadata": metadata, "native_cache": payload})
-                )
-                pending.replace(cache_path)
-            except OSError as exc:
-                logger.warning("Cannot persist MegaMoE tuning result: %s", exc)
-
-        with _native_cache(native_path):
-            # The backend owns dtype/layout keys and loads its original payload.
-            try:
-                native_path.write_text(json.dumps(payload))
-                written = True
-            except OSError:
-                written = False
-            self._require_all_ranks(
-                written,
-                "Cannot stage MegaMoE's selected tactic for workspace creation",
+        native_path = context.staged_profiles.get(profile_key)
+        needs_staging = native_path is None
+        if needs_staging:
+            native_path = (
+                context.directory / f"profile{len(context.staged_profiles)}.json"
             )
+        with _native_cache(native_path):
+            if needs_staging:
+                key = (
+                    self.bootstrap.process_group,
+                    torch.cuda.current_device(),
+                    profile_key,
+                )
+                payload = _session_winners.get(key)
+                if payload is None:
+                    payload = self._broadcast(
+                        context.records.get(profile_key)
+                        if self.bootstrap.rank == 0
+                        else None
+                    )
+                    source = "cache hit"
+                    if not _valid_native_cache(payload):
+                        payload = self._tune(profile_inputs, capacity, native_path)
+                        source = "tuned"
+                    _session_winners[key] = payload
+                    if self.bootstrap.rank == 0:
+                        logger.info(
+                            "MegaMoE %s: capacity=%s, knobs=%s",
+                            source,
+                            capacity,
+                            payload["entries"][0]["knobs"],
+                        )
+                # The backend owns dtype/layout keys and loads its original payload.
+                try:
+                    native_path.write_text(json.dumps(payload))
+                    written = True
+                except OSError:
+                    written = False
+                self._require_all_ranks(
+                    written,
+                    "Cannot stage MegaMoE's selected tactic for workspace creation",
+                )
+                context.staged_profiles[profile_key] = native_path
+                if context.records.get(profile_key) != payload:
+                    context.records[profile_key] = payload
+                    context.dirty = True
             workspace = mega.create_workspace(capacity)
         mega.warmup(profile_inputs, workspace=workspace)
         self.workspaces[capacity] = workspace
 
     @staticmethod
     def _forward(mega, tensors, workspace=None):
-        kwargs = {} if workspace is None else {"workspace": workspace}
         if getattr(mega, "supports_output_view", False):
-            kwargs["return_workspace_view"] = True
-        return mega.forward(tensors, **kwargs)
+            return mega.forward(
+                tensors, workspace=workspace, return_workspace_view=True
+            )
+        return mega.forward(tensors, workspace=workspace)
 
     def __call__(self, mega, tensors):
         context = _active_context
@@ -350,12 +351,15 @@ class MegaMoeTunedForward:
             capacities = set(_capacities(context.decode_num_tokens))
             capacities.add(context.prefill_num_tokens)
             for capacity in sorted(capacities):
-                self._prepare_profile(context, mega, tensors, capacity)
+                self._prepare_profile(mega, tensors, capacity)
+            self._profile_capacities = tuple(sorted(self.workspaces))
 
         count = self._common_tokens(tensors)
-        capacity = next((n for n in sorted(self.workspaces) if n >= count), None)
-        if capacity is not None:
-            return self._forward(mega, tensors, self.workspaces[capacity])
+        index = bisect_left(self._profile_capacities, count)
+        if index < len(self._profile_capacities):
+            return self._forward(
+                mega, tensors, self.workspaces[self._profile_capacities[index]]
+            )
         raise ValueError(
             f"MegaMoE received {count} tokens per rank, exceeding its prepared "
             f"decode/prefill capacity {max(self.workspaces)}"

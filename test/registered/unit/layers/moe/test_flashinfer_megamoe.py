@@ -103,6 +103,16 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
 
     module = _load_autotune_module(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    tuner = types.SimpleNamespace(
+        get_namespaced_records=lambda _: {},
+        publish_namespaced_records=lambda *_: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.autotuner",
+        types.SimpleNamespace(AutoTuner=types.SimpleNamespace(get=lambda: tuner)),
+    )
 
     @dataclass
     class Tensors:
@@ -159,19 +169,17 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
     "decode_tokens,expected", [(3, [1, 2, 3, 128]), (8, [1, 2, 4, 8, 128])]
 )
 def test_megamoe_startup_profiles_are_prepared_once(
-    monkeypatch, tmp_path, decode_tokens, expected
+    monkeypatch, decode_tokens, expected
 ):
     module, forward, tensors, mega, calls = _profile_fixture(monkeypatch, num_tokens=96)
     prepared = []
 
-    def prepare(context, layer, inputs, capacity):
+    def prepare(layer, inputs, capacity):
         prepared.append(capacity)
         forward.workspaces[capacity] = object()
 
     monkeypatch.setattr(forward, "_prepare_profile", prepare)
-    with module.megamoe_autotune_context(
-        tmp_path / "cache.json", decode_tokens, prefill_num_tokens=128
-    ):
+    with module.megamoe_autotune_context(decode_tokens, prefill_num_tokens=128):
         assert forward(mega, tensors) is tensors.hidden_states
     # Bounds may exceed the bootstrap fleet. A large initial dummy must not
     # create intermediate prefill profiles.
@@ -196,6 +204,7 @@ def test_megamoe_profile_selection_uses_all_dp_ranks(monkeypatch, local_tokens):
     dp.get_dp_global_num_tokens = lambda: [0, 1, 3, 7]
     monkeypatch.setitem(sys.modules, dp.__name__, dp)
     forward.workspaces = {1: object(), 4: object(), 8: object(), 128: object()}
+    forward._profile_capacities = tuple(forward.workspaces)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     forward(mega, tensors)
     assert calls[-1][1] is forward.workspaces[8]
@@ -209,15 +218,26 @@ def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
     assert [workspace for _, workspace in calls] == [None, None]
 
 
-def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_path):
+@pytest.mark.parametrize("new_process", [False, True])
+def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     import json
     import os
     from dataclasses import replace
+    from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
     payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
     events = []
     staged = []
+    native_paths = []
+    require_all_ranks = module.MegaMoeTunedForward._require_all_ranks
+    readiness = Mock()
+
+    def require(self, success, message):
+        readiness(success)
+        require_all_ranks(self, success, message)
+
+    monkeypatch.setattr(module.MegaMoeTunedForward, "_require_all_ranks", require)
 
     class Mega:
         supports_output_view = True
@@ -240,9 +260,9 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_
 
         def create_workspace(self, capacity):
             assert capacity == 1
-            staged.append(
-                json.loads(Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).read_text())
-            )
+            path = Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"])
+            native_paths.append(path)
+            staged.append(json.loads(path.read_text()))
             self.workspace = object()
             events.append("create")
             return self.workspace
@@ -255,35 +275,59 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_
     fake_moe = types.ModuleType("flashinfer.moe_ep")
     fake_moe.MoEEpMegaLayer = Mega
     fake_autotuner = types.ModuleType("flashinfer.autotuner")
-    fake_autotuner._collect_metadata = lambda: {"runtime": "test"}
+    records = {}
+    tuner = types.SimpleNamespace(
+        get_namespaced_records=Mock(
+            side_effect=lambda namespace: records.get(namespace, {}).copy()
+        ),
+        publish_namespaced_records=Mock(
+            side_effect=lambda namespace, values: records.__setitem__(
+                namespace, values.copy()
+            )
+        ),
+    )
+    fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 
     owners = []
-    for phase, scale in (("first", 1.0), ("second", 2.0)):
-        phase_backend = replace(
-            first.backend,
-            megakernel=replace(first.backend.megakernel, input_norm_const=scale),
-        )
-        forward = module.MegaMoeTunedForward(
-            first.bootstrap, first.fleet_params, phase_backend
-        )
-        mega = Mega()
+    for phase in range(2):
+        if owners:
+            if new_process:
+                module._session_winners.clear()  # Only the loaded cache survives.
+            else:
+                records.clear()  # A new cache context must preserve pooled choices.
         with module.megamoe_autotune_context(
-            tmp_path / phase / "cache.json",
             decode_num_tokens=1,
             prefill_num_tokens=1,
-            reuse_cache=False,
         ):
-            assert forward(mega, tensors) is tensors.hidden_states
-        owners.append(mega)
+            for scale in (1.0, 2.0):
+                backend = replace(
+                    first.backend,
+                    megakernel=replace(
+                        first.backend.megakernel, input_norm_const=scale
+                    ),
+                )
+                forward = module.MegaMoeTunedForward(
+                    first.bootstrap, first.fleet_params, backend
+                )
+                mega = Mega()
+                assert forward(mega, tensors) is tensors.hidden_states
+                owners.append(mega)
+            assert readiness.call_count == phase + 1
+            assert native_paths[-2] == native_paths[-1]
+            assert native_paths[-1].is_file()
+        assert not native_paths[-1].exists()
         assert os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"] == "original-cache.json"
+        assert list(records["sglang_flashinfer_megamoe"].values()) == [payload]
+        assert tuner.get_namespaced_records.call_count == phase + 1
 
-    assert events == ["tune", "destroy", "create", "warmup", "create", "warmup"]
-    assert staged == [payload, payload]
-    assert owners[0].workspace is not owners[1].workspace
+    assert tuner.publish_namespaced_records.call_count == (1 if new_process else 2)
+    assert events == ["tune", "destroy"] + ["create", "warmup"] * 4
+    assert staged == [payload] * 4
+    assert len({id(owner.workspace) for owner in owners}) == 4
 
 
 @pytest.mark.parametrize("tokens,capacity", [(0, 8), (3, 8), (3, 1)])
@@ -462,7 +506,7 @@ def test_w4a16_keeps_weight_scale_storage_without_activation_scales(
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-        def forward(self, tensors):
+        def forward(self, tensors, workspace=None):
             self.tensors = tensors
             return tensors.hidden_states
 

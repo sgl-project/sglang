@@ -83,6 +83,12 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
         general = Mock(side_effect=lambda *_args, **_kwargs: contextlib.nullcontext())
         modules = {
             "flashinfer.autotuner": SimpleNamespace(
+                AutoTuner=SimpleNamespace(
+                    get=lambda: SimpleNamespace(
+                        get_namespaced_records=lambda _: {},
+                        publish_namespaced_records=lambda *_: None,
+                    )
+                ),
                 _collect_metadata=lambda: ENV,
                 autotune=general,
                 get_autotune_process_group=lambda: None,
@@ -157,14 +163,12 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             self.assertIs(context, previous)
                         else:
                             self.assertIsNot(context, previous)
-                            self.assertEqual(context.cache_path, cache_path)
                             runner.max_decode_logits_rows.assert_called_with()
                             runner.decode_num_tokens_per_req.assert_called_with(
                                 num_draft_tokens=width
                             )
                             self.assertEqual(context.decode_num_tokens, decode)
                             self.assertEqual(context.prefill_num_tokens, prefill)
-                            self.assertTrue(context.reuse_cache)
                     self.assertIs(mega_autotune._active_context, previous)
 
 
