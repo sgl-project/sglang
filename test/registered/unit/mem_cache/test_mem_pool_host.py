@@ -415,7 +415,13 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             pin_memory=False,
             is_dummy=True,
         )
-        mirror = DSAIndexerPoolHost(decl, stub, anchor, pin_memory=False, is_dummy=True)
+        mirror = DSAIndexerPoolHost(
+            decl=decl,
+            device_pool=stub,
+            anchor_host=anchor,
+            pin_memory=False,
+            is_dummy=True,
+        )
         self.assertEqual(mirror.layout, anchor.layout)
         self.assertEqual(mirror.indexer_page_stride_size, desc.page_bytes(64))
         self.assertEqual(

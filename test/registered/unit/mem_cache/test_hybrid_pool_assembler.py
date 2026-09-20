@@ -14,7 +14,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
-    _legacy_build_anchor_sidecar_stack,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
@@ -27,7 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
-from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
+from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl, plan_host_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -269,11 +268,11 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
         seen = {}
 
-        def fake_indexer_host(desc, device_pool, anchor_host, *, allocator_type):
-            self.assertIsInstance(desc, HostPoolDecl)
+        def fake_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+            self.assertIsInstance(decl, HostPoolDecl)
             self.assertIs(device_pool, draft_kv_pool)
             self.assertIs(anchor_host, draft_host_pool)
-            seen["desc"] = desc
+            seen["desc"] = decl
             return SimpleNamespace(layer_num=1)
 
         with (
@@ -353,6 +352,89 @@ def _entry_shape(group, transfer_layer_num):
         )
         for entry in group.entries
     ]
+
+
+def _legacy_build_anchor_sidecar_stack(
+    *,
+    params,
+    kv_pool,
+    indexer_decl,
+    full_layer_mapping,
+    load_cache_event,
+    storage_backend,
+    use_mla,
+    override_kv_cache_dim=None,
+    prefetch_threshold=256,
+    model_name=None,
+    storage_backend_extra_config=None,
+    enable_storage_metrics=False,
+):
+    """Pre-declaration DSA assembly (main before 2a), kept here only as the
+    parity oracle for assemble_declared_stack."""
+    transfer_layer_id_max = len(full_layer_mapping)
+    mtp_draft_device_pools = tuple(
+        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+    )
+    kv_host_pool = hybrid_pool_assembler.build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=params.page_size,
+        use_mla=use_mla,
+        override_kv_cache_dim=override_kv_cache_dim,
+        mtp_draft_device_pools=mtp_draft_device_pools,
+    )
+    sidecar_host_pool = hybrid_pool_assembler.DSAIndexerPoolHost(
+        indexer_decl,
+        kv_pool,
+        kv_host_pool,
+        allocator_type=hybrid_pool_assembler._get_allocator_type(),
+    )
+    if mtp_draft_device_pools:
+        full_layer_mapping = hybrid_pool_assembler._with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
+    entries = [
+        hybrid_pool_assembler.build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host_pool,
+            device_pool=kv_pool,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
+            is_anchor=True,
+            packed_draft_device_pools=mtp_draft_device_pools,
+        ),
+        hybrid_pool_assembler.build_pool_entry(
+            name=indexer_decl.name,
+            host_pool=sidecar_host_pool,
+            device_pool=kv_pool,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
+            packed_draft_device_pools=mtp_draft_device_pools,
+        ),
+    ]
+    host_pool_group = hybrid_pool_assembler.HostPoolGroup(entries)
+    cache_controller = hybrid_pool_assembler.HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=hybrid_pool_assembler.get_memory().hicache_write_policy,
+        io_backend=hybrid_pool_assembler.get_memory().hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=hybrid_pool_assembler.get_memory().hicache_host_memory_mode,
+    )
+    return host_pool_group, cache_controller
 
 
 class TestDeclaredStackParity(CustomTestCase):
@@ -483,7 +565,7 @@ class TestDeclaredPoolPlanning(CustomTestCase):
     planner must reject self-references and sidecar chains up front."""
 
     def _plan(self, decls):
-        return hybrid_pool_assembler._plan_declared_pools(
+        return plan_host_pools(
             decls=decls,
             device_pool=object(),
             full_layer_mapping={0: 0},
@@ -507,6 +589,17 @@ class TestDeclaredPoolPlanning(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "layout_source"):
             self._plan((kv, bad))
 
+    def test_rejects_primary_that_is_not_kv(self):
+        import msgspec
+
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
+        swa_primary = msgspec.structs.replace(kv, name=PoolName.SWA)
+        follower = msgspec.structs.replace(
+            indexer, index_source=PoolName.SWA, layout_source=PoolName.SWA
+        )
+        with self.assertRaisesRegex(ValueError, "primary KV pool"):
+            self._plan((swa_primary, follower))
+
     def test_accepts_dsa_declaration(self):
         plans = self._plan(_dsa_pool_stub(layer_num=1).host_pool_decls())
         self.assertEqual([p.decl.name for p in plans], [PoolName.KV, PoolName.INDEXER])
@@ -516,8 +609,7 @@ class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
     """HiRadixCache's per-request transfers must come from the assembled
     sidecar specs, not from a model-type table beside them."""
 
-    def test_extra_pools_follow_sidecar_specs(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, SidecarPoolSpec
+    def _cache(self, specs):
         from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
@@ -526,13 +618,29 @@ class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
         cache = object.__new__(HiRadixCache)
         cache.cache_controller = MagicMock(spec=HybridCacheController)
         cache.kv_cache = _dsa_pool_stub(layer_num=1)
-        cache.sidecar_pool_specs = [
-            SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        cache.sidecar_pool_specs = specs
+        return cache
+
+    def test_extra_pools_follow_sidecar_specs(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, SidecarPoolSpec
+
+        specs = [
+            SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV),
+            SidecarPoolSpec(
+                pool_name=PoolName.DRAFT_INDEXER,
+                indices_from_pool=PoolName.KV,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
         ]
-        (transfer,) = cache._get_extra_pools()["extra_pools"]
-        self.assertEqual(transfer.name, PoolName.INDEXER)
-        self.assertEqual(transfer.indices_from_pool, PoolName.KV)
-        self.assertEqual(transfer.hit_policy, PoolHitPolicy.ALL_PAGES)
+        transfers = self._cache(specs)._get_extra_pools()["extra_pools"]
+        self.assertEqual(
+            [(t.name, t.indices_from_pool, t.hit_policy) for t in transfers],
+            [(s.pool_name, s.indices_from_pool, s.hit_policy) for s in specs],
+        )
+
+    def test_dsa_without_declared_sidecars_transfers_nothing_extra(self):
+        # The pre-declaration table returned INDEXER for any DSATokenToKVPool.
+        self.assertEqual(self._cache([])._get_extra_pools(), {})
 
 
 class TestDeclaredPoolVerification(CustomTestCase):

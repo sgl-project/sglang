@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import msgspec
+
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -26,7 +28,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     HostPoolPlan,
-    LayerBinding,
+    plan_host_pools,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
@@ -1272,7 +1274,7 @@ def build_hybrid_mamba_swa_stack(
     return host_pool_group, cache_controller
 
 
-class DeclaredStack(NamedTuple):
+class DeclaredStack(msgspec.Struct, frozen=True, kw_only=True):
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
     plans: tuple[HostPoolPlan, ...]
@@ -1280,52 +1282,6 @@ class DeclaredStack(NamedTuple):
     @property
     def sidecars(self) -> list[SidecarPoolSpec]:
         return [p.decl.sidecar_spec() for p in self.plans if not p.decl.is_primary]
-
-
-def _plan_declared_pools(
-    *,
-    decls: tuple[HostPoolDecl, ...],
-    device_pool: Any,
-    full_layer_mapping: dict[int, int],
-    transfer_layer_id_max: int,
-    packed_draft_device_pools: tuple[Any, ...],
-) -> tuple[HostPoolPlan, ...]:
-    names = [d.name for d in decls]
-    if len(set(names)) != len(names):
-        raise ValueError(f"duplicate host pool names: {names}")
-    primaries = [d for d in decls if d.is_primary]
-    if len(primaries) != 1 or primaries[0].name != PoolName.KV:
-        raise ValueError(
-            f"expected exactly one primary KV pool, got {[d.name for d in primaries]}"
-        )
-    primary = primaries[0].name
-    for d in decls:
-        if d.is_primary:
-            continue
-        # HostPoolGroup resolves sidecar indices from one real source, so no
-        # self-reference and no sidecar-to-sidecar chains.
-        if d.index_source != primary:
-            raise ValueError(
-                f"{d.name}.index_source must be the primary pool {primary}, "
-                f"got {d.index_source}"
-            )
-        if d.layout_source is None or d.layout_source == d.name:
-            raise ValueError(f"{d.name}.layout_source must name another pool")
-        if d.layout_source not in names:
-            raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")
-    layers = LayerBinding(
-        transfer_to_device=full_layer_mapping,
-        transfer_layer_id_max=transfer_layer_id_max,
-    )
-    return tuple(
-        HostPoolPlan(
-            decl=d,
-            device_pool=device_pool,
-            layers=layers,
-            packed_draft_device_pools=packed_draft_device_pools,
-        )
-        for d in decls
-    )
 
 
 def assemble_declared_stack(
@@ -1361,7 +1317,7 @@ def assemble_declared_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    plans = _plan_declared_pools(
+    plans = plan_host_pools(
         decls=decls,
         device_pool=kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -1432,90 +1388,9 @@ def assemble_declared_stack(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
     )
-    return DeclaredStack(host_pool_group, cache_controller, plans)
-
-
-def _legacy_build_anchor_sidecar_stack(
-    *,
-    params: CacheInitParams,
-    kv_pool: Any,
-    indexer_decl: HostPoolDecl,
-    full_layer_mapping: dict[int, int],
-    load_cache_event,
-    storage_backend: Optional[str],
-    use_mla: bool,
-    override_kv_cache_dim: Optional[int] = None,
-    prefetch_threshold: int = 256,
-    model_name: Optional[str] = None,
-    storage_backend_extra_config: Optional[dict] = None,
-    enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
-    """Pre-declaration DSA assembly, kept only as the parity oracle for
-    assemble_declared_stack; removed once every DSA path is migrated."""
-    transfer_layer_id_max = len(full_layer_mapping)
-    mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+    return DeclaredStack(
+        host_pool_group=host_pool_group, cache_controller=cache_controller, plans=plans
     )
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
-    sidecar_host_pool = DSAIndexerPoolHost(
-        indexer_decl,
-        kv_pool,
-        kv_host_pool,
-        allocator_type=_get_allocator_type(),
-    )
-    if mtp_draft_device_pools:
-        full_layer_mapping = _with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
-    entries = [
-        build_pool_entry(
-            name=PoolName.KV,
-            host_pool=kv_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            is_anchor=True,
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
-        build_pool_entry(
-            name=indexer_decl.name,
-            host_pool=sidecar_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
-    ]
-    host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
-    )
-    return host_pool_group, cache_controller
 
 
 def _build_mha_mla_host_pool(
@@ -1603,9 +1478,9 @@ def build_full_draft_pools(
         # mirror, but transfer indices still follow the target KV anchor.
         indexer_decl = dsa_indexer_pool_decl(pool, name=PoolName.DRAFT_INDEXER)
         indexer_host_pool = DSAIndexerPoolHost(
-            indexer_decl,
-            pool,
-            draft_host_pool,
+            decl=indexer_decl,
+            device_pool=pool,
+            anchor_host=draft_host_pool,
             allocator_type=_get_allocator_type(),
         )
         specs.append(indexer_decl.sidecar_spec())

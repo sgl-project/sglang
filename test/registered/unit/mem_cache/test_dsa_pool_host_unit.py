@@ -84,9 +84,9 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 override_kv_cache_dim=device_pool.kv_cache_dim,
             )
             indexer_host = DSAIndexerPoolHost(
-                dsa_indexer_pool_decl(device_pool),
-                device_pool,
-                mla_host,
+                decl=dsa_indexer_pool_decl(device_pool),
+                device_pool=device_pool,
+                anchor_host=mla_host,
                 pin_memory=pin_memory,
                 device="cpu",
                 allocator_type="default",

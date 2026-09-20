@@ -66,7 +66,7 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     layout_source: Optional[PoolName]
     layout: HostPoolLayout
     # None only for the primary KV pool, which the assembler builds itself.
-    mirror: Optional[Any]
+    mirror: Optional[MirrorAdapter]
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
     @property
@@ -90,3 +90,51 @@ class HostPoolPlan(msgspec.Struct, frozen=True, kw_only=True):
     device_pool: Any
     layers: LayerBinding
     packed_draft_device_pools: tuple[Any, ...] = ()
+
+
+def plan_host_pools(
+    *,
+    decls: tuple[HostPoolDecl, ...],
+    device_pool: Any,
+    full_layer_mapping: dict[int, int],
+    transfer_layer_id_max: int,
+    packed_draft_device_pools: tuple[Any, ...],
+) -> tuple[HostPoolPlan, ...]:
+    """Bind declarations to a stack after checking they form one primary KV
+    pool plus sidecars that resolve their indices from it."""
+    names = [d.name for d in decls]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate host pool names: {names}")
+    primaries = [d for d in decls if d.is_primary]
+    if len(primaries) != 1 or primaries[0].name != PoolName.KV:
+        raise ValueError(
+            f"expected exactly one primary KV pool, got {[d.name for d in primaries]}"
+        )
+    primary = primaries[0].name
+    for d in decls:
+        if d.is_primary:
+            continue
+        # HostPoolGroup resolves sidecar indices from one real source, so no
+        # self-reference and no sidecar-to-sidecar chains.
+        if d.index_source != primary:
+            raise ValueError(
+                f"{d.name}.index_source must be the primary pool {primary}, "
+                f"got {d.index_source}"
+            )
+        if d.layout_source is None or d.layout_source == d.name:
+            raise ValueError(f"{d.name}.layout_source must name another pool")
+        if d.layout_source not in names:
+            raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")
+    layers = LayerBinding(
+        transfer_to_device=full_layer_mapping,
+        transfer_layer_id_max=transfer_layer_id_max,
+    )
+    return tuple(
+        HostPoolPlan(
+            decl=d,
+            device_pool=device_pool,
+            layers=layers,
+            packed_draft_device_pools=packed_draft_device_pools,
+        )
+        for d in decls
+    )

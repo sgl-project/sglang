@@ -70,7 +70,10 @@ class DSAIndexerMirror:
         allocator_type: str,
     ) -> DSAIndexerPoolHost:
         return DSAIndexerPoolHost(
-            decl, device_pool, anchor_host, allocator_type=allocator_type
+            decl=decl,
+            device_pool=device_pool,
+            anchor_host=anchor_host,
+            allocator_type=allocator_type,
         )
 
 
