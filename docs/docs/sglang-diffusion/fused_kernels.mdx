@@ -185,6 +185,14 @@ unsupported layouts, gradient-bearing inputs, and unverified signatures
 during graph capture use the native path. This does not enable model-level
 BCG support.
 
+For large Hopper BF16 image Q/K with 32 heads of width 128, Joy also uses
+the existing out-of-place QK-Norm + RoPE kernel to read the packed projection
+directly. This removes two input copies while retaining the original CUDA
+arithmetic and contiguous outputs. Each new signature is checked bitwise;
+inputs remain intact if the operation fails. Other shapes and platforms,
+compilation, unverified capture, and `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0`
+retain the original helper.
+
 ### Quantized layout producers
 
 These kernels preserve the quantized checkpoint path's selected reference operation. They are not a claim that FP8 or NVFP4 is equivalent to an unquantized BF16 checkpoint.
@@ -206,7 +214,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
-| Joy Image Edit | Bitwise image/text QKV concatenation for large CUDA inputs |
+| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper |
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |

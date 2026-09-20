@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -52,6 +53,116 @@ _MODULATION_FACTOR = 6
 _JOY_QKV_CAT = BitExactFusionGate(
     "Joy image/text QKV concatenation", per_signature=True
 )
+_JOY_IMAGE_QK_ROPE = BitExactFusionGate("Joy strided image QK RoPE", per_signature=True)
+
+
+def _joy_image_qk_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    cache: torch.Tensor,
+    complex_freqs: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    def reference():
+        return apply_qk_norm_with_optional_rope(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=q.shape[-1],
+            cos_sin_cache=cache,
+            freqs_complex=complex_freqs,
+            is_neox=False,
+            allow_inplace=True,
+        )
+
+    # Read the packed projection directly, using the same CUDA arithmetic as
+    # the original contiguous in-place operation. Keep unmeasured paths native.
+    if (
+        _JOY_IMAGE_QK_ROPE.disabled
+        or not q.is_cuda
+        or torch.version.hip
+        or torch.compiler.is_compiling()
+        or q.ndim != 4
+        or q.shape != k.shape
+        or q.shape[2:] != (32, 128)
+        or q.numel() < 16 * 1024 * 1024
+        or q.dtype != torch.bfloat16
+        or k.dtype != q.dtype
+        or k.device != q.device
+        or torch.cuda.get_device_capability(q.device) != (9, 0)
+        or any(x.stride() != (q.shape[1] * 12288, 12288, 128, 1) for x in (q, k))
+        or cache.ndim != 2
+        or cache.shape[1] != 128
+        or cache.shape[0] < q.shape[1]
+        or cache.dtype != torch.float32
+        or cache.device != q.device
+        or not cache.is_contiguous()
+        or q_norm.variance_epsilon != k_norm.variance_epsilon
+        or any(
+            norm.weight.shape != (128,)
+            or norm.weight.dtype != q.dtype
+            or norm.weight.device != q.device
+            or not norm.weight.is_contiguous()
+            for norm in (q_norm, k_norm)
+        )
+        or (
+            torch.is_grad_enabled()
+            and any(
+                x.requires_grad for x in (q, k, q_norm.weight, k_norm.weight, cache)
+            )
+        )
+        or os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+        in {"0", "false", "off", "no"}
+    ):
+        return reference()
+    sig = (q.device, tuple(q.shape), tuple(q.stride()), q_norm.variance_epsilon)
+    verified = _JOY_IMAGE_QK_ROPE.is_verified(sig)
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return reference()
+    if not diffusion_kernels.can_use_fused_inplace_qknorm_rope(
+        128, 128, False, q.dtype, cache.dtype
+    ):
+        return reference()
+    try:
+        q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        k_out = torch.empty_like(q_out)
+        positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
+        if q.shape[0] != 1:
+            positions = positions.repeat(q.shape[0])
+        diffusion_kernels.fused_qknorm_rope_out_of_place(
+            q.view(-1, 32, 128),
+            k.view(-1, 32, 128),
+            q_out.view(-1, 32, 128),
+            k_out.view(-1, 32, 128),
+            q_norm.weight,
+            k_norm.weight,
+            cache,
+            positions,
+            is_neox=False,
+            eps=q_norm.variance_epsilon,
+            head_dim=128,
+            rope_dim=128,
+        )
+    except Exception as exc:
+        # The out-of-place operation leaves packed Q/K/V pristine, including
+        # when it has written part of an output before raising.
+        _JOY_IMAGE_QK_ROPE.on_exception(exc, logger=logger)
+        return reference()
+    out = (q_out, k_out)
+    if verified:
+        return out
+    return _JOY_IMAGE_QK_ROPE.accept_or_fallback(
+        out,
+        reference(),
+        sig=sig,
+        equal=lambda actual, expected: all(
+            torch.equal(a.view(torch.int16), b.view(torch.int16))
+            for a, b in zip(actual, expected, strict=True)
+        ),
+        logger=logger,
+    )
 
 
 def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -316,18 +427,13 @@ class MMDoubleStreamBlock(nn.Module):
             raise ValueError(
                 f"Fused QK-Norm + RoPE kernel only supports float16/bfloat16, but got {img_q.dtype}"
             )
-        img_q = img_q.contiguous()
-        img_k = img_k.contiguous()
-        img_q, img_k = apply_qk_norm_with_optional_rope(
-            q=img_q,
-            k=img_k,
-            q_norm=self.img_attn_q_norm,
-            k_norm=self.img_attn_k_norm,
-            head_dim=img_q.shape[-1],
-            cos_sin_cache=vis_freqs_cis,
-            freqs_complex=vis_complex_freqs,
-            is_neox=False,
-            allow_inplace=True,
+        img_q, img_k = _joy_image_qk_rope(
+            img_q,
+            img_k,
+            self.img_attn_q_norm,
+            self.img_attn_k_norm,
+            vis_freqs_cis,
+            vis_complex_freqs,
         )
         img_q, img_k = img_q.to(img_v), img_k.to(img_v)
 
