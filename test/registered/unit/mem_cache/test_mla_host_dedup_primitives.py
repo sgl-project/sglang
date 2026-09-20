@@ -212,7 +212,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
     def test_indexer_pages_preserve_logical_order(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
         broadcaster.device = torch.device("cpu")
-        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.device_pool = SimpleNamespace(page_size=1, index_page_size=4)
         broadcaster.idx_bufs = [object()]
 
         device_indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
@@ -226,7 +226,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
     def test_indexer_rejects_partial_pages(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
         broadcaster.device = torch.device("cpu")
-        broadcaster.device_pool = SimpleNamespace(page_size=4)
+        broadcaster.device_pool = SimpleNamespace(page_size=1, index_page_size=4)
         broadcaster.idx_bufs = [object()]
 
         with self.assertRaisesRegex(ValueError, "page-aligned device indices"):

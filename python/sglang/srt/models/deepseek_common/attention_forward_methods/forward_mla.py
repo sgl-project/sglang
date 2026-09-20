@@ -157,6 +157,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if get_parallel().dcp_enabled:
+            return False
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
         # Shared activation surface with the DSA indexer graph dispatch
@@ -632,7 +634,7 @@ class DeepseekMLAForwardMixin:
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-            elif forward_batch.forward_mode.is_extend():
+            elif forward_batch.forward_mode.is_extend() and not self.use_dsa:
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
                     get_token_to_kv_pool(),
@@ -645,7 +647,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_pe,
                 )
-            else:
+            elif not self.use_dsa:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
