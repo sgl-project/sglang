@@ -3343,35 +3343,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         loaded_params: set[str] = set()
 
         num_hidden_layers = self.config.num_hidden_layers
-
-        def maybe_load_truncated_moe_gate(
-            param_name: str, param: torch.Tensor, loaded_weight: torch.Tensor
-        ) -> bool:
-            if self.config.num_experts is None:
-                return False
-            if not (
-                param_name.endswith(".mlp.gate.weight")
-                or param_name.endswith(".mlp.gate.e_score_correction_bias")
-            ):
-                return False
-            if loaded_weight.shape == param.data.shape:
-                return False
-            keep_num_experts = int(self.config.num_experts)
-            if loaded_weight.shape[0] < keep_num_experts:
-                raise ValueError(
-                    f"Cannot truncate Kimi-K3 MoE gate weight {param_name}: "
-                    f"checkpoint has {loaded_weight.shape[0]} experts, "
-                    f"requested {keep_num_experts}."
-                )
-            truncated_weight = loaded_weight.narrow(0, 0, keep_num_experts)
-            if truncated_weight.shape != param.data.shape:
-                raise ValueError(
-                    f"Unexpected truncated Kimi-K3 MoE gate shape for {param_name}: "
-                    f"{truncated_weight.shape=} {param.data.shape=}."
-                )
-            param.data.copy_(truncated_weight)
-            return True
-
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
@@ -3496,9 +3467,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    if maybe_load_truncated_moe_gate(name, param, loaded_weight):
-                        loaded_params.add(name)
-                        continue
                     if name.endswith(".b_proj.weight_scale_inv"):
                         # All TP ranks share K3's single beta output-scale block.
                         param.data.copy_(loaded_weight)
