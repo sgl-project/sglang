@@ -103,6 +103,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
+        use_cross_attention_mask = (
+            is_cross_attn and cross_attention_custom_mask is not None
+        )
+
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
@@ -127,9 +131,8 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
-            if is_cross_attn:
-                # Cross-attention masks cover the current query segment, with
-                # every query attending over the cached encoder sequence.
+            if use_cross_attention_mask:
+                # Each mask row corresponds to a current query position.
                 per_req_query_redudant = per_req_query
             else:
                 per_req_query_redudant = torch.empty(
@@ -153,7 +156,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             attn_mask = None
             is_causal = causal
-            if is_cross_attn and cross_attention_custom_mask is not None:
+            if use_cross_attention_mask:
                 kv_len = end_kv - start_kv
                 end_mask = start_mask + extend_seq_len_q * kv_len
                 attn_mask = (
@@ -185,7 +188,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            if is_cross_attn:
+            if use_cross_attention_mask:
                 output[start_q:end_q, :, :] = per_req_out_redudant
             else:
                 output[start_q:end_q, :, :] = per_req_out_redudant[

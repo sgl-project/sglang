@@ -1373,7 +1373,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
         attn_backend = self._replay_attn_backend()
-        if hasattr(self.model_runner.model, "prepare_forward_batch"):
+        if forward_batch.forward_mode.is_decode() and hasattr(
+            self.model_runner.model, "prepare_forward_batch"
+        ):
             self.model_runner.model.prepare_forward_batch(forward_batch)
         if forward_batch.cross_attention_custom_mask is not None:
             # Padding requests contribute zero entries to the flattened mask.

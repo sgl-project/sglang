@@ -1,5 +1,6 @@
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ from transformers.models.mllama.processing_mllama import (
     get_cross_attention_token_mask,
 )
 
+from sglang.srt.layers.attention import torch_native_backend
 from sglang.srt.layers.attention.cross_attention_mask import (
     filter_cross_attention_kv_indices,
 )
@@ -168,6 +170,40 @@ def test_mixed_batch_masks_with_cached_encoder():
     )
     assert indices.tolist() == [0, 1, 8, 9]
     assert indptr.tolist() == [0, 2, 2, 4]
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_torch_native_cross_attention_with_cached_prefix(masked):
+    query = torch.ones(2, 1, 2)
+    keys = torch.ones(4, 1, 2)
+    values = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+    mask = torch.tensor([[True, False, False, False], [False, False, False, True]])
+    backend = object.__new__(torch_native_backend.TorchNativeAttnBackend)
+
+    with patch.object(
+        torch_native_backend,
+        "scaled_dot_product_attention",
+        wraps=torch.nn.functional.scaled_dot_product_attention,
+    ) as sdpa:
+        actual = backend._run_sdpa_forward_extend(
+            query=query,
+            output=torch.empty_like(query),
+            k_cache=keys,
+            v_cache=values,
+            req_to_token=torch.arange(4).view(1, 4),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([5]),
+            extend_prefix_lens=torch.tensor([3]),
+            extend_seq_lens=torch.tensor([2]),
+            encoder_lens=torch.tensor([4]),
+            is_cross_attn=True,
+            cross_attention_custom_mask=mask.flatten() if masked else None,
+        )
+
+    # Preserve the full query layout for callers using the existing unmasked path.
+    assert sdpa.call_args.args[0].shape[-2] == (2 if masked else 5)
+    expected = values[[0, 3]] if masked else values.mean(0).expand_as(query)
+    torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

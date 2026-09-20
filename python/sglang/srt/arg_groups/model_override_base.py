@@ -317,6 +317,13 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     ):
         return "flashinfer"
 
+    # Mllama uses FlashInfer's custom masks for cross-attention image visibility.
+    if (
+        "MllamaForConditionalGeneration" in (model_config.hf_config.architectures or [])
+        and get_platform().has_flashinfer
+    ):
+        return "flashinfer"
+
     if not use_mla_backend:
         # MHA architecture
 
