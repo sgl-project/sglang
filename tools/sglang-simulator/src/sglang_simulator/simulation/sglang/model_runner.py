@@ -249,6 +249,11 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 if hasattr(token_pool, name):
                     setattr(token_pool, name, value)
 
+            if hasattr(token_pool, "row_dim"):
+                token_pool.row_dim = token_pool.head_num * token_pool.head_dim
+            if hasattr(token_pool, "v_row_dim"):
+                token_pool.v_row_dim = token_pool.head_num * token_pool.v_head_dim
+
             if (
                 hasattr(token_pool, "kv_cache_dim")
                 and token_pool.kv_cache_dim == 2
