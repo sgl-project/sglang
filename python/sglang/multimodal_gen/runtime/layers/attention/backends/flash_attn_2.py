@@ -44,7 +44,6 @@ class FlashAttention2Backend(AttentionBackend):
 
 
 class FlashAttention2Impl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

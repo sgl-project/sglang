@@ -27,6 +27,9 @@ import { fileURLToPath } from "node:url";
 const SNIPPETS = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "snippets");
 const CONFIGS = join(SNIPPETS, "configs");
 const DIFFUSION_COOKBOOK = join(SNIPPETS, "..", "..", "cookbook", "diffusion");
+const COOKBOOK_MODEL_TEMPLATE = join(
+  SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
+  "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
 
 const failures = [];
@@ -69,6 +72,19 @@ if (a && b && a !== b) {
 const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8");
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
+}
+
+const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
+for (const oldName of [
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS",
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND",
+]) {
+  if (cookbookModelTemplate.includes(oldName)) {
+    fail("config.jsx.tmpl", `still emits removed W4A4 setting ${oldName}`);
+  }
+}
+if (!cookbookModelTemplate.includes("--enable-w4a4-mxfp4-megamoe")) {
+  fail("config.jsx.tmpl", "W4A4 MegaMoE option is missing the server flag");
 }
 
 // --------------------------------------------------------------- 3/4. Configs
@@ -256,7 +272,16 @@ for (const path of walk(CONFIGS)) {
       if (!Array.isArray(errors) || errors.length) {
         fail(where, `verifiedRecipes[${index}] fails topology validation: ${(errors || []).join("; ")}`);
       }
-      validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      // A recipe may carry `unverified: true`: it supplies the card's default
+      // shape without claiming a verification run, and must resolve that way.
+      if (recipe.unverified) {
+        const resolved = validateResolved(selection, `verifiedRecipes[${index}]`);
+        if (resolved && resolved.builder.verification?.serve === "verified") {
+          fail(where, `verifiedRecipes[${index}] is declared unverified but resolves as verified`);
+        }
+      } else {
+        validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      }
     }
 
     // H3's architectural contract is important enough to pin directly: exact
@@ -275,6 +300,33 @@ for (const path of walk(CONFIGS)) {
       checkH3("B200 1x8", { hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 1 });
       checkH3("H100 1x4", { hw: "h100", nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 2, ulysses_degree: 2, ring_degree: 1 });
       checkH3("H200 2x8", { hw: "h200", nodes: 2, gpus_per_node: 8, placement: "resident" }, { tp_size: 1, ulysses_degree: 8, ring_degree: 2 });
+      for (const hw of ["gb200", "gb300"]) {
+        checkH3(`${hw} 1x4`, { hw, nodes: 1, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 1 }, hw === "gb300");
+        checkH3(`${hw} 2x4`, { hw, nodes: 2, gpus_per_node: 4, placement: "resident" }, { tp_size: 1, ulysses_degree: 4, ring_degree: 2 }, false);
+        const selection = selectionOf({ hw, nodes: 2, gpus_per_node: 4 });
+        const encoder = config.overlayDims.find((dim) => dim.id === "encoder").options.find((option) => option.id === "auto");
+        if (!encoder.flags(selection).includes("--encoder-parallel replicate")) {
+          fail(where, `${hw} cross-node auto encoder must replicate`);
+        }
+        if (config.runModes(selection).includes("docker")) {
+          fail(where, `${hw} must not advertise an unvalidated Docker command`);
+        }
+      }
+      for (const extra of [
+        { hw: "gb200" },
+        { hw: "gb300", mode: "i2va" },
+        { hw: "gb300", weights: "ref2va", mode: "v2v" },
+        { hw: "gb300", quality: "extra-high" },
+        { hw: "gb300", outputs: "2" },
+        { hw: "gb300", precision: "fp8" },
+        { hw: "gb300", attention: "sage" },
+      ]) {
+        const selection = selectionOf({ nodes: 1, gpus_per_node: 4, placement: "resident", ...extra });
+        const resolved = validateResolved(selection, "H3 Grace Blackwell coverage");
+        if (resolved?.builder.verification?.request !== "unverified") {
+          fail(where, `H3 Grace Blackwell request is outside the measured scope: ${JSON.stringify(extra)}`);
+        }
+      }
       for (const hw of ["mi300x", "mi355x"]) {
         for (const count of [1, 2, 4, 8]) {
           checkH3(`${hw} 1x${count}`, { hw, nodes: 1, gpus_per_node: count, placement: "resident" }, { tp_size: 1, ulysses_degree: count, ring_degree: 1 });
