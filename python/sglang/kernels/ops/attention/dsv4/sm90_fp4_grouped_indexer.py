@@ -15,13 +15,14 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module() -> Module:
+def _jit_module(implementation: str = "auto") -> Module:
     if torch.cuda.get_device_capability()[0] != 9:
         raise RuntimeError("sm90_fp4_grouped_indexer requires an SM90 GPU")
+    mode = {"auto": 0, "persistent": 1, "pipeline": 2}[implementation]
     return load_jit(
-        "sm90_fp4_grouped_indexer",
+        f"sm90_fp4_grouped_indexer_{implementation}",
         cuda_files=["sm90_fp4_grouped_indexer/entry.cuh"],
-        cuda_wrappers=[("dispatch", "sm90_fp4_grouped_indexer_dispatch")],
+        cuda_wrappers=[("dispatch", f"sm90_fp4_grouped_indexer_dispatch<{mode}>")],
         extra_cuda_cflags=[
             "-O3",
             "-DNDEBUG",
@@ -53,8 +54,9 @@ def _sm90_fp4_grouped_indexer_op(
     group_size: int,
     page_size: int,
     ratio: int,
+    implementation: str = "auto",
 ) -> None:
-    _jit_module().dispatch(
+    _jit_module(implementation).dispatch(
         q,
         q_scale,
         weights,
@@ -91,8 +93,18 @@ def fp4_index_logits_grouped_sm90(
     ratio: int,
     width: int,
     group_size: int,
+    *,
+    implementation: str = "auto",
 ) -> torch.Tensor:
-    """Score uniform request-major query groups while reusing each K tile."""
+    """Score request-major groups; optionally use persistent or pipelined CTAs.
+
+    ``auto`` retains the shape-tuned rectangular grid with visibility skipping.
+    ``persistent`` schedules visible chunks on a resident grid; ``pipeline``
+    additionally overlaps packed K loading, decoding and WGMMA. These explicit
+    modes benefit some capacity-padded workloads but can lose on full lengths.
+    """
+    if implementation not in ("auto", "persistent", "pipeline"):
+        raise ValueError(f"Unknown grouped indexer implementation: {implementation}")
     assert q.dtype == torch.bfloat16 and q.shape[1:] == (64, 128)
     assert weights.dtype == torch.bfloat16 and weights.shape == q.shape[:2]
     assert req_to_token.dtype == torch.int32 and req_to_token.dim() == 2
@@ -130,5 +142,6 @@ def fp4_index_logits_grouped_sm90(
             group_size,
             page_size,
             ratio,
+            implementation,
         )
     return out

@@ -24,6 +24,7 @@ limitations under the License.
 
 namespace sglang {
 
+template <int IMPLEMENTATION = 0>
 void sm90_fp4_grouped_indexer_dispatch(
     tvm::ffi::TensorView q,
     tvm::ffi::TensorView q_scale,
@@ -71,7 +72,13 @@ void sm90_fp4_grouped_indexer_dispatch(
 
   DLDevice dev = q.device();
   cudaSetDevice(dev.device_id);
-  fp4_grouped_indexer_sm90::run_sm90_fp4_grouped_indexer(params);
+  if constexpr (IMPLEMENTATION == 1) {
+    fp4_grouped_indexer_sm90::Sm90Fp4PersistentIndexerKernel<false>::run(params);
+  } else if constexpr (IMPLEMENTATION == 2) {
+    fp4_grouped_indexer_sm90::Sm90Fp4PersistentIndexerKernel<true>::run(params);
+  } else {
+    fp4_grouped_indexer_sm90::run_sm90_fp4_grouped_indexer(params);
+  }
 }
 
 }  // namespace sglang
