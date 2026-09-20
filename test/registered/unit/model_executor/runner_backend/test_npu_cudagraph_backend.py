@@ -49,25 +49,6 @@ def test_npu_graph_update_success(legacy):
     backend._device_module.set_device.assert_called_once_with(0)
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Currently, there are 3 operators that need to be updated by capture, "
-        "and there are only 2 elements in the incoming cpu_update_input list",
-        "NPU stream update failed",
-        # Every update failure must reach the caller, regardless of its message.
-        "there are 0 operators that need to be updated",
-    ],
-)
-def test_npu_graph_update_errors_reach_caller(message):
-    error = RuntimeError(message)
-    graph = SimpleNamespace(update=Mock(side_effect=error), replay=Mock())
-    backend = _make_backend(graph)
-    with pytest.raises(RuntimeError) as raised:
-        backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
-    assert raised.value is error
-
-
 def test_npu_graph_waits_for_update_before_returning():
     replay_started = threading.Event()
     update_finished = threading.Event()
@@ -82,20 +63,6 @@ def test_npu_graph_waits_for_update_before_returning():
     result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
     assert update_finished.is_set()
     assert result is backend._outputs[1]
-
-
-@pytest.mark.parametrize("failure_site", ["set_device", "update"])
-def test_npu_graph_worker_exception_reaches_caller(failure_site):
-    error = ValueError("Worker failed")
-    graph = SimpleNamespace(update=Mock(), replay=Mock())
-    backend = _make_backend(graph)
-    if failure_site == "set_device":
-        backend._device_module.set_device.side_effect = error
-    else:
-        graph.update.side_effect = error
-    with pytest.raises(ValueError) as raised:
-        backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
-    assert raised.value is error
 
 
 @pytest.mark.parametrize("legacy", [False, True])

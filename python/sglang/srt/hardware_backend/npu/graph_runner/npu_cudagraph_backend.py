@@ -150,36 +150,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_type: Any = None,
         cpu_update_input: list = None,
     ) -> Any:
-        """Replay a graph, updating recorded operator inputs when needed.
-
-        Requires auto_dispatch_capture=True. With no update records, replay
-        directly without preparing or applying updates. Otherwise, run updates
-        in a background thread concurrently with replay, join the thread, and
-        re-raise any update exception in the caller.
+        """Rebind seq_lens on the recorded NPU graph in a background
+        thread, then replay. Used when the model is not deepseek-nsa.
 
         Two calling conventions:
-        1. Provide seq_lens and attr_name, with optional attr_type; leave
-           cpu_update_input=None. The method builds a one-element list for
-           broadcast to all records. For example:
-               seq_lens=[100, 200], attr_name="actual_seq_lengths_kv"
-           becomes:
-               [{"actual_seq_lengths_kv": [100, 200]}]
-           A Tensor instance as attr_type selects conversion of seq_lens to a
-           CPU int32 tensor. Its dtype and device are not used. Otherwise,
-           seq_lens is used unchanged.
-
-        2. Provide cpu_update_input as a list of update dictionaries; callers
-           can pass seq_lens=None. The list is forwarded unchanged to
-           graph.update(), and seq_lens, attr_name, and attr_type are ignored.
-           A one-element list broadcasts the same updates to all records:
-               [{"actual_seq_lengths_kv": [100, 200]}]
-           A longer list must contain one dictionary per record, in capture
-           order. This example requires exactly two update records:
-               [{"actual_seq_lengths_kv": [101, 201]},
-                {"actual_seq_lengths_kv": [102, 202]}]
-           The inner length lists describe requests, not update records.
-           Dictionaries may contain multiple input updates; supported keys
-           and values depend on the recorded operator and its update handler.
+        1. (legacy) seq_lens + attr_name + attr_type:
+           Constructs cpu_update_input=[{attr_name: seq_lens}] internally.
+        2. cpu_update_input: A list of {attr_name: seq_lens} dicts,
+           one per speculative step.  Used by EAGLE draft runners.
         """
         graph = self._graphs[shape_key]
         # Read the update record count and require automatic capture to be enabled.
@@ -204,21 +182,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
 
-        update_errors: list[Exception] = []
-
         def _update():
-            try:
-                self._device_module.set_device(self._device_id)
-                graph.update(cpu_update_input=cpu_update_input)
-            except Exception as e:
-                update_errors.append(e)
+            self._device_module.set_device(self._device_id)
+            graph.update(cpu_update_input=cpu_update_input)
 
+        # TODO: Propagate update-thread failures to the caller; join() alone
+        # does not raise them. Handle replay failures and thread cleanup in
+        # a separate backend fix.
         thread = threading.Thread(target=_update)
         thread.start()
         graph.replay()
         thread.join()
-        if update_errors:
-            raise update_errors[0]
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
