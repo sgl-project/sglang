@@ -23,7 +23,6 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -266,7 +265,7 @@ class AttentionInputs:
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
         output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_tp_group().all_gather_into_tensor(output, hidden_states)
+        get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
         return output
 
     def fetch_qkv_latent(self):
@@ -510,7 +509,7 @@ def tp_reduce_scatter(
     )
     local_tokens = hidden_states.shape[0] // context.tp_size
     output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    get_parallel().tp_group.reduce_scatter_tensor(output, hidden_states)
     if residual is not None:
         residual = residual.tensor_split(context.tp_size)[context.tp_rank]
     return output, residual
@@ -1075,7 +1074,7 @@ class CommunicateSimpleFn:
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     output = torch.empty(
@@ -1270,7 +1269,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         hidden_states
                     )
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
@@ -1278,7 +1277,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if use_layer_norm_before_gather:
@@ -1510,7 +1509,7 @@ class CommunicateSummableTensorPairFn:
         allow_reduce_scatter: bool = False,
     ):
         if get_parallel().tp_size == get_parallel().attn_dp_size:
-            group = get_tp_group()
+            group = get_parallel().tp_group
         else:
             group = get_parallel().attn_tp_group
         hidden_states, global_hidden_states = (
@@ -1518,7 +1517,7 @@ class CommunicateSummableTensorPairFn:
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
@@ -1600,7 +1599,7 @@ class CommunicateSummableTensorPairFn:
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
-                group = get_tp_group()
+                group = get_parallel().tp_group
             else:
                 group = get_parallel().attn_tp_group
             hidden_states_output, global_hidden_states = (

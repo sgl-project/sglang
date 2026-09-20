@@ -87,9 +87,6 @@ except ImportError:
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
-from sglang.srt.distributed import (
-    get_tp_group,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -693,7 +690,7 @@ class TopK(BaseFusedOp):
         else:
             self.topk_config.torch_native = False
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 topk_output = select_experts(
                     hidden_states=hidden_states,
@@ -784,7 +781,7 @@ class TopK(BaseFusedOp):
                 )
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)

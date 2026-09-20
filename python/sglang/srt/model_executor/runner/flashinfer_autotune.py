@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
@@ -147,7 +148,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
-        str(mr.ps.pp_size),
+        str(get_parallel().pp_size),
         str(mr.ps.attn_dp_size),
         str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
@@ -170,7 +171,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     return (
         cache_dir
-        / f"rank_tp{mr.ps.tp_rank}_pp{mr.ps.pp_rank}_dp{mr.ps.dp_rank or 0}.json"
+        / f"rank_tp{mr.ps.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.ps.dp_rank or 0}.json"
     )
 
 

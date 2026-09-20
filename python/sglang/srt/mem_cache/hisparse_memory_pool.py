@@ -5,6 +5,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
+    translate_padded_hisparse_locations,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
@@ -74,7 +77,18 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             full_to_hisparse_device_index_mapping
         )
 
-    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+    def translate_loc_to_hisparse_device(
+        self, compressed_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map logical locations to physical slots with the same shape.
+
+        CUDA and ROCm use a fused kernel for 1D GPU slot lists, preserving
+        negative padding. Page tables and CPU inputs keep the direct gather.
+        """
+        if compressed_indices.is_cuda and compressed_indices.ndim == 1:
+            return translate_padded_hisparse_locations(
+                self.full_to_hisparse_device_index_mapping, compressed_indices
+            )
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
