@@ -23,9 +23,11 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.sm90_litetopk import get_sm90_litetopk
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -1094,11 +1096,68 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
+        q_offset = ks.shape[0]
+
+        sm90_backend = get_sm90_litetopk()
+        sm90_state_key = (id(self), layer_id)
+        sm90_eligible = (
+            sm90_backend.enabled
+            and _is_cuda
+            and not _is_fp8_fnuz
+            and batch_size == 1
+            and self.index_topk == 2048
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+            and getattr(get_token_to_kv_pool(), "index_kpool", 1) == 1
+            and not self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is None
+            and not get_is_capture_mode()
+            and not _is_in_piecewise_or_breakable_cuda_graph()
+            and getattr(metadata, "topk_transform_method", None)
+            == TopkTransformMethod.RAGGED
+        )
+        if sm90_eligible:
+            topk_offsets = getattr(metadata.attn_metadata, "topk_indices_offset", None)
+            sm90_eligible = topk_offsets is not None and not bool(
+                topk_offsets[:q_offset].any()
+            )
+
+        def try_sm90_litetopk(
+            q_slice: torch.Tensor,
+            weight_slice: torch.Tensor,
+            start_slice: torch.Tensor,
+            end_slice: torch.Tensor,
+        ) -> Optional[torch.Tensor]:
+            if not sm90_eligible:
+                return None
+
+            def select_candidates(
+                values: torch.Tensor, counts: torch.Tensor
+            ) -> torch.Tensor:
+                return metadata.topk_backend.topk_func(values, counts, self.index_topk)
+
+            return sm90_backend.try_run(
+                sm90_state_key,
+                q_slice,
+                k_fp8,
+                k_scale,
+                weight_slice,
+                start_slice,
+                end_slice,
+                select_candidates,
+            )
+
+        def observe_sm90_litetopk(
+            indices: torch.Tensor, end_slice: torch.Tensor
+        ) -> None:
+            if sm90_eligible:
+                sm90_backend.observe(sm90_state_key, indices, int(end_slice[-1].item()))
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
-        q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=q_offset,
@@ -1109,6 +1168,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
+            sm90_result = try_sm90_litetopk(
+                q_fp8[:q_offset],
+                weights[:q_offset],
+                ks,
+                ke,
+            )
+            if sm90_result is not None:
+                topk_result[:q_offset] = sm90_result
+                return topk_result
+
             with self._with_real_sm_count():
                 if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -1154,6 +1223,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
+            observe_sm90_litetopk(raw_topk_result, ke)
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
@@ -1176,6 +1246,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
+
+            sm90_result = try_sm90_litetopk(
+                q_fp8[start:end],
+                weights[start:end],
+                ks[start:end],
+                ke[start:end],
+            )
+            if sm90_result is not None:
+                topk_result[start:end] = sm90_result
+                start = end
+                continue
 
             with self._with_real_sm_count():
                 if _is_hip:
@@ -1239,6 +1320,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
+            observe_sm90_litetopk(raw_topk_chunk, ke[start:end])
             start = end
 
         return topk_result
