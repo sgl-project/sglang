@@ -2557,6 +2557,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ):
             with self.subTest(architecture=architecture):
                 check_pipeline_parallel_compat(

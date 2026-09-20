@@ -1695,7 +1695,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # Only the first stage embeds multimodal inputs; the last stage needs
+            # them for the MTP draft prefill, so relay them with the hidden states.
+            mm_input_embeds = pp_proxy_tensors.tensors.get("mm_input_embeds")
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
+            # The hyper-connection streams ride in the widened hidden state;
+            # there is no separate residual at a PP boundary (hc_hidden_size contract).
+            residual = None
 
         ple_batch = (
             _prepare_ple_batch(
@@ -1731,12 +1738,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {"hidden_states": hidden_states}
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            return PPProxyTensors(proxy_tensors)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
