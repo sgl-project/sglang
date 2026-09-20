@@ -22,10 +22,12 @@ impl AbortOnDrop {
         rid: Option<&str>,
         headers: &HeaderMap,
     ) -> Option<Self> {
+        // The engine treats rid as a prefix; an empty ID would cancel every request.
+        let rid = rid.filter(|id| !id.is_empty())?;
         Some(Self {
             client: client.clone(),
             url: worker.join("/abort_request").ok()?,
-            rid: Some(rid?.to_owned()),
+            rid: Some(rid.to_owned()),
             authorization: headers.get(AUTHORIZATION).cloned(),
         })
     }
@@ -180,8 +182,8 @@ mod tests {
         let (url, mut aborted, task) = worker().await;
         let proxy = Proxy::new(Duration::from_secs(2)).unwrap();
         let breaker = Arc::new(CircuitBreaker::new());
-        for request_id in [Some("complete"), None] {
-            let path = if request_id.is_some() {
+        for request_id in [Some("complete"), None, Some("")] {
+            let path = if request_id == Some("complete") {
                 "/done"
             } else {
                 "/stream"
@@ -201,7 +203,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if request_id.is_some() {
+            if request_id == Some("complete") {
                 response.into_body().collect().await.unwrap();
             }
         }

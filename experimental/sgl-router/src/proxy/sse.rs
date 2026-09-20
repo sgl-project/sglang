@@ -18,7 +18,7 @@ pub struct StreamEnd {
     pub transport_ok: bool,
     /// An SSE error event (`data: {"error"...}`) rode the stream.
     pub saw_error_event: bool,
-    /// The client dropped the response body before upstream finished.
+    /// The client disconnected or stopped consuming the response.
     pub client_disconnect: bool,
 }
 
