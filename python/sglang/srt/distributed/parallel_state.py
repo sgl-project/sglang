@@ -2636,10 +2636,17 @@ def initialize_model_parallel(
         group_ranks.append(ranks)
 
     # message queue broadcaster is only used in tensor model parallel group
+    rocm_dp_attention = is_hip() and attention_data_parallel_size > 1
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
+        # Partial-DPA gathers use the full TP group inside decode/verify CUDA
+        # graphs. AITER custom AR corrupts the multi-token EAGLE verify gather;
+        # keep the CLI default but route this group's collectives through the
+        # graph-safe PyNccl communicator on ROCm DPA runs.
+        use_pynccl=True if rocm_dp_attention else None,
+        use_custom_allreduce=False if rocm_dp_attention else None,
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
