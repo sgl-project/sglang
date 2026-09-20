@@ -803,6 +803,435 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 )
 
 
+class TestDSV41SM90CandidateSlots(CustomTestCase):
+    def test_target_verify_uses_decode_compressor_path(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend._low_ratio_compress_decode = mock.Mock()
+        backend._low_ratio_compress_torch = mock.Mock()
+        layer = SimpleNamespace()
+        x = torch.empty(6, 1)
+        req = torch.empty(6, dtype=torch.int64)
+        pos = torch.empty(6, dtype=torch.int64)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+
+        backend._low_ratio_compress(layer, x, req, pos, forward_batch)
+
+        backend._low_ratio_compress_decode.assert_called_once_with(layer, x, req, pos)
+        backend._low_ratio_compress_torch.assert_not_called()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_pair_pool_matches_target_verify_rows(self):
+        from sglang.kernels.ops.attention.dsv4.pair_pool_decode import pair_pool_decode
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+
+        torch.manual_seed(47)
+        bs, verify_rows, ring_size, dim = 2, 6, 8, 512
+        n = bs * verify_rows
+        state = CompressStatePool(
+            size=bs * ring_size,
+            ring_size=ring_size,
+            overlap=False,
+            head_dim=dim,
+            dtype=torch.float32,
+            device="cuda",
+            enable_memory_saver=False,
+            ratio=2,
+        )
+        initial = torch.randn_like(state.kv_score_buffer.kv_score)
+        initial[-1, :dim] = 0
+        initial[-1, dim:] = -torch.inf
+        state.kv_score_buffer.kv_score.copy_(initial)
+        fused_state = initial.clone()
+        reference = object.__new__(DeepseekV4AttnBackend)
+        reference.token_to_kv_pool = SimpleNamespace(
+            get_attention_compress_states=lambda layer_id: state
+        )
+
+        kv, score = (torch.randn(n, dim, device="cuda") for _ in range(2))
+        req = torch.arange(bs, device="cuda", dtype=torch.int64).repeat_interleave(
+            verify_rows
+        )
+        raw_loc = torch.arange(256, 256 + n, device="cuda", dtype=torch.int32)
+
+        for start_pos in (7, 8):
+            with self.subTest(start_pos=start_pos):
+                fused_state.copy_(initial)
+                state.kv_score_buffer.kv_score.copy_(initial)
+                pos = (
+                    torch.arange(start_pos, start_pos + verify_rows, device="cuda")
+                    .repeat(bs)
+                    .to(torch.int64)
+                )
+                out_loc = torch.where(pos % 2 == 1, raw_loc // 2, -1)
+                partner_kv, partner_score = reference._low_ratio_pair_partners(
+                    layer_id=0, kv=kv, score=score, req=req, pos=pos, pad=raw_loc == 0
+                )
+                pairs = torch.stack([partner_kv, kv], dim=1)
+                weights = torch.stack([partner_score, score], dim=1).softmax(dim=1)
+                expected = (
+                    (pairs * weights).sum(dim=1),
+                    torch.where(pos % 2 == 1, pos - 1, pos),
+                    out_loc.clamp_min(0),
+                )
+
+                actual = pair_pool_decode(
+                    kv,
+                    score,
+                    pos,
+                    raw_loc,
+                    out_loc,
+                    req,
+                    fused_state[:, :dim],
+                    fused_state[:, dim:],
+                    fused_state.shape[0] - 1,
+                    ring_size=ring_size,
+                )
+
+                for got, wanted in zip(actual, expected):
+                    torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    fused_state, state.kv_score_buffer.kv_score, rtol=0, atol=0
+                )
+
+    def test_ragged_verify_metadata_preserves_low_ratio_row_mapping(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.speculative_num_draft_tokens = 6
+        backend.needs_cpu_seq_lens = False
+        backend.has_c4 = False
+        backend.has_c128 = False
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 384
+        backend.req_to_token = torch.empty((3, 384), dtype=torch.int32)
+        backend.token_to_kv_pool = SimpleNamespace()
+
+        repeated = torch.tensor([2, 2, 0, 0, 0, 1], dtype=torch.int64)
+        positions = torch.tensor([260, 261, 6, 7, 8, 129], dtype=torch.int32)
+        core = SimpleNamespace(low_ratios=(), positions_casual=positions)
+        backend._expand_prefill_casually_vectorized = mock.Mock(
+            return_value=(positions + 1, repeated)
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+
+        raw = module.DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([260, 6, 129], dtype=torch.int32),
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+            extend_seq_lens=torch.tensor([2, 3, 1], dtype=torch.int32),
+            extend_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+            verify_lens=torch.tensor([2, 3, 1], dtype=torch.int32),
+            total_verify_tokens=6,
+        )
+
+        metadata = backend.make_forward_metadata_from_raw_verify(raw)
+
+        torch.testing.assert_close(metadata.low_ratio_req_indices, repeated)
+        torch.testing.assert_close(
+            metadata.low_ratio_pos_i64, positions.to(torch.int64)
+        )
+
+    def _run_candidate_case(
+        self, forward_mode, req, length_steps, *, use_topk_v2=False
+    ):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        width, ratio, topk = 384, 2, 3
+        pages = torch.tensor([[7, 5, 1], [6, 4, 2], [9, 8, 3]])
+        tokens = torch.arange(width * ratio)
+        mapping = pages[:, tokens // 256] * 256 + tokens % 256
+        page_indices = torch.full((len(req), topk), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        core = SimpleNamespace(
+            sparse_page_indices=lambda _: page_indices,
+            sparse_raw_indices=lambda _: raw_indices,
+        )
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.forward_metadata = module.DSV4Metadata(
+            core_attn_metadata=core,
+            indexer_metadata=None,
+            c2_indexer_metadata=SimpleNamespace(
+                max_compressed_seq_len=width,
+                use_topk_v2=use_topk_v2,
+                compressed_seq_lens=torch.full((len(req),), width, dtype=torch.int32),
+                topk_metadata=torch.empty(0),
+            ),
+        )
+        backend.req_to_token = mapping
+        backend.candidate_masks = None
+        table = torch.zeros((1, 64 * 68), dtype=torch.uint8)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=lambda _: table
+        )
+        indexer = SimpleNamespace(
+            queries=lambda q, _: q,
+            head_weights=lambda x: x,
+            candidate_topk_blocks=4,
+            candidate_block_size=4,
+            index_topk=topk,
+        )
+        layer = SimpleNamespace(
+            indexer=indexer,
+            freqs_cis=torch.zeros(width * ratio, 1),
+            compress_ratio=ratio,
+            layer_id=20,
+        )
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+        columns = torch.arange(width)
+
+        def score(q, weights, slots, lens, table, page_size):
+            # Distinct physical slots receive distinct scores for each query.
+            return (slots.float() * q).masked_fill(
+                torch.arange(slots.shape[1]) >= lens[:, None], -torch.inf
+            )
+
+        def score_mapping(
+            q,
+            weights,
+            req_to_token,
+            req_rows,
+            lens,
+            table,
+            page_size,
+            ratio,
+            width,
+            candidate_block_size=0,
+            write_logits=True,
+        ):
+            logical = torch.arange(width)
+            slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
+            logits = score(q, weights, slots, lens, table, page_size)
+            if not candidate_block_size:
+                return logits
+            block_scores = logits.unflatten(-1, (-1, candidate_block_size)).amax(dim=-1)
+            last = (lens - 1) // candidate_block_size
+            block_scores = block_scores.masked_fill(
+                torch.arange(block_scores.shape[1]) == last[:, None], torch.inf
+            )
+            block_lens = (lens + candidate_block_size - 1) // candidate_block_size
+            if not write_logits:
+                return block_scores, block_lens
+            return logits, block_scores, block_lens
+
+        def score_candidate_blocks(
+            q,
+            weights,
+            req_to_token,
+            req_rows,
+            candidate_blocks,
+            candidate_lens,
+            table,
+            page_size,
+            ratio,
+            block_size,
+        ):
+            positions = (
+                candidate_blocks[:, :, None] * block_size + torch.arange(block_size)
+            ).flatten(1)
+            valid = torch.arange(positions.shape[1]) < candidate_lens[:, None]
+            safe_positions = positions.clamp_max(width - 1)
+            slots = req_to_token[req_rows[:, None], safe_positions * ratio] // ratio
+            return score(
+                q, weights, slots, candidate_lens, table, page_size
+            ).masked_fill(~valid, -torch.inf)
+
+        def topk_v2(scores, lens, page_table, out, page_size, metadata):
+            self.assertEqual(lens.dtype, torch.int32)
+            out.fill_(-1)
+            k = min(out.shape[1], scores.shape[1])
+            out[:, :k] = scores.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
+
+        def publish_candidates(
+            block_scores,
+            block_lens,
+            lens,
+            *,
+            topk_blocks,
+            block_size,
+        ):
+            top = block_scores.topk(topk_blocks, dim=-1)
+            blocks = (
+                top.indices.masked_fill(top.values == -torch.inf, block_scores.shape[1])
+                .sort(dim=-1)
+                .values
+            )
+            positions = (
+                blocks[:, :, None] * block_size + torch.arange(block_size)
+            ).flatten(1)
+            valid = positions < lens[:, None]
+            return (
+                blocks.to(torch.int32),
+                valid.sum(dim=-1).to(torch.int32),
+                torch.empty(0),
+            )
+
+        def finalize_topk(
+            selected,
+            scores,
+            score_lens,
+            req_to_token,
+            req_rows,
+            page_out,
+            raw_out,
+            *,
+            ratio,
+            candidate_blocks=None,
+            candidate_block_size=1,
+        ):
+            selected = selected.to(torch.int64)
+            selected_scores = scores.gather(1, selected.clamp(0, scores.shape[1] - 1))
+            valid = (
+                (selected >= 0)
+                & (selected < score_lens[:, None])
+                & (selected_scores > -torch.inf)
+            )
+            selected = selected.masked_fill(~valid, scores.shape[1]).sort(1).values
+            valid = selected < score_lens[:, None]
+            if candidate_blocks is None:
+                logical = selected
+                slots = (
+                    req_to_token[
+                        req_rows[:, None],
+                        logical.clamp_max(scores.shape[1] - 1) * ratio,
+                    ]
+                    // ratio
+                )
+            else:
+                safe = selected.clamp_max(scores.shape[1] - 1)
+                blocks = candidate_blocks.gather(1, safe // candidate_block_size)
+                logical = blocks * candidate_block_size + safe % candidate_block_size
+                slots = (
+                    req_to_token[
+                        req_rows[:, None], logical.clamp_max(width - 1) * ratio
+                    ]
+                    // ratio
+                )
+            page_out.fill_(-1)
+            page_out[:, : selected.shape[1]] = slots.masked_fill(~valid, -1)
+            if raw_out is not None:
+                raw_out.fill_(-1)
+                raw_out[:, : selected.shape[1]] = logical.masked_fill(~valid, -1)
+
+        for lengths in length_steps:
+            backend.forward_metadata.sm90_candidates = None
+            lens = torch.tensor(lengths)
+            pos = (lens * ratio - 1).clamp_min(0)
+            mapping.copy_(mapping.roll(1, dims=0))
+            full_slots = mapping[req[:, None], columns * ratio] // ratio
+            source_scores = score(
+                torch.ones(len(req), 1), None, full_slots, lens, table, 64
+            )
+            candidates = module.select_candidate_blocks(
+                source_scores, lens[:, None], 4, 4
+            )
+            with (
+                mock.patch.object(
+                    module,
+                    "fp4_index_logits_candidate_blocks",
+                    side_effect=score_candidate_blocks,
+                ) as compact_logits,
+                mock.patch.object(
+                    module,
+                    "fp4_index_logits_req_to_token",
+                    side_effect=score_mapping,
+                ) as full_logits,
+                mock.patch.object(
+                    module, "topk_transform_paged_v2", side_effect=topk_v2
+                ) as full_topk,
+                mock.patch(
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.candidate_block_state",
+                    side_effect=publish_candidates,
+                ),
+                mock.patch(
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.finalize_candidate_topk",
+                    side_effect=finalize_topk,
+                ),
+            ):
+                indexer.is_candidate_source = False
+                indexer.uses_candidates = False
+                layer.layer_id = 2
+                q = torch.ones(len(req), 1)
+                backend._low_ratio_index_topk_sm90(layer, q, q, req, pos, forward_batch)
+                self.assertEqual(full_logits.call_count, 1)
+                self.assertEqual(compact_logits.call_count, 0)
+                self.assertIsNone(backend.forward_metadata.sm90_candidates)
+                full_logits.reset_mock()
+                full_topk.reset_mock()
+
+                for i in range(5):
+                    indexer.is_candidate_source = i == 0
+                    indexer.uses_candidates = i > 0
+                    layer.layer_id = 20 + i * 4
+                    q = torch.full((len(req), 1), (-1) ** i * (i + 1))
+                    backend._low_ratio_index_topk_sm90(
+                        layer, q, q, req, pos, forward_batch
+                    )
+                    expected_scores = score(q, None, full_slots, lens, table, 64)
+                    if i:
+                        expected_scores.masked_fill_(~candidates, -torch.inf)
+                    values, chosen = expected_scores.topk(topk, dim=1)
+                    chosen = (
+                        chosen.masked_fill(values == -torch.inf, width).sort(1).values
+                    )
+                    valid = chosen < width
+                    expected_pages = full_slots.gather(
+                        1, chosen.clamp_max(width - 1)
+                    ).masked_fill(~valid, -1)
+                    torch.testing.assert_close(
+                        page_indices, expected_pages.to(torch.int32)
+                    )
+                    torch.testing.assert_close(
+                        raw_indices, chosen.masked_fill(~valid, -1).to(torch.int32)
+                    )
+                    if i == 0:
+                        published = backend.forward_metadata.sm90_candidates
+                    else:
+                        self.assertIs(
+                            backend.forward_metadata.sm90_candidates, published
+                        )
+                        blocks, counts, _ = published
+                        self.assertIs(compact_logits.call_args.args[4], blocks)
+                        positions = (blocks[:, :, None] * 4 + torch.arange(4)).flatten(
+                            1
+                        )
+                        torch.testing.assert_close(
+                            positions < lens[:, None],
+                            torch.arange(positions.shape[1]) < counts[:, None],
+                        )
+                self.assertEqual(full_logits.call_args.args[-1], width)
+                self.assertEqual(full_topk.call_count, 5)
+                self.assertEqual(
+                    [call.args[4].shape[1] for call in compact_logits.call_args_list],
+                    [4, 4, 4, 4, 4],
+                )
+
+    def test_decode_candidates_preserve_slots_across_layers_and_steps(self):
+        self._run_candidate_case(
+            ForwardMode.DECODE,
+            torch.tensor([2, 0, 1]),
+            ([261, 7, 0], [130, 260, 3]),
+        )
+
+    def test_static_verify_candidates_preserve_per_token_rows(self):
+        self._run_candidate_case(
+            ForwardMode.TARGET_VERIFY,
+            torch.tensor([2, 2, 0, 0, 1, 1]),
+            ([261, 262, 7, 8, 130, 131], [132, 133, 260, 261, 3, 4]),
+            use_topk_v2=True,
+        )
+
+    def test_ragged_verify_candidates_preserve_per_token_rows(self):
+        self._run_candidate_case(
+            ForwardMode.TARGET_VERIFY,
+            torch.tensor([2, 2, 0, 0, 0, 1]),
+            ([261, 262, 7, 8, 9, 130], [132, 133, 260, 261, 262, 3]),
+        )
+
+
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """SWA writes must translate live locations for idle or missing/mismatched caches.
     A matching cache on an active forward must be reused.
