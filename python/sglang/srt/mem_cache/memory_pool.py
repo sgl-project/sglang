@@ -547,6 +547,20 @@ class MambaPool:
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        if (
+            speculative_num_draft_tokens is not None
+            and _is_npu
+            and ssm_dtype != torch.bfloat16
+        ):
+            # recurrent_gated_delta_rule has a single bfloat16 instantiation and
+            # sizes its UB budget at two bytes per element; a wider state is not
+            # rejected but walked with a two-byte stride, corrupting it silently.
+            logger.warning(
+                f"Mamba SSM state dtype {ssm_dtype} is not supported by the NPU "
+                "speculative verify kernels; using bfloat16 instead. Set "
+                "SGLANG_MAMBA_SSM_DTYPE=bfloat16 to silence this warning."
+            )
+            ssm_dtype = torch.bfloat16
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
