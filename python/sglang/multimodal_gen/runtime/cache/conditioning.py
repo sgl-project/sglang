@@ -64,7 +64,7 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
-        tensor = value.detach().contiguous().cpu()
+        tensor = value.detach().cpu().contiguous()
         data = tensor.reshape(-1).view(torch.uint8).numpy()
         return (
             "tensor",
