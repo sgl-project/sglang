@@ -12,7 +12,7 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -28,11 +28,13 @@ fn config_for(_worker_url: &str) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -42,6 +44,7 @@ fn config_for(_worker_url: &str) -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -464,10 +467,16 @@ async fn non_streaming_upstream_429_preserved() {
         res.headers().get("content-type").unwrap().to_str().unwrap(),
         "application/json",
     );
-    // Router envelope code header must NOT be set — this is upstream's response.
+    // Router envelope headers must NOT be set — this is upstream's response.
+    // Their absence is exactly how a gateway tells "the engine said this" from
+    // "the router said this".
     assert!(
         res.headers().get("x-router-error-code").is_none(),
         "router envelope header must NOT be set on upstream-passthrough responses",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "no status was synthesized over the worker, so no x-router-upstream-status",
     );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -508,9 +517,166 @@ async fn non_streaming_upstream_500_preserved() {
         res.headers().get("x-router-error-code").is_none(),
         "router envelope must NOT wrap upstream 5xx — passthrough",
     );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "a complete worker 500 is forwarded verbatim — distinct from a \
+         synthesized 502 mid-body drop, which DOES echo the worker status",
+    );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(got, upstream_body);
+}
+
+/// A response the router FORWARDS from a worker with a non-2xx status is an
+/// `Ok(Response)` at the router layer — only transport failures become `Err`.
+/// The per-worker `worker_requests_total` outcome must therefore be derived from
+/// the client-visible HTTP status, not from `Result::Ok`/`Err`: a forwarded 5xx
+/// is counted `outcome="error"`, NOT credited as a success.
+#[tokio::test]
+async fn forwarded_5xx_records_worker_outcome_error_not_success() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"type": "server_error", "message": "boom"}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let m = ctx.metrics.render();
+    let error_line = format!(
+        r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="error"}} 1"#,
+        worker.url,
+    );
+    assert!(
+        m.contains(&error_line),
+        "a forwarded 5xx must be counted as outcome=\"error\"; got:\n{m}",
+    );
+    let success_line = format!(
+        r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}}"#,
+        worker.url,
+    );
+    assert!(
+        !m.contains(&success_line),
+        "a forwarded 5xx must NOT be credited as a success; got:\n{m}",
+    );
+}
+
+/// Buffer-backed `tracing` writer so a test can assert on the access log.
+#[derive(Clone)]
+struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for VecWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+    type Writer = VecWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install a permissive global subscriber once per test binary.
+///
+/// `tracing` caches each callsite's "interest" the first time it is hit. Under
+/// the parallel test harness a thread with no subscriber of its own evaluates
+/// the `http_request` callsite against `NoSubscriber`, which caches it as
+/// *never* interested — after which a per-test `set_default` capture on another
+/// thread records nothing, and an access-log assertion fails depending only on
+/// which test ran first. A global subscriber that is interested in everything
+/// keeps the callsite live; it discards what it receives, so per-test
+/// `set_default` buffers stay isolated to their own thread.
+fn prime_tracing_callsites() {
+    static PRIMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PRIMED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+    });
+}
+
+/// The access-log line for a DISPATCHED request must name the worker it was
+/// dispatched to. Only the chat handler knows that, so it attaches a
+/// `RequestLogContext` to the response — including on the post-dispatch error
+/// path, which is where "which engine failed" matters most. Without the attach
+/// the line is still emitted, just anonymous, so only a log assertion catches a
+/// regression here.
+#[tokio::test]
+async fn dispatched_error_names_its_worker_in_the_access_log() {
+    prime_tracing_callsites();
+    let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(VecWriter(buf.clone()))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // A worker that accepts the connection then drops it mid-body: dispatch
+    // succeeds, the request fails afterwards.
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"{\"partial\": ",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", "rid-dispatched-error")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let line = logs
+        .lines()
+        .find(|l| l.contains("rid-dispatched-error"))
+        .unwrap_or_else(|| panic!("no access-log line for the request; captured:\n{logs}"));
+    assert!(
+        line.contains(&format!(r#"worker="{}""#, worker.url)),
+        "a dispatched failure must name its worker: {line}",
+    );
+    assert!(
+        line.contains(r#"model="tiny""#) && line.contains(r#"outcome="error""#),
+        "a dispatched failure must carry model and outcome=error: {line}",
+    );
 }
 
 #[tokio::test]
@@ -667,12 +833,14 @@ async fn chat_rejects_string_body_400() {
 }
 
 #[tokio::test]
-async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
+async fn non_streaming_mid_body_drop_classified_as_upstream_body_incomplete() {
     // Regression: when the upstream replies with a status line and headers
     // but drops the connection mid-body, the failure is NOT
     // "upstream_unreachable" (the upstream demonstrably DID reply). It must
-    // be classified as `upstream_status` so the operator-visible envelope
-    // reflects that the worker partially served the request.
+    // be classified as `upstream_body_incomplete` so the operator-visible
+    // envelope reflects that the worker partially served the request — and the
+    // worker's own status must survive in `x-router-upstream-status` rather
+    // than being replaced by the router's synthesized 502.
     let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
         StatusCode::OK,
         b"{\"partial\": ",
@@ -702,8 +870,13 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
     );
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "upstream_status",
-        "mid-body drop must be upstream_status (worker DID reply), not upstream_unreachable",
+        "upstream_body_incomplete",
+        "mid-body drop must be upstream_body_incomplete (worker DID reply), not upstream_unreachable",
+    );
+    assert_eq!(
+        res.headers().get("x-router-upstream-status").unwrap(),
+        "200",
+        "the worker's own status must be echoed, not discarded behind the 502",
     );
 }
 
@@ -838,6 +1011,7 @@ async fn forward_json_to_records_failure_on_body_drop() {
     let res: Result<_, ApiError> = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -894,6 +1068,7 @@ async fn forward_json_to_records_success_only_after_body_completes() {
     let res: Result<_, ApiError> = proxy
         .forward_json_to(
             &ok_worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -944,10 +1119,12 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     let res: Result<_, ApiError> = proxy
         .forward_streaming_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
             None,
         )
@@ -966,6 +1143,61 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     assert!(
         !breaker.would_allow(),
         "stream drop must trip the breaker (threshold=1)"
+    );
+}
+
+/// Client-visible contract of a streaming mid-body drop, through `build_router`.
+/// This is the asymmetric half of the non-streaming case: headers were already
+/// sent as 200, so the client keeps a 200 (NOT the synthesized 502 of the
+/// non-streaming path), there is NO `x-router-error-code` /
+/// `x-router-upstream-status`, and `responses_total` counts it as a 200 (the
+/// breaker / duration metrics capture the mid-stream failure — see the breaker
+/// test above).
+#[tokio::test]
+async fn streaming_mid_body_drop_stays_200_with_no_router_headers() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: hi\n\n",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "streaming mid-drop: headers were already sent as 200, so the client keeps 200",
+    );
+    assert!(
+        res.headers().get("x-router-error-code").is_none(),
+        "a 200-then-drop stream is not router-originated — no x-router-error-code",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "no status was synthesized over the worker, so no x-router-upstream-status",
+    );
+    let _ = res.into_body().collect().await;
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        ),
+        "a streaming mid-drop counts as a 200 at the edge: {m}",
     );
 }
 
@@ -993,6 +1225,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     let _: Result<_, ApiError> = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -1026,6 +1259,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     let res = proxy
         .forward_json_to(
             &worker.url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -1063,6 +1297,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
     let res = proxy
         .forward_json_to(
             "not-a-url",
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -1319,35 +1554,20 @@ async fn streaming_active_load_drops_on_client_disconnect() {
         Duration::from_millis(100),
     )
     .await;
-    let ctx = build_ctx_with_worker(&worker.url);
+    let (ctx, body) = stream_chat(&worker.url).await;
     let active_load = Arc::clone(&ctx.active_load);
-    let app = build_router(ctx);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": true,
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
 
     // Read one chunk to confirm the stream is live, then drop the body.
     use futures::StreamExt;
-    let mut data_stream = res.into_body().into_data_stream();
+    let mut data_stream = body.into_data_stream();
     let _first = data_stream.next().await;
     drop(data_stream);
 
-    // Wait long enough for the SSE pump to notice the receiver-drop and
-    // exit (per `bytes_stream_to_body_breaks_on_client_disconnect` test
-    // in sse.rs, that takes well under 200 ms).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="client_disconnect"}} 1"#,
+        worker.url,
+    );
+    wait_for_metric(&ctx, &expected).await;
 
     assert_eq!(
         active_load.inflight_count(),
@@ -1476,4 +1696,112 @@ async fn non_streaming_error_path_drops_active_load_guard() {
         0,
         "error path must drop the active-load guard",
     );
+}
+
+fn has_metric_line(metrics: &str, expected: &str) -> bool {
+    metrics.lines().any(|line| line == expected)
+}
+
+/// Send a streaming request and wait for the expected metric.
+async fn stream_chat_and_render(
+    worker_url: &str,
+    expected_metric: &str,
+) -> (Arc<AppContext>, String) {
+    let (ctx, body) = stream_chat(worker_url).await;
+    body.collect().await.unwrap();
+    let metrics = wait_for_metric(&ctx, expected_metric).await;
+    (ctx, metrics)
+}
+
+async fn stream_chat(worker_url: &str) -> (Arc<AppContext>, Body) {
+    let ctx = build_ctx_with_worker(worker_url);
+    let app = build_router(ctx.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    (ctx, res.into_body())
+}
+
+async fn wait_for_metric(ctx: &AppContext, expected_metric: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = ctx.metrics.render();
+        if has_metric_line(&metrics, expected_metric) {
+            return metrics;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for `{expected_metric}`; got:\n{metrics}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A post-200 SSE error event is classified without affecting routing health.
+#[tokio::test]
+async fn streaming_error_event_records_outcome_without_tripping_breaker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\": {\"message\": \"The request queue is full.\", \"code\": 503}}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="stream_error_event"}} 1"#,
+        worker.url,
+    );
+    let (ctx, metrics) = stream_chat_and_render(&worker.url, &expected).await;
+    assert!(has_metric_line(
+        &metrics,
+        r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+    ));
+    assert!(
+        ctx.registry
+            .all()
+            .iter()
+            .all(|worker| worker.breaker.would_allow()),
+        "SSE error event must not trip the circuit breaker",
+    );
+}
+
+#[tokio::test]
+async fn streaming_clean_completion_records_ok() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="ok"}} 1"#,
+        worker.url,
+    );
+    stream_chat_and_render(&worker.url, &expected).await;
+}
+
+#[tokio::test]
+async fn streaming_error_event_then_transport_failure_records_upstream_error() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: {\"error\": {\"code\": 503}}\n\n",
+    )
+    .await;
+    let (ctx, body) = stream_chat(&worker.url).await;
+    assert!(body.collect().await.is_err());
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="upstream_error"}} 1"#,
+        worker.url,
+    );
+    wait_for_metric(&ctx, &expected).await;
 }

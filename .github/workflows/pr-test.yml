@@ -187,7 +187,7 @@ jobs:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   sgl-kernel-build-wheels-arm:
@@ -205,7 +205,7 @@ jobs:
       job_display_name: Build Wheel Arm
       arch_suffix: '-aarch64'
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   # =============================================== Rust extensions ====================================================
@@ -228,7 +228,7 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   # gb300 is Grace, and PyO3 modules are portable across neither arch nor
@@ -248,7 +248,7 @@ jobs:
       artifact_name: rust-ext-aarch64
       cache_key_prefix: rust-ext-aarch64-cp310-cp312
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   call-sgl-kernel-tests:
@@ -263,7 +263,7 @@ jobs:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -289,7 +289,7 @@ jobs:
       sgl_kernel: ${{ (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) && 'false' || needs.check-changes.outputs.sgl_kernel }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -403,7 +403,7 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
+      skip_pr_test_health_check: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 

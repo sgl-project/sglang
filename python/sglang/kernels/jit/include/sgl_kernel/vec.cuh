@@ -118,6 +118,23 @@ struct AlignedVector {
   storage_t m_storage;
 };
 
+/// \brief Maximum vector width for coalesced memory access on GPU.
+struct LoadStoreBytes {
+  enum type : int64_t {
+    MAX_GMEM = device::kMaxVecBytes,  // architecture-dependent
+    MAX_SMEM = 16,                    // smem only support 16B op
+    MAX_PORTABLE = 16,                // general across CUDA/HIP
+    MIN_COALALESCED = 4,              // minimum for coalesced access
+    // some common vector widths for load/store
+    RAW_1B = 1,
+    RAW_2B = 2,
+    RAW_4B = 4,
+    RAW_8B = 8,
+    RAW_16B = 16,
+    RAW_32B = 32,
+  };  // namespace device
+};
+
 /// Sum `M` vectors element-wise into one, accumulating in fp32 regardless of
 /// the packed element type. Used by every collective that reduces peer
 /// contributions in registers.
