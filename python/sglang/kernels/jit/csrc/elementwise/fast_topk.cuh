@@ -200,7 +200,10 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
           const auto key = convert_to_uint32(raw);
           bool ok = true;
           for (int p = 0; p < round; ++p) {
-            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) { ok = false; break; }
+            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) {
+              ok = false;
+              break;
+            }
           }
           if (!ok) continue;
         } else {
@@ -231,7 +234,10 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
           const auto key = convert_to_uint32(raw_input);
           bool ok = true;
           for (int p = 0; p < round; ++p) {
-            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) { ok = false; break; }
+            if (((key >> (24 - 8 * p)) & 0xFF) != s_prefix_bins[p]) {
+              ok = false;
+              break;
+            }
           }
           if (!ok) continue;
         } else {
