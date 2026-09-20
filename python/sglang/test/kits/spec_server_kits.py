@@ -161,6 +161,11 @@ class SpecParityKit:
                 "--dtype",
                 cls.dtype,
                 *(["--trust-remote-code"] if cls.trust_remote_code else []),
+                *(
+                    ["--enable-deterministic-inference"]
+                    if cls.enable_deterministic_inference
+                    else []
+                ),
             ],
         )
         try:
@@ -381,8 +386,8 @@ class SpecLogprobKit:
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
 
-    def test_logprob_spec_v2_match(self):
-        """Verify spec v2 decode logprobs match prefill scoring logprobs."""
+    def test_logprob_decode_match_prefill(self):
+        """Decode logprobs from the spec path must match prefill scoring."""
         top_k = 5
         probe_token_ids = [1, 2, 10, 100, 1000]
         prompts = [

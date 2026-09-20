@@ -22,7 +22,9 @@ class TestMLADeepseekV3(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                ["--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -59,7 +61,7 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--cuda-graph-max-bs", "2"])
+            other_args.extend(["--cuda-graph-max-bs-decode", "2"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -107,7 +109,7 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
                     "fa3",
                     "--mem-fraction-static",
                     "0.8",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "2",
                 ]
             )
@@ -145,7 +147,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
             "--disable-radix",
             "--enable-torch-compile",

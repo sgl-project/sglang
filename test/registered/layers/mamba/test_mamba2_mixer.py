@@ -10,14 +10,16 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     update_environment_variables,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_default_distributed_backend,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
+register_xpu_ci(est_time=60, suite="nightly-xpu-2-gpu", nightly=True)
 
 NUM_GPUS = 2
 
@@ -42,9 +44,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
 
-    assert (
-        get_device_count() >= NUM_GPUS
-    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    assert get_device_count() >= NUM_GPUS, (
+        f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    )
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS
@@ -96,9 +98,12 @@ def mixer2_gated_norm_tensor_parallel(
         }
     )
 
-    # initialize distributed
+    # nccl on CUDA, xccl on XPU, ...; the parameter default is always "nccl".
     init_distributed_environment(
-        world_size=world_size, rank=local_rank, local_rank=local_rank
+        world_size=world_size,
+        rank=local_rank,
+        local_rank=local_rank,
+        backend=get_default_distributed_backend(device.type),
     )
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
@@ -109,9 +114,12 @@ def mixer2_gated_norm_tensor_parallel(
 
     import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
 
-    # Force attn-TP rank through the context (the weight loader reads it via
-    # get_parallel().attn_tp_rank); avoids calling initialize_dp_attention.
-    with get_parallel().override(attn_tp_rank=local_rank):
+    # Force the TP topology through the context (the weight loader reads
+    # get_parallel().attn_tp_rank, Mixer2RMSNormGated reads tp_size / tp_rank);
+    # avoids calling initialize_dp_attention.
+    with get_parallel().override(
+        attn_tp_rank=local_rank, tp_size=world_size, tp_rank=local_rank
+    ):
         # create gated-norm with TP
         mixer = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,

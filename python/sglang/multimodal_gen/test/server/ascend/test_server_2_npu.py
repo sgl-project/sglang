@@ -7,23 +7,17 @@ If the actual run is significantly better than the baseline, the improved cases 
 
 from __future__ import annotations
 
-import pytest
-
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import TWO_NPU_CASES
+from sglang.multimodal_gen.test.server.common.case_fixtures import (
+    diffusion_case_fixture,
+)
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
-
-logger = init_logger(__name__)
 
 
 class TestDiffusionServerTwoNpu(DiffusionServerBase):
     """Performance tests for 2-NPU diffusion cases."""
 
-    @pytest.fixture(params=TWO_NPU_CASES, ids=lambda c: c.id)
-    def case(self, request) -> DiffusionTestCase:
-        """Provide a DiffusionTestCase for each 2-NPU test."""
-        return request.param
+    case = diffusion_case_fixture(TWO_NPU_CASES)

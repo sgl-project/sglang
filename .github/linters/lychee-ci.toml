@@ -9,14 +9,9 @@ max_retries = 2
 offline = false
 scheme = ["http", "https"]
 
-exclude_path = [
-  # Exclude generated Sphinx build artifacts.
-  # - "(\\./)?" allows both "docs/..." and "./docs/..."
-  # - "[/\\\\]" supports both slash styles in CI environments
-  "^(\\./)?docs[/\\\\]_build[/\\\\]",
-]
-
 exclude = [
+  # Slack invite link returns 403 to CI user-agents (anti-bot); the link is valid.
+  "^https://slack\\.sglang\\.io(/|$)",
   # Local-only endpoints referenced in docs/examples.
   # These are expected to be unreachable in GitHub-hosted CI.
   "^https?://localhost(:[0-9]+)?(/|$)",

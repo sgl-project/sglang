@@ -12,8 +12,8 @@ import torch
 from torch.nn import Parameter
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank
-from sglang.multimodal_gen.runtime.models.utils import _make_synced_weight_loader
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_attrs import make_synced_weight_loader
 
 logger = init_logger(__name__)
 
@@ -50,7 +50,7 @@ class BasevLLMParameter(Parameter):
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         if current_platform.is_tpu():
-            weight_loader = _make_synced_weight_loader(weight_loader)
+            weight_loader = make_synced_weight_loader(weight_loader)
 
         self._weight_loader = weight_loader
 
@@ -419,6 +419,6 @@ def permute_param_layout_(
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor
 ) -> tuple[Any, Any]:
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     return shard_size, shard_offset

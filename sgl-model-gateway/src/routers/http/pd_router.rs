@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -36,6 +39,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
+        responses::ResponsesRequest,
     },
     routers::{
         error,
@@ -419,6 +423,10 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        // ResponsesRequest serializes an absent stream as null, which SRT rejects.
+                        if context.route == "/v1/responses" {
+                            json_request["stream"] = Value::Bool(context.is_stream);
+                        }
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -530,7 +538,8 @@ impl PDRouter {
 
         if context.is_stream {
             // Handle streaming error response
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.remove(CONTENT_LENGTH);
             let error_payload = match res.bytes().await {
                 Ok(error_body) => match serde_json::from_slice::<Value>(&error_body) {
                     Ok(error_json) => {
@@ -555,10 +564,7 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
+            let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             self.create_streaming_response(
@@ -694,16 +700,83 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Run both in this handler task (not a detached tokio::spawn) so a client
+        // disconnect cancels the pending decode request too, keeping the
+        // upstream-cancel behavior from #19524.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let prefill_fut = prefill_request.send();
+        let decode_fut = decode_request.send();
+        tokio::pin!(prefill_fut);
+        tokio::pin!(decode_fut);
+
+        // Poll both until prefill resolves; decode normally resolves later, but
+        // may resolve first if it rejects the request outright.
+        let prefill_result;
+        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        loop {
+            tokio::select! {
+                biased;
+                pr = &mut prefill_fut => {
+                    prefill_result = pr;
+                    break;
+                }
+                dr = &mut decode_fut, if decode_early.is_none() => {
+                    decode_early = Some(dr);
+                }
+            }
+        }
+
+        // Decode can't generate without prefill's KV, so any prefill failure
+        // (non-2xx / transport error) dooms the paired decode request, which would
+        // otherwise block in WaitingForInput until the 300s disaggregation
+        // timeout. Drop the decode future to close its connection; the decode
+        // engine then detects the disconnect and aborts the request in ~4-8s.
+        let prefill_failed = match &prefill_result {
+            Ok(resp) => !resp.status().is_success(),
+            Err(_) => true,
+        };
+
+        if prefill_failed {
+            warn!(
+                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
+                decode.url(),
+                prefill.url()
+            );
+
+            // Tick prefill by its real status (4xx = client fault). Don't record
+            // decode: it was cancelled due to a prefill fault, not its own, so a
+            // prefill error storm can't trip healthy decode breakers.
+            let prefill_ok = match &prefill_result {
+                Ok(r) => r.status().is_client_error(),
+                Err(_) => false,
+            };
+            prefill.record_outcome(prefill_ok);
+
+            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            let mut response = match self
+                .process_prefill_response(prefill_result, prefill.url(), false)
+                .await
+            {
+                Err(error_response) => error_response,
+                Ok(_) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill reported failure but returned a success response".to_string(),
+                ),
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        // Prefill ok: take decode's result, awaiting it if still pending.
+        let decode_result = match decode_early {
+            Some(dr) => dr,
+            None => (&mut decode_fut).await,
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -1579,6 +1652,50 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let is_stream = body.is_stream();
+
+        // Reject detached requests even when workers lack response-store
+        // admission checks: the PD router cannot complete their retrieval /
+        // cancel lifecycle. Attached requests still undergo serving-side
+        // capability validation, including rejection of background streams
+        // when response storage is unavailable.
+        if body.background.unwrap_or(false) && !is_stream {
+            warn!("PD mode does not support detached background responses; returning bad request");
+            return error::bad_request(
+                "pd_unsupported_background_responses",
+                "PD mode does not support background responses without streaming",
+            );
+        }
+
+        let request_text = if self.policies_need_request_text() {
+            let text = body.extract_text_for_routing();
+            (!text.is_empty()).then_some(text)
+        } else {
+            None
+        };
+
+        let context = PDRequestContext {
+            route: "/v1/responses",
+            // The Responses API carries one logical response per request.
+            batch_size: None,
+            is_stream,
+            // The PD logprob merging expects /generate-style meta_info,
+            // which the Responses API schema does not carry.
+            return_logprob: false,
             request_text,
             model_id,
             headers: headers.cloned(),
