@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
     RuntimeContext,
     SpawnRanks,
     _FlagGroupBase,
-    _validate_parallel,
     assert_published,
     derive_parallel_widths,
     get_context,
@@ -123,40 +122,48 @@ def _parallel_state():
 
 _DP = "sglang.srt.layers.dp_attention"
 
-# Ranks and the launch width are read off the group they are a position in:
-# they are not implied by anything else, and the group is the only thing that
-# knows. The quotients are not here -- `attn_tp_size` and its siblings are
-# functions of the configured leaves, and `TestDerivedWidths` pins them.
-# `attn_dp_rank` is not here either: no group coordinator knows it, so it is
-# stamped when the attention topology is initialized and `TestStampedRanks` is
-# what pins it. The other world width is not here because the group does not
-# know it; `TestTheTwoWorldWidths` pins it.
-#: (name, the group it is a position in, the member that answers it).
-SIZE_RANK_DELEGATIONS = [
-    ("launch_world_size", "world_group", "world_size"),
-    ("launch_world_rank", "world_group", "rank_in_group"),
-    ("tp_rank", "tp_group", "rank_in_group"),
-    ("dcp_rank", "dcp_group", "rank_in_group"),
-    ("pp_rank", "pp_group", "rank_in_group"),
-    ("moe_ep_rank", "moe_ep_group", "rank_in_group"),
-    ("moe_dp_rank", "moe_dp_group", "rank_in_group"),
-    ("moe_tp_rank", "moe_tp_group", "rank_in_group"),
-    ("attn_tp_rank", "attn_tp_group", "rank_in_group"),
-    ("attn_cp_rank", "attn_cp_group", "rank_in_group"),
-]
+#: The groups `initialize_model_parallel` states on the context, by the module
+#: global it builds each one into. WORLD is not among them: it is built and
+#: stated by `init_distributed_environment`, one call earlier.
+GROUP_STAMPS = {
+    "tp_group": "_TP",
+    "dcp_group": "_DCP",
+    "pp_group": "_PP",
+    "moe_ep_group": "_MOE_EP",
+    "moe_dp_group": "_MOE_DP",
+    "moe_tp_group": "_MOE_TP",
+    "attn_tp_group": "_ATTN_TP",
+    "attn_cp_group": "_ATTN_CP",
+    "shared_experts_tp_group": "_SHARED_EXPERTS_TP",
+}
 
-#: (context name, the module global the build stores that group in).
-GROUP_DELEGATIONS = [
-    ("world_group", "_WORLD"),
-    ("tp_group", "_TP"),
-    ("dcp_group", "_DCP"),
-    ("pp_group", "_PP"),
-    ("moe_ep_group", "_MOE_EP"),
-    ("moe_dp_group", "_MOE_DP"),
-    ("moe_tp_group", "_MOE_TP"),
-    ("attn_tp_group", "_ATTN_TP"),
-    ("attn_cp_group", "_ATTN_CP"),
-]
+
+def _groups_the_build_states() -> dict:
+    """What `initialize_model_parallel` hands the context, read out of its
+    source: `{context name: the module global it passes}`.
+
+    Out of the source because that is the only place the whole set appears at
+    once -- calling the function needs ten live process groups.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.distributed import parallel_state
+
+    body = textwrap.dedent(inspect.getsource(parallel_state.initialize_model_parallel))
+    for node in ast.walk(ast.parse(body)):
+        keys = getattr(node, "keys", None)
+        if (
+            isinstance(node, ast.Dict)
+            and keys
+            and all(
+                isinstance(k, ast.Constant) and str(k.value).endswith("_group")
+                for k in keys
+            )
+        ):
+            return {k.value: v.id for k, v in zip(node.keys, node.values)}
+    raise AssertionError("initialize_model_parallel states no group at all")
 
 
 class TestRuntimeContextSingletons(CustomTestCase):
@@ -184,43 +191,91 @@ class _IsolatedOverrides(CustomTestCase):
         super().tearDown()
 
 
-class TestParallelDelegation(_IsolatedOverrides):
-    def test_a_rank_is_read_off_the_group_it_is_a_rank_in(self):
-        # A distinct sentinel per group: a miswired name would read a different
-        # (unpatched) group and fail rather than agree by accident.
-        for i, (attr, group, member) in enumerate(SIZE_RANK_DELEGATIONS):
-            sentinel = 1000 + i
-            with get_parallel().override(
-                **{group: SimpleNamespace(**{member: sentinel})}
-            ):
-                self.assertEqual(
-                    getattr(get_parallel(), attr),
-                    sentinel,
-                    msg=f"{attr} must read {group}.{member}",
-                )
+class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
+    """Nothing derives a group, so one the build forgets to state is a name
+    that answers "not written" for the rest of the process -- and the reader
+    that finds out is a model layer, a long way from here."""
 
-    def test_a_rank_follows_the_group_a_scope_installs(self):
-        """The reason they are read off the group rather than stated beside it:
-        a scope that swaps the group moves the rank with it, and cannot install
-        one without the other."""
-        with get_parallel().override(tp_group=SimpleNamespace(rank_in_group=3)):
-            self.assertEqual(get_parallel().tp_rank, 3)
-            with get_parallel().override(tp_group=SimpleNamespace(rank_in_group=5)):
-                self.assertEqual(get_parallel().tp_rank, 5)
-            self.assertEqual(get_parallel().tp_rank, 3)
+    def test_the_build_states_every_group_the_context_declares(self):
+        from sglang.srt.runtime_context import _parallel_fields
 
-    def test_a_group_is_read_from_where_the_build_stored_it(self):
+        declared = {name for name in _parallel_fields() if name.endswith("_group")}
+        self.assertEqual(declared, set(GROUP_STAMPS) | {"world_group"})
+
+    def test_the_world_group_is_stated_where_it_is_built(self):
+        """`initialize_model_parallel` places every group it builds by reading
+        `get_world_group().local_rank`, so WORLD has to be answerable before it
+        runs -- one function earlier, where it is constructed."""
+        import ast
+        import inspect
+        import textwrap
+
         from sglang.srt.distributed import parallel_state
 
-        for attr, stored_in in GROUP_DELEGATIONS:
-            sentinel = object()
-            with patch.object(parallel_state, stored_in, sentinel):
-                self.assertIs(
-                    getattr(get_parallel(), attr),
-                    sentinel,
-                    msg=f"{attr} must read parallel_state.{stored_in}",
-                )
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.init_distributed_environment)
+        )
+        stated = {
+            kw.arg
+            for node in ast.walk(ast.parse(body))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "override_permanently"
+            for kw in node.keywords
+        }
+        self.assertIn("world_group", stated)
 
+    def test_nothing_reads_a_name_this_build_has_not_stated_yet(self):
+        """The stamp is at the end, so a getter called before it answers a name
+        nothing has written -- a crash at startup, in a process no unit test
+        runs. What the function may read is what a *previous* call stated, and
+        that is WORLD alone: a rank belongs to the spawn, and this build does
+        not get to assume the spawn ran first."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed import parallel_state
+
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.initialize_model_parallel)
+        )
+        read = set()
+        for node in ast.walk(ast.parse(body)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                name = parallel_state._CONTEXT_NAME_OF.get(node.func.id)
+                if name is not None:
+                    read.add(name)
+        self.assertTrue(read, "no getter is called here; this proves nothing")
+        self.assertEqual(read - {"world_group"}, set())
+
+    def test_each_group_is_stated_from_the_global_it_was_built_into(self):
+        self.assertEqual(_groups_the_build_states(), GROUP_STAMPS)
+
+    def test_a_dimension_the_configuration_has_not_got_is_left_unstated(self):
+        """`_DCP` is None without decode context parallelism, and every one of
+        these getters has always refused to answer for a group that was never
+        built rather than handing back a None to fail on at the collective."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed import parallel_state
+
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.initialize_model_parallel)
+        )
+        stamp = next(
+            node
+            for node in ast.walk(ast.parse(body))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "override_permanently"
+        )
+        self.assertIn("is not None", ast.unparse(stamp))
+
+
+class TestParallelDelegation(_IsolatedOverrides):
     def test_wrapper_holds_no_resolved_state(self):
         # __slots__: no __dict__; the only instance state is the override hook.
         self.assertFalse(hasattr(get_parallel(), "__dict__"))
@@ -231,44 +286,46 @@ class TestParallelDelegation(_IsolatedOverrides):
 
 
 class TestTheTwoWorldWidths(_IsolatedOverrides):
-    """Two questions about the WORLD group: what it was built at, and what it
-    has room for.
+    """Two questions about the WORLD group: what it was launched at, and what
+    it has room for.
 
-    Neither is stored here. How much of that room is serving after a scale-up
-    is elastic-EP state, and is asked of the manager that owns it rather than
-    mirrored onto this namespace.
+    Both are arithmetic over the configured leaves and are worked out at
+    publish, so they answer in a process that never builds the group -- which
+    is where a good half of the readers are. How much of that room is serving
+    after a scale-up is neither of them: that is elastic-EP state, asked of the
+    manager that owns it rather than mirrored onto this namespace.
     """
 
-    def test_the_launch_width_is_what_the_group_was_built_at(self):
-        with patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=4)):
-            self.assertEqual(get_parallel().launch_world_size, 4)
+    def _published(self, **fields):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", **fields), role="test")
+        return get_parallel()
+
+    def test_the_launch_width_is_a_rank_per_stage_of_each_group(self):
+        self.assertEqual(self._published(tp_size=4, pp_size=2).launch_world_size, 8)
+
+    def test_the_launch_width_spans_the_ranks_a_joiner_came_in_above(self):
+        """A scale joiner lays its own groups out at `tp * pp`, while its WORLD
+        spans the cohort already running underneath it as well."""
+        parallel = self._published(tp_size=4, pp_size=1, ep_join_rank_offset=8)
+        self.assertEqual(parallel.launch_world_size, 12)
 
     def test_the_ceiling_is_the_configured_one_when_there_is_one(self):
-        parallel = get_parallel()
-        with (
-            parallel.override(max_ep_size=32),
-            patch.object(_parallel_state(), "_WORLD", None),
-        ):
-            self.assertEqual(parallel.max_world_size, 32)
+        self.assertEqual(self._published(tp_size=4, max_ep_size=32).max_world_size, 32)
 
     def test_without_a_configured_ceiling_the_room_is_the_launch_width(self):
-        parallel = get_parallel()
-        with (
-            parallel.override(max_ep_size=None),
-            patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=8)),
-        ):
-            self.assertEqual(parallel.max_world_size, 8)
+        parallel = self._published(tp_size=8)
+        self.assertEqual(parallel.launch_world_size, 8)
+        self.assertEqual(parallel.max_world_size, 8)
 
     def test_each_width_can_be_stated_on_its_own(self):
         """Stating one must not answer for the other: they are two names."""
-        parallel = get_parallel()
-        with (
-            parallel.override(launch_world_size=2, max_ep_size=None),
-            patch.object(_parallel_state(), "_WORLD", None),
-        ):
+        parallel = self._published(tp_size=8)
+        with parallel.override(launch_world_size=2):
             self.assertEqual(parallel.launch_world_size, 2)
-            self.assertEqual(parallel.max_world_size, 2)
-            with parallel.override(max_ep_size=6):
+            self.assertEqual(parallel.max_world_size, 8)
+            with parallel.override(max_world_size=6):
                 self.assertEqual(parallel.max_world_size, 6)
                 self.assertEqual(parallel.launch_world_size, 2)
 
@@ -405,13 +462,16 @@ class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
             self.assertEqual(get_parallel().attn_tp_rank, 1)
             self.assertEqual(get_parallel().attn_dp_rank, 1)
 
-    def test_without_a_bundle_it_still_asks_the_group(self):
-        """Unchanged for every process that publishes without a placement."""
+    def test_without_a_bundle_a_rank_read_says_what_is_missing(self):
+        """There is nothing to fall back to. Deriving one from whatever group
+        happens to be installed would answer a different question -- where this
+        process sits in that group, not where the launcher put it."""
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
-        with patch.object(
-            _parallel_state(), "_ATTN_TP", SimpleNamespace(rank_in_group=3)
-        ):
-            self.assertEqual(get_parallel().attn_tp_rank, 3)
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_tp_rank
+        message = str(caught.exception)
+        self.assertIn("has not been written in this process", message)
+        self.assertIn("override(attn_tp_rank=...)", message)
 
 
 class TestStampedRanks(_IsolatedOverrides):
@@ -588,16 +648,14 @@ class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
 
         The bag carries the declared quotients as well as the operator's
         leaves, and both are ahead of the live getter once a configuration is
-        published: a name in `_LIVE_READS` and in either of them would answer
+        published: a declared name that is also a leaf would answer
         from the getter before publish and from the bag after."""
         from sglang.srt.runtime_context import (
-            _LIVE_READS,
             _derived_widths,
             _parallel_config_leaves,
         )
 
-        self.assertEqual(set(_LIVE_READS) & _parallel_config_leaves(), set())
-        self.assertEqual(set(_LIVE_READS) & set(_derived_widths()), set())
+        self.assertEqual(set(_derived_widths()) & _parallel_config_leaves(), set())
 
     def test_an_undeclared_name_is_refused(self):
         with self.assertRaises(ValueError):
@@ -761,19 +819,43 @@ class TestParallelDCP(_IsolatedOverrides):
         self.assertTrue(parallel.dcp_enabled)
         self.assertEqual(parallel.attn_dcp_size, 8)
 
-    def test_the_dcp_rank_still_reads_the_group(self):
-        """A rank is not implied by the configuration, so it reads the group --
-        gated on a width that is."""
-        with (
-            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=False),
-            patch.object(_parallel_state(), "_DCP", None),
-        ):
-            self.assertEqual(get_parallel().attn_dcp_rank, 0)
-        with (
-            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True),
-            patch.object(_parallel_state(), "_DCP", SimpleNamespace(rank_in_group=3)),
-        ):
-            self.assertEqual(get_parallel().attn_dcp_rank, 3)
+    def _placed(self, world_rank, **fields):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", **fields),
+            role="test",
+            ranks=SpawnRanks(world_rank=world_rank),
+        )
+        return get_parallel()
+
+    def test_the_dcp_rank_is_where_the_tp_rank_falls_in_its_slice(self):
+        """A DCP group is a contiguous slice of the TP group, so the place in
+        one is the TP rank folded by the width."""
+        parallel = self._placed(5, tp_size=8, dcp_size=4)
+        self.assertEqual(parallel.dcp_rank, 1)
+        self.assertEqual(parallel.attn_dcp_rank, 1)
+
+    def test_the_gated_off_rank_answers_without_a_spawn_bundle(self):
+        """Zero for every process when decode context parallelism is off, so a
+        reader on a path that never publishes a bundle -- a memory pool, an
+        attention backend built in a unit test -- still gets an answer. It
+        stood for a group that was never built before, and it has to keep
+        answering the same way."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
+        self.assertEqual(get_parallel().attn_dcp_rank, 0)
+
+    def test_the_dcp_rank_is_gated_on_a_width_the_configuration_carries(self):
+        """Zero where decode context parallelism is off, so a reader does not
+        have to ask whether it is on before asking where it sits -- and the
+        gated-off name is not answered at all, because no group holds it."""
+        parallel = self._placed(5, tp_size=8, dcp_size=1)
+        self.assertFalse(parallel.dcp_enabled)
+        self.assertEqual(parallel.attn_dcp_rank, 0)
+        with self.assertRaises(RuntimeError):
+            parallel.dcp_rank
 
     def test_the_width_does_not_consult_the_platform(self):
         with patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda:
@@ -2094,10 +2176,16 @@ class TestDerivedWidths(_IsolatedOverrides):
             {name for name in widths if "world" in name},
             set(),
         )
-        parallel = get_parallel()
-        parallel.override_permanently(attn_tp_size=4)
-        with patch.object(_parallel_state(), "_WORLD", SimpleNamespace(world_size=9)):
-            self.assertEqual(parallel.launch_world_size, 9)
+        # Its own arithmetic spans the offset, which is the leaf the quotients
+        # above are not given and could not account for.
+        from sglang.srt.runtime_context import launch_world_size_of
+
+        self.assertEqual(
+            launch_world_size_of(
+                SimpleNamespace(ep_join_rank_offset=8, tp_size=4, pp_size=1)
+            ),
+            12,
+        )
 
     def test_the_bare_name_is_gone(self):
         """It answered two questions, so every reader had to remember which.
@@ -2335,15 +2423,27 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
                 f"{name} is declared but no property was installed",
             )
 
-    def test_the_declared_set_is_what_derive_parallel_widths_produces(self):
-        """The declaration is not a second list to keep in step: it names
-        exactly the quotients the derivation returns."""
-        from sglang.srt.arg_groups.arg_utils import Derived
-        from sglang.srt.arg_groups.fields.parallel import Parallel
+    def test_a_computed_name_names_the_function_that_computes_it(self):
+        """The declaration is not a second list to keep in step: a name that
+        is a function of the leaves points at a function called after it, and
+        that function existing is the whole of what publish needs."""
+        import importlib
 
-        declared = {
-            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
-        }
+        from sglang.srt.runtime_context import _derived_widths
+
+        computed = {n: d.fn for n, d in _derived_widths().items() if d.fn}
+        self.assertTrue(computed, "nothing is computed from the leaves")
+        for name, fn in computed.items():
+            module, _, attr = fn.rpartition(".")
+            self.assertEqual(attr, f"{name}_of", f"{name} is computed by {attr}")
+            self.assertTrue(callable(getattr(importlib.import_module(module), attr)))
+
+    def test_the_arithmetic_produces_nothing_that_is_not_declared(self):
+        """The other side of it: a key the derivation returns and no
+        declaration names is a width the namespace never answers with, and the
+        group build re-states it into a name nobody can read."""
+        from sglang.srt.runtime_context import _derived_widths
+
         produced = set(
             derive_parallel_widths(
                 tp_size=8,
@@ -2355,7 +2455,7 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
                 dcp_enabled=False,
             )
         )
-        self.assertEqual(declared, produced)
+        self.assertEqual(produced - set(_derived_widths()), set())
 
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
@@ -2574,21 +2674,22 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         wrap it -- which is what lets the getters be deprecated without the
         replacement tripping the warning meant for people who bypass it."""
 
-        from sglang.srt.distributed import parallel_state
-        from sglang.srt.runtime_context import _LIVE_READS, Live
+        import inspect
 
-        sources = [
-            live.source if isinstance(live, Live) else live
-            for live in _LIVE_READS.values()
-        ]
-        self.assertEqual(
-            [src for src in sources if isinstance(src, str)],
-            [],
-            "a name answered by calling a parallel_state getter is a name the "
-            "deprecation cannot cover",
-        )
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import ParallelContext, _derived_widths
+
+        written = {n for n, d in _derived_widths().items() if not d.fn}
+        self.assertTrue(written, "no written-at-runtime names; this proves nothing")
+        self.assertIn("tp_group", written)
+
+        # The read path is lookups only -- override, stamp, bag. Nothing in it
+        # can reach a getter, which is what lets them be deprecated without the
+        # replacement tripping the warning meant for people who bypass it.
+        body = inspect.getsource(ParallelContext._read)
+        self.assertNotIn("_ps()", body)
+        self.assertNotIn("parallel_state", body)
         self.assertNotIn("sglang.srt.runtime_context", parallel_state._EXEMPT_CALLERS)
-        self.assertFalse(hasattr(parallel_state, "_UNWRAPPED"))
 
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         """The getters read the context, so redirecting a group redirects them
@@ -2598,16 +2699,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
 
         stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
         with get_parallel().override(tp_group=stand_in):
-            self.assertIs(get_parallel().tp_group, stand_in)
-            self.assertIs(parallel_state.get_tp_group(), stand_in)
-
-    def test_standing_in_the_store_is_what_a_test_does_now(self):
-        """The read reaches the stored group, so that is the patch surface --
-        and a getter, which reads the context, follows it."""
-        from sglang.srt.distributed import parallel_state
-
-        stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
-        with patch.object(parallel_state, "_TP", stand_in):
             self.assertIs(get_parallel().tp_group, stand_in)
             self.assertIs(parallel_state.get_tp_group(), stand_in)
 
@@ -2752,37 +2843,39 @@ class TestTheTopologyIdentities(CustomTestCase):
 
     def test_a_group_built_at_another_width_is_refused(self):
         """The other end of the same identity: what the configuration says and
-        what the coordinators were actually built at, checked where the
-        disagreement is still attributable to the build."""
-        from sglang.srt.distributed import parallel_state
+        what the coordinators were actually built at. Stating a group is how
+        the build hands it over, so that write is where the disagreement
+        surfaces -- still attributable to the build, and before a collective
+        runs on the wrong peers."""
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 
         self._publish_square()
         wrong = GroupCoordinator.__new__(GroupCoordinator)
         wrong.world_size = 8
         wrong.rank_in_group = 0
-        with patch.object(parallel_state, "_TP", wrong):
-            with self.assertRaises(ValueError) as caught:
-                _validate_parallel(get_parallel(), "group build")
+        with self.assertRaises(ValueError) as caught:
+            get_parallel().override_permanently(tp_group=wrong)
         message = str(caught.exception)
-        self.assertIn("set by group build", message)
         self.assertIn("tp_group.world_size == tp_size", message)
         self.assertIn("built 8, configured 4", message)
+        # The refused write left nothing behind: the name is unwritten, not
+        # holding a group no identity accepts.
+        with self.assertRaises(RuntimeError):
+            get_parallel().tp_group
 
     def test_a_group_built_at_the_configured_width_is_quiet(self):
-        from sglang.srt.distributed import parallel_state
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 
         self._publish_square()
         right = GroupCoordinator.__new__(GroupCoordinator)
         right.world_size = 4
         right.rank_in_group = 3
-        with patch.object(parallel_state, "_TP", right):
-            _validate_parallel(get_parallel(), "group build")
+        get_parallel().override_permanently(tp_group=right)
+        self.assertIs(get_parallel().tp_group, right)
 
     def test_a_draft_scope_states_a_consistent_topology(self):
         """The scope narrows four names at once, so the identity applies to it
-        -- and holds, which is what step lets the guard stay on."""
+        -- and holds, which is what lets the guard stay on."""
         from sglang.srt.distributed import parallel_state
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 
@@ -2790,9 +2883,8 @@ class TestTheTopologyIdentities(CustomTestCase):
         group = GroupCoordinator.__new__(GroupCoordinator)
         group.world_size = 2
         group.rank_in_group = 1
-        with patch.object(parallel_state, "_TP", group):
-            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
-                self.assertEqual(get_parallel().attn_tp_size, 2)
+        with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+            self.assertEqual(get_parallel().attn_tp_size, 2)
 
 
 class TestWhoAnswersDuringADraftScope(CustomTestCase):
@@ -2831,11 +2923,10 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         group = self._single_member_group()
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)
-        with patch.object(parallel_state, "_PP", group):
-            with parallel_state.patch_pipeline_parallel_group(group):
-                self.assertEqual(get_parallel().pp_size, 1)
-                self.assertEqual(get_parallel().pp_rank, 0)
-                self.assertIs(get_parallel().pp_group, group)
+        with parallel_state.patch_pipeline_parallel_group(group):
+            self.assertEqual(get_parallel().pp_size, 1)
+            self.assertEqual(get_parallel().pp_rank, 0)
+            self.assertIs(get_parallel().pp_group, group)
         self.assertEqual(get_parallel().pp_size, 2)
         self.assertEqual(get_parallel().pp_rank, 1)
 
@@ -2866,28 +2957,25 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().attn_tp_size, 2)
 
         group = self._group(world_size=2, rank=1)
-        with patch.object(parallel_state, "_TP", group):
-            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
-                parallel = get_parallel()
-                self.assertEqual(parallel.tp_size, 2)
-                self.assertEqual(parallel.attn_tp_size, 2)
-                self.assertEqual(parallel.attn_tp_rank, 1)
-                self.assertEqual(parallel.attn_dp_size, 1)
-                self.assertEqual(parallel.attn_dp_rank, 0)
-                self.assertEqual(parallel.attn_cp_size, 1)
-                self.assertEqual(parallel.attn_cp_rank, 0)
-                # `dp_size` is the deployment's replica count, not a property
-                # of the group being installed, so the scope leaves it alone --
-                # `require_mlp_tp_gather` asserts on it under dp attention.
-                self.assertEqual(parallel.dp_size, 2)
-                # The whole point of stating the rest: the identity the
-                # override path and the group build both check holds in here.
-                self.assertEqual(
-                    parallel.tp_size,
-                    parallel.attn_tp_size
-                    * parallel.attn_dp_size
-                    * parallel.attn_cp_size,
-                )
+        with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+            parallel = get_parallel()
+            self.assertEqual(parallel.tp_size, 2)
+            self.assertEqual(parallel.attn_tp_size, 2)
+            self.assertEqual(parallel.attn_tp_rank, 1)
+            self.assertEqual(parallel.attn_dp_size, 1)
+            self.assertEqual(parallel.attn_dp_rank, 0)
+            self.assertEqual(parallel.attn_cp_size, 1)
+            self.assertEqual(parallel.attn_cp_rank, 0)
+            # `dp_size` is the deployment's replica count, not a property of
+            # the group being installed, so the scope leaves it alone --
+            # `require_mlp_tp_gather` asserts on it under dp attention.
+            self.assertEqual(parallel.dp_size, 2)
+            # The whole point of stating the rest: the identity the override
+            # path and the group build both check holds in here.
+            self.assertEqual(
+                parallel.tp_size,
+                parallel.attn_tp_size * parallel.attn_dp_size * parallel.attn_cp_size,
+            )
         self.assertEqual(get_parallel().attn_dp_size, 2)
         self.assertEqual(get_parallel().dp_size, 2)
 
@@ -2971,9 +3059,8 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)
         group = self._single_member_group()
-        with patch.object(parallel_state, "_PP", group):
-            with parallel_state.patch_pipeline_parallel_group(group):
-                checker = WeightChecker(get_model=lambda: None)
+        with parallel_state.patch_pipeline_parallel_group(group):
+            checker = WeightChecker(get_model=lambda: None)
 
         # The scope has closed and the context answers the target's shape again.
         self.assertEqual(get_parallel().pp_size, 2)

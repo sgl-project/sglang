@@ -24,8 +24,11 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # Unit tests run without distributed initialization. Backends that size buffers by
-# attention tensor-parallel degree should see the single-rank default.
-_parallel_override = get_parallel().override(attn_tp_size=1)
+# attention tensor-parallel degree should see the single-rank default, and a
+# backend that places itself in the decode context-parallel group needs a
+# position: nothing publishes here, so there is no configuration to derive the
+# zero these tests run at from.
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
 _parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
