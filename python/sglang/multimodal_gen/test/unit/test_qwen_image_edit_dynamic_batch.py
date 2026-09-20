@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -10,6 +11,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 
 
 def _scheduler():
@@ -92,6 +96,16 @@ def test_dynamic_condition_latents_merge_on_batch_dimension():
     assert merged.shape == (2, 3, 4)
     torch.testing.assert_close(merged[0], first[0])
     torch.testing.assert_close(merged[1], second[0])
+
+
+def test_dynamic_batch_condition_images_require_one_equal_size_image_per_prompt():
+    batch = SimpleNamespace(
+        condition_image=[Image.new("RGB", (32, 32)), Image.new("RGB", (64, 32))],
+        batch_size=2,
+    )
+
+    with pytest.raises(ValueError, match="same processed size"):
+        InputValidationStage._validate_dynamic_batch_condition_images(batch)
 
 
 def test_dynamic_edit_conditioning_builds_one_shape_per_request():
