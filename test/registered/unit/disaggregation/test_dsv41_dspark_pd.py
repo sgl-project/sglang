@@ -267,11 +267,27 @@ class TestDSV41CPPDHandshake(CustomTestCase):
         self.assertEqual(info.target_cp_ranks, [0])
 
     def test_unequal_model_tp_with_cp_rejected(self):
-        for tp, cp in [(1, 2), (1, 8), (4, 2)]:
+        for tp, cp in [(1, 2), (1, 8)]:
             m = self.make()
             with self.assertRaisesRegex(RuntimeError, "same TP size"):
                 self.fetch(m, tp, cp)
             self.assertFalse(m.prefill_info_table)
+
+    def test_cp4_prefill_to_dp4_decode(self):
+        for mla in (True, False):
+            for rank in range(4):
+                with self.subTest(mla=mla, dp_rank=rank):
+                    m = self.make(rank, hybrid=not mla)
+                    m.is_mla_backend = mla
+                    m.attn_tp_size = 1
+                    m.attn_dp_size = 4
+                    m.attn_dp_rank = rank
+                    self.assertTrue(self.fetch(m, 1, 4))
+                    info = m.prefill_info_table["prefill:8761"]
+                    self.assertEqual(info.target_tp_ranks, [0])
+                    self.assertEqual(info.target_cp_ranks, [0, 1, 2, 3])
+                    self.assertEqual(info.required_dst_info_num, 1)
+                    self.assertEqual(info.required_prefill_response_num, 4)
 
     def test_dp_only_unequal_attention_tp(self):
         for mla in (True, False):
@@ -288,7 +304,8 @@ class TestDSV41CPPDHandshake(CustomTestCase):
                         self.assertEqual(info.target_cp_ranks, [0])
                         if decode_tp >= prefill_tp:
                             self.assertEqual(
-                                info.target_tp_ranks, [rank // (decode_tp // prefill_tp)]
+                                info.target_tp_ranks,
+                                [rank // (decode_tp // prefill_tp)],
                             )
                         else:
                             width = prefill_tp // decode_tp
@@ -355,7 +372,9 @@ class TestDSV41PDFeatureValidation(CustomTestCase):
             ("decode_dp", dict(enable_dp_attention=True, dp_size=4), True),
             (
                 "prefill_dp",
-                dict(disaggregation_mode="prefill", enable_dp_attention=True, dp_size=4),
+                dict(
+                    disaggregation_mode="prefill", enable_dp_attention=True, dp_size=4
+                ),
                 True,
             ),
             ("prefill_cp_before_resolution", prefill_cp, True),
@@ -369,7 +388,11 @@ class TestDSV41PDFeatureValidation(CustomTestCase):
             ("decode_prefill_cp_flag", dict(enable_prefill_cp=True), False),
             ("decode_attention_cp", dict(attn_cp_size=2), False),
             ("decode_dcp", dict(dcp_size=2), False),
-            ("unsupported_transfer", dict(disaggregation_transfer_backend="nixl"), False),
+            (
+                "unsupported_transfer",
+                dict(disaggregation_transfer_backend="nixl"),
+                False,
+            ),
         ]
         for name, changes, supported in cases:
             cfg = SimpleNamespace(**(defaults | changes))
