@@ -1,6 +1,7 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig, BailingMoeV3VLConfig
 from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
+from sglang.srt.configs.berrylm import BerryLMConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.cosmos3 import (
@@ -90,6 +91,7 @@ __all__ = [
     "BailingMM2Config",
     "BailingMoeV3VLConfig",
     "ExaoneConfig",
+    "BerryLMConfig",
     "ChatGLMConfig",
     "Cosmos3Config",
     "Cosmos3EdgeConfig",

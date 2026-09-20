@@ -501,6 +501,13 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     configured linear-attention backend (pure read)."""
     if get_platform().is_xpu:
         return False
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch as _spec_by_arch,
+    )
+
+    _spec = _spec_by_arch(model_arch)
+    if _spec is not None and _spec.support_mamba_cache_extra_buffer:
+        return view.linear_attn_backend == "triton"
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
