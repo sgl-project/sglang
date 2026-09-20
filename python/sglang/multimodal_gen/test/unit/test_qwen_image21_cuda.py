@@ -2,7 +2,6 @@
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipe
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
@@ -274,14 +274,14 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
     try:
         with (
             torch.no_grad(),
-            set_forward_context(None, None, SimpleNamespace(is_warmup=True)),
+            set_forward_context(None, None, Req(is_warmup=True)),
         ):
             model(**first)
             stage._bcg_run(runner, first, model)
         assert len(runner.entries) == 1
         with (
             torch.no_grad(),
-            set_forward_context(None, None, SimpleNamespace(is_warmup=False)),
+            set_forward_context(None, None, Req(is_warmup=False)),
         ):
             model(**second)
             expected = model(**second)
