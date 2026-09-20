@@ -1234,6 +1234,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 )
 
+        packable_draft_params = [
+            params for params in sliced_draft_params if params[2] > params[3]
+        ]
+        if pack_buffer is not None and packable_draft_params:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            # Keep target and draft regions live until all transfer futures complete.
+            pack_offset = plan.target_src_token_indices.size * sum(
+                dcp_token_item_lens[:num_target]
+            )
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=[p[0] for p in packable_draft_params],
+                src_token_indices=plan.draft_src_token_indices,
+                token_item_lens=[p[4] for p in packable_draft_params],
+                src_token_item_lens=[p[2] for p in packable_draft_params],
+                pack_offset_bytes=pack_offset,
+            )
+            if packed is not None:
+                packed_ptrs, packed_indices = packed
+                packed_groups = group_concurrent_contiguous(
+                    packed_indices, plan.draft_dst_token_indices
+                )
+                layers_params.extend(
+                    (ptr, params[1], params[4], packed_groups)
+                    for ptr, params in zip(packed_ptrs, packable_draft_params)
+                )
+                sliced_draft_params = [
+                    params for params in sliced_draft_params if params[2] < params[3]
+                ]
+
         def process_sliced_draft(params) -> int:
             batch_size = self.max_transfer_batch_indices
             if batch_size <= 0:
@@ -1284,7 +1315,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.submit(process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
-            return self._await_transfer_futures(futures)
+            try:
+                return self._await_transfer_futures(futures)
+            finally:
+                # The worker may reuse its pack buffer even after a transfer fails.
+                if pack_buffer is not None:
+                    concurrent.futures.wait(futures)
 
         transfer_blocks = []
         for layer_params in layers_params:

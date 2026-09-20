@@ -1,8 +1,11 @@
 import unittest
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,6 +38,48 @@ class TestPdDcpGather(CustomTestCase):
         packed1 = pack[split:].view(torch.float16).view(4, 1, 5)
         torch.testing.assert_close(packed0, kv0[row_indices], rtol=0, atol=0)
         torch.testing.assert_close(packed1, kv1[row_indices], rtol=0, atol=0)
+
+    def test_packs_head_slices_without_overwriting_adjacent_regions(self):
+        """Head-slice copy widths differ from source strides; packed regions must not overlap."""
+        strides, widths, offsets = [1024, 768], [512, 256], [512, 256]
+        sources = [
+            torch.arange(512 * stride, device="cuda")
+            .remainder(251)
+            .to(torch.uint8)
+            .view(512, stride)
+            for stride in strides
+        ]
+        # Include nonmonotonic rows and a partial final kernel block.
+        rows = np.array([511, 2, 300, 5, 7, 0, 128], dtype=np.int64)
+        prefix, suffix = 37, 19
+        size = rows.size * sum(widths)
+        buffer = StagingBuffer(prefix + size + suffix, "cuda:0", 0)
+        buffer.buffer.fill_(165)
+        ptrs, indices = try_pack_dcp_src(
+            pack_buffer=buffer,
+            kv_data_ptrs=[src.data_ptr() + off for src, off in zip(sources, offsets)],
+            src_token_indices=rows,
+            token_item_lens=widths,
+            src_token_item_lens=strides,
+            pack_offset_bytes=prefix,
+        )
+        expected = torch.cat(
+            [
+                src[rows.tolist(), off : off + width].flatten()
+                for src, off, width in zip(sources, offsets, widths)
+            ]
+        )
+        torch.testing.assert_close(buffer.buffer[prefix : prefix + size], expected)
+        self.assertTrue(bool((buffer.buffer[:prefix] == 165).all()))
+        self.assertTrue(bool((buffer.buffer[-suffix:] == 165).all()))
+        self.assertEqual(
+            ptrs,
+            [
+                buffer.get_ptr() + prefix,
+                buffer.get_ptr() + prefix + rows.size * widths[0],
+            ],
+        )
+        np.testing.assert_array_equal(indices, np.arange(rows.size))
 
 
 if __name__ == "__main__":
