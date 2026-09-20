@@ -45,7 +45,7 @@ class VAE(torch.nn.Module):
     @cached_vae_encode
     def encode(self, x):
         self.calls += 1
-        return AutoencoderKLOutput(latent_dist=DiagonalGaussianDistribution(x))
+        return AutoencoderKLOutput(latent_dist=DiagonalGaussianDistribution(x.clone()))
 
 
 @torch.no_grad()

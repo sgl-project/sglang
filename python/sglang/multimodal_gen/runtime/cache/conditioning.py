@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from PIL import Image
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_world_size,
@@ -69,7 +70,17 @@ def _fingerprint(value):
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
+            tuple(value.stride()),
             hashlib.sha256(data).digest(),
+        )
+    if isinstance(value, Image.Image):
+        return (
+            "image",
+            value.mode,
+            value.size,
+            hashlib.sha256(value.tobytes()).digest(),
+            _fingerprint(value.getpalette()),
+            _fingerprint(value.info.get("transparency")),
         )
     if isinstance(value, np.ndarray):
         if value.dtype.hasobject:
@@ -275,7 +286,14 @@ def cached_vae_encode(fn):
             name: value
             for name, value in vars(self).items()
             if name.startswith(
-                ("use_", "tile_", "spatial_compression", "temporal_compression")
+                (
+                    "use_",
+                    "tile_",
+                    "blend_",
+                    "parallel_",
+                    "spatial_compression",
+                    "temporal_compression",
+                )
             )
             and type(value) in (int, float, bool, str, type(None))
         }
