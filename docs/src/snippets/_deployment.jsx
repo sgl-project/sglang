@@ -109,6 +109,11 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
+  const AMD_RDMA_DOCKER_FLAGS = [
+    "--device /dev/infiniband", "--cap-add IPC_LOCK",
+    "--ulimit memlock=-1", "--ulimit stack=67108864",
+    "--ulimit nofile=1048576:1048576",
+  ];
   const HARDWARE_CATALOG = {
     blackwell: [
       { id: "b300",  label: "B300",  vram: "288GB" },
@@ -128,16 +133,24 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
+    // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
+    // memlock let the transport pin its registered buffers, and the stack /
+    // nofile raises are for the per-QP file descriptors a full 8-NIC mesh opens.
     amd: [
-      { id: "mi300x", label: "MI300X", vram: "192GB" },
-      { id: "mi325x", label: "MI325X", vram: "256GB" },
-      { id: "mi350x", label: "MI350X", vram: "288GB" },
-      { id: "mi355x", label: "MI355X", vram: "288GB" },
+      { id: "mi300x", label: "MI300X", vram: "192GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi325x", label: "MI325X", vram: "256GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi350x", label: "MI350X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi355x", label: "MI355X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
     ],
-    // Atlas 800I A3 (910C): 1 card = 2 dies, so --tp-size is 2× the card
+    // Ascend A3 Series: 1 card = 2 dies, so --tp-size is 2× the card
     // count (32 cards -> --tp-size 64).
     npu: [
-      { id: "a3", label: "Atlas 800I A3", vram: "64GB/die" },
+      { id: "a3", label: "Ascend A3 Series", vram: "64GB/die" },
     ],
   };
 
@@ -826,7 +839,7 @@ export const Deployment = ({ config, benchmarks }) => {
         : vendorOf(sel.hw) === "npu"
         ? [
             // NPU: --privileged grants the davinci devices (16 dies on an
-            // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
+            // 8-card Ascend A3 Series node); the host CANN driver/firmware/state
             // must be mounted in.
             "docker run --privileged --shm-size=16g",
             "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",
@@ -1264,6 +1277,7 @@ export const Deployment = ({ config, benchmarks }) => {
   };
 
   const [sel, setSel] = useState(() => initialSelectionFromCells());
+  const [selectionHydrated, setSelectionHydrated] = useState(false);
   const INTERNAL_HASH_STATE_KEY = "__sglangDeployInternalHash";
   const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
   useEffect(() => {
@@ -1297,12 +1311,14 @@ export const Deployment = ({ config, benchmarks }) => {
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     };
     hydrate();
+    setSelectionHydrated(true);
     window.addEventListener("hashchange", hydrate);
     return () => window.removeEventListener("hashchange", hydrate);
   }, []);
   // history.replaceState does NOT fire hashchange — dispatch a custom event so
   // the Playground hears chip-click selection changes.
   useEffect(() => {
+    if (!selectionHydrated) return;
     const target = "#" + new URLSearchParams(sel).toString();
     if (window.location.hash !== target) {
       const historyState =
@@ -1316,7 +1332,7 @@ export const Deployment = ({ config, benchmarks }) => {
       );
     }
     window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
-  }, [sel]);
+  }, [sel, selectionHydrated]);
 
   const [modal, setModal] = useState(null); // 'curl' | 'env' | 'bench' | null
   useEffect(() => {
@@ -1998,7 +2014,7 @@ export const Deployment = ({ config, benchmarks }) => {
       const options = visibleOptions(dim, sel);
       const currentOption = selectedOption(dim);
       return (
-        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+        <section className={["sgd-builder-context", className].filter(Boolean).join(" ")} aria-live={direct ? undefined : "polite"}>
           <div className="sgd-builder-context-heading">
             <div>
               <span>{direct ? dim.title : `${dim.title} options`}</span>

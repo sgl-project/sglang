@@ -17,6 +17,7 @@ from sglang.srt.parser.template_detection import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
 
@@ -58,7 +59,7 @@ def _glm53_template(concat):
     )
 
 
-class TestTemplateManagerReasoningDetection(unittest.TestCase):
+class TestTemplateManagerReasoningDetection(CustomTestCase):
     def _detect(self, template, vocab):
         force, config = detect_reasoning_pattern(template)
         parser = detect_reasoning_parser(
@@ -99,6 +100,25 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "glm45")
 
+    def test_ling3_template_uses_ling3_parsers(self):
+        template = """
+        {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}
+        {{ '<role>SYSTEM</role>' }}
+        {{ '<role>ASSISTANT</role>' }}
+        {{ '<|role_end|>' }}
+        <tool_call>{function-name}
+        <arg_key>{arg-key}</arg_key>
+        <arg_value>{arg-value}</arg_value>
+        </tool_call>
+        """
+        force, config, reasoning_parser = self._detect(template, [])
+        tool_call_parser = detect_tool_call_parser(
+            template, _DummyTokenizer([]), config, force
+        )
+
+        self.assertEqual(reasoning_parser, "ling3")
+        self.assertEqual(tool_call_parser, "ling3")
+
     def test_glm53_effort_template_resolves_glm_parsers(self):
         # Without an enable_thinking toggle the GLM-4.5 rule misses, and the
         # template used to fall through to deepseek-r1 + the xml_kv fallback
@@ -115,6 +135,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                     ),
                     "glm47",
                 )
+
+    def test_glm53_effort_template_forces_reasoning(self):
+        vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
+        force, config, _ = self._detect(_glm53_template("+"), vocab)
+
+        self.assertTrue(force)
+        self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
 
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
@@ -922,7 +949,7 @@ def _declared(server_args, field):
     return resolution_result(server_args, field)
 
 
-class TestResolveAutoParsers(unittest.TestCase):
+class TestResolveAutoParsers(CustomTestCase):
     """Tests for resolve_auto_parsers()."""
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
@@ -1057,6 +1084,31 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         self.assertEqual(_declared(args, "reasoning_parser"), "kimi_k3")
         self.assertEqual(_declared(args, "tool_call_parser"), "kimi_k3")
+
+    def test_bailing_architectures_and_model_types_use_ling3_parsers(self):
+        cases = (
+            (["BailingMoeV3VLForConditionalGeneration"], ""),
+            (None, "bailing_moe_v3_vl"),
+            (["BailingMoeV3ForCausalLM"], ""),
+            (None, "bailing_hybrid"),
+        )
+        for architectures, model_type in cases:
+            with self.subTest(architectures=architectures, model_type=model_type):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer([])
+                config = SimpleNamespace(
+                    architectures=architectures, model_type=model_type
+                )
+
+                with _patch_hf_transformers_utils(
+                    Mock(return_value=tokenizer), Mock(return_value=config)
+                ):
+                    resolve_auto_parsers(args)
+
+                self.assertEqual(_declared(args, "reasoning_parser"), "ling3")
+                self.assertEqual(_declared(args, "tool_call_parser"), "ling3")
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
