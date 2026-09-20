@@ -358,6 +358,13 @@ class TestAutotuneCachePhases(CustomTestCase):
                 patch.object(
                     autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
                 ),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
+                    ),
+                ),
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
             ):
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
