@@ -24,6 +24,8 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -31,7 +33,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64):
+class _FakeShardPool(PageInterleaveKVPoolMixin):
+    pass
+
+
+def _make_prefill_aware_swa_runner(
+    *, pool_size: int, max_context_len: int = 64, token_to_kv_pool=None
+):
     """A minimal fake ModelRunner that reaches FlashAttentionBackend.__init__'s
     is_prefill_aware_swa branch (mirrors how models like
     python/sglang/srt/models/unlimited_ocr.py opt in)."""
@@ -62,15 +70,24 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
         enable_prefill_cp=False,
         enable_dp_attention=False,
     )
+    token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
+    token_to_kv_pool_allocator = object()
     return SimpleNamespace(
         sliding_window_size=None,
         model_config=model_config,
         device=device,
         req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool=object(),  # not a SWAKVPool instance -> use_sliding_window_kv_pool=False
-        # getattr(..., "full_v2p_page_table", None) is None -> unified_mla_hooks
-        # falls back to the static (disabled) hook set.
-        token_to_kv_pool_allocator=object(),
+        token_to_kv_pool=token_to_kv_pool,  # not a SWAKVPool -> use_sliding_window_kv_pool=False
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        # A real KVIndexTranslator over this non-unified pool: the probe finds no
+        # unified composite, so it is the strict passthrough the backend reads.
+        kv_index_translator=KVIndexTranslator(
+            req_to_token=req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            token_to_kv_pool=token_to_kv_pool,
+            page_size=1,
+            device=device,
+        ),
         kv_cache_dtype=torch.float16,
         kv_cache_dtype_str="auto",
         page_size=1,
@@ -84,6 +101,16 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPrefillAwareSwaPrefillLensBound(CustomTestCase):
+    def test_sharded_pool_requests_cpu_sequence_lengths(self):
+        runner = _make_prefill_aware_swa_runner(
+            pool_size=8, token_to_kv_pool=_FakeShardPool()
+        )
+
+        with get_context().override_server_args():
+            backend = FlashAttentionBackend(runner)
+
+        self.assertTrue(backend.needs_cpu_seq_lens)
+
     def test_buffer_covers_full_req_pool_idx_range(self):
         pool_size = 8
         runner = _make_prefill_aware_swa_runner(pool_size=pool_size)

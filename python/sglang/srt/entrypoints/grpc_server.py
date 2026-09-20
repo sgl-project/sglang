@@ -176,9 +176,9 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.smg_http_sidecar_port
-        if server_args.smg_http_sidecar_port is not None
-        else server_args.port + 1
+        cfg.smg_http_sidecar_port
+        if cfg.smg_http_sidecar_port is not None
+        else cfg.port + 1
     )
 
     # Metrics setup: must set PROMETHEUS_MULTIPROC_DIR before scheduler

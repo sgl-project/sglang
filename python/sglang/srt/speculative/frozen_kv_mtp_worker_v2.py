@@ -73,6 +73,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
     draft_tp_context,
     fast_topk,
     get_plan_stream,
@@ -134,8 +135,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             # Both base classes own initialization, so initialize TpModelWorker
             # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
@@ -201,6 +205,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_attention_backends(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -211,6 +216,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_cuda_graphs(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -720,9 +726,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
         # Frozen MTP does not wire the adaptive controller yet.
-        assert (
-            not get_spec().speculative_adaptive
-        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        assert not get_spec().speculative_adaptive, (
+            "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        )
         self.adaptive_controller = None
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).

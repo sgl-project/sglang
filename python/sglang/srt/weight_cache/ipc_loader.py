@@ -22,6 +22,7 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
@@ -29,6 +30,7 @@ from .protocol import (
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
+    get_socket_path,
     hash_quant_config,
     recv_msg,
     send_msg,
@@ -67,7 +69,7 @@ class IpcModelLoader(BaseModelLoader):
     def __init__(
         self,
         load_config: LoadConfig,
-        socket_path: str,
+        socket_path: Optional[str] = None,
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
@@ -103,7 +105,7 @@ class IpcModelLoader(BaseModelLoader):
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
-        cache_data = self._fetch_from_cache(model_config)
+        cache_data = self._fetch_from_cache(model_config, device_config)
 
         if cache_data is None:
             if self.weight_cache_mode == "daemon":
@@ -446,7 +448,7 @@ class IpcModelLoader(BaseModelLoader):
 
         return model
 
-    def _fetch_from_cache(self, model_config) -> Optional[dict]:
+    def _fetch_from_cache(self, model_config, device_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
 
         Returns the daemon response dict on success, None if the daemon is
@@ -454,6 +456,10 @@ class IpcModelLoader(BaseModelLoader):
         failures so they are never silently swallowed as a disk-load fallback.
         """
         import socket as socket_mod
+
+        if self.socket_path is None:
+            device_uuid = current_platform.get_device_uuid(int(device_config.gpu_id))
+            self.socket_path = get_socket_path(device_uuid)
 
         # Only connect to a real socket node owned by us: reject a symlink, a
         # plain file, or another user's socket planted at this /tmp path. An

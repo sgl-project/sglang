@@ -274,6 +274,7 @@ class TinyModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
@@ -411,6 +412,7 @@ class MockModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
         )
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
