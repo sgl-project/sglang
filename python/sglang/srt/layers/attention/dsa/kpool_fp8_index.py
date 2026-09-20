@@ -17,13 +17,15 @@ def build_pooled_page_table_64(
     page_table_64: torch.Tensor,
     pool_size: int,
 ) -> torch.Tensor:
-    # Advanced indexing is required: a (1, 1) strided slice can remain non-unit-
-    # stride even after contiguous(), which DeepGEMM rejects.
     assert BLOCK_SIZE_K % pool_size == 0, (
         f"pool_size ({pool_size}) must divide page_size ({BLOCK_SIZE_K})"
     )
+    # Page-local KPool layout: one source KV page contributes
+    # BLOCK_SIZE_K / pool_size compressed keys to the beginning of its own
+    # index-cache page. Keep advanced indexing so the result remains a distinct,
+    # unit-stride metadata buffer, as callers relied on before this layout change.
     idx = torch.arange(
-        0, page_table_64.shape[-1], pool_size, device=page_table_64.device
+        page_table_64.shape[-1], device=page_table_64.device, dtype=torch.int64
     )
     return page_table_64[..., idx]
 
@@ -57,7 +59,7 @@ def gather_index_k_scale_prefix_into(
         page_indices,
         k_out,
         scale_out,
-        PAGE_SIZE=pool.page_size,
+        LOGICAL_PAGE_SIZE=pool.pooled_slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
@@ -72,15 +74,15 @@ def _gather_index_k_scale_prefix_into_kernel(
     page_indices_ptr,
     k_out_ptr,
     scale_out_ptr,
-    PAGE_SIZE: tl.constexpr,
+    LOGICAL_PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    page_idx = token_id // PAGE_SIZE
-    token_offset_in_page = token_id % PAGE_SIZE
+    page_idx = token_id // LOGICAL_PAGE_SIZE
+    token_offset_in_page = token_id % LOGICAL_PAGE_SIZE
     page = tl.load(page_indices_ptr + page_idx)
 
     offs = tl.arange(0, BLOCK_D)
@@ -111,8 +113,8 @@ def kpool_build_ragged_layout(
     total_q: int,
     pool_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # One packed-cache page represents 64 pools, so its source is every
-    # pool_size-th real token page.
+    # Every packed-cache page belongs to the same source KV page. Each source
+    # page contributes only SLOTS_PER_PAGE compressed rows.
     device = full_page_table.device
     n_rag = cu_pages_excl.shape[0]
     concat_page_table = torch.empty(
@@ -170,7 +172,7 @@ def _kpool_build_ragged_layout_kernel(
     for p_off in tl.range(0, BLOCK_PAGE * tl.cdiv(n_pages, BLOCK_PAGE), BLOCK_PAGE):
         p_offs = p_off + tl.arange(0, BLOCK_PAGE)
         p_mask = p_offs < n_pages
-        source_cols = p_offs * POOL_SIZE
+        source_cols = p_offs
         pages = tl.load(
             full_page_table_ptr + k * MAX_POOL_PAGES + source_cols,
             mask=p_mask,
@@ -208,6 +210,7 @@ def _prep_update_kpool_write_plan_launch(
     pool_size: int,
     num_draft_tokens: int,
     slots_per_page: int,
+    page_stride: int,
 ):
     # Eager and captured replay must share one launch spec, including
     # N > pool_size where one write closes multiple pools.
@@ -245,6 +248,7 @@ def _prep_update_kpool_write_plan_launch(
         POOL_SIZE=pool_size,
         N=num_draft_tokens,
         SLOTS_PER_PAGE=slots_per_page,
+        PAGE_STRIDE=page_stride,
         MAX_CLOSED_POOLS=max_closed_pools,
         HAS_PER_Q=has_per_q_outputs,
     )
@@ -265,9 +269,12 @@ def update_kpool_write_plan_cuda_graph(
     pool_size: int,
     num_draft_tokens: int,
     slots_per_page: int,
+    page_stride: Optional[int] = None,
 ) -> None:
     if write_start.shape[0] == 0:
         return
+    if page_stride is None:
+        page_stride = BLOCK_SIZE_K
     bs, args, constexprs = _prep_update_kpool_write_plan_launch(
         write_start,
         req_pool_indices,
@@ -281,6 +288,7 @@ def update_kpool_write_plan_cuda_graph(
         pool_size=pool_size,
         num_draft_tokens=num_draft_tokens,
         slots_per_page=slots_per_page,
+        page_stride=page_stride,
     )
     _update_kpool_write_plan_kernel[(bs,)](*args, **constexprs)
 
@@ -302,6 +310,7 @@ def _update_kpool_write_plan_kernel(
     POOL_SIZE: tl.constexpr,
     N: tl.constexpr,
     SLOTS_PER_PAGE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
     HAS_PER_Q: tl.constexpr,
 ):
@@ -322,8 +331,7 @@ def _update_kpool_write_plan_kernel(
     tl.store(tail_logical_start_out_ptr + b, (base_pool * POOL_SIZE).to(tl.int32))
     for p in tl.static_range(0, MAX_CLOSED_POOLS):
         pool_id = base_pool + p
-        pool_page_group = pool_id // SLOTS_PER_PAGE
-        token_page_row = pool_page_group * POOL_SIZE
+        token_page_row = pool_id // SLOTS_PER_PAGE
         token_page_row = tl.minimum(
             tl.maximum(token_page_row, 0), real_page_table_cols - 1
         )
@@ -334,7 +342,7 @@ def _update_kpool_write_plan_kernel(
             + (b * N).to(tl.int64) * real_page_table_stride_0
             + token_page_row
         ).to(tl.int64)
-        write_loc = packed_page * SLOTS_PER_PAGE + (pool_id % SLOTS_PER_PAGE)
+        write_loc = packed_page * PAGE_STRIDE + (pool_id % SLOTS_PER_PAGE)
         tl.store(
             write_loc_out_ptr + b * write_loc_out_stride_0 + p,
             write_loc.to(tl.int64),
@@ -348,11 +356,13 @@ def compute_pooled_write_locs(
 ) -> torch.Tensor:
     assert page_table_64.ndim == 1
     pool_ids = pool_ids.to(torch.int64)
-    pool_page_group = torch.div(pool_ids, BLOCK_SIZE_K, rounding_mode="floor")
-    token_page_row = pool_page_group * pool_size
+    pooled_slots_per_page = BLOCK_SIZE_K // pool_size
+    token_page_row = torch.div(
+        pool_ids, pooled_slots_per_page, rounding_mode="floor"
+    )
     packed_page = page_table_64.index_select(0, token_page_row.to(torch.int64))
     return packed_page.to(torch.int64) * BLOCK_SIZE_K + torch.remainder(
-        pool_ids, BLOCK_SIZE_K
+        pool_ids, pooled_slots_per_page
     )
 
 
@@ -825,7 +835,7 @@ def kpool_decode_update_and_maybe_write_cache(
         S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
-        SLOTS_PER_PAGE=pool.slots_per_page,
+        POOLED_SLOTS_PER_PAGE=pool.pooled_slots_per_page,
     )
 
 
@@ -1002,7 +1012,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    SLOTS_PER_PAGE: tl.constexpr,
+    POOLED_SLOTS_PER_PAGE: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -1102,8 +1112,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         quantized = tl.minimum(tl.maximum(quantized, fp8_min), fp8_max)
 
         pool_id = safe_pos // POOL_SIZE
-        pool_page_group = pool_id // SLOTS_PER_PAGE
-        token_page_row = pool_page_group * POOL_SIZE
+        token_page_row = pool_id // POOLED_SLOTS_PER_PAGE
         token_page_row = tl.minimum(tl.maximum(token_page_row, 0), BLOCK_TABLE_COLS - 1)
         packed_page = tl.load(
             block_tables_ptr
@@ -1111,7 +1120,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + token_page_row * block_tables_stride_1,
         )
         loc_page_index = packed_page.to(tl.int64)
-        loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
+        loc_token_offset_in_page = pool_id % POOLED_SLOTS_PER_PAGE
         out_k_offsets = (
             loc_page_index * BUF_NUMEL_PER_PAGE
             + loc_token_offset_in_page * HEAD_DIM

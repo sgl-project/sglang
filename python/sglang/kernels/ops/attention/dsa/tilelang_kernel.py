@@ -1405,17 +1405,21 @@ def fp8_paged_mqa_logits_kernel(
     block_size: int = 64,
     clear_accum: bool = True,
     split_kv: int = 1,
+    physical_block_size: Optional[int] = None,
 ) -> Any:
     N = T.symbolic("batch_size")
     L = T.symbolic("max_table_length")
     S = T.symbolic("max_seq_len")
     C = T.symbolic("num_blocks")
     B = block_size
+    PB = physical_block_size or B
     D = head_dim
     H = num_heads
     SK = int(split_kv)
-    BLOCK_BYTES = B * (D + 4)
-    SCALE_OFFSET = B * D
+    BLOCK_BYTES = PB * (D + 4)
+    K_DATA_BYTES = B * D
+    SCALE_OFFSET = PB * D
+    SCALE_END = SCALE_OFFSET + B * 4
 
     assert D % 4 == 0
     assert H % 4 == 0
@@ -1455,11 +1459,11 @@ def fp8_paged_mqa_logits_kernel(
                 i = i_start + j
                 page = page_table[bx, i]
                 k_smem_u8 = T.alloc_shared((1, B * D), UINT8)
-                T.copy(kvcache_u8[page : page + 1, 0:SCALE_OFFSET], k_smem_u8)
+                T.copy(kvcache_u8[page : page + 1, 0:K_DATA_BYTES], k_smem_u8)
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
                 k_s_smem_u8 = T.alloc_shared((1, B * 4), UINT8)
                 T.copy(
-                    kvcache_u8[page : page + 1, SCALE_OFFSET:BLOCK_BYTES],
+                    kvcache_u8[page : page + 1, SCALE_OFFSET:SCALE_END],
                     k_s_smem_u8,
                 )
                 k_s_smem = T.view(k_s_smem_u8, (B,), FP32)
@@ -1499,14 +1503,18 @@ def tilelang_fp8_paged_mqa_logits(
     deep_gemm_metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
+    logical_block_size: Optional[int] = None,
 ) -> torch.Tensor:
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
-    block_size = kvcache_fp8.shape[1]
+    physical_block_size = kvcache_fp8.shape[1]
+    block_size = logical_block_size or physical_block_size
     assert head_dim == 128, "TODO"
-    assert block_size == 64, "TODO"
+    assert physical_block_size == 64, "TODO"
+    assert 0 < block_size <= physical_block_size
+    assert physical_block_size % block_size == 0
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
-    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert kvcache_fp8.shape[1:] == (physical_block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
@@ -1520,11 +1528,12 @@ def tilelang_fp8_paged_mqa_logits(
         head_dim=head_dim,
         num_heads=num_heads,
         block_size=block_size,
+        physical_block_size=physical_block_size,
         clear_accum=clean_logits,
         split_kv=split_kv,
     )
     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
-    kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    kvcache_u8 = kvcache_fp8.view(-1, physical_block_size * (head_dim + 4))
     kernel(q_fp8, kvcache_u8, weight, seq_lens, page_table, logits)
     return logits
 

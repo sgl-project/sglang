@@ -279,6 +279,7 @@ def _kpool_plan_to_gpu(
     local_req_pool_indices: torch.Tensor,
     pool_size: int,
     slots_per_page: int,
+    page_stride: int,
     topk_transform_method: TopkTransformMethod,
 ) -> KPoolExtendPlan:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -366,14 +367,13 @@ def _kpool_plan_to_gpu(
         cu_pages_excl_t = cu_q_len_excl_t = empty_i32
 
     if n_pool > 0:
-        pool_page_group = torch.div(
+        token_page_row = torch.div(
             pool_pool_id_t, slots_per_page, rounding_mode="floor"
         )
-        token_page_row = pool_page_group * pool_size
         packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
             torch.int64
         )
-        pool_write_locs = packed_page * slots_per_page + torch.remainder(
+        pool_write_locs = packed_page * page_stride + torch.remainder(
             pool_pool_id_t, slots_per_page
         )
     else:
@@ -526,6 +526,7 @@ def init_kpool_extend_metadata(
         local_req_pool_indices,
         pool_size,
         slots_per_page,
+        real_page_size,
         topk_transform_method,
     )
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
@@ -755,6 +756,7 @@ def update_kpool_write_plan(
         pool_size=pool_size,
         num_draft_tokens=num_draft_tokens,
         slots_per_page=slots_per_page,
+        page_stride=real_page_size,
     )
 
     if (

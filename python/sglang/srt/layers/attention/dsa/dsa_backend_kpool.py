@@ -68,9 +68,18 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return dsa_impl
 
     def _kpool_slots_per_page(self) -> int:
-        return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
+        return getattr(
+            self.token_to_kv_pool,
+            "pooled_slots_per_page",
+            self.real_page_size // self.dsa_index_kpool,
+        )
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
+        # The page-local layout has page_size / index_kpool logical rows inside
+        # each physical page. It is read by the TileLang path, which does not
+        # use DeepGEMM's schedule metadata.
+        if self._kpool_slots_per_page() != self.real_page_size:
+            return False
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
         return True
