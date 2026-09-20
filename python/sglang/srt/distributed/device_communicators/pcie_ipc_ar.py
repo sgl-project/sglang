@@ -30,10 +30,11 @@ keeps the reductions this backend should not serve on NCCL.
 
 Workspace sizing
 ----------------
-The workspace is sized for decode, ``max_bs * draft_tokens * hidden``, which
-leaves every prefill chunk on NCCL. That split is deliberate. These kernels win by
-latency at small messages; a prefill chunk is three orders of magnitude larger,
-and there NCCL's ring is the better algorithm. Measured at 8 ranks, TP8, 8k
+The workspace is sized for the widest decode reduction the runner will issue,
+``max_bs * draft_tokens * hidden``. The bound is a row count, not a phase
+split: a prefill chunk narrower than it is admitted too. What the bound rules
+out is the full-width prefill chunk, which is orders of magnitude larger, and
+there NCCL's ring is the better algorithm. Measured at 8 ranks, TP8, 8k
 context, against NCCL as the baseline:
 
 ===================  ==========  ==========  ===============
@@ -105,7 +106,7 @@ def _warn_symm_mem_wins() -> None:
     )
 
 
-def eligible_group(group_name: Optional[str], world_size: int) -> bool:
+def eligible_group(*, group_name: Optional[str], world_size: int) -> bool:
     """Whether ``GroupCoordinator`` should build this backend for a group."""
     if not (
         envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.get()
@@ -148,7 +149,7 @@ def _decode_width() -> Optional[int]:
     the reduction. ``max_bs`` counts requests, not rows: a speculative forward
     verifies several draft tokens per sequence, so the row count is
     ``max_bs * draft tokens``, as in
-    ``runtime_context.max_num_tokens_for_cutedsl_moe``.
+    ``runtime_context.cutedsl_moe_max_num_tokens``.
     """
     try:
         from sglang.srt.runtime_context import get_exec, get_spec
@@ -220,6 +221,7 @@ class PcieIpcCommunicator:
         self._workspace: Optional[Any] = None
         self._bound_stream: Optional[torch.cuda.Stream] = None
         self._cpu_group = cpu_group
+        self._max_rows: Optional[int] = None
 
         world_size = dist.get_world_size(group=group)
         if world_size not in _SUPPORTED_WORLD_SIZES:
@@ -273,7 +275,10 @@ class PcieIpcCommunicator:
         if override:
             max_numel = override
         else:
-            width = _decode_width()
+            # The runner's width is the one the decode graphs are captured for,
+            # already clamped to the request pool; _decode_width() is the
+            # lazy-build fallback and can only re-derive it.
+            width = self._max_rows if self._max_rows else _decode_width()
             if width is None:
                 # This bound admits a different set of batches than the server
                 # will issue; every reduction outside it silently uses NCCL.
@@ -315,15 +320,18 @@ class PcieIpcCommunicator:
         self._tune(hidden)
         return True
 
-    def prepare(self, hidden: int) -> None:
+    def prepare(self, *, hidden: int, max_rows: Optional[int] = None) -> None:
         """Build and measure ahead of the first reduction.
 
-        Call this from warmup, before any other autotuning starts. Left to the
-        first reduction instead, the build lands inside SGLang's own FlashInfer
-        autotune pass, and ``_tune`` then declines -- see there for why.
+        Tuning runs here rather than on the first reduction, which may land
+        inside graph capture or another autotune pass; ``_tune`` declines in
+        both, leaving the kernels on FlashInfer's seed policy.
+
+        ``max_rows`` is the widest decode reduction the runner will issue.
         """
         if self.disabled or self._workspace is not None:
             return
+        self._max_rows = max_rows
         probe = torch.empty((1, hidden), dtype=torch.bfloat16, device=self._device)
         self._ensure_workspace(probe)
 

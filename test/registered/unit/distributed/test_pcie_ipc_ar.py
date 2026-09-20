@@ -24,7 +24,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 HIDDEN = 6144
 
 
-def _make_comm(world_size=8, workspace_cls=None, cpu_group=None, tune=None):
+def _make_comm(
+    world_size=8, workspace_cls=None, cpu_group=None, tune=None, max_rows=None
+):
     """Build a communicator with the collaborators stubbed out.
 
     The constructor is bypassed: it needs a live process group and a CUDA
@@ -47,6 +49,7 @@ def _make_comm(world_size=8, workspace_cls=None, cpu_group=None, tune=None):
     comm._workspace_cls = workspace_cls or MagicMock()
     comm._build_failed = False
     comm._cpu_group = cpu_group
+    comm._max_rows = max_rows
     comm._tune = tune if tune is not None else (lambda hidden: None)
     return comm
 
@@ -84,10 +87,18 @@ class TestGroupEligibility(CustomTestCase):
 
     def test_only_the_tensor_parallel_group_is_eligible(self):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
-            self.assertTrue(pcie_ipc_ar.eligible_group("tp", 4))
+            self.assertTrue(
+                pcie_ipc_ar.eligible_group(
+                    group_name="tp", world_size=4
+                )
+            )
             for name in ("attention_tp", "moe_tp", "pdmux_prefill_tp", "world", "pp"):
                 with self.subTest(group=name):
-                    self.assertFalse(pcie_ipc_ar.eligible_group(name, 4))
+                    self.assertFalse(
+                        pcie_ipc_ar.eligible_group(
+                            group_name=name, world_size=4
+                        )
+                    )
 
     def test_symmetric_memory_wins_when_both_are_enabled(self):
         """Two independent opt-in flags; the pre-existing one keeps the path.
@@ -100,10 +111,18 @@ class TestGroupEligibility(CustomTestCase):
             with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=True):
                 with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
                     pcie_ipc_ar._warn_symm_mem_wins.cache_clear()
-                    self.assertFalse(pcie_ipc_ar.eligible_group("tp", 4))
+                    self.assertFalse(
+                        pcie_ipc_ar.eligible_group(
+                            group_name="tp", world_size=4
+                        )
+                    )
                 self.assertIn("--enable-symm-mem", "\n".join(logs.output))
             with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
-                self.assertTrue(pcie_ipc_ar.eligible_group("tp", 4))
+                self.assertTrue(
+                    pcie_ipc_ar.eligible_group(
+                        group_name="tp", world_size=4
+                    )
+                )
 
     def test_symm_mem_probe_reads_the_real_flag(self):
         """Exercise the probe itself: a patched stand-in cannot catch a rename."""
@@ -132,16 +151,32 @@ class TestGroupEligibility(CustomTestCase):
 
     def test_single_rank_group_is_not_eligible(self):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
-            self.assertFalse(pcie_ipc_ar.eligible_group("tp", 1))
+            self.assertFalse(
+                pcie_ipc_ar.eligible_group(
+                    group_name="tp", world_size=1
+                )
+            )
 
     def test_disabled_by_default(self):
         """The backend is opt-in; nothing attaches without the flag."""
-        self.assertFalse(pcie_ipc_ar.eligible_group("tp", 4))
+        self.assertFalse(
+            pcie_ipc_ar.eligible_group(
+                group_name="tp", world_size=4
+            )
+        )
 
     def test_anonymous_group_is_not_eligible(self):
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
-            self.assertFalse(pcie_ipc_ar.eligible_group(None, 4))
-            self.assertFalse(pcie_ipc_ar.eligible_group("anonymous", 4))
+            self.assertFalse(
+                pcie_ipc_ar.eligible_group(
+                    group_name=None, world_size=4
+                )
+            )
+            self.assertFalse(
+                pcie_ipc_ar.eligible_group(
+                    group_name="anonymous", world_size=4
+                )
+            )
 
 
 class TestWorkspaceRelease(CustomTestCase):
@@ -293,7 +328,8 @@ class TestDecodeWidth(CustomTestCase):
 
     Reading it from ``ServerArgs`` raised ``AttributeError`` on every call once
     upstream moved the resolved config onto the exec bag, and a bare ``except``
-    turned that into a permanent, silent fallback: whatever ``--cuda-graph-max-bs``
+    turned that into a permanent, silent fallback: whatever
+    ``--cuda-graph-max-bs``
     the operator passed, the workspace was sized for a fixed 64 rows.
     """
 
@@ -353,6 +389,18 @@ class TestDecodeWidth(CustomTestCase):
         self.assertTrue(hasattr(runtime_context, "get_exec"))
         self.assertTrue(hasattr(runtime_context, "get_spec"))
         self.assertTrue(hasattr(default_cuda_graph_config().decode, "max_bs"))
+
+    def test_runner_width_wins_over_the_re_derivation(self):
+        """prepare() carries the width the decode graphs were captured for.
+
+        get_batch_sizes_to_capture already applies the attention-tp alignment
+        and the req_to_token_pool clamp; _decode_width() cannot see either, so
+        when the runner supplies a width it has to take precedence.
+        """
+        comm = _make_comm(max_rows=24)
+        with patch.object(pcie_ipc_ar, "_decode_width", return_value=512):
+            comm._ensure_workspace(torch.empty(1, HIDDEN, dtype=torch.bfloat16))
+        self.assertEqual(comm.max_numel, 24 * HIDDEN)
 
     def test_fallback_width_is_announced(self):
         comm = _make_comm()

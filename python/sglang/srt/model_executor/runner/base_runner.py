@@ -319,7 +319,32 @@ class BaseRunner(ABC):
         if pcie_ipc_comm is None:
             return
 
-        pcie_ipc_comm.prepare(self.model_runner.model_config.hidden_size)
+        mr = self.model_runner
+        pcie_ipc_comm.prepare(
+            hidden=mr.model_config.hidden_size,
+            max_rows=self._widest_decode_rows(),
+        )
+
+    def _widest_decode_rows(self) -> Optional[int]:
+        """Rows in the widest decode reduction, or None when no graph is captured.
+
+        Same derivation the decode runner uses for its buffers, so the workspace
+        covers exactly the batches that will be issued: get_batch_sizes_to_capture
+        already applies the attention-tp alignment and the req_to_token_pool clamp,
+        which a second derivation from cuda_graph_config would miss.
+        """
+        if get_exec().graph.cuda_graph_config is None:
+            return None
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mr = self.model_runner
+        tokens_per_req = mr.decode_num_tokens_per_req()
+        capture_bs, _ = get_batch_sizes_to_capture(mr, tokens_per_req)
+        if not capture_bs:
+            return None
+        return max(capture_bs) * tokens_per_req
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
