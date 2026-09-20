@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import doctest
 import importlib.util
@@ -2002,6 +2003,36 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+@contextlib.contextmanager
+def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
+    """Publish a record describing the parallel topology a test wants.
+
+    Replaces standing a per-process parallel record into the object under
+    test. The widths arrive the way production gets them -- from published
+    configuration -- and the per-process ranks the way a spawned process gets
+    them, so a rank read is answered without building a process group. Stating
+    the topology through the same door production uses also keeps the derived
+    widths honest: a hand-built double can claim an `attn_tp_size` the
+    configuration would never produce.
+
+    `ranks` overrides the spawn identities; by default this process is rank
+    zero of the world, which fixes every other rank. The context is reset on exit, including when the
+    test fails.
+    """
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    bundle = dict(world_rank=0, dp_rank=None)
+    bundle.update(ranks or {})
+    server_args = ServerArgs(model_path="dummy", **server_args_fields)
+    reset_context()
+    publish(server_args, role=role, ranks=SpawnRanks(**bundle))
+    try:
+        yield server_args
+    finally:
+        reset_context()
+
+
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
@@ -2251,6 +2282,17 @@ def enter_override(test_case, override):
     installed = override.install()
     test_case.addCleanup(override.restore)
     return installed
+
+
+def enter_scope(test_case, scope):
+    """Enter a context manager for the length of one test.
+
+    The `with`-statement form of `enter_override` above, and 3.10-safe for the
+    same reason: `enterContext` arrived in 3.11.
+    """
+    entered = scope.__enter__()
+    test_case.addCleanup(scope.__exit__, None, None, None)
+    return entered
 
 
 class CustomTestCase(unittest.TestCase):

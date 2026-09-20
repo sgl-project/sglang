@@ -171,9 +171,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
-    build_torch_compile_kwargs,
-    maybe_enable_inductor_compute_comm_overlap,
-    resolve_torch_compile_mode,
+    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -553,18 +551,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self._torch_compile_registry.is_compiled(module):
             return
 
+        dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_TORCH_COMPILE_MODE",
+            config=dit_config,
+            default="max-autotune-no-cudagraphs",
+            module=module,
+            enable_inductor_compute_comm_overlap=True,
+        )
         if current_platform.is_npu():
-            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            maybe_enable_inductor_compute_comm_overlap()
-            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = resolve_torch_compile_mode(
-                "SGLANG_TORCH_COMPILE_MODE",
-                config=dit_config,
-                default="max-autotune-no-cudagraphs",
-            )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):
@@ -976,6 +973,36 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "taylorseer_order",
                 envs.SGLANG_CACHE_DIT_TS_ORDER,
                 envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
+                secondary=secondary,
+            ),
+            enable_dmd=knob(
+                "enable_dmd",
+                envs.SGLANG_CACHE_DIT_DMD,
+                envs.SGLANG_CACHE_DIT_SECONDARY_DMD,
+                secondary=secondary,
+            ),
+            dmd_history=knob(
+                "dmd_history",
+                envs.SGLANG_CACHE_DIT_DMD_HISTORY,
+                envs.SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY,
+                secondary=secondary,
+            ),
+            dmd_rank=knob(
+                "dmd_rank",
+                envs.SGLANG_CACHE_DIT_DMD_RANK,
+                envs.SGLANG_CACHE_DIT_SECONDARY_DMD_RANK,
+                secondary=secondary,
+            ),
+            dmd_ridge=knob(
+                "dmd_ridge",
+                envs.SGLANG_CACHE_DIT_DMD_RIDGE,
+                envs.SGLANG_CACHE_DIT_SECONDARY_DMD_RIDGE,
+                secondary=secondary,
+            ),
+            dmd_svd_precision=knob(
+                "dmd_svd_precision",
+                envs.SGLANG_CACHE_DIT_DMD_SVD_PRECISION,
+                envs.SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION,
                 secondary=secondary,
             ),
             num_inference_steps=num_inference_steps,

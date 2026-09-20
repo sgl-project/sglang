@@ -24,7 +24,6 @@ from torch import nn
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1003,7 +1002,7 @@ class MiMoV2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
@@ -1197,7 +1196,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder

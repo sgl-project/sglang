@@ -103,6 +103,7 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    log_replay_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -114,6 +115,7 @@ class PrefillStats:
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
+            log_replay_tokens=adder.log_replay_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
@@ -307,7 +309,7 @@ class SchedulerMetricsReporter:
         if (
             get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
-            and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
+            and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
@@ -660,7 +662,10 @@ class SchedulerMetricsReporter:
         gap_latency = now - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = now
         self.last_input_throughput = (
-            prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
+            (prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens)
+            / gap_latency
+            if gap_latency > 0
+            else 0.0
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
@@ -685,6 +690,8 @@ class SchedulerMetricsReporter:
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
+        if prefill_stats.log_replay_tokens:
+            msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
@@ -728,7 +735,9 @@ class SchedulerMetricsReporter:
                 value=can_run_cuda_graph
             )
             self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=prefill_stats.log_input_tokens,
+                prefill_compute_tokens=(
+                    prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens
+                ),
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )
