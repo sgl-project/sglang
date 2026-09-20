@@ -78,11 +78,10 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
 class SparsePrefillWorkspace:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    Callers normally overwrite the entire workspace. Shared compressed-KV
-    callers keep separate workspaces per ratio and track prefix validity in the
-    per-forward gather cache, including the allocation address. Sparse prefill
-    executes eagerly and serially on the supported paths, so the allocation can
-    be replaced when a larger extent is needed.
+    The workspace contents are fully overwritten before every attention call,
+    so token buckets and compression ratios can safely share one buffer. Sparse
+    prefill executes eagerly and serially on the supported paths, which makes it
+    safe to replace the scratch allocation when a larger extent is needed.
     """
 
     def __init__(self, device: torch.device):
@@ -276,18 +275,14 @@ class CompressedGather:
     # chunk-invariant per request; subsequent layers only overwrite that prefix.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
-    # Valid only for this forward's gather layout. Each ratio has its own
-    # workspace; its compressed prefix survives consumer layers' SWA writes.
-    dequantized_source: Optional[tuple[int, int]] = None
 
 
 @dataclass
 class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
-    Gather layouts depend on request/token mappings and compressed page tables.
-    Shared-source dequantization keys live only for this forward; per-layer
-    top-k combinations are recomputed into reused
+    Fields depend on request/token mappings and compressed page tables, not
+    per-layer k_cache; per-layer top-k combinations are recomputed into reused
     buffers.
     """
 
