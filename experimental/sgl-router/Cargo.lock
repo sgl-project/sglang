@@ -2072,7 +2072,6 @@ dependencies = [
  "memo-map",
  "percent-encoding",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3285,7 +3284,6 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
- "chrono",
  "clap",
  "criterion",
  "dashmap",
@@ -3301,12 +3299,12 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "minijinja",
- "minijinja-contrib",
  "parking_lot",
  "rand 0.8.8",
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "sgl-kv-indexer",
@@ -3830,6 +3828,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "mime",
  "pin-project-lite",
  "tokio",
