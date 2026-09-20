@@ -278,15 +278,9 @@ export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
 Cross-node KV transfer uses the `ascend` transfer backend, which requires the `memfabric_hybrid` package on both nodes (`pip install memfabric_hybrid`; it is already included in the reference container image). `ASCEND_MF_STORE_URL` must point at the prefill node and be reachable from the decode node. Source the CANN environment in every shell that starts a server or the router.
 </Note>
 
-<Warning>
-**Transfer engine initialization fails with `Failed to determine driver version` in minimal containers.** `memfabric_hybrid` locates the driver through `/etc/ascend_install.info` (fallback: `/usr/local/Ascend`) and reads `<driver path>/driver/version.info`. Container setups that mount only `driver/include` and `driver/lib64` lack this file, so the engine cannot start. Create `/usr/local/Ascend/driver/version.info` with the driver version reported by `npu-smi info`, e.g.:
-
-```bash Command
-printf 'Version=26.1.1\nInnerversion=V100R001C23SPC005B219\n' | tee /usr/local/Ascend/driver/version.info
-```
-
-`Innerversion` must be a driver release known to your `memfabric_hybrid` build; `V100R001C23SPC005B219` is accepted by 1.1.x–1.2.0.
-</Warning>
+<Note>
+Cross-node KV transfer uses the `ascend` transfer backend (`memfabric`). If your container exposes only `driver/include` and `driver/lib64`, the engine cannot read the driver version and fails to initialize — make sure `/usr/local/Ascend/driver/version.info` is present. See the [Ascend NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for driver and container setup.
+</Note>
 
 **1. Start the prefill node** (`<your prefill ip>`):
 
