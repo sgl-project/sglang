@@ -262,11 +262,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=self.invoke_regex,
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
+                invoke_match = self._find_invoke(current_text)
                 if not invoke_match:
                     break
 
@@ -279,12 +275,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
-                    # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+                    preamble = self._extract_preamble(
+                        current_text, invoke_match.start()
+                    )
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -364,6 +357,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            self._raise_parse_error(e)
             # Re-emit verbatim rather than swallowing the turn; the preamble is
             # still inside current_text unless a completed call advanced past it.
             # Calls are dropped on purpose: the failure can land between a tool's
@@ -372,6 +366,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
             return StreamingParseResult(normal_text=current_text)
+
+    def _find_invoke(self, text: str) -> re.Match | None:
+        return re.search(self.invoke_regex, text, re.DOTALL)
+
+    def _extract_preamble(self, text: str, invoke_start: int) -> str:
+        start = text.rfind(self.bot_token, 0, invoke_start)
+        if start == -1:
+            start = invoke_start
+        return text[:start].removesuffix("\n\n")
+
+    def _raise_parse_error(self, error: Exception) -> None:
+        """Allow subclasses to reject the legacy raw-text fallback."""
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         if self._pending_non_string_parameter:
