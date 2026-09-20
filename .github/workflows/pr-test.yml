@@ -392,17 +392,7 @@ jobs:
 
   base-c-test:
     name: base-c-test-${{ matrix.runner_config }}
-    # Both rust-ext builds are needed so the aarch64 row can pick its artifact;
-    # the x86 rows just do not read the aarch64 one.
-    needs:
-      [
-        check-changes,
-        call-gate,
-        wait-for-base-b,
-        sgl-kernel-build-wheels,
-        rust-ext-build,
-        rust-ext-build-aarch64,
-      ]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     strategy:
       fail-fast: false
@@ -424,8 +414,6 @@ jobs:
             }
           - { runner_config: 8-gpu-h20, run_timeout: '30', timeout_per_file: '' }
           - { runner_config: 4-gpu-b200, run_timeout: '30', timeout_per_file: '1800' }
-          # The one aarch64 stage, so it takes the aarch64 build.
-          - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800', aarch64: true }
           - { runner_config: 8-gpu-b300, run_timeout: '60', timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -440,7 +428,31 @@ jobs:
       warmup_server_models: ${{ matrix.warmup_server_models }}
       # Rows that do not set it keep _pr-test-stage.yml's own default.
       warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
-      rust_ext_artifact: ${{ matrix.aarch64 && needs.rust-ext-build-aarch64.outputs.artifact_name || needs.rust-ext-build.outputs.artifact_name }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
+  # Separate from base-c-test only because `needs` cannot vary per matrix row:
+  # the aarch64 stage takes the aarch64 build, and neither table should wait on
+  # the other architecture's.
+  base-c-test-aarch64:
+    name: base-c-test-${{ matrix.runner_config }}
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-${{ matrix.runner_config }}
+      runner_config: ${{ matrix.runner_config }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: ${{ matrix.run_timeout }}
+      timeout_per_file: ${{ matrix.timeout_per_file }}
+      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   # List every build and test job: `skipped` passes here, so an omission turns that
@@ -469,6 +481,7 @@ jobs:
         base-a-test-cpu,
         base-b-test,
         base-c-test,
+        base-c-test-aarch64,
       ]
     if: always()
     runs-on: ubuntu-latest
