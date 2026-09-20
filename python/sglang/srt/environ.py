@@ -1264,14 +1264,15 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # FlashInfer PCIe-IPC all-reduce, for switch-free intra-node hosts (no
     # NVLink, no multicast) where the backends above do not apply. Which shapes
-    # the kernels take is FlashInfer's own decision, not a size knob here: an
-    # unsupported shape is reported as such and the caller keeps its NCCL path.
+    # reach the kernels is decided here: supports() only reports whether they
+    # can run a tensor, so the workspace bound is what keeps the rest on NCCL.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     # Elements its workspace is sized for. It cannot grow after construction, so
-    # 0 sizes it for the widest decode (cuda_graph_config[decode].max_bs *
-    # hidden), leaving prefill chunks on NCCL -- measured faster than routing
-    # them here. Raise it to hand larger reductions to the kernels, at
-    # ~2 * world_size * max_numel * itemsize bytes per rank.
+    # 0 sizes it for the widest decode the runner captures for (max_bs *
+    # draft_tokens * hidden), which leaves full-width prefill chunks on NCCL --
+    # measured faster than routing them here. Raise it to hand larger
+    # reductions to the kernels, at ~2 * world_size * max_numel * itemsize
+    # bytes per rank.
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

@@ -369,9 +369,9 @@ class PcieIpcCommunicator:
         from flashinfer.autotuner import AutoTuner
 
         if AutoTuner.get().is_tuning_mode:
-            # tune() mutates shared autotuner state (process group,
-            # warmup/repeat, bucket overrides) for the length of the call, so
-            # nesting would time the enclosing pass's candidates with ours.
+            # Reached through the lazy build in should_pcie_ipc_ar, so tuning
+            # would start at whatever point the first reduction happens; keep
+            # it to prepare(), where the caller chose the moment.
             logger.warning(
                 "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
                 "another autotune context; skipping autotune and keeping the seed "

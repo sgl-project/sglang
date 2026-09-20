@@ -359,7 +359,7 @@ class TestDecodeWidth(CustomTestCase):
     Reading it from ``ServerArgs`` raised ``AttributeError`` on every call once
     upstream moved the resolved config onto the exec bag, and a bare ``except``
     turned that into a permanent, silent fallback: whatever
-    ``--cuda-graph-max-bs``
+    ``--cuda-graph-max-bs-decode``
     the operator passed, the workspace was sized for a fixed 64 rows.
     """
 
