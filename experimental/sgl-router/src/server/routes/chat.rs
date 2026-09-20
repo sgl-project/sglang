@@ -1470,10 +1470,16 @@ struct BootstrapFields {
 /// panicking on a shape `parse_probe` should already have rejected.
 fn splice_top_level(
     body: &Bytes,
-    members: &[(SamplingField, serde_json::Number)],
+    sampling: &[(SamplingField, serde_json::Number)],
+    rid: Option<&str>,
 ) -> Option<Bytes> {
     use std::io::Write as _;
 
+    // Declining here costs only the parse path, which escapes correctly.
+    let rid = match rid {
+        Some(r) if !rid_is_splice_safe(r) => return None,
+        other => other,
+    };
     let open = body.iter().position(|&b| b == b'{')?;
     let close = body.iter().rposition(|&b| b == b'}')?;
     if close <= open {
@@ -1484,21 +1490,45 @@ fn splice_top_level(
     let has_members = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    // 24 bytes per member covers `"repetition_penalty":` plus a short number;
-    // an over-run just costs one realloc, never correctness.
-    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
+    // 24 bytes per sampling member covers `"repetition_penalty":` plus a short
+    // number; the rid is measured. An over-run just costs one realloc, never
+    // correctness.
+    let rid_budget = rid.map_or(0, |r| r.len() + ",\"rid\":\"\"".len());
+    let mut out = Vec::with_capacity(body.len() + 24 * sampling.len() + rid_budget + 1);
     out.extend_from_slice(&body[..close]);
-    for (i, (field, value)) in members.iter().enumerate() {
-        if has_members || i > 0 {
+    let mut wrote_any = has_members;
+    for (field, value) in sampling {
+        if wrote_any {
             out.push(b',');
         }
         // Wire names are a fixed set of JSON-safe identifiers and a
         // `serde_json::Number` renders as valid JSON, so neither needs
         // escaping. Written straight into `out` — no intermediate `String`.
         write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+        wrote_any = true;
+    }
+    if let Some(rid) = rid {
+        if wrote_any {
+            out.push(b',');
+        }
+        // `rid_is_splice_safe` above proved this needs no string escaping.
+        write!(out, "\"rid\":\"{rid}\"").ok()?;
     }
     out.extend_from_slice(&body[close..]);
     Some(Bytes::from(out))
+}
+
+/// Whether `rid` can be written into a JSON string literal verbatim.
+///
+/// A router-minted rid always can: [`resolve_engine_rid`] builds it from
+/// `router-`, a [`correlation_id`] that already passed an id-alphabet check,
+/// and a hex uuid. Checking anyway costs one pass over ~70 bytes and keeps
+/// [`splice_top_level`] correct on its own terms rather than by appeal to a
+/// caller two functions away — anything unexpected declines the splice and
+/// falls back to the parse path, where `serde_json` escapes it properly.
+fn rid_is_splice_safe(rid: &str) -> bool {
+    rid.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 /// Build the body forwarded to the engine, injecting (when present) the
@@ -1515,18 +1545,13 @@ fn splice_top_level(
 ///
 /// `value` is the ingress parse when one is on hand, reused rather than
 /// repeated — and dropped unused when splicing makes it unnecessary. Sampling
-/// alone never reaches `serde_json`: only `input_ids`, bootstrap and `rid`
-/// injection do, because the first two may have to OVERWRITE a key the client
-/// sent, which [`splice_top_level`] cannot. The non-object arm defends against
-/// a TOCTOU regression rather than panicking.
-///
-/// NOTE: a router-minted `rid` never overwrites a client key — `resolve_engine_rid`
-/// returns `None` the moment the caller sets its own — so it has the same
-/// splice-safe shape as the sampling inject-set. It takes the parse path here
-/// only because [`splice_top_level`] writes `(SamplingField, Number)` members.
-/// Until that is generalized, minting a rid pulls every plain-mode request onto
-/// a full `serde_json::Value` round-trip of a body up to
-/// [`MAX_CHAT_BODY_BYTES`], which is the fast path #39002 added.
+/// and `rid` never reach `serde_json`: only `input_ids` and bootstrap injection
+/// do, because only those may have to OVERWRITE a key the client sent, which
+/// [`splice_top_level`] cannot. A minted `rid` cannot collide either —
+/// [`resolve_engine_rid`] returns `None` the moment the caller files the
+/// request under its own — so it splices alongside the sampling inject-set and
+/// a plain-mode request keeps the untouched-body fast path. The non-object arm
+/// defends against a TOCTOU regression rather than panicking.
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
@@ -1536,12 +1561,12 @@ fn build_outgoing_body(
     rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
     // `input_ids` and bootstrap injection may have to OVERWRITE a key the
-    // client sent, which only the parse path can do; sampling injection never
-    // does, because the inject-set holds only keys the request omitted. A
-    // minted `rid` cannot overwrite either, but still takes the parse path —
-    // see the note on this function.
-    let only_sampling = input_ids.is_none() && bootstrap.is_none() && rid.is_none();
-    if only_sampling && sampling.is_empty() {
+    // client sent, which only the parse path can do. Sampling injection never
+    // does — the inject-set holds only keys the request omitted — and neither
+    // does a minted `rid`, which exists only when the caller set none. Both
+    // can therefore be spliced into the raw bytes.
+    let needs_parse = input_ids.is_some() || bootstrap.is_some();
+    if !needs_parse && sampling.is_empty() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -1555,8 +1580,8 @@ fn build_outgoing_body(
     // multimodal, thinking). A chat-encoder model on a plain request is NOT
     // one of them — there `input_ids` is `Some`, so the parse path runs
     // either way.
-    if only_sampling {
-        if let Some(spliced) = splice_top_level(body, sampling) {
+    if !needs_parse {
+        if let Some(spliced) = splice_top_level(body, sampling, rid) {
             return Ok(spliced);
         }
     }
@@ -2053,6 +2078,105 @@ mod tests {
         assert!(
             parsed.get("messages").is_some(),
             "messages must be retained alongside the injected rid",
+        );
+    }
+
+    /// The point of the whole exercise: a minted rid rides #39002's splice, so
+    /// a plain-mode body is NOT round-tripped through `serde_json`. Pinned on
+    /// the exact bytes — the sloppy inter-token spacing survives verbatim,
+    /// which a `Value` round-trip would have normalized away.
+    #[test]
+    fn build_outgoing_body_splices_rid_without_reparsing() {
+        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
+        let out = build_outgoing_body(&body, None, None, None, &[], Some("router-abc123")).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,  "messages" : [ ] ,"rid":"router-abc123"}"#,
+            "a minted rid must be spliced, not re-serialized",
+        );
+    }
+
+    /// A parse ALREADY on hand does not force the parse path: the splice is
+    /// still taken and `value` is dropped unused. This is the cache-aware /
+    /// bucket-routing shape, where ingress parses but no `input_ids` are
+    /// forwarded — the largest slice of plain-mode traffic.
+    #[test]
+    fn build_outgoing_body_splices_rid_even_when_a_parse_is_on_hand() {
+        let body = Bytes::from_static(br#"{ "model" : "x" }"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), None, None, &[], Some("router-xyz")).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{ "model" : "x" ,"rid":"router-xyz"}"#,
+        );
+    }
+
+    /// Sampling and rid splice together, in one pass, correctly comma-separated.
+    #[test]
+    fn build_outgoing_body_splices_sampling_and_rid_together() {
+        let body = Bytes::from_static(br#"{"model":"x"}"#);
+        let inject = apply_sampling_overrides(
+            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
+            &probe_of(r#"{"model":"x"}"#),
+            &metrics(),
+        )
+        .unwrap();
+        let out =
+            build_outgoing_body(&body, None, None, None, &inject, Some("router-both")).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"model":"x","temperature":1.0,"rid":"router-both"}"#,
+        );
+    }
+
+    /// An empty object takes no leading comma.
+    #[test]
+    fn build_outgoing_body_splices_rid_into_an_empty_object() {
+        let body = Bytes::from_static(br#"{}"#);
+        let out = build_outgoing_body(&body, None, None, None, &[], Some("router-solo")).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"rid":"router-solo"}"#
+        );
+    }
+
+    /// A client `"rid": null` reads as absent, so the router mints one — and
+    /// the spliced copy goes in before the CLOSING brace, so it WINS the
+    /// last-wins reading every JSON parser performs. Same rule #39002 relies on
+    /// for a null-valued sampling parameter.
+    #[test]
+    fn build_outgoing_body_spliced_rid_wins_over_an_explicit_null() {
+        let body = Bytes::from_static(br#"{"model":"x","rid":null}"#);
+        let out = build_outgoing_body(&body, None, None, None, &[], Some("router-wins")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("rid").and_then(|r| r.as_str()),
+            Some("router-wins"),
+            "the injected rid must win the last-wins reading",
+        );
+    }
+
+    /// The escaping guard: a rid outside the id alphabet declines the splice
+    /// and falls back to the parse path, where `serde_json` escapes it. Not
+    /// reachable through `resolve_engine_rid` today — this pins that
+    /// `splice_top_level` is safe on its own terms, not by appeal to its caller.
+    #[test]
+    fn build_outgoing_body_declines_to_splice_an_unsafe_rid() {
+        assert!(!rid_is_splice_safe(r#"router-"injected"#));
+        let body = Bytes::from_static(br#"{"model":"x"}"#);
+        let evil = r#"a","messages":["pwned"#;
+        let out = build_outgoing_body(&body, None, None, None, &[], Some(evil)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("rid").and_then(|r| r.as_str()),
+            Some(evil),
+            "an unsafe rid must round-trip through the escaping parse path",
+        );
+        assert_eq!(
+            parsed.get("messages"),
+            None,
+            "a quote in the rid must never break out into a sibling key",
         );
     }
 
@@ -3009,7 +3133,8 @@ mod tests {
             // Trailing whitespace stays outside the object.
             ("{\"a\":1} \n", "{\"a\":1,\"temperature\":1.0} \n"),
         ] {
-            let out = splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject).unwrap();
+            let out =
+                splice_top_level(&Bytes::copy_from_slice(raw.as_bytes()), &inject, None).unwrap();
             assert_eq!(std::str::from_utf8(&out).unwrap(), want, "input {raw:?}");
             serde_json::from_slice::<serde_json::Value>(&out)
                 .unwrap_or_else(|e| panic!("{raw:?} spliced to invalid JSON: {e}"));
