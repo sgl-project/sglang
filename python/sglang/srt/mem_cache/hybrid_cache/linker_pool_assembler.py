@@ -345,6 +345,40 @@ def _build_deepseek_v4_device_pool_group(
         c128_buffers,
         mappings.c128,
     )
+
+    # ---- fp8 two-pool unified_kv: ship the bf16 rope half too.
+    #
+    # Under SGLANG_DSV4_UNIFIED_KV_FP8=1 a unified row is TWO parallel pools --
+    # fp8 nope in unified_kv_pool.kv_buffer and bf16 rope in
+    # unified_kv_pool.kv_buffer_rope -- and one row index addresses both.
+    # unified_region_buffers() / _dsv4_compressed_region_buffers() above return
+    # the NOPE pool only, so without this the linker offloads and restores 512 of
+    # every 640 bytes and the rope half keeps whatever the slot last held. That is
+    # the pool's own warning on unified_rope_region_buffers(): "wrong output
+    # rather than a crash" -- and nothing downstream can catch it, because
+    # DevicePoolEntry derives its row stride and page size from the buffers it is
+    # handed and has no view of the logical row width.
+    #
+    # HiCache already does this (_dsv4_rope_sibling / _build_dsv4_rope_entry in
+    # hybrid_pool_assembler.py); this is the direct-external-linker mirror of it.
+    # Everything after this point is already generic: DevicePoolGroup
+    # .resolve_transfers expands every entry off its source pool, and object keys
+    # carry the pool name, so the rope pool gets its own keyspace rather than
+    # colliding with the nope pool.
+    #
+    # unified_rope_region_buffers() returns None on every non-fp8 layout, so the
+    # bf16 path is untouched.
+    for ratio, rope_name, rope_pool, rope_mapping in (
+        (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
+        (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
+    ):
+        rope_region = (
+            kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
+        )
+        if rope_region is None:
+            continue
+        rope_buffers, _ = rope_region
+        add(rope_name, PoolName.KV, rope_pool, rope_buffers, rope_mapping)
     if not is_unified_kv:
         add(
             PoolName.DEEPSEEK_V4_C4_STATE,
