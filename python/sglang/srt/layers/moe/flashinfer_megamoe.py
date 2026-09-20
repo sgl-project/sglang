@@ -526,6 +526,12 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
         )
 
     _validate_nvfp4_fc1_alpha(layer)
+    weights = MoEWeightPack(
+        w13=layer.w13_weight.data,
+        w2=layer.w2_weight.data,
+        w13_scale=layer.w13_weight_scale.data,
+        w2_scale=layer.w2_weight_scale.data,
+    )
     if use_w4a16:
         from flashinfer.moe_ep import preprocess_bf16_nvfp4_cutedsl_mega_weights
 
@@ -534,12 +540,7 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             param = getattr(layer, name)
             load_layouts[name] = (param.shape, param.stride(), param.dtype)
         transformed_weights = preprocess_bf16_nvfp4_cutedsl_mega_weights(
-            MoEWeightPack(
-                w13=layer.w13_weight.data,
-                w2=layer.w2_weight.data,
-                w13_scale=layer.w13_weight_scale.data,
-                w2_scale=layer.w2_weight_scale.data,
-            ),
+            weights,
             intermediate_size=layer.intermediate_size_per_partition,
             hidden_size=layer.hidden_size,
         )
@@ -550,12 +551,7 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
             layer.w13_input_scale_quant
         )
         transformed_weights = preprocess_nvfp4_cutedsl_mega_weights(
-            MoEWeightPack(
-                w13=layer.w13_weight.data,
-                w2=layer.w2_weight.data,
-                w13_scale=layer.w13_weight_scale.data,
-                w2_scale=layer.w2_weight_scale.data,
-            ),
+            weights,
             intermediate_size=layer.intermediate_size_per_partition,
             hidden_size=layer.hidden_size,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,

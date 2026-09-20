@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -288,25 +289,28 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
-        # MegaMoE has its own collective tuner; flashinfer.autotune() alone
-        # does not run it. Prepare immutable capacity profiles before capture.
-        # Its optional extend sweep runs expert kernels directly, including on
-        # speculative targets whose model-level dummy is TARGET_VERIFY.
-        extend_num_tokens = 0
-        if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get() and not mr.is_draft_worker:
-            extend_num_tokens = (
-                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        mega_context = empty_context()
+        if (
+            not mr.is_draft_worker
+            and get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+            and "flashinfer_megamoe" not in skip_ops
+        ):
+            # The chunk size is already per DP rank. Prepare one prefill profile
+            # independently of the optional full-model EXTEND autotune pass.
+            schedule = get_schedule()
+            prefill_num_tokens = (
+                schedule.chunked_prefill_size
+                if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+                else schedule.max_prefill_tokens
             )
-        mega_context = (
-            megamoe_autotune_context(
+            mega_context = megamoe_autotune_context(
                 cache_path=autotune_cache,
-                decode_num_tokens=mr.max_decode_logits_rows(),
-                extend_num_tokens=extend_num_tokens,
+                decode_num_tokens=mr.max_decode_logits_rows(
+                    min_batch_size=get_eager_max_batch_size(mr.max_running_requests)
+                ),
+                prefill_num_tokens=prefill_num_tokens,
                 reuse_cache=envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get(),
             )
-            if "flashinfer_megamoe" not in skip_ops
-            else empty_context()
-        )
         with (
             _autotune_process_group(sync_group),
             autotune(
