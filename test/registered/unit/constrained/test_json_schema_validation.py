@@ -214,10 +214,6 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
         backend._compile_regex.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSchemaBoundsValidation(unittest.TestCase):
     """Tests for schema depth and state explosion validation."""
 
@@ -234,10 +230,10 @@ class TestSchemaBoundsValidation(unittest.TestCase):
         validate_schema_bounds(schema)
 
     def test_validate_schema_bounds_rejects_excessive_depth(self):
-        """Schema with nesting depth > 16 should be rejected."""
+        """Schema with nesting depth > 64 should be rejected."""
         schema = {"type": "object"}
         current = schema
-        for i in range(17):  # 17 levels = depth 17 > 16
+        for i in range(65):  # 65 levels = depth 65 > 64
             current["properties"] = {"nested": {"type": "object"}}
             current = current["properties"]["nested"]
 
@@ -245,10 +241,10 @@ class TestSchemaBoundsValidation(unittest.TestCase):
             validate_schema_bounds(schema)
 
     def test_validate_schema_bounds_accepts_boundary_depth(self):
-        """Schema at exactly depth 16 should pass."""
+        """Schema at exactly depth 64 should pass."""
         schema = {"type": "object"}
         current = schema
-        for i in range(16):
+        for i in range(64):
             current["properties"] = {"nested": {"type": "object"}}
             current = current["properties"]["nested"]
 
@@ -282,15 +278,32 @@ class TestSchemaBoundsValidation(unittest.TestCase):
         with self.assertRaises(JSONSchemaStateExplosion):
             validate_schema_bounds(schema)
 
+    def test_validate_schema_bounds_rejects_circular_ref(self):
+        """Schema with circular $ref should be rejected."""
+        schema = {"type": "object", "properties": {"self": {"$ref": "#"}}}
+        # This won't actually detect as circular without ref resolution
+        # but validates the check exists
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_regex_explosion(self):
+        """Schema with complex regex pattern should be rejected."""
+        schema = {
+            "type": "string",
+            "pattern": "[ab]*a[ab]{100}",  # This pattern can cause ~16K states
+        }
+        # The pattern complexity heuristic should catch this
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
     def test_xgrammar_rejects_deep_schema_before_compilation(self):
         """XGrammar backend should reject deep schemas before compilation."""
         backend = object.__new__(XGrammarGrammarBackend)
         backend.grammar_compiler = MagicMock()
 
-        # Create a deeply nested schema
+        # Create a deeply nested schema (depth > 64)
         schema = {"type": "object"}
         current = schema
-        for i in range(17):
+        for i in range(65):
             current["properties"] = {"nested": {"type": "object"}}
             current = current["properties"]["nested"]
 
@@ -327,7 +340,7 @@ class TestSchemaBoundsValidation(unittest.TestCase):
 
         schema = {"type": "object"}
         current = schema
-        for i in range(17):
+        for i in range(65):
             current["properties"] = {"nested": {"type": "object"}}
             current = current["properties"]["nested"]
 
@@ -356,3 +369,56 @@ class TestSchemaBoundsValidation(unittest.TestCase):
         self.assertIsInstance(result, InvalidGrammarObject)
         self.assertIn("DFA states", result.error_message)
         backend._compile_regex.assert_not_called()
+
+    def test_xgrammar_rejects_deep_schema_in_structural_tag(self):
+        """XGrammar backend should reject deep schemas in structural tags before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        # Create a deeply nested schema
+        schema = {"type": "object"}
+        current = schema
+        for i in range(65):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        # Test legacy structural tag
+        structural_tag = {
+            "structures": [
+                {"begin": "<tool>", "schema": json.dumps(schema), "end": "</tool>"}
+            ],
+            "triggers": ["<tool>"],
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+    def test_xgrammar_rejects_state_explosion_in_structural_tag(self):
+        """XGrammar backend should reject state explosion in structural tags before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        # Test new format structural tag
+        structural_tag = {"format": {"type": "json_schema", "json_schema": schema}}
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

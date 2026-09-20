@@ -29,6 +29,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
     JSONSchemaDepthExceeded,
     JSONSchemaStateExplosion,
     validate_outlines_json_schema,
@@ -182,6 +183,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             NotImplementedError,
             JSONSchemaDepthExceeded,
             JSONSchemaStateExplosion,
+            JSONSchemaCircularRef,
             json.decoder.JSONDecodeError,
             ValueError,
         ) as e:

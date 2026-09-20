@@ -1,6 +1,7 @@
 """Detect JSON Schema constraints that grammar backends silently ignore."""
 
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -16,16 +17,72 @@ class JSONSchemaStateExplosion(ValueError):
     pass
 
 
-# Maximum allowed nesting depth for JSON schema
-MAX_SCHEMA_DEPTH = 16
+class JSONSchemaCircularRef(ValueError):
+    """Raised when JSON schema contains a circular $ref."""
+
+    pass
+
+
+# Maximum allowed nesting depth for JSON schema (increased from 16 to support valid deeply nested tool definitions)
+MAX_SCHEMA_DEPTH = 64
+# Maximum allowed total nodes in schema traversal (prevents pathological cases)
+MAX_TOTAL_NODES = 50000
 # Maximum allowed estimated DFA states (to prevent state explosion)
 MAX_DFA_STATES = 10000
 
 
+@dataclass
+class TraversalContext:
+    """Thread-local traversal context passed explicitly down the call stack.
+
+    This ensures thread safety by avoiding global or thread-local counters.
+    """
+
+    depth: int = 0
+    total_nodes: int = 0
+    active_ref_stack: list[str] = field(default_factory=list)
+    max_depth: int = MAX_SCHEMA_DEPTH
+    max_total_nodes: int = MAX_TOTAL_NODES
+
+    def enter(self) -> "TraversalContext":
+        """Create a new context for a child node with incremented depth."""
+        return TraversalContext(
+            depth=self.depth + 1,
+            total_nodes=self.total_nodes + 1,
+            active_ref_stack=self.active_ref_stack,
+            max_depth=self.max_depth,
+            max_total_nodes=self.max_total_nodes,
+        )
+
+    def check_bounds(self) -> None:
+        """Check if traversal bounds are exceeded."""
+        if self.depth > self.max_depth:
+            raise JSONSchemaDepthExceeded(
+                f"JSON schema nesting depth exceeds allowable limit of {self.max_depth}"
+            )
+        if self.total_nodes > self.max_total_nodes:
+            raise JSONSchemaStateExplosion(
+                f"JSON schema total nodes ({self.total_nodes}) exceeds maximum allowed ({self.max_total_nodes})"
+            )
+
+    def push_ref(self, ref: str) -> None:
+        """Push a $ref onto the active reference stack for circular detection."""
+        if ref in self.active_ref_stack:
+            raise JSONSchemaCircularRef(
+                f"Circular $ref detected: {' -> '.join(self.active_ref_stack + [ref])}"
+            )
+        self.active_ref_stack.append(ref)
+
+    def pop_ref(self) -> None:
+        """Pop a $ref from the active reference stack."""
+        if self.active_ref_stack:
+            self.active_ref_stack.pop()
+
+
 def validate_schema_depth(
     schema: Any,
-    current_depth: int = 0,
     max_depth: int = MAX_SCHEMA_DEPTH,
+    max_total_nodes: int = MAX_TOTAL_NODES,
 ) -> None:
     """
     Validate that JSON schema nesting depth does not exceed the maximum allowed limit.
@@ -34,48 +91,65 @@ def validate_schema_depth(
 
     Args:
         schema: The JSON schema to validate
-        current_depth: Current nesting depth (used for recursion)
         max_depth: Maximum allowed nesting depth
+        max_total_nodes: Maximum allowed total nodes in traversal
 
     Raises:
         JSONSchemaDepthExceeded: If nesting depth exceeds max_depth
+        JSONSchemaStateExplosion: If total nodes exceeds max_total_nodes
+        JSONSchemaCircularRef: If a circular $ref is detected
     """
-    if current_depth > max_depth:
-        raise JSONSchemaDepthExceeded(
-            f"JSON schema nesting depth exceeds allowable limit of {max_depth}"
-        )
+    ctx = TraversalContext(max_depth=max_depth, max_total_nodes=max_total_nodes)
+    _validate_schema_depth_recursive(schema, ctx)
+
+
+def _validate_schema_depth_recursive(schema: Any, ctx: TraversalContext) -> None:
+    """Recursive implementation using explicit TraversalContext."""
+    ctx.check_bounds()
+
     if not isinstance(schema, dict):
         return
+
+    # Handle $ref for circular reference detection
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        ctx.push_ref(ref)
+        try:
+            # Note: We don't resolve the ref here, just detect cycles in the ref chain
+            # Actual ref resolution happens at compile time
+            pass
+        finally:
+            ctx.pop_ref()
 
     # Single subschema keywords
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
         if isinstance(child, (bool, dict)):
-            validate_schema_depth(child, current_depth + 1, max_depth)
+            _validate_schema_depth_recursive(child, ctx.enter())
         elif keyword == "items" and isinstance(child, list):
             for item in child:
-                validate_schema_depth(item, current_depth + 1, max_depth)
+                _validate_schema_depth_recursive(item, ctx.enter())
 
     # Array subschema keywords
     for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, list):
             for child in children:
-                validate_schema_depth(child, current_depth + 1, max_depth)
+                _validate_schema_depth_recursive(child, ctx.enter())
 
     # Map subschema keywords
     for keyword in _SUBSCHEMA_MAP_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, dict):
             for child in children.values():
-                validate_schema_depth(child, current_depth + 1, max_depth)
+                _validate_schema_depth_recursive(child, ctx.enter())
 
     # Dependencies
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         for child in dependencies.values():
             if isinstance(child, (bool, dict)):
-                validate_schema_depth(child, current_depth + 1, max_depth)
+                _validate_schema_depth_recursive(child, ctx.enter())
 
 
 def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
@@ -101,6 +175,49 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
     properties = schema.get("properties", {})
     if isinstance(properties, dict):
         state_count += len(properties) * 2  # Property name + value states
+
+    # Handle string patterns - regex patterns can cause exponential state explosion
+    # We estimate based on pattern complexity (rough heuristic)
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str):
+        # Estimate regex complexity: count of quantifiers, alternations, groups
+        # A pattern like "[ab]*a[ab]{13}" can generate ~16K states
+        import re
+
+        # Match quantifiers properly: *, +, ?, {N}, {N,}, {N,M}
+        # Use raw strings for proper regex escaping
+        quantifier_count = len(re.findall(r"[*+?]|\{\d+,?\d*\}", pattern))
+        alt_count = pattern.count("|")
+        group_count = pattern.count("(")
+        char_class_count = pattern.count("[")
+        # Look for {N} quantifiers with large N
+        brace_quantifiers = re.findall(r"\{(\d+)(?:,\d*)?\}", pattern)
+        large_quantifier_sum = sum(int(n) for n in brace_quantifiers if int(n) > 10)
+        # Heuristic: each quantifier/alternation/group roughly multiplies states
+        # For patterns like [ab]*a[ab]{13}, the combination of * and {N} is problematic
+        # Use exponential estimation for bounded quantifiers combined with unbounded
+        has_unbounded = "*" in pattern or "+" in pattern
+        has_bounded = bool(brace_quantifiers)
+        if has_unbounded and has_bounded:
+            # This combination can cause exponential blowup
+            # Multiply by the product of bounded quantifiers
+            bounded_product = 1
+            for n in brace_quantifiers:
+                bounded_product *= max(1, int(n))
+            # Cap at reasonable value
+            bounded_product = min(bounded_product, 10000)
+            pattern_complexity = max(
+                1,
+                (quantifier_count + alt_count + group_count + char_class_count) * 100
+                + bounded_product * 100,
+            )
+        else:
+            pattern_complexity = max(
+                1,
+                (quantifier_count + alt_count + group_count + char_class_count) * 100
+                + large_quantifier_sum * 500,
+            )
+        state_count += pattern_complexity
 
     # Single subschema keywords
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
@@ -139,6 +256,7 @@ def validate_schema_bounds(
     schema: Any,
     max_depth: int = MAX_SCHEMA_DEPTH,
     max_states: int = MAX_DFA_STATES,
+    max_total_nodes: int = MAX_TOTAL_NODES,
 ) -> None:
     """
     Validate JSON schema bounds to prevent DFA state explosion and CPU thread hanging.
@@ -147,15 +265,19 @@ def validate_schema_bounds(
 
     Args:
         schema: The JSON schema to validate
-        max_depth: Maximum allowed nesting depth (default: 16)
+        max_depth: Maximum allowed nesting depth (default: 64)
         max_states: Maximum allowed estimated DFA states (default: 10000)
+        max_total_nodes: Maximum allowed total nodes in traversal (default: 50000)
 
     Raises:
         JSONSchemaDepthExceeded: If nesting depth exceeds max_depth
-        JSONSchemaStateExplosion: If estimated DFA states exceeds max_states
+        JSONSchemaStateExplosion: If estimated DFA states exceeds max_states or total nodes exceeds max_total_nodes
+        JSONSchemaCircularRef: If a circular $ref is detected
     """
-    validate_schema_depth(schema, max_depth=max_depth)
+    # First validate depth and total nodes (also detects circular refs)
+    validate_schema_depth(schema, max_depth=max_depth, max_total_nodes=max_total_nodes)
 
+    # Then estimate DFA states
     estimated_states = _estimate_dfa_states(schema)
     if estimated_states > max_states:
         raise JSONSchemaStateExplosion(

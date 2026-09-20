@@ -37,6 +37,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
     JSONSchemaDepthExceeded,
     JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
@@ -318,6 +319,30 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 XGrammarGrammarBackend._sanitize_structural_format(tag)
 
     @staticmethod
+    def _validate_structural_format_schemas(structural_format):
+        """Validate all JSON schemas in a structural format tree."""
+        if not isinstance(structural_format, dict):
+            return
+
+        fmt_type = structural_format.get("type")
+        if fmt_type in {"json_schema", "qwen_xml_parameter"}:
+            schema = structural_format.get("json_schema")
+            if schema is not None:
+                validate_xgrammar_json_schema(schema)
+                validate_schema_bounds(schema)
+
+        if fmt_type == "tag":
+            XGrammarGrammarBackend._validate_structural_format_schemas(
+                structural_format.get("content")
+            )
+        elif fmt_type in {"sequence", "or"}:
+            for element in structural_format.get("elements", []):
+                XGrammarGrammarBackend._validate_structural_format_schemas(element)
+        elif fmt_type in {"triggered_tags", "tags_with_separator"}:
+            for tag in structural_format.get("tags", []):
+                XGrammarGrammarBackend._validate_structural_format_schemas(tag)
+
+    @staticmethod
     def _sanitize_structural_tag_structures(structural_tag: Dict) -> None:
         for structure in structural_tag.get("structures", []):
             if structure.get("schema") is None:
@@ -389,6 +414,15 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             structural_tag = json.loads(key_string)
             if is_legacy_structural_tag(structural_tag):
                 self._sanitize_structural_tag_structures(structural_tag)
+                # Validate each schema in legacy structural tag
+                for structure in structural_tag["structures"]:
+                    schema = structure.get("schema")
+                    if schema is not None:
+                        # Schema might be a JSON string (double-encoded) or already a dict
+                        if isinstance(schema, str):
+                            schema = json.loads(schema)
+                        validate_xgrammar_json_schema(schema)
+                        validate_schema_bounds(schema)
                 tags = [
                     StructuralTagItem(
                         begin=structure["begin"],
@@ -406,10 +440,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
                     self._sanitize_structural_format(format_dict)
+                    # Validate schemas in new format tree
+                    self._validate_structural_format_schemas(format_dict)
                     structural_tag["format"] = format_dict
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+        except (
+            RuntimeError,
+            UnsupportedJSONSchemaFeature,
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
+            JSONSchemaCircularRef,
+            json.decoder.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(
