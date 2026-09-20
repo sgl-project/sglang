@@ -274,7 +274,15 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def process_batch_result(batch, result):
             observed_idle_flags.append(batch.after_idle_gap)
             observed_iters.append(batch.forward_iter)
-            scheduler._record_step_counters(batch, result)
+            # Script the completion clock like run_batch's launch clock:
+            # _record_step_counters measures prefill busy time from launch /
+            # previous-prefill-end timestamps, so an unscripted wall clock
+            # would sample real elapsed time instead of LAUNCH_TIMESTAMPS.
+            with patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=batch.launch_ts,
+            ):
+                scheduler._record_step_counters(batch, result)
 
         scheduler.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
@@ -309,6 +317,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._engine_paused = False
         scheduler._sched_idled = False
         scheduler._prev_step = None
+        scheduler._prev_prefill_end_ts = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
