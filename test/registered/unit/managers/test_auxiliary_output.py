@@ -493,7 +493,8 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
+@pytest.mark.parametrize("split_index", [0, 1])
+def test_pdmux_split_prefill_schedules_auxiliary_output_copy(split_index):
     device_output = DeviceOutput(torch.tensor([1.0]))
     result = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
@@ -528,6 +529,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
             is_prebuilt=lambda: False,
             is_split_prefill=lambda: True,
         ),
+        split_index=split_index,
         reqs=[],
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
