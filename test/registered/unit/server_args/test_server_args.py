@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
+from sglang.srt.arg_groups import validation_hook
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
@@ -62,6 +63,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_server_args,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -104,6 +106,72 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_pipeline_parallelism_allows_speculative_decoding_when_overlap_disabled(
+        self,
+    ):
+        """PP and speculative decoding are compatible when overlap is off.
+
+        GLM-5.3 Prefill uses PP2 with EAGLE MTP. The PP guard must reject the
+        overlapping scheduler, not speculative decoding itself.
+        """
+        cfg = SimpleNamespace(
+            ep_join_mode="normal",
+            tp_size=8,
+            pp_size=2,
+            nnodes=2,
+            pp_max_micro_batch_size=1,
+            disable_cuda_graph_padding=False,
+            enable_torch_compile=False,
+            disable_overlap_schedule=True,
+            min_free_slots_delay=None,
+            dp_size=1,
+            enable_dp_attention=False,
+            base_gpu_id=0,
+            gpu_id_step=1,
+            moe_dense_tp_size=None,
+            served_model_name="dummy",
+            speculative_algorithm="EAGLE",
+            enable_mixed_chunk=False,
+            chunked_prefill_size=-1,
+            disaggregation_mode="null",
+            page_size=1,
+            enable_pdmux=False,
+            tokenizer_worker_num=1,
+            detokenizer_worker_num=1,
+            mm_processor_worker_num=0,
+            mm_io_worker_num=0,
+            prompt_tokens_buckets=[],
+            generation_tokens_buckets=[],
+            enable_priority_scheduling=False,
+            schedule_policy="fcfs",
+            default_priority_value=None,
+            disable_priority_preemption=False,
+            retraction_policy="ignore",
+            schedule_conservativeness=1.0,
+            model_impl="auto",
+            tokenizer_metrics_custom_labels_header=None,
+            tokenizer_metrics_allowed_custom_labels=[],
+            export_metrics_to_file=False,
+            export_metrics_to_file_dir=None,
+            enable_quant_communications=False,
+            device="cuda",
+            smg_grpc_mode=False,
+            grpc_mode=False,
+            grpc_port=30000,
+            port=30001,
+            gc_threshold=None,
+            kv_canary_sweep_interval=0,
+            kv_canary="none",
+        )
+        with (
+            patch.object(validation_hook, "resolving_view", return_value=cfg),
+            patch("sglang.srt.arg_groups.lora_hook.check_lora_server_args"),
+            patch.object(validation_hook, "run_post_process_pass"),
+            patch.object(validation_hook, "check_two_batch_overlap"),
+            patch.object(validation_hook, "check_load_publish_args"),
+        ):
+            check_server_args(object())
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",
