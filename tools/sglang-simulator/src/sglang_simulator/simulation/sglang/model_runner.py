@@ -176,6 +176,11 @@ class C_KVCacheConfiguratorHook(BaseHook):
                         )
                     except RuntimeError:
                         return 0
+                    except ValueError as error:
+                        # New runtimes reject deliberately undersized SWA probes.
+                        if "cannot hold even one request" not in str(error):
+                            raise
+                        return 0
                     return config.max_total_num_tokens
 
                 lower, upper = 0, 1
@@ -249,9 +254,18 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 if hasattr(token_pool, name):
                     setattr(token_pool, name, value)
 
-            if hasattr(token_pool, "row_dim"):
+            # Some pools derive their physical row widths while the dimensions
+            # above are compacted. Restore that derived geometry before host
+            # pools inspect the device-pool rows for HiCache sizing.
+            if all(
+                hasattr(token_pool, name)
+                for name in ("head_num", "head_dim", "row_dim")
+            ):
                 token_pool.row_dim = token_pool.head_num * token_pool.head_dim
-            if hasattr(token_pool, "v_row_dim"):
+            if all(
+                hasattr(token_pool, name)
+                for name in ("head_num", "v_head_dim", "v_row_dim")
+            ):
                 token_pool.v_row_dim = token_pool.head_num * token_pool.v_head_dim
 
             if (
