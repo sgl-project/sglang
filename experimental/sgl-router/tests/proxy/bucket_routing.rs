@@ -200,7 +200,7 @@ fn build_cache_ctx_with_affinity(
     context.config.model.cache_aware = Some(CacheAwareConfig {
         prefix_provider: CachePrefixProvider::Indexer,
         kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
-            url: "http://fake-indexer".into(),
+            urls: vec!["http://fake-indexer".into()],
             query_timeout_ms: 100,
             query_max_inflight: 32,
         }),

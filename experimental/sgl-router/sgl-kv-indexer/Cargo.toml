@@ -21,8 +21,18 @@ path = "src/bin/kv-indexer-bridge.rs"
 [dependencies]
 bytes = "1"
 prost = "0.14"
+# TLS is rustls with webpki roots, matching the router's reqwest configuration,
+# so `valkeys://` works without a native TLS stack; `script` gives EVALSHA hashes.
+redis = { version = "1", default-features = false, features = [
+    "tokio-comp",
+    "connection-manager",
+    "cluster-async",
+    "tokio-rustls-comp",
+    "tls-rustls-webpki-roots",
+    "script",
+] }
 rmpv = "1.3.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
 tracing = "0.1"
@@ -30,6 +40,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Must mirror the router's feature set: Cargo unifies features across the
 # workspace, so enabling more transports here also enlarges the router binary.
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+[dev-dependencies]
+# Serving on a listener the test already bound, instead of a port it reserved
+# and released, is what keeps parallel test binaries off each other's ports.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
