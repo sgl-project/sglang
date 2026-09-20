@@ -325,6 +325,30 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
             force_reasoning=False,
         )
 
+    def test_inline_duplicate_closer_at_tool_boundary(self):
+        for prefix, expected in [
+            ("Now run.</think>\n\n", "Now run.\n\n"),
+            ("Now run:</think>", "Now run:"),
+            ("Now run. </think> \t\r\n", "Now run.  \t\r\n"),
+            ("Now run.</think>\n</think>\n", "Now run.\n\n"),
+            (
+                "Mention </think> here, then run.</think>\n",
+                "Mention </think> here, then run.\n",
+            ),
+        ]:
+            text = "Inspect.</think>" + prefix + self.tool
+            normal = expected + self.tool
+            for stream_reasoning in [True, False]:
+                with self.subTest(prefix=prefix, stream_reasoning=stream_reasoning):
+                    self._assert_parses(
+                        text, "Inspect.", normal, stream_reasoning=stream_reasoning
+                    )
+            for split in range(len(text) + 1):
+                with self.subTest(prefix=prefix, split=split):
+                    self.assertEqual(
+                        self._stream([text[:split], text[split:]]), ("Inspect.", normal)
+                    )
+
     def test_consecutive_closers_and_crlf(self):
         self._assert_parses(
             "Inspect.</think>Now run.\r\n </think>\r\n\t</think>\r\n" + self.tool,
@@ -350,6 +374,9 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
             "`</think>`\n" + self.tool,
             "> </think>\n" + self.tool,
             "\\</think>\n" + self.tool,
+            "An escaped closer: \\</think>\n" + self.tool,
+            "An escaped closer: \\\\</think>\n" + self.tool,
+            "Quoted `</think>`\n" + self.tool,
             "<think>example\n</think>\n" + self.tool,
             "```\n</think>\n" + self.tool + "\n```",
             '"an open quotation\n</think>\n' + self.tool,

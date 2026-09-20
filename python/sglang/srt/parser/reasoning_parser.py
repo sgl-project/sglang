@@ -1564,9 +1564,9 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         prefix = self._content_pending[: marker.start()]
         visible_prefix = visible[: marker.start()]
         if self._saw_think_end and self.think_start_token not in visible_prefix:
-            # Only redundant closer-only lines immediately before an unquoted
-            # tool block are structural. Preserve prose and quoted examples.
-            pattern = r"(?m)^[ \t]*(</think>)[ \t]*(?:\r?\n[ \t]*)+\Z"
+            # A redundant closer at an established tool boundary is structural
+            # even when attached to prose. Keep quoted or escaped literals.
+            pattern = r"(?<!\\)(</think>)[ \t\r\n]*\Z"
             while match := re.search(pattern, prefix):
                 start, end = match.span(1)
                 if visible_prefix[start:end] != self.think_end_token:
