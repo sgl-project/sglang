@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -444,12 +445,13 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.index_key_cache.buffer.append(torch.zeros((4, 11), dtype=torch.uint8))
         draft_pools = (dsa_pool(13, 17), dsa_pool(19, 23))
 
-        group = resolve_hybrid_device_pool_group(
-            kvcache=kvcache,
-            page_size=2,
-            params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
-            components={ComponentType.FULL},
-        )
+        with get_parallel().override(attn_dcp_size=1):
+            group = resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
+                components={ComponentType.FULL},
+            )
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
@@ -476,6 +478,31 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         ].get_prepared_layer_range_meta([0], 1)
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
+
+    def test_dsa_rejects_dcp(self):
+        # The DSA entry packs the target's DCP-widened KV rows together with
+        # any MTP draft rows (replicated, indexed raw) under one dcp_size, so
+        # a single collapse cannot be correct for both; reject rather than
+        # silently reproduce the widened-loc-as-physical-row bug this pool's
+        # sibling (mamba's KV entry) had before it was given its own dcp_size.
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.layer_num = 1
+        kvcache.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        kvcache.index_key_cache = SimpleNamespace(
+            buffer=[torch.zeros((4, 7), dtype=torch.uint8)]
+        )
+
+        with get_parallel().override(attn_dcp_size=8):
+            with self.assertRaisesRegex(ValueError, "does not support --dcp-size"):
+                resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=SimpleNamespace(mtp_draft_device_pools=()),
+                    components={ComponentType.FULL},
+                )
 
     def test_linker_requires_packed_draft(self):
         """Do not accept draft state that the linker would omit from storage."""

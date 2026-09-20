@@ -397,6 +397,18 @@ def _build_dsa_device_pool_group(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
+    # This entry packs the target's token-addressed KV buffer (DCP-widened,
+    # needs the same starts // dcp_size collapse as the mamba group's KV
+    # entry) together with any MTP draft buffers (replicated, indexed raw)
+    # under one set of rows -- a single dcp_size cannot collapse both
+    # correctly at once, and this combination has never run under DCP.
+    # Reject rather than silently reproduce the 8x capacity bug this pool's
+    # sibling had (see kv_cache_configurator.py's loc_space_scale).
+    if get_parallel().attn_dcp_size > 1:
+        raise ValueError(
+            "The direct external linker's DSA pool group does not support "
+            "--dcp-size > 1 yet."
+        )
     num_layers = kvcache.layer_num
     if any(pool.page_size != page_size for pool in mtp_draft_device_pools):
         raise ValueError("DSA MTP page size must match the tree page size.")
