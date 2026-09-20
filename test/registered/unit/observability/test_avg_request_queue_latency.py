@@ -17,14 +17,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-from sglang.srt.runtime_context import get_context
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
 )
-from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    SchedulerMetricsReporter,
-)
+from sglang.srt.runtime_context import get_context
 
 
 class _RecordingMetric:
@@ -108,9 +108,15 @@ class TestCalcAvgRequestQueueLatency(unittest.TestCase):
 
     def test_requests_with_valid_latencies(self):
         now = time.perf_counter()
-        req1 = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now - 1.0))
-        req2 = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now - 2.0))
-        req3 = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now - 3.0))
+        req1 = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now - 1.0)
+        )
+        req2 = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now - 2.0)
+        )
+        req3 = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now - 3.0)
+        )
 
         reporter = self._create_reporter([req1, req2, req3])
         latency = reporter._calc_avg_request_queue_latency()
@@ -120,16 +126,24 @@ class TestCalcAvgRequestQueueLatency(unittest.TestCase):
     def test_clock_jitter_future_entry_time_clamped(self):
         now = time.perf_counter()
         # Entry time in slight future due to clock jitter
-        req = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now + 0.1))
+        req = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now + 0.1)
+        )
         reporter = self._create_reporter([req])
         latency = reporter._calc_avg_request_queue_latency()
         self.assertEqual(latency, 0.0)
 
     def test_mixed_valid_and_invalid_requests(self):
         now = time.perf_counter()
-        req_valid1 = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now - 1.0))
-        req_valid2 = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=now - 3.0))
-        req_invalid = SimpleNamespace(time_stats=SimpleNamespace(wait_queue_entry_time=0.0))
+        req_valid1 = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now - 1.0)
+        )
+        req_valid2 = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=now - 3.0)
+        )
+        req_invalid = SimpleNamespace(
+            time_stats=SimpleNamespace(wait_queue_entry_time=0.0)
+        )
 
         reporter = self._create_reporter([req_valid1, req_invalid, req_valid2])
         latency = reporter._calc_avg_request_queue_latency()

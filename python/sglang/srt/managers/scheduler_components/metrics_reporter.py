@@ -797,7 +797,9 @@ class SchedulerMetricsReporter:
                 self.scheduler.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-            self.stats.avg_request_queue_latency = self._calc_avg_request_queue_latency()
+            self.stats.avg_request_queue_latency = (
+                self._calc_avg_request_queue_latency()
+            )
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
@@ -1016,7 +1018,9 @@ class SchedulerMetricsReporter:
                 self.scheduler.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-            self.stats.avg_request_queue_latency = self._calc_avg_request_queue_latency()
+            self.stats.avg_request_queue_latency = (
+                self._calc_avg_request_queue_latency()
+            )
             self.stats.gen_throughput = self.last_gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
             # ticks must not reset it, or the exported gauge reads 0 whenever
