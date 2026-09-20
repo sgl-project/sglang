@@ -712,7 +712,7 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
             kwargs = _sparse_attn_kv_quant_kwargs()
 
         self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
-        self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
+        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
 
 
