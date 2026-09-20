@@ -41,9 +41,9 @@ def _flux2_strided_qknorm_rope_kernel(
     pos = rows // HEADS % TOKENS
     cos = tl.load(cache_ptr + pos * CACHE_STRIDE + dims // 2, mask=rows < ROWS, other=0.0)
     sin = tl.load(cache_ptr + pos * CACHE_STRIDE + 64 + dims // 2, mask=rows < ROWS, other=0.0)
-    # FlashInfer's interleaved rotation rounds the first product before FMA.
+    # FlashInfer rounds the sine product before the cosine multiply-add.
     signed_partner = tl.where(dims % 2 == 0, -partner, partner)
-    rotated = tl.fma(signed_partner, sin, normalized * cos)
+    rotated = tl.fma(normalized, cos, signed_partner * sin)
     tl.store(y_ptr + rows * 128 + dims, rotated, mask=rows < ROWS)
 
 
