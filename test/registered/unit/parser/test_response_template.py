@@ -420,14 +420,11 @@ class TestResponseTemplateAdapters(unittest.TestCase):
                     PREFIX,
                 )
 
-    def test_response_template_backend_is_internal(self):
-        self.assertNotIn("response_template", ReasoningParser.DetectorMap)
-        self.assertNotIn(
-            "response_template",
-            FunctionCallParser.ToolCallParserEnum,
-        )
+    def test_response_template_backend_is_available_explicitly(self):
+        self.assertIn("response_template", ReasoningParser.DetectorMap)
+        self.assertIn("response_template", FunctionCallParser.ToolCallParserEnum)
 
-    def test_internal_adapters_use_checkpoint_metadata(self):
+    def test_adapters_use_checkpoint_metadata(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
         reasoning = ReasoningParser(
             model_type="response_template",

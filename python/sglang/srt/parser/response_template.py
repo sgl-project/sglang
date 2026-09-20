@@ -366,6 +366,7 @@ class ResponseTemplateStreamAdapter:
 class _ResponseTemplateParserInputMixin:
     """Preserve response-template delimiters until parsing."""
 
+    requires_response_parser_prefix = True
     response_template: dict | None = None
 
     def _load_response_template(

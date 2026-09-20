@@ -112,8 +112,6 @@ class FunctionCallParser:
         "gigachat3": GigaChat3Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
-    }
-    _InternalToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "response_template": ResponseTemplateToolDetector,
     }
 
@@ -124,9 +122,7 @@ class FunctionCallParser:
         tokenizer=None,
         prefix: str | None = None,
     ):
-        detector_class = self.ToolCallParserEnum.get(
-            tool_call_parser
-        ) or self._InternalToolCallParserEnum.get(tool_call_parser)
+        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
             if tokenizer is not None or prefix:

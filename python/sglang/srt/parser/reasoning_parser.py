@@ -2195,8 +2195,6 @@ class ReasoningParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
-    }
-    _InternalDetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "response_template": ResponseTemplateReasoningDetector,
     }
 
@@ -2213,9 +2211,7 @@ class ReasoningParser:
         if not model_type:
             raise ValueError("Model type must be specified")
 
-        detector_class = self.DetectorMap.get(
-            model_type.lower()
-        ) or self._InternalDetectorMap.get(model_type.lower())
+        detector_class = self.DetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 

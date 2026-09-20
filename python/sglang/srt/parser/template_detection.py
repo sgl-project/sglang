@@ -749,7 +749,6 @@ def _detect_auto_parser(
             f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
         )
         return detected
-    _log_undetected_parser(attr, label)
     return None
 
 
@@ -861,42 +860,6 @@ def resolve_auto_parsers(server_args) -> None:
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
 
-    detected: Dict[str, Optional[str]] = {}
-    if tokenizer is not None and chat_template_arg is None:
-        from sglang.srt.parser.response_template import (
-            resolve_response_template,
-            validate_response_template_for_serving,
-        )
-
-        response_template = resolve_response_template(tokenizer, None)
-        if response_template is not None:
-            try:
-                template = validate_response_template_for_serving(response_template)
-            except (TypeError, ValueError) as exc:
-                logger.warning(
-                    "Ignoring invalid response_template from tokenizer configuration: %s",
-                    exc,
-                )
-            else:
-                for attr, field in (
-                    ("reasoning_parser", "thinking"),
-                    ("tool_call_parser", "tool_calls"),
-                ):
-                    if attr in needs and field in template.fields:
-                        detected[attr] = "response_template"
-                if detected:
-                    logger.info(
-                        "Auto-detected response-template parsers from tokenizer configuration"
-                    )
-                    needs = tuple(attr for attr in needs if attr not in detected)
-                    if not needs:
-                        declare_resolution(
-                            server_args,
-                            "template-detection",
-                            **detected,
-                        )
-                        return
-
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
@@ -906,6 +869,7 @@ def resolve_auto_parsers(server_args) -> None:
         template, tokenizer, reasoning_config, force_reasoning
     )
 
+    detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
@@ -921,13 +885,8 @@ def resolve_auto_parsers(server_args) -> None:
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
-        for attr, label in (
-            ("reasoning_parser", "reasoning parser"),
-            ("tool_call_parser", "tool-call parser"),
-        ):
-            if attr in needs and attr not in detected:
-                _log_undetected_parser(attr, label)
-                detected[attr] = None
+        for attr in needs:
+            detected.setdefault(attr, None)
     else:
         for attr, rules, label in (
             ("reasoning_parser", REASONING_PARSER_RULES, "reasoning parser"),
@@ -935,6 +894,43 @@ def resolve_auto_parsers(server_args) -> None:
         ):
             if attr in needs:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
+
+    unresolved = tuple(attr for attr in needs if detected.get(attr) is None)
+    if unresolved and tokenizer is not None and chat_template_arg is None:
+        from sglang.srt.parser.response_template import (
+            resolve_response_template,
+            validate_response_template_for_serving,
+        )
+
+        response_template = resolve_response_template(tokenizer, None)
+        if response_template is not None:
+            try:
+                response_template = validate_response_template_for_serving(
+                    response_template
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring invalid response_template from tokenizer configuration: %s",
+                    exc,
+                )
+            else:
+                for attr, field in (
+                    ("reasoning_parser", "thinking"),
+                    ("tool_call_parser", "tool_calls"),
+                ):
+                    if attr in unresolved and field in response_template.fields:
+                        detected[attr] = "response_template"
+                        logger.info(
+                            "Auto-detected --%s as 'response_template' from tokenizer configuration",
+                            attr.replace("_", "-"),
+                        )
+
+    for attr, label in (
+        ("reasoning_parser", "reasoning parser"),
+        ("tool_call_parser", "tool-call parser"),
+    ):
+        if attr in needs and detected.get(attr) is None:
+            _log_undetected_parser(attr, label)
 
     if detected:
         declare_resolution(server_args, "template-detection", **detected)

@@ -40,6 +40,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -682,6 +683,9 @@ class ServingChatTestCase(unittest.TestCase):
             self.tm.tokenizer.decode.assert_not_called()
 
     def test_response_template_prefix_uses_prompt_token_ids(self):
+        class ResponseTemplateAlias:
+            requires_response_parser_prefix = True
+
         processed_messages = MessageProcessingResult(
             "prompt decoded with default spacing",
             [1, 2, 3],
@@ -691,14 +695,20 @@ class ServingChatTestCase(unittest.TestCase):
             [],
             None,
         )
-        self.chat.tool_call_parser = "response_template"
+        self.chat.tool_call_parser = "response-template-alias"
         self.basic_req.input_ids = [1, 2, 3]
         self.tm.tokenizer.decode.return_value = "<first><second>"
 
-        with patch.object(
-            self.chat,
-            "_process_messages",
-            return_value=processed_messages,
+        with (
+            patch.dict(
+                FunctionCallParser.ToolCallParserEnum,
+                {"response-template-alias": ResponseTemplateAlias},
+            ),
+            patch.object(
+                self.chat,
+                "_process_messages",
+                return_value=processed_messages,
+            ),
         ):
             _, request = self.chat._convert_to_internal_request(self.basic_req)
 
@@ -720,6 +730,7 @@ class ServingChatTestCase(unittest.TestCase):
             None,
         )
         self.chat.reasoning_parser = "response_template"
+        self.chat._reasoning_detector = Mock(requires_response_parser_prefix=True)
         self.tm.model_config.is_multimodal = True
 
         with patch.object(

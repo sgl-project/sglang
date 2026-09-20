@@ -1313,10 +1313,12 @@ class OpenAIServingChat(OpenAIServingBase):
         request,
         adapted_request: GenerateReqInput,
     ) -> None:
-        if "response_template" in (
-            self.reasoning_parser,
-            self.tool_call_parser,
-        ):
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        if getattr(
+            self._reasoning_detector,
+            "requires_response_parser_prefix",
+            False,
+        ) or getattr(tool_detector, "requires_response_parser_prefix", False):
             request._response_parser_prefix = self._response_parser_prefix(
                 adapted_request
             )

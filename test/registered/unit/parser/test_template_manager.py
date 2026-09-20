@@ -953,6 +953,27 @@ class TestResolveAutoParsers(CustomTestCase):
     """Tests for resolve_auto_parsers()."""
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+    response_template = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "content": {"content": "text"},
+            "thinking": {
+                "open": "<think>",
+                "close": "</think>",
+            },
+            "tool_calls": {
+                "open": "<call>",
+                "close": "</call>",
+                "content": "json",
+                "transform": {
+                    "function": {
+                        "name": "tool",
+                        "arguments": "{content}",
+                    },
+                },
+            },
+        },
+    }
 
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
@@ -1002,52 +1023,40 @@ class TestResolveAutoParsers(CustomTestCase):
             tokenizer_backend="fastokens",
         )
 
-    def test_gemma4_response_template_takes_precedence_over_legacy_detection(self):
+    def test_existing_detection_takes_precedence_over_response_template(self):
         args = self._make_server_args(
             reasoning_parser="auto",
             tool_call_parser="auto",
         )
-        tokenizer = _DummyTokenizer([], chat_template="<|channel>content")
-        tokenizer.response_template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content": "text"},
-                "thinking": {
-                    "open": "<think>",
-                    "close": "</think>",
-                },
-                "tool_calls": {
-                    "open": "<call>",
-                    "close": "</call>",
-                    "content": "json",
-                    "transform": {
-                        "function": {
-                            "name": "tool",
-                            "arguments": "{content}",
-                        },
-                    },
-                },
-            },
-        }
+        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        tokenizer.response_template = self.response_template
 
         with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
             resolve_auto_parsers(args)
 
-        self.assertEqual(
-            _declared(args, "reasoning_parser"),
-            "response_template",
+        self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
+        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_response_template_fills_undetected_parsers(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
         )
-        self.assertEqual(
-            _declared(args, "tool_call_parser"),
-            "response_template",
-        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = self.response_template
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "reasoning_parser"), "response_template")
+        self.assertEqual(_declared(args, "tool_call_parser"), "response_template")
 
     def test_response_template_resolves_only_supported_parser_fields(self):
         args = self._make_server_args(
             reasoning_parser="auto",
             tool_call_parser="auto",
         )
-        tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
         tokenizer.response_template = {
             "start_anchor": "<assistant>",
             "fields": {
@@ -1062,7 +1071,7 @@ class TestResolveAutoParsers(CustomTestCase):
             _declared(args, "reasoning_parser"),
             "response_template",
         )
-        self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+        self.assertIsNone(_declared(args, "tool_call_parser"))
 
     def test_invalid_response_template_uses_existing_detection(self):
         templates = {
