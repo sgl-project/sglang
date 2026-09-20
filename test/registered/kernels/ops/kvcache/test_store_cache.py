@@ -177,5 +177,59 @@ def test_can_use_store_cache() -> None:
     assert can_use_store_cache(1024, 0) == can_use_store_cache(1024)
 
 
+# The paged store kernels address the cache as page * bytes_per_page. That
+# product leaves int32 as soon as the cache passes 2 GiB, which a DSV4 KV pool
+# does well before it is full, so the store lands on a wrapped address and
+# corrupts unrelated memory instead of failing. Writing the same row to a low
+# and a high slot has to produce identical page bytes.
+# A regression shows up as a GPU memory access fault that aborts the process,
+# not as a failed assertion -- the wrapped address is simply not ours to write.
+_INT32_MAX = 2**31 - 1
+_PAGED_PAGE_SIZE = 64
+# bytes per token: flashmla = 576 payload + 8 ue8m0 scales, indexer = 128 + fp32 scale
+_PAGED_CASES = {"flashmla": (512, 584), "indexer": (128, 132)}
+
+
+@pytest.mark.parametrize("kernel", sorted(_PAGED_CASES))
+def test_paged_store_past_int32_byte_offset(kernel: str) -> None:
+    from sglang.kernels.ops.kvcache.triton_store_cache import (
+        triton_fused_store_flashmla,
+        triton_fused_store_indexer,
+    )
+
+    element_dim, bytes_per_token = _PAGED_CASES[kernel]
+    store = (
+        triton_fused_store_flashmla
+        if kernel == "flashmla"
+        else triton_fused_store_indexer
+    )
+    bytes_per_page = _PAGED_PAGE_SIZE * bytes_per_token
+    # Enough pages that the last one's byte offset no longer fits in int32.
+    num_pages = _INT32_MAX // bytes_per_page + 8
+    nbytes = num_pages * bytes_per_page
+    free, _ = torch.cuda.mem_get_info()
+    if free < nbytes + (1 << 30):
+        pytest.skip(f"needs ~{nbytes >> 30} GiB free, has {free >> 30} GiB")
+
+    cache = torch.zeros((num_pages, bytes_per_page), dtype=torch.uint8, device=DEVICE)
+    row = torch.randn((1, element_dim), dtype=DTYPE, device=DEVICE)
+    slot = 7
+    low_page, high_page = 1, num_pages - 1
+    assert high_page * bytes_per_page > _INT32_MAX
+
+    for page in (low_page, high_page):
+        loc = torch.tensor(
+            [page * _PAGED_PAGE_SIZE + slot], dtype=torch.int32, device=DEVICE
+        )
+        store(row, cache, loc, _PAGED_PAGE_SIZE)
+    torch.cuda.synchronize()
+
+    assert cache[low_page].any(), "low page was not written at all"
+    assert torch.equal(cache[high_page], cache[low_page]), (
+        f"{kernel}: page {high_page} (byte offset "
+        f"{high_page * bytes_per_page}) does not match page {low_page}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

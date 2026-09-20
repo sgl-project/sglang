@@ -1,6 +1,7 @@
 # Adapt from
 # https://github.com/mlc-ai/xgrammar/blob/v0.1.17/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
 
+import functools
 from typing import List, Optional, Union
 
 import torch
@@ -8,6 +9,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import get_device_core_count
+
+
+@functools.lru_cache(maxsize=None)
+def _warp_size(index: int) -> int:
+    return torch.cuda.get_device_properties(index).warp_size
 
 
 @triton.jit
@@ -136,6 +142,10 @@ def apply_token_bitmask_inplace_triton(
         bitmask_shape[1],
         NUM_SMS,
         BLOCK_SIZE,
-        num_warps=BLOCK_SIZE // 32 // (16 // logits.element_size()),
+        # Warps are 64 lanes wide on CDNA, so a hard-coded 32 asks for twice the
+        # threads the hardware allows and the launch fails with OutOfResources.
+        num_warps=BLOCK_SIZE
+        // _warp_size(logits.device.index or 0)
+        // (16 // logits.element_size()),
         num_stages=3,
     )

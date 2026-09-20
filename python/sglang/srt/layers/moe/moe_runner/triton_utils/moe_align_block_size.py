@@ -126,7 +126,11 @@ def moe_align_block_size(
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = False
+    # PATCH(AMD): the AOT sgl_moe_align_block_size op segfaults on ROCm -- it
+    # dies host-side on any input, reproducible with a 1x6 int32 topk_ids. The
+    # JIT kernel does the same job, so prefer it on HIP. (It only implements
+    # the "+1 offset" convention, hence the ignore_invalid_expert guard.)
+    use_jit_align = _is_hip and not ignore_invalid_expert
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
