@@ -47,9 +47,7 @@ if __name__ == "__main__":
     assert _configs_discovered
     assert len(_CONFIG_REGISTRY) == 62
 
-    package = importlib.import_module(
-        "sglang.multimodal_gen.configs.pipeline_configs"
-    )
+    package = importlib.import_module("sglang.multimodal_gen.configs.pipeline_configs")
     modules = [
         importlib.import_module(info.name)
         for info in pkgutil.iter_modules(package.__path__, package.__name__ + ".")
