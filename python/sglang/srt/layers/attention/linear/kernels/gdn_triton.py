@@ -200,6 +200,60 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        # --- AscendC prefill switch (patch_gdn_prefill_ascendc.py) ---
+        # #747 flipped the pool, the decode kernel and the verify operator to
+        # (nv, dv, dk); the triton path here still returns (nv, dk, dv), so the
+        # state written back to the pool is transposed -- silently, because
+        # dk == dv == 128 makes the shapes identical. Use the operator #747
+        # added, which is native to the unified layout.
+        if is_npu():
+            import torch as _torch
+
+            _op = getattr(_torch.ops.npu, "chunk_gated_delta_rule", None)
+            if _op is None:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "chunk_gated_delta_rule is not registered; falling back to the "
+                    "triton prefill, whose state layout does not match the pool."
+                )
+            else:
+                from sgl_kernel_npu.fla.l2norm import l2norm_fwd as _l2norm
+
+                _t, _nk, _dk = q.shape[-3], q.shape[-2], q.shape[-1]
+                _nv, _dv = v.shape[-2], v.shape[-1]
+                # q/k/v arrive as strided views of mixed_qkv, so one reshape each
+                # is the copy the operator needs; l2norm_fwd returns contiguous.
+                _q = _l2norm(q.reshape(-1, _dk)).view(_t, _nk, _dk)
+                _k = _l2norm(k.reshape(-1, _dk)).view(_t, _nk, _dk)
+                _lens = _torch.diff(query_start_loc).to(_torch.int32)
+                # The operator's chunk grid is sum_b ceil(len_b / 64), the same
+                # grid _init_track_ssm_indices builds for GDN, and it writes each
+                # chunk's entering state -- so chunk_state is exactly the `h` the
+                # mamba page tracking reads. Sizing it costs one host sync.
+                _chunks = int(((_lens + 63) // 64).sum())
+                _h = _torch.empty(
+                    _chunks,
+                    _nv,
+                    _dv,
+                    _dk,
+                    dtype=recurrent_state.dtype,
+                    device=recurrent_state.device,
+                )
+                _out, _state = _op(
+                    _q,
+                    _k,
+                    v.reshape(_t, _nv, _dv),
+                    beta=beta.reshape(_t, _nv),
+                    initial_state=recurrent_state,
+                    actual_seq_lengths=_lens,
+                    scale=_dk**-0.5,
+                    g=g.reshape(_t, _nv).to(_torch.float32),
+                    chunk_state=_h,
+                )
+                return _out.unsqueeze(0), _state, _h.unsqueeze(0)
+        # --- end switch ---
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
