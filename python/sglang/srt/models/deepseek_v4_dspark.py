@@ -1070,7 +1070,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"geometry: expected bs * gamma = {bs} * {runtime_gamma} = "
                 f"{expected_rows}, got shape {tuple(x_post_hc.shape)}."
             )
-        x_post_hc = x_post_hc.reshape(bs, runtime_gamma, -1)
+        x_post_hc = x_post_hc.view(bs, runtime_gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
                 [
