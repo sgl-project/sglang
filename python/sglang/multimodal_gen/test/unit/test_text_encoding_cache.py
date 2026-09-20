@@ -7,6 +7,7 @@ from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache import conditioning
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
@@ -37,9 +38,29 @@ class FullHiddenStateEncoder(TextEncoder):
 
 
 @pytest.mark.parametrize("output_type", ["tensor", "tuple", "structured"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 @torch.no_grad()
-def test_cache_stores_only_consumed_text_conditioning(output_type):
-    encoder = FullHiddenStateEncoder().eval()
+def test_cache_stores_only_consumed_text_conditioning(output_type, device, monkeypatch):
+    encoder = FullHiddenStateEncoder().to(device).eval()
+    fingerprint = conditioning._fingerprint
+
+    def fingerprint_host_inputs(value):
+        if isinstance(value, torch.Tensor):
+            assert value.device.type == "cpu", "token keys must not read GPU inputs"
+        return fingerprint(value)
+
+    monkeypatch.setattr(conditioning, "_fingerprint", fingerprint_host_inputs)
 
     def postprocess(output, text_inputs, return_attention_mask=False):
         embedding = output.hidden_states[9]
@@ -83,14 +104,14 @@ def test_cache_stores_only_consumed_text_conditioning(output_type):
     cache = ConditioningCache(4096)
     with cache.scope():
         first = stage.encode_text(
-            "hello", args, device="cpu", return_attention_mask=True
+            "hello", args, device=device, return_attention_mask=True
         )
         expected = first[0][0].clone()
         expected_pooled = first[2][0].clone()
         first[0][0].zero_()
         first[2][0].zero_()
         restored = stage.encode_text(
-            "hello", args, device="cpu", return_attention_mask=True
+            "hello", args, device=device, return_attention_mask=True
         )
         torch.testing.assert_close(restored[0][0], expected, rtol=0, atol=0)
         torch.testing.assert_close(restored[2][0], expected_pooled, rtol=0, atol=0)
@@ -98,11 +119,11 @@ def test_cache_stores_only_consumed_text_conditioning(output_type):
         assert encoder.calls == 1
         assert cache.stats()["entries"] == 1
         assert cache.bytes < 32  # two embeddings, one pooled value, optional mask
-        stage.encode_text("changed", args, device="cpu", return_attention_mask=True)
+        stage.encode_text("changed", args, device=device, return_attention_mask=True)
         assert encoder.calls == 2
         # The same encoder can serve different pipeline postprocessing contracts.
         make_stage().encode_text(
-            "hello", args, device="cpu", return_attention_mask=True
+            "hello", args, device=device, return_attention_mask=True
         )
         assert encoder.calls == 3
 
