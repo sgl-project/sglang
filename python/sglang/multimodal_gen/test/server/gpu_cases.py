@@ -1131,6 +1131,26 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
     ),
+    # TODO: re-enable when the checkpoint is accessible to fork PR CI
+    # DiffusionTestCase(
+    #     "qwen_image21_t2i_tp2",
+    #     DiffusionServerArgs(
+    #         model_path="Qwen/Qwen-Image-2.1",
+    #         tp_size=2,
+    #         ulysses_degree=1,
+    #         ring_degree=1,
+    #     ),
+    #     replace(
+    #         T2I_sampling_params,
+    #         output_size="1024x1024",
+    #         output_format="png",
+    #         extras={"num_inference_steps": 40, "guidance_scale": 1, "seed": 42},
+    #     ),
+    #     perf_repeat_requests=2,
+    #     run_perf_check=False,
+    #     run_component_accuracy_check=False,
+    #     run_t2v_input_reference_check=False,
+    # ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus_extra_high",
         DiffusionServerArgs(

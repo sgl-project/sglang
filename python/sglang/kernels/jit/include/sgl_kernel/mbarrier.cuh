@@ -43,6 +43,12 @@ SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
   return state;
 }
 
+SGL_DEVICE uint64_t mbar_arrive_relaxed(uint64_t* bar) {
+  uint64_t state;
+  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  return state;
+}
+
 // Combined arrive + set tx-count, for TMA-load completion.
 SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
