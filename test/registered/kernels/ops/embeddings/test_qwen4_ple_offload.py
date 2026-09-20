@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
@@ -15,6 +16,7 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -189,6 +191,52 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
     assert graph_five.data_ptr() != graph_three.data_ptr()
     assert set(layer._graph_prefetch_buffers) == {3, 5}
+
+
+@pytest.fixture
+def single_rank_runtime_context():
+    """``Qwen4ExpPLELayer.__init__`` reads the TP topology through
+    ``VocabParallelEmbedding``; pin it to one rank without a process group."""
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    try:
+        with get_parallel().override(
+            tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1
+        ):
+            yield
+    finally:
+        override.restore()
+
+
+def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
+    # sgl-project/sglang#39841: the table was built on the device before the
+    # host table existed, so the flag needed a full per-rank shard of free VRAM.
+    # Small everywhere except the n-gram table (16 heads x ~20k rows x 4 dims),
+    # which must dominate the layer's footprint for the peak check to bite.
+    config = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        hc_count=2,
+        ple_embed_dim=64,
+        ngram_size=3,
+        heads_per_ngram=8,
+        ngram_vocab_size_base=20_000,
+        eos_token_id=1,
+        ple_offload_embedding=True,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    with torch.device("cuda"):  # the model loader builds every layer this way
+        layer = Qwen4ExpPLELayer(config, prefix="ple", layer_id=0, ple_layer_index=0)
+    peak = torch.cuda.max_memory_allocated() - base
+
+    emb = layer.ple_embedding.ngram_embedding
+    table_bytes = emb.weight.numel() * emb.weight.element_size()
+    assert peak < table_bytes // 2, (peak, table_bytes)
+    assert emb.weight.device.type == "cpu" and emb.weight.is_pinned()
+    assert emb.weight_scale.is_cuda
+    assert not any(t.is_meta for t in (*layer.parameters(), *layer.buffers()))
 
 
 def _file_backend_supported() -> bool:

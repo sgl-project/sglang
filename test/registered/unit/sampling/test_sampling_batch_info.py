@@ -12,7 +12,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
 from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
     SamplingBatchInfo,
     merge_bias_tensor,
 )
@@ -149,48 +151,50 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
 
 class TestMergeCustomLogitProcessor(CustomTestCase):
-    def test_both_none_returns_none(self):
-        """Test that merging two None processor dicts returns None."""
-        result = SamplingBatchInfo.merge_custom_logit_processor(
-            None, None, 2, 3, DEVICE
-        )
-        self.assertIsNone(result)
+    def test_merge_preserves_processors_and_offsets_rows(self):
+        proc_a, proc_b = MagicMock(), MagicMock()
+        for left_rows, right_rows, expected in (
+            ({}, {}, {}),
+            ({1: [0]}, {1: [0, 2]}, {1: [0, 2, 4]}),
+            ({1: [0]}, {2: [0]}, {1: [0], 2: [2]}),
+            ({}, {2: [0]}, {2: [2]}),
+            ({1: [1]}, {}, {1: [1]}),
+        ):
+            with self.subTest(left=left_rows, right=right_rows):
+                infos = []
+                for size, rows in ((2, left_rows), (3, right_rows)):
+                    infos.append(
+                        _make_info(
+                            batch_size=size,
+                            has_custom_logit_processor=bool(rows),
+                            custom_logit_processor={
+                                key: ProcessorEntry(
+                                    processor=proc_a if key == 1 else proc_b,
+                                    rows=values,
+                                    indices=torch.tensor(values, dtype=torch.long),
+                                )
+                                for key, values in rows.items()
+                            }
+                            or None,
+                            custom_params=[None] * size if rows else None,
+                        )
+                    )
+                left, right = infos
+                original_indices = {
+                    key: entry.indices
+                    for key, entry in (left.custom_logit_processor or {}).items()
+                }
 
-    def test_same_key_merges_masks(self):
-        """Test that same processor key concatenates the boolean masks."""
-        proc = MagicMock()
-        lhs = {42: (proc, torch.tensor([True, False]))}
-        rhs = {42: (proc, torch.tensor([False, True, True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(lhs, rhs, 2, 3, DEVICE)
-        self.assertIn(42, result)
-        self.assertEqual(result[42][1].shape[0], 5)
-        self.assertTrue(result[42][1][0].item())  # from lhs
-        self.assertFalse(result[42][1][1].item())  # from lhs
-        self.assertTrue(result[42][1][3].item())  # from rhs
+                left.merge_batch(right)
 
-    def test_disjoint_keys(self):
-        """Test that disjoint processor keys are merged with zero-filled padding."""
-        proc_a = MagicMock()
-        proc_b = MagicMock()
-        lhs = {1: (proc_a, torch.tensor([True, False]))}
-        rhs = {2: (proc_b, torch.tensor([True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(lhs, rhs, 2, 1, DEVICE)
-        # Key 1: lhs mask [True, False] + zero-filled rhs [False]
-        self.assertEqual(result[1][1].shape[0], 3)
-        self.assertTrue(result[1][1][0].item())
-        self.assertFalse(result[1][1][2].item())
-        # Key 2: zero-filled lhs [False, False] + rhs mask [True]
-        self.assertEqual(result[2][1].shape[0], 3)
-        self.assertFalse(result[2][1][0].item())
-        self.assertTrue(result[2][1][2].item())
-
-    def test_lhs_none_rhs_present(self):
-        """Test that None lhs is treated as empty dict and rhs mask is padded."""
-        proc = MagicMock()
-        rhs = {10: (proc, torch.tensor([True]))}
-        result = SamplingBatchInfo.merge_custom_logit_processor(None, rhs, 2, 1, DEVICE)
-        self.assertIn(10, result)
-        self.assertEqual(result[10][1].shape[0], 3)
+                self.assertEqual(set(left.custom_logit_processor or {}), set(expected))
+                for key, expected_rows in expected.items():
+                    entry = left.custom_logit_processor[key]
+                    self.assertEqual(entry.rows, expected_rows)
+                    self.assertEqual(entry.indices.tolist(), expected_rows)
+                    if key not in right_rows:
+                        self.assertIs(entry.indices, original_indices[key])
+                    self.assertIs(entry.processor, proc_a if key == 1 else proc_b)
 
 
 # apply_logits_bias
@@ -439,26 +443,100 @@ class TestFilterBatch(CustomTestCase):
         self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
 
     def test_filter_with_custom_logit_processor(self):
-        """Test that filter updates both custom_params list and processor mask."""
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
-        info.custom_logit_processor = {42: (proc, torch.tensor([True, False, True]))}
+        info.custom_logit_processor = {
+            42: ProcessorEntry(
+                processor=proc, rows=[0, 2], indices=torch.tensor([0, 2])
+            )
+        }
         info.custom_params = [{"a": 1}, {"b": 2}, {"c": 3}]
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
         self.assertEqual(info.custom_params, [{"a": 1}, {"c": 3}])
-        mask = info.custom_logit_processor[42][1]
-        self.assertEqual(mask.shape[0], 2)
+        entry = info.custom_logit_processor[42]
+        self.assertEqual(entry.rows, [0, 1])
+        self.assertEqual(entry.indices.tolist(), entry.rows)
+
+    def test_filter_reuses_indices_only_when_rows_are_unchanged(self):
+        for keep, expected_rows in (([0, 1], [0, 1]), ([1, 2], [0]), ([2], [])):
+            with self.subTest(keep=keep):
+                original_indices = torch.tensor([0, 1])
+                info = _make_info(
+                    batch_size=3,
+                    has_custom_logit_processor=True,
+                    custom_logit_processor={
+                        42: ProcessorEntry(
+                            processor=MagicMock(),
+                            rows=[0, 1],
+                            indices=original_indices,
+                        )
+                    },
+                    custom_params=[None] * 3,
+                )
+                info.filter_batch(keep, torch.tensor(keep))
+                if not expected_rows:
+                    self.assertIsNone(info.custom_logit_processor)
+                    continue
+                entry = info.custom_logit_processor[42]
+                self.assertEqual(entry.rows, expected_rows)
+                self.assertEqual(entry.indices.tolist(), expected_rows)
+                if expected_rows == [0, 1]:
+                    self.assertIs(entry.indices, original_indices)
+                else:
+                    self.assertIsNot(entry.indices, original_indices)
+
+    def test_filter_merge_preserves_per_token_params(self):
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        def processor(logits, params):
+            for row, param in zip(logits, params, strict=True):
+                row.fill_(param["value"])
+            return logits
+
+        info = _make_info(
+            batch_size=3,
+            has_custom_logit_processor=True,
+            custom_logit_processor={
+                42: ProcessorEntry(
+                    processor=processor, rows=[0, 2], indices=torch.tensor([0, 2])
+                )
+            },
+            custom_params=[{"value": 10}, None, {"value": 20}],
+        )
+        info.filter_batch([2, 1, 0], torch.tensor([2, 1, 0]))
+        info.merge_batch(
+            _make_info(
+                batch_size=1,
+                has_custom_logit_processor=True,
+                custom_logit_processor={
+                    42: ProcessorEntry(
+                        processor=processor, rows=[0], indices=torch.tensor([0])
+                    )
+                },
+                custom_params=[{"value": 30}],
+            )
+        )
+        entry = info.custom_logit_processor[42]
+        self.assertEqual(entry.rows, [0, 2, 3])
+        self.assertEqual(entry.indices.tolist(), entry.rows)
+        for width in (1, 3):
+            with self.subTest(width=width):
+                logits = torch.zeros(4 * width, VOCAB_SIZE)
+                apply_custom_logit_processor(logits, info, width)
+                expected = torch.tensor([20, 0, 10, 30]).repeat_interleave(width)
+                self.assertTrue(torch.equal(logits[:, 0], expected))
 
     def test_filter_removes_all_custom_processors(self):
         """Test cleanup when filter removes all requests using a processor."""
         proc = MagicMock()
         info = _make_info(batch_size=3)
         info.has_custom_logit_processor = True
-        info.custom_logit_processor = {42: (proc, torch.tensor([False, True, False]))}
+        info.custom_logit_processor = {
+            42: ProcessorEntry(processor=proc, rows=[1], indices=torch.tensor([1]))
+        }
         info.custom_params = [None, {"x": 1}, None]
-        # Keep only index 0 and 2 — processor 42's mask becomes [False, False]
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
         self.assertFalse(info.has_custom_logit_processor)
@@ -522,7 +600,9 @@ class TestMergeBatch(CustomTestCase):
         proc = MagicMock()
         info1 = _make_info(batch_size=1)
         info1.has_custom_logit_processor = True
-        info1.custom_logit_processor = {1: (proc, torch.tensor([True]))}
+        info1.custom_logit_processor = {
+            1: ProcessorEntry(processor=proc, rows=[0], indices=torch.tensor([0]))
+        }
         info1.custom_params = [{"a": 1}]
         info2 = _make_info(batch_size=1)
         info2.has_custom_logit_processor = False
@@ -704,12 +784,30 @@ class TestFromScheduleBatch(CustomTestCase):
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
 
+    def test_merge_preserves_processor_cache_after_batch_without_processors(self):
+        self._exec_ns.features.enable_custom_logit_processor = True
+        left_batch = MagicMock()
+        left_batch.reqs = [self._make_req(), self._make_req()]
+        left_batch.device = DEVICE
+        left = SamplingBatchInfo.from_schedule_batch(left_batch, VOCAB_SIZE)
+
+        processor_str = DisallowedTokensLogitsProcessor.to_str()
+        req = self._make_req()
+        req.custom_logit_processor = processor_str
+        req.sampling_params.custom_params = {"token_ids": [1]}
+        right_batch = MagicMock()
+        right_batch.reqs = [req]
+        right_batch.device = DEVICE
+        right = SamplingBatchInfo.from_schedule_batch(right_batch, VOCAB_SIZE)
+
+        left.merge_batch(right)
+
+        entry = left.custom_logit_processor[hash(processor_str)]
+        self.assertEqual(entry.rows, [2])
+        self.assertEqual(entry.indices.tolist(), [2])
+
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
-        from sglang.srt.sampling.custom_logit_processor import (
-            DisallowedTokensLogitsProcessor,
-        )
-
         self._exec_ns.features.enable_custom_logit_processor = True
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
@@ -728,12 +826,12 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertTrue(info.has_custom_logit_processor)
         self.assertIsNotNone(info.custom_logit_processor)
         self.assertEqual(len(info.custom_logit_processor), 1)
-        # Check the mask: req1 has processor (True), req2 doesn't (False)
         key = list(info.custom_logit_processor.keys())[0]
-        proc, mask = info.custom_logit_processor[key]
-        self.assertIsInstance(proc, DisallowedTokensLogitsProcessor)
-        self.assertTrue(mask[0].item())
-        self.assertFalse(mask[1].item())
+        entry = info.custom_logit_processor[key]
+        self.assertIsInstance(entry.processor, DisallowedTokensLogitsProcessor)
+        self.assertEqual(entry.rows, [0])
+        self.assertEqual(entry.indices.tolist(), entry.rows)
+        self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
 

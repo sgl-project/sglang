@@ -35,7 +35,6 @@ from sglang.srt.disaggregation.encoder.receiver import (
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
-    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -654,7 +653,7 @@ class MMEncoder:
                 get_parallel().tp_size,
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
-                tp_group=get_tp_group().cpu_group,
+                tp_group=get_parallel().tp_group.cpu_group,
                 all_rank_get=False,
                 dtype=self._embedding_dtype,
             )
@@ -1275,7 +1274,7 @@ class MMEncoder:
         layout_digest: tuple[int, int],
     ) -> List[torch.Tensor]:
         """Raise the same preparation error on every TP rank."""
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         error_code = (
             int(
                 local_error.code

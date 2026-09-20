@@ -654,6 +654,9 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Run PP tensor communication on a dedicated stream so asynchronous sends
+    # do not fence the next forward through the scheduler stream.
+    SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================
@@ -675,9 +678,6 @@ class Envs:
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
-    # TODO(DSV4): @ispobock this has bug on main branch when retract
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
-    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================
@@ -1075,6 +1075,9 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
+    # layout. The scheduler continues to allocate 256-token logical pages.
+    SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1186,6 +1189,13 @@ class Envs:
     # SGLANG_CACHE_DIR; set to an empty string to keep compilation
     # process-local. Must be trusted: cached objects are loaded into the process.
     SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
+
+    # ===================================================================
+    # Kernel development: JIT build cache, diagnostics and benchmarks
+    # ===================================================================
+    # Everything here is a developer knob for working ON kernels -- building
+    # them, inspecting what the compiler produced, and benchmarking them. Flags
+    # that select a kernel in production live with their own feature instead.
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
@@ -1195,10 +1205,23 @@ class Envs:
     # is what makes reverting an edit an instant hit instead of a rebuild; set
     # it to trade that away for disk (1 keeps only the most recent build).
     SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+    # Skip the cache lookup and run the compiler for every module this process
+    # loads. The result is still published, so the cost is one rebuild per
+    # module, not one per load.
+    SGLANG_JIT_FORCE_RECOMPILE = EnvBool(False)
     # Raise instead of compiling when a module misses the cache, so a
     # deployment that expects a pre-seeded cache fails loudly at startup
     # rather than silently eating a cold compile.
     SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
+    # Ask the device compiler for per-kernel resource usage (registers, spills,
+    # shared memory) and log it at INFO. Changes the build flags, so it compiles
+    # into its own cache entry and leaves the normal one alone -- but that entry
+    # is a hit on the second run, and a cache hit has nothing to report, so pair
+    # this with SGLANG_JIT_FORCE_RECOMPILE to see the report every time.
+    SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
+    SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
+    SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1534,6 +1557,10 @@ class Envs:
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
+    # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
+    # Emits MXFP8 when wo_b supports it, otherwise BF16.
+    SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
