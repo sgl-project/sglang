@@ -70,6 +70,14 @@ class TestLingBotModulation(CustomTestCase):
             torch.equal(actual.view(torch.int16), expected.view(torch.int16))
         )
 
+    def assert_norm_dispatch(self, gate):
+        # A live Torch reduction can differ on another device. The site must
+        # either verify exact fusion or permanently choose its native path.
+        self.assertNotEqual(gate.verified, gate.disabled)
+        if torch.cuda.get_device_capability() == (9, 0):
+            self.assertTrue(gate.verified)
+            self.assertFalse(gate.disabled)
+
     @torch.inference_mode()
     def test_fp32_norm_shapes_and_rounding(self):
         torch.manual_seed(42)
@@ -158,6 +166,7 @@ class TestLingBotModulation(CustomTestCase):
 
     @torch.inference_mode()
     def test_norm1_per_frame_and_replay(self):
+        torch.manual_seed(42)
         block = make_sites(256)
         x = torch.randn(2, 63, 256, device="cuda", dtype=torch.bfloat16)
         table = torch.randn(2, 3, 6, 256, device="cuda", dtype=torch.float32)
@@ -168,7 +177,16 @@ class TestLingBotModulation(CustomTestCase):
             .flatten(1, 2)
             .bfloat16()
         )
+        raw = try_fused_fp32_layernorm_bf16(
+            x.view(6, 21, 256),
+            scale.reshape(6, 256).contiguous(),
+            shift.reshape(6, 256).contiguous(),
+            1e-6,
+        ).view_as(x)
+        exact = torch.equal(raw.view(torch.int16), expected.view(torch.int16))
         self.assert_bits(block._fp32_norm(x, scale, shift), expected)
+        self.assertEqual(block._norm1_modulation_gate.disabled, not exact)
+        self.assertEqual(block._norm1_modulation_gate.verified, exact)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = block._fp32_norm(x, scale, shift)
@@ -182,7 +200,7 @@ class TestLingBotModulation(CustomTestCase):
             .bfloat16()
         )
         self.assert_bits(output, expected)
-        self.assertFalse(block._norm1_modulation_gate.disabled)
+        self.assert_norm_dispatch(block._norm1_modulation_gate)
 
     @torch.inference_mode()
     def test_residual_matches_native_cute_and_replay(self):
@@ -277,7 +295,7 @@ class TestLingBotModulation(CustomTestCase):
         norm.weight.normal_()
         norm.bias.normal_()
         self.assert_bits(block._fp32_norm(x), norm(x))
-        self.assertFalse(block._cross_norm_gate.disabled)
+        self.assert_norm_dispatch(block._cross_norm_gate)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = block._fp32_norm(x)
@@ -291,7 +309,7 @@ class TestLingBotModulation(CustomTestCase):
         self.assert_bits(block._fp32_norm(x), norm(x))
         norm.weight.normal_()
         self.assert_bits(block._fp32_norm(x), norm(x))
-        self.assertFalse(block._cross_norm_gate.disabled)
+        self.assert_norm_dispatch(block._cross_norm_gate)
 
     @torch.inference_mode()
     def test_causal_block_forward_and_cache_update(self):
@@ -325,11 +343,9 @@ class TestLingBotModulation(CustomTestCase):
             kwargs = dict(cam_conditioner_scale_shift=camera)
             actual = block(x, x, temb, (), None, **kwargs)
             self.assertEqual(norm.call_count, 2)
-            self.assertTrue(block._norm1_modulation_gate.verified)
-            self.assertTrue(block._cross_norm_gate.verified)
+            self.assert_norm_dispatch(block._norm1_modulation_gate)
+            self.assert_norm_dispatch(block._cross_norm_gate)
             self.assertTrue(block._self_residual_gate.verified)
-            self.assertFalse(block._norm1_modulation_gate.disabled)
-            self.assertFalse(block._cross_norm_gate.disabled)
             block._norm1_modulation_gate.disable()
             block._cross_norm_gate.disable()
             block._self_residual_gate.disable()
