@@ -329,7 +329,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
@@ -1407,6 +1407,7 @@ class Engine(EngineScoreMixin, EngineBase):
             "load_format": tm.config_value("load_format"),
             "reasoning_parser": tm.config_value("reasoning_parser"),
             "tool_call_parser": tm.config_value("tool_call_parser"),
+            "disaggregation_mode": tm.config_value("disaggregation_mode"),
         }
 
     def init_weights_update_group(
@@ -1783,6 +1784,7 @@ def _log_legacy_kernel_cache_dirs():
             os.path.expanduser("~/.triton"),
             os.path.expanduser("~/.cache/flashinfer"),
             os.path.expanduser("~/.cache/deep_gemm"),
+            os.path.expanduser("~/.tilelang/cache"),
         )
         if os.path.isdir(d)
     ]

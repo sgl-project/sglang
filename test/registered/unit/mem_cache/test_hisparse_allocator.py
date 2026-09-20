@@ -60,6 +60,25 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
 
+    def test_forwards_prealloc_reclaim_to_logical_allocator(self):
+        """PD decode preallocation must not crash on the HiSparse composite."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        logical_allocator = MagicMock(spec=["reclaim_for_prealloc"])
+        allocator.logical_attn_allocator = logical_allocator
+        logical_allocator.reclaim_for_prealloc.return_value = None
+
+        tree_cache = object()
+        self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, 512, 256))
+        logical_allocator.reclaim_for_prealloc.assert_called_once_with(
+            tree_cache, 512, 256
+        )
+
+        logical_allocator.reclaim_for_prealloc.return_value = "SWA eviction short"
+        self.assertEqual(
+            allocator.reclaim_for_prealloc(tree_cache, 512, 256),
+            "SWA eviction short",
+        )
+
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 

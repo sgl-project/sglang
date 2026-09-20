@@ -10,11 +10,25 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
+@pytest.fixture
+def stated_tp_group():
+    """A TP group for a test that runs in a process without one.
+
+    The production call passes the group *into* `use_symmetric_memory`, so
+    stubbing that context manager does not stop the read -- the argument is
+    evaluated first. Stating it on the context answers every spelling.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("num_tokens", [0, 1, 8, 17, 32, 64])
 @pytest.mark.parametrize("use_norm", [False, True])
 def test_mhc_fused_post_pre_matches_unfused(
-    monkeypatch, hidden_size, num_tokens, use_norm
+    monkeypatch, hidden_size, num_tokens, use_norm, stated_tp_group
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TileLang mHC kernels")
@@ -22,12 +36,10 @@ def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     # This is a single-process kernel unit test with no TP group initialized.
     # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
-    # pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
-    # kernel runs with a plain torch.empty allocation. Mirrors the workaround in
-    # test_mxfp4_sm90_cutlass.py for the same TP-group-not-initialized case.
+    # pool, which asks for the TP group; bypassing the allocation is enough, and
+    # then nothing asks. Mirrors the workaround in test_mxfp4_sm90_cutlass.py.
     monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
     torch.manual_seed(0)
     device = torch.device("cuda")
     hc_mult = 4
