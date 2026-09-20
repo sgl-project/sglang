@@ -31,6 +31,17 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    MQA_LOGITS_BYTES_PER_ELEM,
+    MQA_LOGITS_MAX_BYTES_ROCM,
+    MQA_LOGITS_STATIC_SKIP_ELEMS,
+    MQA_LOGITS_TOTAL_MEM_FRACTION,
+    mqa_logits_budget_bytes,
+    mqa_logits_free_mem_fraction,
+    mqa_logits_should_chunk,
+    mqa_logits_static_budget_bytes,
+)
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -42,7 +53,6 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
-    get_schedule,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -51,7 +61,6 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_device_module,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -111,10 +120,6 @@ if _is_xpu:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
-from sglang.srt.distributed import (
-    get_attn_tp_group,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -156,7 +161,7 @@ if _is_cuda:
 
 
 def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
-    group = get_attn_tp_group()
+    group = get_parallel().attn_tp_group
     if group.world_size == 1:
         return
 
@@ -205,16 +210,16 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-    _MQA_LOGITS_BYTES_PER_ELEM = 4
-    _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
-    _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
-    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
-    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
+    _MQA_LOGITS_BYTES_PER_ELEM = MQA_LOGITS_BYTES_PER_ELEM
+    _MQA_LOGITS_STATIC_SKIP_ELEMS = MQA_LOGITS_STATIC_SKIP_ELEMS
+    _MQA_LOGITS_TOTAL_MEM_FRACTION = MQA_LOGITS_TOTAL_MEM_FRACTION
+    _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
+    # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
-        return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
+        return mqa_logits_free_mem_fraction()
 
     def __init__(
         self,
@@ -259,7 +264,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
-            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+            self.logits_with_pp_recv = (
+                pp_size > 1 and not get_parallel().pp_group.is_last_rank
+            )
         else:
             self.logits_with_pp_recv = False
 
@@ -398,20 +405,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        # When kv_len <= index_topk the top-k selects ALL valid positions, so the
-        # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
-        # topk_transform(dummy_logits) already yields the correct "select-all"
-        # (physical page-slot) indices. Skipping the logits path is safe here.
-        #
-        # Prefill/extend: original fast path, all platforms.
-        # Decode: new here, and ROCm-only for now (see the _is_hip gate below).
-        # Under a captured decode cuda graph the chosen branch is frozen at
-        # capture time and would replay incorrectly for kv_len > index_topk, so
-        # the decode skip is not decided per-step during capture; it is driven by
-        # which graph variant is being captured instead.
+        # topk_transform selects every valid page slot when kv_len <= index_topk;
+        # logits are unnecessary in that case.
         fb = forward_batch
 
-        # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
+        # Prefill/extend.
         if fb.forward_mode.is_extend_without_speculative():
             if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
                 return False
@@ -419,41 +417,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
-            # Decode k-only skip (both the captured dual-graph "dense" variant
-            # and the eager per-step skip below) is currently HIP-only. On CUDA
-            # this common code keeps the original behavior (decode never skips
-            # the indexer, i.e. always runs the full logits path) because the
-            # decode k-only path has not been validated on CUDA yet. Mirrors the
-            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
-            # already prevents the CUDA capture path from setting a "dense"
-            # variant.
-            if not _is_hip:
-                return False
             if get_is_capture_mode():
-                # Under a captured decode cuda graph the taken branch is frozen at
-                # capture time, so we must NOT branch on a runtime seq_len (also a
-                # host sync would break capture). The chosen branch is instead
-                # driven by which graph variant is being captured.
-                #
-                # The decode runner captures a "dense" (k-only) and a "sparse"
-                # (full indexer) graph per bs bucket and dispatches on max_kv_len
-                # at replay. The capture-variant signal tells us which one to
-                # bake in.
+                # Graph replay freezes this branch; use the capture variant,
+                # not capture-time sequence lengths.
                 from sglang.srt.model_executor.runner_utils.capture_mode import (
-                    get_capture_dsa_variant,
+                    get_capture_attention_variant,
                 )
 
-                variant = get_capture_dsa_variant()
-                if variant == "dense":
-                    return True
-                if variant == "sparse":
-                    return False
-
-                # No dual-variant capture signal: default to the correct-for-all
-                # full-indexer (sparse) path.
+                # No variant means the full indexer path for any context length.
+                return get_capture_attention_variant() == DSA_DENSE
+            # Eager k-only decode skip is validated on ROCm only.
+            if not _is_hip:
                 return False
-            # Eager decode: safe to check per-step (host sync OK); correct for both
-            # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())
             elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
@@ -1021,67 +996,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return topk_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
-        free_mem_fraction = self._mqa_logits_free_mem_fraction()
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
             return cached_budget
 
-        total_mem = get_device_module().get_device_properties(device_index).total_memory
-
-        total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
-        mem_fraction_static = get_schedule().mem_fraction_static
-        if mem_fraction_static is None:
-            static_budget = total_mem_budget
-        else:
-            static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
-            static_budget = min(
-                int(static_free_mem * free_mem_fraction),
-                total_mem_budget,
-            )
-        static_budget = max(1, static_budget)
-
-        # Keep the static serving-memory guard during CUDA graph capture without
-        # caching it. The first non-capture prefill path will cache the real
-        # free-memory budget below.
+        # Graph capture cannot sync the host; use the static guard and do not
+        # cache it, so the first eager prefill still measures the real budget.
         if get_is_capture_mode():
-            return static_budget
+            return mqa_logits_static_budget_bytes(device_index=device_index)
 
-        # Match the original free-memory guard: logits_bytes * 2 > free_mem.
-        # Synchronizes the host; cache the result capped by serving-memory headroom.
-        if _is_xpu:
-            # On XPU, use total_mem budget as the free-memory estimate;
-            # dynamic free-memory query is not supported the same way as CUDA.
-            # TODO Use torch.xpu.mem_get_info() when available (planned end of 2026).
-            budget_bytes = static_budget
-        else:
-            free_mem, _ = torch.cuda.mem_get_info(device_index)
-            budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
-
-        budget_bytes = max(1, budget_bytes)
+        budget_bytes = mqa_logits_budget_bytes(
+            device_index=device_index, allow_sync=True
+        )
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes
-
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device_index: int
-    ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM,
-        and on ROCm to stay under aiter's 2 GiB logits limit
-        Return: (need_chunk, logits_budget_bytes)
-        """
-        # Quick static check for normal batches
-        if num_q * num_k < self._MQA_LOGITS_STATIC_SKIP_ELEMS:
-            return False, 0
-
-        logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
-        logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
-        if _is_hip:
-            logits_budget_bytes = min(
-                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
-            )
-
-        need_chunk = logits_bytes > logits_budget_bytes
-        return need_chunk, logits_budget_bytes
 
     def _get_topk_ragged(
         self,
@@ -1172,8 +1100,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
-            q_offset, k_offset, device_index
+        need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
+            num_rows=q_offset,
+            num_cols=k_offset,
+            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
+            rocm=_is_hip,
         )
 
         if not need_chunk:

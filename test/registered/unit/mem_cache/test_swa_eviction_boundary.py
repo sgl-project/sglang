@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -111,7 +112,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         extra_key=None,
         cache_salt=None,
         last_node=tree.root_node,
-        swa_uuid_for_lock=None,
+        lock_receipt=DecLockRefParams(),
         swa_prefix_lock_released=False,
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),
@@ -190,7 +191,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             self.assertLess(req.kv.swa_evicted_seqlen, insert_len)
 
             tree.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+                req, is_insert=True, owned_kv_len=req._kv_committed_len
             )
             tree.sanity_check()
 
@@ -357,7 +358,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             )
 
             tree.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+                req, is_insert=True, owned_kv_len=req._kv_committed_len
             )
             tree.sanity_check()
 
@@ -396,7 +397,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         pool.write((0, slice(0, first_len)), kv1)
         req1 = _make_req(0, list(range(first_len)), 0, tree)
         tree.cache_finished_req(
-            req1, is_insert=True, kv_len_to_handle=req1._kv_committed_len
+            req1, is_insert=True, owned_kv_len=req1._kv_committed_len
         )
         tree.sanity_check()
 
@@ -414,7 +415,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
 
         swa_evictable_before = tree.swa_evictable_size_
         tree.cache_finished_req(
-            req2, is_insert=True, kv_len_to_handle=req2._kv_committed_len
+            req2, is_insert=True, owned_kv_len=req2._kv_committed_len
         )
 
         # New tokens [16, 24) should all be non-tombstone
@@ -446,9 +447,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         self.assertGreater(req.kv.swa_evicted_seqlen, 0, "Should have some eviction")
         self.assertLess(req.kv.swa_evicted_seqlen, insert_len, "Should be partial")
 
-        tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
-        )
+        tree.cache_finished_req(req, is_insert=True, owned_kv_len=req._kv_committed_len)
 
         non_tombstone = insert_len - req.kv.swa_evicted_seqlen
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + non_tombstone)
@@ -486,9 +485,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         req.kv.swa_evicted_seqlen = old_evicted
         swa_evictable_before = tree.swa_evictable_size_
 
-        tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
-        )
+        tree.cache_finished_req(req, is_insert=True, owned_kv_len=req._kv_committed_len)
 
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
 
@@ -518,7 +515,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             self.assertLess(req.kv.swa_evicted_seqlen, insert_len, f"turn {turn}")
 
             tree.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+                req, is_insert=True, owned_kv_len=req._kv_committed_len
             )
             tree.sanity_check()
 
@@ -544,7 +541,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
             )
 
             tree.cache_finished_req(
-                req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+                req, is_insert=True, owned_kv_len=req._kv_committed_len
             )
             tree.sanity_check()
 

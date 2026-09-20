@@ -1271,6 +1271,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
@@ -1508,8 +1509,16 @@
                   {
                     "group": "Qwen-Image",
                     "pages": [
+                      "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
+                    ]
+                  },
+                  {
+                    "group": "SenseNova",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
                     ]
                   },
                   {
@@ -1661,7 +1670,8 @@
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables"
+                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/production_metrics"
                 ]
               },
               {

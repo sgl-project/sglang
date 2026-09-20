@@ -15,6 +15,12 @@ register_npu_ci(
     nightly=True,
 )
 
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-16-npu-a3-cann910",
+    nightly=True,
+)
+
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -41,6 +47,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
