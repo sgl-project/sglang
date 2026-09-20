@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_conditioning,
     cached_vae_encode,
     invalidate_conditioning_caches,
+    prefer_conditioning_cache,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -216,6 +217,32 @@ def test_scoped_invalidation_preserves_independent_encoders_and_shared_weights()
         assert torch.equal(alias(x).last_hidden_state, x * 2)
     assert (independent.calls, nested.calls, alias.calls) == (1, 2, 2)
     assert cache.bytes <= cache.max_bytes
+
+
+@torch.no_grad()
+def test_negative_conditioning_survives_positive_capacity_pressure():
+    model = Encoder().eval()
+    # only one entry fits, reproducing two LTX embeddings in the host budget
+    cache = ConditioningCache(24)
+    positive, negative = torch.ones(4), torch.zeros(4)
+    with cache.scope(refresh=True):
+        model(positive)
+        with prefer_conditioning_cache():
+            model(negative)
+    with cache.scope():
+        model(positive + 1)
+        with prefer_conditioning_cache():
+            actual = model(negative)
+        assert model.calls == 3
+        assert cache.hits == 1
+        assert cache.bytes == 16
+        assert cache.evictions == 1
+        torch.testing.assert_close(actual.last_hidden_state, negative)
+        # preferred entries still replace each other and remain bounded
+        with prefer_conditioning_cache():
+            model(negative - 1)
+        assert cache.bytes == 16
+        assert cache.evictions == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")

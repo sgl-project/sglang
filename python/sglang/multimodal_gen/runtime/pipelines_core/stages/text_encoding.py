@@ -15,7 +15,10 @@ import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    prefer_conditioning_cache,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_encoder_data_parallel_group,
     get_local_torch_device,
@@ -178,12 +181,13 @@ class TextEncodingStage(ConditionEncodingStage):
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
         """Encode negative conditioning through the shared encoder cache."""
-        return self.encode_text(
-            batch.negative_prompt,
-            server_args,
-            encoder_index=all_indices,
-            return_attention_mask=True,
-        )
+        with prefer_conditioning_cache():
+            return self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+            )
 
     def _append_positive_text_outputs(
         self,

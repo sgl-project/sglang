@@ -32,6 +32,7 @@ _active_cache: ContextVar["ConditioningCache | None"] = ContextVar(
 _refresh_cache: ContextVar[bool] = ContextVar(
     "refresh_conditioning_cache", default=False
 )
+_prefer_cache: ContextVar[bool] = ContextVar("prefer_conditioning_cache", default=False)
 _container_types: set[type] = {DiagonalGaussianDistribution}
 _live_caches = weakref.WeakSet()
 _weights_epoch = 0
@@ -62,6 +63,16 @@ def register_conditioning_container(cls):
 
 class Uncacheable(TypeError):
     pass
+
+
+@contextmanager
+def prefer_conditioning_cache():
+    # retain reusable negative conditioning ahead of changing positive prompts
+    token = _prefer_cache.set(True)
+    try:
+        yield
+    finally:
+        _prefer_cache.reset(token)
 
 
 def _fingerprint(value):
@@ -126,6 +137,7 @@ class _CacheEntry:
     size: int
     ready: tuple[torch.cuda.Event, ...]
     owner: int
+    preferred: bool
 
     def wait(self):
         for event in self.ready:
@@ -273,6 +285,7 @@ class ConditioningCache:
             hit = bool(flag.item())
         if hit:
             entry.wait()
+            entry.preferred |= _prefer_cache.get()
             self.hits += 1
             self._entries.move_to_end(key)
             logger.debug("Conditioning cache hit: %s.%s", type(model).__name__, method)
@@ -316,8 +329,24 @@ class ConditioningCache:
         if old is not None:
             old.wait()
             self.bytes -= old.size
-        while self.bytes + size > self.max_bytes or len(self._entries) >= 128:
-            _, removed = self._entries.popitem(last=False)
+        preferred = _prefer_cache.get()
+        evictable = [
+            key
+            for key, entry in self._entries.items()
+            if preferred or not entry.preferred
+        ]
+        available = (
+            self.max_bytes
+            - self.bytes
+            + sum(self._entries[key].size for key in evictable)
+        )
+        if size > available or (len(self._entries) >= 128 and not evictable):
+            self.bypasses += 1
+            return output
+        for evicted in evictable:
+            if self.bytes + size <= self.max_bytes and len(self._entries) < 128:
+                break
+            removed = self._entries.pop(evicted)
             removed.wait()
             self.bytes -= removed.size
             self.evictions += 1
@@ -344,7 +373,7 @@ class ConditioningCache:
             event.record(stream)
             ready.append(event)
         self._entries[key] = _CacheEntry(
-            stored, size, tuple(ready), self._identity(model)
+            stored, size, tuple(ready), self._identity(model), preferred
         )
         self.bytes += size
         logger.debug(
