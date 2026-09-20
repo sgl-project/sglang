@@ -4,6 +4,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.srt.layers import communicator
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -109,3 +111,45 @@ def test_partial_dp_reduce_scatter_does_not_alias_collective_input(monkeypatch):
         torch.cat([expected_chunk] * attn_tp_size),
     )
     torch.testing.assert_close(collective_input, original)
+
+
+def test_attn_tp_scatter_before_mlp_uses_non_aliasing_output(monkeypatch):
+    """The attention-TP reduce-scatter output must own separate storage."""
+
+    attn_tp_size = 4
+    attn_tp_rank = 1
+    input_hidden_states = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    residual = torch.zeros(2, 4)
+    expected = input_hidden_states.tensor_split(attn_tp_size)[attn_tp_rank].clone()
+
+    def fake_reduce_scatter(output, input_tensor):
+        assert (
+            output.untyped_storage().data_ptr()
+            != input_tensor.untyped_storage().data_ptr()
+        )
+        output.copy_(input_tensor.tensor_split(attn_tp_size)[attn_tp_rank])
+
+    def fake_layernorm(hidden_states, residual_states):
+        return hidden_states, residual_states
+
+    monkeypatch.setattr(
+        communicator, "attn_tp_reduce_scatter_tensor", fake_reduce_scatter
+    )
+    context = SimpleNamespace(
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+    )
+
+    hidden_states, output_residual = (
+        communicator.CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual(
+            input_hidden_states,
+            residual,
+            forward_batch=None,
+            layernorm=fake_layernorm,
+            context=context,
+            residual_input_mode=ScatterMode.SCATTERED,
+        )
+    )
+
+    assert torch.equal(hidden_states, expected)
+    assert output_residual is residual
