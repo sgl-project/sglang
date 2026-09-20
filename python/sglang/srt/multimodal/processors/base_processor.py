@@ -261,11 +261,20 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
+        cpu_process_start_method = (
+            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        )
+
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
+            mm_processor_worker_num=get_mm().mm_processor_worker_num,
+            mm_io_worker_num=get_mm().mm_io_worker_num,
+            cpu_process_start_method=cpu_process_start_method,
         )
+        self.cpu_process_start_method = processor_config.cpu_process_start_method
+        self.cpu_worker_num = processor_config.cpu_worker_num
 
         self.image_processor_backend = processor_config.image_processor_backend
         if processor_config.disable_fast_image_processor:
@@ -324,7 +333,7 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
-        requested_mm_io_worker_num = get_mm().mm_io_worker_num
+        requested_mm_io_worker_num = processor_config.mm_io_worker_num
         env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
         if requested_mm_io_worker_num:
             self.mm_io_worker_num = requested_mm_io_worker_num
@@ -347,7 +356,7 @@ class BaseMultimodalProcessor(ABC):
                 io_worker_source,
             )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
-        requested_mm_processor_worker_num = get_mm().mm_processor_worker_num
+        requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
         self.mm_processor_worker_num = (
             1
             if skip_mm_pool
@@ -510,10 +519,10 @@ class BaseMultimodalProcessor(ABC):
             self.mm_processor_executor.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
-        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
         return concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            mp_context=mp.get_context(self.cpu_process_start_method),
+            max_workers=self.cpu_worker_num
+            or int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 
     def _replace_broken_cpu_executor(
