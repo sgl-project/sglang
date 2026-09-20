@@ -11,9 +11,11 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=57, suite="base-a-test-cpu")
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
+import contextlib
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import traceback
 import unittest
@@ -26,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
+from sglang.srt.model_executor.runner import flashinfer_autotune as autotune_runner
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
@@ -62,6 +65,215 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
+
+
+class TestMegaMoEAutotuneStartup(CustomTestCase):
+    def setUp(self):
+        self.patches = contextlib.ExitStack()
+        self.addCleanup(self.patches.close)
+        self.config = SimpleNamespace(
+            kernel=SimpleNamespace(
+                disable_flashinfer_autotune=False, flashinfer_autotune_skip_ops=[]
+            ),
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            moe=SimpleNamespace(
+                moe_runner_backend="flashinfer_megamoe",
+                moe_a2a_backend="flashinfer_megamoe",
+            ),
+        )
+        self.runner = SimpleNamespace(
+            device="cuda",
+            model_config=SimpleNamespace(quantization="nvfp4_online"),
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+            is_draft_worker=False,
+            tp_group=SimpleNamespace(world_size=1),
+            forward_stream=Mock(),
+            max_decode_logits_rows=lambda: 256,
+        )
+        self.patches.enter_context(
+            patch.multiple(
+                autotune_runner,
+                get_exec=lambda: self.config,
+                get_spec=lambda: SimpleNamespace(
+                    speculative_moe_runner_backend=None,
+                    speculative_moe_a2a_backend=None,
+                ),
+            )
+        )
+        self.patches.enter_context(
+            patch.object(
+                autotune_runner.torch.cuda,
+                "get_device_capability",
+                return_value=(10, 3),
+            )
+        )
+        # Dense-GEMM eligibility must not mask a missing MegaMoE startup gate.
+        dense = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: False,
+            is_flashinfer_cutedsl=lambda: False,
+            is_flashinfer=lambda: False,
+        )
+        self.patches.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.layers.quantization.fp4_utils": SimpleNamespace(
+                        get_fp4_gemm_runner_backend=lambda: dense
+                    ),
+                    "sglang.srt.layers.quantization.fp8_utils": SimpleNamespace(
+                        flashinfer_per_tensor_fp8_supported=lambda: False,
+                        resolve_mxfp8_dense_gemm_backend=lambda: dense,
+                    ),
+                },
+            )
+        )
+
+    def test_eligibility_without_dense_autotune(self):
+        for quantization in ("nvfp4_online", "modelopt_fp4", "mxfp8", "modelopt"):
+            for w4a16 in (False, True):
+                with (
+                    self.subTest(quantization=quantization, w4a16=w4a16),
+                    patch.dict(
+                        os.environ, SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=str(w4a16)
+                    ),
+                ):
+                    self.runner.model_config.quantization = quantization
+                    self.assertTrue(
+                        autotune_runner.should_run_flashinfer_autotune(self.runner)
+                    )
+
+    def test_startup_guards(self):
+        for obj, field, value in (
+            (self.runner, "device", "cpu"),
+            (self.config.kernel, "disable_flashinfer_autotune", True),
+            (self.config.deterministic, "enable_deterministic_inference", True),
+        ):
+            with self.subTest(guard=field), patch.object(obj, field, value):
+                self.assertFalse(
+                    autotune_runner.should_run_flashinfer_autotune(self.runner)
+                )
+
+    def test_speculative_target_and_explicit_draft(self):
+        self.runner.spec_algorithm.is_speculative = lambda: True
+        self.assertTrue(autotune_runner.should_run_flashinfer_autotune(self.runner))
+        self.runner.is_draft_worker = True
+        self.assertFalse(autotune_runner.should_run_flashinfer_autotune(self.runner))
+        self.assertTrue(
+            autotune_runner.should_run_flashinfer_autotune(
+                self.runner, for_speculative_draft=True
+            )
+        )
+
+    def test_context_bridges_extend_policy(self):
+        active = []
+
+        @contextlib.contextmanager
+        def mega_context(**_kwargs):
+            active.append(True)
+            try:
+                yield
+            finally:
+                active.pop()
+
+        general = Mock(side_effect=lambda *_args, **_kwargs: contextlib.nullcontext())
+        mega = Mock(side_effect=mega_context)
+        self.patches.enter_context(
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer.autotuner": SimpleNamespace(
+                        _collect_metadata=lambda: ENV,
+                        autotune=general,
+                        get_autotune_process_group=lambda: None,
+                        set_autotune_process_group=lambda _: None,
+                    ),
+                    "sglang.srt.layers.logits_processor": SimpleNamespace(
+                        autotune_dummy_run_mode=lambda **_: contextlib.nullcontext()
+                    ),
+                    "sglang.srt.layers.moe.flashinfer_megamoe_autotune": SimpleNamespace(
+                        megamoe_autotune_context=mega
+                    ),
+                },
+            )
+        )
+        self.patches.enter_context(
+            patch.object(
+                autotune_runner.torch.cuda, "current_stream", return_value=Mock()
+            )
+        )
+        self.patches.enter_context(
+            patch.object(
+                autotune_runner.torch,
+                "get_device_module",
+                return_value=SimpleNamespace(stream=lambda _: contextlib.nullcontext()),
+            )
+        )
+        self.patches.enter_context(
+            patch.object(
+                autotune_runner,
+                "get_schedule",
+                return_value=SimpleNamespace(max_prefill_tokens=8192),
+            )
+        )
+        cases = [
+            (False, False, False, 4096, True, False),
+            (True, False, False, 4096, True, False),
+            (True, False, True, 4096, True, False),
+            (True, True, True, 4096, True, False),
+            (True, False, False, 0, False, False),
+            (True, False, False, 4096, True, True),
+        ]
+        for extend, draft, speculative, per_rank_tokens, reuse_cache, skip in cases:
+            with (
+                self.subTest(case=(extend, draft, speculative, reuse_cache, skip)),
+                tempfile.TemporaryDirectory() as directory,
+                contextlib.ExitStack() as patches,
+            ):
+                cache_path = Path(directory) / "rank.json"
+                patches.enter_context(
+                    patch.dict(
+                        os.environ,
+                        SGLANG_FLASHINFER_AUTOTUNE_EXTEND=str(extend),
+                        SGLANG_FLASHINFER_AUTOTUNE_CACHE=str(reuse_cache),
+                    )
+                )
+                patches.enter_context(
+                    patch.multiple(
+                        autotune_runner,
+                        flashinfer_autotune_cache_path=lambda _: cache_path,
+                        max_prefill_buffer_tokens=lambda: per_rank_tokens,
+                    )
+                )
+                self.runner.is_draft_worker = draft
+                self.runner.spec_algorithm.is_speculative = lambda: speculative
+                self.config.kernel.flashinfer_autotune_skip_ops = (
+                    ["flashinfer_megamoe"] if skip else []
+                )
+                general.reset_mock()
+                mega.reset_mock()
+                with autotune_runner.flashinfer_autotune_context(
+                    self.runner, run_lm_head=False
+                ):
+                    general.assert_called_once()
+                    self.assertEqual(
+                        general.call_args.kwargs["skip_ops"],
+                        set(self.config.kernel.flashinfer_autotune_skip_ops),
+                    )
+                    self.assertEqual(bool(active), not skip)
+                    if skip:
+                        mega.assert_not_called()
+                    else:
+                        selected_cache = Path(general.call_args.kwargs["cache"])
+                        mega.assert_called_once_with(
+                            cache_path=selected_cache,
+                            decode_num_tokens=256,
+                            extend_num_tokens=(per_rank_tokens or 8192)
+                            if extend and not draft
+                            else 0,
+                            reuse_cache=reuse_cache,
+                        )
+                        self.assertEqual(selected_cache == cache_path, reuse_cache)
+                self.assertEqual(active, [])
 
 
 class TestAutotuneCacheDigest(CustomTestCase):

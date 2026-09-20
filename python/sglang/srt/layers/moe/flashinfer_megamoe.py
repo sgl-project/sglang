@@ -290,26 +290,46 @@ def _ensure_flashinfer_megamoe_layer(
         layer.hidden_size,
     )
 
+    process_group = None
+    if world_size > 1:
+        from sglang.srt.distributed import get_moe_ep_group
+
+        process_group = get_moe_ep_group().device_group
+    bootstrap = BootstrapConfig(
+        world_size=world_size,
+        rank=rank,
+        device=torch.cuda.current_device(),
+        process_group=process_group,
+    )
+    fleet_params = FleetParams(
+        num_experts=layer.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        token_hidden_size=layer.hidden_size,
+    )
+    backend = MegaConfig(
+        megakernel=megakernel_config,
+        preprocess_weights=False,
+        transformed_weights=transformed_weights,
+    )
     mega = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(
-            world_size=world_size, rank=rank, device=torch.cuda.current_device()
-        ),
-        fleet_params=FleetParams(
-            num_experts=layer.num_experts,
-            max_tokens_per_rank=max_tokens_per_rank,
-            token_hidden_size=layer.hidden_size,
-        ),
+        bootstrap=bootstrap,
+        fleet_params=fleet_params,
         # weights already preprocessed in prepare_*; with transformed_weights set
         # the kernel never reads `weights` (see MoEEpMegaLayer), so pass None.
         weights=None,
-        backend=MegaConfig(
-            megakernel=megakernel_config,
-            preprocess_weights=False,
-            transformed_weights=transformed_weights,
-        ),
+        backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+    if hasattr(megakernel_config, "knobs"):
+        from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+            MegaMoeTunedForward,
+        )
+
+        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
+            bootstrap, fleet_params, backend
+        )
+    else:
+        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
 

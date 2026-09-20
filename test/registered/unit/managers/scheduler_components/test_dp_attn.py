@@ -17,20 +17,36 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
-    def test_megamoe_draft_gather_preserves_dp_counts(self):
+    def test_megamoe_profiles_and_draft_preserve_dp_counts(self):
         counts = [0, 3, 7, 2]
         logprob_counts = [0, 1, 3, 1]
         cases = [
-            (MoeA2ABackend.FLASHINFER_MEGAMOE, "EAGLE", MoeA2ABackend.NONE, True),
-            (MoeA2ABackend.FLASHINFER_MEGAMOE, None, MoeA2ABackend.NONE, False),
+            (
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                "EAGLE",
+                MoeA2ABackend.NONE,
+                False,
+                True,
+            ),
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, None, MoeA2ABackend.NONE, False, True),
+            (MoeA2ABackend.FLASHINFER_MEGAMOE, None, MoeA2ABackend.NONE, True, True),
             (
                 MoeA2ABackend.FLASHINFER_MEGAMOE,
                 "EAGLE",
                 MoeA2ABackend.FLASHINFER_MEGAMOE,
                 False,
+                True,
             ),
-            (MoeA2ABackend.NONE, None, MoeA2ABackend.NONE, True),
-            (MoeA2ABackend.FLASHINFER, None, MoeA2ABackend.NONE, True),
+            (
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                "EAGLE",
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                True,
+                True,
+            ),
+            (MoeA2ABackend.NONE, None, MoeA2ABackend.NONE, False, True),
+            (MoeA2ABackend.FLASHINFER, None, MoeA2ABackend.NONE, False, True),
+            (MoeA2ABackend.DEEPEP, None, MoeA2ABackend.NONE, False, False),
         ]
         parallel = SimpleNamespace(
             enable_dp_attention=True,
@@ -39,13 +55,15 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             moe_dense_tp_size=1,
             enable_dp_lm_head=True,
         )
-        for target, speculative_algorithm, draft, expected_gather in cases:
+        for target, speculative_algorithm, draft, w4a16, expected_gather in cases:
             with (
                 self.subTest(
                     target=target,
                     speculative_algorithm=speculative_algorithm,
                     draft=draft,
+                    w4a16=w4a16,
                 ),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16),
                 patch("sglang.srt.utils.common.get_parallel", return_value=parallel),
                 patch(
                     "sglang.srt.utils.common.get_exec",

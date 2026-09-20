@@ -3871,7 +3871,6 @@ def require_mlp_tp_gather():
     """
     from sglang.srt.layers.moe.utils import (
         get_moe_a2a_backend,
-        get_speculative_moe_a2a_backend,
     )
 
     # elastic-EP scale-up rewrites dp_size on the published config
@@ -3902,14 +3901,10 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif (
-            get_moe_a2a_backend().is_flashinfer_megamoe()
-            and get_spec().speculative_algorithm is not None
-            and get_speculative_moe_a2a_backend().is_none()
-        ):
-            # MegaMoE keeps expert inputs local, but its standard-communication
-            # draft gathers across DP ranks. Preserve the shared batch's full
-            # token counts and synchronize graph buckets for that draft.
+        elif get_moe_a2a_backend().is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
             return True
         elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
             "SGLANG_MORI_RECV_BOUND", "false"
