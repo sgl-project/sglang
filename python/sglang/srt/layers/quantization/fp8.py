@@ -745,19 +745,25 @@ class Fp8LinearMethod(LinearMethodBase):
             self._process_mxfp8_linear_weight_scale(layer)
             return
         elif _is_npu and is_npu_arch35():
-            from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
-                process_npu_arch35_mxfp8_linear_weights,
-            )
+            # UE8M0 checkpoints keep the lossless MXFP8 re-layout unconditionally.
+            # Plain block-FP8 ones (fp32 block scales) only requantize to MXFP8
+            # (lossy, see process_npu_arch35_mxfp8_linear_weights) when
+            # SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8=1; otherwise fall through to
+            # the generic path below and keep the plain layout for the Triton
+            # emulation kernel, preserving the checkpoint numerics.
+            if getattr(self.quant_config, "scale_fmt", None) == "ue8m0" or (
+                envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
+                    process_npu_arch35_mxfp8_linear_weights,
+                )
 
-            # UE8M0 checkpoints only need re-layout; plain block-FP8 ones
-            # (fp32 block scales) get requantized inside. Either way the
-            # layer ends up in the MXFP8 layout for npu_w8a8_mxfp8_linear.
-            process_npu_arch35_mxfp8_linear_weights(
-                layer,
-                self.weight_block_size,
-                scale_fmt=getattr(self.quant_config, "scale_fmt", None),
-            )
-            return
+                process_npu_arch35_mxfp8_linear_weights(
+                    layer,
+                    self.weight_block_size,
+                    scale_fmt=getattr(self.quant_config, "scale_fmt", None),
+                )
+                return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
