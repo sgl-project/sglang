@@ -41,6 +41,10 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
+from sglang.srt.models.mllama_utils import (
+    build_mllama_cross_attention_mask,
+    mllama_image_layout,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -849,12 +853,10 @@ class MllamaForConditionalGeneration(nn.Module):
     def pad_input_ids(
         self, input_ids: array[int], mm_inputs: MultimodalInputs
     ) -> array[int]:
-        pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
         pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
-
-        num_concurrent_media, num_tiles = pixel_values.shape[1:3]
-        num_patches = self.vision_model.num_patches
-        image_len = num_concurrent_media * num_tiles * num_patches
+        image_len = self.vision_model.num_patches * sum(
+            item.feature.shape[1] * item.feature.shape[2] for item in mm_inputs.mm_items
+        )
         mm_inputs.num_image_tokens = image_len
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
@@ -869,12 +871,14 @@ class MllamaForConditionalGeneration(nn.Module):
         max_num_images = max_num_tiles = bs = 0
         for i, mm_input in enumerate(forward_batch.mm_inputs):
             if not forward_batch.encoder_cached[i] and mm_input is not None:
-                pixel_values = torch.cat(
-                    [item.feature for item in mm_input.mm_items], dim=0
+                max_num_images = max(
+                    max_num_images,
+                    sum(item.feature.shape[1] for item in mm_input.mm_items),
                 )
-                max_num_images = max(max_num_images, pixel_values.shape[1])
-
-                max_num_tiles = max(max_num_tiles, pixel_values.shape[2])
+                max_num_tiles = max(
+                    max_num_tiles,
+                    max(item.feature.shape[2] for item in mm_input.mm_items),
+                )
                 bs += 1
 
         if max_num_images * max_num_tiles * bs == 0:
@@ -901,21 +905,19 @@ class MllamaForConditionalGeneration(nn.Module):
                 if forward_batch.encoder_cached[k] or mm_input is None:
                     continue
 
-                encoder_lens_need.append(forward_batch.encoder_lens[k])
-                pixel_values = torch.cat(
-                    [item.feature for item in mm_input.mm_items], dim=0
-                )
-                for j in range(pixel_values.shape[1]):
-                    img = pixel_values[0, j]
-                    num_tiles = img.shape[0]
-                    batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
-                        "aspect_ratio_ids"
-                    ][0, j]
-
-                    batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
+                encoder_lens_need.append(forward_batch.encoder_lens_cpu[k])
+                image_start = 0
+                for item in mm_input.mm_items:
+                    num_images, num_tiles = item.feature.shape[1:3]
+                    image_end = image_start + num_images
+                    batched_images[i, image_start:image_end, :num_tiles] = item.feature[
                         0
-                    ].model_specific_data["aspect_ratio_mask"][0, j]
+                    ]
+                    batched_ar_ids[i, image_start:image_end] = item.aspect_ratio_ids[0]
+                    batched_ar_mask[i, image_start:image_end, :num_tiles] = (
+                        item.aspect_ratio_mask[0]
+                    )
+                    image_start = image_end
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need
@@ -946,29 +948,57 @@ class MllamaForConditionalGeneration(nn.Module):
 
         return cross_attention_states_flat
 
+    def prepare_forward_batch(self, forward_batch: ForwardBatch):
+        """Prepare image visibility before the attention backend plans KV reads."""
+        forward_batch.cross_attention_custom_mask = None
+        if not forward_batch.mm_inputs or not any(forward_batch.encoder_lens_cpu):
+            return
+
+        is_decode = forward_batch.forward_mode.is_decode()
+        device = forward_batch.seq_lens.device
+        mask_parts = []
+        for i, encoder_len in enumerate(forward_batch.encoder_lens_cpu):
+            q_len = 1 if is_decode else forward_batch.extend_seq_lens_cpu[i]
+            if encoder_len == 0 or q_len == 0:
+                continue
+            positions, tile_masks = mllama_image_layout(forward_batch.mm_inputs[i])
+            # Generation repeats the last prompt row's image visibility.
+            query_start = (
+                positions[-1] if is_decode else forward_batch.extend_prefix_lens_cpu[i]
+            )
+            mask = build_mllama_cross_attention_mask(
+                positions,
+                tile_masks,
+                self.vision_model.num_patches,
+                query_start,
+                q_len,
+                device,
+            )
+            # Text before the first image uses a finite attention row. The
+            # cross-attention block zeros its attention and MLP residuals.
+            mask |= ~mask.any(dim=1, keepdim=True)
+            mask_parts.append(mask.flatten())
+
+        if mask_parts:
+            forward_batch.cross_attention_custom_mask = torch.cat(mask_parts)
+
     def get_full_text_row_masked_out_mask(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode():
-            full_text_row_masked_out_mask = forward_batch.encoder_lens != 0
-        else:
-            full_text_row_masked_out_mask = torch.ones(
-                forward_batch.extend_seq_lens.sum(), dtype=torch.bool
+            return (forward_batch.encoder_lens != 0).reshape(-1, 1)
+
+        device = forward_batch.seq_lens.device
+        parts = []
+        for i, q_len in enumerate(forward_batch.extend_seq_lens_cpu):
+            if forward_batch.encoder_lens_cpu[i] == 0:
+                parts.append(torch.zeros(q_len, dtype=torch.bool, device=device))
+                continue
+            first_image_pos = forward_batch.mm_inputs[i].mm_items[0].offsets[0][0]
+            query_start = forward_batch.extend_prefix_lens_cpu[i]
+            parts.append(
+                torch.arange(query_start, query_start + q_len, device=device)
+                >= first_image_pos
             )
-            start_pos = 0
-
-            for seq_len, encoder_len in zip(
-                forward_batch.seq_lens.tolist(), forward_batch.encoder_lens_cpu
-            ):
-                if encoder_len == 0:
-                    full_text_row_masked_out_mask[start_pos : start_pos + seq_len] = (
-                        False
-                    )
-                start_pos += encoder_len
-
-            full_text_row_masked_out_mask = full_text_row_masked_out_mask.to(
-                forward_batch.seq_lens.device
-            )
-
-        return full_text_row_masked_out_mask.reshape(-1, 1)
+        return torch.cat(parts).reshape(-1, 1)
 
     def forward(
         self,
@@ -982,7 +1012,7 @@ class MllamaForConditionalGeneration(nn.Module):
             self._batch_image_inputs(forward_batch)
         )
 
-        # TODO: support multi-image by this mask
+        # The backend consumes the batch's image mask when planning attention.
         cross_attention_mask = None
         cross_attention_states = None
 

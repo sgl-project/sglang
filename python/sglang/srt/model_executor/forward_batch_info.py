@@ -672,7 +672,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 
-    # Encoder-decoder cross-attention mask
+    # Flattened per-request [query length, encoder length] boolean visibility.
+    # Decode contributes one query row per request.
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
     # For DP attention (padding / local info)

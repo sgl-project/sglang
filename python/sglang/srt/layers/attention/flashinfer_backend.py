@@ -30,6 +30,9 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.cross_attention_mask import (
+    filter_cross_attention_kv_indices,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -748,6 +751,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
                 req_pool_indices=req_pool_indices,
+                cross_attention_custom_mask=getattr(
+                    forward_batch, "cross_attention_custom_mask", None
+                ),
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -969,6 +975,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
                 req_pool_indices=forward_batch.req_pool_indices,
+                cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
@@ -1579,6 +1586,7 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1595,6 +1603,7 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -1622,6 +1631,7 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1675,6 +1685,7 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
         encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
@@ -1701,6 +1712,9 @@ class FlashInferIndicesUpdaterDecode:
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 req_pool_indices=req_pool_indices,
+                cross_attention_custom_mask=(
+                    cross_attention_custom_mask if wrapper_id == 1 else None
+                ),
             )
 
     def call_begin_forward(
@@ -1717,6 +1731,7 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         *,
         req_pool_indices: torch.Tensor,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
@@ -1749,6 +1764,19 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
+        cross_attention_indptr_cpu = None
+        if cross_attention_custom_mask is not None:
+            visible_indices, visible_indptr = filter_cross_attention_kv_indices(
+                kv_indices, kv_indptr, cross_attention_custom_mask
+            )
+            if wrapper.is_cuda_graph_enabled:
+                # Captured kernels retain these buffers across replay steps.
+                kv_indices[: visible_indices.numel()].copy_(visible_indices)
+            else:
+                kv_indices = visible_indices
+            kv_indptr.copy_(visible_indptr)
+            cross_attention_indptr_cpu = visible_indptr.cpu()
+
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
@@ -1760,7 +1788,11 @@ class FlashInferIndicesUpdaterDecode:
 
         global global_override_indptr_cpu
         locally_override = False
-        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
+        if (
+            cross_attention_indptr_cpu is None
+            and seq_lens_cpu is not None
+            and global_override_indptr_cpu is None
+        ):
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
@@ -1790,7 +1822,11 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                global_override_indptr_cpu=(
+                    cross_attention_indptr_cpu
+                    if cross_attention_indptr_cpu is not None
+                    else global_override_indptr_cpu
+                ),
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu

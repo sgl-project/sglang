@@ -196,6 +196,9 @@ def build_replay_fb_view(
         ),
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        cross_attention_custom_mask=getattr(
+            forward_batch, "cross_attention_custom_mask", None
+        ),
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
@@ -1370,6 +1373,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
         attn_backend = self._replay_attn_backend()
+        if hasattr(self.model_runner.model, "prepare_forward_batch"):
+            self.model_runner.model.prepare_forward_batch(forward_batch)
+        if forward_batch.cross_attention_custom_mask is not None:
+            # Padding requests contribute zero entries to the flattened mask.
+            buffers.encoder_lens[raw_bs:bs].zero_()
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1390,6 +1398,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.enable_two_batch_overlap
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
+            and forward_batch.cross_attention_custom_mask is None
         ):
             # actual_forward_mode belongs in the key even though the captured
             # graph always targets capture_forward_mode: DSV4's replay prep
