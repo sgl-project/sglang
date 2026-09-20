@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.server_args import ServerArgs
@@ -53,9 +54,14 @@ class TestOOTDFlashHooks(CustomTestCase):
         with (
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(f"{HOOK_MODULE}.attention_backends_of", return_value=(None, None)),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=Mock(architectures=[]),
+            ),
         ):
             handle_speculative_decoding(args)
-        return args.speculative_draft_attention_backend
+        # Resolutions are declared on the stash, not written to the field.
+        return resolving_view(args).speculative_draft_attention_backend
 
     def test_explicit_backends_follow_platform_capabilities(self):
         cases = (
