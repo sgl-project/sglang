@@ -1026,6 +1026,59 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
+    def _build_transfer_dst_indices(
+        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+    ) -> List[int]:
+        """Map source entries to destination entries for this transfer.
+
+        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
+        All other layouts use explicit layer IDs, or positional pairing for non-PP.
+        """
+        use_pp_mla_offsets = (
+            self.pp_size > 1
+            and n_src != n_dst
+            and not self.kv_args.kv_layer_ids
+            and not peer_info.dst_kv_layer_ids
+            and self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.mla_compression_ratios
+        )
+        if not use_pp_mla_offsets:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            return [j for _, j in pairs]
+
+        start, end = self._mla_kv_entry_span_with_pp(n_src)
+        # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
+        # span is a matched-pp stage above 0, whose entries start at its own index 0.
+        if end > n_dst:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            return [j for _, j in pairs]
+
+        indices = list(range(start, end))
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+        if src_item_lens != dst_item_lens:
+            # Disagreeing cell sizes mean the peers did not build the same KV geometry;
+            # writing anyway would silently corrupt the peer's pool.
+            raise RuntimeError(
+                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
+                f"prefill over layers [{start}, {end}): prefill item_lens="
+                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+            )
+        return indices
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
@@ -1110,14 +1163,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
-            pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
-                allow_positional_fallback=self.pp_size == 1,
+            dst_indices = self._build_transfer_dst_indices(
+                peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
-            dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
@@ -3029,7 +3077,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        def bootstrap_thread_guarded():
+            try:
+                bootstrap_thread()
+            except Exception:
+                logger.exception(
+                    "prefill bootstrap_thread died on engine_rank=%s; requests to "
+                    "this rank will time out in KVPoll.Bootstrapping",
+                    self.kv_args.engine_rank,
+                )
+                raise
+
+        threading.Thread(target=bootstrap_thread_guarded).start()
 
 
 class NixlKVSender(CommonKVSender):

@@ -166,6 +166,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        """Free room for a decode-node preallocation; None means it is ready.
+
+        Returns a description of the shortfall when it cannot be met, for the
+        caller to attach to whichever request it was admitting. Separate
+        buffers make the sliding-window side the only one that needs
+        reclaiming here, since the full side is priced by the caller's budget.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        available = self.swa_available_size()
+        if available < swa_tokens:
+            tree_cache.evict_for_alloc(
+                EvictParams(swa_num_tokens=swa_tokens - available)
+            )
+            available = self.swa_available_size()
+        if available < swa_tokens:
+            return (
+                f"SWA eviction insufficient: needed={swa_tokens}, available={available}"
+            )
+        return None
+
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
         return (
             (full_capacity, self.full_available_size()),
@@ -232,14 +256,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Sliding-window token ids as the PD transfer engine addresses them.
-
-        The sibling of `translate_kv_indices_for_transfer` for the SWA state
-        component. On a static pool the sliding-window buffers are indexed by
-        the same ids the kernels use, so the read-path translate IS the answer.
-        A virtual-id pool must override: the transfer addresses raw bytes and
-        needs PHYSICAL ids, not kernel-facing ones.
-        """
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
         return self.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
