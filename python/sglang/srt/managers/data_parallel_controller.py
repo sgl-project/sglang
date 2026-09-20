@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -84,6 +85,77 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
+def _consistent_hash(key: str, n: int) -> int:
+    """Stable (cross-process, cross-run) hash of a session key -> dp_rank in [0, n).
+
+    Uses blake2b rather than the builtin hash() so the session->rank pin is
+    deterministic regardless of PYTHONHASHSEED.
+    """
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little") % n
+
+
+def _select_consistent_hash_rank(
+    key: str,
+    active: list[int],
+    loads: list[int],
+    *,
+    enable_spill: bool,
+    enable_repin: bool,
+    gap_pct: float,
+    abs_floor: int,
+    group_size: int,
+    session_pin: dict[str, int],
+    session_pin_cap: int,
+) -> int | None:
+    """Pick the target dp_rank for session `key`. Returns None when no rank is active
+    (the caller falls back). `active` is the sorted list of active rank ids; `loads`
+    is indexed by rank id (num_waiting_uncached_tokens).
+
+    Extracted from consistent_hash_scheduler so the routing decision is unit-testable
+    without ZMQ. Two documented side effects the caller relies on: a spill
+    speculatively bumps loads[target] (anti-herding within a refresh window), and
+    sticky mode (spill on + repin off) records the spilled rank in session_pin.
+    """
+    if not active:
+        return None
+    ch_home = active[_consistent_hash(key, len(active))]
+
+    # Sticky pin only when spill is on and repin is off; otherwise home == ch_home.
+    home = ch_home
+    sticky = enable_spill and not enable_repin
+    if sticky:
+        pinned = session_pin.get(key)
+        if pinned is not None and pinned in active:
+            home = pinned
+
+    target = home
+    if enable_spill:
+        home_load = loads[home]
+        # Only balance within the home rank's node group (ranks that share its
+        # node-local store); never spill across the node boundary.
+        group = [r for r in active if r // group_size == home // group_size]
+        min_load = min(loads[r] for r in group)
+        threshold = min_load * (1.0 + gap_pct) + abs_floor
+        if home_load > threshold:
+            candidates = [
+                r
+                for r in group
+                if r != home and loads[r] * (1.0 + gap_pct) + abs_floor < home_load
+            ]
+            if candidates:
+                target = candidates[_consistent_hash(key, len(candidates))]
+                # Speculative bump so a burst within one refresh window spreads
+                # instead of all landing on the same spill target.
+                loads[target] += 1
+                if sticky:
+                    # Re-pin the session to the spilled rank (bounded map).
+                    if len(session_pin) >= session_pin_cap:
+                        session_pin.clear()
+                    session_pin[key] = target
+    return target
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -91,6 +163,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    CONSISTENT_HASH = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -106,6 +179,9 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        # Per-rank prefill backlog (uncached tokens still waiting to be prefilled).
+        # Signal for the consistent_hash spill+repin path; harmless otherwise.
+        self.waiting_uncached_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
     def update_budget(self, loads):
@@ -118,6 +194,9 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.waiting_uncached_tokens[load.dp_rank] = (
+                load.num_waiting_uncached_tokens
+            )
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -168,11 +247,34 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.CONSISTENT_HASH: self.consistent_hash_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+
+        # consistent_hash config (opt-in). Pure consistent_hash is a stateless
+        # session->rank pin and reads no load; only the spill path uses the shm
+        # LoadSnapshot num_waiting_uncached_tokens.
+        self.enable_dp_spill = bool(getattr(get_parallel(), "enable_dp_spill", False))
+        self.enable_dp_repin = bool(getattr(get_parallel(), "enable_dp_repin", True))
+        self.dp_spill_gap_pct = float(getattr(get_parallel(), "dp_spill_gap_pct", 0.30))
+        self.dp_spill_abs = int(getattr(get_parallel(), "dp_spill_abs", 8192))
+        # Node boundary: consecutive dp_ranks sharing one node-local KV store; a spill
+        # stays within the home rank's group so it never crosses the shared store.
+        self.dp_spill_group_size = max(
+            1, int(getattr(get_parallel(), "dp_spill_group_size", 8))
+        )
+        # Sticky session->rank map, used only when spill is on and repin is off.
+        # Bounded so an unbounded stream of session ids cannot grow it forever;
+        # a stale/evicted pin only costs a cache miss, never correctness.
+        self._session_pin: dict[str, int] = {}
+        self._session_pin_cap = 200000
+
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+        ) or (
+            self.load_balance_method == LoadBalanceMethod.CONSISTENT_HASH
+            and self.enable_dp_spill
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -795,6 +897,50 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+
+    def consistent_hash_scheduler(self, req: Req):
+        """Consistent-hash the session to a dp_rank, with optional load-aware spill
+        and optional re-pin. All three are independent, parameterized behaviors:
+
+        - pin (always):     home = hash(session_id or rid) % (active dp_ranks). Gives
+                            session->rank stickiness for KV-cache locality.
+        - spill (--enable-dp-spill): if the home rank's waiting-uncached-token backlog
+                            exceeds the least-loaded rank by a relative gap
+                            (--dp-spill-gap-pct) + absolute floor (--dp-spill-abs),
+                            route to a less-loaded rank (anti-herding pick by hash).
+                            Signal = shm LoadSnapshot num_waiting_uncached_tokens.
+        - repin (--enable-dp-repin, default true): a spilled session returns to its
+                            consistent-hash home once the home drains -- home is
+                            recomputed every request, so the spill is transient and NO
+                            per-session state is kept (no migration storm). If false,
+                            the session sticks to the spilled rank (bounded map) until
+                            that rank also overloads.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        key = getattr(req, "session_id", None) or getattr(req, "rid", None) or ""
+        # Route over the ACTIVE ranks (identical to hash % dp_size when all ranks are
+        # active; avoids pinning to an inactive slot under elastic DP).
+        active = [
+            r
+            for r in range(len(self.workers))
+            if self.status[r] and self.workers[r] is not None
+        ]
+        target = _select_consistent_hash_rank(
+            key,
+            active,
+            self.dp_budget.waiting_uncached_tokens,
+            enable_spill=self.enable_dp_spill,
+            enable_repin=self.enable_dp_repin,
+            gap_pct=self.dp_spill_gap_pct,
+            abs_floor=self.dp_spill_abs,
+            group_size=self.dp_spill_group_size,
+            session_pin=self._session_pin,
+            session_pin_cap=self._session_pin_cap,
+        )
+        if target is None:
+            target = _consistent_hash(key, len(self.workers))
+        sock_send(self.workers[target], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
