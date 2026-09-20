@@ -398,6 +398,9 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
+        # Set by the quant method when it repacks experts for MegaMoE.
+        self._mega_moe_weights_built = False
+        self._mega_moe_nvfp4 = False
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
