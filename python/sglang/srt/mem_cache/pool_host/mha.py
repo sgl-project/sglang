@@ -102,7 +102,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
             pool_label=pool_label,
         )
-        self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        self.element_dim = self.head_num * self.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -156,7 +156,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
-        self.head_num = self.device_pool.head_num
+        # One allocator token may hold multiple attention rows.
+        self.head_num = self.device_pool.row_dim // self.device_pool.head_dim
         self.head_dim = self.device_pool.head_dim
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
@@ -764,7 +765,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
@@ -781,7 +782,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(

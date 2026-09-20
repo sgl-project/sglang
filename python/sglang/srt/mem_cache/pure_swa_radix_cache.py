@@ -63,7 +63,7 @@ class PureSWARadixCache(RadixCache):
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         """Cache request when it finishes.
 
@@ -72,20 +72,16 @@ class PureSWARadixCache(RadixCache):
         to the allocator. The range [evict_floor, swa_evicted_seqlen) was already
         freed by _evict_swa during decode — we skip it to avoid double-free.
         """
-        if self.disable_finished_insert:
-            is_insert = False
-
-        kv_committed_len = kv_len_to_handle
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :kv_committed_len
+                req.kv.req_pool_idx, :owned_kv_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         radix_key = RadixKey(
