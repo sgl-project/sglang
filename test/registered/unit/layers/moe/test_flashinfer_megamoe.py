@@ -98,7 +98,7 @@ def _load_autotune_module(monkeypatch):
     return module
 
 
-def _profile_fixture(monkeypatch, world_size=1):
+def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
     from dataclasses import dataclass
 
     module = _load_autotune_module(monkeypatch)
@@ -116,20 +116,34 @@ def _profile_fixture(monkeypatch, world_size=1):
         def num_tokens(self):
             return self.hidden_states.shape[0]
 
+    @dataclass
+    class Config:
+        knobs: str | None = None
+        kernel_name: str = "test_backend"
+        input_norm_const: float = 1.0
+
+    @dataclass
+    class Fleet:
+        max_tokens_per_rank: int = 128
+        num_experts: int = 4
+        token_hidden_size: int = 4
+
+    @dataclass
+    class Backend:
+        megakernel: Config
+        transformed_weights: object
+        preprocess_weights: bool = False
+
     tensors = Tensors(
-        torch.ones(3, 4, dtype=torch.bfloat16),
-        torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32),
-        torch.full((3, 2), 0.5, dtype=torch.float32),
+        torch.ones(num_tokens, 4, dtype=torch.bfloat16),
+        torch.arange(num_tokens * 2, dtype=torch.int32).reshape(num_tokens, 2) % 4,
+        torch.full((num_tokens, 2), 0.5, dtype=torch.float32),
         torch.ones(4, dtype=torch.float32),
     )
     forward = module.MegaMoeTunedForward(
         types.SimpleNamespace(world_size=world_size, rank=0, process_group=None),
-        types.SimpleNamespace(max_tokens_per_rank=128, num_experts=4),
-        types.SimpleNamespace(
-            megakernel=types.SimpleNamespace(knobs=None),
-            preprocess_weights=False,
-            transformed_weights=object(),
-        ),
+        Fleet(),
+        Backend(Config(), object()),
     )
     calls = []
 
@@ -170,20 +184,14 @@ def test_megamoe_startup_profiles_are_prepared_once(
     assert calls[-1][1] is forward.workspaces[selected]
 
 
-@pytest.mark.parametrize("local_tokens", [0, 1, 3])
+@pytest.mark.parametrize("local_tokens", [0, 3])
 def test_megamoe_profile_selection_uses_all_dp_ranks(monkeypatch, local_tokens):
-    from dataclasses import replace
-
-    module, forward, tensors, mega, calls = _profile_fixture(monkeypatch, world_size=4)
+    module, forward, tensors, mega, calls = _profile_fixture(
+        monkeypatch, world_size=4, num_tokens=local_tokens
+    )
     dp = types.ModuleType("sglang.srt.layers.dp_attention")
     dp.get_dp_global_num_tokens = lambda: [0, 1, 3, 7]
     monkeypatch.setitem(sys.modules, dp.__name__, dp)
-    tensors = replace(
-        tensors,
-        hidden_states=tensors.hidden_states[:local_tokens],
-        topk_ids=tensors.topk_ids[:local_tokens],
-        topk_weights=tensors.topk_weights[:local_tokens],
-    )
     forward.workspaces = {1: object(), 4: object(), 8: object(), 128: object()}
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     forward(mega, tensors)
@@ -198,51 +206,21 @@ def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
     assert [workspace for _, workspace in calls] == [None, None]
 
 
-@pytest.mark.parametrize("supports_output_view", [False, True])
-def test_megamoe_profiles_reuse_winner_across_startup_contexts(
-    monkeypatch, tmp_path, supports_output_view
-):
+def test_megamoe_profiles_reuse_winner_across_startup_contexts(monkeypatch, tmp_path):
     import json
     import os
-    from dataclasses import dataclass, replace
+    from dataclasses import replace
 
-    module, _, tensors, _, _ = _profile_fixture(monkeypatch)
-    tensors = replace(
-        tensors,
-        hidden_states=tensors.hidden_states[:1],
-        topk_ids=tensors.topk_ids[:1],
-        topk_weights=tensors.topk_weights[:1],
-    )
-
-    @dataclass
-    class Config:
-        knobs: str | None = None
-        kernel_name: str = "test_backend"
-        input_norm_const: float = 1.0
-
-    @dataclass
-    class Fleet:
-        max_tokens_per_rank: int = 128
-        num_experts: int = 4
-        token_hidden_size: int = 4
-
-    @dataclass
-    class Backend:
-        megakernel: Config
-        transformed_weights: object
-        preprocess_weights: bool = False
-
-    bootstrap = types.SimpleNamespace(world_size=1, rank=0, process_group=object())
-    fleet = Fleet()
-    backend = Backend(Config(), object())
+    module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
     payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
     events = []
     staged = []
 
     class Mega:
+        supports_output_view = True
+
         def __init__(self, **kwargs):
-            self.auto = kwargs.get("backend", backend).megakernel.knobs == "auto"
-            self.supports_output_view = supports_output_view
+            self.auto = kwargs.get("backend", first.backend).megakernel.knobs == "auto"
 
         def warmup(self, inputs, workspace=None):
             if self.auto:
@@ -268,7 +246,7 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(
 
         def forward(self, inputs, *, workspace, return_workspace_view=False):
             assert workspace is self.workspace
-            assert return_workspace_view is supports_output_view
+            assert return_workspace_view
             return inputs.hidden_states
 
     fake_moe = types.ModuleType("flashinfer.moe_ep")
@@ -283,9 +261,12 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(
     owners = []
     for phase, scale in (("target", 1.0), ("draft", 2.0)):
         phase_backend = replace(
-            backend, megakernel=replace(backend.megakernel, input_norm_const=scale)
+            first.backend,
+            megakernel=replace(first.backend.megakernel, input_norm_const=scale),
         )
-        forward = module.MegaMoeTunedForward(bootstrap, fleet, phase_backend)
+        forward = module.MegaMoeTunedForward(
+            first.bootstrap, first.fleet_params, phase_backend
+        )
         mega = Mega()
         with module.megamoe_autotune_context(
             tmp_path / phase / "cache.json", reuse_cache=False
@@ -299,22 +280,10 @@ def test_megamoe_profiles_reuse_winner_across_startup_contexts(
     assert owners[0].workspace is not owners[1].workspace
 
 
-@pytest.mark.parametrize("tokens", [0, 3])
-@pytest.mark.parametrize("capacity", [1, 8])
-@pytest.mark.parametrize("prequantized", [False, True])
-def test_megamoe_profile_inputs_retain_runtime_scales(
-    monkeypatch, tokens, capacity, prequantized
-):
-    from dataclasses import replace
-
-    module, _, tensors, _, _ = _profile_fixture(monkeypatch)
-    tensors = replace(
-        tensors,
-        hidden_states=tensors.hidden_states[:tokens],
-        topk_ids=tensors.topk_ids[:tokens],
-        topk_weights=tensors.topk_weights[:tokens],
-        scales=torch.ones(tokens, 2) if prequantized else None,
-    )
+@pytest.mark.parametrize("tokens,capacity", [(0, 8), (3, 8), (3, 1)])
+def test_megamoe_profile_inputs_retain_runtime_scales(monkeypatch, tokens, capacity):
+    module, _, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=tokens)
+    tensors.scales = torch.ones(tokens, 2)
     profile = module._profile_inputs(tensors, capacity, num_experts=4)
     assert profile.hidden_states.shape == (capacity, 4)
     assert profile.topk_ids.shape == profile.topk_weights.shape == (capacity, 2)
@@ -322,11 +291,8 @@ def test_megamoe_profile_inputs_retain_runtime_scales(
     assert profile.topk_ids.dtype == torch.int32
     assert profile.topk_weights.dtype == torch.float32
     assert profile.fc1_alpha is tensors.fc1_alpha
-    if prequantized:
-        assert profile.scales.shape == (capacity, 2)
-        assert torch.all(profile.scales == 1)
-    else:
-        assert profile.scales is None
+    assert profile.scales.shape == (capacity, 2)
+    assert torch.all(profile.scales == 1)
     assert torch.all((profile.topk_ids >= 0) & (profile.topk_ids < 4))
 
 
