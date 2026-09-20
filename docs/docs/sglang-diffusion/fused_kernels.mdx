@@ -133,6 +133,7 @@ These fusion families mount under both `quality="extra-high"` and
 | --- | --- | --- | --- |
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs the split baseline; exact with `round_norm_before_rope=True` | separate QK-norm kernel + RoPE |
 | `flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact against its selected BF16 reference chain | FLUX.2 QK RMSNorm + RoPE + joint text/image QKV packing |
+| `flux2_strided_qknorm_rope` | Triton | bit-exact against native tiled RMSNorm followed by FlashInfer interleaved RoPE; verified per signature | FLUX.2 Klein single-stream packed Q/K copies + QK RMSNorm + RoPE on Hopper, BF16, 24 heads of dimension 128 |
 | `qwen_qkv_epilogue` | JIT CUDA | bit-exact against its selected BF16 reference chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes on SM100+ |
 | `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
 | `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
@@ -140,6 +141,13 @@ These fusion families mount under both `quality="extra-high"` and
 | `ltx2_qknorm_split_rope` | KDA (JIT CUDA) | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
+
+The Klein strided path preserves the BF16 rounding between RMSNorm and RoPE,
+including signed zeros. It reads packed Q/K views without changing the adjacent
+V or MLP values. Unsupported layouts, devices, or RMSNorm dispatches use the
+original helper. A new signature is verified outside CUDA Graph capture; an
+unverified capture falls back. `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0` also disables
+this path. This kernel does not enable model-level BCG support for FLUX.2.
 
 ### Activation
 
