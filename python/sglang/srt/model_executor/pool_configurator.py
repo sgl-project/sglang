@@ -63,6 +63,25 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 
+def resolve_dsv4_local_pool_layout(
+    compression_ratios: list[int],
+    kv_source_layer_ids: list[int],
+    layer_ids: tuple[int, ...],
+) -> tuple[list[int], set[int]]:
+    local_ratios = [compression_ratios[layer_id] for layer_id in layer_ids]
+    low_ratio_sources = {
+        max(
+            source
+            for source in kv_source_layer_ids
+            if source <= layer_id
+            and compression_ratios[source] == compression_ratios[layer_id]
+        )
+        for layer_id in layer_ids
+        if compression_ratios[layer_id] in (1, 2)
+    }
+    return local_ratios, low_ratio_sources
+
+
 @dataclass
 class MemoryPoolConfig:
     """Resolved memory pool config, shared between target and draft workers."""
@@ -1011,10 +1030,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
-        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
-        self.compression_ratios = cfg.compress_ratios[
-            kvc.layer_info.start_layer : kvc.layer_info.end_layer
-        ]
+        self.layer_ids = tuple(
+            range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+        )
+        self.compression_ratios, low_ratio_sources = resolve_dsv4_local_pool_layout(
+            cfg.compress_ratios,
+            cfg.hf_config.kv_source_layer_ids,
+            self.layer_ids,
+        )
         if kvc.ps.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
@@ -1064,10 +1087,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.indexer_head_dim, use_fp4_indexer=True
         )
         self.low_ratio_bytes_per_full_token = sum(
-            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
-            for l in cfg.hf_config.kv_source_layer_ids
-            if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
-            and cfg.compress_ratios[l] in (1, 2)
+            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[source]
+            for source in low_ratio_sources
         )
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             dsv4_unified_row_bytes,

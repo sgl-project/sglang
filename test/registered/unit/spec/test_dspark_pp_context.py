@@ -10,7 +10,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
 from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
@@ -26,6 +25,7 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     _BlockFp8LinearSlice,
 )
 from sglang.srt.models.dflash import DFlashDraftModel  # noqa: E402
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
     use_empty_draft_model_for_pp_prefill,
@@ -56,7 +56,7 @@ def _make_deepseek_v4_dspark_projection_model(
     model.num_target_features = num_target_features
     stage = torch.nn.Module()
     stage.main_proj = _TupleLinear(hidden_size * num_target_features, hidden_size)
-    stage.main_norm = RMSNorm(hidden_size, eps=1e-6)
+    stage.main_norm = torch.nn.RMSNorm(hidden_size, eps=1e-6)
     model.stages = torch.nn.ModuleList([stage])
     model.markov_head = torch.nn.Identity()
     model.confidence_head = torch.nn.Identity()
@@ -193,11 +193,12 @@ class TestDSparkPPContext(CustomTestCase):
             enable_mamba_track=False,
             hc_hidden_size=16,
         )
-        eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
-        graph_buffers = DecodeInputBuffers.create(
-            next_token_logits_buffer=torch.zeros((max_num_token, 8)),
-            **common_kwargs,
-        )
+        with get_parallel().override(moe_ep_size=1):
+            eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
+            graph_buffers = DecodeInputBuffers.create(
+                next_token_logits_buffer=torch.zeros((max_num_token, 8)),
+                **common_kwargs,
+            )
 
         self.assertEqual(
             eager_buffers.pp_proxy_tensors["hidden_states"].shape,
@@ -214,9 +215,10 @@ class TestDSparkPPContext(CustomTestCase):
         model = DFlashDraftModel.__new__(DFlashDraftModel)
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(hidden_size=hidden_size)
+        model.is_nemotron_35_draft = False
         model.num_context_features = 3
         model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
-        model.hidden_norm = RMSNorm(hidden_size, eps=1e-6)
+        model.hidden_norm = torch.nn.RMSNorm(hidden_size, eps=1e-6)
 
         feature_hidden = [
             torch.randn(5, hidden_size, dtype=torch.float32) for _ in range(3)

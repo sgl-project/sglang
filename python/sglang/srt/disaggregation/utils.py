@@ -456,7 +456,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -1801,25 +1800,23 @@ def setup_state_kv_args(
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Describe the positional transfer layout without pool capacities or pointers."""
+    """Describe the model-wide DSpark transfer contract."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
-        )
+    if not any(
+        state_type in (StateType.SWA, StateType.SWA_RING)
+        for state_type in kv_args.state_types
+    ):
+        raise RuntimeError("DeepSeek-V4.1 DSpark PD requires an SWA state component")
 
     return {
+        "protocol_version": 2,
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
-        "kv_layer_ids": list(kv_args.kv_layer_ids),
-        "kv_item_lens": list(kv_args.kv_item_lens),
-        "state_types": [state_type.value for state_type in kv_args.state_types],
-        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
 
 

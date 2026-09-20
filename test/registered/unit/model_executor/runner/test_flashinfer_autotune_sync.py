@@ -30,6 +30,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
+    should_run_flashinfer_autotune,
 )
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
@@ -58,6 +59,15 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
 
 
 class TestAutotuneTacticSyncGroup(CustomTestCase):
+    def test_dsv41_pp_skips_state_free_dummy_forward(self):
+        model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_size=4),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v41")
+            ),
+        )
+        self.assertFalse(should_run_flashinfer_autotune(model_runner))
+
     def test_single_rank_has_nobody_to_agree_with(self):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
