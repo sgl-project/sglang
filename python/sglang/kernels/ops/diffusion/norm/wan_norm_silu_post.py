@@ -60,7 +60,7 @@ def _storage(x, channels_last):
 
 
 @register_custom_op(mutates_args=["out"])
-def _run(
+def _wan_norm_silu_post(
     x: torch.Tensor,
     denominator: torch.Tensor,
     gamma: torch.Tensor,
@@ -87,7 +87,7 @@ def wan_norm_silu_post(x, denominator, gamma, bias=None, *, scale=None):
     if not can_use_wan_norm_silu_post(x, denominator, gamma, bias):
         raise ValueError("unsupported Wan normalization post-op inputs")
     out = torch.empty_like(x, dtype=torch.float32)
-    _run(
+    _wan_norm_silu_post(
         x,
         denominator,
         gamma,
