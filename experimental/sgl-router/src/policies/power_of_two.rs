@@ -186,7 +186,8 @@ fn best_two_of_sample(
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-        use std::time::Instant;
+    use crate::state::load_monitor::engine_reported_load::EngineReportedSchedulingLoad;
+    use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
