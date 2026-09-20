@@ -597,9 +597,15 @@ def _dp_gather_via_all_gather(
     if not is_partial:
         if get_parallel().attn_tp_rank != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
-        get_parallel().attn_tp_rank
-    ]
+    # Collective outputs must not overlap their inputs.  A tensor_split view
+    # aliases local_tokens, so RCCL can overwrite rows while peers are still
+    # consuming them.  This corrupts activations in partial-DP topologies such
+    # as TP8/DP2, where this gather runs before every MoE layer.
+    scattered_local_tokens = torch.empty_like(
+        local_tokens.tensor_split(get_parallel().attn_tp_size)[
+            get_parallel().attn_tp_rank
+        ]
+    )
     get_parallel().attn_tp_group.reduce_scatter_tensor(
         scattered_local_tokens, local_tokens
     )
@@ -933,9 +939,13 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if get_parallel().tp_size == get_parallel().attn_dp_size:
         get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
-        scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
-            get_parallel().tp_rank
-        ]
+        # The TP reduce-scatter output must not alias its input.  Using this
+        # rank's ``input.tensor_split(...)`` view as the output corrupts the
+        # still-live collective input, which is especially visible for partial
+        # DP attention (for example TP8/DP2) with batched decode.
+        scattered_local_tokens = torch.empty_like(
+            input.tensor_split(get_parallel().tp_size)[get_parallel().tp_rank]
+        )
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
         get_parallel().attn_tp_group.all_gather_into_tensor(
             output, scattered_local_tokens
