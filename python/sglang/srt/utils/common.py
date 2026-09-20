@@ -558,6 +558,16 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
+    if not tensor.is_cuda:
+        return tensor.to("cpu", non_blocking=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return host
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
@@ -4601,7 +4611,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's cache_unfinished_req(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

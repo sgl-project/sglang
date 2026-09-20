@@ -380,18 +380,12 @@ def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, availabl
     assert npu_fia_available() is available
 
 
-@pytest.mark.parametrize(
-    ("is_npu", "uses_native"),
-    [(False, True), (True, False)],
-)
-def test_sensenova_u1_shared_rmsnorm_dispatch(monkeypatch, is_npu, uses_native):
-    monkeypatch.setattr(current_platform, "is_npu", lambda: is_npu)
-
+def test_sensenova_u1_shared_rmsnorm_uses_framework_dispatch():
     norm = make_qwen3_rms_norm(64, eps=1e-6)
 
     assert isinstance(norm, RMSNorm)
     assert norm.cast_x_before_out_mul
-    assert (norm._forward_method == norm.forward_native) is uses_native
+    assert norm._forward_method != norm.forward_native
 
 
 @torch.no_grad()

@@ -29,7 +29,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -347,7 +346,6 @@ def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
         hidden_size,
         eps=eps,
         cast_x_before_out_mul=True,
-        force_native=not current_platform.is_npu(),
     )
 
 
