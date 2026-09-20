@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -1705,6 +1705,14 @@ class DeepseekV4HipRadixBackend(
                 _kv_splits_for_stream,
             )
 
+            adaptive_kv_splits = (
+                verify_as_decode
+                and compress_ratio == 128
+                and 64 < T <= 96
+                and q.shape[1:] == (128, 512)
+                and q.dtype == torch.bfloat16
+                and is_gfx95_supported()
+            )
             return runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1715,6 +1723,7 @@ class DeepseekV4HipRadixBackend(
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
                 kv_splits=_kv_splits_for_stream(compress_ratio),
+                adaptive_kv_splits=adaptive_kv_splits,
             )
 
         # prefill / extend

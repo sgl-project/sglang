@@ -444,6 +444,7 @@ def _paged_decode_split_kernel(
     QUANT_KV: tl.constexpr,  # True → dequant fp8 KV via kv_scales
     GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
     NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+    ADAPTIVE_KV_SPLITS: tl.constexpr,
 ):
     """3D split-K + exp2-softmax sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
@@ -480,7 +481,10 @@ def _paged_decode_split_kernel(
     # masks unwritten slots out of its load. This saves a per-empty-split
     # write of BLOCK_H*BLOCK_D fp32 (16 KB at BLOCK_H=16, BLOCK_D=512) which
     # dominated short-K + many-splits cases.
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    effective_splits = KV_SPLITS
+    if ADAPTIVE_KV_SPLITS:
+        effective_splits = tl.where(kv_len >= 2048, KV_SPLITS, 2)
+    tiles_per_segment = tl.cdiv(kv_len, effective_splits * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
         return
     num_tiles = tl.cdiv(kv_len, BLOCK_K)
@@ -580,6 +584,7 @@ def _paged_decode_reduce_kernel(
     BLOCK_D: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ADAPTIVE_KV_SPLITS: tl.constexpr,
 ):
     """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write
     final output. Grid: ``(T, H, ceil(D / D_CHUNK))`` — one CTA owns one
@@ -635,7 +640,10 @@ def _paged_decode_reduce_kernel(
             mask=d_mask,
         )
         return
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    effective_splits = KV_SPLITS
+    if ADAPTIVE_KV_SPLITS:
+        effective_splits = tl.where(kv_len >= 2048, KV_SPLITS, 2)
+    tiles_per_segment = tl.cdiv(kv_len, effective_splits * BLOCK_K)
     act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
     segm_mask = k_offs < act_num_segments
 
@@ -709,6 +717,7 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    adaptive_kv_splits: bool = False,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -769,7 +778,9 @@ def _sparse_attn_v4_paged_decode_triton(
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
 
-    if kv_splits is None:
+    if adaptive_kv_splits:
+        kv_splits = 4
+    elif kv_splits is None:
         kv_splits = _kv_splits_heuristic(T, H, block_h)
 
     qk_scale = float(softmax_scale) * LOG2E
@@ -877,6 +888,7 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        ADAPTIVE_KV_SPLITS=adaptive_kv_splits,
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
@@ -930,6 +942,7 @@ def _sparse_attn_v4_paged_decode_triton(
         BLOCK_D=block_d,
         D_CHUNK=d_chunk,
         BLOCK_K=block_k,
+        ADAPTIVE_KV_SPLITS=adaptive_kv_splits,
         num_warps=4,
     )
     return out
@@ -944,6 +957,7 @@ def sparse_attn_v4_paged_decode(
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
     kv_splits: int | None = None,
+    adaptive_kv_splits: bool = False,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -978,4 +992,5 @@ def sparse_attn_v4_paged_decode(
             softmax_scale,
             kv_scales=kv_scales,
             kv_splits=kv_splits,
+            adaptive_kv_splits=adaptive_kv_splits,
         )
