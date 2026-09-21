@@ -8,6 +8,7 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -96,7 +97,6 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_npu,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -563,6 +563,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             from sglang.srt.hardware_backend.npu.extra_ops_loader import (
                 initialize_dspark_a5_sparse_attn_ops,
             )
+
             initialize_dspark_a5_sparse_attn_ops()
 
         with draft_pp_context(), self._draft_context():
