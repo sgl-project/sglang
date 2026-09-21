@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
+import json
 import math
+import os
+from importlib.metadata import version
+from pathlib import Path
 
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_rank,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -22,6 +30,28 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+
+
+def _ci_tensor_fingerprint(name, tensor):
+    if os.environ.get("QWEN21_CI_DIAGNOSTICS") != "1":
+        return
+    value = tensor.detach().contiguous().cpu()
+    print(
+        "QWEN21_DIAGNOSTIC "
+        + json.dumps(
+            dict(
+                name=name,
+                rank=get_world_rank(),
+                shape=list(value.shape),
+                dtype=str(value.dtype),
+                sha256=hashlib.sha256(
+                    value.reshape(-1).view(torch.uint8).numpy().tobytes()
+                ).hexdigest(),
+                mean=value.double().mean().item(),
+            )
+        ),
+        flush=True,
+    )
 
 
 def collapse_image_slots(hidden, input_ids, image_token_id):
@@ -105,6 +135,8 @@ class QwenImage21EncodingStage(PipelineStage):
                 vision_images.append(image)
             kwargs["images"] = vision_images
         inputs = self.processor(**kwargs).to(device)
+        _ci_tensor_fingerprint("input_ids", inputs.input_ids)
+        _ci_tensor_fingerprint("attention_mask", inputs.attention_mask)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
@@ -113,8 +145,45 @@ class QwenImage21EncodingStage(PipelineStage):
             )
             # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
             final_hidden = outputs.hidden_states[-1]
+            if os.environ.get("QWEN21_CI_DIAGNOSTICS") == "1":
+                props = torch.cuda.get_device_properties(device)
+                print(
+                    "QWEN21_DIAGNOSTIC "
+                    + json.dumps(
+                        dict(
+                            name="environment",
+                            rank=get_world_rank(),
+                            gpu=props.name,
+                            sm_count=props.multi_processor_count,
+                            torch=torch.__version__,
+                            numpy=version("numpy"),
+                            tf32=torch.backends.cuda.matmul.allow_tf32,
+                            bf16_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+                            libraries=sorted(
+                                {
+                                    line.split()[-1]
+                                    for line in Path("/proc/self/maps")
+                                    .read_text()
+                                    .splitlines()
+                                    if any(
+                                        name in line
+                                        for name in (
+                                            "libcublas",
+                                            "libcudnn",
+                                            "libcuda.so",
+                                        )
+                                    )
+                                }
+                            ),
+                        )
+                    ),
+                    flush=True,
+                )
+                for index, hidden_state in enumerate(outputs.hidden_states):
+                    _ci_tensor_fingerprint(f"encoder_hidden_{index}", hidden_state)
         valid = inputs.attention_mask[0].bool()
         hidden = final_hidden[0, valid][self.drop_idx :]
+        _ci_tensor_fingerprint("prompt_embeds", hidden)
         ids = inputs.input_ids[0, valid][self.drop_idx :]
         return collapse_image_slots(hidden, ids, self.image_token_id)
 
@@ -252,10 +321,14 @@ class QwenImage21DenoisingStage(DenoisingStage):
     ):
         caches = kwargs["prefix_caches"]
         if caches is not None and not caches[0][0]:
+            _ci_tensor_fingerprint("initial_latents", latent_model_input)
+            _ci_tensor_fingerprint("first_timestep", timestep)
             # prefill is request-specific; graph replay must only see populated cache tensors
-            return current_model(
+            noise = current_model(
                 hidden_states=latent_model_input, timestep=timestep, **kwargs
             )
+            _ci_tensor_fingerprint("first_noise_pred", noise)
+            return noise
         return super()._predict_noise(
             current_model,
             latent_model_input,

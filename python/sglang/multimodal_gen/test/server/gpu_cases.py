@@ -1146,6 +1146,7 @@ TWO_GPU_CASES = [
         "qwen_image21_t2i_tp2",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST,
+            env_vars={"QWEN21_CI_DIAGNOSTICS": "1"},
             tp_size=2,
             ulysses_degree=1,
             ring_degree=1,
