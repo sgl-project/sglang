@@ -16,6 +16,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDerivedWeightCache(unittest.TestCase):
+    def test_mhc_cache_protection_survives_model_owned_cache_guard(self):
+        """Both mHC weight splits must still reject updates after merging guards."""
+        for cache_name in ("_hc_attn_tf32_parts", "_hc_ffn_tf32_parts"):
+            with self.subTest(cache_name=cache_name):
+                model = torch.nn.Sequential(torch.nn.Module())
+                setattr(model[0], cache_name, ())
+                error = _unsupported_derived_weight_cache_error(model)
+                self.assertIsNotNone(error)
+                self.assertIn("compensated mHC", error)
+
     def test_nested_model_cache_rejects_updates(self):
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 2, bias=False, device="cpu"),

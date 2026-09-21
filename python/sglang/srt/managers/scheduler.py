@@ -29,6 +29,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
+    SpawnRanks,
     attention_backends,
     get_context,
     get_device,
@@ -44,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     publish,
+    spawn_world_rank,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -74,6 +76,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -98,10 +101,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
-    get_tp_group,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -159,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -279,6 +281,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    allocate_distinct_stream,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -290,6 +293,7 @@ from sglang.srt.mem_cache.common import (
     retraction_discard,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -593,9 +597,9 @@ class Scheduler(
             enable_metrics=get_observability().enable_metrics,
             enable_kv_cache_events=bool(
                 get_observability().kv_events_config
-                and self.ps.pp_rank == 0
-                and self.ps.attn_tp_rank == 0
-                and self.ps.attn_cp_rank == 0
+                and get_parallel().pp_rank == 0
+                and get_parallel().attn_tp_rank == 0
+                and get_parallel().attn_cp_rank == 0
             ),
             ps=self.ps,
             tp_group=self.tp_group,
@@ -757,8 +761,8 @@ class Scheduler(
             return
 
         rank = (
-            self.ps.dp_rank
-            if self.ps.dp_rank is not None
+            get_parallel().dp_rank
+            if get_parallel().dp_rank is not None
             else self.tp_group.rank_in_group
         )
         logger.info("HCCL DP prewarm start: rank=%s", rank)
@@ -773,10 +777,10 @@ class Scheduler(
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import init_zbal
 
-            if self.ps.pp_size > 1:
+            if get_parallel().pp_size > 1:
                 logger.error("only zbal mix mode support pp_size > 1!")
             init_zbal(
-                self.ps.tp_size, self.ps.gpu_id, self.ps.tp_rank
+                get_parallel().tp_size, self.ps.gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
 
     def init_model_config(self):
@@ -809,9 +813,9 @@ class Scheduler(
 
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
         )
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
@@ -822,7 +826,7 @@ class Scheduler(
             skip_tokenizer_init=self.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
-                self.ps.attn_tp_rank == 0
+                get_parallel().attn_tp_rank == 0
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
@@ -835,7 +839,7 @@ class Scheduler(
             return
 
         self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
-        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        dp_rank = get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
                 port_args,
@@ -848,9 +852,9 @@ class Scheduler(
 
     def init_idle_sleeper(self) -> None:
         if (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
             and get_device().sleep_on_idle
         ):
             self.idle_sleeper = IdleSleeper(
@@ -1030,8 +1034,8 @@ class Scheduler(
 
         if (
             envs.SGLANG_ENABLE_PP_SPEC.get()
-            and self.ps.pp_size > 1
-            and self.ps.pp_rank != self.ps.pp_size - 1
+            and get_parallel().pp_size > 1
+            and get_parallel().pp_rank != get_parallel().pp_size - 1
         ):
             # PP+spec: the draft model (MTP layer) needs final hidden states and
             # the lm_head, both of which live on the last PP stage only.
@@ -1128,10 +1132,11 @@ class Scheduler(
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
-            if self.enable_overlap or self.ps.pp_size > 1 or use_mlx()
+            if self.enable_overlap or get_parallel().pp_size > 1 or use_mlx()
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
+            prewarm_graph_pool_borrow()
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
@@ -1205,18 +1210,18 @@ class Scheduler(
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
-                    self.max_running_requests // self.ps.pp_size, 1
+                    self.max_running_requests // get_parallel().pp_size, 1
                 ),
             )
 
-        self.tp_group = get_tp_group()
+        self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        self.pp_group = get_parallel().pp_group
+        self.world_group = get_parallel().world_group
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1236,7 +1241,7 @@ class Scheduler(
         self.startup_available_gpu_memory_gb = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )
-        if self.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={get_schedule().chunked_prefill_size}, "
@@ -1284,6 +1289,13 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
+        # Set by a runtime PD role switch to break out of the current event loop.
+        self._event_loop_should_restart = False
+        # Guards against concurrent/re-entrant PD role switches.
+        self._pd_role_switch_in_progress = False
+        # Set if a role switch tore down the old role but failed to rebuild
+        # either the new or the old role; the instance can no longer serve.
+        self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
@@ -1334,7 +1346,7 @@ class Scheduler(
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
         self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
-        if not (get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1):
+        if not (get_schedule().enable_dynamic_chunking and get_parallel().pp_size > 1):
             return
         sizer = DynamicChunkSizer(
             model_runner=self.tp_worker.model_runner,
@@ -1349,7 +1361,7 @@ class Scheduler(
             device=self.device,
             pp_group=self.pp_group,
             world_group=self.world_group,
-            pp_rank=self.ps.pp_rank,
+            pp_rank=get_parallel().pp_rank,
         )
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
@@ -1412,7 +1424,7 @@ class Scheduler(
             else:
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
-                    attn_tp_size=self.ps.attn_tp_size,
+                    attn_tp_size=get_parallel().attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
                     metrics_collector=(
@@ -1423,7 +1435,7 @@ class Scheduler(
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
-                    debug_log_enabled=self.ps.attn_tp_rank == 0,
+                    debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -1454,7 +1466,7 @@ class Scheduler(
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create()
         self.input_blocker = (
-            SchedulerInputBlocker(noop=self.ps.attn_tp_rank != 0)
+            SchedulerInputBlocker(noop=get_parallel().attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
             else None
         )
@@ -1543,7 +1555,7 @@ class Scheduler(
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                tp_rank=self.ps.tp_rank,
+                tp_rank=get_parallel().tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
@@ -1560,13 +1572,13 @@ class Scheduler(
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
                 gloo_group=self.attn_tp_cpu_group,
-                tp_rank=self.ps.tp_rank,
-                tp_size=self.ps.tp_size,
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
                 dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
-                pp_rank=self.ps.pp_rank,
+                pp_rank=get_parallel().pp_rank,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -1592,16 +1604,16 @@ class Scheduler(
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
-                tp_rank=self.ps.tp_rank,
-                tp_size=self.ps.tp_size,
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
-                pp_rank=self.ps.pp_rank,
-                pp_size=self.ps.pp_size,
+                pp_rank=get_parallel().pp_rank,
+                pp_size=get_parallel().pp_size,
                 transfer_backend=self.transfer_backend,
             )
             # The prefill requests that are in the middle of kv sending
@@ -1628,8 +1640,8 @@ class Scheduler(
                 self.server_args,
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
-                pp_rank=self.ps.pp_rank,
-                tp_rank=self.ps.tp_rank,
+                pp_rank=get_parallel().pp_rank,
+                tp_rank=get_parallel().tp_rank,
                 tp_group=self.tp_group,
                 scheduler=self,
             )
@@ -1804,6 +1816,7 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
+                (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
                     ProfileReq,
                     lambda req: self.profiler_manager._profile(req),
@@ -1884,18 +1897,17 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (self.enable_overlap or self.ps.pp_size > 1):
+        elif (is_cuda() or _is_hip) and (
+            self.enable_overlap or get_parallel().pp_size > 1
+        ):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            _redraws = 0
-            while (
-                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
-                and _redraws < 64
-            ):
-                self.schedule_stream = self.device_module.Stream(priority=0)
-                _redraws += 1
+            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+                self.schedule_stream = allocate_distinct_stream(
+                    self.device_module, (self.forward_stream,)
+                )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -2082,9 +2094,9 @@ class Scheduler(
         """
         local_reqs = []
         if (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
         recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
@@ -2133,6 +2145,13 @@ class Scheduler(
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
+        # A runtime PD role switch rebuilt the disaggregation structures for a new
+        # role. The response has already been sent above; now break out of the
+        # current (old-role) event loop so the supervisor can re-dispatch.
+        if get_disagg().enable_pd_role_switch and self._event_loop_should_restart:
+            self._event_loop_should_restart = False
+            raise role_switch.PdRoleSwitchRestart()
+
     @staticmethod
     def _tokenized_requests(recv_req):
         if isinstance(
@@ -2173,11 +2192,14 @@ class Scheduler(
 
         request_errors = []
         for tokenized_req in tokenized_reqs:
+            # The request broadcast makes this skip consistent across ranks.
+            if tokenized_req.mm_inputs is None:
+                request_errors.append(None)
+                continue
+
             local_error = None
             try:
-                if tokenized_req.mm_inputs is not None and not isinstance(
-                    tokenized_req.mm_inputs, MultimodalInputs
-                ):
+                if not isinstance(tokenized_req.mm_inputs, MultimodalInputs):
                     tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
@@ -2272,9 +2294,9 @@ class Scheduler(
         and with it the server-process duties a Python ``TokenizerManager``
         would otherwise own (e.g. serving the PD KV bootstrap registry)."""
         return envs.SGLANG_RUST_SERVER.get() and (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
         )
 
     def maybe_init_rust_server(self) -> None:
@@ -2399,10 +2421,10 @@ class Scheduler(
         self.kv_events_publisher = SchedulerKvEventsPublisher(
             kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
-            attn_tp_rank=self.ps.attn_tp_rank,
-            attn_cp_rank=self.ps.attn_cp_rank,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_cp_rank=get_parallel().attn_cp_rank,
             attn_dp_rank=self.ps.attn_dp_rank,
-            dp_rank=self.ps.dp_rank,
+            dp_rank=get_parallel().dp_rank,
             tree_cache=self.tree_cache,
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
             max_running_requests=self.max_running_requests,
@@ -2427,6 +2449,7 @@ class Scheduler(
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step: Optional[Tuple[int, float, bool]] = None
+        self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
@@ -2900,6 +2923,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.pp_prefetch_ticketed is True:
+            self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
@@ -3091,6 +3116,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.ps.pp_rank == 0 and getattr(
+            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        ):
+            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3145,7 +3176,7 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                tree_cache.prefetch_from_storage(
+                return tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
@@ -3245,6 +3276,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            self._release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3252,6 +3284,7 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
@@ -3380,7 +3413,7 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            if self.ps.pp_size == 1:
+            if get_parallel().pp_size == 1:
                 inflight_batches = [self.running_batch, self.last_batch]
             else:
                 inflight_batches = [*self.running_mbs, *self.mbs]
@@ -3904,6 +3937,12 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                self.chunked_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -4305,7 +4344,11 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
+        is_split_prefill = batch.forward_mode.is_split_prefill()
+        if not is_split_prefill or batch.split_index == 0:
+            batch.after_idle_gap = self._sched_idled
+            if is_split_prefill:
+                batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
         self._sched_idled = False
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
@@ -4436,7 +4479,7 @@ class Scheduler(
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
-                is_verify_round = self.ps.pp_size > 1 and not (
+                is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
                 )
                 # The relayed tree is what the requests carry between rounds;
@@ -4524,7 +4567,10 @@ class Scheduler(
                     # Only the last PP rank owns real results requiring D2H; other ranks
                     # consume device tensors rebuilt from the output ring.
                     batch_result.copy_done = self.device_module.Event()
-                    if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+                    if (
+                        batch_result.has_sampled_token_ids
+                        and get_parallel().pp_size == 1
+                    ):
                         batch_result.copy_to_cpu(
                             return_logprob=batch.return_logprob,
                             return_hidden_states=batch.return_hidden_states,
@@ -4661,7 +4707,7 @@ class Scheduler(
         ):
             return
         # PP transports the device output to the first rank before copying it.
-        if self.ps.pp_size > 1:
+        if get_parallel().pp_size > 1:
             return
         if result.copy_done is not None:
             raise RuntimeError(
@@ -4743,6 +4789,9 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        # Submit this batch's queued host backups before the next scheduler step.
+        self.tree_cache.flush_pending_backups()
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
@@ -4764,15 +4813,36 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
+        if is_prefill and mode.is_split_prefill():
+            start_iter, start_ts = batch.split_prefill_start
+        else:
+            start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
         self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
         # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
-        if prev is None or batch.after_idle_gap:
-            return
-        prev_iter, prev_ts, prev_is_prefill = prev
-        if prev_iter + 1 != batch.forward_iter or prev_is_prefill != is_prefill:
-            return
-        step_us = int((batch.launch_ts - prev_ts) * 1e6)
+        contiguous = False
+        if prev is not None:
+            prev_iter, prev_launch_ts, prev_is_prefill = prev
+            contiguous = (
+                not batch.after_idle_gap
+                and prev_iter + 1 == start_iter
+                and prev_is_prefill == is_prefill
+            )
+        if is_prefill:
+            # Completion boundaries include the burst tail and scheduling overhead
+            # without double-counting overlapping launch-to-result spans.
+            end_ts = time.monotonic()
+            prev_end_ts = self._prev_prefill_end_ts
+            self._prev_prefill_end_ts = end_ts
+            if prev_end_ts is not None:
+                # A new burst or mode can still overlap an earlier prefill.
+                start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
+            step_us = int((end_ts - start_ts) * 1e6)
+        else:
+            # Decode regression uses launch cadence and skips boundaries.
+            if not contiguous:
+                return
+            step_us = int((batch.launch_ts - prev_launch_ts) * 1e6)
         if not 0 < step_us < STEP_MAX_US:
             return
         if is_prefill:
@@ -4861,9 +4931,12 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
-                # Storage workers need the GIL between I/O calls. Yield while
-                # there is no GPU batch so polling cannot starve their acks.
+            if (
+                self.enable_hicache_storage
+                or self.disaggregation_mode != DisaggregationMode.NULL
+            ):
+                # Storage and transfer workers need the GIL between I/O calls.
+                # Singleton PD polls no longer yield through a collective.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
@@ -4994,7 +5067,7 @@ class Scheduler(
         return idle
 
     def _pp_microbatches_drained(self) -> bool:
-        if self.ps.pp_size == 1:
+        if get_parallel().pp_size == 1:
             return True
         return all(x.is_empty() for x in self.running_mbs) and all(
             mb is None or mb.is_empty() for mb in self.mbs
@@ -5148,7 +5221,7 @@ class Scheduler(
         draft_graph_memory_usage = (
             None if self.draft_worker is None else self.draft_worker.graph_memory_usage
         )
-        ret["memory_usage"] = build_memory_usage(
+        memory_usage = build_memory_usage(
             weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
@@ -5157,8 +5230,29 @@ class Scheduler(
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
+        ret["memory_usage"] = memory_usage
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # PD role switch: report this instance's role and the decode CUDA graph
+        # batch sizes it captured, which a router feeds back as
+        # PdRoleSwitchReqInput.decode_cuda_graph_bs. Unset until
+        # init_disaggregation runs, which also re-derives it on every flip.
+        disaggregation_mode = getattr(self, "disaggregation_mode", None)
+        if disaggregation_mode is not None:
+            ret["disaggregation_mode"] = disaggregation_mode.value
+            ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
+            ret["decode_cuda_graph_memory_gb"] = round(
+                sum(
+                    memory_usage["graph"][phase]
+                    for phase in (
+                        "decode",
+                        "target_verify",
+                        "draft_decode",
+                        "draft_extend",
+                    )
+                ),
+                3,
+            )
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -5214,10 +5308,10 @@ class Scheduler(
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
-                v > self.max_running_requests // self.ps.pp_size or v < 1
+                v > self.max_running_requests // get_parallel().pp_size or v < 1
             ):
                 logging.warning(
-                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.ps.pp_size}]."
+                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // get_parallel().pp_size}]."
                 )
                 if_success = False
                 break
@@ -5331,7 +5425,7 @@ class Scheduler(
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
-        if self.ps.pp_size == 1:
+        if get_parallel().pp_size == 1:
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
@@ -5421,7 +5515,7 @@ class Scheduler(
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
-                    if self.ps.pp_size > 1:
+                    if get_parallel().pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
@@ -5437,7 +5531,7 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
+                    if get_parallel().pp_size > 1:
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
             # Abort requests waiting for kvcache to release tree cache
@@ -5615,7 +5709,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = get_parallel().max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_world_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5736,6 +5830,24 @@ class Scheduler(
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 
+    def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
+        return role_switch.handle_pd_role_switch(self, recv_req)
+
+    def _sync_disaggregation_mode_to_subcomponents(self):
+        # Push the (possibly flipped) mode into sub-components that cache it.
+        # object.__setattr__ because some are frozen dataclasses.
+        for name in (
+            "invariant_checker",
+            "load_inquirer",
+            "output_streamer",
+            "batch_result_processor",
+        ):
+            comp = getattr(self, name, None)
+            if comp is not None and hasattr(comp, "disaggregation_mode"):
+                object.__setattr__(
+                    comp, "disaggregation_mode", self.disaggregation_mode
+                )
+
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
@@ -5752,7 +5864,11 @@ class Scheduler(
         output = self.session_controller.open(recv_req)
         if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
-        if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        if (
+            get_parallel().pp_rank == 0
+            and get_parallel().tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
+        ):
             return output
         return None
 
@@ -5815,6 +5931,15 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if scheduler.server_args.enable_pd_role_switch:
+        return role_switch.run_event_loop_supervisor(
+            scheduler,
+            _dispatch_event_loop_once,
+        )
+    return _dispatch_event_loop_once(scheduler)
+
+
+def _dispatch_event_loop_once(scheduler: Scheduler):
     # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
@@ -5844,6 +5969,20 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
+def resolve_spawn_dp_rank(dp_rank: Optional[int]) -> Optional[int]:
+    """The `dp_rank` this process was spawned with, in either of its two forms.
+
+    A router does not pass it as an argument, it sets `SGLANG_DP_RANK`. Both
+    forms are the launcher naming this process's place, so both have to be in
+    hand before `publish` records the placement -- resolving one of them after
+    would leave the context answering `None` for a process that has a rank.
+    """
+    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
+        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
+        return int(os.environ["SGLANG_DP_RANK"])
+    return dp_rank
+
+
 def configure_scheduler_process(
     server_args: ServerArgs,
     gpu_id: int,
@@ -5856,18 +5995,15 @@ def configure_scheduler_process(
     display_tp_rank: Optional[int] = None,
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
-) -> Optional[int]:
+) -> None:
     """Configure scheduler worker logging and process title.
 
-    display_* ranks are cosmetic; runtime ranks stay local.
+    display_* ranks are cosmetic; runtime ranks stay local. `dp_rank` arrives
+    already resolved -- see `resolve_spawn_dp_rank`.
     """
     kill_itself_when_parent_died()
 
     # Generate the logger prefix
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
-
     shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
     shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
     shown_moe_ep = (
@@ -5909,8 +6045,6 @@ def configure_scheduler_process(
         if numa_node is not None:
             numa_bind_to_node(numa_node)
 
-    return dp_rank
-
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -5929,9 +6063,20 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
-    # Publish before anything in this process reads configuration.
-    publish(server_args, role="scheduler")
-    dp_rank = configure_scheduler_process(
+    dp_rank = resolve_spawn_dp_rank(dp_rank)
+    # Publish before anything in this process reads configuration, with the
+    # placement the launcher decided: from here on a rank read is answered
+    # without a process group, which is what every reader needs before
+    # `init_torch_distributed` has run.
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=pp_rank),
+            dp_rank=dp_rank,
+        ),
+    )
+    configure_scheduler_process(
         server_args,
         gpu_id,
         tp_rank,
