@@ -78,7 +78,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+    initialize_current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
@@ -1573,9 +1576,14 @@ def run_scheduler_process(
     pipe_writer: mp.connection.Connection,
 ) -> None:
     """Run a rank's scheduler and report readiness to the launching process."""
+    # Idempotent safeguard for direct callers; process bootstraps already
+    # initialized the platform before this module was imported.
+    initialize_current_platform()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():
