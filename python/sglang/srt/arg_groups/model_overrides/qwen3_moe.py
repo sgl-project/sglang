@@ -86,9 +86,14 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             and cfg.moe_a2a_backend == "none"
             and cfg.moe_runner_backend == "auto"
         ):
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
+            # The fused TRT-LLM BF16 path cannot inject expert LoRA deltas.
+            use_lora = quantization is None and (
+                cfg.enable_lora
+                or (cfg.enable_lora is None and bool(cfg.lora_paths))
+            )
+            overrides["moe_runner_backend"] = "triton" if use_lora else "flashinfer_trtllm"
             logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on sm100 for "
+                f"Use {overrides['moe_runner_backend']} as MoE runner backend on sm100 for "
                 f"{hf_config.architectures[0]}"
             )
     return overrides
