@@ -510,6 +510,9 @@ def is_nemotron_35_draft_config(config: Any) -> bool:
     ):
         return False
 
+    # Identity probe, not layout resolution: this family declares the field explicitly,
+    # so an omitting config must fail here. `_parse_dflash_anchor_first` reads the same
+    # field to resolve layout and defaults the other way.
     sample_from_anchor = dflash_config.get(
         "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
     )
@@ -534,6 +537,55 @@ def _parse_optional_int(
     return parsed
 
 
+_DFLASH_ANCHOR_FIRST_FIELDS = ("query_zero_predicts_next", "sample_from_anchor")
+
+
+def _parse_dflash_anchor_first(
+    *, dflash_cfg: dict, draft_hf_config: Any
+) -> Optional[bool]:
+    """Resolve the declared draft block layout, or None when the config omits it.
+
+    Two published spellings declare the same choice: `query_zero_predicts_next` in
+    DeepSpec serving configs and `sample_from_anchor` in speculators configs.
+    """
+    declared = {}
+    for field in _DFLASH_ANCHOR_FIRST_FIELDS:
+        value = dflash_cfg.get(field, _cfg_get(draft_hf_config, field, None))
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"DFLASH dflash_config.{field} must be a bool, got {value!r} "
+                f"(type={type(value).__name__})."
+            )
+        declared[field] = value
+
+    if len(set(declared.values())) > 1:
+        pairs = ", ".join(f"{name}={value}" for name, value in sorted(declared.items()))
+        raise ValueError(
+            f"DFLASH draft block layout is declared inconsistently: {pairs}. "
+            "Both fields select the same layout and must agree."
+        )
+    return next(iter(declared.values()), None)
+
+
+def select_dflash_pred_hidden(
+    hidden_states: torch.Tensor,
+    *,
+    bs: int,
+    num_draft_queries: int,
+    pred_start: int,
+) -> torch.Tensor:
+    """Take the draft-predicting rows of a `[bs * num_draft_queries, H]` draft output.
+
+    Every query from `pred_start` on predicts a draft, so the tail is never discarded;
+    the draft block is sized so that exactly `verify block width - 1` of them exist.
+    `pred_start=1` is the 1+N layout, where query 0 re-predicts the seeded anchor slot.
+    `pred_start=0` is anchor-first, where query 0 already predicts the first draft.
+    """
+    return hidden_states.view(bs, num_draft_queries, -1)[:, pred_start:, :]
+
+
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
@@ -555,6 +607,21 @@ class DFlashDraftConfig:
     emb_dim: Optional[int]
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
+    anchor_first: bool = False
+
+    @property
+    def draft_pred_start(self) -> int:
+        """Block position of the first draft-predicting query. See `select_dflash_pred_hidden`."""
+        return 0 if self.anchor_first else 1
+
+    def resolve_num_draft_queries(self, *, verify_block_size: int) -> int:
+        """Width of the draft block that fills a `verify_block_size`-wide verify block.
+
+        The verify block is one anchor plus `verify_block_size - 1` drafts, and every
+        query from `draft_pred_start` on produces one draft. An anchor-first drafter
+        therefore needs one query fewer than the 1+N layout, not one more row dropped.
+        """
+        return int(verify_block_size) - 1 + self.draft_pred_start
 
     @property
     def is_domino(self) -> bool:
@@ -607,6 +674,10 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
+
+    anchor_first = _parse_dflash_anchor_first(
+        dflash_cfg=dflash_cfg, draft_hf_config=draft_hf_config
+    )
 
     num_hidden_layers = _parse_optional_int(
         _cfg_get(draft_text_config, "num_hidden_layers", None),
@@ -808,6 +879,16 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
 
+        # Domino spells the same block layout as `shift_label`; keep one source of truth.
+        if anchor_first is not None and anchor_first != shift_label:
+            raise ValueError(
+                "DFLASH Domino draft block layout is declared inconsistently: "
+                f"shift_label={shift_label}, but "
+                f"{'/'.join(_DFLASH_ANCHOR_FIRST_FIELDS)} select "
+                f"anchor_first={anchor_first}."
+            )
+        anchor_first = shift_label
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -828,6 +909,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
+        anchor_first=bool(anchor_first),
     )
 
 
