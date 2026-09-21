@@ -671,7 +671,7 @@ pub struct GenerateRequest {
     /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
     /// What the MM worker produced (returned as `Encoded`): the feature tensors and their
-    /// per-item metadata, already placed inline or in shm. Pushed to the ring
+    /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
 }

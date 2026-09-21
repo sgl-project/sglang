@@ -118,7 +118,7 @@ impl Intake {
     }
 
     /// Drive a request through its intake states until it terminates (failed or
-    /// pushed to the ring) or is handed to a pool — the tokenizer pool
+    /// pushed to the channel) or is handed to a pool — the tokenizer pool
     /// (re-entering as `Tokenized`) or the MM pool (re-entering as `Encoded`).
     /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
     /// are the design table's states, `Failed` the single reject path.
@@ -266,14 +266,14 @@ impl Intake {
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Hand the request to the stage that answers it: the scheduler
-                // ring (generate payload or control frame), or — for detokenize
+                // channel (generate payload or control frame), or — for detokenize
                 // — the detok shard itself.
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the
                     // discriminant and `req` can be moved into each push.
                     match req.kind {
-                        RequestKind::Generate(_) => self.push_to_ring(req),
-                        RequestKind::Control(_) => self.push_control_to_ring(req),
+                        RequestKind::Generate(_) => self.push_to_channel(req),
+                        RequestKind::Control(_) => self.push_control_to_channel(req),
                         RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
                     }
                     return;
@@ -322,7 +322,7 @@ impl Intake {
     }
 
     /// Hand a `Detokenize` request to its owning detok shard — the stage that
-    /// answers this kind (it never touches the scheduler ring). The shard
+    /// answers this kind (it never touches the scheduler channel). The shard
     /// already holds this rid's sink: `register_detok` queued `Register` on the
     /// same channel from this same thread, so FIFO gives Register → Decode.
     fn push_detokenize_to_shard(&self, mut req: Request) {
@@ -352,11 +352,11 @@ impl Intake {
     /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
     /// from_scheduler channel as a single `Result`.
-    fn push_control_to_ring(&self, mut req: Request) {
+    fn push_control_to_channel(&self, mut req: Request) {
         let encode = match &req.kind {
             RequestKind::Control(control) => control.encode(),
             _ => Err(Error::Internal(
-                "non-control request reached push_control_to_ring".into(),
+                "non-control request reached push_control_to_channel".into(),
             )),
         };
         let header = match encode {
@@ -392,7 +392,7 @@ impl Intake {
             .detok_for(&rid)
             .send(DetokMsg::Deregister { rid: rid.clone() });
 
-        // The ring is BOUNDED and drops pushes under exactly the load this matters
+        // The channel is BOUNDED and drops pushes under exactly the load this matters
         // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
@@ -413,8 +413,8 @@ impl Intake {
 
     /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
     /// push it onto the to_scheduler channel for the scheduler. On backpressure, fail it.
-    fn push_to_ring(&self, mut req: Request) {
-        // Only generate requests reach here (control uses `push_control_to_ring`).
+    fn push_to_channel(&self, mut req: Request) {
+        // Only generate requests reach here (control uses `push_control_to_channel`).
         // Validate + serialize the header first (borrowing `g`), then move the
         // buffers out; the resulting values own their data, so no borrow
         // outlives a `fail(&mut req)`.
@@ -424,7 +424,7 @@ impl Intake {
             }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
-                "non-generate request reached push_to_ring".into(),
+                "non-generate request reached push_to_channel".into(),
             )),
         };
         let (header, buffers) = match serialized {
