@@ -4,7 +4,9 @@
 import os
 import signal
 import socket
+import tempfile
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,9 +15,12 @@ import pytest
 
 from sglang.multimodal_gen.runtime.weight_cache import daemon
 from sglang.multimodal_gen.runtime.weight_cache.client import PROTOCOL
+from sglang.multimodal_gen.runtime.weight_cache.identity import (
+    default_runtime_dir,
+    locate,
+)
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.multimodal_gen.test.unit.test_weight_cache_status import owner_fixture
-from sglang.srt.weight_cache.common.identity import default_runtime_dir
 from sglang.srt.weight_cache.common.liveness import ProcessIdentity
 from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
@@ -100,11 +105,36 @@ def test_live_socket_without_ready_cannot_be_stolen(tmp_path):
 
 def test_empty_and_relative_runtime_directories(monkeypatch):
     monkeypatch.delenv("SGLANG_DIFFUSION_WEIGHT_CACHE_DIR", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert default_runtime_dir() == Path("/tmp/sglang_diffusion_weight_cache")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "")
-    assert default_runtime_dir().is_absolute()
+    assert default_runtime_dir() == Path("/tmp/sglang_diffusion_weight_cache")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "relative")
+    with pytest.raises(ValueError, match="absolute"):
+        default_runtime_dir()
     monkeypatch.setenv("SGLANG_DIFFUSION_WEIGHT_CACHE_DIR", "relative")
     with pytest.raises(ValueError, match="absolute"):
         default_runtime_dir()
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_locator_and_owner_lock_use_diffusion_runtime_directory(override, monkeypatch):
+    # Keep the real Unix socket locator within its encoded pathname budget.
+    with tempfile.TemporaryDirectory(prefix="wc-", dir="/tmp") as directory:
+        root = Path(directory)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(root / "x"))
+        monkeypatch.setenv(
+            "SGLANG_DIFFUSION_WEIGHT_CACHE_DIR", str(root / "d") if override else ""
+        )
+        expected = root / "d" if override else root / "x/sglang_diffusion_weight_cache"
+        owner = owner_fixture()
+        owner.plan = CacheCompatibilityPlan.from_fields(rank={"device_uuid": "gpu-a"})
+        owner.path = locate(owner.plan, SimpleNamespace(weight_cache_socket=None))
+        owner.ready_path = owner.path.with_suffix(".ready")
+        assert default_runtime_dir() == expected
+        assert owner.path.parent.parent == expected
+        assert owner.path.parent / "owner.lock" in owner._owner_lock_paths()
+        assert owner.path.parent.is_dir()
 
 
 def test_endpoint_cleanup_errors_do_not_skip_drain(caplog):

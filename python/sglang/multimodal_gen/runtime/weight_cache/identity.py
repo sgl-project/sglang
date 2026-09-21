@@ -204,6 +204,22 @@ def compatibility_plan(prepared, args, *, verify_checkpoint=False):
     )
 
 
+def default_runtime_dir() -> Path:
+    """Select the diffusion discovery and owner-lock directory."""
+    override = envs.SGLANG_DIFFUSION_WEIGHT_CACHE_DIR.get()
+    root = (
+        Path(override)
+        if override
+        else (
+            Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+            / "sglang_diffusion_weight_cache"
+        )
+    )
+    if not root.is_absolute():
+        raise ValueError("Weight-cache runtime directory must be absolute")
+    return root
+
+
 def locate(plan, args):
     device_uuid = plan.to_dict()["rank"]["device_uuid"]
     if args.weight_cache_socket is not None:
@@ -217,4 +233,4 @@ def locate(plan, args):
         if len(os.fsencode(path)) > 107:
             raise ValueError("Resolved weight-cache socket exceeds 107 bytes")
         return path
-    return socket_path(device_uuid, plan.digest)
+    return socket_path(device_uuid, plan.digest, runtime_dir=default_runtime_dir())

@@ -112,10 +112,11 @@ imports can retain traceback-held storages and stay guarded until worker exit.
 reused SRT/kernel code. Deployment identity must additionally cover relevant
 native/external dependencies or use a verified immutable build artifact ID.
 
-The socket locator uses a 16-hex device hash and a 32-hex compatibility prefix.
-The default path is 89 encoded bytes; paths above Linux's 107-byte pathname budget
-are rejected. **Always compare the full compatibility digest at handshake**;
-prefix collisions are not cache hits. Directory permissions/ownership, device
+`socket_path()` requires an explicit runtime directory from its caller; runtime
+defaults and environment-variable policy belong to each service. The locator uses
+a 16-hex device hash and a 32-hex compatibility prefix. Paths above Linux's 107-byte
+pathname budget are rejected. **Always compare the full compatibility digest at
+handshake**; prefix collisions are not cache hits. Directory permissions/ownership, device
 locking, peer credentials and atomic readiness belong to the subsequent service.
 
 `checkpoint.py` builds portable SHA-256 content manifests for explicitly supplied

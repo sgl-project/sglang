@@ -250,20 +250,19 @@ class TestIdentity(unittest.TestCase):
                 digest, collision
             )  # handshake must compare these, not paths
 
-    def test_default_xdg_and_encoded_path_budget(self):
-        with patch.dict(os.environ, {}, clear=True):
-            path = socket_path("GPU-test", "a" * 64)
-            self.assertEqual(len(os.fsencode(path)), 89)
-            self.assertTrue(str(path).startswith("/tmp/sglang_diffusion_weight_cache/"))
-        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}, clear=True):
-            self.assertLessEqual(
-                len(os.fsencode(socket_path("GPU-test", "a" * 64))), 107
-            )
+    def test_explicit_runtime_directory_and_encoded_path_budget(self):
+        root = Path("/tmp/shared-cache")
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "relative"}, clear=True):
+            path = socket_path("GPU-test", "a" * 64, runtime_dir=root)
+            self.assertEqual(path.parent.parent, root)
+            self.assertLessEqual(len(os.fsencode(path)), 107)
         for root in (Path("/tmp") / ("x" * 100), Path("/tmp") / ("中" * 20)):
             with self.assertRaisesRegex(ValueError, "107 bytes"):
                 socket_path("GPU-test", "a" * 64, runtime_dir=root)
         with self.assertRaises(ValueError):
-            socket_path("GPU-test", "a" * 16)
+            socket_path("GPU-test", "a" * 16, runtime_dir=Path("/tmp"))
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            socket_path("GPU-test", "a" * 64, runtime_dir=Path("relative"))
 
     def test_source_digest_covers_reused_code_not_just_diffusion(self):
         with tempfile.TemporaryDirectory() as directory:

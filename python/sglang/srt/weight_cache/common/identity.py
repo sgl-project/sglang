@@ -11,8 +11,6 @@ from pathlib import Path
 
 import msgspec
 
-from sglang.srt.environ import envs
-
 from .descriptors import canonical_digest
 
 
@@ -103,38 +101,23 @@ def source_digest(package_root: Path) -> str:
     return canonical_digest({"schema": 1, "files": entries})
 
 
-def default_runtime_dir() -> Path:
-    override = envs.SGLANG_DIFFUSION_WEIGHT_CACHE_DIR.get()
-    root = (
-        Path(override)
-        if override
-        else (
-            Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
-            / "sglang_diffusion_weight_cache"
-        )
-    )
-    if not root.is_absolute():
-        raise ValueError("Weight-cache runtime directory must be absolute")
-    return root
-
-
 def socket_path(
-    device_uuid: str, compatibility_digest: str, *, runtime_dir: Path | None = None
+    device_uuid: str, compatibility_digest: str, *, runtime_dir: Path
 ) -> Path:
     """A locator only: peers MUST still compare the full identity on connect.
 
-    The default path is 89 bytes, not the 145-byte UUID/full-digest recipe.
+    The caller selects the runtime directory; this helper does not read policy
+    from the environment. Hash prefixes keep the locator within the Unix budget.
     Directory ownership, locking and ready publication belong to discovery.
     """
     if not device_uuid or not isinstance(device_uuid, str):
         raise ValueError("A physical device UUID is required")
     if not re.fullmatch(r"[0-9a-f]{64}", compatibility_digest):
         raise ValueError("Compatibility digest must be a full SHA-256 hex digest")
-    root = runtime_dir if runtime_dir is not None else default_runtime_dir()
-    if not root.is_absolute():
+    if not runtime_dir.is_absolute():
         raise ValueError("Weight-cache runtime directory must be absolute")
     device_key = hashlib.sha256(device_uuid.encode()).hexdigest()[:16]
-    result = root / device_key / f"{compatibility_digest[:32]}.sock"
+    result = runtime_dir / device_key / f"{compatibility_digest[:32]}.sock"
     if len(os.fsencode(result)) > 107:
         raise ValueError(
             "Weight-cache Unix socket path exceeds 107 bytes; choose a shorter runtime directory"
