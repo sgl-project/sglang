@@ -434,8 +434,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        pass
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
+    ):
+        """Dispose of a finished request's KV.
+
+        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
+        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
+        call's to account for: insert what can be keyed, release the rest.
+        Slicing the kv row by the token-id count instead strands whatever
+        lies between -- no caller releases those. ``release_kv_cache`` frees
+        everything past ``owned_kv_len``.
+        """
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):

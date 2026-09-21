@@ -18,18 +18,13 @@ import unittest
 import requests
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_cuda_ci(
-    est_time=300,
-    stage="base-a",
-    runner_config="1-gpu-small",
-    disabled="Intel XPU only — not available in standard CUDA CI",
-)
+register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 
