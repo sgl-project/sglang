@@ -1,14 +1,16 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
 // Recipes: https://github.com/sgl-project/sglang/pull/40448
 // SGLang: 983e643854f15cf9ef4370a49dfd74b6af54c3e3.
-// B300 validation reported by the model team. Public checkpoint IDs are pending;
-// modelNames are served aliases, and the checkpoint paths are editable separately.
+// B300 validation reported by the model team. Public V2.6 checkpoints are
+// XiaomiMiMo/MiMo-V2.6-{Flash,Pro}-RL (MXFP4 experts, bf16 router, bundled
+// dflash/ drafter); modelNames are served aliases, and the checkpoint paths
+// stay editable so a local copy can be used instead.
 export const config = {
   modelName: "MiMo-V2.6",
   supportedHardware: ["b300"],
   variants: [
     { id: "flash", label: "Flash", subtitle: "309B / 15B active · 4 GPUs" },
-    { id: "pro", label: "Pro", subtitle: "Over 1T · 8 GPUs" },
+    { id: "pro", label: "Pro", subtitle: "1.02T / 42B active · 8 GPUs" },
   ],
   quantizations: [{ id: "mxfp4", label: "MXFP4" }],
   strategies: [{ id: "balanced", label: "Balanced" }],
@@ -32,13 +34,12 @@ export const config = {
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","messages":[{"role":"user","content":"What is 15% of 240?"}],"chat_template_kwargs":{"enable_thinking":true}}'`,
-  // Built locally using the Dockerfile in the page, not a published image tag.
+  // The MiMo-V2.6 support (PR #40448) is on main, so the nightly tag carries it.
   dockerImages: { b300: "lmsysorg/sglang:dev" },
   dockerMounts: ["\"{{MODEL_ROOT}}:/model:ro\""],
   github: { cookbookModel: "MiMo-V2.6 (Flash / Pro)" },
   playgroundFeatures: {
-    // Keep the validated TP/EP topology. DFlash on CUDA rejects DP-attention;
-    // the base recipe also disables Radix cache, so do not expose HiCache.
+    // Keep the validated TP/EP topology. DFlash on CUDA rejects DP-attention.
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser mimo" },
@@ -82,13 +83,11 @@ export const config = {
         "--reasoning-parser mimo",
         "--tool-call-parser mimo",
         "--attention-backend fa4",
-        "--skip-server-warmup",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path '{{FLASH_DRAFT_PATH}}'",
         "--speculative-num-draft-tokens 8",
         "--context-length 1048576",
         "--cuda-graph-backend-prefill=disabled",
-        "--disable-radix-cache",
         "--mm-enable-dp-encoder",
         "--mm-attention-backend fa4",
         "--host {{HOST_IP}}",
@@ -124,13 +123,11 @@ export const config = {
         "--reasoning-parser mimo",
         "--tool-call-parser mimo",
         "--attention-backend fa4",
-        "--skip-server-warmup",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path '{{PRO_DRAFT_PATH}}'",
         "--speculative-num-draft-tokens 8",
         "--context-length 1048576",
         "--cuda-graph-backend-prefill=disabled",
-        "--disable-radix-cache",
         "--mm-enable-dp-encoder",
         "--mm-attention-backend fa4",
         "--host {{HOST_IP}}",
