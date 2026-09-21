@@ -7,11 +7,10 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
@@ -19,6 +18,7 @@ use sgl_router::policies::{
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{Worker, WorkerRegistry};
 use tower::ServiceExt;
@@ -124,6 +124,7 @@ impl Policy for CacheCandidatesPolicy {
                 worker: Arc::clone(&self.worker),
                 matched_prefix_tokens: 1,
                 uncached_tokens: 1,
+                matched_prefix_blocks: 1,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
@@ -142,11 +143,13 @@ fn config(policy: PolicyKind) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -156,12 +159,13 @@ fn config(policy: PolicyKind) -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
@@ -303,7 +307,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
             total_prefill_busy_us,
         }),
     };
-    fixture.ctx.engine_load.set(
+    fixture.ctx.engine_reported_load.set(
         &fixture.workers[0].url,
         0,
         native_load(1, 1),
@@ -311,7 +315,7 @@ async fn chat_commits_the_admitted_prefill_backup() {
     );
     fixture
         .ctx
-        .engine_load
+        .engine_reported_load
         .set(&fixture.workers[0].url, 0, native_load(2, 2), now);
 
     assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
@@ -347,7 +351,7 @@ async fn capacity_exhaustion_does_not_return_503() {
     })
     .await;
     for worker in &fixture.workers {
-        fixture.ctx.engine_load.set(
+        fixture.ctx.engine_reported_load.set(
             &worker.url,
             0,
             LoadStat {
@@ -430,7 +434,7 @@ async fn chat_records_cache_candidates_exhausted() {
         })
     })
     .await;
-    fixture.ctx.engine_load.set(
+    fixture.ctx.engine_reported_load.set(
         &fixture.workers[0].url,
         0,
         LoadStat {
