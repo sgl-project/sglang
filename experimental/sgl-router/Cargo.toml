@@ -27,7 +27,7 @@ dynamo-tokenizers = "=1.8.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=5.1.2"
+dynamo-renderer = "=5.2.0"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 
@@ -49,7 +49,7 @@ axum = { version = "0.8", features = ["macros", "tracing", "http2"] }
 # `Frame`/`SizeHint` are not re-exported through `axum::body`.
 http-body = "1"
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "catch-panic"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 
@@ -83,11 +83,18 @@ uuid = { version = "1", features = ["v4"] }
 # `python/sglang/srt/disaggregation/kv_events.py`.
 parking_lot = "0.12"
 rmp-serde = "1"
+# FxHash for the KV-event radix tree's integer-keyed maps (i64 block
+# hashes, u64 node ids), off the routing hot path's SipHash cost. The
+# keys are client-derivable, not trusted; what bounds a collision attack
+# is that planting a key costs a real request — see the DoS note in
+# src/policies/kv_events/tree.rs.
+rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [dev-dependencies]
+base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
@@ -98,6 +105,9 @@ http-body-util = "0.1"
 # rather than as an unresolved import in a test.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Capture the router's `tracing` access log in tests. Also a runtime dep, but
+# integration tests are a separate crate and need it declared here too.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

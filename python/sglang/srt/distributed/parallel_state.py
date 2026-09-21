@@ -107,7 +107,9 @@ def get_torch_distributed_pg_options(group_name=None):
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.get_device_module().Stream
+    # Evaluating torch.get_device_module() at import marks the process unsafe
+    # to fork, and a child then fails in cuInit; torch.Stream is its base.
+    stream: torch.Stream
 
 
 @dataclass
@@ -2142,6 +2144,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -2171,6 +2174,13 @@ def get_attn_tp_group() -> GroupCoordinator:
         "attention tensor model parallel group is not initialized"
     )
     return _ATTN_TP
+
+
+def get_shared_experts_tp_group() -> GroupCoordinator:
+    assert _SHARED_EXPERTS_TP is not None, (
+        "shared-expert tensor model parallel group is not initialized"
+    )
+    return _SHARED_EXPERTS_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2263,7 +2273,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2518,6 +2528,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    shared_experts_tensor_parallel_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2540,6 +2551,8 @@ def initialize_model_parallel(
             tensor-parallel group during decoding. Must be a divisor of
             tensor_model_parallel_size and is currently only supported on the
             AMD HIP platform.
+        shared_experts_tensor_parallel_size: optional shared-expert TP width.
+            Must divide attention TP; subgroups never cross attention replicas.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2762,6 +2775,34 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    global _SHARED_EXPERTS_TP
+    assert _SHARED_EXPERTS_TP is None, "shared-expert TP group already initialized"
+    if (
+        shared_experts_tensor_parallel_size is not None
+        and shared_experts_tensor_parallel_size > 1
+    ):
+        if shared_experts_tensor_parallel_size == attn_tp_size:
+            _SHARED_EXPERTS_TP = _ATTN_TP
+        else:
+            # Attention TP groups are contiguous, and the requested width
+            # divides each one. These groups also stay inside their PP stage.
+            shared_size = shared_experts_tensor_parallel_size
+            shared_group_ranks = [
+                list(range(start, start + shared_size))
+                for start in range(0, world_size, shared_size)
+            ]
+            _SHARED_EXPERTS_TP = init_model_parallel_group(
+                shared_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="shared_experts_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = derived_widths["moe_tp_size"]
@@ -2906,6 +2947,13 @@ def create_custom_parallel_group(
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
+
+    NOTE: `group_ranks` must be the full rank list of the group, identical on
+    every rank of the world (e.g. obtained via get_process_group_ranks()).
+    Both paths below are world-collective: the general path performs a
+    world-size all_gather_object, and on NPU the fast path derives groups
+    locally from a rank-local check — a rank-local subset passed by only
+    some ranks would make ranks take different paths and deadlock.
     """
     assert torch.distributed.is_initialized()
 
@@ -2913,9 +2961,26 @@ def create_custom_parallel_group(
     rank = torch.distributed.get_rank()
 
     local_config = sorted(list(set(group_ranks)))
-    gathered_configs = [None for _ in range(world_size)]
+    group_size = len(local_config)
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Standard TP/DP partitioning: contiguous, group-aligned ranks.
+    is_standard_partition = (
+        world_size % group_size == 0
+        and local_config == list(range(local_config[0], local_config[0] + group_size))
+        and local_config[0] % group_size == 0
+    )
+
+    if not (_is_npu and is_standard_partition):
+        # General path: collect every rank's group via all_gather_object.
+        gathered_configs = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_configs, local_config)
+    else:
+        # NPU fast path: all_gather_object on the default HCCL PG allocates
+        # an HCCL buffer; instead derive the standard TP/DP groups locally.
+        num_groups = world_size // group_size
+        gathered_configs = [
+            list(range(i * group_size, (i + 1) * group_size)) for i in range(num_groups)
+        ]
 
     unique_groups = []
     seen_signatures = set()
@@ -2966,7 +3031,14 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     global _PP
     _PP = pp_group
     try:
-        yield
+        # `pp_size` is a configured leaf: unlike the rank and the handle it
+        # does not follow the group being swapped, so the scope has to name it.
+        with get_parallel().override(
+            pp_size=pp_group.world_size,
+            pp_rank=pp_group.rank_in_group,
+            pp_group=pp_group,
+        ):
+            yield
     finally:
         _PP_STATE_PATCHED = False
         _PP = old_pp_group
@@ -3100,13 +3172,23 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    get_parallel().clear_derived_widths()
+    get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
+    global _SHARED_EXPERTS_TP
+    global _ATTN_TP
     global _TP
+    if (
+        _SHARED_EXPERTS_TP is not None
+        and _SHARED_EXPERTS_TP is not _ATTN_TP
+        and _SHARED_EXPERTS_TP is not _TP
+    ):
+        _SHARED_EXPERTS_TP.destroy()
+    _SHARED_EXPERTS_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3142,7 +3224,6 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
