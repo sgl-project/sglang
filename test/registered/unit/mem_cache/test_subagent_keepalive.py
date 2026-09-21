@@ -101,7 +101,7 @@ class SubagentKeepaliveTestBase(CustomTestCase):
         )
 
         self.cache.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+            req, is_insert=True, owned_kv_len=req.owned_kv_len()
         )
         return req
 

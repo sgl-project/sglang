@@ -189,12 +189,17 @@ class DeferredTransferEngine:
         return TransferCompletion(_FakeEvent(), finish, False)
 
     def submit_host_to_device(
-        self, transfers, *, layer_num, start_event=None, on_layer_done=None
+        self,
+        transfers,
+        *,
+        transfer_layer_id_max,
+        start_event=None,
+        on_layer_done=None,
     ):
         primary = transfers[0] if transfers else None
 
         def work():
-            for layer_id in range(layer_num):
+            for layer_id in range(transfer_layer_id_max):
                 for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
@@ -277,7 +282,11 @@ def cpu_hicache_patches():
         mock.patch.object(l2_transfer, "_timing_events_supported", lambda: False),
         # psutil reports the whole box; a shared login node can read as negative
         # free memory long before the fixture's few MB matter.
-        mock.patch.object(pool_host_base, "host_memory_budget_bytes", lambda: 1 << 34),
+        mock.patch.object(
+            pool_host_base,
+            "host_memory_budget_bytes",
+            lambda requested_bytes=0: 1 << 34,
+        ),
         mock.patch.object(
             pool_host_common,
             "_cuda_host_register",
@@ -457,7 +466,7 @@ class HiCacheFixture:
                 host_pool=host_pool,
                 device_pool=device_pool,
                 layer_mapping={i: i for i in range(LAYER_NUM)},
-                transfer_layer_num=LAYER_NUM,
+                transfer_layer_id_max=LAYER_NUM,
             ),
         )
         self.sidecar = device_pool
@@ -837,7 +846,7 @@ class MiniScheduler:
             if req is self.chunked_req:
                 continue
             self.fx.cache.cache_finished_req(
-                req, kv_len_to_handle=len(req.origin_input_ids)
+                req, owned_kv_len=len(req.origin_input_ids)
             )
             self.fx.req_pool.free(req)
 
