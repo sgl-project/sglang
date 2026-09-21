@@ -20,67 +20,6 @@ register_cuda_ci(est_time=569, stage="extra-b", runner_config="8-gpu-h200")
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
-@unittest.skip("Skip for saving ci time")
-class TestDeepseek(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--enable-dp-attention",
-                "--dp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
-                "--enable-dp-lm-head",
-                "--moe-a2a-backend",
-                "deepep",
-                "--moe-runner-backend",
-                "deep_gemm",
-                "--enable-two-batch-overlap",
-                "--ep-num-redundant-experts",
-                "32",
-                "--ep-dispatch-algorithm",
-                "dynamic",
-                "--eplb-algorithm",
-                "deepseek",
-                "--cuda-graph-bs-decode",
-                "256",
-                "--max-running-requests",
-                "2048",
-                "--disable-radix-cache",
-                "--model-loader-extra-config",
-                '{"enable_multithread_load": true,"num_threads": 64}',
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=1200,
-            num_threads=1200,
-        )
-        metrics = run_eval(args)
-        print(f"Eval accuracy of GSM8K: {metrics=}")
-
-        self.assertGreater(metrics["score"], 0.92)
-
-
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

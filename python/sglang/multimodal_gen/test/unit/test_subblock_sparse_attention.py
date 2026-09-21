@@ -167,9 +167,15 @@ class TestSubBlockSparseSchedule(unittest.TestCase):
         self.assertEqual(schedule.compute_mode, "bf16")
 
     def test_sage_fp8_uses_16_token_key_subblocks_by_default(self):
-        with _patch_schedule({"compute_mode": "sage_fp8"}):
-            schedule = SubBlockSparseSchedule.from_server_args()
-        self.assertEqual(schedule.n_k, 8)
+        for capability, expected_n_k in (((9, 0), 8), ((12, 0), 4)):
+            with (
+                self.subTest(capability=capability),
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+                _patch_schedule({"compute_mode": "sage_fp8"}),
+            ):
+                schedule = SubBlockSparseSchedule.from_server_args()
+                self.assertEqual(schedule.n_k, expected_n_k)
 
     def test_explicit_sage_fp8_n_k_is_respected(self):
         with _patch_schedule({"compute_mode": "sage_fp8", "n_k": 4}):
@@ -320,11 +326,18 @@ class TestSubBlockGating(unittest.TestCase):
         with _patch_step(20):
             self.assertFalse(impl._sparse_ready(q, q))
 
-    def test_sage_fp8_builds_the_sm90_64x128_router(self):
-        impl = self._impl("blocks.9.attn", compute_mode="sage_fp8")
-        self.assertEqual(impl.router.block_size_k, 128)
-        self.assertEqual(impl.router.n_k, 8)
-        self.assertEqual(impl.router.budget_granularity, 1)
+    def test_sage_fp8_builds_architecture_specific_router(self):
+        for capability, key_block_size, n_k in (((9, 0), 128, 8), ((12, 0), 64, 4)):
+            with (
+                self.subTest(capability=capability),
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+            ):
+                impl = self._impl("blocks.9.attn", compute_mode="sage_fp8")
+                self.assertEqual(impl.router.block_size_k, key_block_size)
+                self.assertEqual(impl.router.n_k, n_k)
+                self.assertEqual(impl.router.block_size_k // impl.router.n_k, 16)
+                self.assertEqual(impl.router.budget_granularity, 1)
 
 
 @requires_subblock_kernel
