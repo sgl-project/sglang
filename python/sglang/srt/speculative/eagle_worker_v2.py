@@ -8,7 +8,6 @@ import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -261,6 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_attention_backends(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -270,6 +270,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_cuda_graphs(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -818,6 +819,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                if self.draft_runner.model_config.model_is_mrope:
+                    forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
                     0,
@@ -1207,7 +1210,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
-        self._hosts_draft = get_pp_group().is_last_rank
+        self._hosts_draft = get_parallel().pp_group.is_last_rank
         self._draft_worker = (
             EagleDraftWorker(
                 server_args,

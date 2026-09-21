@@ -34,7 +34,6 @@ class TestRustServerExtension(CustomTestCase):
                 attn_dp_rank=1,
                 tp_size=2,
                 tp_rank=1,
-                pp_size=1,
                 attn_tp_size=1,
                 attn_cp_size=1,
             ),
@@ -49,7 +48,9 @@ class TestRustServerExtension(CustomTestCase):
                 ),
             ),
             patch.object(
-                server_module, "get_parallel", return_value=SimpleNamespace(nnodes=1)
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(nnodes=1, pp_size=1),
             ),
             patch.object(ModelServer, "_partition_cores", return_value=(None, None)),
             patch.object(

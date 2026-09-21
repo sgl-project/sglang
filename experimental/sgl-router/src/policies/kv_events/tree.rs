@@ -11,26 +11,57 @@
 //! via [`HashTree::match_prefix`] to find which workers already hold the
 //! longest prefix of an incoming request's block-hash chain.
 //!
-//! # Concurrency
+//! # Concurrency: sharded so the event-write path stops blocking matches
 //!
-//! The whole tree lives behind a single [`parking_lot::RwLock`]
-//! ([`HashTree::state`]). The match path takes a read-lock and updates
-//! `last_used` via an [`AtomicU64`] so that routing decisions across tokio
-//! worker threads do not serialise on the lock. Mutations (insert / remove
-//! / clear / evict) take a write-lock. We accept the coarse granularity
-//! for v1 on the write side — correctness over throughput — and the
-//! existing text-tree at `super::super::tree` is what serves the high-RPS
-//! mesh-fallback path. This module is only on the cache-aware-from-events
-//! path.
+//! WHY this is sharded: the routing hot path (`prefix_depths` /
+//! `match_prefix`) takes a read lock while the ZMQ KV-event pump takes a
+//! write lock per event per worker. Under one process-wide lock every
+//! write blocked every concurrent match. The tree is therefore split into
+//! [`N_SHARDS`] independent [`TreeState`]s, each behind its own
+//! [`parking_lot::RwLock`], keyed by the chain's ROOT block hash — a radix
+//! chain lives entirely inside one shard, so a routing read takes exactly
+//! one shard's lock and reads on other roots proceed in parallel. The
+//! integer-keyed maps (`children`, `by_hash`, `nodes` — block hashes and
+//! node ids) use [`FxHashMap`] / [`FxHashSet`]; worker-keyed maps keep
+//! std's SipHash.
+//!
+//! Dropping SipHash there is safe, but NOT because the keys are
+//! unguessable: block hashes are unsalted SHA256 over token blocks
+//! ([`super::hash`]), so a client holding the tokenizer computes them
+//! offline, and steering one into a chosen FxHash bucket is a search over
+//! digests, not an inversion. What makes it safe is the cost of PLANTING
+//! one: a hash reaches these maps only when an engine actually caches that
+//! block and publishes `BlockStored`, so each colliding key costs a real
+//! inference request. Node ids are minted internally and never
+//! client-influenced.
+//!
+//! [`HashTree::route_insert`] / [`HashTree::route_match`] resolve a
+//! `Some(parent_hash)` across shards so a continuation lands in the shard
+//! already holding its chain; `remove` / `clear_worker` / `evict_lru` fan
+//! out over every shard, and the node cap `evict_lru` applies is global.
+//!
+//! Those cross-shard passes never hold all shards at once, so a second
+//! writer landing between a scan and the write it feeds can re-root a
+//! chain under the chosen SHARD's sentinel rather than
+//! `shard_of(block_hashes[0])` — where `match_prefix(None, …)` can never
+//! reach it again. There genuinely are two writers: the pump, and
+//! `KvEventIndex::remove_worker` on the service-discovery task. So
+//! [`HashTree::writer`] serialises them. Readers never take it.
+//!
+//! Which leaves a reader's own scan able to go stale the same way, so
+//! [`HashTree::descend_match_shard`] re-checks the parent it resolved under
+//! the descent's own lock and falls back to `shard_of(block_hashes[0])` —
+//! never to the nominated shard's sentinel, which would match nothing.
 //!
 //! # Reverse index
 //!
 //! `BlockRemoved` events carry only `block_hashes` and no parent context,
 //! so without an index from `block_hash → set of nodes carrying that hash`
-//! we'd have to walk the whole tree. We maintain that reverse index as
-//! [`TreeState::by_hash`]. The same hash can legitimately appear at
-//! multiple positions in the tree (e.g. as the last block of one chain and
-//! as the second block of another), so each entry is a *set* of node IDs.
+//! we'd have to walk the whole tree. We maintain that reverse index per
+//! shard as [`TreeState::by_hash`]. The same hash can legitimately appear
+//! at multiple positions (e.g. as the last block of one chain and as the
+//! second block of another) within a shard, so each entry is a *set* of
+//! node IDs.
 //!
 //! # Pruning
 //!
@@ -38,7 +69,8 @@
 //! workers AND no children, we detach it from its parent and remove it
 //! from the reverse index. Pruning cascades upward iteratively (chains
 //! can be deep — the recursive form would risk stack-overflow for
-//! pathological inputs).
+//! pathological inputs). Pruning is shard-local: a chain never crosses a
+//! shard boundary.
 //!
 //! # Storage tiers
 //!
@@ -80,8 +112,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
+
+/// Number of independent tree shards. A power of two so `shard_of` selects
+/// with a shift, not a modulo; large enough that distinct chains rarely
+/// collide, small enough that a per-shard `RwLock` + arena is free.
+const N_SHARDS: usize = 32;
+
+// `shard_of` shifts by `64 - log2(N_SHARDS)` and indexes `shards`, both
+// only correct for a power of two >= 2.
+const _: () = assert!(
+    N_SHARDS.is_power_of_two() && N_SHARDS >= 2,
+    "N_SHARDS must be a power of two and at least 2",
+);
+
+/// Fibonacci-hashing constant. One worker emits many distinct chains;
+/// mixing the root hash keeps that write load off a single shard.
+const SHARD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Map a chain-root block hash to its shard index, taken from the
+/// best-mixed top bits of the multiplicative hash.
+fn shard_of(root_hash: i64) -> usize {
+    let mixed = (root_hash as u64).wrapping_mul(SHARD_MIX);
+    (mixed >> (64 - N_SHARDS.trailing_zeros())) as usize
+}
 
 /// Process-wide monotonic epoch used to derive cheap millisecond-resolution
 /// timestamps for [`Node::last_used`]. Initialised lazily on first use.
@@ -349,6 +405,13 @@ pub struct MatchResult {
 }
 
 impl MatchResult {
+    /// Whether `worker` holds the deepest matched node on any tier.
+    /// Prefer this to `workers().contains(…)`, which clones every carrier
+    /// (each one a `String` allocation) to answer a membership question.
+    pub fn holds(&self, worker: &KvWorkerId) -> bool {
+        self.tiers.contains_key(worker)
+    }
+
     /// Workers holding the deepest matched node on ANY tier.
     pub fn workers(&self) -> HashSet<KvWorkerId> {
         self.tiers.keys().cloned().collect()
@@ -367,12 +430,15 @@ impl MatchResult {
 
 /// Internal stable handle to a tree node.
 ///
-/// We use an arena (`HashMap<NodeId, Node>`) instead of `Arc<RwLock<Node>>`
+/// We use an arena (`FxHashMap<NodeId, Node>`) instead of `Arc<RwLock<Node>>`
 /// + `Weak` because:
 /// 1. We need to enumerate every node (e.g. for `clear_worker` and
 ///    `evict_lru`); a flat map is direct and cheap.
 /// 2. The reverse index needs a *stable* key per node — `Weak` would force
 ///    upgrades on every lookup and complicate prune semantics.
+///
+/// Node ids are unique *within a shard* only; the shard a node lives in is
+/// implied by the chain root, never stored.
 type NodeId = u64;
 
 /// A single tree node. Non-root nodes are keyed by their `block_hash`
@@ -403,7 +469,7 @@ struct Node {
     /// an entry with empty tiers never exists (see [`TreeState::insert`]).
     workers: HashMap<KvWorkerId, Tiers>,
     /// Children keyed by next-block hash.
-    children: HashMap<i64, NodeId>,
+    children: FxHashMap<i64, NodeId>,
     last_used: AtomicU64,
 }
 
@@ -414,14 +480,29 @@ impl Node {
             parent_block_hash,
             parent: Some(parent),
             workers: HashMap::new(),
-            children: HashMap::new(),
+            children: FxHashMap::default(),
             last_used: AtomicU64::new(now_millis()),
         }
     }
 }
 
-/// Inner mutable tree state. Single-lock for v1; document any cross-method
-/// invariants here:
+/// Where one `insert` hangs its chain. The two halves are separate because a
+/// root-attach still records the hash: [`TreeState::resolve_parent`]'s case 4
+/// keeps `parent_block_hash` on the chain's first node so a later
+/// `BlockStored` for that parent can relink it through the reverse index, and
+/// [`HashTree::route_insert`] has to force a root-attach in a shard that may
+/// hold a local copy of the hash. Collapsing them back into one `Option`
+/// silently drops that breadcrumb.
+#[derive(Clone, Copy, Debug)]
+struct ParentLink {
+    /// Fed to [`TreeState::resolve_parent`]. `None` roots the chain whatever
+    /// the shard's own reverse index holds.
+    attach: Option<i64>,
+    /// Recorded as the first node's `parent_block_hash`.
+    breadcrumb: Option<i64>,
+}
+
+/// Inner mutable state of one shard. Cross-method invariants:
 ///
 /// * `nodes[ROOT_ID]` is always present and is the only node with
 ///   `parent == None`.
@@ -431,10 +512,13 @@ impl Node {
 ///   `n.block_hash == h`. Root is never in `by_hash`.
 /// * Pruning runs after every worker-removal that empties a node: prune
 ///   detaches from parent, removes from `by_hash`, and recurses upward.
+///
+/// Node ids are unique within this shard only; two shards may both mint
+/// id 1.
 #[derive(Debug)]
 struct TreeState {
-    nodes: HashMap<NodeId, Node>,
-    by_hash: HashMap<i64, HashSet<NodeId>>,
+    nodes: FxHashMap<NodeId, Node>,
+    by_hash: FxHashMap<i64, FxHashSet<NodeId>>,
     next_id: NodeId,
     /// Nodes each carrier holds, per tier. Booked at every site where a
     /// carrier's tier bits on a node change (`account_add` /
@@ -463,7 +547,7 @@ const ROOT_HASH_SENTINEL: i64 = i64::MIN;
 
 impl TreeState {
     fn new() -> Self {
-        let mut nodes = HashMap::new();
+        let mut nodes = FxHashMap::default();
         nodes.insert(
             ROOT_ID,
             Node {
@@ -471,13 +555,13 @@ impl TreeState {
                 parent_block_hash: None,
                 parent: None,
                 workers: HashMap::new(),
-                children: HashMap::new(),
+                children: FxHashMap::default(),
                 last_used: AtomicU64::new(now_millis()),
             },
         );
         Self {
             nodes,
-            by_hash: HashMap::new(),
+            by_hash: FxHashMap::default(),
             next_id: 1,
             occupancy: HashMap::new(),
             accounting_errors: [0; ACCOUNTING_REASONS.len()],
@@ -590,9 +674,11 @@ impl TreeState {
         Some(id)
     }
 
-    /// Pick the parent node id for an incoming `BlockStored` event.
+    /// Pick the parent node id for an incoming `BlockStored` event, given
+    /// that this shard is already known to own (or be the fallback for)
+    /// the chain.
     ///
-    /// Resolution order (matches doc-comment on `HashTree::insert`):
+    /// Resolution order:
     /// 1. `parent_hash == None` → root.
     /// 2. There's exactly one node carrying `parent_hash` → use it.
     /// 3. Multiple candidates: prefer one already containing `worker`.
@@ -600,6 +686,15 @@ impl TreeState {
     ///    new chain still carries `parent_hash` on its first node so that
     ///    if the parent's `BlockStored` arrives later we can reconstruct
     ///    the link via the reverse index.
+    ///
+    /// Takes only [`ParentLink::attach`]; case 4's breadcrumb is applied by
+    /// the caller, which is why a forced root-attach can still record the
+    /// hash. [`HashTree::route_insert`] has already made this decision
+    /// globally: case 1 and the ambiguous-with-no-owner fallback arrive as
+    /// `None`, a `parent_hash` no shard carries arrives unchanged and lands
+    /// on case 4 here, and cases 2 / 3 arrive pointing into this shard. The
+    /// remaining root fallback is defence against a routing/local
+    /// disagreement.
     fn resolve_parent(&self, worker: &KvWorkerId, parent_hash: Option<i64>) -> NodeId {
         let Some(parent_hash) = parent_hash else {
             return ROOT_ID;
@@ -643,15 +738,15 @@ impl TreeState {
     fn insert(
         &mut self,
         worker: &KvWorkerId,
-        parent_hash: Option<i64>,
+        parent: ParentLink,
         block_hashes: &[i64],
         tiers: Tiers,
     ) {
         if block_hashes.is_empty() || tiers.is_empty() {
             return;
         }
-        let mut current = self.resolve_parent(worker, parent_hash);
-        let mut prev_hash = parent_hash;
+        let mut current = self.resolve_parent(worker, parent.attach);
+        let mut prev_hash = parent.breadcrumb;
         let now = now_millis();
         // Occupancy is booked once for the whole chain, not per block.
         let mut delta = TierCounts::default();
@@ -686,6 +781,13 @@ impl TreeState {
             prev_hash = Some(h);
         }
         self.account_add(worker, delta);
+    }
+
+    /// Whether this shard's reverse index carries any of `block_hashes`, so
+    /// [`HashTree::remove_tiered`] can skip it under a read lock instead of
+    /// write-locking it to find there was nothing to do.
+    fn carries_any(&self, block_hashes: &[i64]) -> bool {
+        block_hashes.iter().any(|h| self.by_hash.contains_key(h))
     }
 
     /// Clear `tiers` from `worker`'s hold on every node carrying any hash in
@@ -850,7 +952,6 @@ impl TreeState {
 
         let mut current = start;
         let mut matched = 0usize;
-        let mut last_match_node: Option<NodeId> = None;
         let now = now_millis();
         for &h in block_hashes {
             let next = self
@@ -866,13 +967,16 @@ impl TreeState {
                     }
                     current = child_id;
                     matched += 1;
-                    last_match_node = Some(child_id);
                 }
                 None => break,
             }
         }
-        let tiers: HashMap<KvWorkerId, Tiers> = last_match_node
-            .and_then(|id| self.nodes.get(&id))
+        // `current` is the deepest matched node once anything matched; with
+        // nothing matched it is still `start`, whose carriers belong to the
+        // caller-supplied parent and must not be reported.
+        let tiers: HashMap<KvWorkerId, Tiers> = (matched > 0)
+            .then(|| self.nodes.get(&current))
+            .flatten()
             .map(|n| n.workers.clone())
             .unwrap_or_default();
         MatchResult {
@@ -951,24 +1055,17 @@ impl TreeState {
         depths.into_iter().map(|(w, d)| (w.clone(), d)).collect()
     }
 
-    /// Approximate count of *non-root* nodes in the tree.
+    /// Count of *non-root* nodes in this shard.
     fn node_count(&self) -> usize {
         // Subtract one for the root sentinel.
         self.nodes.len().saturating_sub(1)
     }
 
-    fn evict_lru(&mut self, max_size: usize) -> usize {
-        // Fast-path: already under cap.
-        if self.node_count() <= max_size {
-            return 0;
-        }
-        // Count by total node-count delta so cascade prunes (which may
-        // remove multiple ancestors per `prune_cascade` call) are
-        // accounted for accurately, not just the cascade entry point.
+    /// Drop already-empty (no-worker, no-child) leaves in this shard. These
+    /// hang around only because of pruning races — they're free wins.
+    /// Returns the number of nodes dropped (including cascade ancestors).
+    fn drop_empty_leaves(&mut self) -> usize {
         let count_before = self.nodes.len();
-
-        // Phase 1: drop empty (no-worker) leaves first. These hang around
-        // only because of pruning races — they're free wins.
         let empty_leaves: Vec<NodeId> = self
             .nodes
             .iter()
@@ -981,62 +1078,74 @@ impl TreeState {
             })
             .collect();
         for id in empty_leaves {
-            if self.node_count() <= max_size {
-                break;
-            }
             if self.nodes.contains_key(&id) {
                 self.prune_cascade(id);
             }
         }
+        count_before - self.nodes.len()
+    }
 
-        // Phase 2: evict oldest leaves (with workers) until we hit cap.
-        // We re-snapshot leaves each pass because pruning can promote a
-        // parent into "leaf" status. The outer loop bounds work to
-        // O(node_count) so we don't spin on a degenerate tree.
-        let mut iters = 0usize;
-        let max_iters = self.nodes.len().saturating_add(1);
-        while self.node_count() > max_size && iters < max_iters {
-            iters += 1;
-            // Find the LRU leaf. `last_used` is read with `Relaxed` —
-            // approximate freshness is fine for eviction. Equality at
-            // the millisecond boundary tie-breaks by NodeId.
-            let mut oldest: Option<(u64, NodeId)> = None;
-            for (&id, n) in &self.nodes {
-                if id == ROOT_ID || !n.children.is_empty() {
-                    continue;
-                }
-                let ts = n.last_used.load(Ordering::Relaxed);
-                match oldest {
-                    None => oldest = Some((ts, id)),
-                    Some((cur, _)) if ts < cur => oldest = Some((ts, id)),
-                    _ => {}
-                }
+    /// Timestamp + shard-local id of the LRU leaf, for global eviction
+    /// ordering; `None` if the shard has no leaves. Millisecond ties break
+    /// by `NodeId`, and `last_used` is read `Relaxed` — approximate
+    /// freshness is fine for eviction.
+    fn lru_leaf(&self) -> Option<(u64, NodeId)> {
+        let mut oldest: Option<(u64, NodeId)> = None;
+        for (&id, n) in &self.nodes {
+            if id == ROOT_ID || !n.children.is_empty() {
+                continue;
             }
-            let Some((_, victim)) = oldest else {
-                break; // No leaves at all (shouldn't happen with non-empty tree).
-            };
-            // Force-prune even if the leaf still holds workers — eviction
-            // intentionally evicts. We clear workers first so the cascade
-            // precondition holds, releasing each carrier's tiers as we go so
-            // the occupancy counters stay in step.
-            let carriers: Vec<(KvWorkerId, Tiers)> = match self.nodes.get_mut(&victim) {
-                Some(node) => node.workers.drain().collect(),
-                None => Vec::new(),
-            };
-            for (worker, held) in &carriers {
-                self.account_remove(worker, *held);
+            let ts = n.last_used.load(Ordering::Relaxed);
+            match oldest {
+                None => oldest = Some((ts, id)),
+                Some((cur_ts, cur_id)) if (ts, id) < (cur_ts, cur_id) => oldest = Some((ts, id)),
+                _ => {}
             }
-            self.prune_cascade(victim);
         }
+        oldest
+    }
+
+    /// Force-evict the leaf with shard-local id `victim` and cascade-prune.
+    /// Returns the number of nodes removed, or 0 if the node is gone or is
+    /// no longer a leaf (raced away between selection and eviction).
+    ///
+    /// Eviction intentionally evicts, so the carriers are dropped even though
+    /// they still hold the block. They are drained rather than cleared so each
+    /// one's tiers can be released through `account_remove`, keeping the
+    /// occupancy gauge in step, and so the cascade precondition holds.
+    fn evict_leaf(&mut self, victim: NodeId) -> usize {
+        let is_leaf = self
+            .nodes
+            .get(&victim)
+            .map(|n| n.children.is_empty())
+            .unwrap_or(false);
+        if !is_leaf {
+            return 0;
+        }
+        let count_before = self.nodes.len();
+        let carriers: Vec<(KvWorkerId, Tiers)> = match self.nodes.get_mut(&victim) {
+            Some(node) => node.workers.drain().collect(),
+            None => Vec::new(),
+        };
+        for (worker, held) in &carriers {
+            self.account_remove(worker, *held);
+        }
+        self.prune_cascade(victim);
         count_before - self.nodes.len()
     }
 }
 
 /// Public hash-keyed radix tree. Cheap to clone an [`Arc`] of; the
-/// underlying state is `Send + Sync` (single `RwLock`).
+/// underlying state is `Send + Sync`. Split into [`N_SHARDS`] independent
+/// [`TreeState`]s keyed by chain root, with writers serialised by
+/// [`Self::writer`] — see the module docs for both.
 #[derive(Debug)]
 pub struct HashTree {
-    state: RwLock<TreeState>,
+    shards: Vec<RwLock<TreeState>>,
+    /// Held for the whole of every mutation, so a multi-shard write and the
+    /// cross-shard scan that chose its target are atomic against the other
+    /// writer. Readers never take it.
+    writer: Mutex<()>,
 }
 
 impl Default for HashTree {
@@ -1047,9 +1156,198 @@ impl Default for HashTree {
 
 impl HashTree {
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(TreeState::new()),
+        let mut shards = Vec::with_capacity(N_SHARDS);
+        for _ in 0..N_SHARDS {
+            shards.push(RwLock::new(TreeState::new()));
         }
+        Self {
+            shards,
+            writer: Mutex::new(()),
+        }
+    }
+
+    /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
+    /// return the shard to write in plus the [`ParentLink`] to write with,
+    /// mirroring [`TreeState::resolve_parent`]:
+    /// 1. `None` → root shard, nothing to attach to or record.
+    /// 2. No shard carries it → root shard, attach `Some(p)`. No shard can
+    ///    re-derive a parent from a hash none of them holds, so this lands on
+    ///    `resolve_parent`'s case 4 and root-attaches there.
+    /// 3. Exactly one node carries it → that shard, attach `Some(p)`.
+    /// 4. Several do → a `worker`-owned carrier's shard attaching `Some(p)`
+    ///    ("owned" = held on ANY tier); none owned → root shard, attach
+    ///    `None`.
+    ///
+    /// Case 4's `attach: None` is load-bearing: a shard that happens to hold
+    /// one local copy of `parent_hash` would otherwise re-derive a parent
+    /// from its partial reverse index and attach under a node the global
+    /// decision rejected. The breadcrumb stays `Some(p)` throughout, because
+    /// forcing the attach point is not a reason to forget which parent the
+    /// engine named — the unsharded tree recorded it in every one of these
+    /// cases.
+    ///
+    /// `block_hashes` is non-empty (the caller early-returns on empty).
+    fn route_insert(
+        &self,
+        worker: &KvWorkerId,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+    ) -> (usize, ParentLink) {
+        let root_shard = shard_of(block_hashes[0]);
+        let Some(p) = parent_hash else {
+            return (
+                root_shard,
+                ParentLink {
+                    attach: None,
+                    breadcrumb: None,
+                },
+            );
+        };
+        // How many nodes carry `p`, and which shard holds one `worker` owns.
+        let mut total_carriers = 0usize;
+        let mut single_carrier_shard: Option<usize> = None;
+        let mut worker_owned_shard: Option<usize> = None;
+        for (idx, shard) in self.shards.iter().enumerate() {
+            let st = shard.read();
+            let Some(ids) = st.by_hash.get(&p) else {
+                continue;
+            };
+            // A prune drops the key with its last id, so an empty set should
+            // not exist. Not depending on that: it would count as no carrier
+            // yet still nominate this shard, and the write would root the
+            // chain under a sentinel that is not `shard_of(block_hashes[0])`
+            // — unreachable from `match_prefix(None, ..)` from then on.
+            if ids.is_empty() {
+                continue;
+            }
+            total_carriers += ids.len();
+            single_carrier_shard = Some(idx);
+            if worker_owned_shard.is_none()
+                && ids.iter().any(|id| {
+                    st.nodes
+                        .get(id)
+                        .is_some_and(|n| n.workers.contains_key(worker))
+                })
+            {
+                worker_owned_shard = Some(idx);
+            }
+        }
+        let breadcrumb = Some(p);
+        match total_carriers {
+            // Nothing carries `p`, so no shard can resolve it to a node; it
+            // root-attaches inside the shard, on `resolve_parent`'s case 4.
+            0 => (
+                root_shard,
+                ParentLink {
+                    attach: breadcrumb,
+                    breadcrumb,
+                },
+            ),
+            1 => (
+                single_carrier_shard.unwrap_or(root_shard),
+                ParentLink {
+                    attach: breadcrumb,
+                    breadcrumb,
+                },
+            ),
+            _ => match worker_owned_shard {
+                Some(idx) => (
+                    idx,
+                    ParentLink {
+                        attach: breadcrumb,
+                        breadcrumb,
+                    },
+                ),
+                // Forced root-attach, breadcrumb kept.
+                None => (
+                    root_shard,
+                    ParentLink {
+                        attach: None,
+                        breadcrumb,
+                    },
+                ),
+            },
+        }
+    }
+
+    /// Resolve the match path's start point across shards and return
+    /// `(shard, effective_parent_hash)`. Only a UNIQUE carrier of `p` is
+    /// honored; zero or several fall back to the root shard with `None`,
+    /// for the reason [`Self::route_insert`] gives. The hot path passes
+    /// `None` and never scatters. `block_hashes` is non-empty (the caller
+    /// early-returns on empty).
+    ///
+    /// The result holds only for as long as no shard lock is dropped, so it
+    /// is advisory: [`Self::descend_match_shard`] re-checks it under the
+    /// descent's own lock.
+    fn route_match(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> (usize, Option<i64>) {
+        let root_shard = shard_of(block_hashes[0]);
+        let Some(p) = parent_hash else {
+            return (root_shard, None);
+        };
+        let mut total = 0usize;
+        let mut only_shard: Option<usize> = None;
+        for (idx, shard) in self.shards.iter().enumerate() {
+            if let Some(ids) = shard.read().by_hash.get(&p).filter(|ids| !ids.is_empty()) {
+                total += ids.len();
+                only_shard = Some(idx);
+                if total > 1 {
+                    return (root_shard, None);
+                }
+            }
+        }
+        match total {
+            1 => (only_shard.unwrap_or(root_shard), Some(p)),
+            _ => (root_shard, None),
+        }
+    }
+
+    /// Descend the shard that can answer for `parent_hash`, re-checking
+    /// [`Self::route_match`]'s resolution under the descent's own read lock.
+    ///
+    /// The scan and the descent are separate lock scopes and readers never
+    /// take [`Self::writer`], so a write in between can prune `p` or give it
+    /// a second carrier in the chosen shard. The in-shard start resolution
+    /// would then fall back to THAT shard's sentinel — but the chain hangs
+    /// off `shard_of(block_hashes[0])`'s, so the descent matches nothing and
+    /// a caller passing `Some(p)` silently gets `matched_blocks == 0` where
+    /// the unsharded tree returns the real match. Re-checking makes the
+    /// resolution and the descent atomic, and a stale one falls back to the
+    /// chain's own root shard — which is what "fall back to root" means once
+    /// the tree is sharded, and what the ambiguous case already does.
+    ///
+    /// A carrier appearing in a DIFFERENT shard is not re-checked: that
+    /// costs a second cross-shard scan to turn a real match into a root
+    /// fall-back. `block_hashes` is non-empty (callers early-return on
+    /// empty).
+    fn descend_match_shard<R>(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        descend: impl Fn(&TreeState, Option<i64>) -> R,
+    ) -> R {
+        let (idx, effective_parent) = self.route_match(parent_hash, block_hashes);
+        self.descend_routed(idx, effective_parent, block_hashes, descend)
+    }
+
+    /// The half of [`Self::descend_match_shard`] that runs after the scan,
+    /// split out so a test can hand it a resolution that has already gone
+    /// stale — the state a racing writer leaves behind, which no sequential
+    /// call can reach.
+    fn descend_routed<R>(
+        &self,
+        idx: usize,
+        effective_parent: Option<i64>,
+        block_hashes: &[i64],
+        descend: impl Fn(&TreeState, Option<i64>) -> R,
+    ) -> R {
+        if let Some(p) = effective_parent {
+            let shard = self.shards[idx].read();
+            if shard.by_hash.get(&p).is_some_and(|ids| ids.len() == 1) {
+                return descend(&shard, Some(p));
+            }
+        }
+        descend(&self.shards[shard_of(block_hashes[0])].read(), None)
     }
 
     /// Apply an untagged `BlockStored` event: a device store. See
@@ -1072,8 +1370,17 @@ impl HashTree {
         block_hashes: &[i64],
         tiers: Tiers,
     ) {
-        let mut state = self.state.write();
-        state.insert(worker, parent_hash, block_hashes, tiers);
+        if block_hashes.is_empty() || tiers.is_empty() {
+            return;
+        }
+        // The scan and the write it feeds must be one critical section: a
+        // prune in between re-roots the chain under the chosen shard's
+        // sentinel and orphans it.
+        let _writer = self.writer.lock();
+        let (idx, parent) = self.route_insert(worker, parent_hash, block_hashes);
+        self.shards[idx]
+            .write()
+            .insert(worker, parent, block_hashes, tiers);
     }
 
     /// Apply an untagged `BlockRemoved` event: the worker loses the blocks on
@@ -1094,15 +1401,37 @@ impl HashTree {
     ///
     /// Removing the worker from a node does NOT remove the node if other
     /// workers still hold it.
+    ///
+    /// A removed hash can be a chain root in one shard and an interior block
+    /// elsewhere, so this fans out. A shard carrying none of the hashes is
+    /// skipped under a READ lock — write-locking all [`N_SHARDS`] per
+    /// `BlockRemoved` would block every routing match, the exact cost the
+    /// sharding removes. Safe because [`Self::writer`] is held.
     pub fn remove_tiered(&self, worker: &KvWorkerId, block_hashes: &[i64], tiers: Tiers) {
-        let mut state = self.state.write();
-        state.remove(worker, block_hashes, tiers);
+        // Empty `tiers` clears nothing, so the fan-out below would take the
+        // writer mutex and write-lock every carrying shard to do no work.
+        if block_hashes.is_empty() || tiers.is_empty() {
+            return;
+        }
+        let _writer = self.writer.lock();
+        for shard in &self.shards {
+            if !shard.read().carries_any(block_hashes) {
+                continue;
+            }
+            shard.write().remove(worker, block_hashes, tiers);
+        }
     }
 
     /// Apply an `AllBlocksCleared` event for `worker`.
+    ///
+    /// Fans out: a worker can hold chains in many shards. Also the
+    /// scale-down path (`KvEventIndex::remove_worker`), which runs off the
+    /// pump task — hence [`Self::writer`].
     pub fn clear_worker(&self, worker: &KvWorkerId) {
-        let mut state = self.state.write();
-        state.clear_worker(worker);
+        let _writer = self.writer.lock();
+        for shard in &self.shards {
+            shard.write().clear_worker(worker);
+        }
     }
 
     /// Find the longest path from the root that matches a prefix of
@@ -1115,8 +1444,8 @@ impl HashTree {
     /// As a side-effect, touches `last_used` on every node visited along
     /// the match — so frequently-matched paths are kept hot for
     /// [`HashTree::evict_lru`]. The touch is an atomic `Relaxed` store, so
-    /// this method only needs a read lock and many threads can match
-    /// concurrently.
+    /// this method only needs a read lock on a single shard and many
+    /// threads can match concurrently across shards.
     ///
     /// # Ambiguous `parent_hash`
     /// If `parent_hash == Some(p)` and `p` is carried by multiple nodes
@@ -1127,99 +1456,229 @@ impl HashTree {
     /// preferring a worker-owned candidate; `match_prefix` has no worker
     /// context, so the asymmetry is intentional.)
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
-        let state = self.state.read();
-        state.match_prefix(parent_hash, block_hashes)
+        if block_hashes.is_empty() {
+            return MatchResult::default();
+        }
+        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+            shard.match_prefix(parent, block_hashes)
+        })
     }
 
-    /// How many leading blocks of `block_hashes` each worker holds contiguously,
-    /// in one descent under one read lock. [`Self::match_prefix`] names only the
-    /// deepest matched node's holders, so it cannot answer this. Absent = none.
+    /// How many leading blocks of `block_hashes` each worker holds
+    /// contiguously, in one descent under one shard's read lock.
+    /// [`Self::match_prefix`] names only the deepest matched node's holders,
+    /// so it cannot answer this. Absent = none.
     pub fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
         block_hashes: &[i64],
     ) -> HashMap<KvWorkerId, usize> {
-        let state = self.state.read();
-        state.prefix_depths(parent_hash, block_hashes)
+        if block_hashes.is_empty() {
+            return HashMap::new();
+        }
+        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+            shard.prefix_depths(parent, block_hashes)
+        })
     }
 
-    /// Approximate number of non-root nodes in the tree (the root sentinel
-    /// is not counted). Useful for metrics and to decide when to call
-    /// [`HashTree::evict_lru`].
+    /// Number of non-root nodes across all shards, summed under a per-shard
+    /// read lock — a point-in-time sum, not one consistent instant. The
+    /// input a [`HashTree::evict_lru`] cap check takes, and what a size
+    /// gauge would read.
     pub fn node_count(&self) -> usize {
-        self.state.read().node_count()
+        self.shards.iter().map(|s| s.read().node_count()).sum()
     }
 
-    /// Number of distinct block-hash keys carried by the reverse index.
-    /// Exposed for invariant tests: when `node_count() == 0` this must
-    /// also be 0. A nonzero value here with zero nodes means a `prune`
-    /// path forgot to clean up `by_hash` and the index has leaked.
+    /// Distinct block-hash keys in the reverse index, summed across shards
+    /// (one hash can appear in several — one chain's root, another's
+    /// interior). Exposed for invariant tests: nonzero here with
+    /// `node_count() == 0` means a prune path leaked `by_hash`.
     pub fn reverse_index_size(&self) -> usize {
-        self.state.read().by_hash.len()
+        self.shards.iter().map(|s| s.read().by_hash.len()).sum()
     }
 
     /// Times the occupancy bookkeeping contradicted itself, by
-    /// [`ACCOUNTING_REASONS`]. Always zero on a correct tree; rendered so a
-    /// release build, where the debug assertion is compiled out, still says
-    /// so out loud.
+    /// [`ACCOUNTING_REASONS`], summed across shards. Always zero on a correct
+    /// tree; rendered so a release build, where the debug assertion is
+    /// compiled out, still says so out loud.
     pub fn accounting_errors(&self) -> [u64; ACCOUNTING_REASONS.len()] {
-        self.state.read().accounting_errors
+        let mut total = [0u64; ACCOUNTING_REASONS.len()];
+        for shard in &self.shards {
+            for (acc, c) in total.iter_mut().zip(shard.read().accounting_errors) {
+                *acc += c;
+            }
+        }
+        total
     }
 
-    /// Nodes each carrier holds on each tier, sorted by carrier. Rendered as
-    /// `sgl_router_kv_tree_blocks`; against the engine's own per-tier
-    /// occupancy for the same pod it is the tree's coverage of that tier —
-    /// the number that says whether a tier the engine holds is visible to
-    /// routing at all (module docs, "Storage tiers").
+    /// Nodes each carrier holds on each tier, summed across shards and sorted
+    /// by carrier. Rendered as `sgl_router_kv_tree_blocks`; against the
+    /// engine's own per-tier occupancy for the same pod it is the tree's
+    /// coverage of that tier — the number that says whether a tier the engine
+    /// holds is visible to routing at all (module docs, "Storage tiers").
     ///
-    /// Read off the incrementally maintained accounting rather than walked,
-    /// so a scrape costs one read lock. A carrier holding nothing has no row.
+    /// Read off the per-shard accounting rather than walked, so a scrape costs
+    /// one read lock per shard plus a merge over carriers. Like
+    /// [`Self::node_count`], a point-in-time aggregate rather than one
+    /// consistent instant. A carrier holding nothing has no row.
     pub fn tier_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
-        let state = self.state.read();
-        let mut rows: Vec<(KvWorkerId, TierCounts)> = state
-            .occupancy
-            .iter()
-            .map(|(w, counts)| (w.clone(), *counts))
-            .collect();
+        let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
+        for shard in &self.shards {
+            for (worker, counts) in &shard.read().occupancy {
+                let acc = total.entry(worker.clone()).or_default();
+                for (a, c) in acc.iter_mut().zip(counts) {
+                    *a += c;
+                }
+            }
+        }
+        let mut rows: Vec<(KvWorkerId, TierCounts)> = total.into_iter().collect();
         rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
         rows
     }
 
-    /// Evict least-recently-used nodes until `node_count() <= max_size`.
+    /// Evict least-recently-used nodes until `node_count() <= max_size`
+    /// across the whole tree: first the already-empty leaves in every
+    /// shard, then the globally-oldest leaf one at a time. Returns the
+    /// total nodes pruned, cascade ancestors included.
     ///
-    /// Strategy:
-    /// 1. Drop already-empty leaves (no workers, no children) first.
-    /// 2. If still over cap, evict oldest leaves (force-clearing workers
-    ///    on the victim) and cascade-prune.
+    /// The LRU is global, not a per-shard quota, which would evict hot
+    /// entries in a busy shard while idle shards sat under theirs.
+    /// Selection takes the per-shard locks one at a time, so
+    /// [`Self::writer`] is held throughout — otherwise a concurrent
+    /// inserter makes the cap a target rather than a postcondition.
     ///
-    /// Returns the exact total number of nodes pruned, including any
-    /// ancestors removed by cascade-pruning. Suitable for wiring into a
-    /// metric counter.
+    /// Nothing outside the tests calls this yet, so the cap is available
+    /// rather than enforced: today the tree is bounded only by the fleet's
+    /// own `BlockRemoved` turnover. Whoever wires it up runs it off the hot
+    /// path — it holds [`Self::writer`] for the whole sweep.
     pub fn evict_lru(&self, max_size: usize) -> usize {
-        let mut state = self.state.write();
-        state.evict_lru(max_size)
+        let _writer = self.writer.lock();
+        let mut remaining = self.node_count();
+        if remaining <= max_size {
+            return 0;
+        }
+        let mut pruned = 0usize;
+
+        // Phase 1: free empty leaves everywhere. `remaining` tracks the
+        // global count so the between-shard cap check costs no extra scan.
+        for shard in &self.shards {
+            let dropped = shard.write().drop_empty_leaves();
+            pruned += dropped;
+            remaining -= dropped;
+            if remaining <= max_size {
+                return pruned;
+            }
+        }
+
+        // Phase 2: evict the globally-oldest leaf one at a time. Bound the
+        // loop by the total node count so a degenerate tree can't spin.
+        let mut iters = 0usize;
+        let max_iters = remaining.saturating_add(1);
+        while remaining > max_size && iters < max_iters {
+            iters += 1;
+            // Oldest leaf globally; (ts, node id, shard) makes it
+            // deterministic under ties.
+            let mut target: Option<(u64, NodeId, usize)> = None;
+            for (idx, shard) in self.shards.iter().enumerate() {
+                if let Some((ts, id)) = shard.read().lru_leaf() {
+                    let cand = (ts, id, idx);
+                    match target {
+                        None => target = Some(cand),
+                        Some(cur) if cand < cur => target = Some(cand),
+                        _ => {}
+                    }
+                }
+            }
+            let Some((_, victim, idx)) = target else {
+                break; // no leaves anywhere
+            };
+            let dropped = self.shards[idx].write().evict_leaf(victim);
+            if dropped == 0 {
+                // The chosen leaf is no longer a leaf. Re-scan on the next
+                // iteration rather than spin on a stale pick.
+                continue;
+            }
+            pruned += dropped;
+            remaining -= dropped;
+        }
+        pruned
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Whitebox test helpers: the in-module tests assert on internal structure
+// (reverse-index membership, `parent_block_hash` chaining), which now sits
+// behind a per-shard layout.
 
 #[cfg(test)]
 impl HashTree {
-    /// Whether every carrier on every node holds at least one tier. `remove`
-    /// and `prune_cascade` rely on "no bits ⇒ no entry"; a violation means a
-    /// node can never be pruned and a worker never dropped.
+    /// Whether every carrier on every node in every shard holds at least
+    /// one tier. `remove` and `prune_cascade` rely on "no bits ⇒ no entry";
+    /// a violation means a node can never be pruned and a worker never
+    /// dropped.
     fn debug_no_empty_carrier(&self) -> bool {
-        let state = self.state.read();
-        state
-            .nodes
-            .values()
-            .all(|n| n.workers.values().all(|t| !t.is_empty()))
+        self.shards.iter().all(|s| {
+            s.read()
+                .nodes
+                .values()
+                .all(|n| n.workers.values().all(|t| !t.is_empty()))
+        })
     }
 
-    /// Recompute [`Self::tier_occupancy`] by walking every node — the oracle
-    /// the incrementally maintained counters are checked against.
+    /// Whether every chain root lives in `shard_of` its own block hash —
+    /// the invariant `match_prefix(None, …)` rests on, since it looks only
+    /// in `shard_of(block_hashes[0])`.
+    fn debug_roots_in_own_shard(&self) -> bool {
+        self.shards.iter().enumerate().all(|(idx, s)| {
+            s.read().nodes[&ROOT_ID]
+                .children
+                .keys()
+                .all(|&h| shard_of(h) == idx)
+        })
+    }
+
+    /// Whether any shard's reverse index carries `hash`.
+    fn debug_has_hash(&self, hash: i64) -> bool {
+        self.shards
+            .iter()
+            .any(|s| s.read().by_hash.contains_key(&hash))
+    }
+
+    /// Distinct nodes carrying `hash`, summed across shards.
+    fn debug_hash_node_count(&self, hash: i64) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.read()
+                    .by_hash
+                    .get(&hash)
+                    .map(|set| set.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// `parent_block_hash` of the node carrying `hash`. Panics unless
+    /// exactly one node carries it; callers build unambiguous chains.
+    fn debug_parent_block_hash(&self, hash: i64) -> Option<i64> {
+        let mut found: Option<Option<i64>> = None;
+        for shard in &self.shards {
+            let st = shard.read();
+            if let Some(set) = st.by_hash.get(&hash) {
+                assert_eq!(set.len(), 1, "debug_parent_block_hash: hash not unique");
+                let id = *set.iter().next().unwrap();
+                assert!(
+                    found.is_none(),
+                    "debug_parent_block_hash: hash present in multiple shards",
+                );
+                found = Some(st.nodes[&id].parent_block_hash);
+            }
+        }
+        found.expect("debug_parent_block_hash: hash not present")
+    }
+
+    /// Recompute [`Self::tier_occupancy`] by walking every node in every
+    /// shard — the oracle the incrementally maintained counters are checked
+    /// against.
     ///
     /// Its ceiling: it shares `tally_tiers` and [`Tiers::SLOTS`] with the code
     /// it checks, so it proves only that incremental booking agrees with a
@@ -1228,15 +1687,17 @@ impl HashTree {
     /// example-based tier tests and the compile-time coupling asserts own
     /// that half.
     fn debug_recount_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
-        let state = self.state.read();
         let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
-        for (&id, node) in &state.nodes {
-            if id == ROOT_ID {
-                continue;
-            }
-            for (worker, held) in &node.workers {
-                let acc = total.entry(worker.clone()).or_default();
-                tally_tiers(acc, *held);
+        for shard in &self.shards {
+            let st = shard.read();
+            for (&id, node) in &st.nodes {
+                if id == ROOT_ID {
+                    continue;
+                }
+                for (worker, held) in &node.workers {
+                    let acc = total.entry(worker.clone()).or_default();
+                    tally_tiers(acc, *held);
+                }
             }
         }
         let mut rows: Vec<(KvWorkerId, TierCounts)> = total.into_iter().collect();
@@ -1244,6 +1705,10 @@ impl HashTree {
         rows
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1534,16 +1999,18 @@ mod tests {
         assert_eq!(tree.match_prefix(None, &[1]).matched_blocks, 0);
     }
 
-    /// The occupancy counters are maintained incrementally at four mutation
-    /// sites, which is exactly the shape that rots under a later refactor. A
-    /// deterministic random walk over every operation and every medium, with
-    /// both invariants asserted after EVERY step:
+    /// Three invariants every mutation site has to preserve — the shape that
+    /// rots under a later refactor — asserted after EVERY step of a
+    /// deterministic random walk over every operation and every medium:
     ///
-    /// * `tier_occupancy()` equals a full node-walk recount, and
-    /// * no carrier entry with empty tiers exists (`remove` relies on
-    ///   "no bits ⇒ no entry" to know when a node is prunable).
+    /// * `tier_occupancy()` equals a full node-walk recount, now summed over
+    ///   shards rather than read off one map.
+    /// * No carrier entry with empty tiers exists, which `remove` and
+    ///   `prune_cascade` rely on to know when a node is prunable.
+    /// * Every chain root sits in `shard_of` its own hash — the only reason
+    ///   `match_prefix(None, ..)` can find it by looking in one shard.
     #[test]
-    fn occupancy_and_carrier_invariants_hold_under_a_random_walk() {
+    fn tree_invariants_hold_under_a_random_walk() {
         // xorshift64*, so the walk is reproducible without a dev-dependency.
         struct Rng(u64);
         impl Rng {
@@ -1602,6 +2069,11 @@ mod tests {
                 assert!(
                     tree.debug_no_empty_carrier(),
                     "seed {seed} step {step}: a carrier is present holding no tier",
+                );
+                assert!(
+                    tree.debug_roots_in_own_shard(),
+                    "seed {seed} step {step}: a chain root is in the wrong shard, \
+                     so match_prefix(None, ..) can never reach it again",
                 );
             }
         }
@@ -1746,10 +2218,7 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&a]));
 
         // Reverse-index sanity for hash 2: still present (node holds it).
-        {
-            let st = tree.state.read();
-            assert!(st.by_hash.contains_key(&2));
-        }
+        assert!(tree.debug_has_hash(2));
     }
 
     #[test]
@@ -1792,12 +2261,9 @@ mod tests {
         // node_count() returns *non-root* count, so it should be 0.
         assert_eq!(tree.node_count(), 0);
         // Reverse index for these hashes should be empty.
-        {
-            let st = tree.state.read();
-            assert!(!st.by_hash.contains_key(&1));
-            assert!(!st.by_hash.contains_key(&2));
-            assert!(!st.by_hash.contains_key(&3));
-        }
+        assert!(!tree.debug_has_hash(1));
+        assert!(!tree.debug_has_hash(2));
+        assert!(!tree.debug_has_hash(3));
     }
 
     #[test]
@@ -1828,11 +2294,8 @@ mod tests {
         assert_eq!(m.matched_blocks, 2);
         assert_eq!(m.workers(), workers(&[&a]));
 
-        // Reverse index for hash 5 has 2 distinct nodes.
-        {
-            let st = tree.state.read();
-            assert_eq!(st.by_hash.get(&5).map(|s| s.len()), Some(2));
-        }
+        // Hash 5 is carried by 2 distinct nodes, summed across shards.
+        assert_eq!(tree.debug_hash_node_count(5), 2);
 
         // BlockRemoved [5] should remove A from BOTH nodes-carrying-5.
         // Both nodes are leaves, so both prune.
@@ -1845,6 +2308,41 @@ mod tests {
         let m = tree.match_prefix(None, &[2, 5]);
         assert_eq!(m.matched_blocks, 1);
         assert_eq!(m.workers(), workers(&[&a]));
+    }
+
+    /// Two chains whose ROOT hashes collide into the SAME shard stay fully
+    /// independent. Every other multi-root test spreads roots across
+    /// shards; this pins the colliding case.
+    #[test]
+    fn colliding_roots_in_same_shard_stay_independent() {
+        // Guarded so a change to N_SHARDS / SHARD_MIX fails loudly rather
+        // than silently making the test a no-op.
+        assert_eq!(
+            shard_of(1),
+            shard_of(22),
+            "test premise: roots 1 and 22 must share a shard",
+        );
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, None, &[1, 900]);
+        tree.insert(&b, None, &[22, 901]);
+
+        // Each chain matches in full with only its own worker.
+        let m = tree.match_prefix(None, &[1, 900]);
+        assert_eq!(m.matched_blocks, 2);
+        assert_eq!(m.workers(), workers(&[&a]));
+        let m = tree.match_prefix(None, &[22, 901]);
+        assert_eq!(m.matched_blocks, 2);
+        assert_eq!(m.workers(), workers(&[&b]));
+
+        // Removing A's chain leaves B's chain in the shared shard untouched.
+        tree.remove(&a, &[1, 900]);
+        assert_eq!(tree.match_prefix(None, &[1, 900]).matched_blocks, 0);
+        let m = tree.match_prefix(None, &[22, 901]);
+        assert_eq!(m.matched_blocks, 2);
+        assert_eq!(m.workers(), workers(&[&b]));
+        assert_eq!(tree.node_count(), 2);
     }
 
     #[test]
@@ -1910,6 +2408,265 @@ mod tests {
         let m = tree.match_prefix(None, &[9]);
         assert_eq!(m.matched_blocks, 1);
         assert_eq!(m.workers(), workers(&[&c]));
+    }
+
+    /// A `parent_hash` no shard carries root-attaches, but the chain's first
+    /// node keeps the hash so a later `BlockStored` for the parent can be
+    /// linked back through the reverse index (`resolve_parent`, case 4).
+    /// Resolving the parent globally must not drop that breadcrumb on the
+    /// way into the shard.
+    #[test]
+    fn unknown_parent_hash_root_attaches_but_keeps_the_breadcrumb() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert(&a, Some(99), &[1, 2]);
+
+        let m = tree.match_prefix(None, &[1, 2]);
+        assert_eq!(m.matched_blocks, 2, "the chain must attach at root");
+        assert!(m.holds(&a));
+        assert_eq!(
+            tree.debug_parent_block_hash(1),
+            Some(99),
+            "the unresolved parent must stay recorded on the chain's first node",
+        );
+    }
+
+    /// The forced root-attach of an unowned-ambiguous `parent_hash` must not
+    /// cost the chain its breadcrumb: the unsharded tree recorded the hash on
+    /// the first node whether or not `resolve_parent` fell back to root, and a
+    /// later `BlockStored` for that parent relinks through it.
+    #[test]
+    fn ambiguous_unowned_parent_root_attaches_but_keeps_the_breadcrumb() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let c = worker("http://c", 0);
+        // Two carriers of hash 5, neither held by C.
+        tree.insert(&a, None, &[1, 5]);
+        tree.insert(&b, None, &[2, 5]);
+        tree.insert(&c, Some(5), &[1009]);
+
+        assert_eq!(
+            tree.match_prefix(None, &[1009]).matched_blocks,
+            1,
+            "the chain must still root-attach",
+        );
+        assert_eq!(
+            tree.debug_parent_block_hash(1009),
+            Some(5),
+            "forcing the attach point must not drop the recorded parent",
+        );
+    }
+
+    /// Regression: an unowned-ambiguous `parent_hash` must attach the new
+    /// chain at ROOT even when its first hash routes to a shard that
+    /// locally carries `parent_hash` in exactly one node — the case where a
+    /// naive per-shard resolve attaches under that node instead.
+    #[test]
+    fn unowned_ambiguous_parent_force_roots_even_on_carrier_shard() {
+        // Guard the premise; a change to the shard count / mix needs new
+        // constants, not a silently weakened test.
+        assert_ne!(
+            shard_of(1),
+            shard_of(2),
+            "test premise: roots 1 and 2 must be on different shards",
+        );
+        assert_eq!(
+            shard_of(1009),
+            shard_of(1),
+            "test premise: continuation root 1009 must collide with root 1's shard",
+        );
+
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let c = worker("http://c", 0);
+        tree.insert(&a, None, &[1, 5]); // node-5 in shard_of(1)
+        tree.insert(&b, None, &[2, 5]); // node-5 in shard_of(2)
+
+        // C owns neither node-5, so the two carriers of 5 force a
+        // root-attach: 1009 becomes a fresh root child, not a child of 1->5.
+        tree.insert(&c, Some(5), &[1009]);
+
+        let m = tree.match_prefix(None, &[1009]);
+        assert_eq!(
+            m.matched_blocks, 1,
+            "1009 must attach at root, reachable as a top-level child",
+        );
+        assert_eq!(m.workers(), workers(&[&c]));
+
+        // And 1->5 must NOT have grown a 1009 child.
+        let m = tree.match_prefix(None, &[1, 5, 1009]);
+        assert_eq!(
+            m.matched_blocks, 2,
+            "1009 must NOT be attached under the shard's node carrying 5",
+        );
+    }
+
+    /// Regression: [`HashTree::route_match`] drops each shard's read lock
+    /// before the descent takes one, and readers never take
+    /// [`HashTree::writer`], so its resolution can go stale. A parent pruned
+    /// in that window leaves the shard's own start resolution falling back to
+    /// the NOMINATED shard's sentinel — which carries none of the chain, so
+    /// `matched_blocks` comes back 0 where the unsharded tree returns the
+    /// real match. The fall-back has to be the chain's own root shard.
+    ///
+    /// Driven through [`HashTree::descend_routed`] with a hand-made stale
+    /// pair: sequentially, `route_match` and the re-check always agree.
+    #[test]
+    fn a_pruned_parent_falls_back_to_the_chains_root_shard() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let chain = [1i64, 2, 3];
+        // Negative so it cannot collide with the chain; stepped until it
+        // lands off the chain's shard, which is what makes descending the
+        // nominated shard observably wrong.
+        let mut p = -7i64;
+        while shard_of(p) == shard_of(chain[0]) {
+            p -= 1;
+        }
+        tree.insert(&a, None, &chain);
+        tree.insert(&a, None, &[p]);
+
+        let (idx, parent) = tree.route_match(Some(p), &chain);
+        assert_eq!(
+            (idx, parent),
+            (shard_of(p), Some(p)),
+            "test premise: `p` resolves uniquely, to a shard that is not the chain's",
+        );
+
+        // The racing writer prunes `p` — empty and childless, so the node goes.
+        tree.remove(&a, &[p]);
+
+        assert_eq!(
+            tree.shards[idx]
+                .read()
+                .match_prefix(Some(p), &chain)
+                .matched_blocks,
+            0,
+            "test premise: the nominated shard's sentinel carries no chain, \
+             so an in-shard fall-back to root matches nothing",
+        );
+
+        let m = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.match_prefix(parent, &chain)
+        });
+        assert_eq!(
+            m.matched_blocks,
+            chain.len(),
+            "a stale resolution must fall back to the chain's root shard",
+        );
+        assert_eq!(m.workers(), workers(&[&a]));
+
+        let depths = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.prefix_depths(parent, &chain)
+        });
+        assert_eq!(
+            depths.get(&a),
+            Some(&chain.len()),
+            "`prefix_depths` shares the fall-back",
+        );
+    }
+
+    /// The other shape of the same staleness: `p` gains a second carrier in
+    /// the nominated shard between the scan and the descent. Ambiguity there
+    /// means the shard starts from its own sentinel, so the fall-back must
+    /// again be the chain's root shard rather than that shard's root.
+    #[test]
+    fn a_parent_that_gained_a_carrier_falls_back_to_the_chains_root_shard() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let chain = [1i64, 2, 3];
+        let p = -7i64;
+        // Two chain roots sharing ONE shard, and not the chain's: the second
+        // carrier has to land in the shard the scan already nominated.
+        let mut h1 = 4i64;
+        while shard_of(h1) == shard_of(chain[0]) {
+            h1 += 1;
+        }
+        let mut h2 = h1 + 1;
+        while shard_of(h2) != shard_of(h1) {
+            h2 += 1;
+        }
+        tree.insert(&a, None, &chain);
+        tree.insert(&a, None, &[h1, p]);
+
+        let (idx, parent) = tree.route_match(Some(p), &chain);
+        assert_eq!(
+            (idx, parent),
+            (shard_of(h1), Some(p)),
+            "test premise: one carrier of `p`, off the chain's shard",
+        );
+
+        // The racing writer roots a second chain carrying `p` in that shard.
+        tree.insert(&a, None, &[h2, p]);
+
+        assert_eq!(
+            tree.shards[idx]
+                .read()
+                .match_prefix(Some(p), &chain)
+                .matched_blocks,
+            0,
+            "test premise: ambiguity sends the descent to the wrong sentinel",
+        );
+
+        let m = tree.descend_routed(idx, parent, &chain, |shard, parent| {
+            shard.match_prefix(parent, &chain)
+        });
+        assert_eq!(
+            m.matched_blocks,
+            chain.len(),
+            "a resolution invalidated by a second carrier must fall back to \
+             the chain's root shard",
+        );
+        assert_eq!(m.workers(), workers(&[&a]));
+    }
+
+    /// Two concurrent writers must not be able to orphan a chain. A prune
+    /// from `KvEventIndex::remove_worker`'s task landing between `insert`'s
+    /// shard scan and its write leaves the insert re-rooting the chain under
+    /// the CHOSEN SHARD's sentinel — not `shard_of(block_hashes[0])`, so
+    /// `match_prefix(None, …)` can never reach it again. Fails without
+    /// [`HashTree::writer`].
+    #[test]
+    fn concurrent_writers_never_orphan_a_chain() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let tree = Arc::new(HashTree::new());
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        // `h0` must route to a different shard than the chain root `r`, so
+        // a wrongly-rooted continuation is observable.
+        let (r, p) = (1i64, 5i64);
+        let mut h0 = 2i64;
+        while shard_of(h0) == shard_of(r) {
+            h0 += 1;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let clearer = {
+            let (tree, b, stop) = (tree.clone(), b.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    tree.clear_worker(&b);
+                }
+            })
+        };
+
+        for _ in 0..20_000 {
+            tree.insert(&b, None, &[r, p]);
+            tree.insert(&a, Some(p), &[h0]);
+            assert!(
+                tree.debug_roots_in_own_shard(),
+                "a continuation was re-rooted in the wrong shard: unreachable \
+                 from match_prefix(None, ..) for the rest of the process",
+            );
+            tree.clear_worker(&a);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        clearer.join().expect("clearer thread panicked");
     }
 
     #[test]
@@ -2010,14 +2767,10 @@ mod tests {
         assert_eq!(m.workers(), workers(&[&a]));
 
         // Confirm parent_block_hash chain: node carrying 30 should record
-        // parent_block_hash = Some(20).
-        let st = tree.state.read();
-        let n30_id = *st.by_hash.get(&30).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n30_id].parent_block_hash, Some(20));
-        let n20_id = *st.by_hash.get(&20).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n20_id].parent_block_hash, Some(10));
-        let n10_id = *st.by_hash.get(&10).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n10_id].parent_block_hash, None);
+        // parent_block_hash = Some(20), 20 -> Some(10), 10 -> None.
+        assert_eq!(tree.debug_parent_block_hash(30), Some(20));
+        assert_eq!(tree.debug_parent_block_hash(20), Some(10));
+        assert_eq!(tree.debug_parent_block_hash(10), None);
     }
 
     #[test]
@@ -2036,5 +2789,34 @@ mod tests {
         let m = tree.match_prefix(None, &[1, 2, 3]);
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers(), workers(&[&b]));
+    }
+
+    /// Distinct chain roots spread over several shards, yet every chain
+    /// still matches in full — the routing invariant sharding relies on.
+    #[test]
+    fn distinct_roots_spread_across_shards() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        for r in 0..64i64 {
+            tree.insert(&a, None, &[r * 1000, r * 1000 + 1]);
+        }
+        assert_eq!(tree.node_count(), 128);
+
+        // Else the test is not exercising cross-shard routing at all.
+        let used_shards = (0..64i64)
+            .map(|r| shard_of(r * 1000))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            used_shards > 1,
+            "expected roots to span multiple shards, got {used_shards}",
+        );
+
+        // Every chain still matches in full.
+        for r in 0..64i64 {
+            let m = tree.match_prefix(None, &[r * 1000, r * 1000 + 1]);
+            assert_eq!(m.matched_blocks, 2, "chain {r} must match fully");
+            assert_eq!(m.workers(), workers(&[&a]));
+        }
     }
 }
