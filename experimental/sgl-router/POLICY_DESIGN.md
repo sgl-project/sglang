@@ -303,13 +303,14 @@ Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
 use power-of-two without creating assignments. A new or out-of-group binding
-uses power-of-two with default limits, then the session policy checks its selected
-engine before binding. A concurrent live assignment wins, but is checked before
-returning it; rejection ends that attempt without rewriting the binding or
-retrying another engine. Existing bindings are reused regardless of pressure
-when admitted. Session policies can be attached independently to each role.
-Programmatic reorg callers configure `model.affinity.session_id_header` for HTTP
-header extraction; this does not enable legacy global modes or backup escape.
+uses power-of-two with `AdmissionLimits::default()`, then the session policy
+checks its selected engine before binding. A concurrent live assignment wins,
+but is checked before returning it; rejection ends that attempt without
+rewriting the binding or retrying another engine. Existing bindings are reused
+regardless of pressure when admitted. Session policies can be attached
+independently to each role. Programmatic reorg callers configure
+`model.affinity.session_id_header` for HTTP header extraction; this does not
+enable legacy global modes or backup escape.
 
 Session and sticky policies do not create assignments for missing keys. A
 binding outside the candidates cannot win. A missing binding may invoke policy
@@ -503,7 +504,7 @@ do not accept and ignore them.
 - Preserve configured capacity, pending-prefill, and in-flight checks, including
   their missing-report behavior. Power-of-two applies admission to its selected
   engine; other policies explicitly place checks in their selection logic.
-  Other paths use `AdmissionLimits::default()` unless limits are configured.
+  Other paths use `AdmissionLimits::default()` unless a check is configured.
   Never silently discard a configured budget.
 
 Listener and shutdown configuration, discovery, worker health and circuit
