@@ -665,3 +665,16 @@ def validate_prefill_cp_platform(server_args: Any):
         raise ValueError(
             "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
         )
+
+
+def handle_fault_tolerance(server_args: Any):
+    cfg = resolving_view(server_args)
+    if not cfg.enable_fault_tolerance:
+        return
+    assert cfg.dp_size > 1, "Fault tolerance requires --dp-size greater than 1."
+    assert cfg.enable_dp_attention, "Fault tolerance requires --enable-dp-attention."
+    assert cfg.disaggregation_mode == "null", (
+        "Fault tolerance does not support disaggregation."
+    )
+    assert cfg.fault_tolerance_on_error_strategy in ("pause", "continue")
+    assert cfg.fault_tolerance_timeout > 0 and cfg.fault_tolerance_pause_timeout > 0
