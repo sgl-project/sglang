@@ -149,9 +149,8 @@ If you don’t have permission and you’re not the PR author, please ask mainta
 
 ### CI control labels
 
-Four labels change how a PR's CI runs. Each is read live at dispatch time, so a
-label added to a run that is already queued or in flight does not apply to it --
-label the PR first, then trigger.
+Four labels change how a PR's CI runs. Label before you trigger:
+`max-concurrency` fixes the shard fan-out when the run is created.
 
 | Label | Effect |
 | --- | --- |
@@ -160,10 +159,8 @@ label the PR first, then trigger.
 | `max-concurrency` | A suite fans out to all of its shards at once rather than a third of them. |
 | `highest-priority` | All three of the above, and the PR is also skipped by the batch-cancel workflow, sorted first in the active-runs report, and never closed as stale. |
 
-Every one of them multiplies the GPU-runner time a single PR consumes, so they
-exist to unblock a specific PR rather than as a default. `parallel-stages` in
-particular removes the gate that otherwise stops a doomed PR after its first
-stage, so a PR that cannot pass runs its whole matrix.
+Each spends extra runner capacity, so they unblock a specific PR rather than
+serve as a default.
 
 ### CI rate limits
 

@@ -151,13 +151,8 @@ self-hosted GPU runners; `highest-priority` relaxes all of them at once. The
 [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels)
 describes what each one does.
 
-Two things to know before applying one:
-
-- They take effect at dispatch. Labelling a run that is already queued or in
-  flight changes nothing; label first, then trigger.
-- Applying one is a decision to spend other PRs' runner capacity on this one.
-  `parallel-stages` is the expensive one -- it removes the gate that stops a
-  failing PR after its first stage, so the whole matrix runs either way.
+Applying one spends other PRs' runner capacity. `parallel-stages` is the
+expensive one: a PR that cannot pass now runs its whole matrix.
 
 ## CI Maintenance Mode
 When the CI is unhealthy (e.g., the scheduled pr-test on `main` is broken for consecutive runs), the project enters **CI Maintenance Mode** by opening [issue #21065](https://github.com/sgl-project/sglang/issues/21065). While active:
