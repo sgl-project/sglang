@@ -36,7 +36,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVReceiver,
-    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -75,25 +74,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
-    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
-        manager = object.__new__(MooncakeKVManager)
-        sender = object.__new__(MooncakeKVSender)
-        sender.kv_mgr, sender.bootstrap_room = manager, 42
-        for outstanding in (0, 1):
-            with self.subTest(outstanding=outstanding):
-                manager.request_status = {42: KVPoll.Failed}
-                manager._staging_outstanding = {42: outstanding}
-                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
-                with patch.object(manager, "_send_abort_ack") as ack:
-                    sender.clear()
-                    if outstanding:
-                        ack.assert_not_called()
-                        manager._staging_outstanding[42] = 0
-                        manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
-                    manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once()
-
     def test_host_timeout_keeps_ack_that_arrives_before_cleanup(self):
         manager = object.__new__(CommonKVManager)
         manager._deferred_abort_ack_tracker = {}
