@@ -1,4 +1,4 @@
-﻿"""The DeepGEMM two-level indexer on the dense prefill path against the torch
+"""The DeepGEMM two-level indexer on the dense prefill path against the torch
 block selection and the dense implementation of the same protocol."""
 
 import unittest
@@ -17,9 +17,9 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
 from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
     DenseCandidateIndexer,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.srt.runtime_context import get_parallel
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -344,10 +344,17 @@ def test_cp_prefill_matches_dense_with_shuffled_pages(ratio, cp_size):
                 start = selected.request_starts[row]
                 got = positions[row][positions[row] >= 0].long() - start
                 want = expected[row][expected[row] >= 0].long() - start
-                assert got.numel() == want.numel() == min(TOPK, selected.compress_lens[row].item())
+                assert (
+                    got.numel()
+                    == want.numel()
+                    == min(TOPK, selected.compress_lens[row].item())
+                )
                 assert ((got >= 0) & (got < selected.compress_lens[row])).all()
                 assert got.unique().numel() == got.numel()
-                assert len(set(got.tolist()) & set(want.tolist())) >= 0.95 * want.numel()
+                assert (
+                    len(set(got.tolist()) & set(want.tolist()))
+                    >= 0.95 * want.numel()
+                )
                 blocks = sparse_table.blocks[row]
                 columns = torch.searchsorted(blocks, got // BLOCK)
                 assert torch.equal(blocks[columns].long(), got // BLOCK)
@@ -414,6 +421,7 @@ def test_cp_signed_prefill_selects_topk_of_consumed_logits(rank, monkeypatch):
         valid_length = int(table.valid_lens[row])
         assert (sparse_columns < valid_length).all()
         scores = captured[0][row, :valid_length]
+        # Equal scores may choose different indices; compare their multisets.
         torch.testing.assert_close(
             scores[sparse_columns].sort().values,
             torch.topk(scores, got.numel()).values.sort().values,
