@@ -1277,6 +1277,7 @@ export const Deployment = ({ config, benchmarks }) => {
   };
 
   const [sel, setSel] = useState(() => initialSelectionFromCells());
+  const [selectionHydrated, setSelectionHydrated] = useState(false);
   const INTERNAL_HASH_STATE_KEY = "__sglangDeployInternalHash";
   const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
   useEffect(() => {
@@ -1310,12 +1311,14 @@ export const Deployment = ({ config, benchmarks }) => {
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     };
     hydrate();
+    setSelectionHydrated(true);
     window.addEventListener("hashchange", hydrate);
     return () => window.removeEventListener("hashchange", hydrate);
   }, []);
   // history.replaceState does NOT fire hashchange — dispatch a custom event so
   // the Playground hears chip-click selection changes.
   useEffect(() => {
+    if (!selectionHydrated) return;
     const target = "#" + new URLSearchParams(sel).toString();
     if (window.location.hash !== target) {
       const historyState =
@@ -1329,7 +1332,7 @@ export const Deployment = ({ config, benchmarks }) => {
       );
     }
     window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
-  }, [sel]);
+  }, [sel, selectionHydrated]);
 
   const [modal, setModal] = useState(null); // 'curl' | 'env' | 'bench' | null
   useEffect(() => {
@@ -2011,7 +2014,7 @@ export const Deployment = ({ config, benchmarks }) => {
       const options = visibleOptions(dim, sel);
       const currentOption = selectedOption(dim);
       return (
-        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+        <section className={["sgd-builder-context", className].filter(Boolean).join(" ")} aria-live={direct ? undefined : "polite"}>
           <div className="sgd-builder-context-heading">
             <div>
               <span>{direct ? dim.title : `${dim.title} options`}</span>
