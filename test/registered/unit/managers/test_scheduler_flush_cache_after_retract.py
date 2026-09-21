@@ -11,7 +11,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 def _make_req(is_retracted: bool) -> MagicMock:

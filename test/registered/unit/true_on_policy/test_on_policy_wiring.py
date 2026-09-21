@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import textwrap
 import unittest
 from types import SimpleNamespace
@@ -25,70 +26,20 @@ from sglang.srt.true_on_policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-_PATCH_TARGET = "sglang.srt.server_args.get_global_server_args"
+_PATCH_TARGET = "sglang.srt.runtime_context.get_server_args"
 
 
 def _run_server_args_script(argv: list[str]) -> dict[str, object]:
-    stubbed_imports = textwrap.dedent("""
+    script_body = textwrap.dedent("""
         import argparse
-        import importlib.machinery
         import json
-        import sys
-        import types
         from types import SimpleNamespace
         from unittest.mock import patch
 
-        from pydantic import BaseModel
-
-        def install_openai_stubs():
-            openai_mod = types.ModuleType("openai")
-            openai_types_mod = types.ModuleType("openai.types")
-            openai_responses_mod = types.ModuleType("openai.types.responses")
-            openai_response_mod = types.ModuleType("openai.types.responses.response")
-            openai_tool_mod = types.ModuleType("openai.types.responses.tool")
-
-            openai_mod.__spec__ = importlib.machinery.ModuleSpec("openai", loader=None)
-            openai_types_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types", loader=None)
-            openai_responses_mod.__spec__ = importlib.machinery.ModuleSpec(
-                "openai.types.responses", loader=None
-            )
-            openai_response_mod.__spec__ = importlib.machinery.ModuleSpec(
-                "openai.types.responses.response", loader=None
-            )
-            openai_tool_mod.__spec__ = importlib.machinery.ModuleSpec(
-                "openai.types.responses.tool", loader=None
-            )
-
-            for name in [
-                "ResponseFunctionToolCall",
-                "ResponseInputItemParam",
-                "ResponseOutputItem",
-                "ResponseOutputMessage",
-                "ResponseOutputText",
-                "ResponseReasoningItem",
-            ]:
-                setattr(openai_responses_mod, name, type(name, (BaseModel,), {}))
-
-            openai_response_mod.ToolChoice = type("ToolChoice", (BaseModel,), {})
-            openai_tool_mod.Tool = type("Tool", (BaseModel,), {})
-
-            sys.modules.setdefault("openai", openai_mod)
-            sys.modules.setdefault("openai.types", openai_types_mod)
-            sys.modules.setdefault("openai.types.responses", openai_responses_mod)
-            sys.modules.setdefault("openai.types.responses.response", openai_response_mod)
-            sys.modules.setdefault("openai.types.responses.tool", openai_tool_mod)
-
-        install_openai_stubs()
-
-        hf_utils_mod = types.ModuleType("sglang.srt.utils.hf_transformers_utils")
-        hf_utils_mod.__spec__ = importlib.machinery.ModuleSpec(
-            "sglang.srt.utils.hf_transformers_utils", loader=None
-        )
-        hf_utils_mod.check_gguf_file = lambda *args, **kwargs: False
-        sys.modules.setdefault("sglang.srt.utils.hf_transformers_utils", hf_utils_mod)
-
+        from sglang.srt.arg_groups.attention_hook import handle_deterministic_inference
+        from sglang.srt.arg_groups.overrides import resolved_view
         from sglang.srt.server_args import ServerArgs
 
         def _mock_model_config():
@@ -100,21 +51,23 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
         ServerArgs.add_cli_args(parser)
         cli_args = parser.parse_args(ARGV)
 
-        with patch("sglang.srt.server_args.get_device", return_value="cuda"), patch.object(
-            ServerArgs, "get_model_config", return_value=_mock_model_config()
+        server_args = ServerArgs.from_cli_args(cli_args)
+        with patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_mock_model_config(),
         ):
-            server_args = ServerArgs.from_cli_args(cli_args)
-            server_args._handle_deterministic_inference()
+            handle_deterministic_inference(server_args)
+        config = resolved_view(server_args)
 
         print(
             json.dumps(
                 {
-                    "enable_deterministic_inference": server_args.enable_deterministic_inference,
-                    "enable_prefill_only_deterministic_inference": server_args.enable_prefill_only_deterministic_inference,
-                    "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
-                    "rl_on_policy_target": server_args.rl_on_policy_target,
-                    "true_on_policy_contract": server_args.true_on_policy_contract,
-                    "sampling_backend": server_args.sampling_backend,
+                    "enable_deterministic_inference": config.enable_deterministic_inference,
+                    "enable_prefill_only_deterministic_inference": config.enable_prefill_only_deterministic_inference,
+                    "enable_flashinfer_allreduce_fusion": config.enable_flashinfer_allreduce_fusion,
+                    "rl_on_policy_target": config.rl_on_policy_target,
+                    "true_on_policy_contract": config.true_on_policy_contract,
+                    "sampling_backend": config.sampling_backend,
                 }
             )
         )
@@ -126,9 +79,9 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
     env["PYTHONPATH"] = (
         f"{repo_python}{os.pathsep}{pythonpath}" if pythonpath else repo_python
     )
-    script = f"ARGV = {argv!r}\n{stubbed_imports}"
+    script = f"ARGV = {argv!r}\n{script_body}"
     completed = subprocess.run(
-        ["python", "-c", script],
+        [sys.executable, "-c", script],
         check=True,
         capture_output=True,
         text=True,
@@ -399,6 +352,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         from sglang.srt.layers.communicator import (
             CommunicateWithAllReduceAndLayerNormFn,
         )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         hidden_states = torch.ones(2, 4)
         residual = torch.full((2, 4), 3.0)
@@ -429,7 +383,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
                     hidden_states,
                     residual,
-                    forward_batch=None,
+                    forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
                     layernorm=FakeNorm(),
                     context=SimpleNamespace(attn_dp_size=1, cache=None),
                     residual_input_mode=None,
