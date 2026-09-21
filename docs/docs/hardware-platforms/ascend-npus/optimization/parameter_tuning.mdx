@@ -182,9 +182,9 @@ These arguments and environment variables are critical for tuning prefill perfor
       <td>true</td>
     </tr>
     <tr>
-      <td>`--disable-cuda-graph`</td>
-      <td>Disables CUDA Graph capture. CUDA Graphs reduce kernel launch overhead for small, predictable batch sizes, making them ideal for decode. For prefill with large and variable batch sizes, CUDA Graphs provide minimal benefit and can cause issues with dynamic shapes. Set this flag on prefill nodes; leave unset on decode nodes.</td>
-      <td>true</td>
+      <td>`--cuda-graph-backend-prefill=disabled`</td>
+      <td>Disables prefill-phase graph capture/replay (eager prefill). Graphs reduce kernel launch overhead for small, predictable batch sizes and are most useful in decode. Prefill with large or variable shapes often gains little and can fail on dynamic shapes; set this on dedicated prefill nodes and leave decode graphs enabled. `--disable-cuda-graph` is deprecated.</td>
+      <td>prefill role</td>
     </tr>
     <tr>
       <td>`--enable-dsa-prefill-context-parallel`</td>
@@ -757,10 +757,10 @@ Breaks large prefill computations into smaller, fixed-size chunks for better sch
 
 ### NPU Graph (`--cuda-graph-bs`)
 
-Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs`). Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
+Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs-decode`, and `--cuda-graph-bs-prefill` when prefill graphs are enabled). `--cuda-graph-bs` is deprecated. Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
 
 <Note>
-  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, NPU Graph must be disabled via `--disable-cuda-graph`.
+  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, disable graphs with `--cuda-graph-backend-decode=disabled` and `--cuda-graph-backend-prefill=disabled`. `--disable-cuda-graph` is deprecated.
 </Note>
 
 ### Speculative Decoding (`--speculative-algorithm`)
