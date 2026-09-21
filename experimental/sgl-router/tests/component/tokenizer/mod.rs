@@ -4,3 +4,5 @@
 mod kimi;
 mod parity;
 mod render_parity;
+
+mod deepseek;
