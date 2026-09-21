@@ -411,7 +411,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         queue._num_published_destinations = 0
         queue.num_reserved_decode_tokens = 0
         queue.scheduler = SimpleNamespace(
-            enable_hisparse=False, enable_decode_hicache=False
+            enable_hisparse=False,
+            enable_decode_hicache=False,
+            tp_worker=SimpleNamespace(is_hybrid_swa=False),
         )
         kv_args = KVArgs()
         kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
