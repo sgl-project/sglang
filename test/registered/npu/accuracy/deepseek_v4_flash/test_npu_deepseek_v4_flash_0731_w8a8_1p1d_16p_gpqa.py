@@ -43,12 +43,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     # MTP (DSPARK)
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    # dspark correctness-first setup (exported globally in pd.sh)
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
@@ -70,16 +77,11 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "SGLANG_NPU_USE_MULTI_STREAM": "0",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
-    # dspark correctness-first setup
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
-    "SGLANG_DSPARK_QUANT_AUDIT": "1",
-    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
+    # pd.sh also exports this on the decode node
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
-# Prefill node (1 node x 16 NPUs, TP16 DP8) launch arguments.
+# Prefill node (1 node x 16 NPUs, TP16 DP16) launch arguments.
 # Radix cache is intentionally ENABLED on prefill (no --disable-radix-cache).
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -100,17 +102,17 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-bootstrap-port",
     8998,
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
-    6,
+    256,
     "--max-prefill-tokens",
-    140000,
+    67000,
     "--chunked-prefill-size",
     65536,
     "--max-running-requests",
-    128,
+    256,
     "--dp-size",
-    8,
+    16,
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
@@ -165,13 +167,17 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     140000,
     "--load-balance-method",
     "round_robin",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     3,
     4,
     5,
     6,
+    7,
+    8,
+    9,
+    10,
     # DSPARK speculative decoding with the bundled W8A8 draft.
     "--speculative-algorithm",
     "DSPARK",
