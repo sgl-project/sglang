@@ -1191,8 +1191,8 @@ def fused_sigmoid_gating_delta_rule_update(
         # computes every node output without materializing per-node [V, K]
         # states; the post-sampling tree commit folds only the accepted path.
         tree_width = retrieve_parent_token.shape[1]
-        assert tree_width in (31, 33, 49, 65), (
-            "factorized tree supports node=31, 33, 49, or 65, got "
+        assert 17 <= tree_width <= 65, (
+            "factorized tree experimental fixed width must be in [17, 65], got "
             f"{tree_width}"
         )
         assert retrieve_parent_token.shape == (N, tree_width)
@@ -1282,12 +1282,12 @@ def fused_sigmoid_gating_delta_rule_update(
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
-        # Width 31 fits one 32-row output tile and benefits from a smaller CTA.
-        # Widths 33/49 retain the original 64-row tile: splitting them adds a
-        # second program and regresses end-to-end throughput despite small
-        # microbenchmark wins. Width 65 must split to avoid a 128x128 tile.
-        factor_verify_bm = 32 if tree_width in (31, 65) else 64
-        if tree_width == 31:
+        # Keep one output-row tile through width 64. Widths up to 32 use a
+        # 32-row CTA; width 65 is split to avoid a costly 128x128 tile. This
+        # also permits controlled fixed-width sweeps without changing the
+        # production adaptive/batch-aware buckets.
+        factor_verify_bm = 32 if tree_width <= 32 or tree_width == 65 else 64
+        if tree_width <= 32:
             factor_verify_num_warps = 4
             factor_verify_num_stages = 2
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
