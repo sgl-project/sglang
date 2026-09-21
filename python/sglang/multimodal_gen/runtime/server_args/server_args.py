@@ -2573,10 +2573,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "component=value entries, e.g. --layerwise-resident-layers "
             "text_encoder=4. The resident set is scoped to one use: transferred "
             "when the component starts running and released when that use ends. "
-            "That pays for a DiT, whose use spans every denoise step. It buys "
-            "nothing for an auxiliary component whose use is a single forward "
-            "pass -- such a component re-transfers the whole set on every "
-            "request, so setting this for one has no effect today.",
+            "It pays wherever a single use makes many passes over the layers -- a "
+            "DiT across the denoise steps, a video VAE across the latent chunks. "
+            "It buys nothing for a component whose use is one forward pass, such "
+            "as a text encoder: the whole set is re-transferred every request, so "
+            "setting this for one has no effect today.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",
