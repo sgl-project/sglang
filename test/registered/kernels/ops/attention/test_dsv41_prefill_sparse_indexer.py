@@ -1,15 +1,17 @@
-"""The DeepGEMM two-level indexer on the dense prefill path against the torch
+﻿"""The DeepGEMM two-level indexer on the dense prefill path against the torch
 block selection and the dense implementation of the same protocol."""
 
 import unittest
 from typing import NamedTuple
 
 import msgspec
+import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     PrefillIndexerInputs,
+    make_candidate_indexer,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
@@ -17,6 +19,7 @@ from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.runtime_context import get_parallel
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -223,6 +226,202 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
             self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+
+
+def _cp_indexer(cp_size=1):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("DeepGEMM paged sparse MQA logits need SM100")
+    with get_parallel().override(attn_cp_size=cp_size):
+        return make_candidate_indexer(TOPK_BLOCKS, BLOCK)
+
+
+def _take_prefill_rows(inputs, rows, counts):
+    return msgspec.structs.replace(
+        inputs,
+        q_fp4=inputs.q_fp4[rows].contiguous(),
+        q_sf=inputs.q_sf[rows].contiguous(),
+        weights=inputs.weights[rows].contiguous(),
+        compress_lens=inputs.compress_lens[rows].contiguous(),
+        request_starts=inputs.request_starts[rows].contiguous(),
+        kv_page_table=inputs.kv_page_table[rows].contiguous(),
+        rows_per_request=counts,
+    )
+
+
+def _cp_case(ratio):
+    counts, contexts = [1, 47, 48], [256, 20224, 17920]
+    cases = [
+        make_case((n + 3) // 4 * 4, ctx, seed=ctx).inputs
+        for n, ctx in zip(counts, contexts)
+    ]
+    kv_page = 2 * PAGE
+    pages_per_request = [ctx * ratio // kv_page for ctx in contexts]
+    physical_pages = torch.randperm(sum(pages_per_request), device="cuda")
+    packed = torch.cat([c.k_cache for c in cases])
+    cache = torch.empty_like(packed)
+    cache.view(-1, 2 // ratio, PAGE, 1, 68)[physical_pages] = packed.view(
+        -1, 2 // ratio, PAGE, 1, 68
+    )
+    req_to_token = torch.zeros(
+        3, max(contexts) * ratio, dtype=torch.int64, device="cuda"
+    )
+    page_table = torch.zeros(
+        3, max(pages_per_request), dtype=torch.int32, device="cuda"
+    )
+    for request, pages in enumerate(physical_pages.split(pages_per_request)):
+        page_table[request, : pages.numel()] = pages
+        slots = pages[:, None] * kv_page + torch.arange(kv_page, device="cuda")
+        req_to_token[request, : slots.numel()] = slots.flatten()
+    request_ids = torch.repeat_interleave(
+        torch.arange(3, device="cuda"), torch.tensor(counts, device="cuda")
+    )
+    seq_lens = torch.cat(
+        [
+            torch.arange(ctx * ratio - n + 1, ctx * ratio + 1, device="cuda")
+            for n, ctx in zip(counts, contexts)
+        ]
+    ).int()
+    inputs = PrefillIndexerInputs(
+        q_fp4=torch.cat([c.q_fp4[:n] for c, n in zip(cases, counts)]),
+        q_sf=torch.cat([c.q_sf[:n] for c, n in zip(cases, counts)]),
+        weights=torch.cat([c.weights[:n] for c, n in zip(cases, counts)]),
+        compress_lens=seq_lens // ratio,
+        request_starts=torch.tensor(
+            [0, contexts[0], sum(contexts[:2])], device="cuda", dtype=torch.int32
+        )[request_ids],
+        lens_per_request=contexts,
+        rows_per_request=counts,
+        kv=tuple(torch.cat([c.kv[i] for c in cases]) for i in range(2)),
+        k_cache=cache,
+        page_size=PAGE,
+        kv_page_table=page_table[request_ids],
+        kv_page_size=kv_page,
+        compress_ratio=ratio,
+    )
+    return inputs, req_to_token, request_ids
+
+
+@pytest.mark.parametrize("ratio,cp_size", [(1, 2), (2, 4)])
+@torch.inference_mode()
+def test_cp_prefill_matches_dense_with_shuffled_pages(ratio, cp_size):
+    """Sparse selection on CP-local rows must match dense scores on one GPU."""
+    indexer, dense = _cp_indexer(cp_size), DenseCandidateIndexer(TOPK_BLOCKS, BLOCK)
+    inputs, req_to_token, request_ids = _cp_case(ratio)
+    for rank in range(cp_size):
+        rows = torch.arange(rank, inputs.num_rows, cp_size, device="cuda")
+        ids = request_ids[rows]
+        counts = torch.bincount(ids, minlength=3).tolist()
+        local = _take_prefill_rows(inputs, rows, counts)
+        table, own = publish(indexer, local)
+        reference, own_dense = publish(dense, local)
+        assert torch.equal(own.sort().values, own_dense.sort().values)
+        consumer = msgspec.structs.replace(
+            local,
+            q_fp4=local.q_fp4.roll(1, 0),
+            q_sf=local.q_sf.roll(1, 0),
+            weights=local.weights.roll(1, 0),
+        )
+        scores = torch.empty(0, device="cuda")
+        tail_counts = [0, min(4, counts[1]), min(4, counts[2])]
+        ends = torch.tensor(counts, device="cuda").cumsum(0).tolist()
+        tail_rows = torch.cat(
+            [
+                torch.arange(end - n, end, device="cuda")
+                for end, n in zip(ends, tail_counts)
+                if n
+            ]
+        )
+        for tail, selected_rows, lengths in (
+            (False, torch.arange(local.num_rows, device="cuda"), counts),
+            (True, tail_rows, tail_counts),
+        ):
+            sparse_table = indexer.prefill_tail(table, lengths) if tail else table
+            dense_table = dense.prefill_tail(reference, lengths) if tail else reference
+            selected = _take_prefill_rows(consumer, selected_rows, lengths)
+            positions = select(indexer, sparse_table, selected)
+            expected = select(dense, dense_table, selected)
+            for row, source_row in enumerate(selected_rows.tolist()):
+                start = selected.request_starts[row]
+                got = positions[row][positions[row] >= 0].long() - start
+                want = expected[row][expected[row] >= 0].long() - start
+                assert got.numel() == want.numel() == min(TOPK, selected.compress_lens[row].item())
+                assert ((got >= 0) & (got < selected.compress_lens[row])).all()
+                assert got.unique().numel() == got.numel()
+                assert len(set(got.tolist()) & set(want.tolist())) >= 0.95 * want.numel()
+                blocks = sparse_table.blocks[row]
+                columns = torch.searchsorted(blocks, got // BLOCK)
+                assert torch.equal(blocks[columns].long(), got // BLOCK)
+                slots = (
+                    sparse_table.phys_blocks[row, columns].long() * BLOCK + got % BLOCK
+                )
+                assert torch.equal(
+                    slots, req_to_token[ids[source_row], got * ratio] // ratio
+                )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@torch.inference_mode()
+def test_cp_signed_prefill_selects_topk_of_consumed_logits(rank, monkeypatch):
+    """Check signed BF16 selection and CP page mapping using consumed logits."""
+    from sglang.srt.layers.attention.dsv4 import candidate_indexer_deep_gemm as sparse
+
+    indexer = _cp_indexer(4)
+    inputs, req_to_token, request_ids = _cp_case(2)
+    rows = torch.arange(rank, inputs.num_rows, 4, device="cuda")
+    ids = request_ids[rows]
+    counts = torch.bincount(ids, minlength=3).tolist()
+    local = _take_prefill_rows(inputs, rows, counts)
+    local = msgspec.structs.replace(
+        local, weights=(2 * local.weights - 1).bfloat16().float()
+    )
+    table, own = publish(indexer, local)
+    reference, own_dense = publish(DenseCandidateIndexer(TOPK_BLOCKS, BLOCK), local)
+    assert torch.equal(own.sort().values, own_dense.sort().values)
+    source_blocks = [row for blocks in reference.request_blocks for row in blocks]
+    consumer = msgspec.structs.replace(
+        local,
+        q_fp4=local.q_fp4.roll(1, 0),
+        q_sf=local.q_sf.roll(1, 0),
+        weights=local.weights.roll(1, 0),
+    )
+    captured = []
+    original = sparse.sparse_logits
+
+    def capture_logits(*args, **kwargs):
+        logits = original(*args, **kwargs)
+        captured.append(logits)
+        return logits
+
+    monkeypatch.setattr(sparse, "sparse_logits", capture_logits)
+    positions = select(indexer, table, consumer)
+    assert len(captured) == 1 and captured[0].dtype == torch.bfloat16
+    for row, length in enumerate(local.compress_lens.tolist()):
+        blocks = table.blocks[row]
+        want_blocks = source_blocks[row]
+        assert torch.equal(
+            blocks[blocks < (length + BLOCK - 1) // BLOCK],
+            want_blocks[want_blocks >= 0].sort().values,
+        )
+        valid = positions[row] >= 0
+        assert (positions[row, ~valid] == -1).all()
+        got = positions[row, valid].long() - local.request_starts[row]
+        assert got.numel() == got.unique().numel() == min(TOPK, length)
+        assert ((got >= 0) & (got < length)).all()
+        columns = torch.searchsorted(blocks, got // BLOCK)
+        assert (columns < blocks.numel()).all()
+        assert torch.equal(blocks[columns].long(), got // BLOCK)
+        sparse_columns = columns * BLOCK + got % BLOCK
+        valid_length = int(table.valid_lens[row])
+        assert (sparse_columns < valid_length).all()
+        scores = captured[0][row, :valid_length]
+        torch.testing.assert_close(
+            scores[sparse_columns].sort().values,
+            torch.topk(scores, got.numel()).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+        slots = table.phys_blocks[row, columns].long() * BLOCK + got % BLOCK
+        assert torch.equal(slots, req_to_token[ids[row], got * 2] // 2)
 
 
 if __name__ == "__main__":
