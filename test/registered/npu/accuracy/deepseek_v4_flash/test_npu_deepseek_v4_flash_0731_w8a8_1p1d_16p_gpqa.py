@@ -118,8 +118,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--context-length",
-    140000,
     "--disable-cuda-graph",
     "--load-balance-method",
     "round_robin",
@@ -158,8 +156,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--context-length",
-    140000,
     "--load-balance-method",
     "round_robin",
     "--cuda-graph-bs-decode",
@@ -214,11 +210,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH = {
 class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
 ):
-    """Test NPU accuracy for DSV4-Flash-0731 W8A8 PD-Sep GPQA High mode.
-
-    Requirement: DSV4_Flash_Radix_Cache_0 (step 2, 1P1D PD separation with
-    radix cache enabled).
-    """
+    """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D DSPARK GPQA."""
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
