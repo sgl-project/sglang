@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 
@@ -6,6 +7,13 @@ import torch
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpForConditionalGeneration,
+    Qwen4ExpModel,
+    _is_weight_outside_pp_stage,
+    _pack_qwen4_exp_pp_proxy,
+    _unpack_qwen4_exp_pp_proxy,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,6 +106,41 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
 
         self.assertEqual(loaded, {"model.embed_tokens.weight"})
         torch.testing.assert_close(model.model.embed_tokens.weight, expected)
+
+    def test_qwen4_exp_exposes_pipeline_parallel_inputs(self):
+        self.assertIn(
+            "pp_proxy_tensors",
+            inspect.signature(Qwen4ExpForConditionalGeneration.forward).parameters,
+        )
+        self.assertIn(
+            "pp_proxy_tensors", inspect.signature(Qwen4ExpModel.forward).parameters
+        )
+
+    def test_qwen4_exp_pipeline_proxy_uses_flat_hidden_state(self):
+        hidden_states = torch.zeros((2, 10240))
+
+        proxy = _pack_qwen4_exp_pp_proxy(hidden_states)
+        unpacked_hidden_states, residual = _unpack_qwen4_exp_pp_proxy(proxy)
+
+        self.assertEqual(set(proxy.tensors), {"hidden_states"})
+        self.assertIs(unpacked_hidden_states, hidden_states)
+        self.assertIsNone(residual)
+
+    def test_qwen4_exp_skips_ple_weights_outside_local_pp_stage(self):
+        self.assertTrue(
+            _is_weight_outside_pp_stage(
+                "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                start_layer=24,
+                end_layer=48,
+            )
+        )
+        self.assertFalse(
+            _is_weight_outside_pp_stage(
+                "model.layers.24.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                start_layer=24,
+                end_layer=48,
+            )
+        )
 
 
 if __name__ == "__main__":
