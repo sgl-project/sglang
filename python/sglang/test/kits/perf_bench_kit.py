@@ -1,8 +1,6 @@
 """Report and bound the numbers a serving benchmark produces.
 
-The bounds are tuned per CI runner, so they are only enforced under
-``is_in_ci()``; a local run still prints every number, which is the reason to
-run one of these by hand.
+Bounds are tuned per CI runner, so a local run prints them without asserting.
 """
 
 from dataclasses import dataclass
@@ -67,8 +65,8 @@ def check_batch_scaling(
 ) -> None:
     """Bound the latency at each batch size of one sweep.
 
-    `run_all` takes every batch size at once so the sweep shares a server.
-    Each `bounds` entry is `(batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms)`.
+    `run_all` takes every size at once so they share one server. Each `bounds`
+    entry is `(batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms)`.
     """
     results = run_all([b[0] for b in bounds])
     for (batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms), res in zip(

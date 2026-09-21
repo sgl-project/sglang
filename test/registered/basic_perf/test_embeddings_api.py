@@ -22,7 +22,6 @@ register_amd_ci(est_time=240, suite="stage-b-test-1-gpu-large-amd")
 
 class TestEmbeddingsAPI(CustomTestCase):
     def test_embeddings_api_latency_throughput(self):
-        """Test embeddings API latency and throughput performance"""
         res = run_embeddings_benchmark(
             model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
             num_requests=1000,

@@ -51,10 +51,6 @@ class TestLoRALatency(CustomTestCase):
         )
 
     def _run_lora_latency_test(self, enable_background_task: bool):
-        """
-        Run a latency test for LoRA with the specified background task setting.
-        """
-
         async def lora_loader_unloader_task(
             base_url: str,
             start_event: asyncio.Event,

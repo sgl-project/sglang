@@ -22,7 +22,6 @@ register_amd_ci(est_time=210, suite="stage-b-test-1-gpu-large-amd")
 
 class TestScoreAPI(CustomTestCase):
     def test_score_api_latency_throughput(self):
-        """Test score API latency and throughput performance"""
         res = run_score_benchmark(
             model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
             num_requests=1000,

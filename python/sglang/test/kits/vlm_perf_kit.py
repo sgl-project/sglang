@@ -1,8 +1,7 @@
 """One VLM serving benchmark, run against a named attention backend.
 
-The backend is pinned rather than inherited from `get_default_attn_backend`,
-so the file name says which kernel the numbers came from and keeps saying it
-after the default moves.
+Pinned rather than inherited from `get_default_attn_backend`, so the file name
+keeps naming the right kernel after the default moves.
 """
 
 import os
@@ -19,8 +18,7 @@ from sglang.test.test_utils import (
 
 
 def _local_tokenizer_path():
-    # Prefer the local snapshot so the benchmark client's AutoTokenizer does
-    # not call the HF Hub API, which can stall for minutes in CI.
+    # The HF Hub API call can stall for minutes in CI; prefer a local snapshot.
     try:
         from sglang.srt.utils import find_local_repo_dir
 
@@ -45,8 +43,7 @@ def check_vlm_serving_perf(
 ):
     """Offline then online against one server; bound both phases.
 
-    `output_throughput` is the offline bound, left unset on a lane where it has
-    not been measured -- the number is still reported.
+    `output_throughput` unset means the offline number is reported, not bounded.
     """
     common = dict(
         base_url=DEFAULT_URL_FOR_TEST,
@@ -63,8 +60,7 @@ def check_vlm_serving_perf(
         lora_name=None,
     )
     offline = get_benchmark_args(num_prompts=200, request_rate=float("inf"), **common)
-    # 50 prompts at 1 req/s keeps the online phase ~1 min; medians are stable at
-    # this sample size and the thresholds are loose ceilings.
+    # 50 is enough for a stable median against these loose ceilings.
     online = get_benchmark_args(num_prompts=50, request_rate=1, **common)
 
     (_, res_offline), (_, res_online) = run_bench_serving_multi(

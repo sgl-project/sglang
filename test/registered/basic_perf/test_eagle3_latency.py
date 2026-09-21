@@ -1,11 +1,5 @@
-"""Latency and accept length of EAGLE3 speculative decoding.
-
-The point of this one is the latency: it is the only place in the tree that
-asserts speculative decoding actually makes generation faster. Every other
-speculative test bounds accept length, which says how many draft tokens
-survive, not what that buys.
-
-Registered for CUDA only -- AMD bounds for this config have not been measured.
+"""The only test in the tree that bounds speculative decoding LATENCY; every
+other one bounds accept length. CUDA only -- AMD bounds are unmeasured.
 """
 
 import unittest

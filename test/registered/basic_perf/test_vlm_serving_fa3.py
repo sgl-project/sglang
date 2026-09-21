@@ -14,8 +14,7 @@ class TestVLMServingFa3(CustomTestCase):
         check_vlm_serving_perf(
             self,
             "fa3",
-            # Offline throughput on this lane has never been measured; the number is
-            # reported so a bound can be set from the first run.
+            # No offline bound: never measured on this lane.
             e2e_ms=16500,
             ttft_ms=100,
             itl_ms=8,
