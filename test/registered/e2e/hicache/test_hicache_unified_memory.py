@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1500, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 
 _COMMON_ARGS = [
     "--trust-remote-code",
@@ -158,7 +158,7 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
 class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
     """MHA full attention with envelope-strided gated-delta-net state."""
 
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "yujiepan/qwen3.5-tiny-random"
     extra_args = _SMALL_POOL + [
         "--linear-attn-backend",
         "triton",
@@ -174,7 +174,7 @@ class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
 class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
     """Hybrid SWA reloads bind pages to the full-attention pool's virtual IDs."""
 
-    model = "openai/gpt-oss-20b"
+    model = "yujiepan/gemma-4e-tiny-random"
     extra_args = _SMALL_POOL + [
         "--attention-backend",
         "triton",
@@ -186,6 +186,7 @@ class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
 class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
     """Full attention, sliding-window attention, and ShortConv state together."""
 
+    # The test revision is the reduced checkpoint used by Inkling CI.
     model = "thinkingmachines/Inkling"
     server_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_args = _SMALL_POOL + [
