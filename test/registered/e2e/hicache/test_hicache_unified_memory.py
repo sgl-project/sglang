@@ -1,27 +1,9 @@
-"""Hierarchical cache on the unified memory pool.
+"""Compare unified-memory HiCache reloads against a resident-cache reference.
 
-HiCache addresses the device buffers with the ids the controller holds, and
-under `--enable-unified-memory` those are VIRTUAL while the L2 kernels index
-per-layer views in kernel-facing space (and the state pool by physical slot).
-On top of that the pool RELOCATES pages under compaction, and the conv/SSM
-views are envelope-strided rather than a contiguous per-slot array.
-
-So the guard has to be numerical, and it has to force a real host round trip:
-a small device pool plus distinct long prefixes evicts the target off
-the device, and re-requesting it can only be served by loading back through
-L2. If any of the translate, the staging, or the move gate were wrong, the
-reloaded KV would differ.
-
-The reference is the SAME pool with HiCache off -- not the static pool. Unified
-and static legitimately differ in reduction order here (measured up to 1.8 in
-logprob on a fresh prompt for the GDN model), so a static baseline would drown
-the signal; against unified-without-HiCache the expectation is bit-equality.
-
-Both full-attention families get a cell: MHA reaches the L2 kernels through
-`data_ptrs` the unified subclass has to build itself, MLA through ones the base
-builds in `__init__`.
-
-    python -m pytest test/registered/e2e/hicache/test_hicache_unified_memory.py -v
+Evict a target prefix with distinct filler requests, require a host hit on
+reload, and compare generated text and output logprobs. Both servers use the
+same unified-memory configuration to keep attention reduction order comparable.
+Covers GDN, SWA, tri-pool, and MLA layouts.
 """
 
 import os
@@ -50,8 +32,7 @@ _COMMON_ARGS = [
     "4096",
 ]
 
-# A small device pool is what makes the host tier reachable at all: the disjoint
-# fillers below have to push the target off the device.
+# Distinct filler prefixes must evict the target from device memory.
 _SMALL_POOL = ["--max-total-tokens", "8192"]
 
 _PREFIX = (
@@ -82,7 +63,7 @@ def _generate(base_url, text, max_new_tokens=32, logprobs=True):
 
 
 class UnifiedMemoryHiCacheBase(CustomTestCase):
-    """Two servers on the same pool, one with HiCache and one without."""
+    """Compare identical unified-memory configurations with and without HiCache."""
 
     model: str = ""
     extra_args: list = []
@@ -128,24 +109,19 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             )
 
     def _flush_both(self):
-        """Compare from equal cache state. A populated radix tree shifts the
-        chunked-prefill boundaries and with them the reduction order, which is
-        a real effect but not the one under test."""
+        """Reset cache state to match prefill boundaries and reduction order."""
         for url in (self.hicache_url, self.reference_url):
             requests.post(f"{url}/flush_cache", timeout=180)
         time.sleep(3)
 
     def test_load_back_matches_no_hicache(self):
-        """The sharp one: KV that made a device->host->device round trip must
-        produce the same logprobs as a run that never left the device."""
+        """Host reloads preserve generated text and logprobs within tolerance."""
         self._flush_both()
         cold_text, cold_lp, _ = _generate(self.hicache_url, _TARGET)
         ref_cold_text, ref_cold_lp, _ = _generate(self.reference_url, _TARGET)
         self._force_host_round_trip()
-        # Branch after the cached prompt. Repeating the exact prompt would
-        # recompute its last token, then let only the resident reference dedup
-        # that row against KV from the original full prefill. Those rows can
-        # differ numerically even when every transferred byte is identical.
+        # Extend the prefix so both servers compute new KV rows. Repeating it
+        # would let only the resident reference reuse its original final-token KV.
         warm_text, warm_lp, warm_meta = _generate(self.hicache_url, _CONTINUATION)
         ref_text, ref_lp, _ = _generate(self.reference_url, _CONTINUATION)
 
@@ -172,8 +148,7 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             )
 
     def test_server_survives_the_round_trip(self):
-        """A wrong move gate or a missed free shows up as the idle memory-leak
-        invariant aborting the scheduler rather than as bad output."""
+        """Cache churn must leave both schedulers healthy."""
         self._force_host_round_trip()
         for url in (self.hicache_url, self.reference_url):
             resp = requests.get(f"{url}/health", timeout=30)
@@ -181,9 +156,7 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
 
 
 class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
-    """MHA full attention + gated-delta-net state: a per-layer-view sub-pool
-    (kernel-facing ids) alongside an envelope-strided state sub-pool (physical
-    slots, staged through a contiguous buffer)."""
+    """MHA full attention with envelope-strided gated-delta-net state."""
 
     model = "Qwen/Qwen3.5-0.8B"
     extra_args = _SMALL_POOL + [
@@ -199,12 +172,7 @@ class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
 
 
 class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
-    """Hybrid sliding-window attention. The sharpest of the four: the SWA side
-    has no id space of its own here, so its load-back rows are BOUND for the
-    anchor's virtual ids rather than allocated or translated. A translate-only
-    derivation silently yields sink ids (the translate clamps an unbound page
-    rather than failing), which reads correct on the wire and only surfaces
-    later as the tree owning rows the allocator never had live."""
+    """Hybrid SWA reloads bind pages to the full-attention pool's virtual IDs."""
 
     model = "openai/gpt-oss-20b"
     extra_args = _SMALL_POOL + [
@@ -216,8 +184,7 @@ class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
 
 
 class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
-    """All three components at once (full + sliding-window + ShortConv state),
-    each with its own compaction and its own id treatment on the host path."""
+    """Full attention, sliding-window attention, and ShortConv state together."""
 
     model = "thinkingmachines/Inkling"
     server_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
@@ -240,19 +207,14 @@ class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
         "0.5",
         "--cuda-graph-backend-prefill",
         "disabled",
-        # The tri-pool's full cap runs to millions of tokens, and the host pool
-        # is a multiple of it; bound it or the pair asks for hundreds of GB.
+        # Bound total host memory across all three component pools.
         "--hicache-size",
         "8",
     ]
 
 
 class TestUnifiedMemoryHiCacheMLA(UnifiedMemoryHiCacheBase):
-    """MLA full attention + KDA state. The MLA sub-pool reaches HiCache through
-    the same translate, but builds its `data_ptrs` in `MLATokenToKVPool.
-    __init__` rather than in the `_create_buffers` the unified subclass
-    overrides -- so it is a genuinely different wiring path from the MHA cell
-    above, worth its own cell rather than an assumed equivalence."""
+    """MLA full attention with KDA state and MLA-specific transfer pointers."""
 
     model = "yujiepan/kimi-linear-tiny-random"
     extra_args = _SMALL_POOL + [

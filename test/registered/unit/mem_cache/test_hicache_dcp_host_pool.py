@@ -31,8 +31,7 @@ WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
     return SimpleNamespace(
         size=size,
-        # Mirrors the `KVCache` class default: only a pool whose `size` is not
-        # a token count publishes a real capacity here, and this one's is.
+        # Match KVCache's default: this static pool's size already counts tokens.
         host_capacity_tokens=None,
         store_dtype=torch.float16,
         kv_lora_rank=8,

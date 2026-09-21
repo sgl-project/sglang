@@ -202,9 +202,7 @@ class TestSwaLoadAllocation(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTransferStreamOrdering(unittest.TestCase):
     def test_load_translation_follows_supplied_start_event(self):
-        # A delayed producer after an already recorded event exposed the race:
-        # the old engine waited on the event but consumed a later gather.
-
+        # The start event precedes translation; transfer must wait for both.
         engine = L2TransferEngine("kernel")
         ids = torch.tensor([2, 4, 7], device="cuda")
         output = torch.full_like(ids, -1)

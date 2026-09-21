@@ -174,11 +174,7 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        # `size` is a TOKEN count on a static pool, but a kernel-facing ROW
-        # count on the unified pool (num_pages * blocks_per_page * page_size),
-        # which overstates the tokens by 2 * layer_num. Pools that differ
-        # publish the real capacity; sizing off `size` there asked for
-        # hundreds of GB of host memory.
+        # Unified pools report token capacity separately from their buffer-row count.
         device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         if device_capacity is None:
             device_capacity = device_pool.size

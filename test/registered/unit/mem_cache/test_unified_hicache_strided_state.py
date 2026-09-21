@@ -1,15 +1,4 @@
-"""`MambaPoolHost` must notice an envelope-strided device state view.
-
-Every state-transfer kernel in `pool_host/mamba.py` addresses a slot as
-``ptr + index * item_size``, i.e. it assumes the slot stride equals the slot's
-own size. The unified memory pool stores conv/SSM state ENVELOPE-strided: one
-slot's stride spans every state tensor of every layer, so slot `i` does not
-start at `i * numel_per_slot`. The mis-addressing stays inside the buffer, so
-it corrupts silently instead of faulting -- which is why the predicate that
-routes those views through the contiguous staging path is worth pinning.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_hicache_strided_state.py -v
-"""
+"""Cover strided Mamba state staging and shared allocator wiring for HiCache."""
 
 import unittest
 
@@ -24,7 +13,6 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 class TestStridedStateDetection(CustomTestCase):
     def test_contiguous_slots_are_not_strided(self):
-        """A plain per-slot array is what the kernels already handle."""
         for shape in ((8, 4), (8, 4, 3), (1, 5)):
             with self.subTest(shape=shape):
                 self.assertFalse(
@@ -33,20 +21,16 @@ class TestStridedStateDetection(CustomTestCase):
                 )
 
     def test_envelope_strided_slots_are_detected(self):
-        """One slot's stride spanning a wider envelope is the unified layout."""
         num_slots, per_slot, envelope = 6, 4, 10
         raw = torch.zeros(num_slots * envelope)
         view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
         self.assertTrue(MambaPoolHost._slots_are_strided(view))
 
     def test_empty_tensor_is_not_strided(self):
-        """No slots, nothing to address -- must not divide by or index slot 0."""
         self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
 
     def test_staging_round_trip_preserves_slot_contents(self):
-        """The property the staging path relies on: gathering the wanted slots
-        out of a strided view and scattering them back is the identity, so the
-        kernel can run against a contiguous copy in between."""
+        """Gather and scatter preserve selected slots without changing their neighbors."""
         num_slots, per_slot, envelope = 6, 4, 10
         raw = torch.arange(num_slots * envelope, dtype=torch.float32)
         view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
@@ -64,8 +48,7 @@ class TestStridedStateDetection(CustomTestCase):
         dst_view.index_copy_(0, indices, staged)
         for slot in indices.tolist():
             self.assertTrue(torch.equal(dst_view[slot], view[slot]))
-        # Slots outside the index set must be untouched, or a partial backup
-        # would clobber a neighbour's envelope.
+        # A partial transfer must leave unselected slots untouched.
         for slot in set(range(num_slots)) - set(indices.tolist()):
             self.assertTrue(torch.all(dst_view[slot] == 0))
 
@@ -75,29 +58,14 @@ if __name__ == "__main__":
 
 
 class TestMambaSlotWiringIsShared(CustomTestCase):
-    """Wrapping the mamba end in the slot allocator and installing its v2p
-    translate must happen together, in one place.
+    """Both Mamba factories must install slot allocation and transfer translation.
 
-    HiCache holds VIRTUAL slot ids while the state pool is a pure PHYSICAL
-    store, so `L2TransferEngine` applies `host_transfer_translate` just before
-    each transfer. A factory that wraps the allocator without installing the
-    translate hands raw virtual ids to that store -- which reads correctly
-    until the first compaction moves a slot, and then silently transfers the
-    wrong state. That is what happened to the tri-pool factory: it grew its own
-    copy of the wrapping and never got the translate.
-
-    AST-level because the factories build real pools and need a GPU.
+    Inspect the AST so this check does not need GPU-backed pools.
     """
 
     @staticmethod
     def _assignments_to(attr: str):
-        """Enclosing function name for every `<x>.mamba_allocator = <allocator>`
-        in the unified pool module.
-
-        `= None` is excluded: declaring the slot up front is what lets the rest
-        of the code do a None check instead of a defensive `getattr`, so it is
-        the opposite of a second wrapping site.
-        """
+        """Find functions assigning the attribute, excluding None initialization."""
         import ast
         import inspect
 

@@ -512,19 +512,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "the LMCache offload path indexes the device buffers with the ids it "
         "is handed, and under the unified pool those are VIRTUAL."
     )
-    # HiCache is wired for the unified pool:
-    #   * `KVCache.host_transfer_translate` resolves the controller's virtual
-    #     ids to whatever each pool's device buffers are indexed by (per-layer
-    #     views: kernel-facing; state pool: physical slot), applied in
-    #     `L2TransferEngine` immediately before a transfer is queued so it
-    #     reads the live virtual->physical map;
-    #   * the sliding-window side cannot allocate against the full side's id
-    #     space, so it BINDS pages for the anchor's ids on load-back
-    #     (`bind_swa_for_loaded_rows`);
-    #   * `MambaPoolHost` stages the envelope-strided conv/SSM views through a
-    #     contiguous buffer;
-    #   * `host_transfer_move_gate` freezes compaction for the lifetime of an
-    #     operation.
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured

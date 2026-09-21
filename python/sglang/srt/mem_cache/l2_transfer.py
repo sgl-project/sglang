@@ -56,17 +56,12 @@ class L2TransferEngine:
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
-        """Device ids as THIS pool's buffers are indexed.
+        """Resolve controller IDs into this pool's device-buffer indices.
 
-        Identity for every static pool. A virtual-id pool (the unified memory
-        pool) installs `host_transfer_translate`: the controller allocates and
-        stores VIRTUAL ids, while the L2 kernels index per-layer views in
-        kernel-facing space. Resolve on the transfer stream after its producer
-        event, so the gather and every consumer are ordered on the same stream.
-        The host-transfer move gate freezes relocation until completion.
+        Call on the transfer stream after the producer event. The host-transfer
+        move gate prevents relocation until the transfer completes.
         """
-        # getattr: not every device pool derives from `KVCache` (the mamba
-        # state pool does not), so the attribute may be absent entirely.
+        # Mamba state pools do not inherit KVCache's default attributes.
         translate = getattr(transfer.device_pool, "host_transfer_translate", None)
         if translate is None:
             return transfer.device_indices
@@ -158,9 +153,7 @@ class L2TransferEngine:
         tensors = []
         for transfer in transfers:
             tensors.extend((transfer.host_indices, transfer.device_indices))
-        # A translated device-index tensor is a fresh gather owned by nobody
-        # else; without this it can be freed while the transfer stream is still
-        # reading it.
+        # Keep temporary translated indices alive until the transfer completes.
         tensors.extend(resolved)
         for indices in tensors:
             if indices is not None and indices.is_cuda:

@@ -356,14 +356,7 @@ class MambaPoolHost(HostKVCache):
 
     @staticmethod
     def _slots_are_strided(tensor: torch.Tensor) -> bool:
-        """Whether slot ``i`` does NOT start at ``i * numel_per_slot``.
-
-        Every state-transfer kernel here addresses a slot as
-        ``ptr + index * item_size``, so it needs the slot stride to equal the
-        slot's own size. The unified memory pool breaks that: its conv/SSM
-        views are ENVELOPE-strided (one slot's stride spans every state tensor
-        of every layer), and the mis-addressing stays in range -- silent.
-        """
+        """Whether slot stride differs from the slot size transfer kernels expect."""
         return (
             tensor.dim() >= 1
             and tensor.shape[0] > 0
@@ -380,11 +373,9 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        # Envelope-strided device views: stage through a contiguous device
-        # buffer so the kernel sees the layout it assumes. Both gathers are
-        # ordinary torch index ops, which do respect strides, and both stay on
-        # the caller's transfer stream. The state is a handful of slots per
-        # request, so the extra device-side copy is not on any hot path.
+        # Unified conv/SSM views span a whole state envelope per slot. Stage
+        # contiguously for transfer kernels; torch indexing respects the strides
+        # and runs on the caller's transfer stream.
         if MambaPoolHost._slots_are_strided(src):
             staged = src.index_select(0, src_indices.to(src.device))
             MambaPoolHost._copy_tensor(
@@ -452,9 +443,7 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if MambaPoolHost._slots_are_strided(dst):
-            # Envelope-strided device view: land the copy in a contiguous
-            # staging tensor the kernel can address, then scatter with a torch
-            # index op (which does respect strides).
+            # Transfer into contiguous staging, then scatter into the strided view.
             staged = torch.empty(
                 (dst_indices.numel(), *dst.shape[1:]),
                 dtype=dst.dtype,
@@ -530,9 +519,7 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if MambaPoolHost._slots_are_strided(src_layers[0]):
-            # Gather every layer's needed slots into one contiguous
-            # (num_layers, n, ...) buffer so the kernel's `ptr + i * item_size`
-            # addressing holds, then hand it fresh per-layer base pointers.
+            # Stage contiguous slots per layer and pass the staging buffer's pointers.
             staged = torch.stack(
                 [
                     src_layers[i].index_select(0, src_indices.to(src_layers.device))

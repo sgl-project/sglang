@@ -441,10 +441,7 @@ def build_hybrid_swa_stack(
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
         swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
-        # ...unless full and SWA share one virtual id space (unified memory).
-        # There the SWA side cannot allocate on its own (the full side owns the
-        # ids), so the composite binds sliding-window pages FOR the anchor's
-        # virtual ids and hands back their kernel-facing form.
+        # Unified SWA binds pages to the full pool's virtual IDs instead.
         swa_indices_from_anchor_fn=(
             params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
             if get_memory().enable_unified_memory

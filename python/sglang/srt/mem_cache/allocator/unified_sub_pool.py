@@ -418,12 +418,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # While either returns False, `_flush` must not relocate any page: a
-        # page's physical address is published to a reader that does not go
-        # through the allocator (an RDMA peer, or a HiCache host transfer that
-        # resolved its device indices on another stream). Two slots rather than
-        # one composed predicate because the two are installed independently
-        # and a decode node under PD can run HiCache as well.
+        # RDMA and HiCache install independent gates to protect published device
+        # addresses. Either returning False blocks page relocation in `_flush`.
         self.disagg_move_gate: Optional[Callable[[], bool]] = None
         self.host_transfer_move_gate: Optional[Callable[[], bool]] = None
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
@@ -732,9 +728,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if neighbor is None or not neighbor.lazy_compaction:
             return 0
         if neighbor.moves_blocked():
-            # Not realizable: an in-flight transfer blocks the neighbour's
-            # compaction, so crediting these bytes would admit work no flush
-            # can satisfy.
+            # A blocked neighbor cannot reclaim holes to satisfy an allocation.
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
@@ -755,8 +749,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return self._chain_capacity_epoch(), tuple(gates)
 
     def schedulable_available_size(self) -> int:
-        """Tokens allocatable AFTER a neighbor urgent-flush; alloc gates use
-        `available_size()` instead. Memoized on capacity and transfer gates.
+        """Tokens allocatable after flushing a neighbor, including reclaimable holes.
+
+        Allocation checks use available_size(). Cache by capacity and gate state.
         """
         key = self._schedulable_capacity_key()
         if self._sched_avail_memo_key != key:

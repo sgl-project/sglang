@@ -156,8 +156,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         def _is_frontier_transparent(self):
             return False
 
-        # Borrowed, not reimplemented: a hand-written predicate here would let
-        # the stub keep passing after the real one grows another gate slot.
+        # Exercise the production predicate when checking each gate.
         moves_blocked = MultiEndedAllocator.moves_blocked
 
     class _Owner:
@@ -184,9 +183,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         self.assertEqual(self._credit(gate=lambda: True), 4 * 512)
         # Gate closed: an urgent flush would move nothing, so credit nothing.
         self.assertEqual(self._credit(gate=lambda: False), 0)
-        # The HiCache gate is a SECOND slot, not a replacement: an in-flight
-        # host transfer freezes the mover just as a PD transfer does, and
-        # either one closed is enough.
+        # Either the RDMA gate or the HiCache gate can block compaction.
         self.assertEqual(self._credit(gate=None, host_gate=lambda: True), 4 * 512)
         self.assertEqual(self._credit(gate=None, host_gate=lambda: False), 0)
         self.assertEqual(self._credit(gate=lambda: True, host_gate=lambda: False), 0)
@@ -243,10 +240,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     # REACHES rather than on what the stub was given.
     _MEMBER_ATTRS = ("full_attn_allocator", "swa_attn_allocator", "mamba_allocator")
 
-    # The members each composite's gates must reach. The tri-pool row is the
-    # regression: it inherits both setters, and while an enumeration lived
-    # inside each one, the PD setter had been widened by hand and the HiCache
-    # setter had not -- so the mamba end compacted freely under host transfers.
+    # Inherited gate setters must cover every member, including tri-pool Mamba.
     _EXPECTED_COVERAGE = {
         "UnifiedMambaTokenToKVPoolAllocator": {
             "full_attn_allocator",
@@ -292,11 +286,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         }
 
     def test_every_gate_reaches_every_member(self):
-        """A gate that reaches only some members is not a weaker gate, it is no
-        gate: the ungated end relocates its own pages under the very transfer
-        the gate was installed for. Asserted for BOTH slots because they are
-        installed by different callers and drifted apart once already.
-        """
+        """Both transfer gates must protect every sub-pool from relocation."""
         for name, expected in self._EXPECTED_COVERAGE.items():
             for slot in ("disagg_move_gate", "host_transfer_move_gate"):
                 with self.subTest(composite=name, slot=slot):

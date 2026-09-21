@@ -627,11 +627,8 @@ class Scheduler(
                     self.tp_worker.model_runner.forward_stream
                 )
                 if self.enable_unified_memory:
-                    # The unified pool relocates pages on compaction, and a
-                    # host transfer holds kernel-facing rows it resolved on
-                    # another stream. Freeze the mover while any L2 operation
-                    # is outstanding; every mover runs on this thread, so
-                    # reading the controller's queues from here is safe.
+                    # Keep device rows stable until host transfers are acknowledged.
+                    # Queue reads and relocation both run on the scheduler thread.
                     self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
