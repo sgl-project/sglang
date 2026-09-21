@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
-    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -25,20 +24,6 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
-_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV32ForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        # Qwen3.5 (dense / MoE, text and multimodal); folded in from #39602.
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }
-)
-
 
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
@@ -50,9 +35,7 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
-def check_pipeline_parallel_compat(
-    cfg: Any, *, model_architecture: Optional[str] = None
-) -> None:
+def check_pipeline_parallel_compat(cfg: Any) -> None:
     """Validate features used with pipeline parallelism."""
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
@@ -97,11 +80,6 @@ def check_pipeline_parallel_compat(
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
-            assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
-                "PP + speculative decoding is only supported for DeepSeek/GLM/Qwen3.5 "
-                "models whose last pipeline stage supplies the EAGLE draft "
-                f"embedding; got architecture={model_architecture}"
-            )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
@@ -134,10 +112,7 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        model_architecture = None
-        if cfg.speculative_algorithm is not None:
-            model_architecture = model_config_of(server_args).hf_config.architectures[0]
-        check_pipeline_parallel_compat(cfg, model_architecture=model_architecture)
+        check_pipeline_parallel_compat(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"
