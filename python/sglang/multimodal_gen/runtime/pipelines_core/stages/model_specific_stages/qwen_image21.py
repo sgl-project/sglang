@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+import ctypes
 import hashlib
 import json
 import math
 import os
+import re
+from contextlib import contextmanager
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
@@ -31,6 +34,52 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+
+
+@contextmanager
+def _ci_gemm_configs(stage):
+    if os.environ.get("QWEN21_CI_DIAGNOSTICS") != "1":
+        yield
+        return
+    paths = {
+        line.split()[-1]
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if "/libcublasLt.so" in line
+    }
+    library = ctypes.CDLL(next(iter(paths)))
+    callback_type = ctypes.CFUNCTYPE(
+        None, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p
+    )
+    configs = set()
+
+    @callback_type
+    def capture(level, function, message):
+        value = message.decode()
+        if "algo=[" in value:
+            configs.add(
+                " ".join(
+                    re.findall(
+                        r"(?:Adesc|Bdesc|Cdesc|Ddesc|computeDesc|algo)=\[[^]]+\]",
+                        value,
+                    )
+                )
+            )
+
+    library.cublasLtLoggerSetCallback.argtypes = [callback_type]
+    assert library.cublasLtLoggerSetCallback(capture) == 0
+    assert library.cublasLtLoggerSetMask(2) == 0
+    try:
+        yield
+    finally:
+        library.cublasLtLoggerSetMask(0)
+        library.cublasLtLoggerSetCallback(callback_type())
+        print(
+            "QWEN21_CUBLAS_CONFIG "
+            + json.dumps(
+                dict(stage=stage, rank=get_world_rank(), configs=sorted(configs))
+            ),
+            flush=True,
+        )
 
 
 def _ci_tensor_fingerprint(name, tensor):
@@ -228,12 +277,13 @@ class QwenImage21EncodingStage(PipelineStage):
                             )
                         )
             try:
-                outputs = encoder(
-                    **inputs,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    logits_to_keep=1,
-                )
+                with _ci_gemm_configs(f"encoder-{inputs.input_ids.shape[1]}"):
+                    outputs = encoder(
+                        **inputs,
+                        output_hidden_states=True,
+                        use_cache=False,
+                        logits_to_keep=1,
+                    )
             finally:
                 for hook in hooks:
                     hook.remove()
@@ -418,9 +468,10 @@ class QwenImage21DenoisingStage(DenoisingStage):
             _ci_tensor_fingerprint("initial_latents", latent_model_input)
             _ci_tensor_fingerprint("first_timestep", timestep)
             # prefill is request-specific; graph replay must only see populated cache tensors
-            noise = current_model(
-                hidden_states=latent_model_input, timestep=timestep, **kwargs
-            )
+            with _ci_gemm_configs("dit-prefill"):
+                noise = current_model(
+                    hidden_states=latent_model_input, timestep=timestep, **kwargs
+                )
             _ci_tensor_fingerprint("first_noise_pred", noise)
             return noise
         return super()._predict_noise(
