@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def _ci_tensor_fingerprint(name, tensor):
                 name=name,
                 rank=get_world_rank(),
                 shape=list(value.shape),
+                stride=list(tensor.stride()),
                 dtype=str(value.dtype),
                 sha256=hashlib.sha256(
                     value.reshape(-1).view(torch.uint8).numpy().tobytes()
@@ -52,6 +54,16 @@ def _ci_tensor_fingerprint(name, tensor):
         ),
         flush=True,
     )
+
+
+def _ci_layer_fingerprint(module, inputs, output, *, name, weights_logged):
+    if name not in weights_logged:
+        for parameter_name, parameter in module.named_parameters(recurse=False):
+            _ci_tensor_fingerprint(f"layer0.{name}.{parameter_name}", parameter)
+        weights_logged.add(name)
+    for index, value in enumerate(inputs):
+        _ci_tensor_fingerprint(f"layer0.{name}.input{index}", value)
+    _ci_tensor_fingerprint(f"layer0.{name}.output", output)
 
 
 def collapse_image_slots(hidden, input_ids, image_token_id):
@@ -86,6 +98,7 @@ class QwenImage21InputValidationStage(InputValidationStage):
 class QwenImage21EncodingStage(PipelineStage):
     def __init__(self, text_encoder, processor, vae, scheduler):
         super().__init__()
+        self._ci_weights_logged = set()
         self.text_encoder, self.processor, self.vae, self.scheduler = (
             text_encoder,
             processor,
@@ -140,9 +153,50 @@ class QwenImage21EncodingStage(PipelineStage):
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
-            outputs = encoder(
-                **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
-            )
+            hooks = []
+            if os.environ.get("QWEN21_CI_DIAGNOSTICS") == "1":
+                layer = encoder.model.language_model.layers[0]
+                _ci_tensor_fingerprint(
+                    "layer0.rope_cache",
+                    layer.self_attn.rotary_emb.cos_sin_cache[
+                        : inputs.input_ids.shape[1]
+                    ],
+                )
+                for name, module in layer.named_modules():
+                    if name in {
+                        "input_layernorm",
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
+                        "self_attn.v_proj",
+                        "self_attn.q_norm",
+                        "self_attn.k_norm",
+                        "self_attn.attn",
+                        "self_attn.o_proj",
+                        "post_attention_layernorm",
+                        "mlp.gate_proj",
+                        "mlp.up_proj",
+                        "mlp.down_proj",
+                        "mlp",
+                    }:
+                        hooks.append(
+                            module.register_forward_hook(
+                                partial(
+                                    _ci_layer_fingerprint,
+                                    name=name,
+                                    weights_logged=self._ci_weights_logged,
+                                )
+                            )
+                        )
+            try:
+                outputs = encoder(
+                    **inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    logits_to_keep=1,
+                )
+            finally:
+                for hook in hooks:
+                    hook.remove()
             # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
             final_hidden = outputs.hidden_states[-1]
             if os.environ.get("QWEN21_CI_DIAGNOSTICS") == "1":
