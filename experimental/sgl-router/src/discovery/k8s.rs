@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     /// Pod is replaced (same IP, different UID) — router must see this as
-    /// a Removed+Added cycle so the new pod gets fresh CB/active_load
+    /// a Removed+Added cycle so the new pod gets fresh CB/router_inflight_load
     /// state. Without UID-keyed WorkerIds, two consecutive
     /// `process_events` snapshots would dedup by `addr:port` and the
     /// new pod would inherit the dead pod's state.
