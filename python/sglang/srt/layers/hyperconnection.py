@@ -47,18 +47,13 @@ class GroupedGemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _is_npu:
-            from sgl_kernel_npu.qwen3_8_flash_next.hc import (
-                can_run_norm,
-                grouped_norm,
-            )
+            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
 
-            if can_run_norm(x, self.weight, self.group_size):
-                return grouped_norm(
-                    x, self.weight, self.group_size, self.variance_epsilon
-                )
+            return npu_hc.grouped_norm(
+                x, self.weight, self.group_size, self.variance_epsilon
+            )
         if (
-            not _is_npu
-            and x.is_cuda
+            x.is_cuda
             and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
@@ -203,26 +198,6 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
-            if _is_npu:
-                from sgl_kernel_npu.qwen3_8_flash_next.hc import (
-                    can_run_mix,
-                    mix,
-                )
-
-                if can_run_mix(
-                    hyper_input_normed,
-                    input_mix_weight_down,
-                    input_mix_weight_up,
-                    hc,
-                    hs,
-                ):
-                    return mix(
-                        hyper_input_normed,
-                        input_mix_weight_down,
-                        input_mix_weight_up,
-                        hc,
-                        hs,
-                    )
             input_mix_weight = F.silu(
                 F.linear(hyper_input_normed, input_mix_weight_down) / hc
             )
@@ -242,23 +217,6 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
-            if _is_npu:
-                from sgl_kernel_npu.qwen3_8_flash_next.hc import (
-                    can_run_combine,
-                    combine,
-                )
-
-                if can_run_combine(
-                    block_output, residual, normed_residual, block_inject_weight, hc, hs
-                ):
-                    return combine(
-                        block_output,
-                        residual,
-                        normed_residual,
-                        block_inject_weight,
-                        hc,
-                        hs,
-                    )
             R = residual.unflatten(-1, (hc, hs))
             block_inject_weight_out = 2 * torch.sigmoid(
                 F.linear(normed_residual, block_inject_weight) / hc
@@ -302,9 +260,18 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
-            not _is_npu
-            and hyper_input_normed.is_cuda
+        if _is_npu:
+            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
+
+            mixed_input = npu_hc.mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        elif (
+            hyper_input_normed.is_cuda
             and self._jit_mix_ok
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
@@ -354,9 +321,20 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
+        if _is_npu:
+            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
+
+            return npu_hc.combine(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+
         if (
-            not _is_npu
-            and block_output.is_cuda
+            block_output.is_cuda
             and self._jit_combine_ok
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype

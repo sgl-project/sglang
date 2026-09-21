@@ -101,8 +101,22 @@ def test_grouped_norm_cuda_jit_dispatch(
     # Exercise the actual forwards without needing a CUDA device or compiler.
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: tensor_is_cuda))
     monkeypatch.setattr(norm_kernel, "grouped_gemma_rmsnorm", fake_cuda_kernel)
+    npu_calls = []
+    if npu_platform and not ple_norm:
+        def fake_npu_kernel(*args):
+            npu_calls.append(args)
+            return sentinel
+
+        # Routing-only test: do not import the actual NPU package on CUDA CI.
+        monkeypatch.setitem(
+            sys.modules, "sgl_kernel_npu.qwen3_8_flash_next",
+            SimpleNamespace(hc=SimpleNamespace(grouped_norm=fake_npu_kernel)),
+        )
     actual = norm(x)
-    if not npu_platform and tensor_is_cuda:
+    if npu_platform and not ple_norm:
+        assert actual is sentinel
+        assert len(npu_calls) == 1 and not calls
+    elif not npu_platform and tensor_is_cuda:
         assert actual is sentinel
         assert len(calls) == 1
     else:
@@ -119,7 +133,7 @@ def test_npu_cuda_compat_shim_does_not_enable_cuda_kernels(monkeypatch):
 
 
 @pytest.mark.parametrize("ple_norm", [False, True])
-def test_npu_grouped_norm_fallback_matches_reference(monkeypatch, ple_norm):
+def test_npu_grouped_norm_matches_reference(monkeypatch, ple_norm):
     from sglang.srt.models import qwen4_exp
 
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -131,17 +145,18 @@ def test_npu_grouped_norm_fallback_matches_reference(monkeypatch, ple_norm):
         if ple_norm
         else hyperconnection.GroupedGemmaRMSNorm
     )
-    norm = norm_cls(1024, group_size=512).to(device="npu:0", dtype=torch.bfloat16)
+    width, group_size = (1024, 512) if ple_norm else (10240, 2560)
+    norm = norm_cls(width, group_size=group_size).to(device="npu", dtype=torch.bfloat16)
     torch.manual_seed(7)
-    x = torch.randn(3, 1024, dtype=torch.bfloat16, device="npu:0")
+    x = torch.randn(3, width, dtype=torch.bfloat16, device="npu")
     with torch.no_grad():
         norm.weight.copy_(torch.randn_like(norm.weight) * 0.1)
-    assert norm._jit_group_size == 512
+    assert norm._jit_group_size == group_size
     actual = norm(x)
-    grouped = x.cpu().float().reshape(3, 2, 512)
+    grouped = x.cpu().float().reshape(3, width // group_size, group_size)
     normalized = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + 1e-6)
     expected = (
-        normalized.reshape(3, 1024) * (1 + norm.weight.detach().cpu().float())
+        normalized.reshape(3, width) * (1 + norm.weight.detach().cpu().float())
     ).to(x.dtype)
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-2, atol=1e-2)
 
