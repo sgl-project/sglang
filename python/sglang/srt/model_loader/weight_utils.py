@@ -79,6 +79,17 @@ logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
+INSTANTTENSOR_CONFIG_KEYS = frozenset(
+    {
+        "buffer_size",
+        "chunk_size",
+        "concurrency",
+        "io_depth",
+        "max_free_mem_usage",
+        "backend",
+    }
+)
+
 
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
@@ -1166,14 +1177,37 @@ def safetensors_weights_iterator(
 
 def instanttensor_weights_iterator(
     hf_weights_files: List[str],
+    extra_config: Optional[dict] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over Safetensors weights with InstantTensor."""
     try:
         import instanttensor
     except ImportError as e:
         raise ImportError(
-            "Please install InstantTensor via `pip install instanttensor`."
+            'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
         ) from e
+
+    kwargs = {
+        key: value
+        for key, value in (extra_config or {}).items()
+        if key in INSTANTTENSOR_CONFIG_KEYS
+    }
+    backend = kwargs.get("backend")
+    if backend is not None:
+        names = [backend] if isinstance(backend, str) else backend
+        if not isinstance(names, list) or not names:
+            raise ValueError(
+                "InstantTensor backend must be a name or a non-empty list of names"
+            )
+        available = {
+            **instanttensor.Backend.__members__,
+            **instanttensor.BackendPolicy.__members__,
+        }
+        if any(not isinstance(name, str) or name not in available for name in names):
+            raise ValueError(
+                f"Invalid InstantTensor backend {backend!r}; expected names from {sorted(available)}"
+            )
+        kwargs["backend"] = [available[name] for name in names]
 
     distributed = torch.distributed.is_initialized()
     if distributed:
@@ -1189,6 +1223,7 @@ def instanttensor_weights_iterator(
         framework="pt",
         device=device,
         process_group=process_group,
+        **kwargs,
     ) as f:
         yield from tqdm(
             f.tensors(),
