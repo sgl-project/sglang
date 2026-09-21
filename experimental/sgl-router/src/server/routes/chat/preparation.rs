@@ -9,7 +9,6 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::MetricsRegistry;
-use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -87,8 +86,8 @@ impl PreparedChatRequest {
     /// The engine-facing request id this dispatch will be aborted by if the
     /// client disconnects, or `None` when the request opts out — see
     /// [`resolve_engine_rid`].
-    pub(super) fn engine_rid(&self, pd_mode: bool, headers: &HeaderMap) -> Option<String> {
-        resolve_engine_rid(self.caller_set_rid, self.fans_out, pd_mode, headers)
+    pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
+        resolve_engine_rid(self.caller_set_rid, self.fans_out, pd_mode)
     }
 
     /// `engine_rid` is the router-minted request id to file this request under
@@ -503,39 +502,21 @@ fn rid_is_splice_safe(rid: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
-/// Longest `x-request-id` prefix folded into a router-minted rid, so the
-/// engine-facing identifier stays bounded however long the header is.
-const MAX_CORRELATION_ID_CHARS: usize = 64;
-
-/// The caller's correlation id, when it is short and plain enough to embed in
-/// the engine-facing rid. Anything else is dropped so the rid stays a
-/// well-behaved token in engine logs.
-fn correlation_id(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers.get("x-request-id")?.to_str().ok()?;
-    let plain = !raw.is_empty()
-        && raw.len() <= MAX_CORRELATION_ID_CHARS
-        && raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
-    plain.then_some(raw)
-}
-
 /// Resolve the engine-facing request id this request will be aborted by if the
-/// client disconnects — minting one to inject into the forwarded body, or
-/// `None` to leave the body untouched and skip the abort entirely.
+/// client disconnects, or `None` to leave the body's `rid` alone and skip the
+/// abort entirely.
 ///
-/// A minted rid is `router-<x-request-id>-<uuid>`, or `router-<uuid>` when no
-/// usable correlation id is present. The `x-request-id` half lets an operator
-/// take a rid out of an engine log line and find the caller's own request; the
-/// random half is load-bearing, not decoration — see the prefix note below.
-///
-/// **The minted rid is client-visible.** SGLang reports a request's `rid` as
-/// `meta_info["id"]`, which is what the OpenAI response `id` carries, so
-/// injecting one replaces the engine-minted `uuid4().hex` the caller used to
-/// see — the caller's own `x-request-id` included.
-///
-/// The only stable shape is the leading `router-`: a request with no usable
-/// correlation header mints `router-<uuid>`, with no middle segment at all.
+/// The minted rid is a bare `uuid4` hex — deliberately the SAME shape the engine
+/// mints for itself (`GenerateReqInput._normalize_single_inputs`). SGLang reports
+/// a request's `rid` as `meta_info["id"]`, which is what the OpenAI response `id`
+/// carries, so injecting one REPLACES the id the caller used to see. Minting a
+/// distinguishable rid (a `router-` prefix, the caller's `x-request-id` folded in)
+/// would make that a breaking change for anything pattern-matching or
+/// length-checking the id, and buy nothing: nothing here routes, aborts or
+/// branches on the rid's shape — the abort sends the full string, and it is the
+/// uuid, not any prefix, that makes it unguessable. Correlation lives in the
+/// router's own access log instead, which already records `x-request-id` and now
+/// records this rid beside it (see `RequestLogContext`).
 ///
 /// `None`, preserving today's behavior exactly, in three cases:
 ///
@@ -543,40 +524,29 @@ fn correlation_id(headers: &HeaderMap) -> Option<&str> {
 ///   the client for KV-transfer correctness; aborting only the decode half
 ///   mid-transfer is a riskier change, out of scope here.
 /// * **The caller set its own `rid`.** The engine adopts a body `rid` verbatim,
-///   and its scheduler aborts every in-flight request whose rid *starts with*
-///   the one it is handed (`scheduler.py`'s `req.rid.startswith(recv_req.rid)`),
-///   so honouring a caller-chosen abort key would let `{"rid": "router-"}`
-///   cancel a worker's entire router-minted population on disconnect.
-///   Overwriting the caller's `rid` is not an option either — it is the handle
-///   they asked the engine to file the request under.
+///   and its scheduler aborts every in-flight request whose rid *starts with* the
+///   one it is handed (`scheduler.py`'s `req.rid.startswith(recv_req.rid)`), so
+///   honouring a caller-chosen abort key would let a one-character `rid` cancel
+///   half a worker's population on disconnect. Overwriting the caller's `rid` is
+///   not an option either — it is the handle they asked the engine to file the
+///   request under.
 /// * **A request that fans out (`n > 1`).** SGLang converts one to a batch
 ///   (`GenerateReqInput._handle_parallel_sampling`), and the batch path calls
-///   `regenerate_rid()` on every sample — a fresh `uuid4().hex` that is not
-///   prefixed by the injected rid. So the minted rid is discarded before the
-///   request is abortable: an abort by it would match nothing, and the response
-///   `id` would not carry it either. Minting one anyway would buy nothing and
-///   cost a futile `/abort_request` on every disconnect. Conservative in one
-///   direction: a beam-search request keeps its rid (beam width means "sequences
-///   returned", not fan-out), so opting out there loses an abort that would have
-///   worked.
+///   `regenerate_rid()` on every sample — a fresh id that is not derived from the
+///   injected one. So the minted rid is discarded before the request is
+///   abortable: an abort by it would match nothing. Minting one anyway would buy
+///   nothing and cost a futile `/abort_request` on every disconnect. Conservative
+///   in one direction: a beam-search request keeps its rid (beam width means
+///   "sequences returned", not fan-out), so opting out there loses an abort that
+///   would have worked.
 ///
-/// That same prefix rule is why a minted rid ends in a fresh UUID: two callers
-/// can pick colliding `x-request-id` values, but neither can predict the
-/// other's UUID, so one cannot steer an abort onto the other's request.
-fn resolve_engine_rid(
-    caller_set_rid: bool,
-    fans_out: bool,
-    pd_mode: bool,
-    headers: &HeaderMap,
-) -> Option<String> {
+/// A caller cannot steer an abort onto another request: reaching one would mean
+/// supplying a `rid` that extends a minted uuid it was never told.
+fn resolve_engine_rid(caller_set_rid: bool, fans_out: bool, pd_mode: bool) -> Option<String> {
     if caller_set_rid || fans_out || pd_mode {
         return None;
     }
-    let unique = uuid::Uuid::new_v4().simple();
-    Some(match correlation_id(headers) {
-        Some(id) => format!("router-{id}-{unique}"),
-        None => format!("router-{unique}"),
-    })
+    Some(uuid::Uuid::new_v4().simple().to_string())
 }
 
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
@@ -1640,165 +1610,35 @@ mod tests {
         );
     }
 
-    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::HeaderName::from_static(name),
-            axum::http::HeaderValue::from_str(value).unwrap(),
-        );
-        headers
-    }
-
-    /// A router-minted `rid` rides the splice, so a plain-mode body is not
-    /// round-tripped through `serde_json`. Pinned on the exact bytes: the sloppy
-    /// inter-token spacing survives, which a `Value` round-trip would normalize.
+    /// The minted rid is deliberately indistinguishable from one the engine
+    /// mints for itself: a bare 32-char uuid hex. That is what keeps injecting
+    /// one from changing the shape of the client-visible response `id`.
     #[test]
-    fn outgoing_body_splices_rid_without_reparsing() {
-        let body = Bytes::from_static(br#"{ "model" : "x" ,  "messages" : [ ] }"#);
-        // A parse already on hand must not force the parse path either: that is
-        // the cache-aware shape, the largest slice of plain-mode traffic.
-        for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
-            let out =
-                build_outgoing_body(&body, value, None, None, &[], Some("router-abc123")).unwrap();
-            assert_eq!(
-                std::str::from_utf8(&out).unwrap(),
-                r#"{ "model" : "x" ,  "messages" : [ ] ,"rid":"router-abc123"}"#,
-                "a minted rid must be spliced, not re-serialized",
-            );
-        }
-    }
-
-    /// Sampling defaults and the rid splice together, correctly comma-separated,
-    /// and an empty object takes no leading comma.
-    #[test]
-    fn outgoing_body_splices_sampling_and_rid_together() {
-        let defaults = resolve_sampling_defaults(
-            &overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#),
-            &fields_of(r#"{"model":"x"}"#),
-            &metrics(),
-        )
-        .unwrap();
-        let body = Bytes::from_static(br#"{"model":"x"}"#);
-        let out =
-            build_outgoing_body(&body, None, None, None, &defaults, Some("router-both")).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"{"model":"x","temperature":1.0,"rid":"router-both"}"#,
-        );
-
-        let empty = Bytes::from_static(br#"{}"#);
-        let out = build_outgoing_body(&empty, None, None, None, &[], Some("router-solo")).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            r#"{"rid":"router-solo"}"#
-        );
-    }
-
-    /// A client `"rid": null` reads as absent, so the router mints one — and the
-    /// spliced copy goes in before the CLOSING brace, so it wins the last-wins
-    /// reading every JSON parser performs.
-    #[test]
-    fn outgoing_body_spliced_rid_wins_over_an_explicit_null() {
-        let body = Bytes::from_static(br#"{"model":"x","rid":null}"#);
-        let out = build_outgoing_body(&body, None, None, None, &[], Some("router-wins")).unwrap();
-        let parsed: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(
-            parsed.get("rid").and_then(Value::as_str),
-            Some("router-wins"),
-            "the injected rid must win the last-wins reading",
-        );
-    }
-
-    /// The escaping guard: a rid outside the id alphabet declines the splice and
-    /// falls back to the parse path, where `serde_json` escapes it. Not reachable
-    /// through `resolve_engine_rid` today — this pins that `append_top_level_fields`
-    /// is safe on its own terms, not by appeal to its caller.
-    #[test]
-    fn outgoing_body_declines_to_splice_an_unsafe_rid() {
-        assert!(!rid_is_splice_safe(r#"router-"injected"#));
-        let body = Bytes::from_static(br#"{"model":"x"}"#);
-        let evil = r#"a","messages":["pwned"#;
-        let out = build_outgoing_body(&body, None, None, None, &[], Some(evil)).unwrap();
-        let parsed: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(
-            parsed.get("rid").and_then(Value::as_str),
-            Some(evil),
-            "an unsafe rid must round-trip through the escaping parse path",
-        );
-        assert_eq!(
-            parsed.get("messages"),
-            None,
-            "a quote in the rid must never break out into a sibling key",
-        );
-    }
-
-    /// The parse path (taken for `input_ids` / bootstrap injection) carries the
-    /// rid too, so it is not silently dropped when a body must be re-serialized.
-    #[test]
-    fn outgoing_body_injects_rid_on_the_parse_path() {
-        let body =
-            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            &[],
-            Some("router-xyz"),
-        )
-        .unwrap();
-        let parsed: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(
-            parsed.get("rid").and_then(Value::as_str),
-            Some("router-xyz")
-        );
-        assert_eq!(parsed.get("input_ids"), Some(&json!([1, 2, 3])));
-        assert!(
-            parsed.get("messages").is_some(),
-            "messages must be retained alongside the injected rid",
-        );
-    }
-
-    /// With no caller `rid` and no correlation header, the minted rid is
-    /// `router-<uuid>` — self-contained and unique.
-    #[test]
-    fn resolve_engine_rid_mints_uuid_without_correlation_header() {
-        let rid =
-            resolve_engine_rid(false, false, false, &HeaderMap::new()).expect("plain mode mints");
+    fn resolve_engine_rid_mints_an_engine_shaped_uuid() {
+        let rid = resolve_engine_rid(false, false, false).expect("plain mode mints");
         assert_eq!(
             rid.len(),
-            "router-".len() + 32,
-            "a header-less mint is `router-` + a 32-char simple uuid; got {rid}",
+            32,
+            "a minted rid must match `uuid4().hex`, the engine's own format; got {rid}",
         );
-    }
-
-    /// The caller's `x-request-id` is folded in so an operator can cross-reference
-    /// an engine log line against the caller's own request.
-    #[test]
-    fn resolve_engine_rid_folds_in_the_correlation_header() {
-        let rid = resolve_engine_rid(
-            false,
-            false,
-            false,
-            &headers_with("x-request-id", "gw-abc-123"),
-        )
-        .expect("plain mode mints");
         assert!(
-            rid.starts_with("router-gw-abc-123-") && rid.len() > "router-gw-abc-123-".len(),
-            "the correlation id must appear verbatim with a unique suffix; got {rid}",
+            rid.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "and its alphabet too; got {rid}",
+        );
+        assert!(
+            rid_is_splice_safe(&rid),
+            "a minted rid must always take the splice path; got {rid}",
         );
     }
 
-    /// Two requests carrying the SAME correlation id must still get distinct
-    /// rids. This is the property that makes the engine's prefix-abort safe: no
-    /// minted rid can ever be a prefix of another request's.
+    /// Every request gets a distinct rid, and none is a prefix of another. This
+    /// is the property that makes the engine's prefix-abort safe — it comes from
+    /// the uuid, not from any decoration around it.
     #[test]
-    fn resolve_engine_rid_is_unique_per_request_even_with_a_shared_header() {
-        let headers = headers_with("x-request-id", "same-id");
-        let a = resolve_engine_rid(false, false, false, &headers).unwrap();
-        let b = resolve_engine_rid(false, false, false, &headers).unwrap();
+    fn resolve_engine_rid_is_unique_and_never_a_prefix_of_another() {
+        let a = resolve_engine_rid(false, false, false).unwrap();
+        let b = resolve_engine_rid(false, false, false).unwrap();
         assert_ne!(a, b);
         assert!(
             !b.starts_with(&a) && !a.starts_with(&b),
@@ -1806,32 +1646,11 @@ mod tests {
         );
     }
 
-    /// An over-long correlation header, or one outside an id alphabet, is dropped
-    /// rather than embedded, so the engine-facing rid stays a bounded token.
-    #[test]
-    fn resolve_engine_rid_rejects_unsuitable_correlation_headers() {
-        let plain_len = "router-".len() + 32;
-        for bad in [
-            "x".repeat(MAX_CORRELATION_ID_CHARS + 1),
-            "has space".to_string(),
-            "quote\"inside".to_string(),
-            String::new(),
-        ] {
-            let rid = resolve_engine_rid(false, false, false, &headers_with("x-request-id", &bad))
-                .expect("plain mode still mints");
-            assert_eq!(
-                rid.len(),
-                plain_len,
-                "an unsuitable x-request-id ({bad:?}) must be dropped, not embedded; got {rid}",
-            );
-        }
-    }
-
     /// The three opt-outs, each preserving today's behavior exactly: PD mode
     /// (prefill is detached to outlive the client), a caller-supplied `rid` (the
-    /// engine aborts by rid PREFIX, so honouring a caller-chosen key would let
-    /// `{"rid": "router-"}` cancel a worker's whole router-minted population),
-    /// and a fan-out request (the engine regenerates every rid, discarding ours).
+    /// engine aborts by rid PREFIX, so honouring a caller-chosen key would let a
+    /// one-character `rid` cancel half a worker's population), and a fan-out
+    /// request (the engine regenerates every rid, discarding ours).
     #[test]
     fn resolve_engine_rid_opts_out_of_pd_fan_out_and_caller_supplied_rids() {
         for (caller_set_rid, fans_out, pd_mode, why) in [
@@ -1840,12 +1659,12 @@ mod tests {
             (false, true, false, "a fan-out request"),
         ] {
             assert!(
-                resolve_engine_rid(caller_set_rid, fans_out, pd_mode, &HeaderMap::new()).is_none(),
+                resolve_engine_rid(caller_set_rid, fans_out, pd_mode).is_none(),
                 "{why} must not be minted an abort rid",
             );
         }
         assert!(
-            resolve_engine_rid(false, false, false, &HeaderMap::new()).is_some(),
+            resolve_engine_rid(false, false, false).is_some(),
             "a plain single-sample request must still mint one",
         );
     }

@@ -208,7 +208,7 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
         assert!(
             rid.as_ref()
                 .and_then(Value::as_str)
-                .is_some_and(|r| r.starts_with("router-")),
+                .is_some_and(crate::common::is_engine_shaped_rid),
             "plain mode must mint an abort rid; got {rid:?}",
         );
         assert_eq!(forwarded, request, "body must be forwarded untouched");

@@ -1666,10 +1666,9 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         1,
         "a stale-request-janitor timeout must trigger exactly one abort"
     );
-    assert!(log[0]["rid"]
-        .as_str()
-        .expect("rid must be a string")
-        .starts_with("router-"));
+    assert!(crate::common::is_engine_shaped_rid(
+        log[0]["rid"].as_str().expect("rid must be a string")
+    ));
 }
 
 /// Streaming counterpart. Once a stream is established the SSE pump's
@@ -1703,10 +1702,9 @@ async fn janitor_expiry_on_streaming_request_before_headers_still_aborts() {
          still trigger an abort — the engine may already be working on a request \
          no client will ever see"
     );
-    assert!(log[0]["rid"]
-        .as_str()
-        .expect("rid must be a string")
-        .starts_with("router-"));
+    assert!(crate::common::is_engine_shaped_rid(
+        log[0]["rid"].as_str().expect("rid must be a string")
+    ));
 }
 
 /// Task A: a non-streaming request that errors out (upstream
@@ -1937,16 +1935,19 @@ async fn streaming_disconnect_triggers_engine_abort() {
     );
     let rid = log[0]["rid"].as_str().expect("rid must be a string");
     assert!(
-        rid.starts_with("router-"),
+        crate::common::is_engine_shaped_rid(rid),
         "the abort must carry the router-minted rid, got {rid}"
     );
     assert_eq!(log[0]["abort_all"], false);
 }
 
-/// The minted rid folds in the caller's `x-request-id`, so an operator can take
-/// a rid out of an engine log line and find the caller's own request.
+/// The minted rid must NOT embed the caller's `x-request-id`. It is echoed back
+/// as the response `id`, so folding a caller- or gateway-supplied value into it
+/// would both change that id's shape and reflect the header into the response
+/// body. Correlation lives on the router's access log line instead, which
+/// records `x-request-id` and the minted rid together.
 #[tokio::test]
-async fn streaming_disconnect_rid_carries_the_correlation_header() {
+async fn streaming_disconnect_rid_does_not_embed_the_correlation_header() {
     let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
         vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
         Duration::from_millis(50),
@@ -1966,8 +1967,12 @@ async fn streaming_disconnect_rid_carries_the_correlation_header() {
     assert_eq!(log.len(), 1);
     let rid = log[0]["rid"].as_str().expect("rid must be a string");
     assert!(
-        rid.starts_with("router-gw-correlate-456-"),
-        "the minted rid must carry x-request-id verbatim, got {rid}"
+        !rid.contains("gw-correlate-456"),
+        "the minted rid must not echo x-request-id into the response id; got {rid}",
+    );
+    assert!(
+        crate::common::is_engine_shaped_rid(rid),
+        "and it must keep the engine's own rid shape; got {rid}",
     );
 }
 
@@ -2051,10 +2056,9 @@ async fn non_streaming_handler_drop_triggers_engine_abort() {
         1,
         "a dropped handler future (client disconnect) must trigger exactly one abort"
     );
-    assert!(log[0]["rid"]
-        .as_str()
-        .expect("rid must be a string")
-        .starts_with("router-"));
+    assert!(crate::common::is_engine_shaped_rid(
+        log[0]["rid"].as_str().expect("rid must be a string")
+    ));
     assert_eq!(log[0]["abort_all"], false);
 }
 

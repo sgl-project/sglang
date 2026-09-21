@@ -686,7 +686,7 @@ async fn reorg_route_mints_an_abort_rid_for_plain_but_not_for_pd() {
         serde_json::from_slice(&forwarded.expect("plain worker must have seen a body")).unwrap();
     let rid = forwarded.get("rid").and_then(|v| v.as_str());
     assert!(
-        rid.is_some_and(|rid| rid.starts_with("router-")),
+        rid.is_some_and(crate::common::is_engine_shaped_rid),
         "the reorg plain route must mint an abort rid; got {rid:?}",
     );
 

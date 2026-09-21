@@ -118,7 +118,7 @@ fn without_minted_rid(mut body: Value) -> Value {
     assert!(
         rid.as_ref()
             .and_then(Value::as_str)
-            .is_some_and(|r| r.starts_with("router-")),
+            .is_some_and(crate::common::is_engine_shaped_rid),
         "plain mode must mint an abort rid; got {rid:?}",
     );
     body

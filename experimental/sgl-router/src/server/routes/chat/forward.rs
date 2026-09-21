@@ -85,7 +85,7 @@ pub(super) async fn forward_chat_request(
     // The id the engine will know this request by, so the router can tell it to
     // stop generating when the client goes away. `None` leaves the body's `rid`
     // alone and disables the abort — see `resolve_engine_rid`.
-    let engine_rid = request.engine_rid(pd.is_some(), &headers);
+    let engine_rid = request.engine_rid(pd.is_some());
     let body = request.into_outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
@@ -149,7 +149,7 @@ pub(super) async fn forward_chat_request(
             guard.disarm();
         }
     }
-    let log_context = metrics.record_dispatch_result(&result);
+    let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
         Ok(mut response) => {
@@ -339,6 +339,7 @@ impl DispatchMetrics {
     fn record_dispatch_result(
         &self,
         result: &Result<Response<Body>, ApiError>,
+        engine_rid: Option<String>,
     ) -> RequestLogContext {
         let http_status = match result {
             Ok(response) => response.status().as_u16(),
@@ -370,6 +371,7 @@ impl DispatchMetrics {
             model_id: self.model.clone(),
             streaming: self.streaming,
             outcome,
+            engine_rid,
         }
     }
 }
