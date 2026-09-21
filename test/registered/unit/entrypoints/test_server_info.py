@@ -18,13 +18,18 @@ Current coverage:
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
   pre-existing flat `kv_events_config` string all remain visible.
+
+* `TestServerInfoEffectiveMaxRunningRequests` — effective scheduler limits
+  and compatibility across both server-info routes.
 """
 
 import asyncio
 import json
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 
+import httpx
 import msgspec
 import msgspec.structs
 
@@ -106,14 +111,12 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    endpoint: str | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
-    Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
-    `async def` that reads module-level `_global_state`, so wiring a
-    `SimpleNamespace` stub via `set_global_state` and awaiting the
-    coroutine directly is enough to exercise the handler logic without
-    booting a model server.
+    Calls the handler directly by default. Supplying `endpoint` exercises
+    the real ASGI route and JSON serialization without booting a model server.
 
     `config_updates` are applied the way production applies them -- through
     `record_config_updates`, in a process that has published -- rather than
@@ -123,7 +126,20 @@ def _call_server_info_with(
     """
 
     async def _fake_internal_state():
-        return internal_states or [{"max_req_input_len": 1024}]
+        return (
+            internal_states
+            if internal_states is not None
+            else [{"max_req_input_len": 1024}]
+        )
+
+    async def _request():
+        transport = httpx.ASGITransport(app=http_server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await client.get(endpoint)
+        response.raise_for_status()
+        return response.json()
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     stub_state = SimpleNamespace(
@@ -139,6 +155,8 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
+        if endpoint is not None:
+            return asyncio.run(_request())
         return asyncio.run(http_server.server_info())
     finally:
         # Restore so a later test in the same process isn't surprised.
@@ -481,6 +499,66 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
             self.assertEqual(overlaid["weight_version"], "v2")
         finally:
             reset_context()
+
+
+class TestServerInfoEffectiveMaxRunningRequests(CustomTestCase):
+    """Expose capped scheduler capacity without changing the configured limit."""
+
+    def test_effective_max_running_requests_is_exposed_at_top_level(self):
+        cases = (
+            ([{"effective_max_running_requests_per_dp": 9}], 9),
+            (
+                [
+                    {"effective_max_running_requests_per_dp": 11},
+                    {"effective_max_running_requests_per_dp": 9},
+                ],
+                9,
+            ),
+            (
+                [
+                    {},
+                    {"effective_max_running_requests_per_dp": None},
+                    {"effective_max_running_requests_per_dp": 7},
+                ],
+                7,
+            ),
+            (
+                [
+                    {"effective_max_running_requests_per_dp": 9},
+                    {"effective_max_running_requests_per_dp": 0},
+                ],
+                0,
+            ),
+        )
+        for states, expected in cases:
+            for endpoint in ("/server_info", "/get_server_info"):
+                with self.subTest(states=states, endpoint=endpoint):
+                    args = ServerArgs(
+                        model_path="dummy", max_running_requests=32, dp_size=len(states)
+                    )
+                    original_states = deepcopy(states)
+                    info = _call_server_info_with(
+                        args, internal_states=states, endpoint=endpoint
+                    )
+
+                    self.assertEqual(info["max_running_requests"], 32)
+                    self.assertEqual(info["effective_max_running_requests"], expected)
+                    self.assertEqual(info["internal_states"], original_states)
+                    self.assertEqual(states, original_states)
+                    self.assertEqual(args.max_running_requests, 32)
+
+    def test_effective_max_running_requests_is_omitted_when_unavailable(self):
+        for states in ([], [{}], [{"effective_max_running_requests_per_dp": None}]):
+            for endpoint in ("/server_info", "/get_server_info"):
+                with self.subTest(states=states, endpoint=endpoint):
+                    args = ServerArgs(model_path="dummy", max_running_requests=32)
+                    info = _call_server_info_with(
+                        args, internal_states=states, endpoint=endpoint
+                    )
+
+                    self.assertNotIn("effective_max_running_requests", info)
+                    self.assertEqual(info["max_running_requests"], 32)
+                    self.assertEqual(info["internal_states"], states)
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):
