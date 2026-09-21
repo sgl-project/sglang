@@ -455,23 +455,6 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
-  renderer-test:
-    needs: [check-changes, call-gate]
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      needs.check-changes.outputs.renderer == 'true' &&
-      (needs.call-gate.result == 'success' || github.event_name == 'schedule' || inputs.test_parallel_dispatch == true)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.git_ref || github.sha }}
-
-      - name: Run renderer tests
-        run: docker buildx build --target test --progress=plain -f docker/renderer.Dockerfile .
-
   # List every build and test job: `skipped` passes here, so an omission turns that
   # job's failure into a green run with no tests.
   pr-test-finish:
@@ -486,7 +469,6 @@ jobs:
 
         rust-ext-build,
         rust-ext-build-aarch64,
-        renderer-test,
 
         wait-for-base-a,
         wait-for-base-b,

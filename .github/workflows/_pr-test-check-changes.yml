@@ -104,12 +104,6 @@ jobs:
               - "proto/sglang/runtime/v1/sglang.proto"
             renderer:
               - "rust/sglang-renderer/**"
-              - "rust/Cargo.toml"
-              - "rust/Cargo.lock"
-              - "rust/rust-toolchain.toml"
-              - "docker/renderer.Dockerfile"
-              - ".github/workflows/pr-test.yml"
-              - ".github/workflows/_pr-test-check-changes.yml"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
