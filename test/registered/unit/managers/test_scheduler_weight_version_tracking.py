@@ -1,7 +1,13 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    EndWeightUpdateReqInput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -127,6 +133,34 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             **fields,
         )
 
+    def _streaming_updater(self):
+        updater = self._updater(target_result=None)
+        self.weights = [("model.weight", torch.ones(1))]
+        self.runner = Mock()
+        self.runner.weight_updater.receive_weights_from_distributed.return_value = (
+            self.weights
+        )
+        self.runner.weight_updater.update_weights_from_tensor.return_value = (
+            True,
+            "ok",
+        )
+        updater.tp_worker = SimpleNamespace(
+            model_runner=self.runner,
+            iter_runners=lambda: [("", self.runner)],
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        return updater
+
+    def _distributed_request(self):
+        return self._request(
+            names=["model.weight"],
+            dtypes=["float32"],
+            shapes=[[1]],
+            group_name="test",
+            load_format=None,
+            selector="all",
+        )
+
     def test_successful_update_records_the_version(self):
         """A refit that reports success advances the scheduler-side version."""
         updater = self._updater(target_result=(True, "ok"))
@@ -157,37 +191,62 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         self.assertEqual(self.recorded, [])
 
     def test_successful_distributed_update_records_the_version(self):
-        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_distributed"
-        )
+        """A distributed refit's version becomes visible only when its session commits."""
+        updater = self._streaming_updater()
 
-        output = updater.update_weights_from_distributed(self._request())
+        with patch("torch.distributed.barrier"):
+            updater.begin_weight_update(BeginWeightUpdateReqInput())
+            output = updater.update_weights_from_distributed(
+                self._distributed_request()
+            )
+            self.assertTrue(output.success)
+            self.assertEqual(self.recorded, [])
+            output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        updater = self._updater(
-            target_result=(False, "boom"), method="update_weights_from_distributed"
-        )
-
-        output = updater.update_weights_from_distributed(self._request())
-
-        self.assertFalse(output.success)
-        self.assertEqual(self.recorded, [])
-
-    def test_successful_tensor_update_records_the_version(self):
-        """The tensor refit records the version once the load reports success."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_tensor"
+        updater = self._streaming_updater()
+        self.runner.weight_updater.receive_weights_from_distributed.side_effect = (
+            RuntimeError("boom")
         )
 
         with patch("torch.distributed.barrier"):
-            output = updater.update_weights_from_tensor(
-                self._request(disable_draft_model=True)
+            updater.begin_weight_update(BeginWeightUpdateReqInput())
+            output = updater.update_weights_from_distributed(
+                self._distributed_request()
             )
+            self.assertFalse(output.success)
+            self.assertEqual(self.recorded, [])
+            updater.end_weight_update(EndWeightUpdateReqInput(abort=True))
+
+        self.assertEqual(self.recorded, [])
+
+    def test_successful_tensor_update_records_the_version(self):
+        """A tensor refit's version becomes visible only when its session commits."""
+        updater = self._streaming_updater()
+
+        with (
+            patch("torch.distributed.barrier"),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater."
+                "MultiprocessingSerializer.deserialize",
+                return_value=self.weights,
+            ),
+        ):
+            updater.begin_weight_update(BeginWeightUpdateReqInput())
+            output = updater.update_weights_from_tensor(
+                self._request(
+                    serialized_named_tensors=[b"serialized"],
+                    load_format=None,
+                    selector="all",
+                )
+            )
+            self.assertTrue(output.success)
+            self.assertEqual(self.recorded, [])
+            output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])

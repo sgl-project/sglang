@@ -563,6 +563,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
             "lora_name": "adapter",
             "lora_path": "/tmp/adapter",
             "pinned": True,
+            "reloadable": True,
         }
         self.assertEqual(info["lora_paths"], [expected])
         self.assertEqual(info["internal_states"][0]["lora_paths"], [expected])
