@@ -913,9 +913,7 @@ def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outco
     if outcome == "unfinished":
         cache.cache_unfinished_req(req)
     else:
-        cache.cache_finished_req(
-            req, is_insert=outcome == "finished", owned_kv_len=5
-        )
+        cache.cache_finished_req(req, is_insert=outcome == "finished", owned_kv_len=5)
 
     matched = cache.match_prefix(MatchPrefixParams(key=key)).device_indices
     expected = (
