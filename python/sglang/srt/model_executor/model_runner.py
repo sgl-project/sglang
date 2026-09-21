@@ -34,9 +34,6 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    maybe_init_shared_mooncake_transfer_engine,
-)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -218,7 +215,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
-    numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
@@ -402,10 +398,6 @@ class ModelRunner:
             is_draft_worker=self.is_draft_worker,
         )
 
-        # Init OpenMP threads binding for CPU
-        if self.device == "cpu":
-            self.init_threads_binding()
-
         # Set float32 matmul precision
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
@@ -421,11 +413,6 @@ class ModelRunner:
                 f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
             raise
-
-        # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
-        # that the shared TE can be passed to the Mooncake PG backend (avoids
-        # creating duplicate TransferEngines).
-        self.init_shared_mooncake_transfer_engine()
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
@@ -1167,13 +1154,8 @@ class ModelRunner:
         )
 
     def init_torch_distributed(self):
-        self.pre_model_load_memory = bootstrap.init_torch_distributed(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            device=self.device,
-            dist_port=self.dist_port,
-            is_draft_worker=self.is_draft_worker,
-            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+        self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
+            device=self.device, is_draft_worker=self.is_draft_worker
         )
         # Read once, here: a draft runner is constructed inside the scope that
         # states its topology and used outside it, so what it holds has to be
@@ -1196,9 +1178,6 @@ class ModelRunner:
         self.attn_dcp_size = parallel.attn_dcp_size
         self.moe_ep_size = parallel.moe_ep_size
         self.dp_rank = parallel.dp_rank
-
-    def init_shared_mooncake_transfer_engine(self):
-        maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1591,18 +1570,6 @@ class ModelRunner:
             self.graph_time_usage,
             capture.time_usage,
             phases=("prefill", "draft_prefill"),
-        )
-
-    def init_threads_binding(self):
-        # With --enable-dp-attention, dp partitions the existing TP group
-        # rather than spawning additional processes, so dp_size must not be
-        # multiplied into the process count here (unlike regular DP, where
-        # dp_size * tp_size * pp_size is the true worker count).
-        parallel = get_parallel()
-        dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
-        self.local_omp_cpuid = numa_utils.init_threads_binding(
-            numa_index=self.gpu_id,
-            world_size=dp_size * parallel.tp_size * parallel.pp_size,
         )
 
     def apply_torch_tp(self):
