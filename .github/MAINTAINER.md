@@ -143,6 +143,22 @@ This section lists the oncalls for each hardware platform. The format is @github
 
 This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping [Lianmin Zheng](https://github.com/merrymercy) and [Ying Sheng](https://github.com/Ying1123) in the Slack channel. They will start a nomination and internal review process.
 
+## CI Control Labels
+
+`bypass-fail-fast`, `parallel-stages`, `max-concurrency` and `highest-priority`
+each relax one of the limits that keep a single PR from monopolizing the
+self-hosted GPU runners; `highest-priority` relaxes all of them at once. The
+[contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels)
+describes what each one does.
+
+Two things to know before applying one:
+
+- They take effect at dispatch. Labelling a run that is already queued or in
+  flight changes nothing; label first, then trigger.
+- Applying one is a decision to spend other PRs' runner capacity on this one.
+  `parallel-stages` is the expensive one -- it removes the gate that stops a
+  failing PR after its first stage, so the whole matrix runs either way.
+
 ## CI Maintenance Mode
 When the CI is unhealthy (e.g., the scheduled pr-test on `main` is broken for consecutive runs), the project enters **CI Maintenance Mode** by opening [issue #21065](https://github.com/sgl-project/sglang/issues/21065). While active:
 - All PR CI runs are paused. Resources are allocated to PRs that fix the CI.
