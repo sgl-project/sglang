@@ -40,7 +40,7 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    deepseek_v4: Option<super::deepseek::V4Profile>,
+    deepseek: Option<super::deepseek::Encoder>,
     is_kimi_k3: bool,
 }
 
@@ -49,7 +49,14 @@ impl ChatFormatter {
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
         let files = super::adapter::ModelFiles::open(tokenizer_path);
         let config = files.json("config.json")?.unwrap_or_default();
-        let model_type = config["model_type"].as_str().map(str::to_owned);
+        let mut model_type = config["model_type"].as_str().map(str::to_owned);
+        // SGLang also recognizes V4.1 checkpoints that retain a V4 model_type.
+        if config["architectures"][0]
+            .as_str()
+            .is_some_and(|a| a.contains("DeepseekV41"))
+        {
+            model_type = Some("deepseek_v41".into());
+        }
         if let Some(kimi) = Self::kimi_native(model_type.as_deref(), model_id) {
             return Ok(Some(kimi));
         }
@@ -59,8 +66,7 @@ impl ChatFormatter {
             Some(t) if t.starts_with("deepseek_v4") => {
                 let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
                 if let Some(formatter) = &mut formatter {
-                    formatter.deepseek_v4 =
-                        Some(super::deepseek::V4Profile::load(&files, &config)?);
+                    formatter.configure_deepseek(&files, &config)?;
                 }
                 return Ok(formatter);
             }
@@ -73,11 +79,20 @@ impl ChatFormatter {
         let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
             .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
-            if formatter.deepseek_v4.is_some() {
-                formatter.deepseek_v4 = Some(super::deepseek::V4Profile::load(&files, &config)?);
-            }
+            formatter.configure_deepseek(&files, &config)?;
         }
         Ok(formatter)
+    }
+
+    fn configure_deepseek(
+        &mut self,
+        files: &super::adapter::ModelFiles,
+        config: &JsonValue,
+    ) -> Result<()> {
+        if let Some(super::deepseek::Encoder::V4(profile)) = &mut self.deepseek {
+            *profile = super::deepseek::V4Profile::load(files, config)?;
+        }
+        Ok(())
     }
 
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
@@ -146,7 +161,7 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token,
-            deepseek_v4: None,
+            deepseek: None,
             is_kimi_k3: false,
         }))
     }
@@ -161,23 +176,18 @@ impl ChatFormatter {
             formatter,
             defaults: HashMap::new(),
             bos_token: Some("[BOS]".into()),
-            deepseek_v4: None,
+            deepseek: None,
             is_kimi_k3: true,
         })
     }
 
-    /// Native V4 and V3.2 formatters. Other V4-family encoders must be
-    /// supported explicitly; a V4.1 checkpoint cannot use the V4 wire format.
+    /// Native DeepSeek encoders; V4.1 uses its own wire format.
     pub fn deepseek_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
         let name = model_name(model_id);
         let model_type = model_type.map(str::to_lowercase);
-        if model_type.is_none() && (name.contains("v4.1") || name.contains("v41")) {
-            return None;
-        }
-        if model_type
-            .as_deref()
-            .is_some_and(|t| t.starts_with("deepseek_v4") && t != "deepseek_v4")
-        {
+        if model_type.as_deref().is_some_and(|t| {
+            t.starts_with("deepseek_v4") && !matches!(t, "deepseek_v4" | "deepseek_v41")
+        }) {
             return None;
         }
         let PromptFormatter::OAI(formatter) = deepseek_formatter_for(&model_type, &name)?;
@@ -190,6 +200,11 @@ impl ChatFormatter {
             .map_or(version.split(['-', '_', '.']).next() == Some("v4"), |t| {
                 t == "deepseek_v4"
             });
+        let is_deepseek_v41 = model_type
+            .as_deref()
+            .map_or(name.contains("v4.1") || name.contains("v41"), |t| {
+                t == "deepseek_v41"
+            });
         // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
         // reasoning-effort preamble; dynamo-render defaults to thinking at high effort.
         let defaults = HashMap::from([
@@ -200,7 +215,11 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token: Some("<｜begin▁of▁sentence｜>".into()),
-            deepseek_v4: is_deepseek_v4.then(Default::default),
+            deepseek: if is_deepseek_v41 {
+                Some(super::deepseek::Encoder::V41)
+            } else {
+                is_deepseek_v4.then(|| super::deepseek::Encoder::V4(Default::default()))
+            },
             is_kimi_k3: false,
         })
     }
@@ -280,8 +299,8 @@ impl ChatFormatter {
         if self.is_kimi_k3 {
             super::kimi::normalize(request, &mut messages, &mut kwargs)?;
         }
-        if self.deepseek_v4.is_some() {
-            super::deepseek::normalize_messages(&mut messages)?;
+        if let Some(encoder) = self.deepseek {
+            encoder.normalize(&mut messages)?;
         }
         let mut prefix = String::new();
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
@@ -294,7 +313,7 @@ impl ChatFormatter {
                 }
             }
         }
-        if self.deepseek_v4.is_some() {
+        if self.deepseek.is_some() {
             if let Some(task) = request.get("task").filter(|v| !v.is_null()).cloned() {
                 let message = messages
                     .iter_mut()
@@ -304,7 +323,7 @@ impl ChatFormatter {
                 message["task"] = task;
             }
         }
-        if let Some(profile) = self.deepseek_v4 {
+        if let Some(profile) = self.deepseek {
             return Ok((
                 RenderedPrompt::text(profile.render(request, messages, &kwargs)?),
                 prefix,
@@ -657,7 +676,8 @@ mod tests {
         assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
         assert!(ChatFormatter::deepseek_native(None, "deepseek-v4-tiny").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").is_some());
-        assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_none());
+        assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V4.1-Flash").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
         assert!(ChatFormatter::deepseek_native(Some("inkling_mm_model"), "inkling").is_none());
         assert!(ChatFormatter::deepseek_native(Some("llama"), "deepseek-v4").is_none());

@@ -166,6 +166,31 @@ async fn round_robin_plain_chat_forwards_input_ids() {
 }
 
 #[tokio::test]
+async fn v41_system_marker_reaches_worker_input_ids() {
+    let mock = MockWorker::start(vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &path).unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type":"deepseek_v41"}"#,
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = path.to_str().unwrap().into();
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let request = json!({"model":MODEL,"messages":[{"role":"system","content":"S"},{"role":"user","content":"Hi"}]});
+    assert_eq!(send(Arc::clone(&ctx), request).await, StatusCode::OK);
+    let tokenizer = ctx.tokenizers.get(MODEL).unwrap();
+    let expected = sgl_router::tokenizer::adapter::encode(
+        &tokenizer,
+        "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>Hi<｜Assistant｜></think>",
+    )
+    .unwrap();
+    assert_eq!(captured(&mock)["input_ids"], json!(expected));
+}
+
+#[tokio::test]
 async fn forwarding_opt_out_preserves_messages_and_caller_ids() {
     for policy in [PolicyKind::RoundRobin, PolicyKind::CacheAware] {
         let mock = MockWorker::start(vec![]).await;

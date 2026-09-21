@@ -77,3 +77,23 @@ fn v4_matches_sglang_serving() {
         "deepseek_v4",
     );
 }
+
+#[test]
+fn v41_matches_sglang_serving() {
+    check_fixture(
+        include_str!("../../fixtures/deepseek/v41.json"),
+        "deepseek_v41",
+    );
+}
+
+#[test]
+fn v41_leaves_unsupported_shapes_to_the_worker() {
+    let formatter = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").unwrap();
+    for request in [
+        json!({"messages":[{"role":"developer","content":"rule"}]}),
+        json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}),
+        json!({"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"A","reasoning_content":"R"},{"role":"system","content":"rule"}],"chat_template_kwargs":{"thinking":true}}),
+    ] {
+        assert!(formatter.render(&request).is_err(), "{request}");
+    }
+}

@@ -204,7 +204,7 @@ settings are not inferred from the router's environment. Disabling forwarding pr
 engine behavior but does not establish parity for local routing hashes.
 
 Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
-string content into arrays differently from the worker. Dynamo 5.1.2 does not expose
+string content into arrays differently from the worker. The pinned Dynamo renderer does not expose
 its conversion flag, so the router cannot automatically block these templates.
 Detailed content-format parity coverage follows in #39133.
 
@@ -225,7 +225,13 @@ it uses SGLang's preview-profile fallback. A `dsv4_reasoning_effort_profile` val
 of `preview` or `official` in the local `config.json` overrides detection. Keep
 this file and the encoder source consistent with the worker's model and config
 overrides. Worker environment defaults still require the forwarding precautions
-above. V4.1 requires a separate encoder and does not use the V4 formatter.
+above. V4.1 Flash uses Dynamo 5.2's separate encoder with SGLang's numeric reasoning
+budgets, tool payloads, and system markers. Text-only requests are covered;
+media, developer messages, and thinking histories whose last system turn follows
+the last user turn (without tools) fall back to worker rendering because the
+pinned encoder differs from SGLang on those shapes. Such fallbacks also use raw
+text for routing. Non-default `SGLANG_DSV41_REASONING_EFFORT` worker settings
+require the same forwarding precautions as other worker-only defaults.
 
 ## Kimi-K3
 

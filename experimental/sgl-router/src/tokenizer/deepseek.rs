@@ -4,10 +4,46 @@
 //! SGLang's native DeepSeek serving semantics around Dynamo's V4 encoder.
 
 use anyhow::{bail, ensure, Context, Result};
-use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
+use dynamo_renderer::deepseek::{
+    v4::{self, ReasoningEffort, ThinkingMode},
+    v41,
+};
 use serde_json::{json, Map, Value};
 
 use super::{adapter::ModelFiles, chat_formatter::ChatTemplateKwargs};
+
+#[derive(Clone, Copy)]
+pub(super) enum Encoder {
+    V4(V4Profile),
+    V41,
+}
+
+impl Encoder {
+    pub fn normalize(self, messages: &mut [Value]) -> Result<()> {
+        normalize_messages(messages, matches!(self, Self::V4(_)))
+    }
+
+    pub fn render(
+        self,
+        request: &Value,
+        mut messages: Vec<Value>,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<String> {
+        // SGLang drops a later user's task when merging it into an existing
+        // user/tool-result turn. Dynamo otherwise preserves that field.
+        for index in 1..messages.len() {
+            if messages[index]["role"] == "user"
+                && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
+            {
+                messages[index].as_object_mut().unwrap().remove("task");
+            }
+        }
+        match self {
+            Self::V4(profile) => profile.render(request, messages, kwargs),
+            Self::V41 => render_v41(request, messages, kwargs),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum V4Profile {
@@ -99,15 +135,6 @@ impl V4Profile {
         if let Some(tools) = request["tools"].as_array().filter(|t| !t.is_empty()) {
             messages[0]["tools"] = normalize_tools(tools)?.into();
         }
-        // SGLang drops a later user's task when merging it into an existing
-        // user/tool-result turn. Dynamo otherwise preserves that field.
-        for index in 1..messages.len() {
-            if messages[index]["role"] == "user"
-                && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
-            {
-                messages[index].as_object_mut().unwrap().remove("task");
-            }
-        }
         let effort = match (self, request_effort(request).and_then(Value::as_str)) {
             (Self::Official, Some("high")) | (Self::Preview, Some("max")) => {
                 Some(ReasoningEffort::High)
@@ -148,9 +175,9 @@ pub(super) fn request_effort(request: &Value) -> Option<&Value> {
 /// Before continuation extraction, SGLang flattens V4 parts with spaces and
 /// parses assistant arguments as JSON objects. Dynamo expects those arguments
 /// serialized, but must not apply its permissive malformed-JSON fallback here.
-pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<()> {
+fn normalize_messages(messages: &mut [Value], flatten_content: bool) -> Result<()> {
     for message in messages {
-        if let Some(parts) = message["content"].as_array() {
+        if let Some(parts) = message["content"].as_array().filter(|_| flatten_content) {
             message["content"] = parts
                 .iter()
                 .filter(|p| matches!(p["type"].as_str(), Some("text" | "input_text")))
@@ -214,6 +241,94 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>> {
             Ok(json!({"type":"function", "function":function}))
         })
         .collect()
+}
+
+/// Use Dynamo's low-level encoder so SGLang, rather than Dynamo's OpenAI
+/// defaults, controls tool selection and the numeric reasoning budget.
+fn render_v41(
+    request: &Value,
+    mut messages: Vec<Value>,
+    kwargs: &ChatTemplateKwargs,
+) -> Result<String> {
+    ensure!(
+        !messages.is_empty(),
+        "DeepSeek requires messages after continuation extraction"
+    );
+    let thinking = kwargs
+        .get("thinking")
+        .is_some_and(|v| minijinja::Value::from_serialize(v).is_true());
+    // Dynamo maps developer to system, unlike this SGLang encoder. Leave
+    // that unsupported shape to the worker instead of forwarding wrong IDs.
+    ensure!(
+        !messages.iter().any(|m| m["role"] == "developer"),
+        "V4.1 developer messages require engine-side rendering"
+    );
+    if let Some(tools) = request["tools"].as_array().filter(|t| !t.is_empty()) {
+        if messages[0]["role"] != "system" {
+            messages.insert(0, json!({"role":"system", "content":""}));
+        }
+        // dsv41_tool_payload: only supplied fields, in the OpenAI field order.
+        messages[0]["tools"] = tools
+            .iter()
+            .map(|tool| {
+                let f = &tool["function"];
+                let mut function: Map<String, Value> = [
+                    "name",
+                    "description",
+                    "parameters",
+                    "strict",
+                    "defer_loading",
+                ]
+                .into_iter()
+                .filter_map(|key| {
+                    f.get(key)
+                        .filter(|v| !v.is_null())
+                        .map(|v| (key.into(), v.clone()))
+                })
+                .collect();
+                if !function.contains_key("defer_loading") {
+                    if let Some(v) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+                        function.insert("defer_loading".into(), v.clone());
+                    }
+                }
+                json!({"type":"function", "function":function})
+            })
+            .collect();
+    }
+    let last_user = messages.iter().rposition(|m| m["role"] == "user");
+    let last_system = messages
+        .iter()
+        .rposition(|m| m["role"] == "system")
+        .filter(|i| *i > 0);
+    let has_tools = messages
+        .iter()
+        .any(|m| m["tools"].as_array().is_some_and(|t| !t.is_empty()));
+    let different_cutoff = last_system.is_some_and(|s| last_user.is_none_or(|u| s > u));
+    ensure!(
+        !thinking || has_tools || !different_cutoff,
+        "V4.1 reasoning after a final system message requires engine-side rendering"
+    );
+    let effort = request_effort(request);
+    let budget = match effort.and_then(Value::as_str) {
+        Some("low") => 25,
+        Some("high") => 50,
+        Some("xhigh") => 75,
+        Some("max") => 100,
+        _ => effort
+            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+            .filter(|v| (0.0..=0.99).contains(v))
+            .map_or(50, |v| (v * 100.0).round_ties_even().max(1.0) as u8),
+    };
+    v41::encode_messages(
+        &messages,
+        if thinking {
+            ThinkingMode::Thinking
+        } else {
+            ThinkingMode::Chat
+        },
+        true,
+        budget,
+    )
 }
 
 #[cfg(test)]
