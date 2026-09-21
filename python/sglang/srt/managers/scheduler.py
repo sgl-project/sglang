@@ -601,7 +601,6 @@ class Scheduler(
                 and get_parallel().attn_tp_rank == 0
                 and get_parallel().attn_cp_rank == 0
             ),
-            ps=self.ps,
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,

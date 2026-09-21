@@ -129,8 +129,27 @@ def mixer2_gated_norm_tensor_parallel(
         )
         mixer.weight.weight_loader(mixer.weight, weight)
 
-    # m2 reads tp via get_parallel().tp_size/rank — force it through the context.
-    with get_parallel().override(tp_size=1, tp_rank=0):
+    # m2 reads tp via get_parallel().tp_size/rank — state a single-rank topology
+    # through the context. Every width that follows from `tp_size` is named:
+    # narrowing one leaf and leaving the quotients behind describes no layout.
+    with get_parallel().override(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_tp_group=None,
+        attn_dp_size=1,
+        attn_dp_rank=0,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        attn_cp_group=None,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        moe_ep_group=None,
+        moe_dp_size=1,
+        moe_tp_size=1,
+    ):
         # create gated-norm without TP to compute reference
         mixer_single_gpu = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,
