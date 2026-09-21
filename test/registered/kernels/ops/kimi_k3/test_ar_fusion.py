@@ -10,7 +10,7 @@ semaphore window cycling.
 
 Usage::
 
-    python test/registered/jit/kimi_k3/test_ar_fusion.py   # relaunches under torchrun (8 GPUs)
+    python test/registered/kernels/ops/kimi_k3/test_ar_fusion.py   # relaunches under torchrun (8 GPUs)
 """
 
 from __future__ import annotations

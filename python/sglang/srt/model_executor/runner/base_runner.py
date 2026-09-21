@@ -131,12 +131,17 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Sized in tokens, not requests: under speculative decoding the
+            # verify forward carries num_tokens_per_req tokens per request and
+            # _dummy_run slices these buffers to num_tokens (same as
+            # topk_indices below). Identical for plain decode where
+            # num_tokens_per_req == 1.
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                # [T, blocks, H]. Other models use [T, H].
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
@@ -269,7 +274,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.ps.pp_size > 1
+            and get_parallel().pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -541,7 +546,7 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
+                and get_parallel().pp_rank != 0
                 and mr.ps.attn_cp_size > 1
             ):
                 pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
@@ -630,7 +635,11 @@ class BaseRunner(ABC):
             spec_algorithm=mr.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            # Maintained only under expert parallelism; None elsewhere so routing
+            # does not mask every row against a never-filled zero count.
+            num_token_non_padded=(
+                buffers.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
@@ -644,6 +653,8 @@ class BaseRunner(ABC):
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
         def run_once():
             # Reused dummy batches may carry DP-local lazy caches from a prior
