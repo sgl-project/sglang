@@ -5,11 +5,6 @@ tag: "approx"
 ---
 SGLang provides three complementary caching strategies for Diffusion Transformer (DiT) models. All reduce denoising cost by skipping redundant computation, but they operate at different levels.
 
-For faster worker restarts without approximating denoising, see
-[Weight cache for fast recovery](/docs/sglang-diffusion/weight_cache). It shares
-GPU-resident model weights across process lifetimes, rather than caching
-intermediate denoising results.
-
 ## Overview
 
 SGLang supports three complementary caching approaches:
