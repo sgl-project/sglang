@@ -49,9 +49,6 @@ class TestEagle3Latency(CustomTestCase):
             seed=42,
         )
 
-        # Carried over from the EAGLE/Llama-2 config this replaced, so they are
-        # a starting point, not a measured distribution: recalibrate both from
-        # the first CI run of EAGLE3 on this hardware.
         check_perf(
             self,
             "test_online_latency_eagle3",
