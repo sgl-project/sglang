@@ -138,8 +138,9 @@ pub enum BufferStore {
     Inline(BufferData),
     /// A POSIX shared-memory segment (see [`ShmSegment`]); only the name
     /// crosses to Python, which maps it on every TP rank after the broadcast.
-    /// Dropped unconsumed — request aborted while parked, late result — the
-    /// segment is unlinked with it.
+    /// Dropped unconsumed — request rejected after encoding (a pre-send
+    /// check, a full ring) or dropped at shutdown — the segment is unlinked
+    /// with it.
     Shm { segment: ShmSegment, dtype: DType },
 }
 

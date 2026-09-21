@@ -1,5 +1,6 @@
-//! The worker pool: drain MM requests, run the selected processor, hand the
-//! result back as named buffers that ride the ring with the request.
+//! The worker pool: drain requests in `Encoding`, run the selected processor,
+//! and hand each request back with the expanded ids and the named feature
+//! buffers that ride the ring with it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,9 +10,11 @@ use sglang_mm::pipeline::{Tensor, TensorData};
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
-use crate::message::request::{MmRequest, MmWorkItem};
+use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::TmEvent;
+use crate::utils::error::Error;
+use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
 /// Python parity: caller hashes override the computed ones so an external
@@ -57,11 +60,12 @@ pub struct MmProcessOutput {
 
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
-/// request-scoped Python objects. The work item arrives tokenized (the FSM
-/// runs `Tokenizing` before `Encoding` for a text prompt), so a processor
-/// never tokenizes: it expands placeholders in ids.
+/// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
+/// `Tokenizing` before `Encoding` for a text prompt), so a processor never
+/// tokenizes: it expands placeholders in ids. `mm` is the request's media,
+/// owned.
 pub trait MmProcessor: Send + Sync {
-    fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String>;
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
 }
 
 struct QwenMmProcessor {
@@ -77,8 +81,8 @@ impl QwenMmProcessor {
 }
 
 impl MmProcessor for QwenMmProcessor {
-    fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String> {
-        let input = super::payload::to_mm_input(work)?;
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+        let input = super::payload::to_mm_input(input_ids, mm)?;
         let output = sglang_mm::driver::process(self.family.as_ref(), input)?;
         let packed = sglang_mm::qwen_vl::pack_output(output)?;
         let items = packed
@@ -221,9 +225,13 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 
 /// Run the processor for one request. `Ok` returns the final expanded ids and
 /// the buffers to ride the ring; `Err` rejects the request back to the client.
-fn process(ctx: &MmContext, mut work: MmWorkItem) -> Result<(TokenIds, Vec<Buffer>), String> {
-    let caller_hashes = std::mem::take(&mut work.mm_hashes);
-    let mut output = ctx.processor.process(work)?;
+fn process(
+    ctx: &MmContext,
+    input_ids: TokenIds,
+    mut mm: MmData,
+) -> Result<(TokenIds, Vec<Buffer>), String> {
+    let caller_hashes = std::mem::take(&mut mm.mm_hashes);
+    let mut output = ctx.processor.process(input_ids, mm)?;
     output.result.validate(output.input_ids.len())?;
     apply_caller_hashes(
         output.result.items.iter_mut().map(|item| &mut item.hash),
@@ -237,25 +245,24 @@ fn process(ctx: &MmContext, mut work: MmWorkItem) -> Result<(TokenIds, Vec<Buffe
 /// late pool spawn (`Runtime::start_mm_workers`, once Python has resolved
 /// the spec).
 pub struct MmWiring {
-    /// Requests parked in `Encoding`, drained by the worker pool. Stays empty
-    /// for non-multimodal models — nothing routes to it.
-    pub mm_rx: flume::Receiver<MmRequest>,
-    /// Back-channel for the workers' `MmEncoded` / `MmFailed` into the
-    /// to-scheduler loop.
+    /// Requests in `Encoding`, drained by the worker pool. Stays empty for
+    /// non-multimodal models — nothing routes to it.
+    pub mm_rx: flume::Receiver<Request>,
+    /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
 /// pinning policy for this pool — see its docs).
 pub struct MmWorker {
-    mm_rx: flume::Receiver<MmRequest>,
+    mm_rx: flume::Receiver<Request>,
     tm_tx: flume::Sender<TmEvent>,
     ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
-        mm_rx: flume::Receiver<MmRequest>,
+        mm_rx: flume::Receiver<Request>,
         tm_tx: flume::Sender<TmEvent>,
         ctx: Arc<MmContext>,
     ) -> Self {
@@ -266,25 +273,39 @@ impl MmWorker {
 impl Runnable for MmWorker {
     /// Drain until the mm channel closes (to-scheduler drops its sender on
     /// shutdown). One request at a time, so the pool size bounds MM
-    /// concurrency; an error rejects the request back to the client.
+    /// concurrency. Mirrors `TokenizerWorker`: carve the work out of the
+    /// request, process, write the result back, advance the FSM
+    /// (`EncodeDone` → PreSendValidating, or `Error` → Failed, which intake
+    /// rejects to the client as Python turns a per-request exception into a
+    /// 400), and return the request as `Encoded`.
     fn run(self) {
-        while let Ok(req) = self.mm_rx.recv() {
-            let rid = req.rid;
-            let event = match process(&self.ctx, req.work) {
-                Ok((input_ids, buffers)) => {
-                    tracing::debug!(%rid, tokens = input_ids.len(), "mm: processed");
-                    TmEvent::MmEncoded {
-                        rid,
-                        input_ids,
-                        buffers,
+        while let Ok(mut req) = self.mm_rx.recv() {
+            let event = {
+                let RequestKind::Generate(g) = &mut req.kind else {
+                    tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
+                    continue;
+                };
+                // Move the processor's inputs out: the unexpanded ids (always
+                // present by `Encoding`; the expanded ids replace them) and the
+                // media, so the processor owns the bytes without a copy. `text`
+                // stays for the scheduler header; nothing reads `mm` after this.
+                let input_ids = g.input_ids.take().unwrap_or_default();
+                let mm = g.mm.take().map(|m| *m).unwrap_or_default();
+                match process(&self.ctx, input_ids, mm) {
+                    Ok((input_ids, buffers)) => {
+                        tracing::debug!(rid = %req.rid, tokens = input_ids.len(), "mm: processed");
+                        g.input_ids = Some(input_ids);
+                        g.mm_buffers = buffers;
+                        Event::EncodeDone
+                    }
+                    Err(message) => {
+                        tracing::warn!(rid = %req.rid, %message, "mm processing rejected");
+                        Event::Error(Error::Encode(message))
                     }
                 }
-                Err(message) => {
-                    tracing::warn!(%rid, %message, "mm processing rejected");
-                    TmEvent::MmFailed { rid, message }
-                }
             };
-            if self.tm_tx.send(event).is_err() {
+            let _ = req.state.apply(event);
+            if self.tm_tx.send(TmEvent::Encoded(req)).is_err() {
                 return; // to-scheduler gone: shutdown
             }
         }
@@ -305,9 +326,9 @@ mod tests {
     }
 
     impl MmProcessor for ExternalProcessor {
-        fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String> {
+        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, String> {
             Ok(MmProcessOutput {
-                input_ids: work.input_ids,
+                input_ids,
                 result: MmEncodedEntry {
                     items: vec![MmEncodedItem {
                         modality: MmModality::Image,
@@ -492,12 +513,11 @@ mod tests {
             }),
             false,
         );
-        let work = MmWorkItem {
-            input_ids: vec![1, 2],
+        let mm = MmData {
             mm_hashes: vec!["2a".to_owned()],
             ..Default::default()
         };
-        let (input_ids, buffers) = process(&ctx, work).unwrap();
+        let (input_ids, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
         assert_eq!(input_ids, [1, 2]);
         assert_eq!(find(&buffers, "mm.feature.0").unwrap().shape, [1]);
         assert!(find(&buffers, "mm.mrope").is_none());
@@ -519,12 +539,90 @@ mod tests {
         ] {
             let ctx =
                 MmContext::with_processor(Arc::new(ExternalProcessor { shape, offsets }), false);
-            let work = MmWorkItem {
-                input_ids: vec![1, 2],
-                ..Default::default()
-            };
-            assert!(process(&ctx, work).is_err());
+            assert!(process(&ctx, vec![1, 2], MmData::default()).is_err());
         }
+    }
+
+    /// A request in `Encoding` for the worker loop, with the given ids.
+    fn encoding_req(rid: &str, input_ids: Vec<i64>) -> Request {
+        use crate::message::request::GenerateRequest;
+        use crate::message::response::ResponseSink;
+        use crate::utils::fsm::RequestState;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Request {
+            rid: rid.to_string().into(),
+            state: RequestState::Encoding,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: rid.to_string().into(),
+                input_ids: Some(input_ids),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// The worker loop takes the whole request, like the tokenizer pool: on
+    /// success it writes the expanded ids and buffers back and advances to
+    /// `PreSendValidating`; on a processor error it marks the request
+    /// `Failed(Encode)`. Either way the request comes back as `Encoded`.
+    #[test]
+    fn worker_returns_request_with_fsm_advanced() {
+        use crate::utils::fsm::RequestState;
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let ok_ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        ));
+        let worker = std::thread::spawn({
+            let mm_rx = mm_rx.clone();
+            move || MmWorker::new(mm_rx, tm_tx, ok_ctx).run()
+        });
+        mm_tx.send(encoding_req("ok", vec![1, 2])).unwrap();
+        drop(mm_tx); // closes the pool edge → the loop exits after draining
+        worker.join().unwrap();
+
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Encoded");
+        };
+        assert_eq!(req.rid.as_str(), "ok");
+        assert!(
+            matches!(req.state, RequestState::PreSendValidating),
+            "{:?}",
+            req.state
+        );
+        let RequestKind::Generate(g) = &req.kind else {
+            panic!("generate")
+        };
+        assert_eq!(g.input_ids.as_deref(), Some(&[1, 2][..]));
+        assert!(find(&g.mm_buffers, "mm.feature.0").is_some());
+        assert!(find(&g.mm_buffers, "mm.meta").is_some());
+
+        // A malformed result (span past the prompt) fails the request in place.
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let bad_ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 2)],
+            }),
+            false,
+        ));
+        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, bad_ctx).run());
+        mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
+        drop(mm_tx);
+        worker.join().unwrap();
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Encoded");
+        };
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Encode(_))),
+            "{:?}",
+            req.state
+        );
     }
 
     /// Caller hashes override computed ones; mismatched lengths and malformed

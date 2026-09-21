@@ -1,4 +1,4 @@
-//! Convert a parked request's [`MmWorkItem`] into the typed [`MmInput`] the
+//! Convert a request's ids and [`MmData`] into the typed [`MmInput`] the
 //! `sglang-mm` driver consumes — an in-process handoff, nothing serialized.
 //!
 //! Every `Err` rejects the request back to the client; the message says whether
@@ -10,7 +10,7 @@ use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
 use sglang_mm::driver::{ImageSource, MmInput};
 
 use crate::message::multimodal::MmItem;
-use crate::message::request::{MmWorkItem, ProcessorExtensions};
+use crate::message::request::{MmData, ProcessorExtensions};
 use crate::message::types::TokenIds;
 
 /// Fully resolved media for a multimodal processor. I/O sources were
@@ -29,23 +29,23 @@ pub struct ResolvedMediaWork {
 }
 
 /// Resolve all modality fields in the fixed image/video/audio prefetch order.
-pub fn resolve_media_work(work: MmWorkItem) -> Result<ResolvedMediaWork, String> {
-    resolve_media_work_with_budget(work, sglang_mm::driver::MAX_REQUEST_BYTES)
+pub fn resolve_media_work(input_ids: TokenIds, mm: MmData) -> Result<ResolvedMediaWork, String> {
+    resolve_media_work_with_budget(input_ids, mm, sglang_mm::driver::MAX_REQUEST_BYTES)
 }
 
 fn resolve_media_work_with_budget(
-    work: MmWorkItem,
+    input_ids: TokenIds,
+    mm: MmData,
     max_request_bytes: u64,
 ) -> Result<ResolvedMediaWork, String> {
-    let MmWorkItem {
-        input_ids,
+    let MmData {
         image_data,
         video_data,
         audio_data,
         processor_extensions,
         prefetched,
         mm_hashes: _,
-    } = work;
+    } = mm;
     let mut prefetched = prefetched.into_iter();
     let budget = ByteBudget::new(max_request_bytes);
     let images = collect_media(image_data, &mut prefetched, "image_data", &budget)?;
@@ -112,19 +112,18 @@ pub fn io_sources(items: &[MmItem]) -> Vec<String> {
         .collect()
 }
 
-/// I/O-backed sources are swapped for their `work.prefetched` bytes (in
+/// I/O-backed sources are swapped for their `mm.prefetched` bytes (in
 /// [`io_sources`] order); one left without an entry is an internal error here,
 /// never a fetch.
-pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
-    let MmWorkItem {
-        input_ids,
+pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
+    let MmData {
         image_data,
         video_data,
         audio_data,
         processor_extensions,
         prefetched,
         mm_hashes: _,
-    } = work;
+    } = mm;
     if !video_data.is_empty() || !audio_data.is_empty() {
         return Err("unsupported modality: video/audio input".into());
     }
@@ -170,9 +169,10 @@ mod tests {
         MmItem::Source(s.to_owned())
     }
 
-    fn image_work(image_data: Vec<MmItem>) -> MmWorkItem {
-        MmWorkItem {
-            input_ids: vec![7, 1, 8],
+    const IDS: [i64; 3] = [7, 1, 8];
+
+    fn image_work(image_data: Vec<MmItem>) -> MmData {
+        MmData {
             image_data,
             ..Default::default()
         }
@@ -180,30 +180,45 @@ mod tests {
 
     #[test]
     fn converts_source_and_ref_images() {
-        let one = to_mm_input(image_work(vec![src("data:image/png;base64,x")])).unwrap();
+        let one = to_mm_input(
+            IDS.to_vec(),
+            image_work(vec![src("data:image/png;base64,x")]),
+        )
+        .unwrap();
         assert_eq!(one.images.len(), 1);
-        let many =
-            to_mm_input(image_work(vec![src("a"), MmItem::Ref { url: "b".into() }])).unwrap();
+        let many = to_mm_input(
+            IDS.to_vec(),
+            image_work(vec![src("a"), MmItem::Ref { url: "b".into() }]),
+        )
+        .unwrap();
         assert_eq!(many.images.len(), 2);
         assert!(matches!(&many.images[1], ImageSource::String(s) if s == "b"));
     }
 
     #[test]
     fn unsupported_modalities_and_items_rejected() {
-        let video = MmWorkItem {
+        let video = MmData {
             video_data: vec![src("video.mp4")],
             ..Default::default()
         };
-        assert!(to_mm_input(video).err().unwrap().contains("video/audio"));
+        assert!(
+            to_mm_input(IDS.to_vec(), video)
+                .err()
+                .unwrap()
+                .contains("video/audio")
+        );
 
-        let err = to_mm_input(image_work(vec![MmItem::Preprocessed {
-            format: "processor_output".into(),
-        }]))
+        let err = to_mm_input(
+            IDS.to_vec(),
+            image_work(vec![MmItem::Preprocessed {
+                format: "processor_output".into(),
+            }]),
+        )
         .err()
         .unwrap();
         assert!(err.contains("preprocessed `processor_output`"), "{err}");
 
-        let extension = MmWorkItem {
+        let extension = MmData {
             processor_extensions: std::iter::once((
                 "multimodal_custom".to_owned(),
                 rmpv::Value::Boolean(true),
@@ -212,7 +227,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            to_mm_input(extension)
+            to_mm_input(IDS.to_vec(), extension)
                 .err()
                 .unwrap()
                 .contains("unsupported generate extensions")
@@ -234,7 +249,7 @@ mod tests {
 
         let mut work = image_work(image.clone());
         work.prefetched = vec![Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
-        let input = to_mm_input(work).unwrap();
+        let input = to_mm_input(IDS.to_vec(), work).unwrap();
         let as_bytes = |i: usize| match &input.images[i] {
             ImageSource::Bytes(b) => b.as_slice(),
             other => panic!("expected bytes, got {other:?}"),
@@ -243,14 +258,14 @@ mod tests {
         assert_eq!(as_bytes(2), b"bb");
         assert!(matches!(&input.images[1], ImageSource::String(_)));
 
-        let err = to_mm_input(image_work(image)).err().unwrap();
+        let err = to_mm_input(IDS.to_vec(), image_work(image)).err().unwrap();
         assert!(err.contains("not prefetched"), "{err}");
     }
 
     #[test]
     fn image_free_work_rejected() {
         assert!(
-            to_mm_input(MmWorkItem::default())
+            to_mm_input(IDS.to_vec(), MmData::default())
                 .err()
                 .unwrap()
                 .contains("no raw image sources")
@@ -259,19 +274,23 @@ mod tests {
 
     #[test]
     fn resolved_media_shares_one_byte_budget_across_source_forms() {
-        let work = MmWorkItem {
+        let work = MmData {
             image_data: vec![src("YWJjZA=="), src("ZWZnaA==")],
             ..Default::default()
         };
-        let err = resolve_media_work_with_budget(work, 7).err().unwrap();
+        let err = resolve_media_work_with_budget(IDS.to_vec(), work, 7)
+            .err()
+            .unwrap();
         assert!(err.contains("request media byte budget"), "{err}");
 
-        let work = MmWorkItem {
+        let work = MmData {
             image_data: vec![src("YWJjZA==")],
             video_data: vec![src("ZWZnaA==")],
             ..Default::default()
         };
-        let err = resolve_media_work_with_budget(work, 7).err().unwrap();
+        let err = resolve_media_work_with_budget(IDS.to_vec(), work, 7)
+            .err()
+            .unwrap();
         assert!(err.contains("request media byte budget"), "{err}");
     }
 
@@ -281,14 +300,14 @@ mod tests {
         let video = Bytes::from(vec![3, 4]);
         let image_ptr = image.as_ptr();
         let video_ptr = video.as_ptr();
-        let work = MmWorkItem {
+        let work = MmData {
             image_data: vec![src("/image"), src("BQY=")],
             video_data: vec![src("https://example.test/video")],
             audio_data: vec![src("Bwg=")],
             prefetched: vec![image, video],
             ..Default::default()
         };
-        let resolved = resolve_media_work_with_budget(work, 8).unwrap();
+        let resolved = resolve_media_work_with_budget(IDS.to_vec(), work, 8).unwrap();
         assert_eq!(resolved.images[0].as_ptr(), image_ptr);
         assert_eq!(resolved.videos[0].as_ptr(), video_ptr);
         assert_eq!(resolved.images[1].as_ref(), [5, 6]);
@@ -296,19 +315,19 @@ mod tests {
 
         for work in [
             image_work(vec![src("/missing")]),
-            MmWorkItem {
+            MmData {
                 prefetched: vec![Bytes::from_static(b"extra")],
                 ..Default::default()
             },
         ] {
-            assert!(resolve_media_work(work).is_err());
+            assert!(resolve_media_work(IDS.to_vec(), work).is_err());
         }
-        let work = MmWorkItem {
+        let work = MmData {
             image_data: vec![src("/image")],
             audio_data: vec![src("Bwg=")],
             prefetched: vec![Bytes::from_static(b"1234")],
             ..Default::default()
         };
-        assert!(resolve_media_work_with_budget(work, 5).is_err());
+        assert!(resolve_media_work_with_budget(IDS.to_vec(), work, 5).is_err());
     }
 }

@@ -553,32 +553,6 @@ fn extension_value_present(value: &rmpv::Value) -> bool {
     }
 }
 
-/// One request handed to the MM worker pool: the rid to correlate the result,
-/// plus the owned inputs from [`GenerateRequest::take_mm_work`].
-#[derive(Debug)]
-pub struct MmRequest {
-    pub rid: Rid,
-    pub work: MmWorkItem,
-}
-
-/// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`crate::multi_modality::payload::to_mm_input`].
-#[derive(Debug, Default)]
-pub struct MmWorkItem {
-    /// The prompt ids with placeholders unexpanded. Always present by the
-    /// time a request reaches `Encoding`: the client's own, or the tokenizer
-    /// pool's (`Tokenizing { then: Encode }` runs first for a text prompt).
-    pub input_ids: TokenIds,
-    pub image_data: Vec<MmItem>,
-    pub video_data: Vec<MmItem>,
-    pub audio_data: Vec<MmItem>,
-    pub processor_extensions: ProcessorExtensions,
-    /// See [`MmData::prefetched`].
-    pub prefetched: Vec<Bytes>,
-    /// See [`GenerateBody::mm_hashes`].
-    pub mm_hashes: Vec<String>,
-}
-
 /// The owned request as it travels request stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
@@ -696,14 +670,16 @@ pub struct GenerateRequest {
     /// scheduler header. Boxed so the common text-only request doesn't grow
     /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
-    /// What the MM worker produced (`MmEncoded`): the feature tensors and their
+    /// What the MM worker produced (returned as `Encoded`): the feature tensors and their
     /// per-item metadata, already placed inline or in shm. Pushed to the ring
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
-/// modality already fanned out to this request's own item list.
+/// modality already fanned out to this request's own item list. Also the MM
+/// processor's input: the MM worker moves it out of the request whole, and
+/// `payload::to_mm_input` converts it to the driver's.
 ///
 /// Constructed directly only by tests: `api_server::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
@@ -740,25 +716,6 @@ impl GenerateRequest {
                     .values()
                     .any(extension_value_present)
         })
-    }
-
-    /// Carve out the MM worker's inputs: `input_ids` is taken (the expanded
-    /// ids replace it) and the mm values move wholesale. `text` stays — the
-    /// scheduler header still needs it, and the worker does not.
-    pub fn take_mm_work(&mut self) -> MmWorkItem {
-        let mut work = MmWorkItem {
-            input_ids: self.input_ids.take().unwrap_or_default(),
-            ..Default::default()
-        };
-        if let Some(m) = self.mm.as_deref_mut() {
-            work.image_data = std::mem::take(&mut m.image_data);
-            work.video_data = std::mem::take(&mut m.video_data);
-            work.audio_data = std::mem::take(&mut m.audio_data);
-            work.processor_extensions = std::mem::take(&mut m.processor_extensions);
-            work.prefetched = std::mem::take(&mut m.prefetched);
-            work.mm_hashes = std::mem::take(&mut m.mm_hashes);
-        }
-        work
     }
 
     pub fn encode_header(&self) -> Result<Bytes, Error> {
@@ -1204,14 +1161,12 @@ mod tests {
     }
 
     /// `mm_hashes` rides only on single requests (Python `__getitem__`
-    /// parity: batches drop it) and moves into the work item.
+    /// parity: batches drop it) and lives in the mm data.
     #[test]
     fn mm_hashes_single_only() {
-        let (mut ps, _) =
+        let (ps, _) =
             requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#).unwrap();
         assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
-        assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
-        assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
 
         // A batch cannot carry hashes (Python drops them), so it is rejected,
         // as is the nested batch shape on a single request...
@@ -1230,31 +1185,6 @@ mod tests {
         ] {
             assert!(requests(body).is_ok(), "{body}");
         }
-    }
-
-    /// `take_mm_work` takes `input_ids` (the expanded ids replace them) and
-    /// moves everything the worker owns out of the request. `text` is not part
-    /// of the work item: a text prompt reaches `Encoding` already tokenized.
-    #[test]
-    fn mm_work_item_takes_owned_fields() {
-        let (mut ps, _) =
-            requests(r#"{"input_ids": [7, 1, 8], "image_data": ["u1", "u2"], "audio_data": "a"}"#)
-                .unwrap();
-        let work = ps[0].take_mm_work();
-        assert_eq!(work.input_ids, vec![7, 1, 8]);
-        assert_eq!(work.image_data.len(), 2);
-        assert!(work.video_data.is_empty());
-        assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
-        // Moved out, not cloned.
-        assert!(ps[0].input_ids.is_none());
-        assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
-
-        // A text prompt keeps its text for the scheduler header; the worker
-        // gets whatever ids the tokenizer pool filled in.
-        let (mut ps, _) = requests(r#"{"text": "hi", "image_data": "u"}"#).unwrap();
-        ps[0].input_ids = Some(vec![9]);
-        assert_eq!(ps[0].take_mm_work().input_ids, vec![9]);
-        assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 
     /// The body limit is disabled, so an unbounded batch turns a small body into an

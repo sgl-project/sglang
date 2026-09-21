@@ -1,7 +1,7 @@
 //! Configuration and multimodal handles for scheduler intake.
 
 use crate::message::config::ServerArgs;
-use crate::message::request::MmRequest;
+use crate::message::request::Request;
 
 /// Dispatches multimodal requests onto the MM worker channel.
 #[derive(Clone)]
@@ -10,8 +10,9 @@ pub struct MmDispatch {
     /// ignored, as the Python `TokenizerManager` does with `mm_processor is
     /// None`.
     pub enabled: bool,
-    /// → MM worker pool (spawned via `Server.start_mm_workers`).
-    pub tx: flume::Sender<MmRequest>,
+    /// → MM worker pool (spawned via `Server.start_mm_workers`); carries the
+    /// whole request, like the tokenizer pool's edge.
+    pub tx: flume::Sender<Request>,
 }
 
 /// Resolved once at boot from the scheduler's `server_args`.

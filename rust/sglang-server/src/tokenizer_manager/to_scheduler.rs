@@ -1,14 +1,9 @@
 //! TokenizerManager — to_scheduler side.
 
-use std::collections::HashMap;
-
-use crate::message::buffers::Buffer;
 use crate::message::detok::DetokMsg;
-use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{MmRequest, Request, RequestKind, SchedulerRequest};
+use crate::message::request::{Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
-use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -37,10 +32,6 @@ pub struct Intake {
     to_scheduler_tx: ToSchedulerTx,
     limits: Limits,
     mm: MmDispatch,
-    /// Requests parked in `Encoding` while an MM worker processes their media;
-    /// resumed by `MmEncoded` / `MmFailed`. Only this thread touches it, so no
-    /// lock.
-    pending_mm: HashMap<Rid, Request>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -61,7 +52,6 @@ impl Intake {
             to_scheduler_tx,
             limits,
             mm,
-            pending_mm: HashMap::new(),
             shutdown,
         }
     }
@@ -85,18 +75,10 @@ impl Runnable for Intake {
                 .wait();
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
-                // A fresh request and one returning from the tokenizer pool.
-                Some(Lane::Event(TmEvent::Intake(req) | TmEvent::Tokenized(req))) => {
-                    self.drive(req)
-                }
-                Some(Lane::Event(TmEvent::MmEncoded {
-                    rid,
-                    input_ids,
-                    buffers,
-                })) => self.on_mm_encoded(rid, input_ids, buffers),
-                Some(Lane::Event(TmEvent::MmFailed { rid, message })) => {
-                    self.on_mm_failed(rid, message)
-                }
+                // A fresh request and one returning from either pool.
+                Some(Lane::Event(
+                    TmEvent::Intake(req) | TmEvent::Tokenized(req) | TmEvent::Encoded(req),
+                )) => self.drive(req),
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -136,11 +118,10 @@ impl Intake {
     }
 
     /// Drive a request through its intake states until it terminates (failed or
-    /// pushed to the ring), is handed to the tokenizer pool (re-entering as a
-    /// `Tokenized` event), or is parked in `pending_mm` awaiting an MM worker
-    /// (re-entering via `MmEncoded` / `MmFailed`). Each arm acts and advances
-    /// the FSM; the loop re-dispatches. The arms are the design table's states,
-    /// `Failed` the single reject path.
+    /// pushed to the ring) or is handed to a pool — the tokenizer pool
+    /// (re-entering as `Tokenized`) or the MM pool (re-entering as `Encoded`).
+    /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
+    /// are the design table's states, `Failed` the single reject path.
     fn drive(&mut self, mut req: Request) {
         // Flipped once `register_detok` succeeds; `fail` must not deregister before
         // that (see `fail`). A pool return re-enters `drive` already registered.
@@ -222,38 +203,26 @@ impl Intake {
                         }
                     }
                 }
-                // Hand off to the MM worker pool and park the request; it
-                // re-enters via `MmEncoded` (→ PreSendValidating) or `MmFailed`
-                // (→ reject). Doesn't loop.
+                // Hand off to the MM worker pool, which returns the request as
+                // an `Encoded` event (PreSendValidating with the expanded ids and
+                // feature buffers set — or Failed on error). Doesn't loop. Like
+                // the tokenizer hop, the request is out of reach while there: an
+                // abort in that window deregisters and tells the scheduler, and
+                // the request is still pushed when it returns (wasted work, not
+                // misdelivery — the chunks land on a deregistered rid).
                 RequestState::Encoding => {
-                    let work = {
-                        let RequestKind::Generate(g) = &mut req.kind else {
-                            self.fail(
-                                &mut req,
-                                Error::Internal("non-generate request in Encoding".into()),
-                                registered,
-                            );
-                            return;
-                        };
-                        g.take_mm_work()
-                    };
-                    let msg = MmRequest {
-                        rid: req.rid.clone(),
-                        work,
-                    };
                     // Full = the pool can't keep up, so back-pressure like a full
-                    // to_scheduler channel. Disconnected = pool gone.
-                    if let Err(e) = self.mm.tx.try_send(msg) {
-                        let err = match e {
-                            flume::TrySendError::Full(_) => Error::QueueFull,
-                            flume::TrySendError::Disconnected(_) => {
-                                Error::Internal("mm worker pool gone".into())
+                    // to_scheduler channel. Disconnected = pool gone. Either way
+                    // flume hands the request back.
+                    if let Err(e) = self.mm.tx.try_send(req) {
+                        let (err, mut req) = match e {
+                            flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                            flume::TrySendError::Disconnected(req) => {
+                                (Error::Internal("mm worker pool gone".into()), req)
                             }
                         };
                         self.fail(&mut req, err, registered);
-                        return;
                     }
-                    self.pending_mm.insert(req.rid.clone(), req);
                     return;
                 }
                 // Hand off to the tokenizer pool; it returns the request as a
@@ -406,35 +375,6 @@ impl Intake {
         }
     }
 
-    /// An MM worker finished a parked request: fill in the final expanded
-    /// `input_ids`, keep its buffers for the ring push, advance `Encoding →
-    /// PreSendValidating`, and resume driving (pre-send checks → ring). No
-    /// pending entry means the request was already rejected or aborted, so the
-    /// result is dropped — and with it any shm segment it parked.
-    fn on_mm_encoded(&mut self, rid: Rid, input_ids: TokenIds, buffers: Vec<Buffer>) {
-        let Some(mut req) = self.pending_mm.remove(&rid) else {
-            tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
-            drop(buffers);
-            return;
-        };
-        if let RequestKind::Generate(g) = &mut req.kind {
-            g.input_ids = Some(input_ids);
-            g.mm_buffers = buffers;
-        }
-        let _ = req.state.apply(Event::EncodeDone); // Encoding → PreSendValidating
-        self.drive(req);
-    }
-
-    /// An MM worker failed a parked request (bad URL, processor error): reject it
-    /// back to the client, as Python turns a per-request exception into a 400.
-    fn on_mm_failed(&mut self, rid: Rid, message: String) {
-        let Some(mut req) = self.pending_mm.remove(&rid) else {
-            tracing::debug!(rid = %rid, "mm failure for unknown/finished request; dropped");
-            return;
-        };
-        self.fail(&mut req, Error::Encode(message), true); // parked ⇒ registered
-    }
-
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
@@ -442,16 +382,11 @@ impl Intake {
     /// chunks arrive for a rid no longer in the detok table, where they are dropped.
     /// That wastes GPU work until the request finishes on its own, but it cannot be
     /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
-    ///
-    /// A request parked in `pending_mm` is cancelled here, so the worker's late
-    /// result lands in `on_mm_encoded`'s no-entry branch and purges the parked
-    /// result — no generation runs for output nobody will read.
+    /// ([`Rid::from_client`]), so no later request can ever answer to it. The same
+    /// holds for a request that is out in a pool when the abort lands: it is
+    /// pushed on return and finishes on its own.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
-        if self.pending_mm.remove(&rid).is_some() {
-            tracing::debug!(rid = %rid, "abort cancelled request parked for MM");
-        }
         let _ = self
             .senders
             .detok_for(&rid)

@@ -14,8 +14,8 @@ use rustix::shm::{OFlags, open, unlink};
 /// Written by an MM worker so the TP broadcast carries a ~100-byte
 /// `ShmPointerMMData` stub instead of the ~20 MB feature tensor, and every
 /// rank maps it in parallel. Python's `materialize()` unlinks after cloning;
-/// this `Drop` covers the paths where the buffers never reach Python (aborted
-/// while parked, late result purged).
+/// this `Drop` covers the paths where the buffers never reach Python (request
+/// rejected after encoding, or dropped at shutdown).
 #[derive(Debug)]
 pub struct ShmSegment {
     name: String,
