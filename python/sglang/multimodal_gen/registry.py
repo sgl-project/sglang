@@ -28,57 +28,6 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
-    LongCatImageEditPipelineConfig,
-    LongCatImagePipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
-    LTX2PipelineConfig,
-    LTX23PipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImageEditPlus_2511_PipelineConfig,
-    QwenImageEditPlusPipelineConfig,
-    QwenImageLayeredPipelineConfig,
-    QwenImagePipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
-    QwenImage21PipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
-    SanaVideoPipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
-    SenseNovaU1PipelineConfig,
-)
-from sglang.multimodal_gen.configs.sample.longcat_image import (
-    LongCatImageEditSamplingParams,
-    LongCatImageEditTurboSamplingParams,
-    LongCatImageSamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.ltx_2 import (
-    LTX2SamplingParams,
-    LTX23HQSamplingParams,
-    LTX23SamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
-from sglang.multimodal_gen.configs.sample.qwenimage import (
-    QwenImage2512SamplingParams,
-    QwenImageEditPlusSamplingParams,
-    QwenImageLayeredSamplingParams,
-    QwenImageSamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
-from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
-from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
-from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
-from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
-    SenseNovaU1SamplingParams,
-)
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_MODEL_IDS,
     is_sensenova_u1_adapter_only_model,
@@ -235,7 +184,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
 }
 
 
-def register_model(
+def register_configs(
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
@@ -270,9 +219,6 @@ def register_model(
             _PIPELINE_CONFIG_REGISTRY.setdefault(pipeline_name, (pc_cls, sp_cls))
 
     return model_id
-
-
-register_configs = register_model
 
 
 def register_pipeline(
@@ -337,6 +283,10 @@ def register_pipeline(
 
 _configs_discovered: bool = False
 
+# SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
+# SANA-Video (register before generic SANA to avoid detector overlap).
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video")
+
 
 def _discover_and_register_configs() -> None:
     global _configs_discovered
@@ -347,6 +297,7 @@ def _discover_and_register_configs() -> None:
     package_name = "sglang.multimodal_gen.configs.pipeline_configs"
     package = importlib.import_module(package_name)
 
+    discovered = []
     for _, module_name, ispkg in pkgutil.walk_packages(
         package.__path__, package.__name__ + "."
     ):
@@ -359,13 +310,25 @@ def _discover_and_register_configs() -> None:
                 )
                 continue
             if hasattr(config_module, "register"):
-                try:
-                    config_module.register()
-                except Exception as exc:
-                    logger.warning(
-                        f"register() failed for {module_name}: {exc}",
-                        exc_info=True,
-                    )
+                discovered.append((module_name, config_module))
+
+    def _sort_key(item):
+        short_name = item[0].rsplit(".", 1)[-1]
+        try:
+            return (0, _CONFIG_REGISTER_PRIORITY.index(short_name))
+        except ValueError:
+            return (1, 0)
+
+    discovered.sort(key=_sort_key)
+
+    for module_name, config_module in discovered:
+        try:
+            config_module.register()
+        except Exception as exc:
+            logger.warning(
+                f"register() failed for {module_name}: {exc}",
+                exc_info=True,
+            )
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -718,218 +681,6 @@ def get_model_info(
     return model_info
 
 
-# Registration of model configs
-def _register_configs():
-    # LTX-2
-    register_configs(
-        sampling_param_cls=LTX2SamplingParams,
-        pipeline_config_cls=LTX2PipelineConfig,
-        hf_model_paths=["Lightricks/LTX-2"],
-        model_detectors=[
-            lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: (
-                "ltx-2" in path.lower()
-                and "ltx-2.3" not in path.lower()
-                and "ltx-2.5" not in path.lower()
-            ),
-        ],
-    )
-    register_configs(
-        sampling_param_cls=LTX23SamplingParams,
-        pipeline_config_cls=LTX23PipelineConfig,
-        hf_model_paths=["Lightricks/LTX-2.3"],
-        model_detectors=[
-            lambda path: "ltx-2.3" in path.lower(),
-        ],
-        pipeline_config_registry_entries={
-            "LTX2TwoStageHQPipeline": (LTX2PipelineConfig, LTX23HQSamplingParams),
-        },
-    )
-    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
-    # distilled schedule differ. Only the `-Diffusers` repo is listed --
-    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
-    # a model overlay first.
-    register_configs(
-        sampling_param_cls=LTX25SamplingParams,
-        pipeline_config_cls=LTX25PipelineConfig,
-        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
-        model_detectors=[
-            lambda path: "ltx-2.5" in path.lower(),
-        ],
-    )
-
-    register_configs(
-        sampling_param_cls=SenseNovaU1SamplingParams,
-        pipeline_config_cls=SenseNovaU1PipelineConfig,
-        hf_model_paths=[
-            "sensenova/SenseNova-U1.5-8B-MoT",
-        ],
-    )
-    # Qwen-Image
-    register_configs(
-        sampling_param_cls=QwenImage21SamplingParams,
-        pipeline_config_cls=QwenImage21PipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-2.1"],
-        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
-    )
-    register_configs(
-        sampling_param_cls=QwenImageSamplingParams,
-        pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
-        model_detectors=[
-            lambda hf_id: (
-                "qwen-image" in hf_id.lower()
-                and "edit" not in hf_id.lower()
-                and "layered" not in hf_id.lower()
-                and "2512" not in hf_id.lower()
-                and "qwen-image-2.1" not in hf_id.lower()
-            )
-        ],
-    )
-    register_configs(
-        sampling_param_cls=QwenImage2512SamplingParams,
-        pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-2512"],
-        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
-    )
-    register_configs(
-        sampling_param_cls=QwenImageSamplingParams,
-        pipeline_config_cls=QwenImageEditPipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-Edit"],
-        model_detectors=[
-            lambda hf_id: (
-                "qwen-image-edit" in hf_id.lower()
-                and "2509" not in hf_id.lower()
-                and "2511" not in hf_id.lower()
-            )
-        ],
-    )
-
-    register_configs(
-        sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
-    )
-
-    register_configs(
-        sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
-    )
-
-    register_configs(
-        sampling_param_cls=QwenImageLayeredSamplingParams,
-        pipeline_config_cls=QwenImageLayeredPipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-Layered"],
-        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
-    )
-    # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
-    register_configs(
-        sampling_param_cls=SanaWMSamplingParams,
-        pipeline_config_cls=SanaWMPipelineConfig,
-        hf_model_paths=[
-            "Efficient-Large-Model/SANA-WM_bidirectional",
-            "Efficient-Large-Model/SANA-WM_streaming",
-        ],
-        model_detectors=[
-            # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
-        ],
-    )
-
-    # SANA-Video (register before generic SANA to avoid detector overlap).
-    register_configs(
-        sampling_param_cls=SanaVideoSamplingParams,
-        pipeline_config_cls=SanaVideoPipelineConfig,
-        hf_model_paths=[
-            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
-        ],
-        model_detectors=[
-            lambda hf_id: "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
-        ],
-    )
-
-    # SANA
-    register_configs(
-        sampling_param_cls=SanaSamplingParams,
-        pipeline_config_cls=SanaPipelineConfig,
-        hf_model_paths=[
-            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
-            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
-            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
-            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
-            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
-            "Efficient-Large-Model/Sana_600M_512px_diffusers",
-        ],
-        model_detectors=[
-            lambda hf_id: (
-                "sana" in hf_id.lower()
-                and "sana-wm" not in hf_id.lower()
-                and "sana_wm" not in hf_id.lower()
-                and "sana-video" not in hf_id.lower()
-                and "sana_video" not in hf_id.lower()
-            )
-        ],
-    )
-
-    # FireRed-Image-Edit
-    register_configs(
-        sampling_param_cls=QwenImageEditPlusSamplingParams,
-        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
-        hf_model_paths=[
-            "FireRedTeam/FireRed-Image-Edit-1.0",
-            "FireRedTeam/FireRed-Image-Edit-1.1",
-        ],
-    )
-
-    # LongCat-Image
-    register_configs(
-        sampling_param_cls=LongCatImageSamplingParams,
-        pipeline_config_cls=LongCatImagePipelineConfig,
-        hf_model_paths=[
-            "meituan-longcat/LongCat-Image",
-        ],
-        model_detectors=[
-            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
-        ],
-    )
-
-    # LongCat-Image-Edit-Turbo (registered before Edit so its detector wins)
-    register_configs(
-        sampling_param_cls=LongCatImageEditTurboSamplingParams,
-        pipeline_config_cls=LongCatImageEditPipelineConfig,
-        hf_model_paths=[
-            "meituan-longcat/LongCat-Image-Edit-Turbo",
-        ],
-        model_detectors=[
-            lambda hf_id: (
-                "longcat" in hf_id.lower()
-                and "edit" in hf_id.lower()
-                and "turbo" in hf_id.lower()
-            ),
-        ],
-    )
-
-    # LongCat-Image-Edit
-    register_configs(
-        sampling_param_cls=LongCatImageEditSamplingParams,
-        pipeline_config_cls=LongCatImageEditPipelineConfig,
-        hf_model_paths=[
-            "meituan-longcat/LongCat-Image-Edit",
-        ],
-        model_detectors=[
-            lambda hf_id: (
-                "longcat" in hf_id.lower()
-                and "edit" in hf_id.lower()
-                and "turbo" not in hf_id.lower()
-            ),
-        ],
-    )
-
-
-_register_configs()
 _discover_and_register_configs()
 
 
