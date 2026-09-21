@@ -61,3 +61,13 @@ def validate_layernorm_sp(
             "(EAGLE/EAGLE3): the captured aux hidden states would be "
             "sequence-sharded."
         )
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        logger.warning(
+            "--enable-layernorm-sp on NPU runs via the CANN MC2 fused "
+            "matmul+collective fast-path when available, else the un-fused "
+            "reduce-scatter/all-gather fallback. Sequence-parallel semantics "
+            "are only covered by the NPU e2e test; validate it before relying "
+            "on the flag in production on Ascend."
+        )
