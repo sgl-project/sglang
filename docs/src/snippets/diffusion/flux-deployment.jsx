@@ -14,6 +14,7 @@ export const FluxDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
+          { id: 'xeon', label: 'XEON', default: false },
           { id: 'a2', label: 'A2 Series', default: false },
           { id: 'a3', label: 'A3 Series', default: false },
           { id: 'arc_b', label: 'BMG', default: false },
@@ -37,6 +38,13 @@ export const FluxDeployment = () => {
     generateCommand: function(values) {
       const { hardware, version } = values;
       const config = this.modelConfigs[version];
+
+      if (hardware === 'xeon') {
+        return `sglang serve \\
+      --model-path ${config.repoId} \\
+      --ulysses-degree=1 \\
+      --ring-degree=1`;
+      }
 
       if (hardware === 'a2') {
         if (version === 'flux1-dev') {
