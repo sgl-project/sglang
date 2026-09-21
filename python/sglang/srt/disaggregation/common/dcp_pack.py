@@ -96,13 +96,16 @@ def init_dcp_pack_buffers(
     count: int,
     dcp_size: int,
     max_tokens: int,
+    *,
+    include_draft: bool = False,
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _get_custom_mem_pool,
     )
 
-    # Draft head slices share the registered allocation with packed target rows.
     kv_item_lens = kv_args.kv_item_lens
+    if not include_draft and kv_args.num_draft_entries:
+        kv_item_lens = kv_item_lens[: -kv_args.num_draft_entries]
     # Note(kpham-sgl): size = dcp_size x ceil(max_tokens / dcp_size)
     # x sum(per-layer token bytes). At 32,768 tokens and 61 MLA layers
     # x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.

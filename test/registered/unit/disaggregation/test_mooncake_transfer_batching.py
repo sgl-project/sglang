@@ -342,7 +342,6 @@ class TestDcpPackLifetime(CustomTestCase):
             future = worker.submit(send, transfers)
             try:
                 self.assertTrue(running.wait(10))
-                # The send must stay blocked while a transfer still owns the buffer.
                 with self.assertRaises(concurrent.futures.TimeoutError):
                     future.result(timeout=1)
             finally:

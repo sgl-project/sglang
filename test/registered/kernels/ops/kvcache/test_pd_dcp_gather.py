@@ -61,7 +61,6 @@ class TestPdDcpGather(CustomTestCase):
             torch.as_tensor(src_pages, device="cuda")[logical // page] * page
             + logical % page
         )
-        # Four global draft heads, each 128 bf16 elements; TP2 owns two heads.
         values = [
             (
                 (logical[:, None] + 256) * 13
@@ -109,7 +108,6 @@ class TestPdDcpGather(CustomTestCase):
                 buffers = sources + destinations + [pack.buffer]
 
                 def transfer(session, blocks):
-                    # Replace only the transport: resolve its byte ranges into real GPU tensors.
                     def view(ptr, size):
                         for tensor in buffers:
                             offset = ptr - tensor.data_ptr()
