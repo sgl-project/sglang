@@ -34,45 +34,23 @@ impl V4Profile {
         Ok(Self::detect(&source))
     }
 
+    /// `chat_encoding._detect_dsv4_reasoning_effort_profile`: official when the
+    /// encoder declares a low default and low/high/max prompts, else preview.
     fn detect(source: &str) -> Self {
         if source.len() > 1 << 20 {
             return Self::Preview;
         }
-        let assignment = |name: &str| {
-            source.lines().find_map(|line| {
-                let rest = line.strip_prefix(name)?;
-                let rest = rest.trim_start();
-                if !rest.starts_with([':', '=']) {
-                    return None;
-                }
-                rest.split_once('=').map(|(_, value)| value.trim())
-            })
-        };
-        let low_default = assignment("DEFAULT_REASONING_EFFORT")
-            .is_some_and(|s| s.starts_with("\"low\"") || s.starts_with("'low'"));
+        let low_default = source.lines().any(|line| {
+            line.strip_prefix("DEFAULT_REASONING_EFFORT")
+                .and_then(|rest| rest.split_once('='))
+                .is_some_and(|(_, value)| matches!(value.trim().trim_matches(['"', '\'']), "low"))
+        });
         let prompts = source
-            .lines()
-            .scan(false, |inside, line| {
-                if !*inside && line.starts_with("REASONING_EFFORT_PROMPTS") {
-                    *inside = true;
-                }
-                Some(if *inside { line } else { "" })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompts = prompts
-            .split_once('{')
+            .split_once("\nREASONING_EFFORT_PROMPTS")
             .and_then(|(_, rest)| rest.split_once('}'))
-            .map(|(body, _)| body);
-        let has_keys = prompts.is_some_and(|body| {
-            ["low", "high", "max"].iter().all(|key| {
-                [format!("\"{key}\""), format!("'{key}'")]
-                    .iter()
-                    .any(|quoted| {
-                        body.match_indices(quoted)
-                            .any(|(i, _)| body[i + quoted.len()..].trim_start().starts_with(':'))
-                    })
-            })
+            .map_or("", |(body, _)| body);
+        let has_keys = ["low", "high", "max"].iter().all(|key| {
+            prompts.contains(&format!("\"{key}\"")) || prompts.contains(&format!("'{key}'"))
         });
         if low_default && has_keys {
             Self::Official
