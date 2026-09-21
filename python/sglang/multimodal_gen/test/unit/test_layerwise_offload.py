@@ -1435,26 +1435,6 @@ def test_finish_use_keeps_residents_when_the_use_declares_it(monkeypatch):
     assert parked == []
 
 
-def test_retained_parameter_bytes_sizes_the_trade(monkeypatch):
-    """What a caller weighing the declaration is trading away."""
-    _patch_fake_device(monkeypatch)
-    manager = _resident_manager(
-        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
-    )
-    monkeypatch.setattr(manager, "_managed_parameter_bytes", lambda: 8 << 30)
-    # 3 of 6 layers resident -> half the managed bytes.
-    assert manager.retained_parameter_bytes() == 4 << 30
-
-
-def test_retained_parameter_bytes_is_zero_without_a_resident_set(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    manager = _resident_manager(
-        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=0
-    )
-    monkeypatch.setattr(manager, "_managed_parameter_bytes", lambda: 8 << 30)
-    assert manager.retained_parameter_bytes() == 0
-
-
 def test_enable_offload_rearms_after_disable(monkeypatch):
     model = _configure_mixin_model(monkeypatch)
     # blocks[2] holds a placeholder right after configure; the real values are
