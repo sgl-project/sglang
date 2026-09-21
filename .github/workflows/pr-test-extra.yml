@@ -56,7 +56,9 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # A PR keys on its number; github.head_ref is a bare branch name that two
+  # forks can share, which would make them cancel each other's runs.
+  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
