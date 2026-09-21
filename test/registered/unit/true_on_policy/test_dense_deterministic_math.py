@@ -76,6 +76,90 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
 
 
 class TestDenseOnPolicyContracts(unittest.TestCase):
+    def test_qwen_projections_use_activation_dtype_with_quantized_weights(self):
+        from sglang.srt.models import qwen3
+        from sglang.srt.models.qwen2 import Qwen2MLP
+
+        class ProjectionStub:
+            def __init__(self, dtype, weight_dtype):
+                self.params_dtype = dtype
+                self.inputs = []
+                if weight_dtype is not None:
+                    self.weight = torch.empty(1, dtype=weight_dtype)
+
+            def __call__(self, x, **kwargs):
+                self.inputs.append(x)
+                return x, None
+
+        cases = [
+            ("quant_bf16", torch.bfloat16, torch.bfloat16, None, False),
+            ("quant_fp16", torch.float16, torch.float16, None, False),
+            ("packed_int8", torch.bfloat16, torch.bfloat16, torch.int8, False),
+            (
+                "fp8_weight",
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                False,
+            ),
+            ("on_policy", torch.float32, torch.bfloat16, torch.bfloat16, True),
+            ("cleared_flag", torch.float32, torch.bfloat16, torch.bfloat16, False),
+            ("dense_bf16", torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+            ("dense_fp16", torch.float16, torch.float16, torch.float16, False),
+            ("dense_fp32", torch.float32, torch.float32, torch.float32, False),
+        ]
+        for name, input_dtype, dtype, weight_dtype, on_policy in cases:
+            for forward in (qwen3.Qwen3Attention.forward, Qwen2MLP.forward):
+                with self.subTest(case=name, forward=forward.__qualname__):
+                    projection = ProjectionStub(dtype, weight_dtype)
+                    output_projection = ProjectionStub(dtype, weight_dtype)
+                    x = torch.randn(2, 4, dtype=input_dtype)
+
+                    def prepare(positions, hidden_states):
+                        projected, _ = projection(hidden_states)
+                        return projected.float(), projected.float(), projected
+
+                    def attend(q, k, v, forward_batch, save_kv_cache):
+                        self.assertEqual((q.dtype, k.dtype, v.dtype), (dtype,) * 3)
+                        self.assertTrue(save_kv_cache)
+                        return v
+
+                    model = SimpleNamespace(
+                        qkv_proj=projection,
+                        gate_up_proj=projection,
+                        o_proj=output_projection,
+                        down_proj=output_projection,
+                        act_fn=lambda x: x,
+                        use_fused_qk_norm_mrope=False,
+                        forward_prepare_native=prepare,
+                        attn=attend,
+                    )
+                    server_args = SimpleNamespace(
+                        true_on_policy_contract=(
+                            QWEN3_DENSE_TRUE_ON_POLICY_V1 if on_policy else None
+                        ),
+                        tp_size=1,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.runtime_context.get_server_args",
+                            return_value=server_args,
+                        ),
+                        patch.object(qwen3, "_is_npu", False),
+                    ):
+                        if forward is qwen3.Qwen3Attention.forward:
+                            output = forward(model, None, x, None)
+                        else:
+                            output = forward(model, x)
+
+                    self.assertEqual(len(projection.inputs), 1)
+                    self.assertEqual(len(output_projection.inputs), 1)
+                    self.assertEqual(projection.inputs[0].dtype, dtype)
+                    self.assertEqual(output_projection.inputs[0].dtype, dtype)
+                    torch.testing.assert_close(output, x.to(dtype))
+                    if input_dtype == dtype:
+                        self.assertIs(projection.inputs[0], x)
+
     def test_qwen3_style_rms_norm_keeps_fp32_weight_output_and_residual(self):
         result = _run_dense_math_script(
             textwrap.dedent("""

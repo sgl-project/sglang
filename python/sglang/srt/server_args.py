@@ -505,18 +505,17 @@ class ServerArgs:
 
     def needs_engine_info_bootstrap(self) -> bool:
         """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
+        cfg = resolving_view(self)
         return (
-            resolving_view(
-                self
-            ).remote_instance_weight_loader_start_seed_via_transfer_engine
-            or self.enable_engine_info_bootstrap
+            cfg.remote_instance_weight_loader_start_seed_via_transfer_engine
+            or cfg.enable_engine_info_bootstrap
         )
 
     def registers_parallelism_config(self) -> bool:
         """Whether this rank publishes its parallelism config to the bootstrap server."""
         return (
             self.remote_instance_weight_loader_use_transfer_engine()
-            or self.enable_engine_info_bootstrap
+            or resolving_view(self).enable_engine_info_bootstrap
         )
 
 

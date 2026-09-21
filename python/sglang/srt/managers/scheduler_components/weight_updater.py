@@ -199,14 +199,14 @@ class SchedulerWeightUpdaterManager:
         """
         from sglang.srt.weight_sync import local_checkpoint
 
-        server_args = self.tp_worker.model_runner.server_args
+        model_config = get_model()
         try:
             local_checkpoint.pull(
                 local_checkpoint_dir=recv_req.local_checkpoint_dir,
-                base_dir=server_args.model_path,
+                base_dir=model_config.model_path,
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
-                pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+                pre_read_hook=model_config.custom_pull_weights_pre_read_hook,
             )
             success, message = True, "Success."
         except Exception:
