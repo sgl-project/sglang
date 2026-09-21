@@ -528,7 +528,9 @@ def test_an_engine_that_captures_no_buckets_keeps_the_head_eager(monkeypatch):
     from sglang.srt.speculative import lilicorr_utils as sampler_mod
 
     monkeypatch.setattr(
-        sampler_mod, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+        sampler_mod,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(world_size=1)),
     )
     monkeypatch.setattr(sampler_mod, "draft_graph_batch_sizes", lambda: [])
     assert (
@@ -764,7 +766,9 @@ def test_the_eager_seam_obeys_the_device_gate_and_not_the_module_flag(monkeypatc
 
     monkeypatch.setattr(lilicorr_select, "SAMPLING_ENABLED", True)
     monkeypatch.setattr(
-        lilicorr_select, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+        lilicorr_select,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_group=SimpleNamespace(world_size=1)),
     )
     head = _head()
     bs = 2

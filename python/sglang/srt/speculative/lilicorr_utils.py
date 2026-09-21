@@ -17,9 +17,8 @@ from sglang.kernels.ops.speculative.lilicorr import (
     MAX_FUSED_CANDIDATE_TOPK,
     lilicorr_topk_lse,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 
@@ -353,7 +352,7 @@ def propose_lilicorr_block(
     bs, block_size, hidden_size = draft_hidden.shape
     slots = block_size - 1
     pass_hidden = draft_hidden[:, 1:, :]
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     num_org, org_vocab_start = resolve_vocab_shard(lm_head)
 
     log_probs, candidate_tokens = lilicorr_candidates(
@@ -617,7 +616,7 @@ def build_lilicorr_draft_sampler(
         )
         return None
 
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     if int(tp_group.world_size) != 1:
         # tp>1 needs the packed all-gather inside the graph. Legal but unwritten.
         return eager("tp>1")
