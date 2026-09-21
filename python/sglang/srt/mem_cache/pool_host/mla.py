@@ -47,7 +47,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -123,7 +123,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize
+            page_size=self.page_size,
+            element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
 
         if self.layout in ("page_first", "page_first_kv_split"):
@@ -668,6 +669,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.kv_buffer[host_layer_id],
                         indices_dst=device_indices,
@@ -685,6 +687,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.data_refs[host_layer_id],
                         indices_dst=device_indices,
@@ -794,6 +797,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=self.kv_buffer[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
@@ -811,6 +815,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=self.data_refs[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
@@ -893,6 +898,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
+                        page_size=self.page_size,
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=device_data_ptrs,
