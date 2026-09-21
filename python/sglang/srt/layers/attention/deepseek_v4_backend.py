@@ -514,11 +514,17 @@ class DeepseekV4AttnBackend(
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
-        # DSPARK verify replays one full (non-breakable) graph that honors the
-        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
+        # [bug 87039092] DSPARK verify MUST stay POST_REPLAY on DSv4: this
+        # backend sets use_captured_forward_metadata_for_breakable_cuda_graph
+        # = True and the plan kernel rereads req_to_token during replay, so
+        # DSPARK verify here IS breakable-graph style shared-state reread.
+        # Upstream #34816 (f2c84de022) moved the WAR read-done publish to
+        # IN_REPLAY under the false premise "DSPARK does not use
+        # breakable-graph verify", creating a cross-stream WAR race that
+        # tears plan_c (corrupt seq_len -> position<0 -> freqs_cis OOB ->
+        # 890P Hardware hang). Falling back to POST_REPLAY restores the
+        # full-barrier semantics verified PASS on v0.5.17 (1520/1520).
         if fm.is_target_verify():
-            if self.model_runner.spec_algorithm.is_dspark():
-                return SharedReadEnds.IN_REPLAY
             return SharedReadEnds.POST_REPLAY
         return super().shared_read_ends(fm)
 
