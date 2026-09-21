@@ -2037,11 +2037,8 @@ class KimiK3DeltaAttention(nn.Module):
                     and get_is_capture_mode()
                     and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
                 ):
-                    # Record the fork before either projection, then capture
-                    # the main branch first. CUDA graph scheduling considers
-                    # node creation order; prefer the main projection before
-                    # the short [f_a|b] + f_b side branch. Both still depend
-                    # only on hidden_states and join before the consumers.
+                    # Fork before both branches; capture the main projection
+                    # first to avoid CUDA graph replay stream expansion.
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
@@ -2281,8 +2278,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # DeepseekV2AttentionMLA forward cores, so wrap its forward at
             # the instance level (weights, reduce_results, loading untouched).
             self._gate_hidden_states = None
-            # Fork before attention, but record the gate kernel after the
-            # attention core so CUDA graph scheduling keeps the main path.
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             # Above this token count the attention-core kernels fill the SMs
@@ -2335,18 +2330,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return method
 
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
-        """Fork before attention; its output projection records the gate later.
-
-        Recording the main attention branch before the side-stream gate keeps
-        CUDA graph replay from expanding streams at each MLA layer. The fork
-        still precedes both branches, so their GPU work remains independent.
-        """
+        """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
-            # The attention-core break ends the segment between the fork and
-            # join. Avoid a wait that would cross breakable graph segments.
+            # Keep the fork and join within one capture segment.
             and not is_in_breakable_cuda_graph()
             and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
         ):

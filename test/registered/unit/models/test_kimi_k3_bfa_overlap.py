@@ -1,5 +1,4 @@
-"""K3 attention side-stream overlap: verify KDA numerical parity and MLA's
-output gate under CUDA graph capture and changed-input replay."""
+"""K3 attention overlap parity under CUDA graph capture and changed-input replay."""
 
 import unittest
 from types import SimpleNamespace
@@ -84,13 +83,11 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                         with torch.cuda.graph(graph):
                             captured = forward(owner, x, defer_f_b=defer_f_b)
                         for _ in range(3):
-                            # Changing the input catches stale side-branch reads
-                            # or missing fork/join dependencies across replays.
+                            # Changed inputs expose stale reads or missing dependencies.
                             x.normal_(std=0.05)
                             serial = forward(serial_owner, x, defer_f_b=defer_f_b)
                             graph.replay()
                             torch.cuda.synchronize()
-                            # Owners share the same seeded weights.
                             for got, ref, name in zip(
                                 captured, serial, ("qkv", "beta", "forget_gate", "g")
                             ):
