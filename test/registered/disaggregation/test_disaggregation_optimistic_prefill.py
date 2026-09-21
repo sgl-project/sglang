@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import abort_prefix_cache_request
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
@@ -461,7 +462,9 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
+            _release_aborted_request=lambda req, **kwargs: abort_prefix_cache_request(
+                req, tree, **kwargs
+            ),
             clear_pending_chunk_send=lambda req: None,
         )
         with patch(
