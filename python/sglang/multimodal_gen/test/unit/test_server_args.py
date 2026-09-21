@@ -928,6 +928,58 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def _routing_args(self, kwargs):
+        # These tests cover ServerArgs routing, not device/backend validation.
+        # _from_dict_without_model_resolution mocks CUDA, while FIA is NPU-only.
+        with patch.object(
+            MiniMaxH3PipelineConfig, "validate_server_args", return_value=None
+        ):
+            return _from_dict_without_model_resolution(
+                kwargs,
+                pipeline_config=MiniMaxH3PipelineConfig(),
+            )
+
+    def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
+        for backend in ("laser_attn", "fia_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "torch_sdpa"},
+                )
+                self.assertTrue(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
+    def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
+        for backend in ("laser_attn", "fia_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                        "component_attention_backends": {"text_encoder": "fa"},
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "fa"},
+                )
+                self.assertFalse(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
