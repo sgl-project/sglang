@@ -731,6 +731,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "iyastreb": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "jason-fxz": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -900,6 +906,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "lluki": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "luccafong": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1015,6 +1027,12 @@
         "reason": "custom override"
     },
     "oulgen": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "ovidiusm": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,

@@ -8,9 +8,10 @@ use sgl_router::buckets_reorg::{
     Bucket, BucketGroups, BucketRequest, BucketResolver, EngineGroup, TokenLimits,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{
+    AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
+};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
-use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug)]
@@ -25,7 +26,7 @@ struct TestPolicy {
 impl Default for TestPolicy {
     fn default() -> Self {
         Self {
-            admission: Arc::new(AllowAll),
+            admission: Arc::new(AdmissionLimits::default()),
             result: None,
             miss: false,
             invalid: false,
@@ -52,7 +53,9 @@ impl Policy for TestPolicy {
                 return Err(PickError::NoCandidates);
             }
             let engine = self.result.clone().unwrap_or_else(|| engines[0].clone());
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, None)? {
+            if let Decision::Reject(reason) =
+                self.admission.check(&engine, &EngineMetrics::default())?
+            {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
@@ -70,12 +73,7 @@ impl Policy for TestPolicy {
 struct Reject(&'static str);
 
 impl EngineAdmission for Reject {
-    fn check(
-        &self,
-        engine: &Worker,
-        _: &PickRequest<'_>,
-        _: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
         Ok(if engine.id.0 == self.0 {
             Decision::Reject("full".into())
         } else {
@@ -437,12 +435,7 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
     }
 
     impl EngineAdmission for Check {
-        fn check(
-            &self,
-            engine: &Worker,
-            _: &PickRequest<'_>,
-            _: Option<&EngineReportedWorkerLoad>,
-        ) -> Result<Decision, PickError> {
+        fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
             self.calls.lock().unwrap().push(engine.id.clone());
             if self.invalid {
                 Err(PickError::InvalidSignal("admission input".into()))
