@@ -2101,8 +2101,9 @@ def run_benchmark(args_: argparse.Namespace):
             )
         print("{:<40} {:<10}".format("Result file:", out_path))
         print("=" * 50)
-        if getattr(args, "accuracy_only", False):
-            return
+        # Accuracy datasets are not valid throughput datasets; do not continue
+        # into the serving benchmark path after --eval-accuracy.
+        return
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
