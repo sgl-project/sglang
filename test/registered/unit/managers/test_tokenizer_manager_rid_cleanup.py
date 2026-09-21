@@ -139,6 +139,8 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm.model_config = MagicMock()
+    tm.model_config.vocab_size = 32000
     return tm
 
 
@@ -215,6 +217,34 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
 
     return BatchStrOutput(**kwargs)
+
+
+class TestTokenizerManagerLogprobValidation(CustomTestCase):
+    """Test request-level logprob parameter validation."""
+
+    def test_rejects_top_logprobs_num_above_vocab_size(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(
+            text="Hello", return_logprob=True, top_logprobs_num=32001
+        )
+
+        with self.assertRaisesRegex(ValueError, "top_logprobs_num"):
+            tm._validate_top_logprobs_num(obj)
+
+    def test_rejects_negative_top_logprobs_num(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text="Hello", return_logprob=True, top_logprobs_num=-1)
+
+        with self.assertRaisesRegex(ValueError, "top_logprobs_num"):
+            tm._validate_top_logprobs_num(obj)
+
+    def test_accepts_top_logprobs_num_at_vocab_size(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(
+            text="Hello", return_logprob=True, top_logprobs_num=32000
+        )
+
+        tm._validate_top_logprobs_num(obj)
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
