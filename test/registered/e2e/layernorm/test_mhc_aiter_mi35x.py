@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from unittest.mock import patch
 
 import torch
@@ -37,12 +37,12 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
             patch.object(mhc, "is_allocation_symmetric", return_value=False),
             get_parallel().override(tp_group=None),
         )
+        self.allocator_stack = ExitStack()
         for item in self.allocators:
-            item.start()
+            self.allocator_stack.enter_context(item)
 
     def tearDown(self):
-        for item in reversed(self.allocators):
-            item.stop()
+        self.allocator_stack.close()
         self.env.stop()
 
     def _inputs(self, tokens: int, seed: int = 0):
