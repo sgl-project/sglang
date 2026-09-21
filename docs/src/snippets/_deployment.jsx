@@ -147,10 +147,14 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "mi355x", label: "MI355X", vram: "288GB",
         multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
     ],
-    // Ascend A3 Series: 1 card = 2 dies, so --tp-size is 2× the card
-    // count (32 cards -> --tp-size 64).
+    // Ascend device layout: one /dev/davinciN per core. An A3 Series card is
+    // the exception — 2 dies per card, so an 8-card node exposes 16 devices
+    // and --tp-size is twice the card count. A 950PR/DT Series card is a
+    // single core, so the device count and --tp-size follow the cards. Both
+    // counts feed the docker `--device` list (`npuDevices`).
     npu: [
-      { id: "a3", label: "Ascend A3 Series", vram: "64GB/die" },
+      { id: "a3", label: "A3 Series",        vram: "64GB/die", npuDevices: 16 },
+      { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
     ],
   };
 
@@ -819,14 +823,31 @@ export const Deployment = ({ config, benchmarks }) => {
         return (extra && extra.vendor) || "nvidia";
       };
       // `config.hardware` overrides by id, as in buildHardwareGroups.
-      const fabricFlagsOf = (hwId) => {
+      const catalogEntryOf = (hwId) => {
         const extra = (config.hardware || []).find((h) => h.id === hwId);
-        if (extra) return extra.multiNodeDockerFlags || [];
+        if (extra) return extra;
         for (const list of Object.values(HARDWARE_CATALOG)) {
           const hit = list.find((h) => h.id === hwId);
-          if (hit) return hit.multiNodeDockerFlags || [];
+          if (hit) return hit;
         }
-        return [];
+        return null;
+      };
+      const fabricFlagsOf = (hwId) =>
+        (catalogEntryOf(hwId) || {}).multiNodeDockerFlags || [];
+      // NPU cards are reached with --device, one per /dev/davinciN core;
+      // `npuDevices` carries the per-product-line count (16 on an A3 Series
+      // node, 8 on a 950PR/DT Series node), four devices per line as the host
+      // docs show.
+      const davinciLines = (devices) => {
+        const lines = [];
+        for (let i = 0; i < devices; i += 4) {
+          const group = [];
+          for (let k = i; k < Math.min(i + 4, devices); k++) {
+            group.push(`--device=/dev/davinci${k}`);
+          }
+          lines.push("  " + group.join(" "));
+        }
+        return lines;
       };
       const gpuAccessLines = vendorOf(sel.hw) === "amd"
         ? [
@@ -838,14 +859,10 @@ export const Deployment = ({ config, benchmarks }) => {
           ]
         : vendorOf(sel.hw) === "npu"
         ? [
-            // NPU: --privileged grants the davinci devices (16 dies on an
-            // 8-card Ascend A3 Series node); the host CANN driver/firmware/state
-            // must be mounted in.
+            // NPU: --privileged grants the davinci devices; the host CANN
+            // driver/firmware/state must be mounted in.
             "docker run --privileged --shm-size=16g",
-            "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",
-            "  --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7",
-            "  --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11",
-            "  --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15",
+            ...davinciLines((catalogEntryOf(sel.hw) || {}).npuDevices || 16),
             "  --device=/dev/davinci_manager",
             "  --device=/dev/hisi_hdc",
             "  -v /usr/local/sbin:/usr/local/sbin",
