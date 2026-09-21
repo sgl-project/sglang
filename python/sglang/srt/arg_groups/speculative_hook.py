@@ -368,6 +368,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    if cfg.speculative_draft_swa_pool:
+        _validate_dflash_draft_swa_pool(server_args)
+
     _resolve_dflash_draft_attention_backend(server_args)
 
     if cfg.max_running_requests is None:
@@ -378,6 +381,49 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+
+def _validate_dflash_draft_swa_pool(server_args: ServerArgs) -> None:
+    """--speculative-draft-swa-pool: the draft's rows are freed as they leave
+    its window, so every draft layer must be sliding-window attention."""
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_window_size is None:
+        raise ValueError(
+            "--speculative-draft-swa-pool requires --speculative-draft-window-size."
+        )
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("--speculative-draft-swa-pool is only supported on CUDA.")
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-unified-memory", cfg.enable_unified_memory),
+            ("--enable-hisparse", cfg.enable_hisparse),
+            ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
+            ("--dcp-size", cfg.dcp_size > 1),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            f"--speculative-draft-swa-pool does not support {', '.join(unsupported)}."
+        )
+
+    from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        raise ValueError(
+            "--speculative-draft-swa-pool requires every draft layer to be "
+            f"sliding_attention; got layer_types={layer_types}."
         )
 
 

@@ -376,6 +376,9 @@ class ModelRunner:
         self.mtp_draft_device_pools = ()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        # --speculative-draft-swa-pool: the DFLASH draft's KV is the SWA side
+        # of the allocator (see KVCacheConfigurator.draft_swa_pool).
+        self.draft_swa_pool = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
@@ -921,7 +924,8 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
-        if self.is_hybrid_swa:
+        self.draft_swa_pool = self.kv_cache_configurator.draft_swa_pool
+        if self.is_hybrid_swa or self.draft_swa_pool:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
         # Keep a reference so the shared byte buffer is not GC'd.

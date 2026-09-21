@@ -162,6 +162,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
     ] = None
+    speculative_draft_swa_pool: A[
+        bool,
+        "Keep an all-SWA DFLASH draft's KV in a dedicated SWA pool sized from the per-request window cap plus --swa-prefix-tails, instead of one draft slot per target token. Requires --speculative-draft-window-size.",
+    ] = False
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

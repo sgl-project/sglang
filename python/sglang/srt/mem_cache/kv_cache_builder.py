@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_hip
 
@@ -228,16 +229,26 @@ def build_kv_cache(
 
     # Hybrid memory pool
     token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa and (
-        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        or token_to_kv_pool.needs_paged_swa_allocator
+    # Under --speculative-draft-swa-pool the SWA pool is the DFLASH draft's,
+    # kept for the draft's window; the cache treats it like a hybrid-SWA pool.
+    draft_swa_pool = getattr(tp_worker.model_runner, "draft_swa_pool", False)
+    is_hybrid_swa = draft_swa_pool or (
+        tp_worker.is_hybrid_swa
+        and (
+            not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            or token_to_kv_pool.needs_paged_swa_allocator
+        )
     )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
     if is_hybrid_swa:
-        sliding_window_size = tp_worker.sliding_window_size
+        sliding_window_size = (
+            get_spec().speculative_draft_window_size
+            if draft_swa_pool
+            else tp_worker.sliding_window_size
+        )
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )

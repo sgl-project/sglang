@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -866,3 +868,84 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
 def is_swa_req_ring(allocator) -> bool:
     return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring
+
+
+class _DraftSWAKVPoolBinding(BaseSWAKVPool):
+    """The target's full pool with a speculative draft's pool as the SWA side.
+
+    The draft runner builds its pool after the target allocator exists, so the
+    SWA side is attached later and receives the mapping then. The target never
+    reads KV through this object; it only backs the allocator's bookkeeping.
+    """
+
+    swa_req_ring_size = None
+
+    def __init__(self, full_kv_pool: KVCache):
+        self.full_kv_pool = full_kv_pool
+        self.swa_kv_pool: Optional[BaseSWAKVPool] = None
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+
+    def attach_swa_kv_pool(self, swa_kv_pool: BaseSWAKVPool) -> None:
+        self.swa_kv_pool = swa_kv_pool
+        swa_kv_pool.register_mapping(self.full_to_swa_index_mapping)
+
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+        self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        if self.swa_kv_pool is not None:
+            self.swa_kv_pool.register_mapping(full_to_swa_index_mapping)
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_swa_index_mapping[kv_indices]
+
+    def get_state_buf_infos(self):
+        return self.swa_kv_pool.get_contiguous_buf_infos()
+
+    def get_key_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(self, *args, **kwargs):
+        return self.full_kv_pool.set_kv_buffer(*args, **kwargs)
+
+
+class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Target allocator whose SWA side is an all-SWA speculative draft's KV pool.
+
+    Every target layer is full attention; the SWA slot handed out with each full
+    slot indexes the draft pool, which the draft runner attaches once built.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+        req_to_token_pool=None,
+    ):
+        super().__init__(
+            size,
+            size_swa,
+            page_size,
+            dtype,
+            device,
+            _DraftSWAKVPoolBinding(kvcache),
+            need_sort,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+    def attach_draft_kv_pool(self, draft_kv_pool: BaseSWAKVPool) -> None:
+        self._kvcache.attach_swa_kv_pool(draft_kv_pool)
+
+    def get_kvcache(self):
+        # The target's own pool: backends probe this to detect hybrid-SWA
+        # targets, and the target here has no SWA layers.
+        return self._kvcache.full_kv_pool

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -274,7 +274,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # max_total_num_tokens, whose per-token footprint can differ from the
         # target's (e.g. an MLA-latent target paired with a full per-head K/V
         # draft), so size from the draft config rather than the layer ratio.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        # A draft SWA pool is sized separately (DFlashDraftSWAPoolConfigurator).
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and not kvc.draft_swa_pool
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -860,6 +865,20 @@ def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -
         )
 
 
+def resolve_swa_prefix_tails(max_running_requests_per_worker: Optional[int]) -> int:
+    """Cached prefix tails cap mode keeps addressable: a prefix is reusable only
+    while its last sliding_window tokens still hold SWA slots."""
+    prefix_tails = get_schedule().swa_prefix_tails
+    if prefix_tails is not None:
+        return prefix_tails
+    if get_memory().disable_radix_cache:
+        # Nothing is kept for reuse, so the request cap alone bounds the pool.
+        return 0
+    if max_running_requests_per_worker is None:
+        return 0
+    return 4 * max_running_requests_per_worker
+
+
 class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA configurator with the SWA pool sized from a fixed token cap.
 
@@ -935,6 +954,77 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         return self._make_pool_config(
             full_tokens, min(swa_tokens, max_total_num_tokens)
         )
+
+
+class DFlashDraftSWAPoolConfigurator(DefaultPoolConfigurator):
+    """Standard target whose all-SWA DFLASH draft keeps its KV in an SWA pool.
+
+    The draft pool is sized from the per-request window cap plus prefix tails,
+    like a hybrid-SWA target's SWA pool in cap mode, and comes off the budget
+    first; the target pool takes the rest. Without it the draft holds one slot
+    per target token.
+    """
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        super().__init__(kvc)
+        self._swa_cell_size = _dflash_draft_cell_size(kvc)
+        if self._swa_cell_size <= 0:
+            raise ValueError(
+                "--speculative-draft-swa-pool could not resolve the DFLASH draft "
+                "KV bytes/token from the draft config."
+            )
+        window = get_spec().speculative_draft_window_size
+        page_size = kvc.page_size
+        max_running_requests = get_schedule().max_running_requests
+        prefix_tails = resolve_swa_prefix_tails(
+            max_running_requests // kvc.ps.attn_dp_size
+            if max_running_requests is not None
+            else None
+        )
+        cap = compute_swa_request_cap(
+            page_size=page_size, window=window, attn_dp_size=kvc.ps.attn_dp_size
+        )
+        self._swa_tokens = ceil_align(
+            cap + prefix_tails * (window + page_size), page_size
+        )
+        logger.info(
+            f"DFLASH draft SWA pool: window={window}, request_cap={cap}, "
+            f"prefix_tails={prefix_tails}, swa_tokens={self._swa_tokens} "
+            f"({self._swa_tokens * self._swa_cell_size / (1 << 30):.2f} GiB)"
+        )
+
+    def _with_swa_pool(self, config: MemoryPoolConfig) -> MemoryPoolConfig:
+        return replace(
+            config,
+            full_max_total_num_tokens=config.max_total_num_tokens,
+            swa_max_total_num_tokens=self._swa_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        fixed_swa_bytes = self._swa_tokens * self._swa_cell_size
+        if available_bytes <= fixed_swa_bytes:
+            raise RuntimeError(
+                f"DFLASH draft SWA pool ({self._swa_tokens} tokens, "
+                f"{fixed_swa_bytes / (1 << 30):.2f} GiB) leaves no room for the "
+                f"target KV pool within the available "
+                f"{available_bytes / (1 << 30):.2f} GiB. Reduce "
+                f"--max-running-requests, lower --swa-prefix-tails, or increase "
+                f"--mem-fraction-static."
+            )
+        config = super().calculate_pool_sizes(
+            available_bytes - fixed_swa_bytes, page_size
+        )
+        return self._with_swa_pool(config)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        config = super().calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        return self._with_swa_pool(config)
 
 
 # Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
@@ -1205,16 +1295,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _resolve_swa_prefix_tails(self) -> int:
-        """Cached prefix tails cap mode keeps addressable: a prefix is reusable only
-        while its last sliding_window tokens still hold SWA slots."""
-        prefix_tails = get_schedule().swa_prefix_tails
-        if prefix_tails is not None:
-            return prefix_tails
-        if get_memory().disable_radix_cache:
-            # Nothing is kept for reuse, so the request cap alone bounds the pool.
-            return 0
-        max_running_requests = self.requested_max_running_requests_per_worker
-        return 4 * max_running_requests if max_running_requests is not None else 0
+        return resolve_swa_prefix_tails(self.requested_max_running_requests_per_worker)
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
@@ -1539,5 +1620,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if kvc.draft_swa_pool:
+        return DFlashDraftSWAPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

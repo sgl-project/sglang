@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import (
+    DraftSWATokenToKVPoolAllocator,
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     is_swa_req_ring,
@@ -287,10 +288,26 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    draft_swa_pool: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        # --speculative-draft-swa-pool: the all-SWA DFLASH draft's KV is the SWA
+        # side of the target allocator, sized like a cap-mode SWA pool, instead
+        # of one draft slot per target token. The draft worker recognizes the
+        # mode by the allocator it shares with the target.
+        if self.is_draft_worker:
+            self.draft_swa_pool = isinstance(
+                self.token_to_kv_pool_allocator, DraftSWATokenToKVPoolAllocator
+            )
+        else:
+            self.draft_swa_pool = get_spec().speculative_draft_swa_pool
+            if self.draft_swa_pool and self.is_hybrid_swa:
+                raise ValueError(
+                    "--speculative-draft-swa-pool requires a target without "
+                    "sliding-window layers; the target's own SWA pool is in use."
+                )
         self.is_hybrid_swa_mtp_draft = (
             self.is_draft_worker
             and self.draft_model_idx is not None
@@ -416,7 +433,7 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.draft_swa_pool:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
@@ -1299,6 +1316,12 @@ class KVCacheConfigurator:
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
                 )
+            elif self.is_draft_worker and self.draft_swa_pool:
+                token_to_kv_pool = self._build_draft_swa_kv_pool(
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    mha_pool_class=mha_pool_class,
+                )
             elif is_minimax_sparse(self.model_config.hf_config):
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1824,6 +1847,36 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_draft_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: int,
+        swa_max_total_num_tokens: int,
+        mha_pool_class: type,
+    ) -> KVCache:
+        """All-SWA draft pool addressed through the target allocator's full->SWA
+        mapping. Every draft layer is on the SWA side; the full side holds no
+        layers and only spans the target's token space."""
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            post_capture_active=self.post_capture_kv_active,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            swa_attention_layer_ids=list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            ),
+            full_attention_layer_ids=[],
+            device=self.device,
+            enable_kv_cache_copy=True,
+            token_to_kv_pool_class=mha_pool_class,
+        )
+
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -2111,6 +2164,17 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                         req_to_token_pool=req_to_token_pool,
                     )
+                elif self.draft_swa_pool:
+                    token_to_kv_pool_allocator = DraftSWATokenToKVPoolAllocator(
+                        sizes.full_max_total_num_tokens,
+                        sizes.swa_max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
+                    )
                 else:
                     if get_memory().enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (
@@ -2196,6 +2260,8 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+            elif self.draft_swa_pool:
+                token_to_kv_pool_allocator.attach_draft_kv_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:

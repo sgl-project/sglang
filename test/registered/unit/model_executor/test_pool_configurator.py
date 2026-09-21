@@ -88,6 +88,9 @@ def _make_model_runner(
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
     swa_qk_rope_head_dim=32,
+    draft_swa_pool=False,
+    speculative_draft_window_size=None,
+    swa_prefix_tails=None,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -101,6 +104,7 @@ def _make_model_runner(
     mr.page_size = page_size
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
+    mr.draft_swa_pool = draft_swa_pool
     mr.sliding_window_size = sliding_window_size
 
     mc = SimpleNamespace()
@@ -148,6 +152,8 @@ def _make_model_runner(
         speculative_algorithm=speculative_algorithm,
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
+        speculative_draft_window_size=speculative_draft_window_size,
+        swa_prefix_tails=swa_prefix_tails,
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
@@ -176,6 +182,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_cell_size_per_token=None,
     )
 
     return mr
@@ -1323,6 +1330,112 @@ class TestSWAPoolFloor(CustomTestCase):
         slots = cfg._get_num_req_slots(mrr)
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
+
+
+class TestDFlashDraftSWAPoolConfigurator(CustomTestCase):
+    """--speculative-draft-swa-pool: the draft pool is sized from the request
+    cap plus prefix tails and comes off the budget first; the target pool takes
+    the rest at its own cell size."""
+
+    WINDOW = 64
+    DRAFT_CELL = 48  # bytes/token of the draft KV
+    MAX_RUNNING = 2
+
+    def _make(self, **kwargs):
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            speculative_algorithm="DFLASH",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=8,
+            disable_overlap_schedule=True,
+            max_running_requests=self.MAX_RUNNING,
+            chunked_prefill_size=32,
+            speculative_draft_window_size=self.WINDOW,
+            **kwargs,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 5
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = self.DRAFT_CELL
+        return mr
+
+    def _run(self, available_bytes, page_size=1, **kwargs):
+        mr = self._make(page_size=page_size, draft_swa_pool=True, **kwargs)
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                DFlashDraftSWAPoolConfigurator,
+                compute_swa_request_cap,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            self.assertIsInstance(cfg, DFlashDraftSWAPoolConfigurator)
+            cap = compute_swa_request_cap(
+                page_size=page_size, window=self.WINDOW, attn_dp_size=1
+            )
+            config = cfg.calculate_pool_sizes(available_bytes, page_size)
+        return mr, cfg, config, cap
+
+    def _draft_bytes(self, config):
+        return config.swa_max_total_num_tokens * self.DRAFT_CELL
+
+    def test_swa_pool_is_cap_plus_prefix_tails(self):
+        _, _, config, cap = self._run(1_000_000, swa_prefix_tails=3)
+        self.assertEqual(config.swa_max_total_num_tokens, cap + 3 * (self.WINDOW + 1))
+
+    def test_prefix_tails_default_and_radix_off(self):
+        _, _, config, cap = self._run(1_000_000)
+        self.assertEqual(
+            config.swa_max_total_num_tokens,
+            cap + 4 * self.MAX_RUNNING * (self.WINDOW + 1),
+        )
+        _, _, config, cap = self._run(1_000_000, disable_radix_cache=True)
+        self.assertEqual(config.swa_max_total_num_tokens, cap)
+
+    def test_target_pool_takes_the_rest(self):
+        available = 1_000_000
+        mr, cfg, config, _ = self._run(available)
+        self.assertEqual(config.full_max_total_num_tokens, config.max_total_num_tokens)
+        target_cell = _full_per_token(mr) * 4
+        # The draft term is a fixed reservation, not part of the target cell.
+        self.assertEqual(cfg._cell_size, target_cell)
+        used = _actual_memory_used(mr, config) + self._draft_bytes(config)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available - target_cell)
+
+    def test_page_alignment(self):
+        _, _, config, _ = self._run(1_000_000, page_size=16, swa_prefix_tails=1)
+        self.assertEqual(config.swa_max_total_num_tokens % 16, 0)
+        self.assertEqual(config.max_total_num_tokens % 16, 0)
+
+    def test_constraint_keeps_swa_pool(self):
+        _, cfg, config, _ = self._run(1_000_000)
+        with mock_cpu_env():
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(100, page_size=1)
+        self.assertEqual(constrained.max_total_num_tokens, 100)
+        self.assertEqual(constrained.full_max_total_num_tokens, 100)
+        self.assertEqual(
+            constrained.swa_max_total_num_tokens, config.swa_max_total_num_tokens
+        )
+
+    def test_budget_too_small_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "draft SWA pool"):
+            self._run(10)
+
+    def test_default_configurator_keeps_draft_in_cell_size(self):
+        # Without the draft SWA pool the draft costs one slot per target token.
+        mr = self._make(page_size=1)
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+        self.assertIsInstance(cfg, DefaultPoolConfigurator)
+        self.assertEqual(cfg._cell_size, _full_per_token(mr) * 4 + self.DRAFT_CELL)
 
 
 if __name__ == "__main__":
