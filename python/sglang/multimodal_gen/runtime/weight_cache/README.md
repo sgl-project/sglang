@@ -39,7 +39,7 @@ checkpoint requires a content manifest covering exactly `model_index.json`,
 the transformer config, its shard index (if present), and consumed weight files:
 
 ```bash
-python -m sglang.weight_cache_common.checkpoint /path/to/published/model \
+python -m sglang.srt.weight_cache.common.checkpoint /path/to/published/model \
   model_index.json transformer/config.json \
   transformer/diffusion_pytorch_model.safetensors.index.json \
   transformer/diffusion_pytorch_model-00001-of-00002.safetensors \
@@ -88,7 +88,7 @@ Set the owner's `--weight-cache-max-deliveries` to configure the delivery cap
 | --- | --- |
 | IPC serialization/import, UUID mapping | Existing SRT `TorchIpcTransportBackend`, serializer and Torch reduction patch |
 | Message framing/cap, environment stamp | Existing SRT `weight_cache.protocol` |
-| Parameter/buffer traversal, registration, producer watchdog | `weight_cache_common`, also consumed by SRT |
+| Parameter/buffer traversal, registration, producer watchdog | `sglang.srt.weight_cache.common`, shared with SRT |
 | Weight loading and finalization | Existing diffusion `TransformerLoader` and `ComponentLoader`, using frozen decisions |
 | Pipeline component materialization | Existing `ComposedPipelineBase` load loop, including uncached components |
 | Runtime initialization | Shared diffusion worker/owner bootstrap |

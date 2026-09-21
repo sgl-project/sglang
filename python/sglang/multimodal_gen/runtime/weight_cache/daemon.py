@@ -42,10 +42,10 @@ from sglang.multimodal_gen.runtime.weight_cache.identity import (
 from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_index
 from sglang.multimodal_gen.runtime.weight_cache.plan import plan_diff
 from sglang.srt.utils.network import NetworkAddress, get_free_port
+from sglang.srt.weight_cache.common.identity import default_runtime_dir
+from sglang.srt.weight_cache.common.liveness import ProcessHandle, ProcessIdentity
+from sglang.srt.weight_cache.common.transport import CudaIpcExporter
 from sglang.srt.weight_cache.protocol import recv_msg, send_msg
-from sglang.weight_cache_common.identity import default_runtime_dir
-from sglang.weight_cache_common.liveness import ProcessHandle, ProcessIdentity
-from sglang.weight_cache_common.transport import CudaIpcExporter
 
 logger = init_logger(__name__)
 MAX_CONTROL_CONNECTIONS = 16

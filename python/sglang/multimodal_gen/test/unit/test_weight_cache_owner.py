@@ -15,9 +15,9 @@ from sglang.multimodal_gen.runtime.weight_cache import daemon
 from sglang.multimodal_gen.runtime.weight_cache.client import PROTOCOL
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.multimodal_gen.test.unit.test_weight_cache_status import owner_fixture
+from sglang.srt.weight_cache.common.identity import default_runtime_dir
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity
 from sglang.srt.weight_cache.protocol import recv_msg, send_msg
-from sglang.weight_cache_common.identity import default_runtime_dir
-from sglang.weight_cache_common.liveness import ProcessIdentity
 
 
 def test_idle_connection_cannot_block_status_or_protocol_errors():

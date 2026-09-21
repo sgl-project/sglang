@@ -26,16 +26,16 @@ from sglang.multimodal_gen.runtime.weight_cache.plan import (
     DIFFUSION_PROTOCOL_VERSION,
     plan_diff,
 )
-from sglang.srt.weight_cache.protocol import recv_msg, send_msg
-from sglang.weight_cache_common.descriptors import CACHE_ABI, StateManifest
-from sglang.weight_cache_common.liveness import ProcessIdentity
-from sglang.weight_cache_common.mapping import validate_meta_schema
-from sglang.weight_cache_common.transport import (
+from sglang.srt.weight_cache.common.descriptors import CACHE_ABI, StateManifest
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity
+from sglang.srt.weight_cache.common.mapping import validate_meta_schema
+from sglang.srt.weight_cache.common.transport import (
     CudaIpcImporter,
     ExportGeneration,
     IpcDelivery,
     StorageHandle,
 )
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
 logger = init_logger(__name__)
 PROTOCOL = {

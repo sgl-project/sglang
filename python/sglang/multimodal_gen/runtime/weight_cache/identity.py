@@ -19,13 +19,17 @@ from sglang.multimodal_gen.runtime.weight_cache.plan import (
     PlannedRankContext,
 )
 from sglang.srt.environ import envs
-from sglang.srt.weight_cache.protocol import compute_env_stamp
-from sglang.weight_cache_common.checkpoint import (
+from sglang.srt.weight_cache.common.checkpoint import (
     MANIFEST_FILENAME,
     CheckpointManifest,
     verify_manifest,
 )
-from sglang.weight_cache_common.identity import FileStamp, socket_path, source_digest
+from sglang.srt.weight_cache.common.identity import (
+    FileStamp,
+    socket_path,
+    source_digest,
+)
+from sglang.srt.weight_cache.protocol import compute_env_stamp
 
 
 def consumed_files(prepared):

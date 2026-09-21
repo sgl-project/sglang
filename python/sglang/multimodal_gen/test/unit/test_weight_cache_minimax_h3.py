@@ -26,8 +26,8 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.weight_cache.identity import checkpoint_identity
-from sglang.weight_cache_common.mapping import validate_meta_schema
-from sglang.weight_cache_common.traversal import snapshot_module
+from sglang.srt.weight_cache.common.mapping import validate_meta_schema
+from sglang.srt.weight_cache.common.traversal import snapshot_module
 
 
 @pytest.fixture

@@ -448,7 +448,7 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        from sglang.weight_cache_common.traversal import iter_state
+        from sglang.srt.weight_cache.common.traversal import iter_state
 
         state_metadata = list(iter_state(self.model))
         for name, kind, persistent, buf in state_metadata:

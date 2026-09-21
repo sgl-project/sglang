@@ -25,10 +25,10 @@ from sglang.multimodal_gen.runtime.weight_cache.client import (
 )
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
 from sglang.multimodal_gen.test.unit.test_weight_cache_status import owner_fixture
-from sglang.weight_cache_common.liveness import ProcessIdentity
-from sglang.weight_cache_common.mapping import import_state, validate_meta_schema
-from sglang.weight_cache_common.transport import ExportGeneration
-from sglang.weight_cache_common.traversal import snapshot_module, storage_byte_views
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity
+from sglang.srt.weight_cache.common.mapping import import_state, validate_meta_schema
+from sglang.srt.weight_cache.common.transport import ExportGeneration
+from sglang.srt.weight_cache.common.traversal import snapshot_module, storage_byte_views
 
 
 def _components(device):

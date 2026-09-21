@@ -30,7 +30,7 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _weights_checksum,
 )
 from sglang.srt.utils.network import get_free_port
-from sglang.weight_cache_common.liveness import ProcessIdentity
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUDA cache adapter"

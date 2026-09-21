@@ -22,8 +22,8 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.weight_cache_common.liveness import ProcessIdentity, ProducerWatchdog
-from sglang.weight_cache_common.mapping import register_tensor
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity, ProducerWatchdog
+from sglang.srt.weight_cache.common.mapping import register_tensor
 
 from .protocol import (
     CacheConfig,

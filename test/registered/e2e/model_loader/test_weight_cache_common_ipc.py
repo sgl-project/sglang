@@ -27,13 +27,13 @@ import torch
 from msgspec.structs import replace
 from torch import nn
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.weight_cache_common.transport import (
+from sglang.srt.weight_cache.common.transport import (
     CudaIpcExporter,
     CudaIpcImporter,
     ExportBudgetExceeded,
 )
-from sglang.weight_cache_common.traversal import snapshot_module
+from sglang.srt.weight_cache.common.traversal import snapshot_module
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 

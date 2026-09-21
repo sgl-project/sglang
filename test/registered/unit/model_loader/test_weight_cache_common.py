@@ -17,8 +17,7 @@ import torch
 from msgspec.structs import replace
 from torch import nn
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.weight_cache_common.checkpoint import (
+from sglang.srt.weight_cache.common.checkpoint import (
     MANIFEST_FILENAME,
     CheckpointManifest,
     build_manifest,
@@ -26,15 +25,20 @@ from sglang.weight_cache_common.checkpoint import (
     verify_manifest,
     write_manifest,
 )
-from sglang.weight_cache_common.descriptors import StateManifest, canonical_digest
-from sglang.weight_cache_common.identity import hash_file, socket_path, source_digest
-from sglang.weight_cache_common.liveness import (
+from sglang.srt.weight_cache.common.descriptors import StateManifest, canonical_digest
+from sglang.srt.weight_cache.common.identity import (
+    hash_file,
+    socket_path,
+    source_digest,
+)
+from sglang.srt.weight_cache.common.liveness import (
     ProcessIdentity,
     ProducerDiedError,
     ProducerWatchdog,
 )
-from sglang.weight_cache_common.mapping import import_state
-from sglang.weight_cache_common.traversal import snapshot_module, storage_byte_views
+from sglang.srt.weight_cache.common.mapping import import_state
+from sglang.srt.weight_cache.common.traversal import snapshot_module, storage_byte_views
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -333,7 +337,7 @@ class TestIdentity(unittest.TestCase):
 
                 with (
                     patch(
-                        "sglang.weight_cache_common.identity.hash_file",
+                        "sglang.srt.weight_cache.common.identity.hash_file",
                         side_effect=hash_then_change,
                     ),
                     self.assertRaisesRegex(ValueError, "changed while computing"),
@@ -352,7 +356,7 @@ class TestIdentity(unittest.TestCase):
             self.assertEqual(CheckpointManifest.read(destination), manifest)
             receipt = verify_manifest(root, manifest, ["weights.bin", "config.json"])
             with patch(
-                "sglang.weight_cache_common.checkpoint.hash_file",
+                "sglang.srt.weight_cache.common.checkpoint.hash_file",
                 side_effect=AssertionError("Client must not hash weights"),
             ):
                 check_verified_stats(root, manifest, receipt)
@@ -378,7 +382,7 @@ class TestIdentity(unittest.TestCase):
             path.write_bytes(b"after!")
             republished = build_manifest(root, ["weights"])
             with patch(
-                "sglang.weight_cache_common.checkpoint.FileStamp.read",
+                "sglang.srt.weight_cache.common.checkpoint.FileStamp.read",
                 return_value=receipt.stamps[0][1],
             ):
                 with self.assertRaisesRegex(

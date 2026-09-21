@@ -15,8 +15,8 @@ from sglang.multimodal_gen.runtime.weight_cache.client import (
 )
 from sglang.multimodal_gen.runtime.weight_cache.daemon import DiffusionWeightCacheDaemon
 from sglang.multimodal_gen.runtime.weight_cache.plan import CacheCompatibilityPlan
-from sglang.weight_cache_common.liveness import ProcessIdentity
-from sglang.weight_cache_common.transport import (
+from sglang.srt.weight_cache.common.liveness import ProcessIdentity
+from sglang.srt.weight_cache.common.transport import (
     CudaIpcExporter,
     ExportBudgetExceeded,
     ExportGeneration,

@@ -271,8 +271,8 @@ def test_manifest_query_does_not_export_or_register_a_consumer():
     from sglang.multimodal_gen.runtime.weight_cache.daemon import (
         DiffusionWeightCacheDaemon,
     )
-    from sglang.weight_cache_common.liveness import ProcessIdentity
-    from sglang.weight_cache_common.transport import ExportGeneration
+    from sglang.srt.weight_cache.common.liveness import ProcessIdentity
+    from sglang.srt.weight_cache.common.transport import ExportGeneration
 
     owner = object.__new__(DiffusionWeightCacheDaemon)
     owner.stopping = False

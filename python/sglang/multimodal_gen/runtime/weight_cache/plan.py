@@ -9,7 +9,7 @@ import json
 
 import msgspec
 
-from sglang.weight_cache_common.descriptors import CACHE_ABI, canonical_digest
+from sglang.srt.weight_cache.common.descriptors import CACHE_ABI, canonical_digest
 
 DIFFUSION_PROTOCOL_VERSION = 2
 

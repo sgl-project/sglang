@@ -1,6 +1,7 @@
 # Weight-cache correctness foundations (Phase 0A)
 
-This package contains shared correctness primitives for SRT and diffusion.
+`sglang.srt.weight_cache.common` contains shared correctness primitives for SRT
+and diffusion.
 Component export/import delegates to SRT's `TorchIpcTransportBackend`, including
 `MultiprocessingSerializer` and its physical-device UUID reduction patch. SRT's
 daemon now retains prepared tensors and serializes afresh on each fetch; SRT also
@@ -121,7 +122,7 @@ locking, peer credentials and atomic readiness belong to the subsequent service.
 config/weight files, excluding the manifest itself:
 
 ```bash
-python -m sglang.weight_cache_common.checkpoint /path/to/checkpoint config.json weights.safetensors
+python -m sglang.srt.weight_cache.common.checkpoint /path/to/checkpoint config.json weights.safetensors
 ```
 
 The daemon uses `verify_manifest()` against the frozen recipe's exact file set
