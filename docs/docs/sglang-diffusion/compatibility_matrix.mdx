@@ -37,7 +37,12 @@ bit-exact. In the tested image, spatial versus full decode gave RGBA PSNR
 60.69 dB; this is one sample, not a general quality guarantee.
 
 Request-local prefix KV reuse and new-request graph replay have CUDA regression
-tests. The deployment picker marks only its exact tested HTTP combinations as
+tests, including batched targets and independent variable-length prefixes.
+Compatible text-to-image requests support opt-in dynamic batching; image-edit
+requests remain separate, while multiple outputs within one request are supported.
+See the cookbook's [batching guidance](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#batching)
+for deployment settings and floating-point reproducibility limits.
+The deployment picker marks only its exact tested HTTP combinations as
 verified, including H200, B200, RTX PRO 6000 96GB, RTX 5090, and RTX 4090.
 CLI-only combinations remain Unverified in the picker.
 
