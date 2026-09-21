@@ -1248,7 +1248,12 @@ def _wire_mamba_slot_allocator(
         device=device,
     )
     req_to_token_pool.mamba_allocator = slot_allocator
-    req_to_token_pool.mamba_pool.host_transfer_translate = slot_allocator.translate
+    state_pool = req_to_token_pool.mamba_pool
+    state_pool.host_transfer_translate = slot_allocator.translate
+    state_pool.host_capacity_tokens = req_to_token_pool._shared_mamba_size
+    state_pool.host_capacity_bytes = (
+        state_pool.host_capacity_tokens * mamba_end.entry_bytes
+    )
     return slot_allocator
 
 
@@ -1425,7 +1430,11 @@ def init_unified_mamba_pools(
     # sub-pool's `size` (a kernel-facing row count) nor the composite's `size`
     # (the dynamic whole-buffer view, which would ask for a host pool covering
     # the entire buffer instead of the configured limit).
-    token_to_kv_pool.full_kv_pool.host_capacity_tokens = max_total_num_tokens
+    full_pool = token_to_kv_pool.full_kv_pool
+    full_pool.host_capacity_tokens = max_total_num_tokens
+    full_pool.host_capacity_bytes = (
+        max_total_num_tokens * allocator.full_attn_allocator.entry_bytes
+    )
 
     mamba_slot_allocator = _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,

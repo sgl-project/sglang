@@ -61,25 +61,37 @@ class L2TransferEngine:
         Identity for every static pool. A virtual-id pool (the unified memory
         pool) installs `host_transfer_translate`: the controller allocates and
         stores VIRTUAL ids, while the L2 kernels index per-layer views in
-        kernel-facing space. Resolved HERE, on the caller's stream just before
-        the transfer is queued, so it reads the live virtual->physical map --
-        translating when the operation was first enqueued would go stale under
-        a compaction. The window from here to completion is covered by the
-        host-transfer move gate, which freezes the mover.
+        kernel-facing space. Resolve on the transfer stream after its producer
+        event, so the gather and every consumer are ordered on the same stream.
+        The host-transfer move gate freezes relocation until completion.
         """
         # getattr: not every device pool derives from `KVCache` (the mamba
         # state pool does not), so the attribute may be absent entirely.
         translate = getattr(transfer.device_pool, "host_transfer_translate", None)
         if translate is None:
             return transfer.device_indices
-        return translate(transfer.device_indices)
+        original_device = transfer.device_indices.device
+        # The direct backend supplies CPU indices even for a CUDA pool.
+        # Translate alongside the v2p table, then restore the backend's device.
+        indices = transfer.device_indices.to(
+            getattr(transfer.device_pool, "device", original_device)
+        ).contiguous()
+        dcp_size = getattr(transfer.host_pool, "dcp_size", 1)
+        if dcp_size > 1:
+            # The MLA host pool selects this rank and collapses logical IDs.
+            # Translate in local virtual space, then preserve that widened
+            # interface (including token order) for the host pool.
+            resolved = translate(indices // dcp_size) * dcp_size + indices % dcp_size
+        else:
+            resolved = translate(indices)
+        return resolved.to(original_device)
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        device_indices = [self._resolve_device_indices(t) for t in transfers]
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         with device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
+            device_indices = [self._resolve_device_indices(t) for t in transfers]
             ack_start.record()
             for transfer, dev_idx in zip(transfers, device_indices):
                 transfer.host_pool.backup_from_device_all_layer(
@@ -100,15 +112,15 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        device_indices = {id(t): self._resolve_device_indices(t) for t in transfers}
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
+            device_indices = [self._resolve_device_indices(t) for t in transfers]
             ack_start.record()
             for layer_id in range(transfer_layer_id_max):
-                for transfer in transfers:
+                for transfer, dev_idx in zip(transfers, device_indices):
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -123,7 +135,7 @@ class L2TransferEngine:
                     transfer.host_pool.load_to_device_per_layer(
                         transfer.device_pool,
                         transfer.host_indices,
-                        device_indices[id(transfer)],
+                        dev_idx,
                         local_layer_id,
                         self.io_backend,
                         is_draft=transfer.is_draft,
@@ -131,9 +143,7 @@ class L2TransferEngine:
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
             ack_finish.record()
-            self._record_stream(
-                transfers, self.host_to_device_stream, device_indices.values()
-            )
+            self._record_stream(transfers, self.host_to_device_stream, device_indices)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     @staticmethod

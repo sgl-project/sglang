@@ -109,23 +109,26 @@ class MambaPoolHost(HostKVCache):
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         requested_bytes = self.size * self.size_per_token

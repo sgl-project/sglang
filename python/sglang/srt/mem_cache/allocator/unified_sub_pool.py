@@ -442,7 +442,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # schedulers read them O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        self._sched_avail_memo_epoch: Optional[int] = None
+        self._sched_avail_memo_key: Optional[tuple] = None
         self._sched_avail_memo_tokens: int = 0
 
         self.clear()
@@ -616,7 +616,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        if self._sched_avail_memo_epoch == epoch:
+        if self._sched_avail_memo_key == self._schedulable_capacity_key():
             actual = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
@@ -745,16 +745,25 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return True
         return False
 
+    def _schedulable_capacity_key(self) -> tuple:
+        gates = [self.moves_blocked()]
+        for direction in ("low_peer", "high_peer"):
+            neighbor = getattr(self, direction)
+            while neighbor is not None:
+                gates.append(neighbor.moves_blocked())
+                neighbor = getattr(neighbor, direction)
+        return self._chain_capacity_epoch(), tuple(gates)
+
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a neighbor urgent-flush; alloc gates use
-        `available_size()` instead. Memoized on the chain capacity epoch.
+        `available_size()` instead. Memoized on capacity and transfer gates.
         """
-        epoch = self._chain_capacity_epoch()
-        if self._sched_avail_memo_epoch != epoch:
+        key = self._schedulable_capacity_key()
+        if self._sched_avail_memo_key != key:
             self._sched_avail_memo_tokens = self._available_tokens(
                 extra_gap_bytes=self._peer_drainable_hole_bytes()
             )
-            self._sched_avail_memo_epoch = epoch
+            self._sched_avail_memo_key = key
         return self._sched_avail_memo_tokens
 
     def _flush_targets(self):

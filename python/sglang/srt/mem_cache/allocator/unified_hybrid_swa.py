@@ -155,8 +155,15 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         # HiCache addresses each sub-pool's per-layer views directly, so it
         # needs a TOKEN capacity to size the host pool against:
         # `size` on these sub-pools is a kernel-facing ROW count.
-        kvcache.full_kv_pool.host_capacity_tokens = full_max_total_num_tokens
-        kvcache.swa_kv_pool.host_capacity_tokens = swa_max_total_num_tokens
+        kvcache.full_kv_pool.host_capacity_tokens = self._size_full
+        kvcache.swa_kv_pool.host_capacity_tokens = self._size_swa
+        for name, pool in (
+            ("full", kvcache.full_kv_pool),
+            ("swa", kvcache.swa_kv_pool),
+        ):
+            pool.host_capacity_bytes = (
+                pool.host_capacity_tokens * unified_buffer.spec(name).entry_bytes()
+            )
         # Only the FULL side needs the id translate. The controller hands the
         # anchor transfer the tree's VIRTUAL token ids, but the SWA component's
         # indices are produced by `UnifiedRadixCache` through
@@ -347,8 +354,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def bind_swa_for_loaded_rows(
         self, full_token_ids: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        """HiCache load-back: give the sliding-window side real pages for rows
-        the anchor just loaded, and return their kernel-facing ids.
+        """Bind SWA pages for resident or newly loaded full-attention rows.
+
+        Return their kernel-facing IDs, or None if capacity cannot be reclaimed.
 
         The static composite allocates the SWA rows outright
         (`swa_attn_allocator.alloc(n)`), which this composite forbids -- the
@@ -377,6 +385,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         need = int(unbound.numel()) * ps
         if need:
             if need > self.swa_available_size():
+                return None
+            if (
+                need > self.swa_attn_allocator.available_size()
+                and not _relieve_for_alloc(self.swa_attn_allocator, need)
+            ):
                 return None
             self.swa_attn_allocator.alloc_with_virtual(unbound)
         return self.translate_loc_from_full_to_swa(ids)
@@ -712,8 +725,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """No-op stub for HiCache load-back: in shared mode the swa v2p IS the
-        mapping, and HiCache for shared SWA is out of scope."""
+        """Binding load-back rows already updates the shared SWA v2p mapping."""
         return
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
@@ -1063,7 +1075,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
     def _compaction_allowed(self) -> bool:
         return all(
-            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            not allocator.moves_blocked()
             for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
         )
 

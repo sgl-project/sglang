@@ -7,7 +7,7 @@ On top of that the pool RELOCATES pages under compaction, and the conv/SSM
 views are envelope-strided rather than a contiguous per-slot array.
 
 So the guard has to be numerical, and it has to force a real host round trip:
-a small device pool plus a dozen distinct long prefixes evicts the target off
+a small device pool plus distinct long prefixes evicts the target off
 the device, and re-requesting it can only be served by loading back through
 L2. If any of the translate, the staging, or the move gate were wrong, the
 reloaded KV would differ.
@@ -21,7 +21,7 @@ Both full-attention families get a cell: MHA reaches the L2 kernels through
 `data_ptrs` the unified subclass has to build itself, MLA through ones the base
 builds in `__init__`.
 
-    python -m pytest test/registered/hicache/test_hicache_unified_memory.py -v
+    python -m pytest test/registered/e2e/hicache/test_hicache_unified_memory.py -v
 """
 
 import os
@@ -44,9 +44,13 @@ _COMMON_ARGS = [
     "--trust-remote-code",
     "--enable-unified-memory",
     "--enable-cache-report",
+    "--max-running-requests",
+    "1",
+    "--context-length",
+    "4096",
 ]
 
-# A small device pool is what makes the host tier reachable at all: the dozen
+# A small device pool is what makes the host tier reachable at all: the disjoint
 # fillers below have to push the target off the device.
 _SMALL_POOL = ["--max-total-tokens", "8192"]
 
@@ -55,6 +59,7 @@ _PREFIX = (
     "system with paged attention, radix prefix caching and hierarchical offload. "
 ) * 90
 _TARGET = _PREFIX + " Question one:"
+_CONTINUATION = _TARGET + " Explain how it works."
 
 
 def _generate(base_url, text, max_new_tokens=32, logprobs=True):
@@ -64,14 +69,16 @@ def _generate(base_url, text, max_new_tokens=32, logprobs=True):
     }
     if logprobs:
         payload["return_logprob"] = True
-        payload["logprob_start_len"] = 0
+        # Output logprobs suffice; asking for prompt logprobs from zero
+        # caps the reusable prefix at zero and bypasses HiCache entirely.
+        payload["logprob_start_len"] = -1
     resp = requests.post(f"{base_url}/generate", json=payload, timeout=600)
     assert resp.status_code == 200, resp.text
     data = resp.json()
     lp = (
         [t[0] for t in data["meta_info"]["output_token_logprobs"]] if logprobs else None
     )
-    return data["text"], lp
+    return data["text"], lp, data["meta_info"]
 
 
 class UnifiedMemoryHiCacheBase(CustomTestCase):
@@ -99,6 +106,7 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             other_args=base_args + hicache_args,
             env=env,
         )
+        cls.addClassCleanup(kill_process_tree, cls.process_hicache.pid)
         cls.process_reference = popen_launch_server(
             cls.model,
             cls.reference_url,
@@ -106,22 +114,15 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             other_args=base_args + ["--base-gpu-id", "1"],
             env=env,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        for proc in (
-            getattr(cls, "process_hicache", None),
-            getattr(cls, "process_reference", None),
-        ):
-            if proc is not None:
-                kill_process_tree(proc.pid)
+        cls.addClassCleanup(kill_process_tree, cls.process_reference.pid)
 
     def _force_host_round_trip(self):
         """Evict the target off the device so the next hit must come from L2."""
-        for i in range(12):
+        for i in range(8):
             _generate(
                 self.hicache_url,
-                _PREFIX + f" filler variant {i}. Question:",
+                f"Document {i}. "
+                + (f"Unique filler {i} about an unrelated subject. " * 300),
                 max_new_tokens=8,
                 logprobs=False,
             )
@@ -138,15 +139,31 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
         """The sharp one: KV that made a device->host->device round trip must
         produce the same logprobs as a run that never left the device."""
         self._flush_both()
-        cold_text, cold_lp = _generate(self.hicache_url, _TARGET)
+        cold_text, cold_lp, _ = _generate(self.hicache_url, _TARGET)
+        ref_cold_text, ref_cold_lp, _ = _generate(self.reference_url, _TARGET)
         self._force_host_round_trip()
-        warm_text, warm_lp = _generate(self.hicache_url, _TARGET)
-        ref_text, ref_lp = _generate(self.reference_url, _TARGET)
+        # Branch after the cached prompt. Repeating the exact prompt would
+        # recompute its last token, then let only the resident reference dedup
+        # that row against KV from the original full prefill. Those rows can
+        # differ numerically even when every transferred byte is identical.
+        warm_text, warm_lp, warm_meta = _generate(self.hicache_url, _CONTINUATION)
+        ref_text, ref_lp, _ = _generate(self.reference_url, _CONTINUATION)
 
-        self.assertEqual(cold_text, ref_text)
+        self.assertGreater(
+            (warm_meta.get("cached_tokens_details") or {}).get("host", 0),
+            0,
+            msg=f"Target did not reload from host: {warm_meta}",
+        )
+        self.assertEqual(cold_text, ref_cold_text)
         self.assertEqual(warm_text, ref_text)
-        for label, lp in (("cold", cold_lp), ("after-L2-reload", warm_lp)):
-            delta = max(abs(a - b) for a, b in zip(lp, ref_lp))
+        # Match the reference's prefill boundary in each comparison: cold
+        # against cold, and an L2 prefix hit against a resident prefix hit.
+        for label, lp, reference in (
+            ("cold", cold_lp, ref_cold_lp),
+            ("after-L2-reload", warm_lp, ref_lp),
+        ):
+            self.assertEqual(len(lp), len(reference))
+            delta = max(abs(a - b) for a, b in zip(lp, reference))
             self.assertAlmostEqual(
                 delta,
                 0.0,
@@ -175,7 +192,7 @@ class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
         "--mamba-backend",
         "triton",
         "--max-mamba-cache-size",
-        "64",
+        "8",
         "--mem-fraction-static",
         "0.6",
     ]
@@ -204,7 +221,7 @@ class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
 
     model = "thinkingmachines/Inkling"
     server_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-    extra_args = [
+    extra_args = _SMALL_POOL + [
         "--revision",
         "test",
         "--attention-backend",
@@ -214,7 +231,9 @@ class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
         "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--swa-full-tokens-ratio",
-        "0.1",
+        "0.8",
+        "--max-mamba-cache-size",
+        "8",
         "--mamba-full-memory-ratio",
         "0.1",
         "--mem-fraction-static",
@@ -238,7 +257,7 @@ class TestUnifiedMemoryHiCacheMLA(UnifiedMemoryHiCacheBase):
     model = "yujiepan/kimi-linear-tiny-random"
     extra_args = _SMALL_POOL + [
         "--max-mamba-cache-size",
-        "64",
+        "8",
         "--mem-fraction-static",
         "0.5",
         "--linear-attn-backend",

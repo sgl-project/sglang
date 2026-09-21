@@ -179,7 +179,7 @@ class HostKVCache(abc.ABC):
         # which overstates the tokens by 2 * layer_num. Pools that differ
         # publish the real capacity; sizing off `size` there asked for
         # hundreds of GB of host memory.
-        device_capacity = device_pool.host_capacity_tokens
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         if device_capacity is None:
             device_capacity = device_pool.size
         self.device_capacity_tokens = device_capacity

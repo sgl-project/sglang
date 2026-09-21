@@ -28,7 +28,8 @@ class PoolEntry:
     # sliding-window side cannot run its own `alloc` (that trips
     # `assert is_id_owner`) -- it binds pages for the anchor's ids and returns
     # their kernel-facing form. Returns None when it cannot fund them, which
-    # the caller treats like a failed alloc.
+    # the caller treats like a failed alloc. For these entries, device_free_fn
+    # rolls back using the anchor's virtual IDs, not the returned physical IDs.
     device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 

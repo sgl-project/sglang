@@ -1942,6 +1942,8 @@ class KVCache(abc.ABC):
     # overstates the tokens by 2 * layer_num.
     host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     host_capacity_tokens: Optional[int] = None
+    # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
+    host_capacity_bytes: Optional[int] = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
