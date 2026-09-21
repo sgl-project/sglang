@@ -53,12 +53,7 @@ runs:
           const { resolveCiLabels } = require(
             `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
           );
-          let parallelStages = false;
-          try {
-            ({ parallelStages } = await resolveCiLabels(github, context));
-          } catch (e) {
-            console.log(`Could not resolve CI labels: ${e.message}`);
-          }
+          const { parallelStages } = await resolveCiLabels(github, context);
           if (parallelStages) {
             console.log(`Skipping ${stageName} wait (parallel-stages label present)`);
             core.setOutput('result', 'success');

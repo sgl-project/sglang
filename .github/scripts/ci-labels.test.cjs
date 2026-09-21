@@ -110,6 +110,29 @@ test("a commit with no associated PR leaves every axis off", async () => {
   assert.equal(Object.values(resolved).some(Boolean), false);
 });
 
+test("a failed lookup leaves every axis off rather than throwing", async () => {
+  const github = {
+    rest: {
+      pulls: { get: async () => { throw new Error("502"); } },
+      repos: { listPullRequestsAssociatedWithCommit: async () => { throw new Error("502"); } },
+    },
+  };
+  const context = {
+    repo: { owner: "owner", repo: "repo" },
+    sha: "head",
+    payload: { pull_request: { number: 42, head: { sha: "head" }, labels: [] } },
+  };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const { labels, ...resolved } = await resolveCiLabels(github, context);
+    assert.deepEqual(labels, []);
+    assert.equal(Object.values(resolved).some(Boolean), false);
+  } finally {
+    console.warn = warn;
+  }
+});
+
 test("legacy label names no longer switch anything on", async () => {
   const { resolved } = await axes({
     snapshot: [],

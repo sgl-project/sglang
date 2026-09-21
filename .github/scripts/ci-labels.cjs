@@ -14,7 +14,19 @@ const PARALLEL_STAGES = "parallel-stages";
 const MAX_CONCURRENCY = "max-concurrency";
 const HIGHEST_PRIORITY = "highest-priority";
 
+// A lookup failure returns no labels, which leaves every axis off -- fail-fast
+// on, stages serialized, shards throttled. Callers gate the whole run on this,
+// so a transient API error must not fail them.
 async function readLabels(github, context) {
+  try {
+    return await fetchLabels(github, context);
+  } catch (e) {
+    console.warn(`Could not read PR labels: ${e.message}`);
+    return [];
+  }
+}
+
+async function fetchLabels(github, context) {
   const prNumber = context.payload.pull_request?.number;
   if (prNumber) {
     const { data: pr } = await github.rest.pulls.get({
