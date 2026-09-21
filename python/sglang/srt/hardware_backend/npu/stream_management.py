@@ -48,7 +48,7 @@ def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
 def wait_cmo_stream():
     stream = get_cmo_stream()
     if stream is not None:
-        torch.npu.current_stream().wait_stream(stream)
+        _device_module().current_stream().wait_stream(stream)
 
 
 # --- Shared / routed expert streams ---
@@ -120,5 +120,5 @@ shared_expert_on_independent_stream = process_shared_expert
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:
-        indexer_weight_stream = torch.npu.Stream()
+        indexer_weight_stream = _device_module().Stream()
     return indexer_weight_stream
