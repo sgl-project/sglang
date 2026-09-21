@@ -50,9 +50,9 @@ class MirrorAdapter(Protocol):
         self,
         *,
         decl: HostPoolDecl,
-        device_pool: Any,
         anchor_host: Any,
         allocator_type: str,
+        packed_draft_device_pools: tuple[Any, ...],
     ) -> Any: ...
 
 
@@ -60,6 +60,10 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     """One host pool a device pool asks HiCache to mirror. Pool-intrinsic: no layer binding."""
 
     name: PoolName
+    # The pool object that owns this state's device buffers. For a composite
+    # pool the KV state lives on a sub-pool while dependent states live on the
+    # composite itself, so each declaration names its own owner.
+    device_pool: Any
     # Whose host page indices this state reuses when transferred. None: primary.
     index_source: Optional[PoolName]
     # Whose mirror decides this state's capacity and layout. None: self.
@@ -95,16 +99,17 @@ class HostPoolPlan(msgspec.Struct, frozen=True, kw_only=True):
     """A declaration bound to a stack: the unit the assembler builds entries from."""
 
     decl: HostPoolDecl
-    device_pool: Any
     layers: LayerBinding
+    # Draft pools whose same-named state is appended as tail layers, in depth order.
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
-def kv_pool_decl() -> HostPoolDecl:
+def kv_pool_decl(pool: Any) -> HostPoolDecl:
     """The primary KV pool every device pool declares; its mirror is built by
     the assembler, so no layout is declared here."""
     return HostPoolDecl(
         name=PoolName.KV,
+        device_pool=pool,
         index_source=None,
         layout_source=None,
         layout=None,
@@ -165,28 +170,39 @@ def packable_draft_pools(
     return tuple(packable)
 
 
-def plan_host_pools(
-    *,
-    decls: tuple[HostPoolDecl, ...],
-    device_pool: Any,
-    full_layer_mapping: dict[int, int],
-    transfer_layer_id_max: int,
-    packed_draft_device_pools: tuple[Any, ...] = (),
-    index_primary: Optional[PoolName] = None,
-) -> tuple[HostPoolPlan, ...]:
-    """Bind declarations to a stack. A target group contains its own primary
-    KV pool; a draft sidecar group reuses an external ``index_primary``. Either
-    way exactly one layout root anchors the others' capacity, and sidecar
-    indices come from one real source (HostPoolGroup resolves no chains)."""
-    names = [d.name for d in decls]
-    if len(set(names)) != len(names):
-        raise ValueError(f"duplicate host pool names: {names}")
+def layout_root(decls: tuple[HostPoolDecl, ...]) -> HostPoolDecl:
+    """The one declaration whose mirror decides the group's capacity."""
     roots = [d for d in decls if d.is_layout_root]
     if len(roots) != 1:
         raise ValueError(
             f"expected exactly one layout root, got {[d.name for d in roots]}"
         )
-    root = roots[0]
+    return roots[0]
+
+
+def _decl_named(decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostPoolDecl:
+    return next(d for d in decls if d.name == name)
+
+
+def plan_host_pools(
+    *,
+    decls: tuple[HostPoolDecl, ...],
+    full_layer_mapping: dict[int, int],
+    transfer_layer_id_max: int,
+    packed_draft_pools: tuple[Any, ...] = (),
+    index_primary: Optional[PoolName] = None,
+) -> tuple[HostPoolPlan, ...]:
+    """Bind declarations to a stack. A target group contains its own primary
+    KV pool; a draft sidecar group reuses an external ``index_primary``. Either
+    way exactly one layout root anchors the others' capacity, and sidecar
+    indices come from one real source (HostPoolGroup resolves no chains).
+
+    ``packed_draft_pools`` are drafts accepted by packable_draft_pools; each
+    plan carries the draft objects that own its same-named state."""
+    names = [d.name for d in decls]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate host pool names: {names}")
+    root = layout_root(decls)
     if index_primary is None:
         if not root.is_primary or root.name != PoolName.KV:
             raise ValueError(
@@ -208,17 +224,20 @@ def plan_host_pools(
             raise ValueError(f"{d.name}.layout_source must name another pool")
         if d.layout_source not in names:
             raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")
+    draft_decls = [pool.host_pool_decls() for pool in packed_draft_pools]
     return tuple(
         HostPoolPlan(
             decl=d,
-            device_pool=device_pool,
             layers=LayerBinding(
                 transfer_to_device=_owned_layer_mapping(
-                    full_layer_mapping, d.device_layers, device_pool.layer_num
+                    full_layer_mapping, d.device_layers, root.device_pool.layer_num
                 ),
                 transfer_layer_id_max=transfer_layer_id_max,
             ),
-            packed_draft_device_pools=packed_draft_device_pools,
+            packed_draft_device_pools=tuple(
+                _decl_named(decls_of_draft, d.name).device_pool
+                for decls_of_draft in draft_decls
+            ),
         )
         for d in decls
     )

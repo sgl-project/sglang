@@ -65,14 +65,14 @@ class DSAIndexerMirror:
         self,
         *,
         decl: HostPoolDecl,
-        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         allocator_type: str,
+        packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
     ) -> DSAIndexerPoolHost:
         return DSAIndexerPoolHost(
             decl=decl,
-            device_pool=device_pool,
             anchor_host=anchor_host,
+            packed_draft_device_pools=packed_draft_device_pools,
             allocator_type=allocator_type,
         )
 
@@ -83,6 +83,7 @@ def dsa_indexer_pool_decl(
     """Indexer state riding on the full-KV pages: indices and layout both follow KV."""
     return HostPoolDecl(
         name=name,
+        device_pool=pool,
         index_source=PoolName.KV,
         layout_source=PoolName.KV,
         layout=HostPoolLayout(
@@ -108,9 +109,9 @@ class DSAIndexerPoolHost(HostKVCache):
     def __init__(
         self,
         decl: HostPoolDecl,
-        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         *,
+        packed_draft_device_pools: tuple[DSATokenToKVPool, ...] = (),
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
@@ -119,6 +120,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self._is_dummy = is_dummy
         self.decl = decl
         desc = decl.layout
+        device_pool = decl.device_pool
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = anchor_host.layout
@@ -141,7 +143,7 @@ class DSAIndexerPoolHost(HostKVCache):
             layer: i for i, layer in enumerate(self._live_target_layers)
         }
         self.target_layer_num = len(self._live_target_layers)
-        self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
+        self.mtp_draft_device_pools = tuple(packed_draft_device_pools)
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
         self.indexer_dtype = desc.dtype

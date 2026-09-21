@@ -85,7 +85,6 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             )
             indexer_host = DSAIndexerPoolHost(
                 decl=dsa_indexer_pool_decl(device_pool),
-                device_pool=device_pool,
                 anchor_host=mla_host,
                 pin_memory=pin_memory,
                 device="cpu",

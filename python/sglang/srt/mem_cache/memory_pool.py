@@ -1876,7 +1876,7 @@ class KVCache(abc.ABC):
         # pool_host imports this module; resolve the declaration types lazily.
         from sglang.srt.mem_cache.pool_host.host_pool_decl import kv_pool_decl
 
-        return (kv_pool_decl(),)
+        return (kv_pool_decl(self),)
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -3999,7 +3999,6 @@ class HybridLinearKVPool(KVCache):
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
 
-    @property
     def host_pool_decls(self):
         # Mamba state lives in req_to_token_pool and keeps its own host path.
         return self.full_kv_pool.host_pool_decls()

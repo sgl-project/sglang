@@ -156,6 +156,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         full_kv_pool=object(),
                         swa_kv_pool=object(),
                         use_mla=False,
+                        host_pool_decls=lambda: (),
                     )
                     req_pool = SimpleNamespace(
                         mamba_map=global_maps.get("mamba", {}).copy(),
@@ -205,7 +206,9 @@ class TestHybridStageLayerMappings(CustomTestCase):
 class TestDraftSidecarPoolDispatch(CustomTestCase):
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
-        draft_kv_pool.full_kv_pool = SimpleNamespace(layer_num=0)
+        full = SimpleNamespace(layer_num=0)
+        full.host_pool_decls = lambda: (kv_pool_decl(full),)
+        draft_kv_pool.full_kv_pool = full
 
         specs, entries = build_full_draft_pools(
             draft_kv_pool=draft_kv_pool,
@@ -216,9 +219,8 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(
-            layer_num=1, size=800, host_pool_decls=lambda: (kv_pool_decl(),)
-        )
+        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool.host_pool_decls = lambda: (kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
             cache_controller=SimpleNamespace(
@@ -283,10 +285,13 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
         seen = {}
 
-        def fake_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+        def fake_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
             self.assertIsInstance(decl, HostPoolDecl)
-            self.assertIs(device_pool, draft_kv_pool)
+            self.assertIs(decl.device_pool, draft_kv_pool)
             self.assertIs(anchor_host, draft_host_pool)
+            self.assertEqual(packed_draft_device_pools, ())
             seen["desc"] = decl
             return SimpleNamespace(layer_num=1)
 
@@ -398,8 +403,8 @@ def _legacy_build_anchor_sidecar_stack(
     )
     sidecar_host_pool = pool_host_dsa.DSAIndexerPoolHost(
         indexer_decl,
-        kv_pool,
         kv_host_pool,
+        packed_draft_device_pools=mtp_draft_device_pools,
         allocator_type=hybrid_pool_assembler._get_allocator_type(),
     )
     if mtp_draft_device_pools:
@@ -474,11 +479,13 @@ class TestDeclaredStackParity(CustomTestCase):
                 mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
-        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+        def dummy_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
             return real_indexer_host(
                 decl,
-                device_pool,
                 anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
                 allocator_type=allocator_type,
                 pin_memory=False,
                 is_dummy=True,
@@ -504,7 +511,6 @@ class TestDeclaredStackParity(CustomTestCase):
         ):
             out = builder(
                 params=params,
-                kv_pool=pool,
                 full_layer_mapping=dict(full_layer_mapping),
                 load_cache_event=None,
                 storage_backend=None,
@@ -546,6 +552,7 @@ class TestDeclaredStackParity(CustomTestCase):
                     pool=pool,
                     params=params,
                     full_layer_mapping=case["mapping"],
+                    kv_pool=pool,
                     indexer_decl=dsa_indexer_pool_decl(pool),
                 )
                 stack, new_ctrl = self._run(
@@ -587,7 +594,6 @@ class TestDraftSidecarDeclarations(CustomTestCase):
         pool = _dsa_pool_stub(layer_num=2)
         plans = plan_host_pools(
             decls=draft_sidecar_decls(pool.host_pool_decls()),
-            device_pool=pool,
             full_layer_mapping={0: 0, 1: 1},
             transfer_layer_id_max=2,
             index_primary=PoolName.KV,
@@ -598,7 +604,6 @@ class TestDraftSidecarDeclarations(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "every index from the target"):
             plan_host_pools(
                 decls=pool.host_pool_decls(),
-                device_pool=pool,
                 full_layer_mapping={0: 0, 1: 1},
                 transfer_layer_id_max=2,
                 index_primary=PoolName.KV,
@@ -681,7 +686,6 @@ def _legacy_build_full_draft_pools(
         )
         indexer_host_pool = pool_host_dsa.DSAIndexerPoolHost(
             decl=indexer_decl,
-            device_pool=pool,
             anchor_host=draft_host_pool,
             allocator_type=hybrid_pool_assembler._get_allocator_type(),
         )
@@ -724,11 +728,13 @@ class TestSeparateDraftParity(CustomTestCase):
                 pool_label=pool_label,
             )
 
-        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+        def dummy_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
             return real_indexer_host(
                 decl=decl,
-                device_pool=device_pool,
                 anchor_host=anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
                 allocator_type=allocator_type,
                 pin_memory=False,
                 is_dummy=True,
@@ -820,11 +826,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
-        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+        def dummy_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
             return real_indexer_host(
                 decl=decl,
-                device_pool=device_pool,
                 anchor_host=anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
                 allocator_type=allocator_type,
                 pin_memory=False,
                 is_dummy=True,
@@ -857,7 +865,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         ):
             stack = hybrid_pool_assembler.build_hybrid_mamba_stack(
                 params=params,
-                kv_pool=kv_pool,
+                decls=kv_pool.host_pool_decls(),
                 mamba_pool=mamba_pool,
                 full_layer_mapping=full_mapping,
                 mamba_layer_mapping=mamba_mapping,
@@ -887,10 +895,8 @@ class TestDeclaredPoolPlanning(CustomTestCase):
     def _plan(self, decls):
         return plan_host_pools(
             decls=decls,
-            device_pool=SimpleNamespace(layer_num=1),
             full_layer_mapping={0: 0},
             transfer_layer_id_max=1,
-            packed_draft_device_pools=(),
         )
 
     def test_rejects_self_referencing_index_source(self):

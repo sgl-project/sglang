@@ -87,7 +87,6 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         )
         indexer_host = DSAIndexerPoolHost(
             decl=dsa_indexer_pool_decl(dsa_device_pool),
-            device_pool=dsa_device_pool,
             anchor_host=mla_host,
             pin_memory=False,
             is_dummy=True,

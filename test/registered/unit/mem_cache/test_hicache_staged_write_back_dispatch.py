@@ -1028,6 +1028,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
+        host._live_target_layers = list(range(layer_num))
+        host._host_layer_of = {layer: layer for layer in range(layer_num)}
         host.indexer_page_stride_size = indexer_page_stride_size
         host.indexer_layout_dim = host.layer_num * host.indexer_page_stride_size
         host.index_k_device_ptrs = torch.tensor(

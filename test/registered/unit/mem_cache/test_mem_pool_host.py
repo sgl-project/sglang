@@ -418,7 +418,6 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         )
         mirror = DSAIndexerPoolHost(
             decl=decl,
-            device_pool=stub,
             anchor_host=anchor,
             pin_memory=False,
             is_dummy=True,
@@ -453,7 +452,6 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         )
         mirror = DSAIndexerPoolHost(
             decl=decl,
-            device_pool=stub,
             anchor_host=anchor,
             pin_memory=False,
             is_dummy=True,

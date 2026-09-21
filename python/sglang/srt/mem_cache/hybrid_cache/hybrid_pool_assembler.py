@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     HostPoolPlan,
     draft_sidecar_decls,
+    layout_root,
     packable_draft_pools,
     plan_host_pools,
 )
@@ -1052,7 +1053,7 @@ def build_deepseek_v4_hicache_stack(
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
-    kv_pool: Any,
+    decls: tuple[HostPoolDecl, ...],
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
     mamba_layer_mapping: dict[int, int],
@@ -1066,47 +1067,38 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> DeclaredStack:
-    """KV plus every pool the full-attention pool declares (e.g. the DSA
-    indexer), then the Mamba state pool, which keeps its own host path."""
+    """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
+    then the Mamba state pool, which keeps its own host path."""
+    kv_pool = layout_root(decls).device_pool
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    decls = kv_pool.host_pool_decls()
-    mtp_draft_device_pools = packable_draft_pools(
-        decls,
-        tuple(
-            pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
-            for pool in params.mtp_draft_device_pools
-        ),
-    )
+    packed_drafts = packable_draft_pools(decls, params.mtp_draft_device_pools)
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+    if packed_drafts:
+        full_layer_mapping = _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(packed_drafts),
+        )
+    plans = plan_host_pools(
+        decls=decls,
+        full_layer_mapping=full_layer_mapping,
+        transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
+        packed_draft_pools=packed_drafts,
+    )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
-    if mtp_draft_device_pools:
-        full_layer_mapping = _with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
-    plans = plan_host_pools(
-        decls=decls,
-        device_pool=kv_pool,
-        full_layer_mapping=full_layer_mapping,
-        transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-        packed_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_device_pools=_root_plan(plans).packed_draft_device_pools,
     )
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
@@ -1288,6 +1280,10 @@ class DeclaredStack(msgspec.Struct, frozen=True, kw_only=True):
         return [p.decl.sidecar_spec() for p in self.plans if not p.decl.is_primary]
 
 
+def _root_plan(plans: tuple[HostPoolPlan, ...]) -> HostPoolPlan:
+    return next(p for p in plans if p.decl.is_layout_root)
+
+
 def _build_declared_entries(
     plans: tuple[HostPoolPlan, ...], *, root_mirror: Any
 ) -> list[PoolEntry]:
@@ -1312,16 +1308,16 @@ def _build_declared_entries(
             else:
                 mirrors[decl.name] = decl.mirror.build(
                     decl=decl,
-                    device_pool=plan.device_pool,
                     anchor_host=mirrors[decl.layout_source],
                     allocator_type=_get_allocator_type(),
+                    packed_draft_device_pools=plan.packed_draft_device_pools,
                 )
             pending.remove(plan)
     return [
         build_pool_entry(
             name=plan.decl.name,
             host_pool=mirrors[plan.decl.name],
-            device_pool=plan.device_pool,
+            device_pool=plan.decl.device_pool,
             layer_mapping=plan.layers.transfer_to_device,
             transfer_layer_id_max=plan.layers.transfer_layer_id_max,
             is_anchor=plan.decl.is_primary,
@@ -1334,7 +1330,6 @@ def _build_declared_entries(
 def assemble_declared_stack(
     *,
     params: CacheInitParams,
-    kv_pool: Any,
     decls: tuple[HostPoolDecl, ...],
     full_layer_mapping: dict[int, int],
     load_cache_event,
@@ -1346,35 +1341,35 @@ def assemble_declared_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> DeclaredStack:
-    """Build the KV mirror plus every declared dependent pool of ``kv_pool``.
+    """Build the KV mirror plus every dependent pool in ``decls``.
 
     Packed MTP drafts that declare the same pools with the same layout are
     appended as tail layers of each mirror and remapped by the controller.
     Separate drafts are built by build_hicache_draft_sidecars.
     """
+    kv_pool = layout_root(decls).device_pool
     transfer_layer_id_max = len(full_layer_mapping)
-    mtp_draft_device_pools = packable_draft_pools(decls, params.mtp_draft_device_pools)
+    packed_drafts = packable_draft_pools(decls, params.mtp_draft_device_pools)
     # Expose packed MTP tail layers to the controller's flat transfer builder.
-    if mtp_draft_device_pools:
+    if packed_drafts:
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
             target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
+            draft_layer_num=len(packed_drafts),
         )
     plans = plan_host_pools(
         decls=decls,
-        device_pool=kv_pool,
         full_layer_mapping=full_layer_mapping,
-        transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-        packed_draft_device_pools=mtp_draft_device_pools,
+        transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
+        packed_draft_pools=packed_drafts,
     )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
-        mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_device_pools=_root_plan(plans).packed_draft_device_pools,
     )
     entries = _build_declared_entries(plans, root_mirror=kv_host_pool)
     host_pool_group = HostPoolGroup(entries)
@@ -1443,12 +1438,9 @@ def build_full_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build the separate draft sidecars declared by a full-attention draft pool;
     their indices follow target KV and their layout roots on the draft KV mirror."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = pool.full_kv_pool
+    decls = draft_kv_pool.host_pool_decls()
+    # A hybrid draft declares its KV on the full-attention sub-pool.
+    pool = layout_root(decls).device_pool
     if pool.layer_num == 0:
         return [], []
 
@@ -1466,8 +1458,7 @@ def build_full_draft_pools(
         pool_label="draft",
     )
     plans = plan_host_pools(
-        decls=draft_sidecar_decls(pool.host_pool_decls()),
-        device_pool=pool,
+        decls=draft_sidecar_decls(decls),
         full_layer_mapping={i: i for i in range(pool.layer_num)},
         transfer_layer_id_max=draft_host_pool.layer_num,
         index_primary=PoolName.KV,
@@ -1760,7 +1751,7 @@ class _MambaStrategy(StackStrategy):
         )
         stack = build_hybrid_mamba_stack(
             params=params,
-            kv_pool=kvcache.full_kv_pool,
+            decls=kvcache.host_pool_decls(),
             mamba_pool=params.req_to_token_pool.mamba_pool,
             full_layer_mapping=full_layer_mapping,
             mamba_layer_mapping=mamba_layer_mapping,
@@ -1963,7 +1954,6 @@ class _DsaStrategy(StackStrategy):
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
         stack = assemble_declared_stack(
             params=params,
-            kv_pool=full_kv_pool,
             decls=full_kv_pool.host_pool_decls(),
             full_layer_mapping=full_layer_mapping,
             load_cache_event=load_cache_event,
@@ -2136,26 +2126,15 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
 _DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
 
 
-def _declaring_pool(kvcache: Any) -> Optional[Any]:
-    """The pool whose host_pool_decls() the stack must satisfy, or None."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
-
-    pool = kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
-    return pool if isinstance(pool, DSATokenToKVPool) else None
-
-
 def _verify_declared_pools(
     kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
-    pool = _declaring_pool(kvcache)
-    if pool is None:
-        return
     entries = result.host_pool_group.entry_map
-    missing = [d.name.value for d in pool.host_pool_decls() if d.name not in entries]
+    missing = [d.name.value for d in kvcache.host_pool_decls() if d.name not in entries]
     if not missing:
         return
     msg = (
-        f"{type(pool).__name__} declares host pools {missing} that "
+        f"{type(kvcache).__name__} declares host pools {missing} that "
         f"{type(strategy).__name__} did not assemble"
     )
     if isinstance(strategy, _DECLARATION_VERIFIED_STRATEGIES):
@@ -2412,7 +2391,6 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
         stack = assemble_declared_stack(
             params=params,
-            kv_pool=kv,
             decls=kv.host_pool_decls(),
             full_layer_mapping=layer_mapping,
             load_cache_event=load_cache_event,
