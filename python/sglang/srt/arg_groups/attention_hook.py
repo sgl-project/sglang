@@ -551,6 +551,32 @@ def handle_deterministic_inference(server_args: Any):
         run_post_process_pass(server_args, _deterministic_attention_backend)
 
         attention_backend = resolved_view(server_args).attention_backend
+        if attention_backend == "intel_amx":
+            if not str(cfg.device).startswith("cpu"):
+                raise ValueError(
+                    "Deterministic inference with the intel_amx attention "
+                    "backend requires --device cpu."
+                )
+            if cfg.tp_size != 1:
+                raise ValueError(
+                    "Deterministic inference with the intel_amx attention "
+                    "backend currently supports TP=1 only."
+                )
+            if cfg.speculative_algorithm is not None:
+                raise ValueError(
+                    "Deterministic inference with the intel_amx attention "
+                    "backend does not support speculative decoding yet."
+                )
+            if cfg.chunked_prefill_size != -1:
+                logger.warning(
+                    "Chunked prefill is disabled for deterministic inference "
+                    "with the intel_amx attention backend."
+                )
+                declare_resolution(
+                    server_args,
+                    "_handle_deterministic_inference",
+                    chunked_prefill_size=-1,
+                )
         if is_deepseek_model:
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 raise ValueError(

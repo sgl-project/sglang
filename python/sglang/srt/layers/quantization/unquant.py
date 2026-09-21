@@ -472,6 +472,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 layer.weight,
                 bias,
                 True,  # is_vnni
+                get_exec().deterministic.enable_deterministic_inference,
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)

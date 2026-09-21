@@ -4,9 +4,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.attention_hook import handle_deterministic_inference
+from sglang.srt.arg_groups.overrides import resolution_result, resolved_view
 from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
 from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +46,42 @@ class TestServerArgsCPUBackend(CustomTestCase):
             resolution_result(server_args, "attention_backend"), "intel_amx"
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
+
+    def test_intel_amx_deterministic_mvp_disables_unsupported_features(self):
+        server_args = self._make_server_args("intel_amx")
+        server_args.enable_deterministic_inference = True
+        server_args.chunked_prefill_size = 2048
+        server_args.disable_radix_cache = False
+        server_args.tp_size = 1
+
+        with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False):
+            handle_deterministic_inference(server_args)
+
+        view = resolved_view(server_args)
+        self.assertEqual(view.chunked_prefill_size, -1)
+        self.assertTrue(view.disable_radix_cache)
+
+    def test_intel_amx_deterministic_mvp_rejects_tp(self):
+        server_args = self._make_server_args("intel_amx")
+        server_args.enable_deterministic_inference = True
+        server_args.tp_size = 2
+
+        with (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
+            self.assertRaisesRegex(ValueError, "TP=1 only"),
+        ):
+            handle_deterministic_inference(server_args)
+
+    def test_intel_amx_deterministic_mvp_rejects_speculative_decoding(self):
+        server_args = self._make_server_args("intel_amx")
+        server_args.enable_deterministic_inference = True
+        server_args.speculative_algorithm = "EAGLE"
+
+        with (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
+            self.assertRaisesRegex(ValueError, "speculative decoding"),
+        ):
+            handle_deterministic_inference(server_args)
 
 
 class TestServerArgsIBDeviceValidation(CustomTestCase):

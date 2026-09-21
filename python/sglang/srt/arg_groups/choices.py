@@ -119,6 +119,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "intel_amx",
     "intel_xpu",
     "triton",
 ]

@@ -290,7 +290,8 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true);
+    bool is_causal = true,
+    bool deterministic = false);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -383,7 +384,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
 
 // gemm
 at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    bool deterministic);
 
 // gemm fusion
 at::Tensor fused_linear_sigmoid_mul(
@@ -809,7 +815,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True, bool deterministic=False) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -876,7 +882,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #endif
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.def(
+      "weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, bool deterministic=False) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // gemm fusion

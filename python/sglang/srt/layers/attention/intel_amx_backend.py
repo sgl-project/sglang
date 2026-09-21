@@ -9,7 +9,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -56,6 +56,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         ).shape[-1]
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
+        self.enable_deterministic = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
 
         # Number of KV splits used by decode_attention_cpu; attn_logits is
         # sized [bs, num_head, num_kv_splits, v_head_dim + 1] to match.
@@ -262,6 +265,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             sinks,
             tree_mask,
             is_causal,
+            self.enable_deterministic,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

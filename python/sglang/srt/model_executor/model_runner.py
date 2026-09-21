@@ -795,6 +795,12 @@ class ModelRunner:
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:
+            # The generic batch-invariant overrides are implemented with
+            # accelerator kernels (Triton on CUDA/XPU, custom NPU kernels).
+            # Intel AMX CPU kernels enforce their invariants in their own
+            # implementations instead.
+            if self.device == "cpu" or self.device == torch.device("cpu"):
+                return
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()

@@ -474,7 +474,8 @@ void extend_attention_cpu(
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
     std::optional<at::Tensor> tree_mask,
-    bool is_causal = true) {
+    bool is_causal = true,
+    bool deterministic = false) {
   TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
   // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
   // already wrote them to the cache, so this kernel masks causally itself. Cross
@@ -592,7 +593,12 @@ void extend_attention_cpu(
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "extend_attention_packed_types", [&] {
-        if (max_len_extend <= 256) {
+        // Keep a request's reduction topology independent of the longest
+        // request sharing its batch. Radix cache and chunked prefill are
+        // disabled for this initial deterministic Intel AMX path.
+        if (deterministic) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+        } else if (max_len_extend <= 256) {
           LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
         } else if (max_len_extend <= 1024) {
           LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
