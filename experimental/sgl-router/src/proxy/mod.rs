@@ -3,7 +3,10 @@
 
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
+mod abort;
 pub mod sse;
+
+use abort::AbortOnDrop;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
@@ -203,6 +206,7 @@ impl Proxy {
     /// path concatenation (no double-slash) and pass a typed URL to the
     /// split error variants (`UpstreamUnreachable` / `UpstreamTimeout` /
     /// `UpstreamStatus`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_json_to(
         &self,
         worker_url: &str,
@@ -211,6 +215,7 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
+        request_id: Option<&str>,
     ) -> Result<Response<Body>, ApiError> {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker_url.to_string(),
@@ -228,6 +233,8 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .timeout(self.request_timeout);
+        let mut abort =
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, request_id);
         let resp = req.send().await.map_err(|e| {
             breaker.record_failure();
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
@@ -257,6 +264,7 @@ impl Proxy {
                 return Err(ApiError::UpstreamStatus { status });
             }
         };
+        abort.disarm();
         match breaker_outcome(status) {
             BreakerOutcome::Failure => breaker.record_failure(),
             BreakerOutcome::Success => breaker.record_success(),
@@ -301,6 +309,7 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
+        request_id: Option<&str>,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
@@ -322,11 +331,16 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
+        let mut abort =
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, request_id);
         let resp = req.send().await.map_err(|e| {
             breaker.record_failure();
             Self::classify_reqwest_error_for(worker_url.clone(), e, path)
         })?;
         let status = resp.status();
+        if !status.is_success() {
+            abort.disarm();
+        }
         let upstream_ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -385,6 +399,15 @@ impl Proxy {
             None
         };
         permit.disarm();
+        let on_complete: Option<Box<dyn FnOnce(sse::StreamEnd) + Send>> =
+            Some(Box::new(move |end| {
+                if end.reason == sse::StreamEndReason::Completed {
+                    abort.disarm();
+                }
+                if let Some(hook) = on_complete {
+                    hook(end);
+                }
+            }));
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
@@ -465,6 +488,7 @@ mod tests {
                 "/chat",
                 &headers,
                 Bytes::new(),
+                None,
             )
             .now_or_never()
             .is_none());
@@ -477,6 +501,7 @@ mod tests {
                 "/chat",
                 &headers,
                 Bytes::new(),
+                None,
                 None,
                 None,
                 None,
@@ -580,6 +605,7 @@ mod tests {
                 "/v1/chat/completions",
                 &HeaderMap::new(),
                 Bytes::from_static(b"{}"),
+                None,
                 None,
                 None,
                 None,
@@ -694,6 +720,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                 )
                 .await
                 .expect("dispatch should reach the worker (breaker must stay closed)");
@@ -737,6 +764,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                 )
                 .await;
         }
@@ -780,6 +808,7 @@ mod tests {
                 "/v1/chat/completions",
                 &headers,
                 Bytes::from_static(b"{}"),
+                None,
             )
             .await
             .expect("the half-open probe must be admitted and reach the worker");
@@ -815,6 +844,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,

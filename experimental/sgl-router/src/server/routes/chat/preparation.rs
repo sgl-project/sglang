@@ -23,6 +23,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) streaming: bool,
     pub(super) max_output_tokens: Option<u64>,
     pub(super) body: Bytes,
+    rid: Option<Value>,
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
@@ -67,6 +68,7 @@ impl PreparedChatRequest {
             streaming: fields.stream.unwrap_or(false),
             max_output_tokens: fields.requested_max_output_tokens(),
             body,
+            rid: fields.rid,
             tokens,
             input_token_count,
             can_forward_input_ids,
@@ -79,7 +81,8 @@ impl PreparedChatRequest {
         self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
-    ) -> Result<Bytes, ApiError> {
+        headers: &axum::http::HeaderMap,
+    ) -> Result<(Bytes, Option<String>), ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
         let input_ids = match (self.tokens.as_ref(), self.parsed_body.as_ref()) {
             (Some(tokens), Some(parsed_body))
@@ -98,13 +101,40 @@ impl PreparedChatRequest {
         ) {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
-        build_outgoing_body(
+        let body = build_outgoing_body(
             &self.body,
             self.parsed_body,
             input_ids,
             bootstrap,
             &self.sampling_defaults,
-        )
+        )?;
+        // PD prefill must outlive the client to finish KV transfer.
+        if bootstrap.is_some() {
+            return Ok((body, None));
+        }
+        if let Some(rid) = self.rid {
+            return Ok((
+                body,
+                rid.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            ));
+        }
+        let rid = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Splice into the validated object, preserving unrelated JSON values verbatim.
+        let close = body
+            .iter()
+            .rposition(|&b| b == b'}')
+            .ok_or_else(invalid_request)?;
+        let mut output = Vec::with_capacity(body.len() + rid.len() + 16);
+        output.extend_from_slice(&body[..close]);
+        output.extend_from_slice(b",\"rid\":");
+        serde_json::to_writer(&mut output, &rid).expect("serialize request ID");
+        output.extend_from_slice(&body[close..]);
+        Ok((Bytes::from(output), Some(rid)))
     }
 }
 
@@ -115,6 +145,7 @@ pub(super) struct RoutingFields {
     pub(super) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
+    rid: Option<Value>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
 }
 
@@ -223,6 +254,7 @@ enum RoutingKey {
     Model,
     MaxTokens,
     MaxCompletionTokens,
+    Rid,
 }
 
 impl RoutingKey {
@@ -232,6 +264,7 @@ impl RoutingKey {
             Self::Model => 1 << 1,
             Self::MaxTokens => 1 << 2,
             Self::MaxCompletionTokens => 1 << 3,
+            Self::Rid => 1 << 4,
         }
     }
 
@@ -241,6 +274,7 @@ impl RoutingKey {
             Self::Model => "model",
             Self::MaxTokens => "max_tokens",
             Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::Rid => "rid",
         }
     }
 }
@@ -263,6 +297,7 @@ impl<'de> Deserialize<'de> for RequestKey {
 
             fn visit_str<E>(self, v: &str) -> Result<RequestKey, E> {
                 Ok(match v {
+                    "rid" => RequestKey::Routing(RoutingKey::Rid),
                     "stream" => RequestKey::Routing(RoutingKey::Stream),
                     "model" => RequestKey::Routing(RoutingKey::Model),
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
@@ -307,6 +342,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     // Track keys separately so even a repeated null is rejected.
                     seen_routing_keys |= field.bit();
                     match field {
+                        RoutingKey::Rid => fields.rid = map.next_value()?,
                         RoutingKey::Stream => fields.stream = map.next_value()?,
                         RoutingKey::Model => fields.model = map.next_value()?,
                         RoutingKey::MaxTokens => fields.max_tokens = map.next_value()?,

@@ -81,7 +81,8 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let body = request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap))?;
+    let (body, request_id) =
+        request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap), &headers)?;
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -112,6 +113,7 @@ pub(super) async fn forward_chat_request(
         &response_worker,
         &headers,
         body,
+        request_id.as_deref(),
         response_load_guards,
         &metrics,
         expiration_token.clone(),
@@ -171,6 +173,7 @@ fn spawn_prefill_request(
                 CHAT_PATH,
                 &headers,
                 body,
+                None,
             )
             .await
         {
@@ -188,11 +191,13 @@ fn spawn_prefill_request(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
     headers: &HeaderMap,
     body: Bytes,
+    request_id: Option<&str>,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
@@ -209,6 +214,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                request_id,
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
@@ -226,6 +232,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                request_id,
             )
             .await
     }
