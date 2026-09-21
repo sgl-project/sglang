@@ -446,7 +446,7 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     @property
-    def enable_kv_transfer(self) -> bool:
+    def enable_kv_connector(self) -> bool:
         return get_memory().kv_transfer_config is not None
 
     def __init__(
@@ -2506,7 +2506,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: (
-                self.enable_hicache_storage or self.enable_kv_transfer
+                self.enable_hicache_storage or self.enable_kv_connector
             ),
             rust_server=self.rust_server,
         )
@@ -3144,7 +3144,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_kv_transfer:
+        if self.enable_kv_connector:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             return self.tree_cache.prefetch_request(req)
         if self.enable_hicache_storage:
@@ -3648,7 +3648,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
-            or self.enable_kv_transfer
+            or self.enable_kv_connector
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3999,7 +3999,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_kv_transfer:
+            if self.enable_hicache_storage or self.enable_kv_connector:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4043,7 +4043,7 @@ class Scheduler(
                     if (
                         self.enable_hierarchical_cache
                         or self.enable_unified_cache_external_linker
-                        or self.enable_kv_transfer
+                        or self.enable_kv_connector
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
@@ -4115,7 +4115,7 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or self.enable_unified_cache_external_linker
-            or self.enable_kv_transfer
+            or self.enable_kv_connector
         ):
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -4914,7 +4914,7 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_kv_transfer:
+        if self.enable_kv_connector:
             if_success = self.tree_cache.clear_storage_backend()
         elif self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
@@ -4950,7 +4950,7 @@ class Scheduler(
                 )
             if (
                 self.enable_hicache_storage
-                or self.enable_kv_transfer
+                or self.enable_kv_connector
                 or self.disaggregation_mode != DisaggregationMode.NULL
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
@@ -5081,7 +5081,7 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
-            if self.enable_kv_transfer:
+            if self.enable_kv_connector:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle

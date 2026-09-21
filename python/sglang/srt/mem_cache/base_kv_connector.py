@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class BaseKVConnector(BasePrefixCache):
-    """A BasePrefixCache with an external KV transfer lifecycle.
+    """A BasePrefixCache with scheduler hooks for an external KV connector.
 
     A provider may reuse UnifiedRadixCache through inheritance or composition.
     The configured class is constructed with ``(context, config)`` once in each
@@ -33,7 +33,7 @@ class BaseKVConnector(BasePrefixCache):
 
         Called before construction. Do not allocate resources here. In
         particular, check speculative decoding, SWA/Mamba, DCP/DP, and device
-        support against the provider's actual transfer implementation.
+        support against the provider's implementation.
         """
 
     @abstractmethod

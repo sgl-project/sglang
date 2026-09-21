@@ -1,9 +1,14 @@
-# External KV connectors
+---
+title: "External KV connectors"
+description: "Load and implement a SGLang KV cache connector from an external Python package."
+---
 
 `--kv-transfer-config` loads a SGLang prefix-cache connector from an installed
 Python package. The provider owns its implementation and dependencies; adding a
 provider does not require another backend name, import, or flag in SGLang.
-Without this option, the existing cache selection behavior is unchanged.
+A connector can provide local caching, external storage, or KV transfer; enabling
+a connector does not imply that it transfers KV. Without this option, the existing
+cache selection behavior is unchanged.
 
 This initial interface targets colocated serving. It provides the same explicit
 module-selection pattern as vLLM, but uses SGLang's `BasePrefixCache` and scheduler
@@ -32,7 +37,7 @@ python -m sglang.launch_server \
   }'
 ```
 
-[NoOpKVConnector](../../../../examples/runtime/kv_connector/noop_connector.py)
+The `NoOpKVConnector` in `examples/runtime/kv_connector/noop_connector.py`
 keeps ordinary local radix caching and performs no external transfers. It is a
 runnable packaging example, not evidence of external cache reuse. For a real
 provider, install its package in **every worker's** Python environment and replace
@@ -73,7 +78,7 @@ unsupported model, layout, speculative-decoding, or parallelism configuration.
 ## Implement a provider
 
 Export a concrete subclass of
-[`BaseKVConnector`](base_kv_connector.py) with constructor
+`sglang.srt.mem_cache.base_kv_connector.BaseKVConnector` with constructor
 `__init__(self, context: TreeCacheBuildContext, config: KVTransferConfig)`.
 The loader imports the module inside each scheduler worker, checks the class,
 calls `validate_config(context, config)`, and constructs it. The launcher only
