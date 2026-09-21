@@ -168,6 +168,7 @@ async fn h2c_client_streams_sse_from_http2_only_worker() {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })),
             None,
+            None,
         )
         .await
         .expect("h2c client must stream from an HTTP/2-only worker");
