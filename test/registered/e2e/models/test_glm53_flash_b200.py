@@ -96,9 +96,9 @@ class TestGLM53FlashB200LowLatency(
         "--speculative-num-draft-tokens",
         "6",
         "--speculative-adaptive",
-        # Leave about 13 GiB per GPU for activations and CUDA graphs.
+        # Leave headroom for DeepGEMM warmup and adaptive EAGLE graphs.
         "--mem-fraction-static",
-        "0.927",
+        "0.90",
     ]
 
 
