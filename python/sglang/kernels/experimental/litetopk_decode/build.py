@@ -26,11 +26,15 @@ TOPK = 2_048
 CTAS = 148
 WORKSPACE_BYTES = 20_973_568
 SELECTOR_CONFIGS = {
-    1: ("selector_b1.py", 1),
-    2: ("selector_coarse1024.py", 1),
-    4: ("selector_coarse1024.py", 4),
-    8: ("selector_coarse1024.py", 4),
-    16: ("selector_coarse1024.py", 4),
+    1: (2048, 1),
+    2: (1024, 1),
+    4: (1024, 4),
+    8: (1024, 4),
+    16: (1024, 4),
+}
+SELECTOR_SHA256 = {
+    2048: "2c9785d08b1a6e812c12fe417ea4fb551587dff629364c398c3958ce8d7f1326",
+    1024: "faa13c98f6d59eb74961e3649b1175b89c9976c4d22a2239a3d560112600b2c4",
 }
 
 
@@ -46,6 +50,74 @@ def _load(name: str, path: Path):
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _replace_once(text: str, old: str, new: str) -> str:
+    if text.count(old) != 1:
+        raise RuntimeError(f"selector source anchor count != 1: {old[:80]!r}")
+    return text.replace(old, new, 1)
+
+
+def _selector_source(bins: int) -> str:
+    text = (HERE / "selectors/selector.py").read_text()
+    if bins not in SELECTOR_SHA256:
+        raise ValueError(f"unsupported histogram size: {bins}")
+    if bins == 1024:
+        replacements = (
+            (
+                "    # Frozen coarse_boundary; exceptional endpoints are explicit, never half centers.\n",
+                "    # Lower FP32 boundary of one grouped ordered-FP16 bin.\n",
+            ),
+            ("    if tau >= cutlass.Int32(2016):\n", "    if tau >= cutlass.Int32(1008):\n"),
+            ("    elif tau >= cutlass.Int32(31):\n", "    elif tau >= cutlass.Int32(15):\n"),
+            (
+                "        maximum = cutlass.Uint32((tau << cutlass.Int32(5)) | cutlass.Int32(31))\n",
+                "        maximum = cutlass.Uint32((tau << cutlass.Int32(6)) | cutlass.Int32(63))\n",
+            ),
+            (
+                "            if cutlass.const_expr(self.r_const == 148):\n"
+                "                if nv <= cutlass.Int32(131072):\n"
+                "                    R = cutlass.Int32(128)\n",
+                "",
+            ),
+            (
+                "                    if cutlass.const_expr(self.r_const == 148):\n"
+                "                        if R == cutlass.Int32(128):\n"
+                "                            Q = (n4v + cutlass.Int32(127)) // cutlass.Int32(128)\n",
+                "",
+            ),
+            (
+                "            hbase = row * cutlass.Int32(2048)\n",
+                "            hbase = row * cutlass.Int32(1024)\n",
+            ),
+            (
+                "                h0 = histogram[hbase + tidx * cutlass.Int32(2)]\n"
+                "                h1 = histogram[hbase + tidx * cutlass.Int32(2) + cutlass.Int32(1)]\n"
+                "            hs = h0 + h1\n",
+                "                h0 = histogram[hbase + tidx]\n"
+                "            hs = h0\n",
+            ),
+            (
+                "                    s_cbuf[NW + 0] = tidx * cutlass.Int32(2)\n",
+                "                    s_cbuf[NW + 0] = tidx\n",
+            ),
+            (
+                "                    if cert_bin >= 0 and cert_bin <= 2047 and cert_strict >= 0 and cert_strict <= k:\n",
+                "                    if cert_bin >= 0 and cert_bin <= 1023 and cert_strict >= 0 and cert_strict <= k:\n",
+            ),
+            (
+                "                            while hz < cutlass.Int32(2048):\n",
+                "                            while hz < cutlass.Int32(1024):\n",
+            ),
+        )
+        for old, new in replacements:
+            text = _replace_once(text, old, new)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    if digest != SELECTOR_SHA256[bins]:
+        raise RuntimeError(
+            f"selector source drift for {bins} bins: {digest}"
+        )
+    return text
 
 
 def _require_build_environment() -> None:
@@ -101,13 +173,12 @@ def _build_producer(
         "-DHPC_TARGET_ARCH=100",
         "-Dhpc=gred_probe_upstream",
     ]
-    if bins == 1024:
-        flags.extend(
-            (
-                "-DLITETOPK_COARSE_BINS=1024",
-                f"-DLITETOPK_PRODUCER_NAMESPACE={namespace}",
-            )
+    flags.extend(
+        (
+            f"-DLITETOPK_COARSE_BINS={bins}",
+            f"-DLITETOPK_PRODUCER_NAMESPACE={namespace}",
         )
+    )
     result = Path(
         load(
             name=namespace,
@@ -142,18 +213,17 @@ def _build_producer(
 
 
 def build_producers() -> list[dict]:
+    source = HERE / "csrc/producer_batch.cu"
     return [
         _build_producer(
             name="producer2048",
-            source=HERE
-            / "temporal_decode/decode_topk_batched/producer_v2/producer_batch.cu",
+            source=source,
             bins=2048,
             namespace="litetopk_batched_producer_20260920",
         ),
         _build_producer(
             name="producer1024",
-            source=HERE
-            / "batchdecode-coarse-opt-20260921/producer/producer_batch.cu",
+            source=source,
             bins=1024,
             namespace="litetopk_batched_producer_coarse1024_20260921",
         ),
@@ -169,24 +239,26 @@ def _selector_tensor(runtime, cute, dtype, rank: int, align: int = 16):
     )
 
 
-def _build_selector(batch: int, source_name: str, unroll: int) -> dict:
+def _build_selector(batch: int, bins: int, unroll: int) -> dict:
     import torch
     from cutlass.cute import runtime
 
     module_name = "_gvr_hist_prologue_acqrel_hsplitq_original_20260918"
     original = _load(module_name, HERE / "vendor/gvr2_topk_decode.py")
-    host = _load("_litetopk_gvr2_host", HERE / "vendor/gvr2_topk_host.py")
+    directory = BUILD / "selectors" / f"b{batch}"
+    directory.mkdir(parents=True, exist_ok=True)
+    source = _selector_source(bins)
+    generated = directory / "generated.py"
+    if generated.exists():
+        raise FileExistsError(generated)
+    generated.write_text(source)
     derivative = _load(
         f"_litetopk_selector_b{batch}",
-        HERE / "selectors" / source_name,
+        generated,
     )
 
-    route = host.route_streaming(batch, ENVELOPE, ENVELOPE, TOPK, force_main=True)
-    grid, template = tuple(route["grid"]), list(route["tpl"])
     r_const = CTAS // batch
-    if grid != (r_const, batch) or route["block"] != 1024:
-        raise RuntimeError(f"unexpected selector route for B={batch}: {route}")
-    template[1] = unroll
+    template = (1024, unroll, 1, 256, 2, True, False)
 
     cute, cutlass = original.cute, original.cutlass
     scores = _selector_tensor(runtime, cute, cutlass.Float32, 2)
@@ -233,8 +305,6 @@ def _build_selector(batch: int, source_name: str, unroll: int) -> dict:
         options="--enable-tvm-ffi --gpu-arch sm_100a",
     )
 
-    directory = BUILD / "selectors" / f"b{batch}"
-    directory.mkdir(parents=True, exist_ok=True)
     obj, library = directory / "select.o", directory / "select.so"
     if obj.exists() or library.exists():
         raise FileExistsError(directory)
@@ -246,13 +316,13 @@ def _build_selector(batch: int, source_name: str, unroll: int) -> dict:
     )
     return {
         "batch": batch,
-        "histogram_bins": 2048 if batch == 1 else 1024,
+        "histogram_bins": bins,
         "active_ctas_at_128k": 128 if batch == 1 else None,
         "unroll": unroll,
         "grid": [r_const, batch, 1],
         "workspace_bytes": WORKSPACE_BYTES,
-        "source": source_name,
-        "source_sha256": _sha256(HERE / "selectors" / source_name),
+        "source": str(generated),
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "library": str(library),
         "library_sha256": _sha256(library),
     }

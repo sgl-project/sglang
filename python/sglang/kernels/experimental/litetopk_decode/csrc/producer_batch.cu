@@ -1,6 +1,4 @@
-// Batched derivative of decode_topk_final/producer/producer.cu.
-// The frozen B=1 producer is NOT modified; this is a second translation unit with its
-// own torch namespace so both can be loaded at once.
+// Batched DeepGEMM-derived decode producer with a compile-time histogram width.
 //
 // What changes versus the B=1 artifact, and nothing else:
 //   * num_q_tokens_total = B in the scheduler construction (was the literal 1), which
@@ -8,7 +6,7 @@
 //   * The emitter honours the row index the frozen core already hands it
 //     (native_tma_core.cuh: emit(scheduler.get_logits_row(q_block_idx, i), ...)) instead
 //     of dropping every row but 0, and addresses dense[row] and lengths[row].
-//   * One shared 2048-bin histogram is flushed into global hist[row] at each row
+//   * One shared histogram is flushed into global hist[row] at each row
 //     transition. Transitions are CTA-uniform (kNextN==1 => one q token per request =>
 //     num_q_blocks==1 => the row is constant for a whole next_q_block iteration) and,
 //     because the metadata kernel snaps SM starts to request boundaries, each of the B-1
@@ -16,7 +14,7 @@
 //   * The B=1 closed-form schedule guard becomes a device-side transcription of the
 //     general rule in deep_gemm/scheduler/sm100_paged_mqa_logits.cuh:127-177.
 // The shared native core, scheduler, numeric reduction and shared-memory budget are
-// unchanged. See ../../decode_topk_final/README.md and ../hist_fused/LICENSE.*.
+// unchanged.
 // DeepGEMM-derived host/scheduler code: Copyright (c) 2025 DeepSeek, MIT.
 #include "producer_batch.h"
 #include <torch/library.h>
@@ -30,13 +28,13 @@
 #include <cutlass/arch/barrier.h>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 #include <cute/arch/copy_sm100.hpp>
-#include "temporal_decode/fused/native_tma_core.cuh"
+#include "native_tma_core.cuh"
 #include <climits>
 #include <type_traits>
 #include <cmath>
 
 #ifndef LITETOPK_COARSE_BINS
-#error "LITETOPK_COARSE_BINS must be 512 or 1024"
+#error "LITETOPK_COARSE_BINS must be 1024 or 2048"
 #endif
 #ifndef LITETOPK_PRODUCER_NAMESPACE
 #error "LITETOPK_PRODUCER_NAMESPACE must name the isolated Torch namespace"
@@ -46,8 +44,8 @@ namespace LITETOPK_PRODUCER_NAMESPACE {
 namespace {
 constexpr int Ctas = 148, Threads = 384, MathThreads = 256;
 constexpr int Bins = LITETOPK_COARSE_BINS;
-static_assert(Bins == 512 || Bins == 1024);
-constexpr int CoarseShift = Bins == 1024 ? 6 : 7;
+static_assert(Bins == 1024 || Bins == 2048);
+constexpr int CoarseShift = Bins == 2048 ? 5 : 6;
 // Keep the original shared-memory carve-out so this experiment changes only
 // histogram work and global traffic, not scorer occupancy or launch resources.
 constexpr int AllocatedBins = 2048;
@@ -623,9 +621,10 @@ struct BatchProducerHandle::Impl {
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE), "encode weights");
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&device_shared_limit,
         cudaDevAttrMaxSharedMemoryPerBlockOptin, q.get_device()));
-    // Deliberately retain the production carve-out. The effective zero/flush loops
-    // still use Bins, and Mode 24's scratch bin is inside this reserved tail.
-    shared_bytes = sizeof(StageStorage<1, 6>) + AllocatedBins * sizeof(int);
+    // Keep the qualified production carve-out. The diagnostic Mode 24 needs one
+    // extra scratch word only for the 2048-bin build.
+    shared_bytes = sizeof(StageStorage<1, 6>) +
+        (AllocatedBins + (Bins == 2048 && mode == 24 ? 1 : 0)) * sizeof(int);
     #define CONFIG_S(Q, KV, MODE) (page == 64 \
         ? configure_resources<64, Q, KV, MODE>(shared_bytes, device_shared_limit, registers, local_bytes) \
         : configure_resources<128, Q, KV, MODE>(shared_bytes, device_shared_limit, registers, local_bytes))

@@ -28,11 +28,15 @@ environment. Override their location with `LITETOPK_NATIVE_DEEPGEMM_INCLUDE`.
 CUDA_VISIBLE_DEVICES='' \
 MAX_JOBS=1 \
 CUTE_DSL_ARCH=sm_100a \
-python -m sglang.kernels.experimental.litetopk_decode.build --all
+python python/sglang/kernels/experimental/litetopk_decode/build.py --all
 ```
 
 Artifacts and a SHA256 manifest are written below `build/`. The build is CPU-only;
 GPU execution is intentionally separate.
+
+The checked-in selector is the qualified 2048-bin/B1 source. The build derives the
+1024-bin B2/B4/B8/B16 source with checked, single-match substitutions and records its
+SHA256 in the manifest.
 
 ## Scope
 
