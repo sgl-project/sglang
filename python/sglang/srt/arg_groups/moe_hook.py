@@ -298,6 +298,26 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MegaMOE currently requires an SM100-family "
                 "CUDA device for all supported quantization formats."
             )
+        if (
+            cfg.nnodes == 1
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and resolved_view(server_args).quantization
+            in ("modelopt_fp4", "nvfp4_online")
+            and (
+                cfg.speculative_algorithm is None
+                or cfg.speculative_moe_a2a_backend == "none"
+            )
+        ):
+            # This kernel uses directly mapped peer memory. Avoid the NVSHMEM
+            # 3.4.5 proxy's uninitialized global-exit request (cudaMallocHost
+            # does not zero memory). Disable remote transports as well: the
+            # local-only flag cannot disable a full transport proxy.
+            # Device-side global_exit and proxy timeout polling are unavailable
+            # with these defaults. Preserve explicit NVSHMEM configuration and
+            # exclude drafts with their own A2A backend: these are process-wide.
+            os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+            os.environ.setdefault("NVSHMEM_IB_ENABLE_IBGDA", "0")
+            os.environ.setdefault("NVSHMEM_DISABLE_LOCAL_ONLY_PROXY", "1")
         logger.info(
             "FlashInfer MegaMOE is enabled. The expert parallel size is "
             "adjusted to be the same as the tensor parallel size[%s].",
