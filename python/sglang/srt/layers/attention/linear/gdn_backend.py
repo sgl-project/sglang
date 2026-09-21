@@ -540,9 +540,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise ValueError("GDN MIS metadata requires --enable-mis")
             self.mis_metadata = build_gdn_mis_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            if getattr(self.forward_metadata, "mamba_track_mask_indices", None) is None:
+                self.forward_metadata.mamba_track_mask_indices = (
+                    forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                )
             self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices

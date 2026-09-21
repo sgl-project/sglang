@@ -169,28 +169,17 @@ class TestResolveFusionGroup(CustomTestCase):
         fake_moe_tp_group = MagicMock(name="moe_tp_group")
         tp_size = moe_ep_size * moe_tp_size * moe_dp_size
 
-        with (
-            get_parallel().override(
-                moe_ep_size=moe_ep_size,
-                moe_tp_size=moe_tp_size,
-                moe_dp_size=moe_dp_size,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                moe_ep_rank=tp_rank % moe_ep_size,
-                moe_tp_rank=tp_rank % moe_tp_size,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_tp_group",
-                return_value=fake_tp_group,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_ep_group",
-                return_value=fake_ep_group,
-            ),
-            patch(
-                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_tp_group",
-                return_value=fake_moe_tp_group,
-            ),
+        with get_parallel().override(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            moe_ep_rank=tp_rank % moe_ep_size,
+            moe_tp_rank=tp_rank % moe_tp_size,
+            tp_group=fake_tp_group,
+            moe_ep_group=fake_ep_group,
+            moe_tp_group=fake_moe_tp_group,
         ):
             ws = resolve_fusion_world_size(use_attn_tp_group=False)
             group_tuple = resolve_fusion_group(use_attn_tp_group=False)
