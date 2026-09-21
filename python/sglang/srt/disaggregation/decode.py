@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    RetractionBackup,
     discard_kv_cache_backup,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
@@ -97,7 +98,7 @@ from sglang.srt.mem_cache.common import (
     restore_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -1748,13 +1749,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_tokens = ceil_align(
             len(decode_req.req.origin_input_ids), self.host_pool.page_size
         )
-        backup = self.tree_cache.allocate_host_receive(
-            num_tokens, reserved_tokens=self.host_reserved_tokens
-        )
-        if backup is None:
+        required_tokens = num_tokens + self.host_reserved_tokens
+        if (
+            self.host_pool.available_size() < required_tokens
+            and not self.tree_cache.disable
+        ):
+            self.tree_cache.evict_host(required_tokens)
+        if self.host_pool.available_size() < required_tokens:
+            return False
+        host_indices = self.host_pool.alloc(num_tokens)
+        if host_indices is None:
             return False
         assert decode_req.req.kv.retraction_backup is None
-        decode_req.req.kv.retraction_backup = backup
+        # _init_host_receive requires every sidecar to share the primary KV indices.
+        decode_req.req.kv.retraction_backup = RetractionBackup(
+            host_indices=host_indices,
+            pool_transfers=[
+                PoolTransfer(
+                    name=spec.pool_name,
+                    host_indices=host_indices,
+                    indices_from_pool=spec.indices_from_pool,
+                    hit_policy=spec.hit_policy,
+                )
+                for spec in self.tree_cache.sidecar_pool_specs
+                if num_tokens
+            ]
+            or None,
+        )
         if get_disagg().disaggregation_decode_enable_radix_cache:
             # A rejected device admission released its prefix lock. Receive the
             # complete prompt into fresh slots, as for retraction, and let the
@@ -1773,7 +1794,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         assert decode_req.metadata_buffer_index is not None
         page_indices = kv_to_page_indices(
-            backup.host_indices, self.token_to_kv_pool_allocator.page_size
+            host_indices, self.token_to_kv_pool_allocator.page_size
         ).astype(np.int32)
         decode_req.kv_receiver.send_metadata(
             page_indices,

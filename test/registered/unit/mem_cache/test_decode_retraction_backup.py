@@ -389,9 +389,12 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 # Incoming KV and retraction must coexist even with the host pool full.
                 group = cache.host_pool_group
                 blockers = group.alloc(group.available_size() - num_slots)
-                self.assertIsNone(
-                    cache.allocate_host_receive(page_size, reserved_tokens=num_slots)
-                )
+                pending_req = SimpleNamespace(**vars(req))
+                pending_req.kv = ReqKvInfo()
+                pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
+                self.assertFalse(queue._pre_alloc_host(pending))
+                self.assertIsNone(pending_req.kv.retraction_backup)
+                self.assertEqual(group.available_size(), num_slots)
                 retracted, source_indices = self._admit_req(env, num_slots)
                 for index, buffer in enumerate(device_buffers):
                     buffer[source_indices] = index + 100
@@ -423,8 +426,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 # Abort cleanup uses the same descriptor, including sidecars.
-                backup = cache.allocate_host_receive(num_slots)
-                cache.discard_kv_cache_backup(backup)
+                self.assertTrue(queue._pre_alloc_host(pending))
+                cache.discard_kv_cache_backup(pending_req.kv.retraction_backup)
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
                 )
