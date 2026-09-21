@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -1118,14 +1119,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
-            and ps.pp_rank == 0
+            and get_parallel().pp_rank == 0
             and ps.attn_tp_rank == 0
             and ps.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,
