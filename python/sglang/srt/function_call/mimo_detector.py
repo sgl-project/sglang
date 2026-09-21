@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import html
 import json
 import logging
 import re
@@ -24,6 +23,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
 from sglang.srt.function_call.utils import (
     get_schema_properties,
+    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -36,7 +36,7 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
         if tool.function.name == func_name:
             props = get_schema_properties(tool.function.parameters)
             if param_name in props:
-                return props[param_name].get("type", "string")
+                return infer_type_from_json_schema(props[param_name]) or "string"
     return "string"
 
 
@@ -47,16 +47,12 @@ def _convert_param_value(
     Convert parameter value based on its type in the schema.
     Adapted from vllm-project/vllm (vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py)
     """
-    param_value = html.unescape(param_value)
-
-    # Handle null value for any type
-    if param_value.lower() == "null":
-        return None
-
     param_type = _get_param_type(func_name, param_name, tools)
 
     if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
         return param_value
+    elif param_value == "null":
+        return None
     elif (
         param_type.startswith("int")
         or param_type.startswith("integer")
@@ -278,7 +274,88 @@ class MiMoDetector(BaseFormatDetector):
         return {"name": func_name, "parameters": params}
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def get_structural_tag_name(self) -> str:
+        return "mimo"
+
+    def get_structural_tag(
+        self,
+        tools=None,
+        tool_choice="auto",
+        thinking_mode=False,
+        parallel_tool_calls=True,
+    ):
+        try:
+            return super().get_structural_tag(
+                tools, tool_choice, thinking_mode, parallel_tool_calls
+            )
+        except ValueError as error:
+            if not str(error).startswith("Unknown format type: mimo,"):
+                raise
+
+        # XGrammar 0.2.7 has qwen_xml, but predates the compact MiMo builtin.
+        from xgrammar import normalize_tool_choice
+        from xgrammar.structural_tag import (
+            AnyTextFormat,
+            JSONSchemaFormat,
+            SequenceFormat,
+            StructuralTag,
+            TagFormat,
+            TriggeredTagsFormat,
+        )
+
+        from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
+        functions, builtins, choice = normalize_tool_choice(
+            [tool.model_dump() for tool in tools or []],
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice,
+        )
+        if builtins:
+            raise ValueError("MiMo does not support builtin tools.")
+        tags = [
+            TagFormat(
+                begin=f"<tool_call><function={tool.function.name}>",
+                content=JSONSchemaFormat(
+                    json_schema=(
+                        tool.function.parameters
+                        if tool.function.strict is not False
+                        and tool.function.parameters
+                        else True
+                    ),
+                    style="qwen_xml",
+                ),
+                end="</function></tool_call>",
+            )
+            for tool in functions
+        ]
+        excludes = ["<think>", "</think>", "</tool_call>", "<function="]
+        if choice == "forced":
+            suffix = tags[0]
+        elif tags:
+            suffix = TriggeredTagsFormat(
+                triggers=["<tool_call>"],
+                tags=tags,
+                excludes=excludes,
+                at_least_one=choice == "required",
+                stop_after_first=not parallel_tool_calls,
+            )
+        else:
+            suffix = AnyTextFormat(excludes=["<tool_call>", *excludes])
+        if thinking_mode:
+            suffix = SequenceFormat(
+                elements=[
+                    TagFormat(
+                        begin="<think>",
+                        content=AnyTextFormat(excludes=["<tool_call>", *excludes]),
+                        end="</think>",
+                    ),
+                    suffix,
+                ]
+            )
+        return StructuralTag(format=suffix)
