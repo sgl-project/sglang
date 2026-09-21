@@ -469,8 +469,7 @@ class _GenerationStreamAccumulator:
 
         if not self.rust_server_mode:
             # Rust detokenizes and counts output tokens itself. Keep only the
-            # Python detokenizer's inputs here; scheduler statistics below feed
-            # both frontends.
+            # Python detokenizer's inputs here.
             self.http_worker_ipcs.append(req.http_worker_ipc)
             self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
@@ -487,6 +486,11 @@ class _GenerationStreamAccumulator:
                 if beam_output is not None
                 else len(output_ids_)
             )
+        # Both frontends use the scheduler's statistics: reasoning counts follow
+        # its request settings and end-token matching, while cache counts/details
+        # reflect actual prefix reuse and cache tiers. Output token IDs alone do
+        # not carry that state. Forward these values to Rust rather than duplicating
+        # the accounting in its response layer.
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.cached_tokens.append(req.cached_tokens)
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
