@@ -82,6 +82,7 @@ class OlmoeMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
         )
 

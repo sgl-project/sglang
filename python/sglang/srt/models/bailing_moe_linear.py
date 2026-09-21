@@ -300,6 +300,7 @@ class BailingMoE(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             use_grouped_topk=self.use_grouped_topk,
             renormalize=self.norm_expert_prob,
             num_expert_group=self.num_expert_group,

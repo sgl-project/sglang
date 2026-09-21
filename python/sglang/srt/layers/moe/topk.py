@@ -537,6 +537,8 @@ class TopK(BaseFusedOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
+    --layer_id: global index of the owning layer. Required: routed-experts capture and
+      per-layer EPLB state are keyed by it.
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
@@ -548,7 +550,7 @@ class TopK(BaseFusedOp):
         self,
         top_k: int,
         *,
-        layer_id: Optional[int] = None,
+        layer_id: int,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
