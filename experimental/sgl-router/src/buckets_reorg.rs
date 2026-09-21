@@ -140,6 +140,25 @@ impl Bucket {
         }
     }
 
+    /// Reject a policy installed on a stage it cannot serve before any request reaches it.
+    pub fn validate(&self) -> Result<(), PickError> {
+        let groups: &[(Stage, &EngineGroup)] = match &self.groups {
+            BucketGroups::Plain(group) => &[(Stage::Plain, group)],
+            BucketGroups::Pd { prefill, decode } => {
+                &[(Stage::Prefill, prefill), (Stage::Decode, decode)]
+            }
+        };
+        for (stage, group) in groups {
+            if !group.policy.supports(*stage) {
+                return Err(PickError::InvalidConfiguration(format!(
+                    "bucket {} installs a policy that cannot serve the {stage:?} stage",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Select this bucket's plain engine or complete P/D pair, without dispatching.
     /// A failed group reports its stage; the caller may then try another bucket.
     pub async fn pick_engines(
@@ -213,8 +232,12 @@ pub struct BucketResolver {
 }
 
 impl BucketResolver {
-    pub fn new(buckets: Vec<Bucket>) -> Self {
-        Self { buckets }
+    /// Fails if any bucket installs a policy on a stage it cannot serve.
+    pub fn new(buckets: Vec<Bucket>) -> Result<Self, PickError> {
+        for bucket in &buckets {
+            bucket.validate()?;
+        }
+        Ok(Self { buckets })
     }
 
     /// Return all length-compatible buckets, ordered by input capacity, rank, and ID.

@@ -184,7 +184,8 @@ fn resolve_orders_all_length_fits_by_capacity_rank_and_id() {
         later,
         a,
         min,
-    ]);
+    ])
+    .unwrap();
     assert_eq!(
         resolver
             .resolve(10, None)
@@ -207,7 +208,7 @@ fn context_capacity_checks_peak_when_known_and_input_otherwise() {
     short.max_context_tokens = Some(20);
     let mut long = bucket("long", None, policy);
     long.max_context_tokens = Some(30);
-    let resolver = BucketResolver::new(vec![long, short]);
+    let resolver = BucketResolver::new(vec![long, short]).unwrap();
     assert_eq!(resolver.resolve(10, None).unwrap()[0].id, "short");
     assert_eq!(resolver.resolve(10, Some(20)).unwrap()[0].id, "short");
     assert_eq!(resolver.resolve(10, Some(21)).unwrap()[0].id, "long");
@@ -237,7 +238,8 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
             prefill: group(&["p2", "d", "a"], prefill_policy.clone()),
             decode: group(&["d2", "p", "other"], decode_policy.clone()),
         },
-    )]);
+    )])
+    .unwrap();
     let bucket = resolver.resolve(10, Some(20)).unwrap()[0];
     let request = BucketRequest {
         prefix: None,
@@ -268,7 +270,8 @@ async fn resolver_includes_empty_groups_without_invoking_policies() {
         min: None,
         max: Some(10),
     };
-    let resolver = BucketResolver::new(vec![empty, bucket("available", Some(20), policy.clone())]);
+    let resolver =
+        BucketResolver::new(vec![empty, bucket("available", Some(20), policy.clone())]).unwrap();
     let buckets = resolver.resolve(10, None).unwrap();
     assert_eq!(
         buckets

@@ -124,9 +124,12 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
         Arc::new(PolicyRegistry::default()),
     );
     ctx.chat_routing = ChatRouting::Reorg(
-        [(ModelId("tiny".into()), BucketResolver::new(buckets))]
-            .into_iter()
-            .collect(),
+        [(
+            ModelId("tiny".into()),
+            BucketResolver::new(buckets).unwrap(),
+        )]
+        .into_iter()
+        .collect(),
     );
     Arc::new(ctx)
 }

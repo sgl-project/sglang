@@ -400,6 +400,10 @@ impl CacheAwarePolicy {
 }
 
 impl Policy for CacheAwarePolicy {
+    fn supports(&self, stage: Stage) -> bool {
+        stage != Stage::Decode
+    }
+
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],

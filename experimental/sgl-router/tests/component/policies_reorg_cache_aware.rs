@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
+use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::config::AffinityConfig;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
 use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource, PrefixMemo};
+use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, KvWorkerId,
@@ -531,7 +533,8 @@ async fn decode_group_and_invalid_configuration_are_rejected() {
             Err(PickError::InvalidConfiguration(_))
         ));
     }
-    let policy = CacheAwarePolicy::new(source, EngineReportedLoadTable::new(), config()).unwrap();
+    let policy =
+        Arc::new(CacheAwarePolicy::new(source, EngineReportedLoadTable::new(), config()).unwrap());
     let model = ModelId("m".into());
     assert!(matches!(
         policy
@@ -542,4 +545,19 @@ async fn decode_group_and_invalid_configuration_are_rejected() {
             .await,
         Err(PickError::InvalidConfiguration(_))
     ));
+    let pd = |prefill: Arc<dyn Policy>, decode: Arc<dyn Policy>| {
+        Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(prefill),
+                decode: EngineGroup::new(decode),
+            },
+        )
+    };
+    let load = Arc::new(PowerOfTwoPolicy::new(EngineReportedLoadTable::new()));
+    assert!(matches!(
+        BucketResolver::new(vec![pd(load.clone(), policy.clone())]),
+        Err(PickError::InvalidConfiguration(_))
+    ));
+    assert!(BucketResolver::new(vec![pd(policy, load)]).is_ok());
 }

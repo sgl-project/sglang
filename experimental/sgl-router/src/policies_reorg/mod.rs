@@ -90,6 +90,11 @@ pub trait Policy: Send + Sync + Debug {
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
 
+    /// Whether this policy may serve `stage`; checked when a resolver is built.
+    fn supports(&self, _stage: Stage) -> bool {
+        true
+    }
+
     /// Runs on a miss within the same candidates; never on an admission rejection.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
