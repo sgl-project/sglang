@@ -50,8 +50,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeLinker(UnifiedCacheLinker):

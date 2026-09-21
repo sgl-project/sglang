@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=22, suite="base-a-test-cpu")
 
 
 class TestBailingModalityMetadata(CustomTestCase):

@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=170, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=191, stage="extra-b", runner_config="4-gpu-b200")
 
 GPT_OSS_MODEL_PATH = "openai/gpt-oss-120b"
 GSM8K_BASELINE_ACCURACY = 0.88

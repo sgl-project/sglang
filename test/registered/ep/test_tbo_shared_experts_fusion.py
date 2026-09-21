@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=253, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=294, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 

@@ -42,7 +42,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
 )
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=33, suite="base-a-test-cpu")
+register_cpu_ci(est_time=41, suite="base-a-test-cpu")
 
 
 class _CloneFailure:

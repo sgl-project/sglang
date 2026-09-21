@@ -28,7 +28,7 @@ from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):

@@ -12,7 +12,7 @@ from transformers import MistralConfig, PretrainedConfig
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 # Shrunk from inclusionAI/Ling-mini-2.0; the field names are the real
 # checkpoint's, only the sizes are cut down for test speed.

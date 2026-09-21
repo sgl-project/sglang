@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=72, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=77, stage="base-c", runner_config="4-gpu-h100")
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24

@@ -29,7 +29,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=1200, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=136, stage="extra-a", runner_config="2-gpu-large")
 
 UNIFIED_SWA_ARGS = [
     "--skip-tokenizer-init",

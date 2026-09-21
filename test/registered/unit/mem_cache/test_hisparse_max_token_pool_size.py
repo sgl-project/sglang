@@ -23,7 +23,7 @@ from sglang.test.separate_buffer_allocator_double import (
 )
 from sglang.test.test_utils import CustomTestCase, enter_override
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _make_model_runner(**attrs):

@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=128, stage="base-b", runner_config="1-gpu-large")
 
 LORA_NAME = "sql"
 LORA_PATH = "philschmid/code-llama-3-1-8b-text-to-sql-lora"

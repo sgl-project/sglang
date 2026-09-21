@@ -5,11 +5,11 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
 register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 # The dst layout-contract tests run on CPU (no kernel launch).
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
 

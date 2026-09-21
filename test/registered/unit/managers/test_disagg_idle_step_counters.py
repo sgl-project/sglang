@@ -21,7 +21,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.

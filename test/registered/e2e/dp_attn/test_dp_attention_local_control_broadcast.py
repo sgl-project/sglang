@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=124, stage="base-c", runner_config="4-gpu-h100")
 
 _INPUT_IDS = list(range(10, 30))
 _REQUEST_TIMEOUT = 120

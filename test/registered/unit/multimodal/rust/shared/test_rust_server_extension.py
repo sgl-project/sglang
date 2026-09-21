@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestRustServerExtension(CustomTestCase):

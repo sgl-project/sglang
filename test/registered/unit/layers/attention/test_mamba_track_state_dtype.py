@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # Above the fp16 midpoint 1 + 2^-11 (single-rounds up to 1 + 2^-10) but below
 # the bf16 midpoint 1 + 2^-8 (rounds to 1.0, which then stays 1.0 in fp16):

@@ -24,7 +24,7 @@ except ImportError:  # standalone run without an sglang install; CI parses the
         pass
 
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EVICT_POLICY = os.path.normpath(

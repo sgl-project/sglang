@@ -32,7 +32,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=900, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=131, stage="extra-a", runner_config="2-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

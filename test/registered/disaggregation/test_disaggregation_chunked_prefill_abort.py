@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=101, stage="base-b", runner_config="2-gpu-large")
 
 PD_CHUNKED_ABORT_EXTRA_ARGS = [
     "--max-running-requests",

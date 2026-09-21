@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 # A 64-token page widened by dcp_size 8 is 512; scaled down 64x: page 8, and
 # a Mamba track boundary at 576 tokens lands at position 9.

@@ -8,7 +8,7 @@ cover that gate and the digest it decides on.
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=57, suite="base-a-test-cpu")
+register_cpu_ci(est_time=50, suite="base-a-test-cpu")
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 import json
