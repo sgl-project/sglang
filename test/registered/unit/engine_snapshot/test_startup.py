@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -117,6 +118,13 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
     # ------------------------------------------------------------------ #
     # barriers
     # ------------------------------------------------------------------ #
+    def test_active_artifact_path_needs_the_engine_marker(self):
+        with patch.dict(os.environ, {"SGLANG_SNAPSHOT_DIR": str(self.artifact_path)}):
+            os.environ.pop("SGLANG_SNAPSHOT_ENGINE", None)
+            self.assertIsNone(startup.active_artifact_path())
+            os.environ["SGLANG_SNAPSHOT_ENGINE"] = "1"
+            self.assertEqual(startup.active_artifact_path(), str(self.artifact_path))
+
     def test_scheduler_barrier_rehearses_then_parks_released(self):
         scheduler = self.barrier_scheduler()
         self.write_manifest()
