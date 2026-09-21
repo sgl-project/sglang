@@ -45,3 +45,14 @@ Set the crash diagnostics folder with `--crash-dump-folder /tmp/crash_dump`.
 When SGLang handles a crash, it writes completed requests retained by the crash-dump buffer plus in-flight requests to `/tmp/crash_dump/<hostname>/crash_dump_<timestamp>.pkl`. The file also contains the server arguments and launch command. Replay it with `scripts/playground/replay_request_dump.py`.
 
 On NVIDIA CUDA, the option also sets default environment variables before CUDA initializes. These defaults enable device coredumps on CUDA exceptions and allow SGLang to trigger device coredumps for live scheduler processes when it handles a crash. CUDA device coredumps are written to `/tmp/crash_dump/<hostname>/core.cuda.<timestamp>.<pid>`. Explicitly configured CUDA coredump environment variables take precedence, including a custom `CUDA_COREDUMP_FILE` path. This option does not configure OS process core dumps.
+
+When a scheduler process handles a crash, SGLang can also write a CPU-only snapshot of the host-pool KV
+transfers it ran just before. Enable it with `SGLANG_DEBUG_CRASH_SNAPSHOT=1`; the file lands next to the other
+crash artifacts at `<crash_dump_folder>/<hostname>/crash_snapshot_<timestamp>_<pid>.json` and holds the last
+`SGLANG_DEBUG_CRASH_SNAPSHOT_SIZE` transfers (op, direction, layout, page size, per-page bytes, host
+allocator, which pool implementation served it, index tensor shapes and devices) plus CPU-only scheduler
+counters. Nothing in that path touches the GPU, which matters because an asynchronous fault has usually
+already made the CUDA context unusable by the time the crash is handled. Coredumps show the faulting GPU
+state and `SGLANG_PYSPY_DUMP_BEFORE_CRASH` shows where the threads were, but neither says which operation was
+in flight; the snapshot does. For the same records as log lines while the server is running, set
+`SGLANG_DEBUG_HOST_POOL_IO=1`.

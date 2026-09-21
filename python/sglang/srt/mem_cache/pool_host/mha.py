@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.io_log import log_host_pool_io
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -294,6 +295,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    @log_host_pool_io
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -461,6 +463,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
             layer_start = layer_end
 
+    @log_host_pool_io
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -885,6 +888,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
 
+    @log_host_pool_io
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -959,6 +963,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    @log_host_pool_io
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -1193,6 +1198,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             "Use a backend that does not use this interface (e.g. mooncake, simm)."
         )
 
+    @log_host_pool_io
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1265,6 +1271,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 f"{io_backend}; expected 'kernel' or 'direct'."
             )
 
+    @log_host_pool_io
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):

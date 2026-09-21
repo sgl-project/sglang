@@ -75,6 +75,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.crash_snapshot import dump_crash_snapshot
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
@@ -6096,6 +6097,14 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # The CUDA context is usually unusable by now, so the snapshot is
+        # assembled from Python state only (SGLANG_DEBUG_CRASH_SNAPSHOT).
+        dump_crash_snapshot(
+            "scheduler_exception",
+            server_args=server_args,
+            scheduler=scheduler,
+            traceback_text=traceback,
+        )
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
