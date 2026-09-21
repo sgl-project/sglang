@@ -31,7 +31,7 @@ _CUDA_LIKE = frozenset({"cuda", "hip"})
 
 
 def platform_key() -> str:
-    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``cpu``.
+    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``xpu``/``cpu``.
 
     Deliberately *not* memoized: :func:`select_impl` calls it at module import
     time, and latching that first answer would freeze the choice before the
@@ -40,7 +40,7 @@ def platform_key() -> str:
     """
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    for name in ("cuda", "hip", "npu", "mps", "musa"):
+    for name in ("cuda", "hip", "npu", "mps", "musa", "xpu"):
         if getattr(current_platform, f"is_{name}")():
             return name
     return "cpu"
@@ -64,6 +64,12 @@ def is_hip() -> bool:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     return current_platform.is_hip()
+
+
+def is_xpu() -> bool:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_xpu()
 
 
 def has_triton() -> bool:

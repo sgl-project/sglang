@@ -112,11 +112,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
-        """Allocate only logical indices without hisparse device indices.
-
-        Used in the direct-to-host transfer path where KV data is written
-        directly to host memory by the prefill node, skipping GPU staging.
-        """
+        """Allocate only logical indices without hisparse device indices."""
         return self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -131,9 +127,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        # Filter valid (non-zero) hisparse indices.
-        # In the direct-to-host path, mapping is all zeros since no hisparse
-        # device indices were pre-allocated.
+        # Zero means unmapped; after alloc_logical_only the mapping is all zeros.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
@@ -241,7 +235,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
-        # Note: the last item is -1, we don't clear it, see the comment in __init__
+        # Keep the trailing -1: it is what a last_loc of -1 translates to.
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None
 
@@ -352,6 +346,27 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.logical_attn_allocator.translate_swa_indices_for_transfer(
+            kv_indices
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Use this wrapper's capacity, which also includes the compressed pool.
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -361,8 +376,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        # C4 needs no reclaim here: full_available_size prices it into the budget.
+        return self.logical_attn_allocator.reclaim_for_prealloc(
+            tree_cache, full_tokens, swa_tokens
+        )
+
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
+
+    def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
+        self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
 
     def free_full(self, free_indices: torch.Tensor):
         if free_indices.numel() == 0:
@@ -478,7 +504,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
+        # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
+        return (last_locs - (self.compress_ratio - 1)) // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(

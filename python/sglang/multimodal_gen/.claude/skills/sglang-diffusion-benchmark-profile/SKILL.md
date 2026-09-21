@@ -51,7 +51,7 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 ## Main Reference
 
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as LongCat image/edit, Qwen base edit/layered, SD3.5, SANA-Video/SANA-WM, LingBot Video/World, Cosmos3 Edge/Super I2V/distilled and the explicit Super TP2 x CFG2 comparator, LTX-2.5 and its diffusion decoder, MiniMax-H3, FLUX.2 Klein, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.1/2.2, the Blackwell-only Wan2.2 NVFP4 comparator, `LTX-2.3`, HunyuanVideo, MOVA, Helios, image edit, Hunyuan3D shape, and a separate Pi0.5 action-policy lane
-- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
+- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, MoE routing, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery from the skill's owning checkout before falling back to `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; defaults to eager/lossless, supports explicit quality and BCG comparators plus a same-GPU applicability matrix, rejects invalid BCG capture/fallback logs and late high-quality DiT fusion mounts, forces H3 to its eager consistency mode, enables synchronized stage attribution, validates nightly preset drift, and can clean one isolated model cache after the full matrix in a `finally` block with a JSONL ledger
 
@@ -74,6 +74,8 @@ Always rule out these existing families first:
 - bit-exact diffusion adaLN modulation and fused LayerNorm + modulation for
   FLUX.1, GLM-Image, and SANA
 - request-scoped DiT and VAE fast paths at `quality=extra-high` or `quality=high`
+- LingBot Video's default-on fused group-limited top-k expert selection before
+  treating its router's `topk`/mask/gather chain as a new hotspot
 - Wan causal-VAE cache/padding and DupUp3D data-movement fusions
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE

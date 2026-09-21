@@ -57,6 +57,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
@@ -185,6 +188,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     and returns an HTTP error.
     """
     with torch.inference_mode():
+        restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
