@@ -356,6 +356,11 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
     return hasattr(dispatch_output, "origin_topk_ids")
 
 
+def _is_fixed_cap_mori_epv2_output(dispatch_output: Any) -> bool:
+    """Whether dispatch exposes MORI EPv2's fixed-cap token-major view."""
+    return type(dispatch_output).__module__.endswith(".token_dispatcher.moriepv2")
+
+
 def _resolve_mori_quant_type(
     dispatch_a1_dtype: torch.dtype,
     dispatch_scale: Optional[torch.Tensor],
@@ -422,7 +427,7 @@ def _pre_permute_deepep_to_aiter(
             mori_max = _mori_decode_recv_bound(
                 hidden_states.shape[0], topk_ids.shape[-1]
             )
-        if mori_max > 0:
+        if mori_max > 0 and not _is_fixed_cap_mori_epv2_output(dispatch_output):
             hidden_states = hidden_states[:mori_max]
             if a1_scale is not None:
                 a1_scale = a1_scale[:mori_max]

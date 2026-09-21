@@ -474,6 +474,39 @@ def handle_a2a_moe(server_args: Any):
                 "(chunked_prefill_size by default)"
             )
 
+    if a2a_backend == "mori-epv2":
+        if cfg.deepep_mode == "auto":
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                deepep_mode="normal",
+            )
+            logger.warning("auto set deepep_mode=`normal` for MORI EPv2")
+        elif cfg.deepep_mode != "normal":
+            raise ValueError("MORI EPv2 currently supports deepep_mode=`normal` only")
+
+        logger.warning(
+            "MORI EPv2 MoE A2A is enabled (cco-LSA, intranode, "
+            "world_size<=8). Expert parallel size follows TP[%s].",
+            cfg.tp_size,
+        )
+        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
+            current = int(
+                os.environ.get(
+                    "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "4096"
+                )
+            )
+            if current < cfg.chunked_prefill_size:
+                os.environ["SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+                    cfg.chunked_prefill_size
+                )
+                logger.warning(
+                    "auto set SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                    "%s (was %s)",
+                    cfg.chunked_prefill_size,
+                    current,
+                )
+
     if a2a_backend == "pplx":
         if cfg.deepep_mode == "normal":
             raise ValueError(

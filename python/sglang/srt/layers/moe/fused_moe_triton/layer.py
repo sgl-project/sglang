@@ -150,7 +150,7 @@ def _maybe_copy_weight_view_before_h2d(
 def _get_deepep_comm_group(a2a_backend):
     group = get_parallel().tp_group.device_group
 
-    if a2a_backend.is_mori():
+    if a2a_backend.is_mori_family():
         group = get_parallel().tp_group
 
     elif _is_npu:
@@ -181,7 +181,7 @@ def create_moe_dispatcher(
     elif (
         a2a_backend.is_deepep()
         or a2a_backend.is_mooncake()
-        or a2a_backend.is_mori()
+        or a2a_backend.is_mori_family()
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):

@@ -3818,7 +3818,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 assert (
                     moe_a2a_backend.is_deepep()
                     or moe_a2a_backend.is_megamoe()
-                    or moe_a2a_backend.is_mori()
+                    or moe_a2a_backend.is_mori_family()
                 ), (
                     "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
                     f"got {moe_a2a_backend.value!r}."
@@ -3964,7 +3964,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_after_input_norm = hidden_states
         state.attn_x_quant = x_quant
         # mori's op_output slices final_hidden_states[:num_tokens].
-        if get_moe_a2a_backend().is_mori():
+        if get_moe_a2a_backend().is_mori_family():
             state.num_tokens = attn_residual.shape[0]
         state.update(
             dict(
