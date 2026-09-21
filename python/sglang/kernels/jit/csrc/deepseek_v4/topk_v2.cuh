@@ -742,7 +742,6 @@ struct TopKKernel {
         .batch_size = batch_size,
     };
 
-    constexpr bool kUsePDL = true;
     const auto dispatch = [&]<typename F>(F&& f) {
       const auto mode = raw_indices.has_value()  ? TopKMode::DUAL_OUTPUT
                         : page_table.has_value() ? TopKMode::PAGE_TABLE
