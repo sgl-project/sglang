@@ -14,7 +14,9 @@ from sglang.srt.utils import get_device_name, is_cuda, is_hip
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
-    from sglang.kernels.ops.quantization import per_token_group_quant
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
+    )
 
 logger = logging.getLogger(__name__)
 
