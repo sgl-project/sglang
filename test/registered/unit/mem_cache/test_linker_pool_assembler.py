@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _storage_suffix,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -500,15 +501,20 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
         storage.mem_pool_host = group
         storage.registered_pools = group.entry_map
         storage.pp_rank, storage.pp_size = 0, pp_size
-        storage.mla_suffix, storage.mha_suffix = "cp1_pp0", "tp2_cp1_pp0"
-        storage.config_prefix = "model_pp0_tag"
+        storage.mla_suffix = _storage_suffix(
+            rank_replicated=True, tp_rank=2, attn_cp_rank=1, pp_rank=0
+        )
+        storage.mha_suffix = _storage_suffix(
+            rank_replicated=False, tp_rank=2, attn_cp_rank=1, pp_rank=0
+        )
+        storage.config_prefix = "model_0_tag"
         storage.is_mla_backend = True
 
-        def exists(keys, extra_info=None):
+        def exists(keys):
             self.queried.extend(keys)
             return [int(key in self.existing) for key in keys]
 
-        storage._batch_exist = exists
+        storage.store = SimpleNamespace(batch_is_exist=exists)
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         linker.pool_group, linker.storage = group, storage
         linker.stats = {"lookup": 0}
@@ -516,7 +522,7 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
 
     def add_pages(self, pp_rank, pages, pool=PoolName.DEEPSEEK_V4_C4):
         self.existing.update(
-            f"model_pp0_tag_{self.keys[page]}_cp1_pp{pp_rank}_{pool}" for page in pages
+            f"model_0_tag_{self.keys[page]}_cp1_{pp_rank}_{pool}" for page in pages
         )
 
     def test_pp0_uses_shortest_stage_prefix(self):
@@ -534,8 +540,8 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
                 self.assertEqual(len(self.queried), len(self.keys) * 3)
                 self.assertEqual(linker.stats["lookup"], 1)
                 # Query must not mutate suffixes used concurrently by load/offload.
-                self.assertEqual(linker.storage.mla_suffix, "cp1_pp0")
-                self.assertEqual(linker.storage.mha_suffix, "tp2_cp1_pp0")
+                self.assertEqual(linker.storage.mla_suffix, "cp1_0")
+                self.assertEqual(linker.storage.mha_suffix, "tp2_cp1_0")
 
     def test_pp_swa_requires_a_common_restorable_boundary(self):
         linker = self.make_linker(side_pool=PoolName.SWA)
