@@ -5,14 +5,14 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::policies::active_load::ActiveLoadGuard;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -20,11 +20,12 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-type LoadGuards = (LoadGuard, ActiveLoadGuard);
+type LoadGuards = (LoadGuard, RouterInflightLoadGuard);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -58,14 +59,12 @@ pub(super) async fn forward_chat_request(
     } else {
         prefill.load_guard()
     };
-    let active_request_guard = ctx.active_load.register(
+    let active_request_guard = ctx.router_inflight_load.register(
         prefill.id.clone(),
         prefill.url.clone(),
         request.input_token_count,
         0,
     );
-    // PD requests keep using the prefill expiration token after dispatching decode.
-    let expiration_token = active_request_guard.cancel_token().clone();
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
@@ -97,7 +96,7 @@ pub(super) async fn forward_chat_request(
         );
         let decode_load_guards = (
             decode.load_guard(),
-            ctx.active_load
+            ctx.router_inflight_load
                 .register(decode.id.clone(), decode.url.clone(), 0, 1),
         );
         (decode, decode_load_guards)
@@ -105,6 +104,9 @@ pub(super) async fn forward_chat_request(
         (prefill, prefill_load_guards)
     };
 
+    // In PD mode, prefill can finish before decode. Watch the registration
+    // held by the response so expiration remains live for its full lifetime.
+    let expiration_token = response_load_guards.1.cancel_token().clone();
     let response_future = forward_to_response_worker(
         ctx,
         &response_worker,
@@ -112,6 +114,7 @@ pub(super) async fn forward_chat_request(
         body,
         response_load_guards,
         &metrics,
+        expiration_token.clone(),
     );
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -192,6 +195,7 @@ async fn forward_to_response_worker(
     body: Bytes,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
+    expiration: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -208,6 +212,7 @@ async fn forward_to_response_worker(
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
+                Some(expiration),
             )
             .await
     } else {
@@ -279,6 +284,9 @@ impl DispatchMetrics {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
         Box::new(move |end| {
+            if end.reason == StreamEndReason::Expired {
+                metrics.record_stale_request(StaleRequestOutcome::Expired);
+            }
             metrics.record_stream_outcome(&response_worker_url, &model, classify_stream_end(end));
         })
     }
