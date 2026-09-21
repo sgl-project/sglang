@@ -40,6 +40,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -154,19 +155,11 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Host-pool retraction transfers full and sliding-window components
-        # only, so a model with recurrent state stays on cpu_tensor.
-        #
-        # The unified pool is excluded for the same reason hierarchical cache is
-        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
-        # device buffers with the ids it is handed, and under the unified pool
-        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
-        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
-        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
-        # asks for 418 GB of host memory per component.
+        # Host-pool retraction does not address unified page envelopes or
+        # recurrent state, so those configurations stay on cpu_tensor.
         supports_host_pool = (
-            not uses_ssm_state(tp_worker.model_runner.model_config)
-            and not memory.enable_unified_memory
+            not memory.enable_unified_memory
+            and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
@@ -265,8 +258,8 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
+    # component (match + lock + CoW), the same path as colocated serving.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -295,11 +288,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -340,32 +328,36 @@ def build_kv_cache(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
-    tree_cache = create_tree_cache(
-        TreeCacheBuildContext(
-            server_args=server_args,
-            params=params,
-            is_hybrid_swa=is_hybrid_swa,
-            full_tokens_per_layer=full_tokens_per_layer,
-            is_hybrid_ssm=is_hybrid_ssm,
-            is_dsa=is_dsa,
-            enable_hierarchical_cache=enable_hierarchical_cache,
-            disable_radix_cache=disable_radix_cache,
-            effective_chunked_prefill_size=effective_chunked_prefill_size,
-            tp_worker=tp_worker,
-            model_config=model_config,
-            tp_size=ps.tp_size,
-            tp_rank=ps.tp_rank,
-            tp_group=tp_group,
-        )
+    tree_context = TreeCacheBuildContext(
+        server_args=server_args,
+        params=params,
+        is_hybrid_swa=is_hybrid_swa,
+        full_tokens_per_layer=full_tokens_per_layer,
+        is_hybrid_ssm=is_hybrid_ssm,
+        is_dsa=is_dsa,
+        enable_hierarchical_cache=enable_hierarchical_cache,
+        disable_radix_cache=disable_radix_cache,
+        effective_chunked_prefill_size=effective_chunked_prefill_size,
+        tp_worker=tp_worker,
+        model_config=model_config,
+        tp_size=ps.tp_size,
+        tp_rank=ps.tp_rank,
+        tp_group=tp_group,
     )
+    with auto_size_hicache(
+        params,
+        hicache_draft_plan,
+        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+    ):
+        tree_cache = create_tree_cache(tree_context)
 
-    if (
-        enable_hierarchical_cache or retraction_backup == "host_pool"
-    ) and hicache_draft_plan is not None:
-        maybe_register_hicache_draft(
-            tree_cache=tree_cache,
-            draft_plan=hicache_draft_plan,
-        )
+        if (
+            enable_hierarchical_cache or retraction_backup == "host_pool"
+        ) and hicache_draft_plan is not None:
+            maybe_register_hicache_draft(
+                tree_cache=tree_cache,
+                draft_plan=hicache_draft_plan,
+            )
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):

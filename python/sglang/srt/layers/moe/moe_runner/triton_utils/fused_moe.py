@@ -22,14 +22,13 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     support_tensor_descriptor,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -578,7 +577,7 @@ def _fused_moe_kernel_sequence(
         # symmetric path. Only this output enters the pool; the intermediate caches
         # below stay on the default allocator to bound pool occupancy.
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 

@@ -63,6 +63,20 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 GROUP_SIZE = 32  # MXFP4 block size
 
 
+@pytest.fixture
+def stated_tp_group():
+    """A TP group for a test that runs in a process without one.
+
+    The production call passes the group *into* `use_symmetric_memory`, so
+    stubbing that context manager does not stop the read -- the argument is
+    evaluated first. Stating it on the context answers every spelling.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
 class _MockLayer:
     """Stand-in for ``FusedMoE`` carrying the attributes the SM90 helpers read.
 
@@ -336,7 +350,7 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
     ],
 )
 def test_apply_sm90_cutlass_matches_flashinfer_direct(
-    tokens, num_experts, hidden, inter, top_k, monkeypatch
+    tokens, num_experts, hidden, inter, top_k, monkeypatch, stated_tp_group
 ):
     """End-to-end: SGLang's ``_apply_sm90_cutlass`` must produce the same
     output as a direct FlashInfer ``cutlass_fused_moe`` call fed with the
@@ -352,7 +366,6 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
     monkeypatch.setattr(
         fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
         "get",
@@ -593,7 +606,7 @@ def test_humming_range_ignores_prerounded_hidden_tail():
     [(8, 256, 256, 1, 0), (8, 192, 192, 1, 0), (8, 256, 256, 2, 1)],
 )
 def test_apply_sm90_humming_matches_flashinfer_direct(
-    tokens, hidden, inter, ep_size, ep_rank, monkeypatch
+    tokens, hidden, inter, ep_size, ep_rank, monkeypatch, stated_tp_group
 ):
     """SGLang must forward the five Humming scales and enable the new kernel."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
@@ -602,7 +615,6 @@ def test_apply_sm90_humming_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
     monkeypatch.setattr(
         fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
         "get",
@@ -725,7 +737,7 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
     ],
 )
 def test_dsv4_apply_matches_flashinfer_direct(
-    tokens, num_experts, hidden, inter, top_k, monkeypatch
+    tokens, num_experts, hidden, inter, top_k, monkeypatch, stated_tp_group
 ):
     """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
@@ -741,7 +753,6 @@ def test_dsv4_apply_matches_flashinfer_direct(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
 
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
     w1, w3 = w13.chunk(2, dim=1)
