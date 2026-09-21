@@ -25,11 +25,13 @@ export const Gemma4Deployment = () => {
       getDynamicItems: (values) => {
         const size = values.modelSize;
         const showMI300X = size === '31b' || size === '26b-a4b';
+        const showXeon = ['e2b', 'e4b', '31b', '26b-a4b'].includes(size);
         return [
           { id: 'h200', label: 'H200', default: true },
           { id: 'b200', label: 'B200', default: false },
           { id: 'b300', label: 'B300', default: false },
           { id: 'mi300x', label: 'MI300X', default: false, disabled: !showMI300X },
+          { id: 'xeon', label: 'XEON', default: false, disabled: !showXeon },
           { id: 'arc_b', label: 'BMG', default: false },
         ];
       }
@@ -93,6 +95,12 @@ export const Gemma4Deployment = () => {
       '31b': { tp: 4, mem: 0.80 },
       '26b-a4b': { tp: 4, mem: 0.75 },
     },
+    xeon: {
+      e2b: { tp: 1, mem: 0.9 },
+      e4b: { tp: 1, mem: 0.9 },
+      '31b': { tp: 4, mem: 0.5 },
+      '26b-a4b': { tp: 4, mem: 0.5 },
+    },
   };
 
   const generateCommand = (values) => {
@@ -117,11 +125,14 @@ export const Gemma4Deployment = () => {
     const modelPath = `${modelNames[modelSize]}${qatSuffix}`;
 
     const mtpEnabled = values.speculative === 'enabled';
-    if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x') {
+    if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x' && hardware !== 'xeon') {
       tp = 2;
     }
 
     let cmd = `sglang serve --model-path ${modelPath}`;
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
     }
@@ -135,11 +146,15 @@ export const Gemma4Deployment = () => {
     });
 
     if (mtpEnabled) {
-      cmd += ` \\\n  --speculative-algorithm NEXTN`;
-      cmd += ` \\\n  --speculative-draft-model-path ${modelPath}-assistant`;
-      cmd += ` \\\n  --speculative-num-steps 5`;
-      cmd += ` \\\n  --speculative-num-draft-tokens 6`;
-      cmd += ` \\\n  --speculative-eagle-topk 1`;
+      if (hardware === 'xeon') {
+        cmd += ` \\\n  --speculative-algorithm NGRAM`;
+      } else {
+        cmd += ` \\\n  --speculative-algorithm NEXTN`;
+        cmd += ` \\\n  --speculative-draft-model-path ${modelPath}-assistant`;
+        cmd += ` \\\n  --speculative-num-steps 5`;
+        cmd += ` \\\n  --speculative-num-draft-tokens 6`;
+        cmd += ` \\\n  --speculative-eagle-topk 1`;
+      }
     }
 
     if (hardware === 'b300') {
@@ -232,6 +247,9 @@ export const Gemma4Deployment = () => {
         }
         next.checkpoint = 'standard';
         next.speculative = 'disabled';
+      }
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.checkpoint = 'standard';
       }
       return next;
     });
@@ -420,8 +438,17 @@ export const Gemma4Deployment = () => {
                     values.hardware === 'arc_b' &&
                     option.name === 'speculative' &&
                     item.id !== 'disabled';
+                  const isXeonQatLocked =
+                    values.hardware === 'xeon' &&
+                    option.name === 'checkpoint' &&
+                    item.id === 'qat';
+                  const isXeon12bLocked =
+                    values.hardware === 'xeon' &&
+                    option.name === 'modelSize' &&
+                    item.id === '12b';
                   const isDisabled = Boolean(
-                    item.disabled || isArcBModelLocked || isArcBCheckpointLocked || isArcBSpeculativeLocked
+                    item.disabled || isArcBModelLocked || isArcBCheckpointLocked ||
+                    isArcBSpeculativeLocked || isXeonQatLocked || isXeon12bLocked
                   );
                   return (
                     <label
