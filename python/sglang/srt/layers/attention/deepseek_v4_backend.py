@@ -195,7 +195,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or get_platform().is_sm89 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -2444,7 +2444,7 @@ class DeepseekV4AttnBackend(
         assert isinstance(metadata, DSV4Metadata)
         # The tail never takes the sparse path, so it carries no chunk cache.
         use_sparse_prefill = (
-            not get_platform().is_sm120
+            not (get_platform().is_sm120 or get_platform().is_sm89)
             and metadata.late_layer_tail is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -3764,11 +3764,15 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # sparse_prefill_fwd does not support SM120. The tail stays dense: its
-            # window floor lives in swa_page_indices, which the chunk cache ignores.
+            # sparse_prefill_fwd does not support SM120 or SM89 (Ada).
+            # On SM89 the SM120 sparse-MLA decode kernel (Triton fallback via
+            # SGLANG_SM120_FLASHMLA_BACKEND=triton) handles both prefill and
+            # decode without requiring sgl_kernel.flash_mla_sparse_fwd.
+            # The tail stays dense: its window floor lives in swa_page_indices,
+            # which the chunk cache ignores.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
+                and not (get_platform().is_sm120 or get_platform().is_sm89)
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
                 and (
@@ -3828,7 +3832,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            if get_platform().is_sm120 or get_platform().is_sm89:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
