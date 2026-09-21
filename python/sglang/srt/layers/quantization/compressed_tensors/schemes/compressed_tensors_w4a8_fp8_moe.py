@@ -113,6 +113,14 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
     ):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        if get_moe_runner_backend().is_flashinfer_cutlass():
+            raise ValueError(
+                "FlashInfer W4AFP8 supports native w4afp8 checkpoints with static "
+                "activation scales, not compressed-tensors W4AFP8. "
+                "Use --moe-runner-backend cutlass for this checkpoint."
+            )
 
         # Weights in checkpoint (non-transposed) layout: [E, N, K // pack_factor]
         # This matches the pack-quantized checkpoint format directly.
@@ -203,7 +211,6 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
             return
 
         dtype = torch.bfloat16
-        device = layer.w2_weight_packed.device
 
         # TODO: currently only support per tensor quant.
         layer.a13_scale = None

@@ -105,6 +105,13 @@ class DeepEPMoE(FusedMoE):
         )
         if get_moe_a2a_backend().is_deepep_v2():
             self.deprecate_flag = True
+        elif (
+            isinstance(quant_config, W4AFp8Config)
+            and get_moe_runner_backend().is_flashinfer_cutlass()
+        ):
+            # The FlashInfer payload owns a different weight layout; use its
+            # registered DeepEP runner rather than the native CUTLASS methods.
+            self.deprecate_flag = True
         elif is_humming:
             self.deprecate_flag = True
         elif _use_aiter:
