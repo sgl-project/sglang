@@ -18,7 +18,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     get_device,
     get_device_module,
-    is_xpu,
     kill_process_tree,
 )
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
@@ -30,13 +29,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# torch has no _share_xpu_, so reduce_tensor falls through to the CPU-only fd path
-# and MultiprocessingSerializer cannot ship an XPU tensor. Drop once torch-xpu-ops
-# implements tensor IPC.
-_needs_tensor_ipc = unittest.skipIf(
-    is_xpu(), "XPU has no torch tensor IPC (no _share_xpu_)"
-)
-
 
 def test_update_weights_from_tensor(tp_size):
     assert get_device_module().device_count() >= tp_size, (
@@ -46,24 +38,20 @@ def test_update_weights_from_tensor(tp_size):
 
     engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, tp_size=tp_size)
 
-    # Without the finally, a mid-test failure abandons the engine and its scheduler
-    # subprocesses keep the GPU allocation, so every later case in the file dies.
-    try:
-        param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+    param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
 
-        _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
+    _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
 
-        memory_before = get_device_module().memory_allocated()
-        new_tensor = torch.full((16384, 2048), 1.5, device=get_device())
+    memory_before = get_device_module().memory_allocated()
+    new_tensor = torch.full((16384, 2048), 1.5, device=get_device())
 
-        time_start = time.perf_counter()
-        engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
-        print(f"Time delta: {time.perf_counter() - time_start:.03f}")
+    time_start = time.perf_counter()
+    engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
+    print(f"Time delta: {time.perf_counter() - time_start:.03f}")
 
-        for param_name in param_names[:3]:
-            _check_param(engine, param_name, [1.5] * 5)
-    finally:
-        engine.shutdown()
+    for param_name in param_names[:3]:
+        _check_param(engine, param_name, [1.5] * 5)
+    engine.shutdown()
 
     del new_tensor
     gc.collect()
@@ -78,7 +66,6 @@ def test_update_weights_from_tensor(tp_size):
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
-    @_needs_tensor_ipc
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:
@@ -148,7 +135,6 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         engine.shutdown()
 
-    @_needs_tensor_ipc
     def test_update_weights_from_tensor_load_format_flattened_bucket(self):
         """Test updating weights using flattened_bucket format"""
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -268,7 +254,6 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         ret = response.json()
         return ret
 
-    @_needs_tensor_ipc
     def test_update_weights(self):
         num_requests = 32
         with ThreadPoolExecutor(num_requests) as executor:

@@ -28,7 +28,6 @@ import torch
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     get_device,
-    is_xpu,
     kill_process_tree,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,13 +47,6 @@ _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # name directly hits a name.replace() collision (gate_up_proj contains up_proj),
 # producing a malformed key like "gate_gate_up_proj.weight" and crashing load.
 _UP_PROJ_SHAPE = (3072, 1024)  # intermediate_size, hidden_size for Qwen3-0.6B
-
-# torch has no _share_xpu_, so reduce_tensor falls through to the CPU-only fd path
-# and MultiprocessingSerializer cannot ship an XPU tensor. Drop once torch-xpu-ops
-# implements tensor IPC.
-_needs_tensor_ipc = unittest.skipIf(
-    is_xpu(), "XPU has no torch tensor IPC (no _share_xpu_)"
-)
 
 
 class TestWeightCheckerE2E(CustomTestCase):
@@ -117,7 +109,6 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Unsupported", resp.json()["message"])
 
-    @_needs_tensor_ipc
     def test_c_update_with_diff_tensor_makes_compare_fail(self):
         """A snapshot then an update with new bytes must make compare fail."""
         self.assertEqual(self._post("snapshot").status_code, 200)
@@ -138,7 +129,6 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertIn("model.layers.5.mlp.gate_up_proj.weight", body["message"])
         self.assertIn("max_abs_err", body["message"])
 
-    @_needs_tensor_ipc
     def test_d_update_with_same_tensor_keeps_compare_passing(self):
         """Prime a param, snapshot, push the same bytes again, compare must pass."""
         param_name = "model.layers.6.mlp.up_proj.weight"
@@ -200,7 +190,6 @@ class TestWeightCheckerE2E(CustomTestCase):
         second = self._post("checksum").json()["ranks"]
         self.assertEqual(first, second)
 
-    @_needs_tensor_ipc
     def test_e_checksum_changes_after_weight_update(self):
         """Updating a tensor must change its corresponding hash."""
         param_name = "model.layers.7.mlp.up_proj.weight"
