@@ -229,12 +229,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
-    # Cosmos3 Multiview-AV sparse attention kernel: "triton" or "fa4". Wins over
-    # the checkpoint's multiview.backend; an explicit pipeline-config
-    # multiview_attention_backend wins over both.
-    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
-        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
-    ),
     # Varlen kernel behind the maskless backend's three passes: "auto" (default;
     # FA4 on Blackwell, FA3 on Hopper, torch FA2 elsewhere), "fa4", "fa3", "fa2".
     # A/B knob only: every kernel computes the same attention.

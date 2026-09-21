@@ -63,9 +63,8 @@ COSMOS3_MULTIVIEW_DEFAULT_GUIDANCE_SCALE = 6.0
 COSMOS3_MULTIVIEW_MAX_GUIDANCE_SCALE = 7.0
 COSMOS3_MULTIVIEW_DEFAULT_NUM_INFERENCE_STEPS = 35
 COSMOS3_MULTIVIEW_DEFAULT_FLOW_SHIFT = 10.0
-# Prompt cap per caption; the sparse attention pads text keys to this plus the
-# two framing tokens (times the camera count for per-camera captions), and the
-# compiled kernel sees one shape for the life of the process.
+# Prompt cap per caption, the reference tokenizer's truncation limit; the two
+# framing tokens the tokenizer appends come on top of it.
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODES = ("none", "same", "inverse")
 COSMOS3_MULTIVIEW_RESOLUTIONS = ("480", "720")
@@ -533,8 +532,8 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             and int(self.max_sequence_length) > COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
         ):
             raise ValueError(
-                "Cosmos3 multiview max_sequence_length cannot exceed the ceiling the "
-                f"sparse attention is sized for: requested={self.max_sequence_length}, "
+                "Cosmos3 multiview max_sequence_length cannot exceed the caption cap: "
+                f"requested={self.max_sequence_length}, "
                 f"ceiling={COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH}."
             )
         if self.guidance_scale is not None and float(self.guidance_scale) < 0.0:

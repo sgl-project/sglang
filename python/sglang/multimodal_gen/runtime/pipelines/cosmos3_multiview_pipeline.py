@@ -7,7 +7,7 @@ camera, and one caption per rig or per camera. Joint exports also take an
 HD-map range-map control and denoise a LiDAR target alongside the cameras.
 Same Nano weights, VAE, tokenizer, and FlowUniPC schedule as
 ``Cosmos3Pipeline``; the difference is camera-major packing, per-camera VAE
-calls, wrapped temporal positions, and the sparse cross-camera attention
+calls, wrapped temporal positions, and the maskless cross-camera attention
 installed by ``Cosmos3MultiviewTransformer``.
 """
 
@@ -65,7 +65,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         2. Cosmos3MultiviewTokenizationStage - transfer prompt + WSM emphasis
         3. Cosmos3MultiviewLatentStage - per-camera VAE encode, anchors, layout
         4. Cosmos3TimestepPreparationStage - FlowUniPC timesteps (shift 10)
-        5. Cosmos3DenoisingStage - sequential text CFG with the sparse mask
+        5. Cosmos3DenoisingStage - sequential text CFG with the maskless folds
         6. Cosmos3MultiviewDecodingStage - per-camera VAE decode, camera-major,
            plus LiDAR range-map decode for joint requests
         """
@@ -91,7 +91,6 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             )
         vae = self.get_module("vae")
         scheduler = self.get_module("scheduler")
-        backend = pipeline_config.resolved_multiview_backend()
         lidar_encoder = None
         lidar_decoder = None
         if deployment.supports_lidar:
@@ -126,7 +125,6 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
                 vae=vae,
                 transformer=transformer,
                 deployment=deployment,
-                attention_backend=backend,
                 lidar_encoder=lidar_encoder,
             )
         )
@@ -148,7 +146,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             deployment.num_views,
             deployment.attention_scope,
             deployment.control_attends_sensor,
-            backend,
+            deployment.backend,
             deployment.schema_version,
             deployment.separate_view_text_tokenization,
             deployment.supports_lidar,

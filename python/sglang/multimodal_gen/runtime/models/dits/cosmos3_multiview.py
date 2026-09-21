@@ -2,17 +2,16 @@
 """Cosmos3 Multiview-AV transformer.
 
 Same weights and layer stack as ``Cosmos3OmniTransformer``. Two things change
-inside the network. The GEN cross-attention runs the block-sparse multiview
-attention from ``cosmos3_multiview_attention`` whenever the pipeline hands over
-a ``MultiviewLayout``. And the GEN sequence is assembled from packed sensor
+inside the network. The GEN cross-attention runs the maskless multiview folds
+from ``cosmos3_multiview_maskless`` whenever the pipeline hands over a
+``MultiviewLayout``. And the GEN sequence is assembled from packed sensor
 items instead of one video clip: the WSM control cameras, the RGB target
 cameras, and on joint checkpoints the HD-map control and LiDAR target range
 maps, each patchified through its own input projection and sharing one
 temporal origin. Per-camera captions are encoded by separate causal UND passes
 so no caption attends another; their K/V are concatenated for the GEN layers.
-The transformer also owns the request-local mask and packing-buffer caches so
-36 layers and every denoising step reuse one block map and one set of padded
-q/k/v buffers.
+The transformer also owns the request-local plan cache so 36 layers and every
+denoising step reuse one set of gathers and varlen offsets.
 """
 
 from __future__ import annotations
@@ -35,14 +34,12 @@ from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
-    padded_multiview_flex_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_maskless import (
-    MASKLESS_BACKEND,
     multiview_maskless_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
@@ -77,7 +74,7 @@ def unpack_state(
 
 
 class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
-    """GEN cross-attention that runs the sparse multiview kernel for a layout."""
+    """GEN cross-attention that runs the maskless multiview folds for a layout."""
 
     def _forward_multiview(
         self,
@@ -93,13 +90,11 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 "Cosmos3 multiview cross-attention expected MultiviewAttentionContext, "
                 f"got {type(multiview_layout).__name__}."
             )
-        if multiview_layout.layout.backend == MASKLESS_BACKEND:
-            return multiview_maskless_attention(q, k, v, k_und, v_und, multiview_layout)
-        return padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
+        return multiview_maskless_attention(q, k, v, k_und, v_und, multiview_layout)
 
 
 class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
-    """Cosmos3 Nano weights with packed sensor items and request-local mask caching."""
+    """Cosmos3 Nano weights with packed sensor items and request-local plan caching."""
 
     _cross_attention_cls = Cosmos3MultiviewCrossAttention
 
@@ -142,17 +137,14 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                 quant_config=quant_config,
                 prefix="lidar_proj_out",
             )
-        self._multiview_mask_cache: dict[tuple[Any, ...], Any] = {}
-        # Padded q/k/v packing buffers, keyed by shape/dtype/device. Held on
-        # the transformer rather than a per-forward context so the packed
-        # tensors are allocated and zeroed once per request, not once per layer.
-        self._multiview_buffer_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+        # Maskless plans (gathers and varlen offsets) keyed by layout, UND length,
+        # batch and device; built once per request rather than once per layer.
+        self._multiview_plan_cache: dict[tuple[Any, ...], Any] = {}
 
     def reset_cache(self, cache_key: str | None = None) -> None:
         super().reset_cache(cache_key)
         if cache_key is None:
-            self._multiview_mask_cache.clear()
-            self._multiview_buffer_cache.clear()
+            self._multiview_plan_cache.clear()
 
     # -- Packed forward -----------------------------------------------------
 
@@ -343,9 +335,7 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
             items=items,
             caption_lengths=lengths if separate_captions else (),
         )
-        context = MultiviewAttentionContext(
-            layout, self._multiview_mask_cache, self._multiview_buffer_cache
-        )
+        context = MultiviewAttentionContext(layout, self._multiview_plan_cache)
 
         self._ensure_cache_dicts()
         if (

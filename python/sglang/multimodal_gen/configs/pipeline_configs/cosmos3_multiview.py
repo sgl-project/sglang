@@ -3,12 +3,12 @@
 
 ``transformer/config.json`` marks the checkpoint with
 ``backbone_type: cosmos3_multiview`` and a ``multiview`` object that fixes the
-camera list and the sparse-attention visibility rules. Unversioned v1 exports
+camera list and the attention contract the weights were trained with. Unversioned v1 exports
 ship the regular Cosmos3 Nano weight layout; schema-2 exports add the
 ``lidar_proj_in/out`` projections and a ``lidar_vae/`` component for joint
 camera/LiDAR generation. This config reuses ``Cosmos3Config`` (Wan VAE, Qwen2
 tokenizer, FlowUniPC) and swaps in the transformer subclass that installs the
-sparse cross-camera attention.
+maskless cross-camera attention.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Any
 
 import msgspec
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
@@ -32,18 +31,16 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-MULTIVIEW_BACKEND_ENV_VAR = "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
-
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 COSMOS3_MULTIVIEW_ATTENTION_SCOPES = ("all_views", "same_view", "decomposed")
-COSMOS3_MULTIVIEW_ATTENTION_BACKENDS = ("triton", "fa4", "maskless")
-# ``triton``/``fa4`` project the same masked predicate; ``maskless`` is a
-# different attention (two overlapping dense folds merged by log-sum-exp), so
-# a checkpoint exported for one family is not served faithfully by the other.
-COSMOS3_MULTIVIEW_MASKED_BACKENDS = ("triton", "fa4")
-# AV system prompt wordings: "provided_controls" is the text the Sep-15 (masked)
-# exports were trained with, "wsm_controls" the Sep-15-onward training text the
-# maskless exports were trained with (names WSM, adds a control-adherence paragraph).
+# The only attention this port implements. Exports trained under the masked
+# FlexAttention backends ("triton"/"fa4": the Sep-14 2026 HF revision 3e7d669 and
+# earlier) are a different attention pattern and are refused at load time.
+COSMOS3_MULTIVIEW_ATTENTION_BACKEND = "maskless"
+# AV system prompt wordings: "wsm_controls" is the Sep-15-2026-onward training text
+# every maskless export was trained with (names WSM, adds a control-adherence
+# paragraph); "provided_controls" is the earlier wording, selectable through the
+# ``system_prompt_variant`` key for an export that records it.
 COSMOS3_SYSTEM_PROMPT_VARIANTS = ("provided_controls", "wsm_controls")
 
 # The fixed 11-camera MADS rig order the v1 checkpoint was exported with.
@@ -186,10 +183,10 @@ class Cosmos3MultiviewDeploymentConfig(msgspec.Struct, frozen=True):
     inference_defaults: dict[str, Any] | None = None
     lidar: dict[str, Any] | None = None
     lidar_attends_captions: bool = True
-    #: Which AV system prompt wording the captions were trained under; the
-    #: export does not record it, so it follows the export vintage (see
-    #: ``COSMOS3_SYSTEM_PROMPT_VARIANTS``) unless ``system_prompt_variant`` is set.
-    system_prompt_variant: str = "provided_controls"
+    #: Which AV system prompt wording the captions were trained under; every
+    #: maskless export trained after the Sep-15-2026 prompt change, so this is
+    #: "wsm_controls" unless the export records ``system_prompt_variant``.
+    system_prompt_variant: str = "wsm_controls"
 
     @property
     def num_views(self) -> int:
@@ -476,38 +473,35 @@ def parse_multiview_deployment_config(
     backend = _required_field(raw, "backend")
     if not isinstance(backend, str):
         raise TypeError("Cosmos3 multiview backend must be a string.")
-    if backend not in COSMOS3_MULTIVIEW_ATTENTION_BACKENDS:
+    if backend != COSMOS3_MULTIVIEW_ATTENTION_BACKEND:
         raise ValueError(
-            "Cosmos3 multiview backend must be one of "
-            f"{list(COSMOS3_MULTIVIEW_ATTENTION_BACKENDS)}, got {backend!r}."
+            f"Cosmos3 multiview backend {backend!r} is not supported: this build serves "
+            f"{COSMOS3_MULTIVIEW_ATTENTION_BACKEND!r} exports only (nvidia/Cosmos3-Nano-"
+            "Transfer-Auto revision 75f2199 or later). Exports trained under the masked "
+            "FlexAttention backends are a different attention pattern; use a maskless "
+            "export or an sglang build from before Sep 21 2026."
         )
+    if schema_version != 2:
+        raise ValueError(
+            "Cosmos3 multiview maskless exports carry schema_version=2 metadata; "
+            f"got {schema_version!r}. Re-export the checkpoint."
+        )
+    reason = maskless_unavailable_reason(
+        attention_scope=attention_scope,
+        decomposed_temporal_window_seconds=temporal_window,
+        control_attends_sensor=bool(raw["control_attends_sensor"]),
+    )
+    if reason is not None:
+        raise ValueError(f"Cosmos3 multiview backend 'maskless': {reason}")
     lidar_attends_captions = raw.get("lidar_attends_captions", True)
     if not isinstance(lidar_attends_captions, bool):
         raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
-    # The Sep-15 training prompt change landed with the maskless recipe, so the
-    # backend is the only vintage marker an export carries.
-    system_prompt_variant = raw.get(
-        "system_prompt_variant",
-        "wsm_controls" if backend == "maskless" else "provided_controls",
-    )
+    system_prompt_variant = raw.get("system_prompt_variant", "wsm_controls")
     if system_prompt_variant not in COSMOS3_SYSTEM_PROMPT_VARIANTS:
         raise ValueError(
             "Cosmos3 multiview system_prompt_variant must be one of "
             f"{list(COSMOS3_SYSTEM_PROMPT_VARIANTS)}, got {system_prompt_variant!r}."
         )
-    if backend == "maskless":
-        if schema_version != 2:
-            raise ValueError(
-                "Cosmos3 multiview backend 'maskless' requires schema_version=2 metadata; "
-                "re-export the checkpoint."
-            )
-        reason = maskless_unavailable_reason(
-            attention_scope=attention_scope,
-            decomposed_temporal_window_seconds=temporal_window,
-            control_attends_sensor=bool(raw["control_attends_sensor"]),
-        )
-        if reason is not None:
-            raise ValueError(f"Cosmos3 multiview backend 'maskless': {reason}")
 
     return Cosmos3MultiviewDeploymentConfig(
         cameras=tuple(cameras),
@@ -542,12 +536,6 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
     use_duration_template: bool = True
     use_system_prompt: bool = True
 
-    # Attention kernel. ``None`` follows the checkpoint's ``multiview.backend``;
-    # ``"fa4"`` needs an SM90/SM100 GPU, CUDA 13, and flash-attn-4. Swapping
-    # ``triton`` and ``fa4`` is safe for A/B measurement; the masked family and
-    # ``maskless`` are different attention patterns and cannot be swapped.
-    multiview_attention_backend: str | None = None
-
     # Parsed once from transformer/config.json in update_config_from_dict.
     multiview_deployment: Cosmos3MultiviewDeploymentConfig | None = None
 
@@ -562,47 +550,6 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
                     "Cosmos3 multiview expects the FlowUniPC schedule; a distilled "
                     "fixed-step scheduler is not supported."
                 )
-            # Fail on a bad backend name at launch, not on the first request.
-            backend, source = self._resolve_multiview_backend()
-            logger.info(
-                "Cosmos3 multiview attention backend: %s (from %s)", backend, source
-            )
-
-    def _resolve_multiview_backend(self) -> tuple[str, str]:
-        """Explicit config field, then the env override, then the checkpoint."""
-        backend = self.multiview_attention_backend
-        source = "pipeline config multiview_attention_backend"
-        if backend is None:
-            backend = envs.SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND
-            source = MULTIVIEW_BACKEND_ENV_VAR
-        if not backend:
-            if self.multiview_deployment is None:
-                raise ValueError(
-                    "Cosmos3 multiview deployment config has not been resolved; "
-                    "set model_path first."
-                )
-            backend = self.multiview_deployment.backend
-            source = "transformer/config.json multiview.backend"
-        if backend not in COSMOS3_MULTIVIEW_ATTENTION_BACKENDS:
-            raise ValueError(
-                "Cosmos3 multiview attention backend must be one of "
-                f"{list(COSMOS3_MULTIVIEW_ATTENTION_BACKENDS)}, got {backend!r} "
-                f"(from {source})."
-            )
-        exported = self.multiview_deployment.backend
-        if (backend == "maskless") != (exported == "maskless"):
-            # triton <-> fa4 is a kernel swap; masked <-> maskless changes the
-            # attention the weights were trained with, so it is not an override.
-            raise ValueError(
-                f"Cosmos3 multiview attention backend {backend!r} (from {source}) is not "
-                f"the family the checkpoint was exported for ({exported!r}). The masked "
-                "(triton/fa4) and maskless backends are different attention patterns; "
-                "pick a backend from the checkpoint's family or re-export the checkpoint."
-            )
-        return backend, source
-
-    def resolved_multiview_backend(self) -> str:
-        return self._resolve_multiview_backend()[0]
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
@@ -612,9 +559,9 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
             "ulysses_degree": server_args.ulysses_degree,
             "ring_degree": server_args.ring_degree,
         }
-        # The sparse mask spans the whole camera-major sequence, so sequence and
+        # The attention plan spans the whole camera-major sequence, so sequence and
         # tensor sharding are not supported. CFG parallel is fine: each rank runs
-        # one complete branch with its own mask cache and only the weighted
+        # one complete branch with its own plan cache and only the weighted
         # velocities are all-reduced.
         for name, degree in parallel_degrees.items():
             if int(degree or 1) > 1:

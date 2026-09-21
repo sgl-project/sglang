@@ -5,7 +5,7 @@ One request carries every camera of the rig. The stages pack all cameras
 camera-major along time (all frames of camera 0, then camera 1, ...), encode
 and decode each camera separately through the temporally causal Wan VAE, and
 hand the transformer a ``MultiviewLayout`` plus the temporal wrap period that
-make the GEN cross-attention sparse across cameras. Joint checkpoints add an
+drive the maskless cross-camera attention. Joint checkpoints add an
 HD-map range-map control and a LiDAR target of their own geometry; the
 denoised state is one flat packing of every target so the shared scheduler
 steps cameras and LiDAR together. Denoising reuses ``Cosmos3DenoisingStage``:
@@ -43,8 +43,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     pack_state,
     unpack_state,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
-    DEFAULT_MAX_UND_TOKENS,
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
     MultiviewLayout,
     expand_multiview_condition_frame_indexes,
@@ -868,7 +867,7 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
         max_sequence_length = min(int(requested), COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
         # ``_tokenize_prompt`` reserves two slots inside its cap for the eos and
         # vision_start framing tokens. The reference caps the caption itself, so
-        # widen by two; the sparse attention's UND capacity (4096 + 2) matches.
+        # widen by two.
         return max_sequence_length + 2
 
     def _tokenize_compact(
@@ -1003,14 +1002,12 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         vae,
         transformer,
         deployment: Cosmos3MultiviewDeploymentConfig,
-        attention_backend: str,
         lidar_encoder: Cosmos3LidarEncoder | None = None,
     ) -> None:
         super().__init__()
         self.vae = vae
         self.transformer = transformer
         self.deployment = deployment
-        self.attention_backend = attention_backend
         self.lidar_encoder = lidar_encoder
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -1215,8 +1212,6 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             decomposed_temporal_window_seconds=deployment.decomposed_temporal_window_seconds,
             control_attends_sensor=deployment.control_attends_sensor,
             seconds_per_frame=camera_rate,
-            backend=self.attention_backend,
-            max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate else 1),
             items=tuple(items),
             lidar_attends_captions=deployment.lidar_attends_captions,
         )
@@ -1254,8 +1249,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             f"Prepared multiview latents {shape} ({num_views} cameras x "
             f"{latent_frames_per_view} latent frames, {layout.gen_tokens} GEN tokens, "
             f"{len(condition_indexes)} anchored frames"
-            f"{', LiDAR latents %s' % (tuple(lidar_control_latents.shape),) if lidar_control_latents is not None else ''}, "
-            f"backend={self.attention_backend})"
+            f"{', LiDAR latents %s' % (tuple(lidar_control_latents.shape),) if lidar_control_latents is not None else ''})"
         )
         return batch
 

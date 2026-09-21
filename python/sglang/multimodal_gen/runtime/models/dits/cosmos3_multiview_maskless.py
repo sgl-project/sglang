@@ -33,7 +33,7 @@ import msgspec
 import torch
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
@@ -42,6 +42,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# The value ``transformer/config.json`` ``multiview.backend`` carries for exports
+# trained with these folds; the only attention this port serves.
 MASKLESS_BACKEND = "maskless"
 # Varlen kernels that return the per-row log-sum-exp the merge needs. "auto" picks
 # FA4 on Blackwell (sm100+), FA3 on Hopper (sm90) and torch's FA2 elsewhere; the
@@ -480,7 +482,7 @@ def resolve_maskless_kernel(
         kernel = requested
     _resolved_kernels[key] = kernel
     logger.info(
-        "Cosmos3 maskless attention kernel: %s (%s, sm%d0)",
+        "Cosmos3 maskless attention kernel: %s (%s, compute capability %d.x)",
         kernel,
         torch.cuda.get_device_name(device) if device.type == "cuda" else device.type,
         capability_major,
@@ -548,12 +550,12 @@ def _plan_for(
         batch_size,
         str(device),
     )
-    plan = context.mask_cache.get(key)
+    plan = context.plan_cache.get(key)
     if not isinstance(plan, MultiviewMasklessPlan):
         plan = build_multiview_maskless_plan(
             context.layout, und_tokens=und_tokens, batch_size=batch_size, device=device
         )
-        context.mask_cache[key] = plan
+        context.plan_cache[key] = plan
     return plan
 
 
