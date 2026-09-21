@@ -287,7 +287,7 @@ class SchedulerProfilerManager:
 
         if get_parallel().tp_rank != 0:
             return ""
-        if self.ps.dp_size > 1 and get_parallel().dp_rank != 0:
+        if get_parallel().dp_size > 1 and get_parallel().dp_rank != 0:
             return ""
         if get_parallel().pp_size > 1 and get_parallel().pp_rank != 0:
             return ""
@@ -342,7 +342,7 @@ class SchedulerProfilerManager:
                 filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
-                if self.ps.dp_size > 1:
+                if get_parallel().dp_size > 1:
                     filename_parts.append(f"DP-{get_parallel().dp_rank}")
                 if get_parallel().pp_size > 1:
                     filename_parts.append(f"PP-{get_parallel().pp_rank}")

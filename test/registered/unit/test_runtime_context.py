@@ -2338,6 +2338,119 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().pp_size, 2)
         self.assertEqual(get_parallel().pp_rank, 1)
 
+    def _group(self, world_size, rank):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = world_size
+        group.rank_in_group = rank
+        return group
+
+    def test_the_tensor_swap_states_the_draft_has_no_attention_replica(self):
+        """The draft runs the whole model on the group being installed. Its
+        attention identity is therefore that group, with one replica -- while
+        the target this process also serves is attention-DP over four ranks."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().attn_tp_size, 2)
+
+        group = self._group(world_size=2, rank=1)
+        with patch.object(parallel_state, "_TP", group):
+            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+                parallel = get_parallel()
+                self.assertEqual(parallel.tp_size, 2)
+                self.assertEqual(parallel.attn_tp_size, 2)
+                self.assertEqual(parallel.attn_tp_rank, 1)
+                self.assertEqual(parallel.attn_dp_size, 1)
+                self.assertEqual(parallel.attn_dp_rank, 0)
+                self.assertEqual(parallel.attn_cp_size, 1)
+                self.assertEqual(parallel.attn_cp_rank, 0)
+                # `dp_size` is the deployment's replica count, not a property
+                # of the group being installed, so the scope leaves it alone --
+                # `require_mlp_tp_gather` asserts on it under dp attention.
+                self.assertEqual(parallel.dp_size, 2)
+                # The whole point of stating the rest: the identity the
+                # override path and the group build both check holds in here.
+                self.assertEqual(
+                    parallel.tp_size,
+                    parallel.attn_tp_size
+                    * parallel.attn_dp_size
+                    * parallel.attn_cp_size,
+                )
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().dp_size, 2)
+
+    def test_every_caller_says_whether_the_draft_owns_its_attention(self):
+        """The scope cannot work it out from the group it is handed: the same
+        call site passes an attention-TP slice for one draft and the target's
+        whole TP group for another, and the two want opposite answers. So the
+        worker states it, and a caller that forgets is the bug this catches --
+        `owns_attention` has no default, but a missing one is a TypeError only
+        on the path that runs, and these paths need a GPU and a draft model."""
+        import ast
+
+        package = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
+        checkout = package.parents[1]
+        roots = [package] + [
+            checkout / name for name in ("test",) if (checkout / name).is_dir()
+        ]
+        missing = []
+        for path in (q for root in roots for q in root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "attr", None) or getattr(func, "id", None)
+                if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
+                    continue
+                if not any(kw.arg == "owns_attention" for kw in node.keywords):
+                    missing.append(f"{path}:{node.lineno}")
+        self.assertEqual(missing, [], "these enter the draft scope without saying")
+
+    def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
+        """The other caller. A draft built outside any scope carries the
+        target's whole TP group, and the graph capture installs *that* -- so
+        the process is still one of two attention-DP replicas and still gathers
+        with the other one. Narrowing here would claim a replica count it does
+        not have, and the reader that acts on it is a collective: the DP gather
+        takes its buffer size from the replica count and its communicator from
+        this group, so the two stop agreeing and the all-gather is refused."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        whole_tp = self._group(world_size=4, rank=0)
+        with patch.object(parallel_state, "_TP", whole_tp):
+            with parallel_state.patch_tensor_parallel_group(
+                whole_tp, owns_attention=False
+            ):
+                parallel = get_parallel()
+                self.assertEqual(parallel.tp_size, 4)
+                self.assertEqual(parallel.attn_dp_size, 2)
+                self.assertEqual(parallel.attn_tp_size, 2)
+                self.assertEqual(parallel.dp_size, 2)
+
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         """A weight check is an on-demand request served from the scheduler
         loop, so it runs outside the scope that describes a draft runner. Its

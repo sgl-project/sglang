@@ -424,7 +424,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _draft_context(self):
         if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
+            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
         return nullcontext()
 
     def alloc_memory_pool(

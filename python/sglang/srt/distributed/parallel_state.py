@@ -3045,17 +3045,37 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
 
 
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
+def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: bool):
     """Run under a different tensor-parallel group until this scope ends.
 
     This is for draft workers of speculative decoding, which run the draft model
     at the target's attention-TP width rather than its global TP width.
 
     The scope replaces both the module global that ``get_tp_group()`` reads and
-    the three members the runtime context answers with.
+    the members the runtime context answers with.
+
+    Which members depends on what the draft is, and only the worker knows: the
+    same call site hands over an attention-TP slice for one draft and the
+    target's whole TP group for another, so this cannot be read off the group.
+
+    ``owns_attention`` says which. A draft that owns its attention topology
+    runs the whole model on the group being installed -- there is no
+    attention-DP replica inside it, so its attention identity is the group
+    itself, one replica, one context shard, and no expert dimension either.
+    Leaving those names on the target's answers is what lets a draft read
+    report a replica count the draft does not have.
+
+    A draft that does not own it was built outside any scope and keeps the
+    target's layout: the process is still one of several attention-DP replicas
+    and still gathers with them. Claiming one replica there is the same error
+    in the other direction, and the reader that acts on it is a collective -- a
+    DP gather takes its buffer size from the replica count and its communicator
+    from this group, so the two stop agreeing.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
+        owns_attention (bool): whether the draft's attention topology is this
+            group, decided by the worker where it builds its draft runner
     """
 
     global _TP_STATE_PATCHED
@@ -3065,12 +3085,22 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     old_tp_group = get_tp_group()
     global _TP
     _TP = tp_group
+    narrowed = dict(
+        tp_size=tp_group.world_size,
+        tp_rank=tp_group.rank_in_group,
+        tp_group=tp_group,
+    )
+    if owns_attention:
+        narrowed.update(
+            attn_tp_size=tp_group.world_size,
+            attn_tp_rank=tp_group.rank_in_group,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        )
     try:
-        with get_parallel().override(
-            tp_size=tp_group.world_size,
-            tp_rank=tp_group.rank_in_group,
-            tp_group=tp_group,
-        ):
+        with get_parallel().override(**narrowed):
             yield
     finally:
         _TP_STATE_PATCHED = False
