@@ -106,7 +106,6 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_lora,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 
@@ -1785,8 +1784,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             layer = self.layers[layer_idx]
             ctx = (
                 nullcontext()
-                if get_server_args().cuda_graph_config is not None
-                and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(
                     layer_idx
                 )
