@@ -1959,7 +1959,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
-        # Rings allocate per request slot; preserve HiSparse's direct-to-host path.
         swa_pages_charged = (
             uses_swa_tail
             and not is_swa_req_ring(allocator)
