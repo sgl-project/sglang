@@ -122,6 +122,14 @@ class Memory(msgspec.Struct):
             choices=["write_back", "write_through", "write_through_selective"],
         ),
     ] = "write_through"
+    hicache_write_back_threshold: A[
+        float,
+        "Occupancy watermark shared by L1->L2 and L2->L3 asynchronous write-back. "
+        "L2->L3 delay applies to cache mode, including SWA/Mamba and sidecars; "
+        "other host modes retain eager storage writes. Must be in (0, 1]; "
+        "1 keeps legacy behavior "
+        "(on-demand L1 write-back and eager L3 writes). Only affects write_back.",
+    ] = 1.0
     hicache_io_backend: A[
         str,
         Arg(

@@ -364,6 +364,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_ratio",
     "hicache_size",
     "hicache_write_policy",
+    "hicache_write_back_threshold",
     "hicache_io_backend",
     "hicache_mem_layout",
     "hicache_storage_backend",

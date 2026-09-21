@@ -16,6 +16,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 
 from __future__ import annotations
 
+import heapq
 import logging
 import sys
 from array import array
@@ -1509,6 +1510,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 lru_op(lru, node)
 
+    def prepare_device_write_back(self, num_tokens: int, write) -> None:
+        """Prepare cold device copies without invoking any eviction action."""
+        comp = self.components_by_type[BASE_COMPONENT_TYPE]
+        comp._ensure_eviction_strategy()
+        heap = [
+            (comp.session_ref_eviction_strategy(node), node)
+            for node in self.evictable_device_leaves
+        ]
+        heapq.heapify(heap)
+        prepared = submitted = 0
+        while heap and prepared < num_tokens:
+            _, node = heapq.heappop(heap)
+            if any(cd.lock_ref for cd in node.component_data):
+                continue
+            cost = len(node.component_data[BASE_COMPONENT_TYPE].value)
+            if not node.backuped or self._needs_incremental_component_backup(node):
+                if write(BackupKV([node.id])) == 0:
+                    break
+                submitted += cost
+            prepared += cost
+            if submitted >= max(4096, self.page_size):
+                break
+
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
     ) -> None:
@@ -1590,7 +1614,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
-    def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
+    def drop_subtree_no_host(
+        self, node_id: NodeId, can_evict_host=None
+    ) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
         memory pressure: drop the subtree rooted at the unbacked leaf so
         device eviction keeps making progress instead of leaving its KV
@@ -1603,6 +1629,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert not node.backuped and node.write_through_pending_id is None
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
+        if can_evict_host is not None and not can_evict_host(node):
+            return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
@@ -1610,6 +1638,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
             ):
+                return result
+            if can_evict_host is not None and not can_evict_host(cur):
                 return result
             descendants.append(cur)
             stack.extend(cur.children.values())
@@ -1702,6 +1732,101 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.device_frees,
                 result.host_frees,
             )
+        return result
+
+    def drive_host_write_back(
+        self, component_type: ComponentType, num_tokens: int, prepare
+    ) -> DriveHostEvictionResult:
+        """Reclaim only storage-confirmed nodes, without changing component drivers.
+
+        FULL uses the existing leaf priority; auxiliary pools use their host
+        LRU. The storage policy stages dirty candidates and permits release
+        only after all resident pools (including sidecars) are confirmed.
+        prepare returns (release_source, stop_walk); submission alone can
+        exhaust the budget without incrementing the eviction tracker.
+        """
+        result = DriveHostEvictionResult()
+        comp = self.components_by_type.get(component_type)
+        if comp is None:
+            return result
+        full = component_type == BASE_COMPONENT_TYPE
+        lru = None if full else self.host_lru_lists[component_type]
+        session = not full and self.enable_session_radix_cache
+
+        def candidates():
+            if full:
+                comp._ensure_eviction_strategy()
+                heap = [
+                    (comp.session_ref_eviction_strategy(n), n)
+                    for n in self.evictable_host_leaves
+                ]
+                heapq.heapify(heap)
+                while heap:
+                    _, node = heapq.heappop(heap)
+                    if node not in self.evictable_host_leaves:
+                        continue
+                    yield node
+                    if node.parent in self.evictable_host_leaves:
+                        heapq.heappush(
+                            heap,
+                            (
+                                comp.session_ref_eviction_strategy(node.parent),
+                                node.parent,
+                            ),
+                        )
+            else:
+                node = (
+                    lru.cursor_next(host_lock=True)
+                    if session
+                    else lru.get_lru_no_host_lock()
+                )
+                while node is not None and lru.in_list(node):
+                    next_node = None if session else lru.get_prev_no_host_lock(node)
+                    yield node
+                    node = lru.cursor_next(host_lock=True) if session else next_node
+
+        if session:
+            lru.cursor_begin()
+        try:
+            for node in candidates():
+                if result.tracker[component_type] >= num_tokens:
+                    break
+                if any(cd.host_lock_ref for cd in node.component_data):
+                    continue
+                release, stop = prepare(node)
+                if not release:
+                    if stop:
+                        break
+                    continue
+                if node in self.evictable_host_leaves and (
+                    full or not session or comp._can_evict_leaf_atomically(node)
+                ):
+                    self._evict_host_leaf(
+                        node, result.tracker, result.device_frees, result.host_frees
+                    )
+                else:
+                    self._evict_component_and_detach_lru(
+                        node,
+                        comp,
+                        target=EvictLayer.HOST,
+                        tracker=result.tracker,
+                        device_frees=result.device_frees,
+                        host_frees=result.host_frees,
+                    )
+                    self._cascade_evict(
+                        node,
+                        comp,
+                        result.tracker,
+                        result.device_frees,
+                        result.host_frees,
+                        target=EvictLayer.HOST,
+                    )
+                    self._update_evictable_leaf_sets(node)
+                if stop:
+                    break
+        finally:
+            if session:
+                lru.cursor_end()
         return result
 
     def evict_excess_path_states(
@@ -2200,10 +2325,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:
-        """Gather a node's device->storage backup spec; None if the node is not backuped."""
+        """Gather all resident host components, including nodes without FULL KV."""
         node = self.node_by_id(node_id)
-        if not node.backuped:
-            return None
         prefix_keys = None
         if pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
@@ -2216,10 +2339,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             if transfers:
                 comp_xfers[comp.component_type] = transfers
+        host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if host_value is None and not comp_xfers:
+            return None
         return StorageBackupSpec(
-            host_value=node.component_data[BASE_COMPONENT_TYPE].host_value,
+            host_value=(
+                host_value
+                if host_value is not None
+                else torch.empty(0, dtype=torch.int64)
+            ),
             token_ids=node.key.token_ids,
-            hash_value=node.hash_value,
+            hash_value=node.hash_value if host_value is not None else [],
             prefix_keys=prefix_keys,
             comp_xfers=comp_xfers,
         )
