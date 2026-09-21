@@ -1288,6 +1288,17 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
 
     expansion_module.expand_blocks = npu_expansion
     monkeypatch.setitem(sys.modules, expansion_module.__name__, expansion_module)
+    topk_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_topk")
+    topk_calls = []
+
+    def npu_topk(logits, lengths, topk, starts):
+        topk_calls.append((logits, lengths, topk, starts))
+        # This routing fixture has four equal-score blocks, all selected.
+        ranks = torch.arange(topk).expand(logits.shape[0], -1)
+        return torch.where(ranks < lengths[:, None], ranks, -1).int()
+
+    topk_module.fast_topk = npu_topk
+    monkeypatch.setitem(sys.modules, topk_module.__name__, topk_module)
     # The platform guard must short-circuit before inspecting rotary fields.
     assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
     assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(
@@ -1298,6 +1309,7 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     starts = torch.zeros_like(lengths)
     logits = qsa_mqa_prefill(q, torch.ones(4, 1, 16), starts, lengths)
     blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
+    assert len(topk_calls) == 1
     raw_lengths = lengths * 4
     selected = expand_qsa_block_indices(blocks, raw_lengths - 1, raw_lengths, 4, 2048)
     assert len(expansion_calls) == 1
@@ -1307,8 +1319,10 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     qsa_mqa_decode(q, torch.ones(1, 4, 1, 16), starts[:, None], lengths, 4)
 
 
-@pytest.mark.parametrize("device", ["cpu", "npu"])
-@pytest.mark.parametrize("columns,topk", [(12, 8), (900, 512), (0, 8)])
+@pytest.mark.parametrize("device,columns,topk", [
+    ("cpu", 12, 8), ("cpu", 900, 512), ("cpu", 0, 8),
+    ("npu", 12, 512), ("npu", 900, 512), ("npu", 0, 2048),
+])
 def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
     if device == "npu" and not qsa_kernel_module._is_npu:
         pytest.skip("NPU is not available")
@@ -1322,16 +1336,21 @@ def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
         return original_topk(input, *args, **kwargs)
 
     monkeypatch.setattr(torch, "topk", record_topk)
-    # Strided input, nonzero starts, short rows, and all-padding rows.
+    # GPU-like NPU columns must be contiguous; the CPU reference still
+    # accepts the legacy column-strided input.
     logits = torch.arange(columns * 2, dtype=torch.float32, device=device)[::2]
     logits = logits.unsqueeze(0).expand(3, -1)
+    if device == "npu":
+        # contiguous() can be a no-op on an empty stride-2 view. Allocate
+        # the GPU-like column stride explicitly, including M=0.
+        logits = torch.empty(logits.shape, dtype=logits.dtype, device=device).copy_(logits)
     starts = torch.tensor([0, min(4, columns), 0], dtype=torch.int32, device=device)
     ends = torch.tensor([columns, min(7, columns), 0], dtype=torch.int32, device=device)
     actual = qsa_fast_topk(logits, starts, ends, topk).cpu()
     if columns == 0:
         assert topk_input_dims == []
     elif device == "npu":
-        assert topk_input_dims == [2]  # One batched top-k.
+        assert topk_input_dims == []  # These shapes use shortcut/tiled Triton.
     else:
         assert topk_input_dims == [1, 1]  # One top-k per nonempty row.
     assert actual.shape == (3, topk)
@@ -1339,6 +1358,14 @@ def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
     for row, (start, end) in enumerate(zip(starts.cpu().tolist(), ends.cpu().tolist())):
         count = min(topk, end - start)
         expected = list(range(end - start - 1, end - start - count - 1, -1))
+        if device == "npu":
+            if end - start <= topk:
+                expected = list(range(count))
+            else:
+                # Long-row order is unspecified, even without score ties.
+                assert sorted(actual[row, :count].tolist()) == sorted(expected)
+                assert actual[row, count:].tolist() == [-1] * (topk - count)
+                continue
         assert actual[row, :count].tolist() == expected
         assert actual[row, count:].tolist() == [-1] * (topk - count)
 

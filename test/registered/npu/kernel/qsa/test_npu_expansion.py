@@ -31,6 +31,28 @@ def _assert_prefix(blocks, positions, lengths, ratio):
     assert torch.all(((b + 1) * ratio)[valid] <= limit[valid])
 
 
+def _assert_topk(logits, starts, lengths, blocks):
+    """Test-only exact selection oracle; ties do not require equal indices."""
+    assert logits.dtype == torch.float32 and logits.stride(1) == 1
+    assert starts.is_contiguous() and lengths.is_contiguous()
+    scores, begin, counts, indices = (x.cpu() for x in (logits, starts, lengths, blocks))
+    width = indices.shape[1]
+    for row, (start, length) in enumerate(zip(begin.tolist(), counts.tolist())):
+        valid_scores = scores[row, start:start + length]
+        assert torch.isfinite(valid_scores).all()
+        count = min(width, length)
+        chosen = indices[row, :count].long()
+        assert ((chosen >= 0) & (chosen < length)).all()
+        assert chosen.unique().numel() == count
+        assert (indices[row, count:] == -1).all()
+        if length <= width:
+            assert torch.equal(chosen, torch.arange(length))
+        else:
+            torch.testing.assert_close(valid_scores[chosen].sort().values,
+                                       valid_scores.topk(width).values.sort().values,
+                                       atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("rows", [0, 1, 127, 128, 129])
 @pytest.mark.parametrize("block_topk", [512, 2048])
 def test_dispatch_model_contract(rows, block_topk, monkeypatch):
@@ -85,12 +107,12 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
         blocks = kernel.qsa_fast_topk(logits, starts, ends, block_topk)
         tokens = kernel.expand_qsa_block_indices(
             blocks, positions, sequence_lengths[ids.long()], 4, block_topk * 4)
-        return blocks, tokens
+        return blocks, tokens, logits, starts, ends - starts
 
     for _ in range(2): forward()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        captured_blocks, captured_tokens = forward()
+        captured_blocks, captured_tokens, scores, starts, lengths = forward()
     for step in range(4):
         if step == 1:
             q.zero_()
@@ -107,9 +129,11 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
         torch.npu.synchronize()
         row_lengths = sequence_lengths[ids.long()]
         _assert_prefix(captured_blocks, positions, row_lengths, 4)
+        _assert_topk(scores, starts, lengths, captured_blocks)
         expected = _expected(captured_blocks, positions, row_lengths, 4, block_topk * 4)
         torch.testing.assert_close(captured_tokens.cpu(), expected, atol=0, rtol=0)
-        eager_blocks, eager_tokens = forward()
+        eager_blocks, eager_tokens, eager_scores, eager_starts, eager_lengths = forward()
+        _assert_topk(eager_scores, eager_starts, eager_lengths, eager_blocks)
         torch.testing.assert_close(captured_blocks, eager_blocks, atol=0, rtol=0)
         torch.testing.assert_close(captured_tokens, eager_tokens, atol=0, rtol=0)
 
@@ -162,7 +186,7 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         tokens = kernel.expand_qsa_block_indices(
             blocks, indexer.decode_logical_positions, indexer.sequence_lengths, 4, 2048)
         slots = backend._logical_to_physical(tokens, metadata)
-        return blocks, tokens, slots
+        return blocks, tokens, slots, logits, lengths
 
     for _ in range(2): forward()
     graph = torch.npu.NPUGraph()
@@ -190,7 +214,8 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         assert pointers() == addresses
         graph.replay()
         torch.npu.synchronize()
-        blocks, tokens, slots = outputs
+        blocks, tokens, slots, logits, lengths = outputs
+        _assert_topk(logits, torch.zeros_like(lengths), lengths, blocks)
         p, n = indexer.decode_logical_positions, indexer.sequence_lengths
         _assert_prefix(blocks, p, n, 4)
         expected = _expected(blocks, p, n, 4, 2048)
@@ -202,3 +227,71 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         torch.testing.assert_close(slots.cpu(), physical, atol=0, rtol=0)
         for captured, eager in zip(outputs, forward()):
             torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("rows,width,path", [
+    (4, 256, "shortcut"), (4, 8193, "tiled"),
+    (4, 262145, "hybrid"), (129, 262145, "hybrid"),
+])
+def test_final_topk_expansion_all_paths_graph(k, rows, width, path):
+    from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import select_implementation
+
+    assert select_implementation(rows, width, k) == path
+    logits = torch.randn(rows, width, device="npu", dtype=torch.float32)
+    starts = (torch.arange(rows, device="npu") % 8).int()
+    lengths = torch.full_like(starts, width - 16)
+    positions = lengths * 4 + 2
+    sequence_lengths = torch.full_like(starts, width * 4)
+
+    def forward():
+        blocks = kernel.qsa_fast_topk(logits, starts, starts + lengths, k)
+        tokens = kernel.expand_qsa_block_indices(blocks, positions, sequence_lengths, 4, k * 4)
+        return blocks, tokens
+
+    def check(outputs):
+        blocks, tokens = outputs
+        _assert_topk(logits, starts, lengths, blocks)
+        _assert_prefix(blocks, positions, sequence_lengths, 4)
+        torch.testing.assert_close(tokens.cpu(), _expected(blocks, positions, sequence_lengths, 4, k * 4),
+                                   atol=0, rtol=0)
+
+    for _ in range(2):
+        check(forward())
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        outputs = forward()
+    for step in range(4):
+        if step == 1:
+            logits.zero_()
+            starts.fill_(7)
+        elif step == 2:
+            lengths.copy_((torch.arange(rows, device="npu") % 3).int())
+            positions.copy_(lengths * 4)
+        elif step == 3:
+            logits.normal_()
+            lengths.fill_(width - 16)
+            positions.copy_(lengths * 4 + 2)
+        graph.replay()
+        torch.npu.synchronize()
+        check(outputs)
+        check(forward())
+
+
+def test_topk_dispatch_errors_are_not_hidden(monkeypatch):
+    from sgl_kernel_npu.qwen3_8_flash_next import qsa_topk
+
+    logits = torch.zeros(2, 4096, device="npu")
+    starts = torch.zeros(2, dtype=torch.int32, device="npu")
+    ends = starts + 1024
+    with pytest.raises(ValueError, match="K=512 or 2048"):
+        kernel.qsa_fast_topk(logits, starts, ends, 8)
+    with pytest.raises(ValueError, match="contiguous in columns"):
+        kernel.qsa_fast_topk(logits[:, ::2], starts, ends, 512)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("intentional Top-K failure")
+
+    monkeypatch.setattr(qsa_topk, "fast_topk", fail)
+    with pytest.raises(RuntimeError, match="intentional Top-K failure"):
+        kernel.qsa_fast_topk(logits, starts, ends, 512)

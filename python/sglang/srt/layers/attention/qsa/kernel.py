@@ -30,11 +30,18 @@ def qsa_fast_topk(
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks using the platform's fixed-width Top-K."""
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
-    if not _is_npu and logits.is_cuda:
+    if _is_npu:
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import fast_topk
+
+        # Upstream supplies contiguous bounds and finite scores within each
+        # valid interval. Unsupported metadata/errors must not silently fall back.
+        return fast_topk(logits, lengths, topk, starts)
+
+    if logits.is_cuda:
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
@@ -60,26 +67,6 @@ def qsa_fast_topk(
         dtype=torch.int32,
         device=logits.device,
     )
-    if _is_npu:
-        # Keep row bounds on device and use a fixed-width, batched top-k
-        # so NPU graph capture needs no device-to-host scalar reads.
-        width = min(topk, logits.shape[1])
-        if width == 0 or logits.shape[0] == 0:
-            return output
-        columns = torch.arange(logits.shape[1], device=logits.device).unsqueeze(0)
-        valid = (columns >= starts.unsqueeze(1)) & (
-            columns < (starts + lengths).unsqueeze(1)
-        )
-        selected = torch.topk(
-            logits.masked_fill(~valid, -float("inf")), width, dim=1
-        ).indices
-        relative = (selected - starts.unsqueeze(1)).to(torch.int32)
-        ranks = torch.arange(width, device=logits.device).unsqueeze(0)
-        output[:, :width] = torch.where(
-            ranks < valid.sum(dim=1, keepdim=True), relative, -1
-        )
-        return output
-
     # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     for row in range(logits.shape[0]):
         start = int(starts[row])
