@@ -135,6 +135,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and running_batch.is_empty()
                 )
                 if running_batch.is_empty() and self.split_prefill_batch is None:
+                    self._sched_idled = True
                     self.on_idle()
 
             if adjust_stream_group:
