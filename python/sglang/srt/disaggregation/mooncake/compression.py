@@ -62,6 +62,8 @@ class CompressionRuntime:
         else:
             if shared.force != self.force:
                 raise ValueError("P/D and L2 compression force policies differ")
+            if shared.verify != envs.SGLANG_PD_KV_COMPRESSION_VERIFY.get():
+                raise ValueError("P/D and L2 verification policies differ")
             if shared.layout.tag != self.layout.tag:
                 raise ValueError("P/D and L2 compression layout mismatch")
             self.shared = shared
@@ -69,14 +71,20 @@ class CompressionRuntime:
         self.wire_capacity = self.chunk_tokens * align_bytes(
             max(self.bytes_per_token, self.shared.output_bound)
         )
-        if 2 * self.max_raw_bytes + self.wire_capacity > self.shared.budget_bytes:
+        self.verify = envs.SGLANG_PD_KV_COMPRESSION_VERIFY.get()
+        decode_workspace = (
+            2 + int(self.verify)
+        ) * self.max_raw_bytes + 64 * self.chunk_tokens
+        if (
+            max(2 * self.max_raw_bytes + self.wire_capacity, decode_workspace)
+            > self.shared.budget_bytes
+        ):
             raise ValueError(
                 "Chunk exceeds compression workspace budget; reduce chunk size or raise SGLANG_KV_COMPRESSION_WORKSPACE_MB"
             )
         self.local = threading.local()
         self.outputs = []  # Registered allocation ownership lasts until exit.
         self.transport_failed = False
-        self.verify = envs.SGLANG_PD_KV_COMPRESSION_VERIFY.get()
         allocator = getattr(manager._staging_ctx, "allocator", None)
         if allocator is not None and self.wire_capacity > allocator.total_size:
             raise ValueError("Compression chunk cannot fit in Decode staging")
@@ -97,6 +105,9 @@ class CompressionRuntime:
     def source_digest(self, indices, stream, ready_event):
         """Verify the protected source; failure must also finish source reads."""
         raw = None
+        reservation = self.shared.reserve_workspace(
+            2 * len(indices) * self.bytes_per_token + 64 * len(indices), wait=True
+        )
         try:
             with torch.cuda.stream(stream):
                 if ready_event is not None:
@@ -108,10 +119,12 @@ class CompressionRuntime:
                 stream.synchronize()
             except Exception as exc:
                 self.transport_failed = True
-                self.shared.quarantine(exc, (raw, indices, ready_event))
+                reservation.quarantine(exc, (raw, indices, ready_event))
                 raise BufferDrainError(
                     "Source KV verification did not drain; restart worker"
                 ) from exc
+            raw = None
+            reservation.release()
 
     def encode_pages(self, indices, refs, ready_event, stream):
         if self.transport_failed:
@@ -221,7 +234,6 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
         self._restore_lock = threading.Lock()
         self._restore_tasks = {}
         self._quarantined = {}
-        self._verify_buffer = None
         self.staging_allocator._scatter_stream = torch.cuda.Stream(
             device=self.runtime.device
         )
@@ -307,7 +319,7 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
         begin, layout_begin, decoded, scattered_event = (
             torch.cuda.Event(enable_timing=True) for _ in range(4)
         )
-        pages = page_major = raw = future = None
+        pages = page_major = raw = future = owner = reservation = None
         try:
             with torch.cuda.stream(stream):
                 begin.record(stream)
@@ -315,14 +327,25 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                     EncodedPage(wire[o : o + n], e, self.runtime.bytes_per_token)
                     for o, n, e in desc.pages
                 ]
-                future = self.runtime.shared.submit(
-                    lambda: self.runtime.shared.decode_pages(pages), priority=0
+                consumer_bytes = desc.raw_bytes if desc.sha256 else 0
+                shared = self.runtime.shared
+                reservation = shared.reserve_workspace(
+                    shared.decode_workspace_bytes(pages, consumer_bytes),
+                    wait=True,
+                    cancelled=lambda: req._staging_failed,
                 )
-                page_major = future.result()
+                future = shared.submit(
+                    lambda: shared.decode_pages(
+                        pages, consumer_bytes=consumer_bytes, reservation=reservation
+                    ),
+                    priority=0,
+                )
+                owner = future.result()
+                page_major = owner.raw
                 restore_wait_ms = (time.perf_counter() - started) * 1000
                 layout_begin.record(stream)
                 layout_start = time.perf_counter()
-                raw = self.runtime.layout.to_staging_order(page_major)
+                raw = owner.to_staging_order()
                 decoded.record(stream)
                 restored = time.perf_counter()
                 layout_host_ms = (restored - layout_start) * 1000
@@ -375,8 +398,23 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                     page_major,
                     raw,
                     future,
+                    owner,
+                    reservation,
+                )
+                self.runtime.shared.quarantine(
+                    exc, self._quarantined[req.req.bootstrap_room]
                 )
                 raise BufferDrainError("Restore stream did not drain") from exc
+            if reservation is not None:
+                if self.runtime.shared.is_quarantined():
+                    error = BufferDrainError("Restore runtime did not drain")
+                    reservation.quarantine(error, (pages, owner))
+                    raise error
+                elif owner is not None:
+                    page_major = raw = None
+                    owner.close(stream)
+                else:
+                    reservation.release()
 
     def _verify_written_pages(self, req, page_start, num_pages, expected):
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -384,31 +422,40 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
             gather_all_layers_to_staging,
         )
 
-        if self._verify_buffer is None:
-            self._verify_buffer = StagingBuffer(
-                self.runtime.max_raw_bytes,
-                str(self.runtime.device),
-                self.runtime.device.index,
-            )
+        # Per-operation, covered by the decoded result's reservation. Never
+        # keep a max-chunk allocation alive after returning its budget.
+        verify_buffer = StagingBuffer(
+            num_pages * self.runtime.bytes_per_token,
+            str(self.runtime.device),
+            self.runtime.device.index,
+        )
+        token_start = req.req.kv.cache_protected_len + page_start
         indices = (
             self.scheduler.req_to_token_pool.req_to_token[
-                req.req.kv.req_pool_idx, page_start : page_start + num_pages
+                req.req.kv.req_pool_idx, token_start : token_start + num_pages
             ]
             .cpu()
             .numpy()
         )
-        nbytes = gather_all_layers_to_staging(
-            self.kv_buffer_info["k_buffers"],
-            self.kv_buffer_info["v_buffers"],
-            indices,
-            self._verify_buffer,
-            0,
-            self.total_kv_heads,
-            1,
-            self.runtime.device.index,
-        )
-        if digest(self._verify_buffer.buffer[:nbytes]) != expected:
-            raise ValueError("Restored KV pages do not match Prefill KV bytes")
+        try:
+            nbytes = gather_all_layers_to_staging(
+                self.kv_buffer_info["k_buffers"],
+                self.kv_buffer_info["v_buffers"],
+                indices,
+                verify_buffer,
+                0,
+                self.total_kv_heads,
+                1,
+                self.runtime.device.index,
+            )
+            if digest(verify_buffer.buffer[:nbytes]) != expected:
+                raise ValueError("Restored KV pages do not match Prefill KV bytes")
+        finally:
+            try:
+                self.staging_allocator._scatter_stream.synchronize()
+            except Exception as exc:
+                self.runtime.shared.quarantine(exc, (verify_buffer, indices, req))
+                raise BufferDrainError("Verification did not drain") from exc
 
     def advance_scatter(self, decode_req):
         room = decode_req.req.bootstrap_room
@@ -434,6 +481,10 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
     def unregister_decode_req(self, room):
         with self._restore_lock:
             req = self._room_to_decode_req.pop(room, None)
+            if req is not None:
+                req._staging_failed = (
+                    True  # Interrupt workspace waits before teardown drains.
+                )
             receiver = self._room_to_receiver.pop(room, None)
             self._writer_counts.pop(room, None)
             tasks = [
@@ -455,6 +506,10 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
             self.release_room(room, req, receiver)
         self.kv_manager._staging_ctx.room_receivers.pop(room, None)
         self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+
+    def is_quarantined(self):
+        with self._restore_lock:
+            return bool(self._quarantined) or self.runtime.shared.is_quarantined()
 
     def is_idle(self):
         with self._restore_lock:

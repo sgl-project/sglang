@@ -2116,8 +2116,10 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            if (
+                is_health_check_generate_req(recv_req)
+                and self.compression_failure_reason() is None
+                and not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -2921,6 +2923,11 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if failure := self.compression_failure_reason():
+            prepare_abort(req, failure, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+            self.output_streamer.stream_output([req], req.return_logprob)
             return
 
         if recv_req.pp_prefetch_ticketed is True:
@@ -3846,11 +3853,31 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _reject_quarantined_waiting(self, reason):
+        retained = getattr(self, "_compression_quarantined_waiting", None)
+        if retained is None:
+            retained = self._compression_quarantined_waiting = []
+        pending = self.waiting_queue
+        self.waiting_queue = []
+        if self.chunked_req is not None:
+            if not any(req is self.chunked_req for req in pending):
+                pending.append(self.chunked_req)
+            self.chunked_req = None
+        for req in pending:
+            retained.append(req)
+            prepare_abort(req, reason, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+            self.output_streamer.stream_output([req], req.return_logprob)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        if failure := self.compression_failure_reason():
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return None, running_batch
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -3939,6 +3966,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            admission_failure_reason=self.compression_failure_reason,
         )
 
         if self.chunked_req is not None:
@@ -4864,7 +4892,22 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        failure = self.compression_failure_reason()
+        if failure:
+            if not getattr(self, "_compression_failure_announced", False):
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(quarantine_reason=failure)
+                )
+                self._compression_failure_announced = True
+            while self.return_health_check_ipcs:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=self.return_health_check_ipcs.popleft(),
+                        quarantine_reason=failure,
+                    )
+                )
+            return
+        if self.return_health_check_ipcs and self.compression_failure_reason() is None:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
@@ -5016,6 +5059,28 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active()
+
+    def compression_failure_reason(self):
+        tree = getattr(self, "tree_cache", None)
+        reason = getattr(tree, "admission_failure_reason", lambda: None)()
+        if reason:
+            return reason
+        queue_name = (
+            "disagg_prefill_bootstrap_queue"
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else "disagg_decode_prealloc_queue"
+        )
+        manager = getattr(getattr(self, queue_name, None), "kv_manager", None)
+        runtime = getattr(manager, "compression_runtime", None)
+        if runtime is not None and (
+            runtime.transport_failed or runtime.shared.is_quarantined()
+        ):
+            return "KV compression transport is quarantined; restart worker"
+        transfer = getattr(self, "disagg_decode_transfer_queue", None)
+        handler = getattr(transfer, "staging_handler", None)
+        if getattr(handler, "is_quarantined", lambda: False)():
+            return "KV restoration is quarantined; restart worker"
+        return None
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.

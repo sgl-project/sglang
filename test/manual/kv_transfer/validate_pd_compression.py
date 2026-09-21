@@ -1,4 +1,4 @@
-"""Prepare, run and audit bounded r2 correctness workloads (not a benchmark).
+"""Prepare, run and audit bounded compression correctness workloads (not a benchmark).
 
 `prepare` needs the model tokenizer; `run`/`audit` use only the standard library.
 Log commands are explicit, read-only collector commands, executed without a shell.
@@ -37,6 +37,60 @@ L2_DOCUMENTS = (
 def host_cached_tokens(meta):
     """A missing provenance record is a host miss, never a successful restore."""
     return (meta.get("cached_tokens_details") or {}).get("host", 0)
+
+
+def validate_restore_response(row):
+    if row["group"] != "l2" or row["case"] != "restore":
+        return
+    require(row["input_tokens"] == 8192, "Unexpected frozen restore workload")
+    meta = row["result"]["meta_info"]
+    detail = meta.get("cached_tokens_details")
+    require(
+        isinstance(detail, dict)
+        and meta.get("cached_tokens") == 8191
+        and detail.get("device") == 0
+        and detail.get("host") == 8191
+        and detail.get("storage", 0) == 0,
+        f"Host miss or partial restore: expected device=0, host=8191: {row['rid']} {detail}",
+    )
+
+
+def validate_restore_event(row, event, phase):
+    validate_restore_response(row)
+    require(event is not None, "Missing GPU eviction evidence")
+    require(
+        all(
+            event.get(k) == 8191
+            for k in ("native_missing_pages", "adopted_pages", "verified_pages")
+        ),
+        "Frozen L2 restore requires 8191 evicted, adopted and verified pages",
+    )
+    if phase == "force-l2":
+        require(event.get("lz4_pages") == 8191, "L2 restored raw objects")
+
+
+def completed_drains(observations):
+    completed, history, snapshots = set(), {}, set()
+    for obs in observations:
+        label = obs["label"]
+        if "snapshot_id" in obs:
+            require(obs["snapshot_id"] not in snapshots, "Replayed drain snapshot")
+            snapshots.add(obs["snapshot_id"])
+        previous, stable = history.get(label, (-1.0, 0))
+        require(
+            0 <= previous < obs["elapsed"] <= 180
+            or previous == -1.0
+            and 0 <= obs["elapsed"] <= 180,
+            "Drain observations must have increasing bounded timestamps",
+        )
+        stable = stable + 1 if obs["idle"] else 0
+        require(
+            obs["consecutive"] == stable, "Missing consecutive fresh drain observations"
+        )
+        history[label] = obs["elapsed"], stable
+        if stable >= 3:
+            completed.add(label)
+    return completed
 
 
 def require(condition, message):
@@ -129,6 +183,7 @@ def latest_state(text):
                     "resident_bytes",
                 )
             )
+            and r.get("workspace_waiters", 0) == 0
             and h["reserved_bytes"] == h["retired_bytes"] == 0
             and all(
                 h.get(k, -1) == 0
@@ -184,6 +239,7 @@ def drain(command, output, label, timeout=180):
                         "idle": idle,
                         "consecutive": stable,
                         "state": state,
+                        "snapshot_id": sha(line),
                     }
                 )
                 + "\n"
@@ -211,6 +267,49 @@ def request(url, ids, rid):
         return json.load(response)
 
 
+def validate_execution_contract(contract):
+    keys = (
+        "source_manifest_sha256",
+        "image_digest",
+        "model",
+        "model_revision",
+        "dtype",
+        "kv_cache_dtype",
+        "topology",
+        "page_size",
+        "chunk_tokens",
+    )
+    require(
+        isinstance(contract, dict) and all(k in contract for k in keys),
+        "Incomplete execution contract",
+    )
+    require("REPLACE_WITH" not in json.dumps(contract), "Unfilled execution contract")
+    for name, prefix in (("source_manifest_sha256", ""), ("image_digest", "sha256:")):
+        value = contract[name]
+        require(isinstance(value, str) and value.startswith(prefix), f"Invalid {name}")
+        value = value[len(prefix) :]
+        require(
+            len(value) == 64 and all(c in "0123456789abcdef" for c in value),
+            f"Invalid {name}",
+        )
+    require(
+        all(
+            isinstance(contract[k], str) and contract[k].strip()
+            for k in ("model", "model_revision", "dtype", "kv_cache_dtype")
+        ),
+        "Missing model identity or dtype",
+    )
+    require(
+        contract["page_size"] == 1 and contract["chunk_tokens"] == 1024,
+        "Unsupported acceptance page/chunk geometry",
+    )
+    require(
+        contract["topology"]
+        == {"prefill": 1, "decode": 1, "tp": 1, "pp": 1, "cp": 1, "dcp": 1},
+        "Unsupported acceptance topology",
+    )
+
+
 def run(args):
     work = json.loads(args.workload.read_text())
     require(work["version"] == 1, "Unsupported workload")
@@ -222,7 +321,10 @@ def run(args):
         "started_ns": time.time_ns(),
         "router": args.router,
         "drain_timeout": 180,
+        "sampling_params": {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True},
+        "execution_contract": json.loads(args.execution_contract.read_text()),
     }
+    validate_execution_contract(config["execution_contract"])
     chosen = (
         {args.scenario}
         if args.scenario != "all"
@@ -341,10 +443,7 @@ def run(args):
                     save(issue("l2", f"pressure-{i}", ids, cycle))
                     time.sleep(8)  # Preserve the r1 eight-request sequence.
                 restored = save(issue("l2", "restore", docs[0], cycle))
-                require(
-                    host_cached_tokens(restored["result"]["meta_info"]) > 0,
-                    "Host miss: cached_tokens_details is missing/null or reports host=0; original response retained",
-                )
+                validate_restore_response(restored)
                 drain(args.prefill_log_command, args.output, f"cycle-{cycle}-complete")
         if args.phase in CACHE_PHASES:
             drain(args.prefill_log_command, args.output, "final")
@@ -385,8 +484,10 @@ def complete_rows(directory, config):
         and set(keys) == {tuple(k) for k in config["expected_cases"]},
         "Missing/duplicate cases: incomplete runs cannot pass audit",
     )
+    require(len({r["rid"] for r in rows}) == len(rows), "Duplicate request identity")
     for row in rows:
         validate_response(row)
+        validate_restore_response(row)
     return rows
 
 
@@ -485,20 +586,16 @@ def audit(directory):
                     "Decode did not decompress every object",
                 )
 
-    restores = {r["rid"]: r for _, r in records(pre, "KV_COMPRESSION_L2_RESTORE")}
+    requested = {row["rid"] for row in rows}
+    restore_records = [
+        r for _, r in records(pre, "KV_COMPRESSION_L2_RESTORE") if r["rid"] in requested
+    ]
+    restores = {r["rid"]: r for r in restore_records}
+    require(len(restores) == len(restore_records), "Duplicate restore logs")
     l2_rows = [r for r in rows if r["group"] == "l2"]
     for row in l2_rows:
         if row["case"] == "restore" and phase != "native":
-            r = restores.get(row["rid"])
-            require(
-                r and r["native_missing_pages"] > 0, "Missing GPU eviction evidence"
-            )
-            require(
-                r["verified_pages"] == r["adopted_pages"] > 0,
-                "L2 writeback was not verified",
-            )
-            if phase == "force-l2":
-                require(r["lz4_pages"] == r["adopted_pages"], "L2 restored raw objects")
+            validate_restore_event(row, restores.get(row["rid"]), phase)
     if l2_rows and phase != "native":
         for cycle in (1, 2, 3):
             cycle_rows = {r["case"]: r for r in l2_rows if r["cycle"] == cycle}
@@ -531,11 +628,12 @@ def audit(directory):
             json.loads(line)
             for line in (directory / "drain.jsonl").read_text().splitlines()
         ]
-        completed = {
-            s["label"]
-            for s in observations
-            if s["consecutive"] == 3 and s["elapsed"] <= 180
-        }
+        if "execution_contract" in config:
+            require(
+                all("snapshot_id" in obs for obs in observations),
+                "Missing fresh snapshot identities",
+            )
+        completed = completed_drains(observations)
         needed = {"warmup", "final"}
         if l2_rows:
             needed |= {
@@ -574,7 +672,30 @@ def audit(directory):
 
 
 def compare(baseline, tested):
+    require(baseline.resolve() != tested.resolve(), "Self-comparison is not acceptance")
     configs = [json.loads((p / "config.json").read_text()) for p in (baseline, tested)]
+    allowed = {
+        ("native", "passthrough"),
+        ("native", "lz4"),
+        ("native", "force-l2"),
+        ("off", "force"),
+    }
+    require(
+        (configs[0]["phase"], configs[1]["phase"]) in allowed,
+        "Invalid baseline/test phase pair",
+    )
+    for key in (
+        "model",
+        "dtype",
+        "kv_cache_dtype",
+        "topology",
+        "sampling_params",
+        "execution_contract",
+    ):
+        require(
+            configs[0].get(key) == configs[1].get(key),
+            f"Different execution configuration: {key}",
+        )
     require(
         configs[0]["workload_sha256"] == configs[1]["workload_sha256"],
         "Different workloads",
@@ -643,6 +764,12 @@ def main():
     p.add_argument("--workload", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--router", required=True)
+    p.add_argument(
+        "--execution-contract",
+        required=True,
+        type=Path,
+        help="Frozen model/topology/image/source contract shared by all phases",
+    )
     p.add_argument("--phase", choices=PHASES, required=True)
     p.add_argument(
         "--scenario",

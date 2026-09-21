@@ -19,11 +19,11 @@ This branch integrates upstream main at
 `1da8ac10e1` and requires a new image and new GPU/RDMA acceptance run.
 Build from the complete branch checkout. The old r4 overlay, file hashes and
 online results describe the old snapshot and must not be used to certify this
-revision. All implementation and test files are committed in this branch.
+revision. Source delivery must identify both the base revision and all overlay hashes.
 
 The LZ4 payload and chunk descriptor remain v2, with nvCOMP `5.3.0.16`.
 Upstream added per-entry KV lengths to registration frame 19; compression now
-uses frames 20 and 21. The advertised capability includes `registration-v2` so
+uses frames 20 and 21. The advertised capability includes `registration-v2` and the `verify-0`/`verify-1` requirement so
 older experimental peers are rejected during bootstrap. Upgrade both workers
 together. With compression disabled, no compression fields are appended.
 
@@ -140,6 +140,7 @@ new source-hash manifest for that checkout. On each GPU worker, run:
 ```bash
 python test/manual/kv_transfer/check_pd_compression_image.py --manifest /path/to/new-manifest.json
 python -m pytest -q test/manual/kv_transfer/test_pd_compression_gpu.py --junitxml=/tmp/gpu.xml
+python test/manual/kv_transfer/check_pd_compression_image.py --manifest /path/to/new-manifest.json --gpu-report /tmp/gpu.xml
 ```
 
 Compare collected test node IDs with the new manifest; failures, missing cases
@@ -170,7 +171,7 @@ validation. Use fresh workers for each group, with no resets within a group.
 ```bash
 python test/manual/kv_transfer/validate_pd_compression.py run \
   --workload workload.json --output results/force-l2 --phase force-l2 \
-  --router "$ROUTER" \
+  --router "$ROUTER" --execution-contract execution-contract.json \
   --prefill-log-command "$PREFILL_LOG_COMMAND" \
   --decode-log-command "$DECODE_LOG_COMMAND"
 python test/manual/kv_transfer/validate_pd_compression.py audit results/force-l2
@@ -209,3 +210,54 @@ Never publish failed targets. Safe failures must drain before reclamation and
 allow a subsequent request; uncertain CUDA/RDMA drain must retain ownership
 and quarantine the worker. Local injection is not a real RDMA failure test.
 The complete online fault matrix and performance assessment remain required.
+
+## Review repair: admission, ownership and evidence
+
+A completed compressed restore already owns destination GPU pages. HiCache now
+exposes only the matching request's ready, generation-checked reservation to
+PrefillAdder. Its initial budget check subtracts those pages once; global free
+capacity and other requests receive no credit. Admission still checks the new
+tail and output reservation. Stale or cancelled tickets are reconciled without
+publishing their target pages.
+
+`decode_pages()` now returns a `DecodedPages` owner. Borrow `owner.raw` and
+`owner.to_staging_order()` only while open, discard borrowed views, then call
+`owner.close(consumer_stream)` after writeback and verification. The reservation
+covers output, a possible layout copy, Host-input upload and declared consumer
+scratch until GPU work drains. An impossible reservation fails before allocation;
+external restore threads may wait for temporary pressure without holding the
+executor lock. The sole executor thread must never wait for its own workspace.
+Cancellation interrupts receive-side reservation waits. Uncertain drain retains
+both allocations and charges. Backend-private nvCOMP allocations, registered
+wire buffers, receive rings and model KV are separate; this is not a total CUDA
+memory cap. Record process/device peaks separately in image testing.
+
+Compression quarantine now blocks incoming requests, Prefill admission and
+Decode preallocation/prebuilt admission. It retains uncertain resources and sends an explicit unhealthy signal to the
+tokenizer. `/ready`, `/health` and `/health_generate` remain unavailable until
+worker replacement; successful old responses do not clear quarantine. GPU byte
+corruption that drains safely remains a request failure and can be followed by
+a healthy request. These are different fault classes.
+
+Before `run`, create `execution-contract.json` from the actual deployment. It
+must contain source_manifest_sha256, image_digest, model, model_revision, dtype,
+kv_cache_dtype, topology, page_size and chunk_tokens. Use the same contract for
+all six groups of the same image; group switches are captured by phase and
+startup diagnostics. Retain the actual expanded launcher configuration beside
+it. Do not use the original r4 digest. A template is provided in
+`execution_contract.example.json`; replace every placeholder before running.
+Comparisons reject self-comparison, incompatible phase pairs and contract or
+sampling differences. Historical evidence without a contract may be audited,
+but does not certify a new deployment.
+
+The frozen 8192-token L2 replay now requires exactly 8191 Host-adopted and verified
+pages and device=0, host=8191, storage=0 in the response. Missing/null source
+details, partial restore, duplicate restore events, changed output tokens or
+missing requests fail. Natural drain requires three independently observed
+snapshots within 180 seconds; a single record declaring consecutive=3 is invalid.
+New runs retain snapshot identities and reject stale duplicates.
+
+The GPU test inventory includes decoded-owner lifetime at 1/64/65/1024 full
+Qwen3-8B-shaped pages, too-small budgets, and actual payload/target corruption.
+Use the manifest's collected node IDs, never an old hard-coded case count.
+Local CPU success and GPU collection/skips are not GPU or RDMA acceptance.

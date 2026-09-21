@@ -35,6 +35,60 @@ class HiCacheLifecycleMixin:
         state = self.async_l2
         return (state.runtime, state.provider) if state is not None else (None, None)
 
+    def admission_failure_reason(self):
+        state = self.async_l2
+        if state is not None and (
+            state.quarantined
+            or getattr(state.runtime, "is_quarantined", lambda: False)()
+        ):
+            return "Compressed HiCache is quarantined; restart worker"
+        return None
+
+    def get_restore_reserved_tokens(self, req, match=None):
+        state = self.async_l2
+        ticket = state.restore_ticket if state is not None else None
+        if ticket is None or ticket.req is not req:
+            return 0
+        anchor = match.best_match_node if match is not None else req.best_match_node
+        host_hits = match.host_hit_length if match is not None else req.host_hit_length
+        if (
+            ticket is None
+            or ticket.req is not req
+            or not ticket.ready
+            or ticket.consumed
+            or ticket.abandoned
+            or self.admission_failure_reason()
+            or req.finished_reason is not None
+            or req.to_finish is not None
+            or getattr(req, "retracted_stain", False)
+            or anchor != ticket.anchor
+        ):
+            return 0
+        # Scheduler-thread snapshot only. Do not publish, allocate, or give
+        # other candidates credit for memory owned by this request.
+        kv, extra = self.tree_core.build_load_back_spec(ticket.anchor, req=req)
+        if extra or len(kv.host_indices) != host_hits:
+            return 0
+        positions = {h: i for i, h in enumerate(ticket.host_indices.tolist())}
+        current = kv.host_indices.tolist()  # Handles include the generation.
+        if len(set(current)) != len(current) or any(
+            h not in positions for h in current
+        ):
+            return 0
+        refs = tuple(
+            ref
+            for nid in kv.nodes_to_load or []
+            for ref in self.tree_core.node_by_id(nid)
+            .component_data[ComponentType.FULL]
+            .metadata.get(REFS, ())
+        )
+        selected = [positions[h] for h in current]
+        if refs != tuple(ticket.page_refs[i] for i in selected):
+            return 0
+        if any(i >= len(ticket.device_indices) for i in selected):
+            return 0
+        return len(selected)
+
     def kv_page_refs(self, node):
         cd = node.component_data[ComponentType.FULL]
         refs = cd.metadata.get(REFS)
@@ -485,6 +539,11 @@ class HiCacheLifecycleMixin:
             match.host_hit_length == 0
             or getattr(ticket.req, "retracted_stain", False)
             or match.best_match_node != ticket.anchor
+            or (
+                ticket.ready
+                and self.get_restore_reserved_tokens(ticket.req, match)
+                != match.host_hit_length
+            )
         ):
             ticket.abandoned = True
             self._reap_cancelled_restore()

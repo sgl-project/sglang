@@ -636,7 +636,9 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        admission_failure_reason=None,
     ):
+        self._admission_failure_reason = admission_failure_reason
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
@@ -1232,6 +1234,14 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        failure_check = getattr(self, "_admission_failure_reason", None)
+        failure = (
+            failure_check
+            or getattr(self.tree_cache, "admission_failure_reason", lambda: None)
+        )()
+        if failure:
+            req.set_finish_with_abort(failure, status_code=503)
+            return AddReqResult.OTHER
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
@@ -1259,9 +1269,14 @@ class PrefillAdder:
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
         with self._lock_node(req.last_node):
+            reserved = getattr(
+                self.tree_cache, "get_restore_reserved_tokens", lambda r: 0
+            )(req)
+            if not 0 <= reserved <= min(req.host_hit_length, cand_extend_input_len):
+                raise RuntimeError("Invalid request-owned restore reservation")
             admission = self._select_prefill_admission(
                 req,
-                total_tokens=total_tokens,
+                total_tokens=total_tokens - reserved,
                 host_hit_length=req.host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,

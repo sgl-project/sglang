@@ -44,6 +44,72 @@ class _Entry:
     submitted: bool = False
 
 
+class WorkspaceReservation:
+    """Explicit ownership through the final consumer, not just the producer Future."""
+
+    def __init__(self, runtime, size):
+        self.runtime, self.size = runtime, size
+        self.closed = False
+        self.quarantined = False
+
+    def release(self):
+        with self.runtime._lock:
+            if self.quarantined:
+                raise BufferDrainError("Workspace is quarantined")
+            if not self.closed:
+                self.closed = True
+                self.runtime._live_bytes -= self.size
+                self.runtime._workspace_bytes -= self.size
+
+    def quarantine(self, error, owners=()):
+        # Do not release the charge or the tensors while access is uncertain.
+        self.quarantined = True
+        self.runtime.quarantine(error, (self, owners))
+
+
+class DecodedPages:
+    """Borrow raw/staging tensors only while this owner remains open.
+
+    close() must name the consumer stream when it differs from the runtime
+    stream. Callers must drop borrowed tensor views before closing the owner.
+    Backend-private CUDA allocations are separate from this explicit budget.
+    """
+
+    def __init__(self, runtime, raw, reservation):
+        self.runtime, self.raw, self.reservation = runtime, raw, reservation
+        self.staging = None
+        self.conversion_stream = None
+
+    def to_staging_order(self):
+        if self.reservation.closed:
+            raise RuntimeError("Decoded pages have been released")
+        if self.staging is None:
+            if self.raw.is_cuda:
+                self.conversion_stream = torch.cuda.current_stream(self.raw.device)
+            self.staging = self.runtime.layout.to_staging_order(self.raw)
+        return self.staging
+
+    def close(self, consumer_stream=None):
+        if self.reservation.closed:
+            return
+        try:
+            if self.reservation.quarantined:
+                raise BufferDrainError("Decoded pages are quarantined")
+            self.runtime.drain()
+            if (
+                self.conversion_stream is not None
+                and self.conversion_stream is not consumer_stream
+            ):
+                self.conversion_stream.synchronize()
+            if consumer_stream is not None:
+                consumer_stream.synchronize()
+        except Exception as exc:
+            self.reservation.quarantine(exc, (self, consumer_stream))
+            raise BufferDrainError("Decoded consumer did not drain") from exc
+        self.raw = self.staging = None
+        self.reservation.release()
+
+
 class KVCompressionRuntime:
     batch_pages = 64
 
@@ -77,6 +143,8 @@ class KVCompressionRuntime:
         self._jobs = queue.PriorityQueue()
         self._sequence = itertools.count()
         self._live_bytes = 0
+        self._workspace_bytes = 0
+        self._workspace_waiters = 0
         self._closed = False
         self._running = 0
         self._active_job = None
@@ -88,6 +156,8 @@ class KVCompressionRuntime:
             "raw_fallback_pages": 0,
             "encode_seconds": 0.0,
             "peak_bytes": 0,
+            "workspace_rejections": 0,
+            "workspace_wait_seconds": 0.0,
             "attempted_raw_bytes": 0,
             "attempted_encoded_bytes": 0,
             "attempted_capacity_bytes": 0,
@@ -217,12 +287,67 @@ class KVCompressionRuntime:
 
     def _charge(self, size):
         with self._lock:
+            if size < 0 or size > self.budget_bytes:
+                raise CompressionCapacityError(
+                    "Single operation exceeds compression workspace budget"
+                )
             if self._live_bytes + size > self.budget_bytes:
+                self.stats["workspace_rejections"] += 1
                 raise CompressionCapacityError(
                     "Compression GPU workspace budget exhausted"
                 )
             self._live_bytes += size
             self.stats["peak_bytes"] = max(self.stats["peak_bytes"], self._live_bytes)
+
+    def reserve_workspace(self, size, *, wait=False, cancelled=None):
+        if size < 0 or size > self.budget_bytes:
+            raise CompressionCapacityError(
+                "Single operation exceeds compression workspace budget"
+            )
+        if wait and threading.current_thread() is self._worker:
+            raise RuntimeError(
+                "The sole compression worker must not wait for workspace"
+            )
+        started = time.monotonic()
+        with self._lock:
+            self._workspace_waiters += 1
+        try:
+            while True:
+                with self._lock:
+                    if cancelled is not None and cancelled():
+                        raise concurrent.futures.CancelledError()
+                    if self._quarantine or self._closed:
+                        raise BufferDrainError("Compression runtime is unavailable")
+                    try:
+                        self._charge(size)
+                    except CompressionCapacityError:
+                        if not wait:
+                            raise
+                    else:
+                        self._workspace_bytes += size
+                        return WorkspaceReservation(self, size)
+                # Only an external execution thread may wait. No pool/runtime
+                # lock, scheduler thread, or GPU allocation is held here.
+                time.sleep(0.001)
+        finally:
+            with self._lock:
+                self._workspace_waiters -= 1
+                self.stats["workspace_wait_seconds"] += time.monotonic() - started
+
+    def is_quarantined(self):
+        with self._lock:
+            return bool(self._quarantine)
+
+    def decode_workspace_bytes(self, pages, consumer_bytes=0):
+        raw = len(pages) * self.layout.page_bytes
+        # Output + possible slot-major copy + caller's verification storage.
+        # Host inputs also need H2D copies; receive-ring GPU views are external.
+        inputs = sum(
+            p.nbytes
+            for p in pages
+            if isinstance(p, HostEncodedPage) or not p.data.is_cuda
+        )
+        return 2 * raw + inputs + consumer_bytes + 64 * len(pages)
 
     def _drop(self, key, entry):
         with self._lock:
@@ -500,7 +625,29 @@ class KVCompressionRuntime:
                         entry.future.set_exception(failure)
                     self._drop(key, entry)
 
-    def decode_pages(self, pages):
+    def decode_pages(self, pages, *, consumer_bytes=0, reservation=None):
+        """Worker-only. Return an owned result; caller closes after GPU use."""
+        required = self.decode_workspace_bytes(pages, consumer_bytes)
+        if reservation is None:
+            reservation = self.reserve_workspace(required)
+        elif (
+            reservation.runtime is not self
+            or reservation.closed
+            or reservation.size < required
+        ):
+            raise ValueError("Invalid decode workspace reservation")
+        try:
+            raw = self._decode_pages(pages)
+            return DecodedPages(self, raw, reservation)
+        except BaseException as exc:
+            if isinstance(exc, BufferDrainError):
+                reservation.quarantine(exc, pages)
+            else:
+                reservation.release()
+            raise
+
+    def _decode_pages(self, pages):
+        # L2 restore owns an enclosing reservation through unpack + verification.
         with materialize_pages(pages) as contiguous:
             return self._decode_contiguous_pages(contiguous)
 
@@ -581,7 +728,7 @@ class KVCompressionRuntime:
                     host.pool.test_fault.check(
                         f"restore:{host.handle}", "before_restore"
                     )
-                raw = self.decode_pages(pages)
+                raw = self._decode_pages(pages)
                 if host is not None:
                     host.pool.test_fault.check(
                         f"restore:{host.handle}", "after_restore_copy"
@@ -636,17 +783,26 @@ class KVCompressionRuntime:
                 and not self._running
                 and self._jobs.empty()
                 and not self._quarantine
+                and not self._workspace_bytes
+                and not self._workspace_waiters
             )
 
     def has_pending_work(self):
         with self._lock:
-            return bool(self._running or not self._jobs.empty())
+            return bool(
+                self._running
+                or not self._jobs.empty()
+                or self._workspace_bytes
+                or self._workspace_waiters
+            )
 
     def snapshot(self):
         with self._lock:
             return dict(
                 self.stats,
                 resident_bytes=self._live_bytes,
+                workspace_bytes=self._workspace_bytes,
+                workspace_waiters=self._workspace_waiters,
                 inflight_objects=len(self._entries),
                 queued_tasks=self._jobs.qsize(),
                 running_tasks=self._running,

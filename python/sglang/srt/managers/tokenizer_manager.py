@@ -669,10 +669,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
+    def _handle_health_check_output(self, output: HealthCheckOutput):
+        if output.quarantine_reason:
+            self.compression_quarantine_reason = output.quarantine_reason
+            self.server_status = ServerStatus.UnHealthy
+
     def is_ready(self) -> bool:
         """Return whether this server should receive new requests."""
         return (
             not self.is_pause
+            and not getattr(self, "compression_quarantine_reason", None)
             and not self.gracefully_exit
             and self.server_status == ServerStatus.Up
         )
@@ -833,7 +839,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
+                (HealthCheckOutput, self._handle_health_check_output),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),

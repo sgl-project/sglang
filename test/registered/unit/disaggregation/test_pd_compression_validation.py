@@ -25,6 +25,115 @@ spec.loader.exec_module(validation)
 
 
 class ValidationTests(unittest.TestCase):
+    def test_execution_contract_requires_pinned_real_values(self):
+        template = json.loads(
+            (
+                ROOT / "test/manual/kv_transfer/execution_contract.example.json"
+            ).read_text()
+        )
+        with self.assertRaises(AssertionError):
+            validation.validate_execution_contract(template)
+        template.update(
+            source_manifest_sha256="a" * 64,
+            image_digest="sha256:" + "b" * 64,
+            model_revision="model-files-sha256",
+        )
+        validation.validate_execution_contract(template)
+        for key, value in (
+            ("model_revision", ""),
+            ("page_size", 16),
+            ("source_manifest_sha256", "old"),
+            ("topology", {}),
+        ):
+            with self.assertRaises(AssertionError):
+                validation.validate_execution_contract(dict(template, **{key: value}))
+
+    def test_gpu_inventory_rejects_skips_missing_and_duplicate_cases(self):
+        spec = importlib.util.spec_from_file_location(
+            "image_check",
+            ROOT / "test/manual/kv_transfer/check_pd_compression_image.py",
+        )
+        check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(check)
+        manifest = {"gpu_test_nodeids": ["test_gpu.py::test_a", "test_gpu.py::test_b"]}
+        path = self.root / "gpu.xml"
+        path.write_text(
+            '<testsuite><testcase name="test_a"/><testcase name="test_b"/></testsuite>'
+        )
+        self.assertEqual(check.validate_gpu_report(manifest, path), 2)
+        for bad in (
+            '<testcase name="test_a"/>',
+            '<testcase name="test_a"/><testcase name="test_a"/>',
+            '<testcase name="test_a"><skipped/></testcase><testcase name="test_b"/>',
+            '<testcase name="test_a"><failure/></testcase><testcase name="test_b"/>',
+        ):
+            path.write_text("<testsuite>" + bad + "</testsuite>")
+            with self.assertRaises(AssertionError):
+                check.validate_gpu_report(manifest, path)
+
+    def test_restore_gate_requires_full_frozen_range(self):
+        row = {
+            "group": "l2",
+            "case": "restore",
+            "rid": "r",
+            "input_tokens": 8192,
+            "result": {
+                "meta_info": {
+                    "cached_tokens": 8191,
+                    "cached_tokens_details": {"device": 0, "host": 8191, "storage": 0},
+                }
+            },
+        }
+        event = dict(
+            native_missing_pages=8191,
+            adopted_pages=8191,
+            verified_pages=8191,
+            lz4_pages=8191,
+        )
+        validation.validate_restore_event(row, event, "force-l2")
+        for count in (1, 7172):
+            broken = dict(event, adopted_pages=count, verified_pages=count)
+            with self.assertRaises(AssertionError):
+                validation.validate_restore_event(row, broken, "force-l2")
+        for detail in (
+            None,
+            {},
+            {"device": 8190, "host": 1},
+            {"device": 0, "host": 7172},
+        ):
+            row["result"]["meta_info"]["cached_tokens_details"] = detail
+            with self.assertRaises(AssertionError):
+                validation.validate_restore_response(row)
+
+    def test_drain_requires_three_observations_not_claimed_counter(self):
+        rows = [
+            dict(label="final", elapsed=i * 5, idle=True, consecutive=i)
+            for i in (1, 2, 3)
+        ]
+        self.assertEqual(validation.completed_drains(rows), {"final"})
+        for broken in (
+            [rows[-1]],
+            [rows[0], rows[0], rows[-1]],
+            [dict(rows[0], elapsed=181)],
+        ):
+            with self.assertRaises(AssertionError):
+                validation.completed_drains(broken)
+
+    def test_illegal_pairs_self_comparison_and_model_changes_rejected(self):
+        a, b = self.fixture("a"), self.fixture("b")
+        with self.assertRaisesRegex(AssertionError, "Self-comparison"):
+            validation.compare(b, b)
+        config = json.loads((b / "config.json").read_text())
+        config["model"] = "other"
+        (b / "config.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(AssertionError, "configuration"):
+            validation.compare(a, b)
+        config.pop("model")
+        config["phase"] = "force-l2"
+        (b / "config.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(AssertionError, "phase pair"):
+            validation.compare(a, b)
+
     def test_null_missing_and_device_only_are_host_misses(self):
         for meta in (
             {},
@@ -48,7 +157,7 @@ class ValidationTests(unittest.TestCase):
         root = self.root / name
         root.mkdir()
         config = {
-            "phase": "force",
+            "phase": "off" if name == "a" else "force",
             "workload_sha256": "same",
             "expected_cases": [["lengths", 0, "32"]],
         }

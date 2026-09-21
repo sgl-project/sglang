@@ -28,7 +28,7 @@ def validate_mode(mode: str) -> str:
     return mode
 
 
-def capability(mode: str, force=None) -> str:
+def capability(mode: str, force=None, verify=None) -> str:
     validate_mode(mode)
     if mode == "off":
         return "off"
@@ -39,10 +39,17 @@ def capability(mode: str, force=None) -> str:
             "yes",
             "y",
         )
+    if verify is None:
+        verify = os.environ.get("SGLANG_PD_KV_COMPRESSION_VERIFY", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
     suffix = "/forced-test" if force else ""
     return (
         f"pd-kv-v{PROTOCOL_VERSION}/{mode}/nvcomp-{NVCOMP_VERSION}"
-        f"/native-lz4-65536/registration-v{REGISTRATION_VERSION}{suffix}"
+        f"/native-lz4-65536/registration-v{REGISTRATION_VERSION}/verify-{int(verify)}{suffix}"
     )
 
 

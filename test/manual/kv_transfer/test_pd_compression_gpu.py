@@ -391,3 +391,245 @@ def test_gpu_block_write_failure_drains_before_reclaim():
         assert pool.free_block_count == pool.block_count
     finally:
         runtime.close()
+
+
+# Review regressions ported from the isolated H20 diagnostics.
+def review_record(value):
+    import json
+
+    print(json.dumps(value))
+
+
+def review_layout(count):
+    from sglang.srt.kv_compression.layout import KVLayoutAdapter
+
+    assert torch.cuda.is_available(), "A GPU skip cannot satisfy this diagnostic"
+    # Full Qwen3-8B GQA page size: 36 layers * K/V * 8 * 128 * BF16.
+    tensors = [
+        torch.zeros((2 * count + 3, 8, 128), dtype=torch.bfloat16, device="cuda:0")
+        for _ in range(72)
+    ]
+    return KVLayoutAdapter(tensors[:36], tensors[36:])
+
+
+def review_encoded(runtime, indices):
+    from sglang.srt.kv_compression.types import EncodedPage, new_page_refs
+    from sglang.srt.kv_compression.verification import page_digests
+
+    # The production Host I/O publisher adds these digests; the transient
+    # encoder by itself intentionally does not attach L2 verification metadata.
+    expected = page_digests(runtime.layout.pack_pages(indices))
+    leases = runtime.acquire_pages(new_page_refs(len(indices)), indices)
+    try:
+        pages = [lease.future.result(timeout=120) for lease in leases]
+        # Independent receiver input storage, outside decompression workspace.
+        output = [
+            EncodedPage(p.data.clone(), p.encoding, p.raw_bytes, digest)
+            for p, digest in zip(pages, expected)
+        ]
+        torch.cuda.synchronize()
+        return output
+    finally:
+        for lease in leases:
+            lease.close()
+
+
+@pytest.mark.parametrize("mode", ["passthrough", "lz4"])
+@pytest.mark.parametrize("count", [1, 64, 65, 1024])
+def test_decode_output_stays_budgeted_until_delayed_scatter(mode, count):
+    import concurrent.futures
+    import gc
+    import threading
+
+    from sglang.srt.kv_compression.runtime import KVCompressionRuntime
+
+    model = review_layout(count)
+    runtime = KVCompressionRuntime(
+        model, mode, 512 * 1024**2, force=mode == "lz4", verify=True
+    )
+    pages = review_encoded(runtime, list(range(0, 2 * count, 2)))
+    release, reached = threading.Event(), threading.Event()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    held = []
+    owner = decoded = staging = None
+    try:
+        before = torch.cuda.memory_allocated()
+        owner = runtime.submit(lambda: runtime.decode_pages(pages), priority=0).result(
+            timeout=120
+        )
+        decoded = owner.raw
+        torch.cuda.synchronize()
+        staging = owner.to_staging_order()
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_allocated()
+
+        # A real consumer holds both results before writing non-contiguous KV.
+        def scatter():
+            held.extend([decoded, staging])
+            reached.set()
+            if not release.wait(timeout=30):
+                raise TimeoutError("Test release signal missing")
+            model.unpack_pages(decoded, list(range(1, 2 * count + 1, 2)))
+            torch.cuda.synchronize()
+
+        consumer = executor.submit(scatter)
+        assert reached.wait(timeout=10)
+        snapshot = runtime.snapshot()
+        storages = {
+            t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in held
+        }
+        live_result_bytes = sum(storages.values())
+        review_record(
+            dict(
+                case="delayed-scatter",
+                mode=mode,
+                count=count,
+                raw_bytes=count * model.page_bytes,
+                held_storage_bytes=live_result_bytes,
+                pytorch_allocated_delta=after - before,
+                runtime=snapshot,
+                encoding={
+                    e: sum(p.encoding == e for p in pages) for e in ("raw", "lz4")
+                },
+                budget_covers_live_output=snapshot["resident_bytes"]
+                >= live_result_bytes,
+            )
+        )
+        release.set()
+        consumer.result(timeout=30)
+        assert torch.equal(model.pack_pages(list(range(1, 2 * count + 1, 2))), decoded)
+        assert snapshot["resident_bytes"] >= live_result_bytes, (
+            "Decode output/layout storage is live but uncharged"
+        )
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+        del held[:]
+        decoded = staging = None
+        if owner is not None:
+            owner.close(torch.cuda.current_stream())
+            assert runtime.snapshot()["workspace_bytes"] == 0
+        runtime.close()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def test_decode_rejects_task_larger_than_workspace():
+
+    from sglang.srt.kv_compression.runtime import KVCompressionRuntime
+    from sglang.srt.kv_compression.types import EncodedPage
+
+    model = review_layout(1)
+    raw = torch.zeros(model.page_bytes, dtype=torch.uint8, device="cuda:0")
+    runtime = KVCompressionRuntime(
+        model, "passthrough", model.page_bytes - 1, verify=True
+    )
+    rejected = False
+    try:
+        try:
+            runtime.submit(
+                lambda: runtime.decode_pages([EncodedPage(raw, "raw", raw.numel())]),
+                priority=0,
+            ).result(timeout=30)
+        except Exception as exc:
+            from sglang.srt.kv_compression.types import CompressionCapacityError
+
+            if not isinstance(exc, CompressionCapacityError):
+                raise
+            rejected = True
+        review_record(
+            dict(
+                case="impossible-decode-budget",
+                budget=runtime.budget_bytes,
+                output_bytes=model.page_bytes,
+                rejected=rejected,
+                runtime=runtime.snapshot(),
+            )
+        )
+        assert rejected, "Impossible decode task was accepted"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("mode", ["passthrough", "lz4"])
+@pytest.mark.parametrize("where", ["payload", "target"])
+def test_actual_byte_corruption_detected_and_next_restore_succeeds(mode, where):
+    import concurrent.futures
+    from unittest.mock import patch
+
+    from sglang.srt.kv_compression.runtime import KVCompressionRuntime
+    from sglang.srt.kv_compression.types import EncodedPage, KVVerificationError, Lease
+    from sglang.srt.kv_compression.verification import page_digests
+
+    model = review_layout(1)
+    runtime = KVCompressionRuntime(
+        model, mode, 512 * 1024**2, force=mode == "lz4", verify=True
+    )
+    pages = review_encoded(runtime, [0])
+    future = concurrent.futures.Future()
+    future.set_result(pages[0])
+    leases = [Lease(future, lambda: None)]
+    triggered = 0
+    rejected = False
+    try:
+        if where == "payload":
+            # Mutate bytes without risking malformed nvCOMP metadata: encode
+            # changed source bytes but retain the original source digest.
+            model.buffers[0][0].view(torch.uint8).flatten()[0] ^= 1
+            changed = review_encoded(runtime, [0])[0]
+            assert not torch.equal(changed.data, pages[0].data)
+            bad = EncodedPage(
+                changed.data, changed.encoding, changed.raw_bytes, pages[0].raw_sha256
+            )
+            bad_future = concurrent.futures.Future()
+            bad_future.set_result(bad)
+            bad_leases = [Lease(bad_future, lambda: None)]
+            triggered += 1
+            try:
+                runtime.submit(
+                    lambda: runtime.restore(bad_leases, [1]), priority=0
+                ).result(timeout=30)
+            except KVVerificationError:
+                rejected = True
+            model.buffers[0][0].view(torch.uint8).flatten()[0] ^= 1
+            bad_leases[0].close()
+        else:
+            original = model.unpack_pages
+
+            def corrupt(raw, indices):
+                nonlocal triggered
+                original(raw, indices)
+                model.buffers[0][indices[0]].view(torch.uint8).flatten()[0] ^= 1
+                triggered += 1
+
+            with patch.object(model, "unpack_pages", side_effect=corrupt):
+                try:
+                    runtime.submit(
+                        lambda: runtime.restore(leases, [1]), priority=0
+                    ).result(timeout=30)
+                except KVVerificationError:
+                    rejected = True
+        failed_snapshot = runtime.snapshot()
+        assert rejected and triggered == 1
+        assert failed_snapshot["verified_restore_pages"] == 0
+        assert failed_snapshot["resident_bytes"] == 0
+        runtime.submit(lambda: runtime.restore(leases, [1]), priority=0).result(
+            timeout=30
+        )
+        assert page_digests(model.pack_pages([1])) == [pages[0].raw_sha256]
+        review_record(
+            dict(
+                case="real-byte-corruption",
+                mode=mode,
+                where=where,
+                triggered=triggered,
+                rejected=rejected,
+                next_restore_passed=True,
+                after_failure=failed_snapshot,
+                boundary="Isolated CUDA restore; no scheduler/attention or RDMA",
+            )
+        )
+    finally:
+        for lease in leases:
+            lease.close()
+        runtime.close()

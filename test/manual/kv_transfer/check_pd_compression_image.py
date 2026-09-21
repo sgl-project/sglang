@@ -1,19 +1,33 @@
 """Verify packaged source and runtime; does not send serving requests.
 
-Run with the same CUDA_VISIBLE_DEVICES as the worker launcher. Optionally
-supply --manifest to verify every delivered source file before GPU tests.
+Run with the same CUDA_VISIBLE_DEVICES as the worker launcher. The manifest
+is required; --gpu-report also checks exact test coverage and zero skips.
 """
 
 import argparse
 import hashlib
 import importlib.metadata
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
+
+
+def validate_gpu_report(manifest, path):
+    expected = {node.split("::", 1)[1] for node in manifest["gpu_test_nodeids"]}
+    cases = list(ET.parse(path).getroot().iter("testcase"))
+    names = [case.attrib.get("name") for case in cases]
+    if not expected or len(names) != len(set(names)) or set(names) != expected:
+        raise AssertionError("GPU test inventory is incomplete or duplicated")
+    for case in cases:
+        if any(case.find(kind) is not None for kind in ("skipped", "failure", "error")):
+            raise AssertionError(f"GPU test did not pass: {case.attrib.get('name')}")
+    return len(cases)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--gpu-report", type=Path)
     args = parser.parse_args()
     import torch
 
@@ -34,6 +48,9 @@ def main():
                 or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]
             ):
                 raise AssertionError(f"Delivered source mismatch: {path}")
+    gpu_passed = (
+        validate_gpu_report(manifest, args.gpu_report) if args.gpu_report else None
+    )
     assert PROTOCOL_VERSION == 2
     assert REGISTRATION_VERSION == 2
     assert torch.cuda.is_available(), "CUDA is unavailable"
@@ -73,6 +90,7 @@ def main():
                 versions=versions,
                 gpu=torch.cuda.get_device_name(0),
                 source_verified=bool(args.manifest),
+                gpu_tests_passed=gpu_passed,
             ),
             indent=2,
         )

@@ -2806,6 +2806,10 @@ class SchedulerDisaggregationDecodeMixin:
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
+        if failure := self.compression_failure_reason():
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return None
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
             return self._get_new_prebuilt_batch(running_batch)
@@ -2935,6 +2939,12 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
+        if failure := self.compression_failure_reason():
+            # Preallocation, receive and retraction queues retain ownership.
+            # An uncertain worker cannot allocate or admit more requests.
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

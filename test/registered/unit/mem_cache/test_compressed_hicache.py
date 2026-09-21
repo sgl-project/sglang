@@ -379,6 +379,108 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.stats["raw_fallback_pages"], 0)
         self.assertEqual(self.runtime._live_bytes, 0)
 
+    def test_decode_owner_covers_output_and_layout_until_closed(self):
+        from sglang.srt.kv_compression.types import EncodedPage
+
+        raw = self.layout.pack_pages([0, 1, 2])
+        pages = [EncodedPage(row, "raw", self.layout.page_bytes) for row in raw]
+        owner = self.runtime.submit(lambda: self.runtime.decode_pages(pages), 0).result(
+            5
+        )
+        staging = owner.to_staging_order()
+        storages = {
+            t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+            for t in (owner.raw, staging)
+        }
+        self.assertGreaterEqual(
+            self.runtime.snapshot()["workspace_bytes"], sum(storages.values())
+        )
+        self.assertFalse(self.runtime.idle())
+        self.assertTrue(torch.equal(owner.raw, raw))
+        staging = None
+        stream = NS(synchronize=Mock())
+        owner.close(stream)
+        owner.close(stream)
+        stream.synchronize.assert_called_once()
+        self.assertEqual(self.runtime.snapshot()["resident_bytes"], 0)
+        self.assertIsNone(owner.raw)
+
+    def test_decode_rejects_impossible_budget_before_allocating(self):
+        from sglang.srt.kv_compression.types import EncodedPage
+
+        page = EncodedPage(
+            self.layout.pack_pages([0])[0], "raw", self.layout.page_bytes
+        )
+        self.runtime.budget_bytes = self.layout.page_bytes - 1
+        with self.assertRaises(CompressionCapacityError):
+            self.runtime.submit(lambda: self.runtime.decode_pages([page]), 0).result(5)
+        self.assertEqual(self.runtime.snapshot()["resident_bytes"], 0)
+        with self.assertRaises(CompressionCapacityError):
+            self.runtime.reserve_workspace(self.layout.page_bytes, wait=True)
+
+    def test_decode_failure_releases_but_unknown_drain_retains_budget(self):
+        from sglang.srt.kv_compression.types import EncodedPage
+
+        page = EncodedPage(
+            self.layout.pack_pages([0])[0], "bad", self.layout.page_bytes
+        )
+        with self.assertRaises(ValueError):
+            self.runtime.submit(lambda: self.runtime.decode_pages([page]), 0).result(5)
+        self.assertEqual(self.runtime.snapshot()["resident_bytes"], 0)
+        page = EncodedPage(page.data, "raw", page.raw_bytes)
+        owner = self.runtime.submit(
+            lambda: self.runtime.decode_pages([page]), 0
+        ).result(5)
+        with self.assertRaises(BufferDrainError):
+            owner.close(NS(synchronize=Mock(side_effect=RuntimeError("uncertain"))))
+        self.assertTrue(self.runtime.is_quarantined())
+        self.assertGreater(self.runtime.snapshot()["workspace_bytes"], 0)
+        with self.assertRaises(BufferDrainError):
+            owner.close()
+        self.assertIsNotNone(owner.raw)
+
+    def test_cancelled_workspace_wait_does_not_consume_or_leak_budget(self):
+        held = self.runtime.reserve_workspace(self.runtime.budget_bytes)
+        cancel = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            waiting = executor.submit(
+                self.runtime.reserve_workspace, 1, wait=True, cancelled=cancel.is_set
+            )
+            cancel.set()
+            with self.assertRaises(concurrent.futures.CancelledError):
+                waiting.result(5)
+        self.assertEqual(
+            self.runtime.snapshot()["workspace_bytes"], self.runtime.budget_bytes
+        )
+        self.assertEqual(self.runtime.snapshot()["workspace_waiters"], 0)
+        held.release()
+        self.runtime.reserve_workspace(1).release()
+        self.assertEqual(self.runtime.snapshot()["resident_bytes"], 0)
+
+    def test_workspace_wait_does_not_block_executor_or_hold_lock(self):
+        lease = self.runtime.reserve_workspace(self.runtime.budget_bytes)
+        entered, finished = threading.Event(), threading.Event()
+
+        def waiting():
+            entered.set()
+            second = self.runtime.reserve_workspace(1, wait=True)
+            second.release()
+            finished.set()
+
+        worker = threading.Thread(target=waiting)
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        self.runtime.submit(lambda: 42, 0).result(5)
+        self.assertFalse(finished.is_set())
+        lease.release()
+        worker.join(5)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(self.runtime.snapshot()["workspace_bytes"], 0)
+        with self.assertRaises(RuntimeError):
+            self.runtime.submit(
+                lambda: self.runtime.reserve_workspace(1, wait=True), 0
+            ).result(5)
+
     def test_host_only_restore_and_send_reuse_no_reencode(self):
         pool = CompressedHostKVCache(self.layout.page_bytes, 65536, pin_memory=False)
         self.runtime.provider = HostEncodedKVProvider(
@@ -1816,8 +1918,10 @@ class AuditR31Tests(unittest.TestCase):
                         pack_pages=Mock(side_effect=ValueError("pack failed")),
                         to_staging_order=Mock(),
                     ),
-                    shared=NS(quarantine=Mock()),
+                    shared=NS(quarantine=Mock(), reserve_workspace=Mock()),
                 )
+                reservation = NS(release=Mock(), quarantine=runtime.shared.quarantine)
+                runtime.shared.reserve_workspace.return_value = reservation
                 helper = source_function(
                     "disaggregation/mooncake/compression.py",
                     "source_digest",
@@ -2640,6 +2744,228 @@ class BackupAdmissionTimingTests(unittest.TestCase):
             exporter.allocator_work, "allocation_blocks", 40000
         )
         exporter.allocator_lock_max.set.assert_called_once_with(1.0)
+
+
+class RestoreAdmissionBudgetTests(unittest.TestCase):
+    """Actual admission/selection/budget/ACK/consume methods, fake I/O only."""
+
+    def setUp(self):
+        import contextlib
+        import dataclasses
+        from enum import Enum, auto
+
+        self.f = LifecycleTests()
+        self.f.setUp()
+        f = self.f
+        count = 8191
+        handles = torch.arange(count, dtype=torch.int64)
+        refs = tuple(range(1, count + 1))
+        f.kv.host_indices = handles
+        f.cd.host_value = handles
+        f.cd.metadata["compression_page_refs"] = refs
+        f.node.key = list(range(count))
+        page = NS(nbytes=4096, raw_bytes=4096, encoding="raw")
+        f.state.pool = NS(
+            acquire=lambda *a, **kw: NS(future=result(page), close=lambda: None)
+        )
+        self.available = 12000
+
+        def alloc(n):
+            self.available -= n
+            return torch.arange(n, dtype=torch.int64)
+
+        allocator = NS(
+            page_size=1,
+            available_size=lambda: self.available,
+            alloc=alloc,
+            free=lambda x: setattr(self, "available", self.available + len(x)),
+        )
+        f.cache.token_to_kv_pool_allocator = allocator
+        f.cache.supports_mamba = lambda: False
+        f.cache.evictable_size = lambda: 0
+        f.cache.init_load_back = lambda params: self.init_load_back(params)
+        req = f.req
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.full_untruncated_fill_ids = list(range(8192))
+        req.output_ids = []
+        req.sampling_params = NS(ignore_eos=False, max_new_tokens=1)
+        req.host_hit_length, req.swa_host_hit_length = count, 0
+        req.best_match_node = 1
+        req.kv = NS(cache_protected_len=0)
+        req.needs_host_load_back = lambda: req.host_hit_length > 0
+        req.set_extend_range = Mock()
+        path = ROOT / "python/sglang/srt/managers/schedule_policy.py"
+        ns = dict(Enum=Enum, auto=auto, dataclass=dataclasses.dataclass)
+        tree = ast.parse(path.read_text())
+        for name in ("AddReqResult", "_PrefillAdmission"):
+            node = next(
+                n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name
+            )
+            exec(
+                compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns
+            )
+        self.Result = ns["AddReqResult"]
+        ns.update(
+            torch=torch,
+            CLIP_MAX_NEW_TOKENS=4096,
+            _IS_HIP=False,
+            InitLoadBackParams=lambda **kw: NS(mem_quota=None, **kw),
+        )
+        methods = {
+            name: source_function(
+                "managers/schedule_policy.py", name, "PrefillAdder", **ns
+            )
+            for name in (
+                "add_one_req",
+                "_select_prefill_admission",
+                "_check_prefill_budget",
+                "_swa_new_tokens",
+                "ceil_paged_tokens",
+                "_commit_prefill_admission",
+                "_update_prefill_budget",
+                "budget_state",
+                "_check_prefill_tile_budget",
+            )
+        }
+        Adder = type("ActualPrefillMethods", (), methods)
+        budget_tree = ast.parse(
+            (ROOT / "python/sglang/srt/mem_cache/prefill_budget.py").read_text()
+        )
+        node = next(
+            n
+            for n in budget_tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "PrefillBudget"
+        )
+        bns = {}
+        exec(
+            compile(
+                ast.Module(body=[node], type_ignores=[]), "prefill_budget.py", "exec"
+            ),
+            bns,
+        )
+        self.adder = Adder()
+        self.adder.__dict__.update(
+            tree_cache=f.cache,
+            memory_budget=bns["PrefillBudget"](allocator, f.cache),
+            prefill_max_requests=None,
+            can_run_list=[],
+            page_size=1,
+            rem_chunk_tokens=1024,
+            rem_input_tokens=32768,
+            rem_mamba_slots=None,
+            dllm_config=None,
+            exact_chunk_fill=False,
+            prefill_delayer_single_pass=None,
+            _lock_node=lambda n: contextlib.nullcontext(),
+            _mamba_gap_budget_for_req=lambda r: 0,
+            _req_inc_lock_ref=Mock(),
+            _account_prefill_cache_admission=Mock(),
+            log_hit_tokens=0,
+            log_input_tokens=0,
+        )
+
+    def init_load_back(self, params):
+        self.f.params = params
+        return self.f.begin()
+
+    def tearDown(self):
+        self.f.tearDown()
+
+    def step(self):
+        return self.adder.add_one_req(self.f.req, False, None)
+
+    def test_pending_restoration_never_publishes(self):
+        self.step()
+        self.step()
+        self.assertFalse(self.adder.can_run_list)
+        self.f.cache.tree_core.commit_load_back.assert_not_called()
+        self.assertEqual(self.f.cache.get_restore_reserved_tokens(self.f.req), 0)
+
+    def test_other_request_gets_no_credit(self):
+        self.step()
+        self.f.complete()
+        other = NS(**self.f.req.__dict__)
+        other.rid = "other"
+        self.assertEqual(self.f.cache.get_restore_reserved_tokens(other), 0)
+        self.assertEqual(
+            self.adder.add_one_req(other, False, None), self.Result.NO_TOKEN
+        )
+        self.assertFalse(self.adder.can_run_list)
+
+    def test_real_shortfall_still_rejected(self):
+        self.step()
+        self.f.complete()
+        self.available = 2
+        self.assertEqual(self.step(), self.Result.NO_TOKEN)
+        self.assertFalse(self.adder.can_run_list)
+
+    def test_stale_cancelled_or_abandoned_ticket_has_no_credit(self):
+        self.step()
+        self.f.complete()
+        ticket = self.f.state.restore_ticket
+        for attr, value in (("abandoned", True), ("consumed", True), ("ready", False)):
+            old = getattr(ticket, attr)
+            setattr(ticket, attr, value)
+            self.assertEqual(self.f.cache.get_restore_reserved_tokens(self.f.req), 0)
+            setattr(ticket, attr, old)
+        self.f.req.to_finish = "abort"
+        self.assertEqual(self.f.cache.get_restore_reserved_tokens(self.f.req), 0)
+        self.f.req.to_finish = None
+        self.f.kv.host_indices = self.f.kv.host_indices + 100000
+        self.assertEqual(self.f.cache.get_restore_reserved_tokens(self.f.req), 0)
+
+    def test_quarantined_cache_rejects_new_cold_request(self):
+        self.step()
+        self.f.future.set_exception(BufferDrainError("unknown drain"))
+        self.f.poll()
+        cold = NS(**self.f.req.__dict__)
+        cold.rid, cold.host_hit_length = "cold", 0
+        cold.full_untruncated_fill_ids = list(range(32))
+        cold.needs_host_load_back = lambda: False
+        cold.set_finish_with_abort = Mock()
+        self.assertEqual(self.adder.add_one_req(cold, False, None), self.Result.OTHER)
+        self.assertFalse(self.adder.can_run_list)
+        cold.set_finish_with_abort.assert_called_once()
+        self.assertEqual(self.available, 3809)
+        self.assertTrue(self.f.state.quarantined)
+
+    def test_stale_generation_is_reaped_before_readmission(self):
+        self.step()
+        self.f.complete()
+        self.f.kv.host_indices = self.f.kv.host_indices + 100000
+        self.f.cache.reconcile_restore_ticket(
+            NS(req=self.f.req), NS(best_match_node=1, host_hit_length=8191)
+        )
+        self.assertIsNone(self.f.state.restore_ticket)
+        self.assertEqual(self.available, 12000)
+        self.f.cache.tree_core.commit_load_back.assert_not_called()
+
+    def test_cancel_after_ready_releases_once_and_does_not_publish(self):
+        self.step()
+        self.f.complete()
+        self.f.req.to_finish = "cancel"
+        self.f.cache._reap_cancelled_restore()
+        self.f.cache._reap_cancelled_restore()
+        self.assertEqual(self.available, 12000)
+        self.assertIsNone(self.f.state.restore_ticket)
+        self.f.cache.tree_core.commit_load_back.assert_not_called()
+
+    def test_transport_failure_callback_blocks_pd_without_l2(self):
+        self.adder._admission_failure_reason = lambda: "transport quarantined"
+        self.assertEqual(self.step(), self.Result.OTHER)
+        self.assertFalse(self.adder.can_run_list)
+        self.assertEqual(self.available, 12000)
+
+    def test_ready_ticket_does_not_pay_for_gpu_pages_twice(self):
+        self.assertEqual(self.step(), self.Result.OTHER)
+        self.assertEqual(self.available, 3809)
+        self.assertFalse(self.adder.can_run_list)
+        self.f.complete()
+        self.assertEqual(self.step(), self.Result.CONTINUE)
+        self.assertEqual(self.adder.can_run_list, [self.f.req])
+        self.assertEqual(self.f.req.host_loaded_length, 8191)
+        self.assertEqual(self.adder.memory_budget.total_offset, 3)
+        self.assertIsNone(self.f.state.restore_ticket)
 
 
 if __name__ == "__main__":

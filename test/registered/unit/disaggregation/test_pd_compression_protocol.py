@@ -138,6 +138,96 @@ class TestBackgroundProgress(unittest.TestCase):
         runtime.shared.idle = lambda: True
         self.assertTrue(is_idle(obj))
 
+    def test_quarantine_health_does_not_piggyback_on_busy_worker(self):
+        modes = NS(PREFILL="prefill", DECODE="decode")
+        reason = load_body(
+            "managers/scheduler.py",
+            "compression_failure_reason",
+            dict(DisaggregationMode=modes),
+            owner="Scheduler",
+        )
+        send = load_body(
+            "managers/scheduler.py",
+            "maybe_send_health_check_signal",
+            dict(HealthCheckOutput=lambda **kw: kw),
+            owner="Scheduler",
+        )
+        runtime = NS(transport_failed=False, shared=NS(is_quarantined=lambda: False))
+        worker = NS(
+            tree_cache=NS(admission_failure_reason=lambda: None),
+            disaggregation_mode=modes.PREFILL,
+            disagg_prefill_bootstrap_queue=NS(
+                kv_manager=NS(compression_runtime=runtime)
+            ),
+        )
+        self.assertIsNone(reason(worker))
+        runtime.transport_failed = True
+        self.assertIn("quarantined", reason(worker))
+        from collections import deque
+
+        worker.return_health_check_ipcs = deque(["probe"])
+        worker.compression_failure_reason = lambda: reason(worker)
+        worker.ipc_channels = NS(send_to_tokenizer=NS(send_output=Mock()))
+        send(worker)
+        outputs = worker.ipc_channels.send_to_tokenizer.send_output.call_args_list
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(c.args[0]["quarantine_reason"] for c in outputs))
+        self.assertEqual(len(worker.return_health_check_ipcs), 0)
+        send(worker)
+        self.assertEqual(
+            worker.ipc_channels.send_to_tokenizer.send_output.call_count, 2
+        )
+        runtime.transport_failed = False
+        worker.return_health_check_ipcs.append("healthy-probe")
+        send(worker)
+        self.assertEqual(
+            worker.ipc_channels.send_to_tokenizer.send_output.call_count, 3
+        )
+
+    def test_quarantine_is_sticky_in_tokenizer_readiness(self):
+        states = NS(Up="up", UnHealthy="unhealthy")
+        handle = load_body(
+            "managers/tokenizer_manager.py",
+            "_handle_health_check_output",
+            dict(ServerStatus=states),
+            owner="TokenizerManager",
+        )
+        ready = load_body(
+            "managers/tokenizer_manager.py",
+            "is_ready",
+            dict(ServerStatus=states),
+            owner="TokenizerManager",
+        )
+        manager = NS(is_pause=False, gracefully_exit=False, server_status=states.Up)
+        self.assertTrue(ready(manager))
+        handle(manager, NS(quarantine_reason="uncertain drain"))
+        self.assertFalse(ready(manager))
+        handle(manager, NS(quarantine_reason=None))
+        manager.server_status = states.Up  # An unrelated heartbeat cannot clear it.
+        self.assertFalse(ready(manager))
+
+    def test_quarantined_waiters_receive_abort_without_resource_release(self):
+        from http import HTTPStatus
+
+        abort = Mock()
+        reject = load_body(
+            "managers/scheduler.py",
+            "_reject_quarantined_waiting",
+            dict(prepare_abort=abort, HTTPStatus=HTTPStatus),
+            owner="Scheduler",
+        )
+        a, b = NS(return_logprob=False), NS(return_logprob=False)
+        scheduler = NS(
+            waiting_queue=[a], chunked_req=b, output_streamer=NS(stream_output=Mock())
+        )
+        reject(scheduler, "uncertain drain")
+        self.assertEqual(scheduler._compression_quarantined_waiting, [a, b])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertEqual(abort.call_count, 2)
+        reject(scheduler, "uncertain drain")
+        self.assertEqual(abort.call_count, 2)
+
     def test_split_preserves_page_identity_and_host_handles(self):
         import torch
 
@@ -303,6 +393,28 @@ class TestProtocol(unittest.TestCase):
         protocol.ChunkDescriptor("x", "lz4", 64, 80).validate(
             nonce="x", raw_bytes=64, capacity=80, mode="lz4"
         )
+
+    def test_verification_requirements_are_part_of_capability(self):
+        from unittest.mock import patch
+
+        for mode in ("passthrough", "lz4"):
+            for local in (False, True):
+                for remote in (False, True):
+                    a = protocol.capability(mode, force=False, verify=local)
+                    b = protocol.capability(mode, force=False, verify=remote)
+                    if local == remote:
+                        protocol.check_peer(a, b)
+                    else:
+                        with self.assertRaises(ValueError):
+                            protocol.check_peer(a, b)
+                current = protocol.capability(mode, force=False, verify=local)
+                with self.assertRaises(ValueError):
+                    protocol.check_peer(
+                        current, current.replace(f"/verify-{int(local)}", "")
+                    )
+            with patch.dict(os.environ, {"SGLANG_PD_KV_COMPRESSION_VERIFY": "1"}):
+                self.assertIn("/verify-1", protocol.capability(mode))
+        self.assertEqual(protocol.capability("off", verify=True), "off")
 
     def test_peer_agreement(self):
         for mode in protocol.MODES:
@@ -1120,6 +1232,90 @@ class TestSenderAdmission(unittest.TestCase):
         )
         sender = NS(bootstrap_room=7, kv_mgr=NS(compression_uncertain_rooms={7}))
         self.assertEqual(poll(sender), 2)
+
+
+class TestRestoreVerificationBoundary(unittest.TestCase):
+    def test_decode_quarantine_stops_preallocation_and_prebuilt_admission(self):
+        for name in ("get_new_prebuilt_batch", "process_decode_queue"):
+            method = load_body(
+                "disaggregation/decode.py",
+                name,
+                dict(
+                    scheduler_stage_method=lambda *a: lambda f: f,
+                    SCHEDULER_STAGE_PROCESS_QUEUE="queue",
+                ),
+                owner="SchedulerDisaggregationDecodeMixin",
+            )
+            worker = NS(
+                compression_failure_reason=lambda: "undrained",
+                _reject_quarantined_waiting=Mock(),
+                maybe_send_health_check_signal=Mock(),
+            )
+            args = (None,) if name == "get_new_prebuilt_batch" else ()
+            self.assertIsNone(method(worker, *args))
+            worker._reject_quarantined_waiting.assert_called_once_with("undrained")
+            worker.maybe_send_health_check_signal.assert_called_once()
+
+    def test_healthy_decode_keeps_original_prebuilt_path(self):
+        method = load_body(
+            "disaggregation/decode.py",
+            "get_new_prebuilt_batch",
+            {},
+            owner="SchedulerDisaggregationDecodeMixin",
+        )
+        worker = NS(
+            compression_failure_reason=lambda: None,
+            kv_checksum_computer=None,
+            _get_new_prebuilt_batch=Mock(return_value="original"),
+        )
+        self.assertEqual(method(worker, "running"), "original")
+        worker._get_new_prebuilt_batch.assert_called_once_with("running")
+
+    def test_verification_reads_the_same_prefix_offset_as_scatter(self):
+        from unittest.mock import patch
+
+        import torch
+
+        gather = Mock(return_value=16)
+        staging = types.ModuleType("sglang.srt.disaggregation.common.staging_buffer")
+        staging.StagingBuffer = lambda *a: NS(buffer=torch.zeros(16, dtype=torch.uint8))
+        staging.gather_all_layers_to_staging = gather
+        method = load_body(
+            "disaggregation/mooncake/compression.py",
+            "_verify_written_pages",
+            dict(digest=lambda data: "expected", BufferDrainError=RuntimeError),
+            owner="CompressedDecodeStagingHandler",
+        )
+        handler = NS(
+            runtime=NS(
+                bytes_per_token=8, device=NS(index=0), shared=NS(quarantine=Mock())
+            ),
+            scheduler=NS(
+                req_to_token_pool=NS(req_to_token=torch.arange(32).reshape(1, 32))
+            ),
+            kv_buffer_info={"k_buffers": [], "v_buffers": []},
+            total_kv_heads=1,
+            staging_allocator=NS(_scatter_stream=NS(synchronize=Mock())),
+        )
+        req = NS(req=NS(kv=NS(req_pool_idx=0, cache_protected_len=10)))
+        with patch.dict(sys.modules, {staging.__name__: staging}):
+            method(handler, req, 3, 2, "expected")
+        self.assertEqual(gather.call_args.args[2].tolist(), [13, 14])
+        handler.staging_allocator._scatter_stream.synchronize.assert_called_once()
+
+    def test_health_quarantine_overrides_bypass_and_idle_fast_paths(self):
+        health = load_body(
+            "entrypoints/http_server.py",
+            "health_generate",
+            dict(
+                app=NS(get=lambda *a: lambda f: f),
+                Response=lambda **kw: NS(**kw),
+                _global_state=NS(
+                    tokenizer_manager=NS(compression_quarantine_reason="undrained")
+                ),
+            ),
+        )
+        self.assertEqual(asyncio.run(health(NS())).status_code, 503)
 
 
 if __name__ == "__main__":
