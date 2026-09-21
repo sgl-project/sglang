@@ -248,6 +248,21 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
+  extra-b-test-8-gpu-b300:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-8-gpu-b300
+      runner_config: 8-gpu-b300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
   # =============================================== aggregator ====================================================
   # Mirrors pr-test.yml's `pr-test-finish` so notify-pr-states below only
   # depends on one job rather than re-listing every stage. Fails if any
@@ -266,6 +281,7 @@ jobs:
         extra-b-test-4-gpu-h100,
         extra-b-test-4-gpu-b200,
         extra-b-test-8-gpu-h200,
+        extra-b-test-8-gpu-b300,
       ]
     if: always()
     runs-on: ubuntu-latest
