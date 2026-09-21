@@ -84,6 +84,7 @@ def _gqa_share_sparse_decode_kernel(
     BATCH_SIZE_BUCKET: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    PAGED_CONTIG: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     NUM_TOPK_CHUNKS: tl.constexpr,
@@ -168,12 +169,21 @@ def _gqa_share_sparse_decode_kernel(
         # resolve slots for this block via req_to_token
         pos = c + off_n
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        if PAGED_CONTIG:
+            # A block lies inside one page, and slots are contiguous within a page,
+            # so the block's first slot fixes the whole tile.
+            base_slot = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + c, mask=c < seq_len, other=0
+            ).to(tl.int64)
+            base_slot = (base_slot + max_slots) % max_slots
+            slots = base_slot + off_n.to(tl.int64)
+        else:
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
+            slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -318,6 +328,7 @@ def flash_decode_with_gqa_share_sparse(
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    page_size: int = 0,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -335,6 +346,9 @@ def flash_decode_with_gqa_share_sparse(
         f"block_size must be a power of 2, but got {block_size}"
     )
     # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
+    # A selected block cannot straddle a page boundary under this condition, so its
+    # slots are contiguous. page_size == 0 means unknown: keep the gather.
+    paged_contig = page_size >= block_size and page_size % block_size == 0
     max_kv_len = req_to_token.shape[1]
     # gqa
     assert num_q_heads % num_kv_heads == 0
@@ -418,6 +432,7 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(1),
         lse_partial.stride(2),
         BLOCK_SIZE_N=block_size,
+        PAGED_CONTIG=paged_contig,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
     )
