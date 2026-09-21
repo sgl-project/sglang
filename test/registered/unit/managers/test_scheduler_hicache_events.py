@@ -54,7 +54,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 ),
                 patch(
                     "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(enable_flexkv=flexkv),
+                    return_value=SimpleNamespace(
+                        enable_flexkv=flexkv, kv_transfer_config=None
+                    ),
                 ),
             ):
                 self.calls.reset_mock()

@@ -32,7 +32,12 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_observability,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
@@ -74,6 +79,9 @@ class SchedulerOutputStreamer:
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
+        config = get_memory().kv_transfer_config
+        if config is not None:
+            return config["kv_connector"]
         storage_backend_type = "none"
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
         if cache_controller and hasattr(cache_controller, "storage_backend"):

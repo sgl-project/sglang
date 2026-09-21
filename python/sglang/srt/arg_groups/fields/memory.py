@@ -99,6 +99,18 @@ class Memory(msgspec.Struct):
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",
     ] = None
+    kv_transfer_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "External SGLang KV connector configuration as a JSON object: "
+                "kv_connector (class name), kv_connector_module_path (Python module), "
+                "kv_role (kv_producer, kv_consumer, or kv_both), and "
+                "kv_connector_extra_config (provider options)."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical cache

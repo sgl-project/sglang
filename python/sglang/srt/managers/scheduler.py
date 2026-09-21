@@ -445,6 +445,10 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
 
+    @property
+    def enable_kv_transfer(self) -> bool:
+        return get_memory().kv_transfer_config is not None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2501,7 +2505,9 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            enable_hicache_storage=lambda: (
+                self.enable_hicache_storage or self.enable_kv_transfer
+            ),
             rust_server=self.rust_server,
         )
 
@@ -3138,6 +3144,9 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if self.enable_kv_transfer:
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            return self.tree_cache.prefetch_request(req)
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3639,6 +3648,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
+            or self.enable_kv_transfer
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
@@ -3989,7 +3999,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_kv_transfer:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4033,6 +4043,7 @@ class Scheduler(
                     if (
                         self.enable_hierarchical_cache
                         or self.enable_unified_cache_external_linker
+                        or self.enable_kv_transfer
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
@@ -4101,7 +4112,11 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_unified_cache_external_linker
+            or self.enable_kv_transfer
+        ):
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -4899,7 +4914,9 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_kv_transfer:
+            if_success = self.tree_cache.clear_storage_backend()
+        elif self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
             if_success = True
@@ -4933,6 +4950,7 @@ class Scheduler(
                 )
             if (
                 self.enable_hicache_storage
+                or self.enable_kv_transfer
                 or self.disaggregation_mode != DisaggregationMode.NULL
             ):
                 # Storage and transfer workers need the GIL between I/O calls.
@@ -5063,6 +5081,8 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+            if self.enable_kv_transfer:
+                idle &= not self.tree_cache.has_pending_cache_operations()
 
         return idle
 

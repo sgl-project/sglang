@@ -21,6 +21,13 @@ from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
+
+def handle_kv_transfer_config(server_args: Any) -> None:
+    from sglang.srt.mem_cache.kv_transfer_config import validate_kv_transfer_config
+
+    validate_kv_transfer_config(resolving_view(server_args))
+
+
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
     "nvfp4": "trtllm_mha",

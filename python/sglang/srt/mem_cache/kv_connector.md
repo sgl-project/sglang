@@ -1,0 +1,139 @@
+# External KV connectors
+
+`--kv-transfer-config` loads a SGLang prefix-cache connector from an installed
+Python package. The provider owns its implementation and dependencies; adding a
+provider does not require another backend name, import, or flag in SGLang.
+Without this option, the existing cache selection behavior is unchanged.
+
+This initial interface targets colocated serving. It provides the same explicit
+module-selection pattern as vLLM, but uses SGLang's `BasePrefixCache` and scheduler
+contracts. A vLLM `LMCacheMPConnector` cannot be passed directly: LMCache needs a
+SGLang adapter implementing `BaseKVConnector`. This change does not ship that
+adapter or migrate `--enable-lmcache`.
+
+## Try the loading path
+
+Prerequisites: a SGLang source checkout installed with its serving dependencies,
+a supported serving device, and access to the public `Qwen/Qwen3-0.6B` model on
+Hugging Face. Run these commands from the repository root on a Linux NVIDIA CUDA
+serving machine. The example uses one GPU (`--tp 1`). No provider service or
+credentials are required.
+
+```bash
+export PYTHONPATH="$PWD/examples/runtime/kv_connector${PYTHONPATH:+:$PYTHONPATH}"
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-0.6B \
+  --tp 1 \
+  --kv-transfer-config '{
+    "kv_connector": "NoOpKVConnector",
+    "kv_connector_module_path": "noop_connector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {}
+  }'
+```
+
+[NoOpKVConnector](../../../../examples/runtime/kv_connector/noop_connector.py)
+keeps ordinary local radix caching and performs no external transfers. It is a
+runnable packaging example, not evidence of external cache reuse. For a real
+provider, install its package in **every worker's** Python environment and replace
+the class, module, and extra configuration with the provider's documented values.
+The module path is an importable Python module, not a filesystem path. Only load
+trusted installed providers; importing a provider executes its Python code.
+
+The same dictionary is accepted by Python callers:
+
+```python
+from sglang import Engine
+
+engine = Engine(
+    model_path="Qwen/Qwen3-0.6B",
+    kv_transfer_config={
+        "kv_connector": "NoOpKVConnector",
+        "kv_connector_module_path": "noop_connector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {},
+    },
+)
+```
+
+| Field | Meaning |
+| --- | --- |
+| `kv_connector` | Required exported class name, a `BaseKVConnector` subclass. |
+| `kv_connector_module_path` | Required Python module containing the class. |
+| `kv_role` | `kv_producer`, `kv_consumer`, or `kv_both` (default). The provider must enforce the role or reject it in `validate_config`. This does not enable PD disaggregation. |
+| `kv_connector_extra_config` | Provider-owned JSON object, default `{}`. Keys and nested values pass through without SGLang interpreting them. |
+
+Malformed configurations and conflicting selectors fail at startup. Do not
+combine this option with `--radix-cache-backend`, `--enable-lmcache`,
+`--enable-flexkv`, HiCache/storage backend options, the unified external linker,
+HiSparse, or `--disable-radix-cache`. PD disaggregation and streaming sessions
+are outside this initial interface. Provider validation must reject any other
+unsupported model, layout, speculative-decoding, or parallelism configuration.
+
+## Implement a provider
+
+Export a concrete subclass of
+[`BaseKVConnector`](base_kv_connector.py) with constructor
+`__init__(self, context: TreeCacheBuildContext, config: KVTransferConfig)`.
+The loader imports the module inside each scheduler worker, checks the class,
+calls `validate_config(context, config)`, and constructs it. The launcher only
+validates the serializable configuration and does not import provider modules.
+Import, class, or construction failures do not fall back to a different cache.
+
+`TreeCacheBuildContext` supplies `CacheInitParams` (request/KV pools, page size,
+process groups and rank information), model configuration, the TP worker and its
+model runner, TP identity, and hybrid-model information. The adapter must select
+its own component layout and register any transfer counters it uses with the KV
+pool and worker. It can reuse `UnifiedRadixCache` through inheritance or
+composition; SGLang continues to control admission and request execution.
+
+The required `BasePrefixCache` methods cover local prefix matching, ownership,
+eviction, locks, and finished/chunked request caching. External I/O additionally
+follows this lifecycle:
+
+1. When a request enters the waiting queue, the scheduler refreshes its local
+   prefix and calls `prefetch_request(req)`. Key attempt state by
+   `CacheRequestHandle` (request ID **and attempt ID**), preserve `extra_key` and
+   `cache_salt`, and avoid allocating destination GPU slots at lookup time.
+2. `check_hicache_events()` runs before scheduling decisions, including when no
+   batch can run. Complete transfers and release holds there. TP/PP participants
+   must make completion decisions in consistent collective order.
+3. `check_prefetch_progress(handle)` gates admission. Failed lookups must allow
+   normal prefill. `match_prefix()` reports external hits using the existing
+   host-hit/load-back contract. `PrefillAdder` calls `init_load_back()` only
+   after admission: return `None` to retry, or return safe device indices and a
+   locked cache node. Never publish incomplete KV as a reusable device prefix.
+4. Before an admitted batch executes, `ready_to_load_host_cache()` establishes
+   transfer/forward ordering. Return a layer-counter consumer index if using
+   the existing layer counters, or `-1` if the provider establishes ordering
+   itself. Keep transfer events and referenced pages alive until completion.
+5. `cache_unfinished_req()` and `cache_finished_req()` can submit writes.
+   `finish(handle, outcome)` and `release_aborted_request(handle)` must release
+   attempt state correctly on completion, abort, and retraction. Successful
+   request completion must not release pages still read by an asynchronous
+   store. Consumer-only providers must not store.
+6. `has_pending_cache_operations()` must cover all operations retaining cache
+   resources. Such work prevents full idle, local flush/reset, and sleeping.
+   `release_host_resources()` drains and closes resources during shutdown and
+   must be idempotent.
+
+`pop_prefetch_loaded_span()` reports tokens actually loaded and their absolute
+prefix start once per attempt. A lookup hit is not a transferred token. Adapters
+that transfer during admission must update the request's storage accounting
+there. Responses identify the configured connector in
+`cached_tokens_details.storage_backend`.
+
+`clear_storage_backend()` is optional and defaults to `False`. Returning `True`
+means external storage was cleared successfully; the provider must synchronize
+that action with active I/O. Local `reset()` remains separate from remote data
+deletion.
+
+## Validation boundary
+
+The registered CPU tests use a temporary external package and cover configuration,
+worker imports, provider validation, polling, abort cleanup, pending-store idle
+and flush protection, and metadata. The no-op example can smoke-test normal
+serving. Neither proves GPU transfers or a provider's TP/PP correctness. A real
+adapter still needs device tests for positive external cache hits, transfer
+ordering, failure fallback, cancellation, and model/parallelism combinations it
+claims to support.

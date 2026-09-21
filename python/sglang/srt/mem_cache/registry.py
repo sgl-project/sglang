@@ -10,6 +10,8 @@ To plug in a custom backend, register it under a string name via
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -228,7 +230,10 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = get_memory().radix_cache_backend
-    if name:
+    if get_memory().kv_transfer_config is not None:
+        cache = _create_external_kv_connector(ctx)
+        source = "external_kv_connector"
+    elif name:
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(
@@ -297,3 +302,40 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         streaming_wrapped,
     )
     return cache
+
+
+def _create_external_kv_connector(ctx: TreeCacheBuildContext) -> BasePrefixCache:
+    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.mem_cache.base_kv_connector import BaseKVConnector
+    from sglang.srt.mem_cache.kv_transfer_config import (
+        KVTransferConfig,
+        validate_kv_transfer_config,
+    )
+
+    # Recheck after model-specific argument resolution, including Python callers
+    # that construct a build context without going through the CLI pipeline.
+    validate_kv_transfer_config(resolved_view(ctx.server_args))
+    config = KVTransferConfig.from_dict(get_memory().kv_transfer_config)
+    module_name = config.kv_connector_module_path
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(
+            f"Cannot import KV connector module {module_name!r}. Install the "
+            "provider and its dependencies in every SGLang worker environment."
+        ) from exc
+    connector_cls = getattr(module, config.kv_connector, None)
+    if not inspect.isclass(connector_cls) or not issubclass(
+        connector_cls, BaseKVConnector
+    ):
+        raise TypeError(
+            f"{module_name}.{config.kv_connector} must be a SGLang "
+            "BaseKVConnector subclass"
+        )
+    if inspect.isabstract(connector_cls):
+        raise TypeError(
+            f"{module_name}.{config.kv_connector} is missing connector methods: "
+            f"{sorted(connector_cls.__abstractmethods__)}"
+        )
+    connector_cls.validate_config(ctx, config)
+    return connector_cls(ctx, config)

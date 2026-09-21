@@ -16,12 +16,16 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
+        override = get_context().override_server_args(kv_transfer_config=None)
+        override.install()
+        self.addCleanup(override.restore)
         s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False

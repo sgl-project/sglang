@@ -113,6 +113,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_tokenizer_batching",
         "handle_environment_variables",
         "handle_cache_compatibility",
+        "handle_kv_transfer_config",
         "handle_page_major_kv_layout",
         "handle_unified_memory_pool",
         "handle_dllm_inference",
