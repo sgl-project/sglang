@@ -19,9 +19,8 @@ def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
     Resolution order:
-    1) Shared decode host pool layout for KV transfer.
-    2) Layout <-> I/O compatibility for direct conflicts.
-    3) Storage <-> layout compatibility (may rewrite layout).
+    1) Layout <-> I/O compatibility for direct conflicts.
+    2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
     if cfg.enable_linker_mla_dedup and (
@@ -56,20 +55,15 @@ def handle_hicache(server_args: Any):
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_enable_host_receive:
-        # KV transfer copies contiguous per-layer buffers without relayout.
-        # Build the shared receive/retraction pool in that format; retraction
-        # itself supports the other HiCache layouts too.
-        if cfg.hicache_mem_layout != "layer_first":
-            logger.info(
-                "Using layer_first for the shared decode host pool "
-                "to match KV transfer buffers"
-            )
+        # The shared host pool must match KV transfer's per-layer buffers.
         declare_resolution(
             server_args, "handle_hicache", hicache_mem_layout="layer_first"
         )
 
-    # Normalize the chosen pool layout against I/O and storage requirements.
+    # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
+
+    # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
     if (
         cfg.disaggregation_decode_enable_host_receive
@@ -80,7 +74,7 @@ def handle_hicache(server_args: Any):
             "cannot share the layer_first decode host pool used by KV transfer"
         )
 
-    # DCP compatibility for the L2 (device<->host) path.
+    # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
 
 

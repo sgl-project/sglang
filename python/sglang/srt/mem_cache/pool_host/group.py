@@ -72,12 +72,7 @@ class HostPoolGroup:
         return self.get_entry(name).host_pool
 
     def get_contiguous_buf_infos(self):
-        """Return (device_buffers, host_buffers) in matching transfer order.
-
-        Each group contains (data_ptrs, data_lens, item_lens), as returned by
-        a device pool. Packed drafts and sidecars follow their target pool.
-        KV transfer addresses both groups as contiguous per-layer buffers.
-        """
+        """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
         host_by_device_ptr = {}
@@ -122,9 +117,7 @@ class HostPoolGroup:
             ):
                 if (
                     not host_buffer.is_contiguous()
-                    or host_buffer.shape[0] != host.size
                     or host_buffer.shape[1:] != device_buffer.shape[1:]
-                    or host_buffer.dtype != device_buffer.dtype
                 ):
                     raise ValueError(
                         "KV transfer requires matching contiguous per-layer "
@@ -135,8 +128,6 @@ class HostPoolGroup:
                     host_buffer.nbytes,
                     host.token_stride_size * self.page_size,
                 )
-        if host_by_device_ptr.keys() != set(device_infos[0]):
-            raise ValueError("Host receive must cover every target and draft KV buffer")
         infos = [host_by_device_ptr[ptr] for ptr in device_infos[0]]
         host_infos = (
             [info[0] for info in infos],

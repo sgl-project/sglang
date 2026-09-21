@@ -1308,11 +1308,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0 or (
-                envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.get()
-                and not decode_req.is_rebootstrap
-                and not _is_fake_transfer(decode_req.req)
-            ):
+            if self.req_to_token_pool.available_size() <= 0:
                 if self._pre_alloc_host(decode_req):
                     preallocated_reqs.append(decode_req)
                     indices_to_remove.add(i)
@@ -1735,13 +1731,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "Host pool group must match the transferred target and draft KV"
             )
         (
-            (kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens),
-            (
-                kv_args.host_kv_data_ptrs,
-                kv_args.host_kv_data_lens,
-                kv_args.host_kv_item_lens,
-            ),
-        ) = device_buffers, host_buffers
+            kv_args.host_kv_data_ptrs,
+            kv_args.host_kv_data_lens,
+            kv_args.host_kv_item_lens,
+        ) = host_buffers
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         if (
@@ -1750,11 +1743,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             or _is_fake_transfer(decode_req.req)
         ):
             return False
-        if (
-            envs.SGLANG_TEST_DISAGG_FORCE_HOST_TRANSFER.get()
-            and not decode_req.kv_receiver.supports_host_destination
-        ):
-            raise ValueError("Forced host transfer requires a compatible prefill peer")
         if not decode_req.kv_receiver.supports_host_destination:
             return False
         num_tokens = ceil_align(
