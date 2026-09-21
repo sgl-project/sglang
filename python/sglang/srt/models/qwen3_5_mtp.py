@@ -73,10 +73,17 @@ def _mtp_quant_config(quant_config):
     # every `mtp.*` layer appears under the quantization exclude list. Detect
     # that and skip quantization here so linear/MoE weight loaders allocate
     # bf16 shapes (see sgl-project/sglang#23113).
+    #
+    # The entry has to name the MTP experts, not merely start with `mtp.`: an
+    # export that does serialize the MTP experts as MXFP4 still excludes
+    # mtp.fc, the draft router, the draft shared expert and the draft attention
+    # projections, and those must not drag the whole draft back to bf16.
     if quant_config and quant_config.get_name() == "quark":
         exclude_layers = getattr(quant_config, "exclude_layers", [])
         if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
+            isinstance(layer, str)
+            and layer.startswith("mtp.")
+            and ".mlp.experts" in layer
             for layer in exclude_layers
         ):
             return None
@@ -84,6 +91,13 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # The draft reuses the target's module layout, so it needs the target's
+    # fused-module mapping too. Without it the Quark exclude list, which names
+    # q/k/v_proj separately, cannot be matched against the fused qkv_proj, and a
+    # checkpoint whose draft attention is bf16 while its experts are MXFP4 would
+    # build that attention quantized.
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(

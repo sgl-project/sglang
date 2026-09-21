@@ -741,8 +741,49 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             get_name=lambda: "quark", exclude_layers=["mtp.mlp.experts"]
         )
         self.assertIsNone(_mtp_quant_config(quark_mtp))
+        # A Quark export that serializes the MTP experts as MXFP4 still excludes
+        # mtp.fc, the draft router, the draft shared expert and the draft
+        # attention projections. Those must not read as "the MTP head is bf16",
+        # or the MoE weight loader allocates bf16 shapes for packed MXFP4
+        # tensors (4096 vs 2048 on the last dim).
+        quark_serialized_mtp_experts = SimpleNamespace(
+            get_name=lambda: "quark",
+            exclude_layers=[
+                "mtp.fc",
+                "mtp.layers.0.mlp.gate",
+                "mtp.layers.0.mlp.shared_expert.down_proj",
+                "mtp.layers.0.mlp.shared_expert.gate_proj",
+                "mtp.layers.0.mlp.shared_expert.up_proj",
+                "mtp.layers.0.mlp.shared_expert_gate",
+                "mtp.layers.0.self_attn.k_proj",
+                "mtp.layers.0.self_attn.o_proj",
+                "mtp.layers.0.self_attn.q_proj",
+                "mtp.layers.0.self_attn.v_proj",
+            ],
+        )
+        self.assertIs(
+            _mtp_quant_config(quark_serialized_mtp_experts),
+            quark_serialized_mtp_experts,
+        )
+        # The per-expert names an actual export carries still read as bf16.
+        quark_bf16_mtp_experts = SimpleNamespace(
+            get_name=lambda: "quark",
+            exclude_layers=[
+                "mtp.fc",
+                "mtp.layers.0.mlp.experts.0.down_proj",
+                "mtp.layers.0.mlp.experts.0.gate_proj",
+            ],
+        )
+        self.assertIsNone(_mtp_quant_config(quark_bf16_mtp_experts))
         kept = _quant("fp8")
         self.assertIs(_mtp_quant_config(kept), kept)
+        # The draft reuses the target's module layout, so the Quark exclude
+        # list -- which names q/k/v_proj separately -- can only be matched
+        # against the draft's fused qkv_proj through this mapping.
+        self.assertEqual(
+            Qwen3_5ForCausalLMMTP.packed_modules_mapping,
+            Qwen3_5ForCausalLM.packed_modules_mapping,
+        )
 
         text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
         seen, patcher = self._recording_gate(Qwen3_5ForCausalLM)
