@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -278,7 +278,6 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
     scheduler = _Scheduler()
     scheduler.scheduler_stage_metrics = None
     scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
-    scheduler.ps = SimpleNamespace(tp_rank=0)
     scheduler.metrics_reporter.enable_metrics = False
     scheduler._release_aborted_request = Mock()
     scheduler.enable_staging = False
@@ -308,6 +307,7 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
         req.output_ids.append(2)
         req.customized_info = {"scores": [payload]}
         req.disagg_kv_sender = Mock()
+        req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
         req.time_stats = Mock()
         scheduler.disagg_prefill_inflight_queue.append(req)
         scheduler.disagg_prefill_pending_chunk_rids.add(req.rid)
@@ -323,7 +323,8 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
             req.disagg_kv_sender.send.assert_not_called()
             release_kv_cache.assert_not_called()
             assert scheduler.disagg_prefill_inflight_queue == [req]
-            assert scheduler.process_disagg_prefill_inflight_queue() == [req]
+            with get_parallel().override(tp_rank=0):
+                assert scheduler.process_disagg_prefill_inflight_queue() == [req]
             assert scheduler.process_disagg_prefill_inflight_queue() == []
             assert req.finished_reason is finish_reason
             scheduler._release_aborted_request.assert_called_once_with(req)
