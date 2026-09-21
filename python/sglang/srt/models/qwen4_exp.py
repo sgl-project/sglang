@@ -48,7 +48,11 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
@@ -377,6 +381,23 @@ def _ple_track_targets(
         return None
 
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
+
+
+def _pack_qwen4_exp_pp_proxy(hidden_states: torch.Tensor) -> PPProxyTensors:
+    return PPProxyTensors({"hidden_states": hidden_states})
+
+
+def _unpack_qwen4_exp_pp_proxy(
+    pp_proxy_tensors: PPProxyTensors,
+) -> Tuple[torch.Tensor, None]:
+    return pp_proxy_tensors["hidden_states"], None
+
+
+def _is_weight_outside_pp_stage(
+    name: str, *, start_layer: int, end_layer: int
+) -> bool:
+    layer_id = get_layer_id(name)
+    return layer_id is not None and not (start_layer <= layer_id < end_layer)
 
 
 def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
@@ -1671,11 +1692,19 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+            residual = None
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            assert pp_proxy_tensors is not None
+            hidden_states, residual = _unpack_qwen4_exp_pp_proxy(
+                pp_proxy_tensors
+            )
 
         ple_batch = (
             _prepare_ple_batch(
@@ -1687,7 +1716,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
-        residual = None
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1710,6 +1738,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
+
+        if not self.pp_group.is_last_rank:
+            return _pack_qwen4_exp_pp_proxy(hidden_states)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
@@ -1753,6 +1784,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
@@ -1789,8 +1821,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
     @torch.no_grad()
-    def forward(self, *args, **kwargs):
-        output = super().forward(*args, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        output = super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            get_embedding=get_embedding,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
@@ -2024,6 +2069,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
+            # Specialized PLE loaders only see modules owned by this PP stage.
+            # Skip remote layers before interpreting their checkpoint layout.
+            if _is_weight_outside_pp_stage(
+                name, start_layer=self.start_layer, end_layer=self.end_layer
+            ):
+                continue
+
             if self._load_qwen4_exp_ple_buffer(
                 name, loaded_weight, buffers, loaded_buffers
             ):
@@ -2048,12 +2100,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     lm_head_param, "weight_loader", default_weight_loader
                 )
                 weight_loader(lm_head_param, loaded_weight)
-
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.start_layer or layer_id >= self.end_layer
-            ):
-                continue
 
             if (
                 _use_aiter
