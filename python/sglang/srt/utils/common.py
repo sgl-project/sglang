@@ -2120,8 +2120,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2434,6 +2451,8 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    configure_hf_hub_logger()
 
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
