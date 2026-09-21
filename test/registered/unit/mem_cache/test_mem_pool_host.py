@@ -47,6 +47,47 @@ class TestHostKVCache(CustomTestCase):
             allocator_type="default",
         )
 
+    def test_multiple_attention_rows_per_token(self):
+        for rows_per_token in (1, 3):
+            device_pool = MHATokenToKVPool(
+                size=4,
+                page_size=self.page_size,
+                dtype=torch.float16,
+                head_num=2 * rows_per_token,
+                head_dim=4,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            # Report logical heads while retaining the wider physical rows.
+            device_pool.head_num = 2
+            for layout in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_head",
+            ):
+                with self.subTest(rows_per_token=rows_per_token, layout=layout):
+                    host_pool = MHATokenToKVPoolHost(
+                        device_pool=device_pool,
+                        host_to_device_ratio=2.0,
+                        host_size=0,
+                        page_size=self.page_size,
+                        layout=layout,
+                        pin_memory=False,
+                    )
+                    device_row = device_pool.k_buffer[0][0]
+                    row_bytes = device_row.numel() * device_row.element_size()
+                    self.assertEqual(host_pool.element_dim, device_row.numel())
+                    self.assertEqual(host_pool.token_stride_size, row_bytes)
+                    self.assertEqual(
+                        host_pool.size_per_token, 2 * device_pool.layer_num * row_bytes
+                    )
+                    self.assertEqual(
+                        host_pool.kv_buffer.nbytes,
+                        host_pool.size * host_pool.size_per_token,
+                    )
+
     def test_double_alloc(self):
         indices = self.host_pool.alloc(4)
         self.assertEqual(len(indices), 4)
@@ -241,11 +282,10 @@ class TestHostMemoryBudget(CustomTestCase):
     def _budget_with_ranks(self, ranks):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
-        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
         with (
             unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
             unittest.mock.patch.object(
-                base.psutil, "virtual_memory", return_value=fake_mem
+                base, "available_host_memory_bytes", return_value=self._AVAILABLE
             ),
         ):
             return base.host_memory_budget_bytes()

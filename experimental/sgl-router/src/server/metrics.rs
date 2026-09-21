@@ -92,7 +92,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -236,14 +236,19 @@ pub enum StreamOutcome {
     UpstreamError,
     /// The client disconnected before the stream finished.
     ClientDisconnect,
+    /// The router's stale-request deadline aborted the stream.
+    Expired,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
-    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
-        (false, _, _) => StreamOutcome::UpstreamError,
-        (_, true, _) => StreamOutcome::StreamErrorEvent,
-        (_, _, true) => StreamOutcome::ClientDisconnect,
-        _ => StreamOutcome::Ok,
+    match end.reason {
+        StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
+        _ if end.saw_error_event => StreamOutcome::StreamErrorEvent,
+        StreamEndReason::ClientDisconnect => StreamOutcome::ClientDisconnect,
+        StreamEndReason::Completed => StreamOutcome::Ok,
     }
 }
 
@@ -254,6 +259,7 @@ impl StreamOutcome {
             Self::StreamErrorEvent => "stream_error_event",
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
+            Self::Expired => "expired",
         }
     }
 }
@@ -375,12 +381,12 @@ impl PolicySelectionFailureReason {
 
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
-pub enum ActiveLoadKind {
+pub enum RouterInflightLoadKind {
     PrefillTokens,
     DecodeBlocks,
 }
 
-impl ActiveLoadKind {
+impl RouterInflightLoadKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::PrefillTokens => "prefill_tokens",
@@ -408,7 +414,7 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
-    active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
+    router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -470,12 +476,12 @@ pub struct WorkerSnapshot {
     pub healthy: bool,
     /// Circuit breaker state code: 0=closed, 1=open, 2=half_open.
     pub cb_state: u8,
-    /// In-flight request count for this worker (`Worker::active_load`).
+    /// In-flight request count for this worker (`Worker::router_inflight_load`).
     pub inflight: i64,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct ActiveLoadKey {
+struct RouterInflightLoadKey {
     worker_url: String,
     kind: &'static str,
 }
@@ -657,12 +663,17 @@ impl MetricsRegistry {
 
     /// Set `sgl_router_active_load` for the given worker + kind. Replaces the
     /// previous value (gauge semantics).
-    pub fn set_active_load(&self, worker_url: &str, kind: ActiveLoadKind, value: i64) {
-        let key = ActiveLoadKey {
+    pub fn set_router_inflight_load(
+        &self,
+        worker_url: &str,
+        kind: RouterInflightLoadKind,
+        value: i64,
+    ) {
+        let key = RouterInflightLoadKey {
             worker_url: worker_url.to_owned(),
             kind: kind.as_str(),
         };
-        let mut guard = self.active_load.lock();
+        let mut guard = self.router_inflight_load.lock();
         let gauge = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicI64::new(0)))
@@ -984,13 +995,13 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // active_load gauge
+        // router_inflight_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
         );
         out.push_str("# TYPE sgl_router_active_load gauge\n");
-        let guard = self.active_load.lock();
-        let mut entries: Vec<(&ActiveLoadKey, i64)> = guard
+        let guard = self.router_inflight_load.lock();
+        let mut entries: Vec<(&RouterInflightLoadKey, i64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
@@ -1495,22 +1506,26 @@ mod tests {
     fn stream_outcome_precedence() {
         use StreamOutcome::*;
 
-        for (transport_ok, saw_error_event, client_disconnect, expected) in [
-            (false, false, false, UpstreamError),
-            (false, false, true, UpstreamError),
-            (false, true, false, UpstreamError),
-            (false, true, true, UpstreamError),
-            (true, false, false, Ok),
-            (true, false, true, ClientDisconnect),
-            (true, true, false, StreamErrorEvent),
-            (true, true, true, StreamErrorEvent),
+        for (reason, expected) in [
+            (StreamEndReason::Completed, Ok),
+            (StreamEndReason::ClientDisconnect, ClientDisconnect),
+            (StreamEndReason::UpstreamError, UpstreamError),
+            (StreamEndReason::IdleTimeout, UpstreamError),
+            (StreamEndReason::PumpPanicked, UpstreamError),
+            (StreamEndReason::Expired, Expired),
         ] {
-            let end = StreamEnd {
-                transport_ok,
-                saw_error_event,
-                client_disconnect,
-            };
-            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            for saw_error_event in [false, true] {
+                let end = StreamEnd {
+                    reason,
+                    saw_error_event,
+                };
+                let expected = if saw_error_event && matches!(expected, Ok | ClientDisconnect) {
+                    StreamErrorEvent
+                } else {
+                    expected
+                };
+                assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            }
         }
     }
 
@@ -1522,12 +1537,14 @@ mod tests {
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Expired);
         let out = reg.render();
         for expected in [
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="expired"} 1"#,
         ] {
             assert_metric_line(&out, expected);
         }
@@ -1651,8 +1668,8 @@ mod tests {
     #[test]
     fn set_active_load_gauge_overwrites() {
         let reg = MetricsRegistry::new();
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 100);
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 250);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 100);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 250);
         let out = reg.render();
         assert!(out.contains(
             r#"sgl_router_active_load{worker_url="http://w:30000",kind="prefill_tokens"} 250"#,
