@@ -89,6 +89,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
+              - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
@@ -112,7 +113,6 @@ jobs:
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
-              - "test/registered/kernel/diffusion/**"
               - "test/registered/unit/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
@@ -120,7 +120,6 @@ jobs:
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "test/registered/kernels/**"
-              - "test/registered/kernel/diffusion/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/!(*.md)"

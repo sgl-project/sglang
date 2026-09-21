@@ -84,7 +84,7 @@ from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -768,7 +768,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        tree.cache_finished_req(req, owned_kv_len=12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -784,7 +784,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        tree.cache_finished_req(req, owned_kv_len=12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.
@@ -1215,10 +1215,8 @@ def _dist_init(rank, world, port, attn_cp_size):
         ServerArgs(model_path="dummy", tp_size=world, attn_cp_size=attn_cp_size),
         role="scheduler",
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world,
-        attention_context_model_parallel_size=attn_cp_size,
-    )
+    publish_build_topology(tp_size=world, attn_cp_size=attn_cp_size, world_rank=rank)
+    initialize_model_parallel()
 
 
 def _gather_make_spec(shard_rank, max_prefix_groups=16, chunk_groups=4):
