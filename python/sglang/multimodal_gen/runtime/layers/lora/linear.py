@@ -142,12 +142,12 @@ class BaseLayerWithLoRA(nn.Module):
         # TODO: Support multiple LoRA adapters when use not merged mode
         if not self.merged:
             lora_dtype = lora_A.dtype
-            input_lora = input.to(dtype=lora_dtype)
+            input_lora = input_parallel.to(dtype=lora_dtype)
             lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input.device, non_blocking=True)
+                lora_A.to(device=input_parallel.device, non_blocking=True)
             )
             lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input.device, non_blocking=True)
+                lora_B.to(device=input_parallel.device, non_blocking=True)
             )
             delta_parallel = _compute_lora_delta(
                 input_lora, lora_A_sliced, lora_B_sliced
