@@ -293,11 +293,24 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    # The next PP stage receives this proxy before it can
+                    # enter the disaggregation control rings below.  Forward
+                    # and complete it immediately after launch; deferring it
+                    # until after the control rings lets PP1 wait for PP0
+                    # while PP0 waits in the same untagged control channel.
+                    if not self.pp_group.is_last_rank:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        self._pp_send_and_commit_proxy(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
@@ -346,15 +359,6 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -453,12 +457,23 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if (
+                        not self.pp_group.is_last_rank
+                        and not cur_batch.forward_mode.is_prebuilt()
+                    ):
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        self._pp_send_and_commit_proxy(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                        )
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
 
@@ -535,15 +550,6 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -942,6 +948,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -960,6 +967,7 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            relay_output_immediately=relay_output_immediately,
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
@@ -1069,6 +1077,17 @@ class SchedulerPPMixin:
             )
         )
         return p2p_work
+
+    def _pp_send_and_commit_proxy(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Complete a proxy exchange before reusing the PP output/control ring."""
+        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+            tensor_dict,
+            async_send=True,
+            msg_type="proxy",
+        )
+        self._pp_commit_comm_work(self.send_proxy_work)
 
     def _pp_recv_typed_dict(
         self: Scheduler,
@@ -1278,6 +1297,7 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1330,7 +1350,28 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if relay_output_immediately and self.pp_group.is_last_rank:
+            # Inject the last-stage output into the ring and finish that
+            # exchange before entering the PD control rings.
+            send_output_work = _do_send()
+            _do_recv()
+            self._pp_commit_comm_work(send_output_work)
+            send_output_work = []
+        elif relay_output_immediately:
+            # A non-last stage must forward the payload it just received in
+            # the same scheduler slot.  Otherwise the last stage can wait for
+            # the relay while the first stage has already entered a control
+            # ring that shares the untagged process group.
+            _do_recv()
+            if next_pp_outputs is not None:
+                send_output_work = self._pp_send_dict_to_next_stage(
+                    next_pp_outputs.tensors,
+                    async_send=True,
+                    msg_type="output",
+                )
+            self._pp_commit_comm_work(send_output_work)
+            send_output_work = []
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
