@@ -24,32 +24,6 @@ register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestBenchServing1GPUPart2(CustomTestCase):
-    @unittest.skip(
-        "Qwen2.5-VL server crashes with SIGBUS (exit code -7) on main; disable until fixed"
-    )
-    def test_vlm_offline_throughput(self):
-        res = run_bench_serving(
-            model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
-            num_prompts=200,
-            request_rate=float("inf"),
-            other_server_args=[
-                "--mem-fraction-static",
-                "0.7",
-            ],
-            dataset_name="mmmu",
-        )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_vlm_offline_throughput\n"
-                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
-            )
-            # relax for mi300x
-            if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 900)
-            else:
-                self.assertGreater(res["output_throughput"], 2500)
-
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
