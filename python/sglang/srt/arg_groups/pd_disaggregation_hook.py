@@ -67,13 +67,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
         if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
             raise ValueError("Decode host KV buffering requires host_pool retraction")
-        if cfg.hicache_mem_layout != "layer_first":
-            logger.info("Using layer_first host KV layout for decode host buffering")
         declare_resolution(
             server_args,
             "handle_pd_disaggregation",
             disaggregation_decode_retraction_backup="host_pool",
-            hicache_mem_layout="layer_first",
         )
 
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:

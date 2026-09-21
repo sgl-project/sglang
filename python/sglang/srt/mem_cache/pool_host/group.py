@@ -76,14 +76,10 @@ class HostPoolGroup:
 
         Each group contains (data_ptrs, data_lens, item_lens), as returned by
         a device pool. Packed drafts and sidecars follow their target pool.
+        KV transfer addresses both groups as contiguous per-layer buffers.
         """
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
-        if self.layout != "layer_first":
-            raise ValueError(
-                "Host KV transfer requires layer_first layout: the transfer format "
-                "uses the page copy size as the destination stride"
-            )
         host_by_device_ptr = {}
         device_infos = ([], [], [])
         for entry in self.entries:
@@ -124,6 +120,16 @@ class HostPoolGroup:
             for device_buffer, host_buffer in zip(
                 device_buffers, host_buffers, strict=True
             ):
+                if (
+                    not host_buffer.is_contiguous()
+                    or host_buffer.shape[0] != host.size
+                    or host_buffer.shape[1:] != device_buffer.shape[1:]
+                    or host_buffer.dtype != device_buffer.dtype
+                ):
+                    raise ValueError(
+                        "KV transfer requires matching contiguous per-layer "
+                        "device and host buffers"
+                    )
                 host_by_device_ptr[device_buffer.data_ptr()] = (
                     host_buffer.data_ptr(),
                     host_buffer.nbytes,

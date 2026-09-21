@@ -396,15 +396,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "and cannot be used at the same time. Please use only one of them."
         )
 
-    if (
-        cfg.disaggregation_decode_enable_host_receive
-        and cfg.hicache_mem_layout != "layer_first"
-    ):
-        raise ValueError(
-            "Decode host receive requires layer_first host KV layout; "
-            f"the resolved layout is {cfg.hicache_mem_layout!r}"
-        )
-
     if cfg.disaggregation_decode_enable_offload_kvcache:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(

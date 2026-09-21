@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.arg_groups.hicache_hook import handle_hicache
+from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
@@ -113,10 +115,17 @@ class TestDecodeRetractionBackup(CustomTestCase):
             page_size=page_size,
             hicache_ratio=hicache_ratio,
             hicache_io_backend=io_backend,
-            hicache_mem_layout="layer_first" if shared_receive else "page_first",
+            hicache_mem_layout="page_first",
             disable_radix_cache=not radix_cache,
             hicache_write_policy="write_back",
+            disaggregation_mode="decode" if shared_receive else "null",
+            disaggregation_decode_enable_host_receive=shared_receive,
+            disaggregation_decode_enable_radix_cache=radix_cache,
         )
+        if shared_receive:
+            # Exercise pool layout selection from the normal HiCache default.
+            handle_pd_disaggregation(server_args)
+            handle_hicache(server_args)
         set_global_server_args_for_scheduler(server_args)
 
         req_to_token_pool = ReqToTokenPool(
