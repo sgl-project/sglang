@@ -338,6 +338,37 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
             [("get_weather", '{"city": "NY"}')],
         )
 
+    def test_non_streaming_drops_unclosed_invoke_in_closed_wrapper(self):
+        text = (
+            f"<{DSML}tool_calls>\n"
+            f'<{DSML}invoke name="get_weather">\n{{"city": "SF"}}\n'
+            f"</{DSML}tool_calls>"
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_non_streaming_parses_bare_invoke_without_wrapper(self):
+        result = DeepSeekV4Detector().detect_and_parse(
+            "Checking.\n\n" + _invoke("get_weather", '{"city": "SF"}'), self.tools
+        )
+
+        self.assertEqual(result.normal_text, "Checking.")
+        self.assertEqual(
+            [(call.name, call.parameters) for call in result.calls],
+            [("get_weather", '{"city": "SF"}')],
+        )
+
+    def test_non_streaming_malformed_bare_invoke_fails_closed(self):
+        result = DeepSeekV4Detector().detect_and_parse(
+            _invoke("get_weather", '{"city": }'), self.tools
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(DSML, result.normal_text)
+
     def test_stream_end_drops_incomplete_invoke(self):
         parser = FunctionCallParser(self.tools, "deepseekv4")
         normal, calls = parser.parse_stream_chunk(

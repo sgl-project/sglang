@@ -170,7 +170,9 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             # Assume reasoning was truncated before end token
-            return StreamingParseResult(reasoning_text=processed_text)
+            return StreamingParseResult(
+                reasoning_text=self._strip_partial_tool_start(processed_text)
+            )
 
         # Extract reasoning content
         if self.think_end_token in processed_text:
@@ -300,6 +302,21 @@ class BaseReasoningFormatDetector:
                 return i
         return 0
 
+    def _strip_partial_tool_start(self, text: str, preceded_by: str = "") -> str:
+        """Drop a trailing partial tool-start token that begins a line: generation
+        ended mid-tag, and flushing the fragment as reasoning would surface raw
+        markup to the client. `preceded_by` is as in `_find_tool_start`."""
+        if not self.tool_start_at_line_start or not text:
+            return text
+        n = self._ends_with_partial_token(text, self.tool_start_token or "")
+        if n == 0:
+            return text
+        start = len(text) - n
+        prev = text[start - 1] if start > 0 else preceded_by
+        if prev in ("", "\n"):
+            return text[:start]
+        return text
+
     def finish(self) -> StreamingParseResult:
         """Flush reasoning still buffered when the stream ends before the end token
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
@@ -315,6 +332,7 @@ class BaseReasoningFormatDetector:
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
         buffer = self._strip_leading_think_start(self._buffer)
+        buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
         if self._force_nonempty_content:

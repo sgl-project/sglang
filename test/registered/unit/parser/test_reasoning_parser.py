@@ -270,6 +270,48 @@ class TestDeepSeekV4Detector(CustomTestCase):
         )
         self.assertEqual(result.normal_text, "done")
 
+    def test_truncated_calls_opener_is_not_flushed_into_reasoning(self):
+        """A generation cut off mid-calls-opener (e.g. max_tokens before `>`)
+        must not surface the partial tag in reasoning_content."""
+        for model, partial in (
+            ("deepseek-v4", "<｜DSML｜tool_calls"),
+            ("deepseek-v41", "<｜DSML｜ calls"),
+        ):
+            with self.subTest(model=model):
+                text = "Choosing a tool\n\n" + partial
+                detector = ReasoningParser(
+                    model_type=model, force_reasoning=True
+                ).detector
+                streamed = detector.parse_streaming_increment(text)
+                flushed = detector.finish()
+                reasoning = (streamed.reasoning_text or "") + (
+                    flushed.reasoning_text or ""
+                )
+                normal = (streamed.normal_text or "") + (flushed.normal_text or "")
+                self.assertEqual(reasoning, "Choosing a tool\n\n")
+                self.assertEqual(normal, "")
+
+                result = ReasoningParser(
+                    model_type=model, force_reasoning=True
+                ).detector.detect_and_parse(text)
+                self.assertEqual(result.reasoning_text, "Choosing a tool\n\n")
+                self.assertFalse(result.normal_text)
+
+    def test_mid_sentence_partial_calls_opener_stays_in_reasoning(self):
+        """A partial calls opener that does not begin a line is a mention,
+        not a call, and must survive the EOS flush."""
+        detector = ReasoningParser(
+            model_type="deepseek-v4", force_reasoning=True
+        ).detector
+        text = "mentioning <｜DSML｜tool"
+
+        streamed = detector.parse_streaming_increment(text)
+        flushed = detector.finish()
+
+        self.assertEqual(
+            (streamed.reasoning_text or "") + (flushed.reasoning_text or ""), text
+        )
+
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):

@@ -196,24 +196,36 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
-        if self.bot_token not in text:
+        if idx != -1:
+            normal_text = text[:idx].removesuffix("\n\n")
+            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
+        else:
+            # The streaming path accepts bare invokes without the outer
+            # wrapper; parse them here too instead of leaking raw DSML.
+            start = text.find(self.invoke_start_token)
+            if start == -1:
+                return StreamingParseResult(normal_text=text, calls=[])
+            normal_text = self._text_before_dsml(text)
+            sections = [text[start:]]
+
+        if not sections:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
         try:
-            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
-            if not sections:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
             # Find all invoke blocks
             for function_calls_content in sections:
                 for invoke_match in re.finditer(
                     self.invoke_regex, function_calls_content, re.DOTALL
                 ):
-                    func_name, invoke_content, _ = self._unpack_invoke_match(
+                    func_name, invoke_content, is_complete = self._unpack_invoke_match(
                         invoke_match
                     )
+                    if not is_complete:
+                        logger.warning(
+                            f"Dropping unclosed DeepSeek invoke '{func_name}'"
+                        )
+                        continue
                     try:
                         func_args = self._parse_parameters_from_xml(invoke_content)
                     except ValueError as e:
