@@ -53,6 +53,7 @@ _ESSAY_QUESTION = (
 class TestDFlashDraftSWAPool(CustomTestCase, GSM8KMixin):
     model = TARGET_MODEL
     draft_model = DRAFT_MODEL
+    page_size = 1
     gsm8k_accuracy_thres = 0.80
     gsm8k_accept_length_thres = 3.0
     gsm8k_num_questions = 200
@@ -76,6 +77,8 @@ class TestDFlashDraftSWAPool(CustomTestCase, GSM8KMixin):
             "--speculative-draft-swa-pool",
             "--swa-prefix-tails",
             str(PREFIX_TAILS),
+            "--page-size",
+            str(cls.page_size),
             "--max-running-requests",
             str(MAX_RUNNING_REQUESTS),
             "--mem-fraction-static",
@@ -141,7 +144,9 @@ class TestDFlashDraftSWAPool(CustomTestCase, GSM8KMixin):
         log = self._server_log()
         self.assertEqual(window, DRAFT_WINDOW)
         self.assertEqual(tails, PREFIX_TAILS)
-        self.assertEqual(swa_tokens, cap + PREFIX_TAILS * (DRAFT_WINDOW + 1))
+        self.assertEqual(
+            swa_tokens, cap + PREFIX_TAILS * (DRAFT_WINDOW + self.page_size)
+        )
         # The draft pool is built with that many SWA slots.
         pools = re.findall(r"SWAKVPool .*swa size: (\d+), full size: (\d+)", log)
         self.assertIn(swa_tokens, [int(swa) for swa, _ in pools])
@@ -160,7 +165,9 @@ class TestDFlashDraftSWAPool(CustomTestCase, GSM8KMixin):
             f"prefix hit: prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
         )
         self.assertGreater(cached_tokens, prompt_tokens - DRAFT_WINDOW)
-        self.assertGreaterEqual(cached_tokens, prompt_tokens - CHECKPOINT_SLACK)
+        self.assertGreaterEqual(
+            cached_tokens, prompt_tokens - CHECKPOINT_SLACK - self.page_size
+        )
 
     def test_greedy_determinism_across_hit(self):
         self._flush_cache()
@@ -194,6 +201,17 @@ class TestDFlashDraftSWAPool(CustomTestCase, GSM8KMixin):
         self.assertLessEqual(cached_tokens, prompt_tokens - DRAFT_WINDOW)
         self.assertEqual(cold["text"], warm["text"])
         self.assertIsNone(self.process.poll())
+
+
+class TestDFlashDraftSWAPoolPaged(TestDFlashDraftSWAPool):
+    """The same pool at page size 64, where the allocator pages both sides and
+    the draft backend builds its page table from translated slots."""
+
+    page_size = 64
+
+    def test_gsm8k(self):
+        # Covered at page size 1; this class exercises the paged allocator.
+        self.skipTest("accuracy is covered by the page-size-1 class")
 
 
 if __name__ == "__main__":
