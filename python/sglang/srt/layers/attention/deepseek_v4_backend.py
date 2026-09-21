@@ -1670,6 +1670,8 @@ class DeepseekV4AttnBackend(
         supported = (
             bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
         )
+        # CP's paged indexer needs a bounded static context width. Captured
+        # multistream prepare joins its source workers before scoring these rows.
         return supported and (
             get_parallel().attn_cp_size == 1 or _prefill_graph_max_seq_len() is not None
         )
@@ -2741,10 +2743,34 @@ class DeepseekV4AttnBackend(
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
-                self._source_projection_buffers(
-                    forward_batch.out_cache_loc.shape[0], ratio
-                )
+                if dsa_use_prefill_cp(forward_batch):
+                    self._cp_indexer_projection_buffers(
+                        forward_batch._cp_positions.shape[0], ratio
+                    )
+                else:
+                    self._source_projection_buffers(
+                        forward_batch.out_cache_loc.shape[0], ratio
+                    )
         return self.forward_metadata
+
+    def _cp_indexer_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
+        """Capture-stable CP-local Q and weight rows for the paged indexer."""
+        sets = getattr(self, "_cp_indexer_proj_bufs", None)
+        if sets is None:
+            sets = self._cp_indexer_proj_bufs = {}
+        key = (ratio, num_tokens)
+        if key not in sets:
+            cfg = self.model_runner.model_config.hf_text_config
+            heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
+            sets[key] = {
+                "q": torch.zeros(
+                    num_tokens, heads, dim, dtype=torch.bfloat16, device=self.device
+                ),
+                "w": torch.zeros(
+                    num_tokens, heads, dtype=torch.bfloat16, device=self.device
+                ),
+            }
+        return sets[key]
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2889,6 +2915,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
@@ -2904,6 +2931,7 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                precomputed_x_global=precomputed_x_global,
             )
             return
         meta = self.forward_metadata
@@ -2939,15 +2967,26 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
         tail = self.forward_metadata.late_layer_tail
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )
+            x_global = precomputed_x_global
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
             if self._low_ratio_in_prefill_graph():
                 assert tail is None, "bounded SWA replay cannot enter prefill BCG"
                 core = self.forward_metadata.core_metadata
