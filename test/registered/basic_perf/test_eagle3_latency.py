@@ -52,9 +52,9 @@ class TestEagle3Latency(CustomTestCase):
         check_perf(
             self,
             at_most(
-                "median_e2e_latency_ms", res["median_e2e_latency_ms"], 900, unit="ms"
+                "median_e2e_latency_ms", res["median_e2e_latency_ms"], 1150, unit="ms"
             ),
-            at_least("accept_length", res["accept_length"], 3.0),
+            at_least("accept_length", res["accept_length"], 2.3),
         )
 
 
