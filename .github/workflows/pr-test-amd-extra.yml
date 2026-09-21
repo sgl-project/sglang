@@ -243,9 +243,8 @@ jobs:
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,
       ]
-    # Same `labeled` guard as call-gate above; without it a run started by an
-    # unrelated label finishes green with nothing executed, and that green
-    # lands on the commit over the real run's result.
+    # Same `labeled` guard as call-gate: without it a run started by an unrelated
+    # label finishes green with nothing executed, over the real run's result.
     if: |
       always() &&
       (github.event_name != 'pull_request' ||

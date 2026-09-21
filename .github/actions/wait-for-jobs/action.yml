@@ -49,9 +49,7 @@ runs:
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
           const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
-          // `parallel-stages` opts the PR out of stage-to-stage waiting, letting
-          // every stage dispatch at once the way scheduled runs do. A failed
-          // lookup leaves the wait in place rather than skipping it.
+          // A failed lookup leaves the wait in place rather than skipping it.
           const { resolveCiLabels } = require(
             `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
           );

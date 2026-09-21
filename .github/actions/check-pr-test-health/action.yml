@@ -23,7 +23,7 @@ runs:
             return;
           }
 
-          // Skip for scheduled runs — they should collect all failures, not fail-fast
+          // Skip for scheduled runs -- they should collect all failures, not fail-fast
           if (context.eventName === 'schedule') {
             core.info('Skipping health check for scheduled run');
             return;
@@ -47,8 +47,7 @@ runs:
             return;
           }
 
-          // Skip the jobs-failed check when the PR opts out of fail-fast.
-          // Lint check above still runs.
+          // The lint check above is never bypassed; only sibling failures are.
           const { resolveCiLabels } = require(
             `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
           );

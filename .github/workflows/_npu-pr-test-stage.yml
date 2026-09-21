@@ -105,7 +105,7 @@ jobs:
               return;
             }
 
-            // Skip for scheduled runs — they should collect all failures, not fail-fast
+            // Skip for scheduled runs -- they should collect all failures, not fail-fast
             if (context.eventName === 'schedule') {
               core.notice('[health-check] SKIP: scheduled run');
               return;

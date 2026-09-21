@@ -203,9 +203,8 @@ jobs:
       - name: Set continue-on-error for schedule/full runs
         id: set-continue-on-error
         env:
-          # `bypass-fail-fast` also disables within-suite fail-fast here. The
-          # shared actions/wait-for-jobs reads `parallel-stages` for the
-          # separate question of whether stages may overlap.
+          # `parallel-stages` is the separate axis, read by actions/wait-for-jobs;
+          # this one only decides whether a failure stops the rest of the suite.
           BYPASS_FAIL_FAST: ${{ steps.ci-labels.outputs.bypass_fail_fast }}
         run: |
           if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" \

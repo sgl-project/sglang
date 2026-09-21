@@ -56,8 +56,7 @@ on:
         default: false
 
 concurrency:
-  # A PR keys on its number; github.head_ref is a bare branch name that two
-  # forks can share, which would make them cancel each other's runs.
+  # Keys on the PR number: two forks can share a head_ref and would cancel each other.
   group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
@@ -204,12 +203,10 @@ jobs:
         simulator-test-cpu,
         extra-test,
       ]
-    # Same `labeled` guard as check-changes above. Any label starts a run;
-    # for a label that is not gating, check-changes and everything under it
-    # skip, and an unguarded `always()` here would still finish green -- and
-    # that green publishes a passing `pr-test-extra-finish` check over the
-    # real run's failure on the same commit. Skipping it leaves the run
-    # `skipped` as a whole, which is what pr-states.yml's `isReal` expects.
+    # Same `labeled` guard as check-changes. Without it a run started by an
+    # unrelated label finishes green with nothing executed, superseding the real
+    # run's failure on the commit; skipping it leaves the run `skipped`, which is
+    # what pr-states.yml's `isReal` reads.
     if: |
       always() &&
       (github.event_name != 'pull_request' ||
@@ -245,10 +242,8 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
-    # Carries the same `labeled` guard: on a non-gating label this run has
-    # nothing to report, and a green job here would drag the run conclusion
-    # back to `success`. pr-states.yml subscribes to labeled/unlabeled through
-    # its own pull_request_target trigger, so nothing is lost.
+    # Same guard: a green job here would pull the run conclusion back to `success`.
+    # pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&

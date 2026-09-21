@@ -2,20 +2,11 @@
 
 /**
  * Resolve a PR's CI control labels into the axes the pipeline dispatches on.
+ * `highest-priority` turns on the other three; the contribution guide says what
+ * each one does.
  *
- * Four labels, three of them independent switches and one that turns on all
- * three:
- *
- *   bypass-fail-fast  a sibling job failing does not abort the rest of the run
- *   parallel-stages   stages dispatch together instead of waiting on each other
- *   max-concurrency   a suite fans out to every shard at once, not 1/3 of them
- *   highest-priority  all three, plus the protections keyed on it elsewhere
- *                     (never batch-cancelled, sorted first, never stale-closed)
- *
- * Labels come from the API, not from `context.payload`: a rerun replays the
- * original event, so the payload still carries the label set from when the run
- * was first created. Adding a label and rerunning is how a PR opts in, and only
- * a live read observes that.
+ * Labels come from the API, not `context.payload`: a rerun replays the original
+ * event, so the payload carries the label set from when the run was created.
  */
 
 const BYPASS_FAIL_FAST = "bypass-fail-fast";
