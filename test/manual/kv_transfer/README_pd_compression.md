@@ -100,24 +100,7 @@ wait are recorded separately. Timers overlap and must not be summed as request
 latency. `SGLANG_KV_COMPRESSION_TRACE_STORE=1` adds node, handle, generation and
 page-identity logs; shared cache operations do not invent request ownership.
 
-## Local checks
-
-Run the control-flow and storage suite from the repository root:
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 SGLANG_COMPRESSION_STANDALONE_TEST=1 PYTHONPATH=python \
-python -m pytest -q \
-  test/registered/unit/mem_cache/test_compressed_hicache.py \
-  test/registered/unit/mem_cache/test_compressed_block_pool.py \
-  test/registered/unit/disaggregation/test_pd_compression_protocol.py \
-  test/registered/unit/disaggregation/test_pd_compression_validation.py
-```
-
-The standalone switch bypasses package initialization on a CPU workstation.
-Storage code runs directly; selected serving methods run with controlled
-collaborators. These checks do not import or exercise the complete GPU server.
-The registered tests also provide the executable entry points used by CPU CI.
-The admission-timing fixture covers identity tracing both enabled and disabled.
+## Local capacity replay
 
 For a capacity replay, supply the frozen workload and request order:
 
