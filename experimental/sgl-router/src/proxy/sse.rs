@@ -109,55 +109,41 @@ where
                 None => std::future::pending().await,
             }
         };
-        tokio::pin!(expired);
+        // Disconnect and expiration race the whole forwarding loop, so they
+        // fire while `send` waits on a full queue as well as while upstream is silent.
         let pump = async {
-            loop {
-                let chunk = tokio::select! {
-                    biased;
-                    _ = tx.closed() => {
-                        end.client_disconnect = true;
-                        return Ok(());
-                    }
-                    _ = &mut expired => {
-                        end.transport_ok = false;
-                        return Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"));
-                    }
-                    chunk = tokio::time::timeout(idle, stream.next()) => chunk,
-                };
-                let bytes = match chunk {
-                    Ok(None) => return Ok(()),
-                    Ok(Some(Ok(bytes))) => bytes,
-                    Ok(Some(Err(e))) => {
-                        end.transport_ok = false;
-                        return Err(std::io::Error::other(e.to_string()));
-                    }
-                    Err(_) => {
-                        end.transport_ok = false;
-                        return Err(std::io::Error::other("SSE upstream idle timeout"));
-                    }
-                };
-                if let Some(hook) = on_first_byte.take() {
-                    hook();
+            tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    end.client_disconnect = true;
+                    Ok(())
                 }
-                if !end.saw_error_event {
-                    end.saw_error_event = scanner.feed(&bytes);
+                _ = expired => {
+                    end.transport_ok = false;
+                    Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
                 }
-                tokio::select! {
-                    biased;
-                    _ = tx.closed() => {
-                        end.client_disconnect = true;
-                        return Ok(());
-                    }
-                    _ = &mut expired => {
-                        end.transport_ok = false;
-                        return Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"));
-                    }
-                    result = tx.send(bytes) => {
-                        if result.is_err() {
-                            end.client_disconnect = true;
-                            return Ok(());
+                result = async {
+                    loop {
+                        let bytes = match tokio::time::timeout(idle, stream.next()).await {
+                            Ok(None) => return Ok(()),
+                            Ok(Some(Ok(bytes))) => bytes,
+                            Ok(Some(Err(e))) => return Err(std::io::Error::other(e.to_string())),
+                            Err(_) => return Err(std::io::Error::other("SSE upstream idle timeout")),
+                        };
+                        if let Some(hook) = on_first_byte.take() {
+                            hook();
+                        }
+                        if !end.saw_error_event {
+                            end.saw_error_event = scanner.feed(&bytes);
+                        }
+                        if tx.send(bytes).await.is_err() {
+                            // Receiver gone; the `tx.closed()` arm reports the disconnect.
+                            std::future::pending::<()>().await;
                         }
                     }
+                } => {
+                    end.transport_ok &= result.is_ok();
+                    result
                 }
             }
         };
