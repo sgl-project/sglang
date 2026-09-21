@@ -99,6 +99,14 @@ class PixtralForConditionalGeneration(nn.Module):
             config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
             config_dict["rope_scaling"] = config_dict["rope_parameters"]
             config_dict.pop("rope_parameters")
+        # Restore to original values if padded
+        # since VisionTransformers defined in this file does not apply TP
+        original_num_heads = config_dict.get("original_num_attention_heads")
+        if original_num_heads:
+            config_dict["num_attention_heads"] = original_num_heads
+        original_intermediate_size = config_dict.get("original_intermediate_size")
+        if original_intermediate_size:
+            config_dict["intermediate_size"] = original_intermediate_size
         vision_args = {
             key: value for key, value in config_dict.items() if key in dataclass_fields
         }
