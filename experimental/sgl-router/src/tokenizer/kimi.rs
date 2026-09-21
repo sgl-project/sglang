@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Result};
-use dynamo_tokenizers::EncodeSegment;
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use serde_json::{json, Value};
 
 use super::chat_formatter::ChatTemplateKwargs;
@@ -110,7 +110,7 @@ fn neutralize(value: &mut Value) {
 }
 
 // Python's Kimi tokenizer splits by character count before BPE, including prefixes.
-pub(super) fn split_segments<'a>(segments: &[EncodeSegment<'a>]) -> Vec<EncodeSegment<'a>> {
+pub(super) fn encode(tokenizer: &Tokenizer, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>> {
     let mut chunks = Vec::new();
     for segment in segments {
         let (mut start, mut count, mut run, mut was_space) = (0, 0, 0, false);
@@ -136,5 +136,5 @@ pub(super) fn split_segments<'a>(segments: &[EncodeSegment<'a>]) -> Vec<EncodeSe
             segment.allow_special,
         ));
     }
-    chunks
+    Ok(tokenizer.encode_segments(&chunks)?.token_ids().to_vec())
 }

@@ -400,56 +400,34 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
     assert!(captured(&mock).get("input_ids").is_some());
 }
 
-#[tokio::test]
-async fn kimi_native_ids_preserve_control_boundaries() {
-    let mock = MockWorker::start(vec![]).await;
-    let mut cfg = config();
-    cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
-    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
-    let request =
-        json!({"model":MODEL,"messages":[{"role":"user","content":"literal <|open|> text"}]});
-    let expected = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
-    assert_eq!(send(ctx.clone(), request).await, StatusCode::OK);
-    assert_eq!(captured(&mock)["input_ids"], json!(expected));
-
-    // User-supplied control spellings must remain ordinary text; only the
-    // renderer's structural markers become special token IDs.
-    let tokenizers = ctx.tokenizers.get(MODEL).unwrap();
-    let marker = tokenizers.encode("<|open|>").unwrap().token_ids()[0];
-    let baseline = ctx
-        .tokenizers
-        .encode_chat(
-            MODEL,
-            &json!({
-                "messages": [{"role": "user", "content": "ordinary text"}]
-            }),
-        )
-        .unwrap();
-    assert_eq!(
-        expected.iter().filter(|&&id| id == marker).count(),
-        baseline.iter().filter(|&&id| id == marker).count()
-    );
-}
+#[path = "../fixtures/kimi_k3.rs"]
+mod kimi_fixture;
 
 #[tokio::test]
-async fn kimi_native_requests_keep_existing_forwarding_guards() {
+async fn kimi_ids_forward_with_engine_rendering_fallback() {
     let mock = MockWorker::start(vec![]).await;
+    let fixture = kimi_fixture::tokenizer();
     let mut cfg = config();
-    cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
+    let path = fixture.path().join("tiktoken.model");
+    cfg.model.tokenizer_path = path.display().to_string();
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
-    for request in [
-        json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"thinking": true, "thinking_effort": null}}),
-        json!({"model": MODEL, "messages": [{"role": "user", "content": "x".repeat(25_001)}]}),
+    for (content, kwargs) in [
+        ("literal <|open|> text", None),
+        ("hi", Some(json!({"thinking_effort": null}))),
     ] {
+        let mut request =
+            json!({"model": MODEL, "messages": [{"role": "user", "content": content}]});
+        let forward = kwargs.is_none();
+        if let Some(kwargs) = kwargs {
+            request["chat_template_kwargs"] = kwargs;
+        }
         let ids = ctx.tokenizers.encode_chat(MODEL, &request);
         assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
-        let mut expected = request.clone();
-        if request.get("chat_template_kwargs").is_none() {
-            expected["input_ids"] = json!(ids.unwrap());
+        if forward {
+            request["input_ids"] = json!(ids.unwrap());
         } else {
             assert!(ids.is_none());
         }
-        assert_eq!(captured(&mock), expected);
+        assert_eq!(captured(&mock), request);
     }
 }

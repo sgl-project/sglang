@@ -3,11 +3,13 @@
 Run from experimental/sgl-router in a SGLang Python environment.
 """
 
+import base64
 import copy
 import hashlib
 import json
 import pathlib
 import sys
+import tempfile
 from types import SimpleNamespace
 
 from huggingface_hub import hf_hub_download
@@ -31,7 +33,15 @@ config = json.loads((fixture / "tokenizer_config.json").read_text())
 config["added_tokens_decoder"] = {
     int(k): AddedToken(**v) for k, v in config["added_tokens_decoder"].items()
 }
-tokenizer = TikTokenTokenizer(str(fixture / "tiktoken.model"), **config)
+tokens = [bytes([b]) for b in range(256)]
+tokens += [s.encode() for s in (fixture / "merges.txt").read_text().split()]
+vocab = "".join(
+    f"{base64.b64encode(token).decode()} {rank}\n" for rank, token in enumerate(tokens)
+)
+with tempfile.NamedTemporaryFile(suffix=".model", mode="w+") as model:
+    model.write(vocab)
+    model.flush()
+    tokenizer = TikTokenTokenizer(model.name, **config)
 server = object.__new__(OpenAIServingChat)
 server.chat_encoding_spec = "kimi_k3"
 server.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer)
@@ -51,6 +61,8 @@ for case in cases:
     ).hexdigest()
 (fixture / "prompts.json").write_text(
     "[\n"
-    + ",\n".join(json.dumps(c, ensure_ascii=False, separators=(",", ":")) for c in cases)
+    + ",\n".join(
+        json.dumps(c, ensure_ascii=False, separators=(",", ":")) for c in cases
+    )
     + "\n]\n"
 )

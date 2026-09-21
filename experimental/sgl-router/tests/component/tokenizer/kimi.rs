@@ -5,9 +5,14 @@ use serde_json::{json, Value};
 use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter};
 use sha2::{Digest, Sha256};
 
+#[path = "../../fixtures/kimi_k3.rs"]
+mod fixture;
+
 #[test]
 fn kimi_tokens_match_sglang() {
-    let path = "tests/fixtures/kimi_k3/tiktoken.model";
+    let fixture = fixture::tokenizer();
+    let path = fixture.path().join("tiktoken.model");
+    let path = path.to_str().unwrap();
     let tokenizer = adapter::load(path).unwrap();
     let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
     let cases: Vec<Value> =

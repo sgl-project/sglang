@@ -316,25 +316,17 @@ impl ChatFormatter {
     ) -> Result<Vec<u32>> {
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
-            Some(segments) => {
-                let segments = if self.is_kimi_k3 {
-                    super::kimi::split_segments(&segments)
-                } else {
-                    segments
-                };
-                tokenizer.encode_segments(&segments)?.token_ids().to_vec()
-            }
+            Some(segments) if self.is_kimi_k3 => super::kimi::encode(tokenizer, &segments)?,
+            Some(segments) => tokenizer.encode_segments(&segments)?.token_ids().to_vec(),
             None => super::adapter::encode(tokenizer, prompt.as_str())?,
         };
         if !prefix.is_empty() {
             // SGLang encodes the assistant prefix separately and removes its leading BOS.
             let mut suffix = if self.is_kimi_k3 {
-                tokenizer
-                    .encode_segments(&super::kimi::split_segments(&[
-                        dynamo_tokenizers::EncodeSegment::control(&prefix),
-                    ]))?
-                    .token_ids()
-                    .to_vec()
+                super::kimi::encode(
+                    tokenizer,
+                    &[dynamo_tokenizers::EncodeSegment::control(&prefix)],
+                )?
             } else {
                 super::adapter::encode(tokenizer, &prefix)?
             };
