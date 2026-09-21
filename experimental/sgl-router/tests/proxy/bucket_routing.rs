@@ -10,17 +10,17 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
-    ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
-    CachePrefixProvider, Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig,
+    AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig, CachePrefixProvider,
+    Config, DiscoveryBackend, InflightLoadConfig, KvIndexerEndpointConfig, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,11 +55,13 @@ fn build_app_context(
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy,
             decode_policy: Default::default(),
             bucket_config: Some(bucket_config),
@@ -69,12 +71,13 @@ fn build_app_context(
             affinity,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -233,7 +236,7 @@ fn set_native_load_with_waiting(
     max_total_num_tokens: u64,
     num_waiting_uncached_tokens: u64,
 ) {
-    ctx.engine_load.set(
+    ctx.engine_reported_load.set(
         worker_url,
         0,
         LoadStat {

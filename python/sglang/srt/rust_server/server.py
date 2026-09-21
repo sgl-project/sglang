@@ -124,7 +124,7 @@ class RustServer:
             # The joining TP group is entirely local to this node.
             tp_size_per_node = scheduler.ps.tp_size
         else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
+            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
             tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
         dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
         # Count DP leaders within this node's TP range. The first leader must
