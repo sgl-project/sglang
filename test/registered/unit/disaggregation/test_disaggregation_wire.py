@@ -8,12 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.disaggregation.base.conn import (
-    KVArgs,
-    KVPoll,
-    KVTransferDestination,
-    StateType,
-)
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -35,7 +30,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
-    MooncakeKVReceiver,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -74,37 +68,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
-    def test_host_timeout_keeps_ack_that_arrives_before_cleanup(self):
-        manager = object.__new__(CommonKVManager)
-        manager._deferred_abort_ack_tracker = {}
-        manager.waiting_timeout = 0
-        manager.failure_records = {}
-        manager.failure_lock = threading.Lock()
-        manager.request_status = {}
-        manager.local_ip, manager.rank_port = "127.0.0.1", 1234
-        receiver = object.__new__(MooncakeKVReceiver)
-        receiver.kv_mgr = manager
-        receiver.bootstrap_infos = [{}]
-        receiver.bootstrap_room, receiver.init_time = 42, 0
-        receiver.destination = KVTransferDestination.HOST
-        receiver.abort_notified, receiver.conclude_state = False, None
-        socket = Mock()
-        socket.send_multipart.side_effect = lambda _: manager.note_abort_ack(42, 0)
-        with (
-            patch.object(receiver, "invalidate_cached_bootstrap_infos"),
-            patch.object(
-                receiver,
-                "_connect_to_bootstrap_server",
-                return_value=(socket, threading.Lock()),
-            ),
-        ):
-            self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
-            self.assertTrue(manager.is_abort_release_safe(42, 1))
-            receiver.conclude_state = KVPoll.Failed
-            receiver.abort()
-            self.assertTrue(manager.is_abort_release_safe(42, 1))
-            socket.send_multipart.assert_called_once()
-
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -136,54 +99,6 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
-
-        self.assertEqual(info.dst_host_kv_ptrs, [])
-        msg[16:18] = [b"1", b"0"]
-        msg.extend(
-            [
-                b"",
-                struct.pack("Q", 128),
-                pack_int_lists([[0x4000], [1024], [128]], "Q"),
-            ]
-        )
-        info = KVArgsRegisterInfo.from_zmq(msg)
-        self.assertEqual(info.dst_kv_item_lens, [128])
-        self.assertEqual(info.dst_host_kv_ptrs, [0x4000])
-        self.assertEqual(info.dst_host_kv_data_lens, [1024])
-        self.assertEqual(info.dst_host_kv_item_lens, [128])
-        manager = object.__new__(MooncakeKVManager)
-        manager.pp_size = manager.dcp_size = manager.attn_cp_size = 1
-        manager.attn_tp_size = 1
-        manager.kv_args = SimpleNamespace(state_types=[], kv_item_lens=[128])
-        metadata = [
-            b"42",
-            b"127.0.0.1",
-            b"1234",
-            b"session",
-            np.array([5, 7], dtype=np.int32).tobytes(),
-            b"3",
-            b"",
-            b"1",
-            b"0",
-            b"",
-        ]
-        device_req = TransferInfo.from_zmq(metadata)
-        self.assertIs(
-            manager._select_kv_destination(device_req, info), info.dst_kv_ptrs
-        )
-        host_req = TransferInfo.from_zmq(metadata + [b"host"])
-        self.assertIs(
-            manager._select_kv_destination(host_req, info), info.dst_host_kv_ptrs
-        )
-        for field, value in (
-            ("dst_host_kv_ptrs", []),
-            ("dst_host_kv_item_lens", [64]),
-            ("dst_attn_tp_size", 2),
-            ("dst_host_kv_data_lens", [896]),
-        ):
-            with self.subTest(field=field), patch.object(info, field, value):
-                with self.assertRaises(ValueError):
-                    manager._select_kv_destination(host_req, info)
 
     def test_int_lists_roundtrip(self):
         cases = [

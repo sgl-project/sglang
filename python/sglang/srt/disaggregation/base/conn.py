@@ -120,6 +120,8 @@ class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
     enable_deferred_decode_kv_release: bool = False
+    # Opt-in requires registering host KV buffers and reporting when aborted
+    # transfers have drained so the scheduler can release their destination pages.
     supports_host_destination: bool = False
 
     @abstractmethod
@@ -222,6 +224,7 @@ class BaseKVSender(ABC):
 class BaseKVReceiver(ABC):
     @property
     def supports_host_destination(self) -> bool:
+        """Whether this receiver's peer and layout support host KV destinations."""
         return False
 
     @abstractmethod
@@ -253,6 +256,8 @@ class BaseKVReceiver(ABC):
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
+
+        HOST selects the registered host KV buffers and their page indices.
         """
         ...
 

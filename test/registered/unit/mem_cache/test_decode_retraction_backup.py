@@ -331,9 +331,15 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     seqlen=num_tokens + 1,
                     time_stats=Mock(),
                 )
-                receiver = Mock(supports_host_destination=True)
+                receiver = Mock(supports_host_destination=False)
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
                 host_free_before = cache.host_pool_group.available_size()
+                self.assertFalse(queue._pre_alloc_host(decode_req))
+                receiver.send_metadata.assert_not_called()
+                self.assertEqual(
+                    cache.host_pool_group.available_size(), host_free_before
+                )
+                receiver.supports_host_destination = True
                 self.assertTrue(queue._pre_alloc_host(decode_req))
                 backup = req.kv.retraction_backup
                 self.assertEqual(
