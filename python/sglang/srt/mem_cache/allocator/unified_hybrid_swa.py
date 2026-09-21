@@ -836,9 +836,6 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     def prealloc_fits_assumes_reclaim(self) -> bool:
         return True
 
-    def reclaims_full_for_prealloc(self) -> bool:
-        return True
-
     def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
         return self.can_reserve(full_tokens, swa_tokens, empty_pool=True)
 
