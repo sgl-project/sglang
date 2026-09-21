@@ -9,6 +9,7 @@ import torch
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.pool_host import mamba as mamba_module
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.speculative import base_spec_worker as spec
@@ -104,6 +105,42 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+@pytest.mark.parametrize(
+    ("build_stack", "extra_kwargs"),
+    [
+        (assembler.build_hybrid_swa_stack, {"use_mla": False}),
+        (
+            assembler.build_hybrid_mamba_swa_stack,
+            {
+                "mamba_pool": object(),
+                "mamba_layer_mapping": {},
+                "page_size": 16,
+                "tp_group": None,
+            },
+        ),
+    ],
+)
+def test_swa_hicache_rejects_non_swa_drafts(build_stack, extra_kwargs):
+    drafts = tuple(
+        SimpleNamespace(
+            full_kv_pool=SimpleNamespace(layer_num=int(i == 1)),
+            swa_kv_pool=SimpleNamespace(layer_num=int(i != 1)),
+        )
+        for i in range(3)
+    )
+    with pytest.raises(AssertionError, match="requires SWA-only draft attention"):
+        build_stack(
+            params=SimpleNamespace(mtp_draft_device_pools=drafts),
+            full_kv_pool=object(),
+            swa_kv_pool=object(),
+            full_layer_mapping={0: 0},
+            swa_layer_mapping={1: 0},
+            load_cache_event=None,
+            storage_backend=None,
+            **extra_kwargs,
+        )
 
 
 def test_ascend_packed_state_roundtrip_uses_per_layer_destinations(monkeypatch):

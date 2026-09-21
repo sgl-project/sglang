@@ -56,15 +56,13 @@ def _mamba_pool(layer_ids: list[int], with_temporal: bool) -> MambaPool:
     ("io_backend", "layout"),
     [("kernel", "page_first"), ("direct", "page_first_direct")],
 )
-@pytest.mark.parametrize("local_drafts", [[0, 1, 2], [0, 2]])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("target_layers", [2, 4])
 @pytest.mark.parametrize("with_temporal", [False, True])
-def test_hicache_restores_all_mtp_kv_and_conv_state(
+def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
     io_backend: str,
-    local_drafts: list[int],
     dtype: torch.dtype,
     target_layers: int,
     with_temporal: bool,
@@ -102,10 +100,7 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
     full_layers = list(range(1, target_layers, 2))
     swa_layers = list(range(0, target_layers, 2))
     target_kv = kv_pool(full_layers, swa_layers)
-    drafts = tuple(
-        kv_pool([] if i in local_drafts else [i], [i] if i in local_drafts else [])
-        for i in range(3)
-    )
+    drafts = tuple(kv_pool([], [i]) for i in range(3))
     target_mamba = _mamba_pool(list(range(target_layers)), with_temporal)
     draft_mamba = tuple(_mamba_pool([i], with_temporal) for i in range(3))
     allocator = SimpleNamespace(alloc=lambda n: None, free=lambda ids: None)

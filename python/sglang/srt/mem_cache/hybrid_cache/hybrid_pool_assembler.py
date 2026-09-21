@@ -316,7 +316,6 @@ def build_hybrid_swa_group(
     swa_attn_allocator: Any = None,
     swa_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     swa_free_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
-    mtp_full_device_pools: tuple[Any, ...] = (),
     mtp_swa_device_pools: tuple[Any, ...] = (),
     transfer_layer_id_max: Optional[int] = None,
 ) -> HostPoolGroup:
@@ -348,7 +347,6 @@ def build_hybrid_swa_group(
             page_size=page_size,
             use_mla=use_mla,
             host_size=kv_host_size,
-            mtp_draft_device_pools=mtp_full_device_pools,
             pool_label="full",
         )
         swa_host_pool = build_kv_host_pool(
@@ -358,13 +356,6 @@ def build_hybrid_swa_group(
             host_size=swa_host_size,
             mtp_draft_device_pools=mtp_swa_device_pools,
             pool_label="swa",
-        )
-    if mtp_full_device_pools:
-        full_layer_mapping = _with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=full_kv_pool.layer_num,
-            draft_layer_num=len(mtp_full_device_pools),
         )
     if mtp_swa_device_pools:
         swa_layer_mapping = _with_mtp_layer_mapping(
@@ -380,10 +371,9 @@ def build_hybrid_swa_group(
                 host_pool=kv_host_pool,
                 device_pool=full_kv_pool,
                 layer_mapping=full_layer_mapping,
-                transfer_layer_id_max=transfer_layer_id_max + len(mtp_full_device_pools),
+                transfer_layer_id_max=transfer_layer_id_max,
                 is_anchor=True,
                 host_evict_fn=host_full_evict_fn if has_shared_arena else None,
-                packed_draft_device_pools=mtp_full_device_pools,
             ),
             build_pool_entry(
                 name=PoolName.SWA,
@@ -449,6 +439,14 @@ def build_kv_only_stack(
     return host_pool_group, cache_controller
 
 
+def _mtp_swa_device_pools(params: CacheInitParams) -> tuple[Any, ...]:
+    # Dropping a non-SWA draft here would leave its KV unrestored on a host hit.
+    assert all(
+        pool.full_kv_pool.layer_num == 0 for pool in params.mtp_draft_device_pools
+    ), "Packed MTP with SWA HiCache requires SWA-only draft attention"
+    return tuple(pool.swa_kv_pool for pool in params.mtp_draft_device_pools)
+
+
 def build_hybrid_swa_stack(
     *,
     params: CacheInitParams,
@@ -470,17 +468,7 @@ def build_hybrid_swa_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
     )
-    # Each draft depth may use full or sliding-window attention.
-    mtp_full_device_pools = tuple(
-        pool.full_kv_pool
-        for pool in params.mtp_draft_device_pools
-        if pool.full_kv_pool.layer_num
-    )
-    mtp_swa_device_pools = tuple(
-        pool.swa_kv_pool
-        for pool in params.mtp_draft_device_pools
-        if pool.swa_kv_pool.layer_num
-    )
+    mtp_swa_device_pools = _mtp_swa_device_pools(params)
 
     kv_host_size = swa_host_size = None
     memory = get_memory()
@@ -516,7 +504,6 @@ def build_hybrid_swa_stack(
             if get_memory().enable_unified_memory
             else None
         ),
-        mtp_full_device_pools=mtp_full_device_pools,
         mtp_swa_device_pools=mtp_swa_device_pools,
     )
     cache_controller = HybridCacheController(
@@ -1283,6 +1270,7 @@ def build_hybrid_mamba_swa_stack(
         )
         + 1
     )
+    mtp_swa_device_pools = _mtp_swa_device_pools(params)
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
@@ -1312,16 +1300,7 @@ def build_hybrid_mamba_swa_stack(
             if get_memory().enable_unified_memory
             else None
         ),
-        mtp_full_device_pools=tuple(
-            pool.full_kv_pool
-            for pool in params.mtp_draft_device_pools
-            if pool.full_kv_pool.layer_num
-        ),
-        mtp_swa_device_pools=tuple(
-            pool.swa_kv_pool
-            for pool in params.mtp_draft_device_pools
-            if pool.swa_kv_pool.layer_num
-        ),
+        mtp_swa_device_pools=mtp_swa_device_pools,
         transfer_layer_id_max=transfer_layer_id_max,
     )
     mamba_host_pool = MambaPoolHost(
