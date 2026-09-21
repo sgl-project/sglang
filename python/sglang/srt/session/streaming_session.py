@@ -370,6 +370,12 @@ class StreamingSession(BasePrefixCache):
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         self.inner.release_aborted_request(handle)
 
+    def cancel_aborted_request_work(self, handle: CacheRequestHandle) -> None:
+        self.inner.cancel_aborted_request_work(handle)
+
+    def finish_request_session(self, handle: CacheRequestHandle) -> None:
+        self.inner.finish_request_session(handle)
+
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 

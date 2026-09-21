@@ -72,6 +72,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    abort_prefix_cache_request,
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
@@ -1092,8 +1093,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
-        self._release_aborted_request(req)
+        abort_prefix_cache_request(req, self.tree_cache, release_kv=True)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1134,9 +1134,12 @@ class SchedulerDisaggregationPrefillMixin:
             req.update_finish_state()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+        abort_prefix_cache_request(
+            req,
+            self.tree_cache,
+            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
+            is_insert=False,
+        )
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1157,15 +1160,17 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache)
+        abort_prefix_cache_request(
+            req,
+            self.tree_cache,
+            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
+        )
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -1515,11 +1520,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self._release_aborted_request(req)
-        # Mamba insertion donates the checkpoint and clears its sequence marker.
-        release_kv_cache(
-            req, self.tree_cache, is_insert=not self.tree_cache.supports_mamba()
+        self._release_aborted_request(
+            req, release_kv=True, is_insert=not self.tree_cache.supports_mamba()
         )
+        # Mamba insertion donates the checkpoint and clears its sequence marker.
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
