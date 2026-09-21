@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,7 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
+        scheduler=Mock(),
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._weight_update_in_progress = True
@@ -48,7 +50,7 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
     # Default selector ("all"): only the target (main model) owns the update group,
     # so it receives the broadcast once; that single weights object is then loaded
     # into every selected runner — receive once on the target, load into each.
-    weights = object()
+    weights = [("model.layers.0.weight", object())]
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
     draft_runner = Mock()
@@ -78,7 +80,7 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
     # selector="target": the target still receives once, but the draft worker is
     # never enumerated and no draft runner is loaded.
-    weights = object()
+    weights = [("model.layers.0.weight", object())]
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
     draft_worker = Mock()
@@ -225,3 +227,7 @@ def test_begin_weight_update_rejects_reentry():
     with patch("torch.distributed.barrier"):
         with pytest.raises(AssertionError, match="already open"):
             manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
