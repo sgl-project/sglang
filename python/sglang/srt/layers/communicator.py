@@ -23,8 +23,6 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
-    get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -60,6 +58,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -265,7 +265,7 @@ class AttentionInputs:
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
         output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_tp_group().all_gather_into_tensor(output, hidden_states)
+        get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
         return output
 
     def fetch_qkv_latent(self):
@@ -509,7 +509,7 @@ def tp_reduce_scatter(
     )
     local_tokens = hidden_states.shape[0] // context.tp_size
     output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    get_parallel().tp_group.reduce_scatter_tensor(output, hidden_states)
     if residual is not None:
         residual = residual.tensor_split(context.tp_size)[context.tp_rank]
     return output, residual
@@ -724,7 +724,9 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    # Fusion was published but this shape can't use the kernel,
+                    # so run the deferred reduction inline.
+                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -915,7 +917,10 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
+        # Prefill CP predicates must stay out of decode graph capture.
+        if forward_batch.forward_mode.is_context_parallel_extend() and (
+            dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)
+        ):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
@@ -935,16 +940,16 @@ class LayerCommunicator:
         ):
             return False
 
-        # Fusing makes the next layer's residual+LN absorb the post-experts
-        # all-reduce, and that fused kernel reduces over a single group. Under
-        # hybrid EP+TP the post-experts reduction spans two disjoint groups
-        # (moe_expert_parallel_all_reduce over _MOE_EP, then
-        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-        # should_skip_post_experts_all_reduce() skips *both* once fusion is
-        # published -- so the fused reduce would cover only half the peers and
-        # silently return under-reduced activations.
+        # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
+        # two disjoint groups; post_experts_all_reduce() merges them into one
+        # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
+        # When merging is blocked, no single group covers both, so fusion stays off.
         parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        if (
+            parallel.moe_ep_size > 1
+            and parallel.moe_tp_size > 1
+            and not can_merge_post_experts_all_reduce()
+        ):
             return False
 
         if (
@@ -1069,7 +1074,7 @@ class CommunicateSimpleFn:
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     output = torch.empty(
@@ -1264,7 +1269,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         hidden_states
                     )
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
@@ -1272,7 +1277,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if use_layer_norm_before_gather:
@@ -1504,7 +1509,7 @@ class CommunicateSummableTensorPairFn:
         allow_reduce_scatter: bool = False,
     ):
         if get_parallel().tp_size == get_parallel().attn_dp_size:
-            group = get_tp_group()
+            group = get_parallel().tp_group
         else:
             group = get_parallel().attn_tp_group
         hidden_states, global_hidden_states = (
@@ -1512,7 +1517,7 @@ class CommunicateSummableTensorPairFn:
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
@@ -1594,7 +1599,7 @@ class CommunicateSummableTensorPairFn:
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
-                group = get_tp_group()
+                group = get_parallel().tp_group
             else:
                 group = get_parallel().attn_tp_group
             hidden_states_output, global_hidden_states = (

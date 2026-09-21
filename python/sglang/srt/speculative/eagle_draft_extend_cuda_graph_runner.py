@@ -135,6 +135,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -343,6 +344,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         bs = size
         buffers = self.buffers
@@ -547,6 +549,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions,
             forward_batch.req_pool_indices,
         ]
+        if self.model_runner.model_config.model_is_mrope:
+            buffers.mrope_positions.zero_()
+            if forward_batch.mrope_positions is not None:
+                copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
+                copy_srcs.append(forward_batch.mrope_positions)
         if forward_batch.extend_seq_lens is not None:
             copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
             copy_srcs.append(forward_batch.extend_seq_lens)
