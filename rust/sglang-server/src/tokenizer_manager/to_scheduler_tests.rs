@@ -379,9 +379,9 @@ fn hidden_states_gated_on_server_support() {
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
-/// to the ring, after registration — so it must be deregistered, not leaked.
+/// to the channel, after registration — so it must be deregistered, not leaked.
 #[test]
-fn over_context_request_deregisters_and_never_reaches_the_ring() {
+fn over_context_request_deregisters_and_never_reaches_the_channel() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
         context_len: 4,
         ..test_limits()
@@ -412,9 +412,9 @@ fn over_context_request_deregisters_and_never_reaches_the_ring() {
 /// through the sink registered under that rid, so a `Decode` that arrives
 /// unregistered is silently dropped and the caller waits forever. Both
 /// messages ride one channel from this one thread, which is the FIFO this
-/// pins. Nothing may reach the scheduler ring.
+/// pins. Nothing may reach the scheduler channel.
 #[test]
-fn detokenize_flows_register_then_decode_and_skips_the_ring() {
+fn detokenize_flows_register_then_decode_and_skips_the_channel() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
     let (tx, mut rx) = mpsc::channel(8);
     intake.drive(Request {
@@ -472,17 +472,17 @@ fn detokenize_negative_ids_reject_before_registration() {
     assert!(consumer.drain(16).is_empty());
 }
 
-/// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
+/// A dropped channel push is survivable, and this pins WHY. The channel is bounded,
 /// so under load the scheduler never learns to stop and keeps generating; its
 /// chunks then arrive for a rid the detok table no longer holds and are
 /// dropped. That wastes GPU work but cannot MISDELIVER, because
 /// `Rid::from_client` guarantees no later request ever answers to that rid.
 /// The detok entry is dropped either way — that is the half that must not
-/// depend on the ring.
+/// depend on the channel.
 ///
-/// Ring capacity 1: the first abort pushes, the second finds it full.
+/// Channel capacity 1: the first abort pushes, the second finds it full.
 #[test]
-fn abort_deregisters_even_when_the_ring_push_is_dropped() {
+fn abort_deregisters_even_when_the_channel_push_is_dropped() {
     let (tok_tx, _tok_rx) = flume::unbounded();
     let (detok_tx, detok_rx) = flume::unbounded();
     let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
@@ -509,11 +509,11 @@ fn abort_deregisters_even_when_the_ring_push_is_dropped() {
     intake.on_abort(AbortSource::Guard("pushed".into()));
     intake.on_abort(AbortSource::Guard("dropped".into()));
 
-    // Both deregisters land regardless of whether the ring accepted the push.
+    // Both deregisters land regardless of whether the channel accepted the push.
     for expected in ["pushed", "dropped"] {
         assert!(
             matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
-            "{expected}: the detok entry must be dropped even when the ring is full",
+            "{expected}: the detok entry must be dropped even when the to_scheduler channel is full",
         );
     }
 }
@@ -722,7 +722,7 @@ fn abort_deregisters_from_shard() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
-/// A successful pool return (Queued, ids filled) is pushed to the ring, not
+/// A successful pool return (Queued, ids filled) is pushed to the channel, not
 /// rejected; its registration is untouched.
 #[test]
 fn tokenized_return_pushes_without_deregister() {
@@ -737,7 +737,7 @@ fn tokenized_return_pushes_without_deregister() {
     drop(tm_tx);
     intake.run();
 
-    // Pushed to the ring; the shard sees nothing.
+    // Pushed to the channel; the shard sees nothing.
     assert!(
         detok_rx.try_recv().is_err(),
         "a queued pool-return must be pushed, not touch the shard",
@@ -871,14 +871,14 @@ fn abort_cancels_parked_mm_request() {
 }
 
 /// A pre-tokenized multimodal request parks in `Encoding` (submitted to the
-/// mm worker pool, not the tokenizer pool, not the ring) until `MmEncoded`
-/// resumes it → ring.
+/// mm worker pool, not the tokenizer pool, not the channel) until `MmEncoded`
+/// resumes it → channel.
 #[test]
-fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
+fn mm_request_parks_then_mm_encoded_pushes_to_channel() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
     intake.drive(mm_pretokenized_req("mm-1"));
 
-    // Submitted to the mm pool with the typed work item; nothing on the ring yet.
+    // Submitted to the mm pool with the typed work item; nothing on the channel yet.
     let sub = mm_rx.try_recv().expect("mm pool must receive the request");
     assert_eq!(sub.rid.as_str(), "mm-1");
     assert_eq!(
@@ -892,7 +892,7 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     );
     assert!(consumer.drain(16).is_empty(), "parked, not queued");
 
-    // The worker returns the final expanded ids → pushed to the ring.
+    // The worker returns the final expanded ids → pushed to the channel.
     intake.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8], Vec::new());
     let batch = consumer.drain(16);
     assert_eq!(batch.len(), 1);
@@ -905,13 +905,13 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
 
 /// A multimodal *text* prompt visits the tokenizer pool first
 /// (`Tokenizing { then: Encode }`), then parks in `Encoding` carrying the
-/// pool's ids — the MM worker never sees text. `MmEncoded` then resumes it → ring.
+/// pool's ids — the MM worker never sees text. `MmEncoded` then resumes it → channel.
 #[test]
 fn mm_text_prompt_tokenizes_then_encodes() {
     let (mut intake, tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
     intake.drive(mm_generate_req("mm-t"));
 
-    // In the pool, not the mm channel, not the ring.
+    // In the pool, not the mm channel, not the scheduler channel.
     let mut req = tok_rx
         .try_recv()
         .expect("text prompt must go to the tokenizer pool");
@@ -964,7 +964,7 @@ fn mm_text_prompt_tokenizes_then_encodes() {
     );
 }
 
-/// A worker failure rejects the parked request (deregister, no ring push).
+/// A worker failure rejects the parked request (deregister, not push to channel).
 #[test]
 fn mm_failure_rejects_parked_request() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
@@ -1017,4 +1017,36 @@ fn late_mm_result_is_dropped() {
     intake.on_mm_encoded("ghost".to_string().into(), vec![1], Vec::new());
     intake.on_mm_failed("ghost".to_string().into(), "boom".into());
     assert!(consumer.drain(16).is_empty());
+}
+
+/// Under `skip_tokenizer_init` a text + image prompt will return 400.
+#[test]
+fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
+    let limits = Limits {
+        skip_tokenizer_init: true,
+        ..test_limits()
+    };
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake_with(limits);
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_generate_req("mm-skip");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+
+    let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+        panic!("expected a terminal error frame");
+    };
+    assert_eq!(err.http_status(), 400, "{err}");
+    assert!(err.to_string().contains("must provide input_ids"), "{err}");
+    assert!(detok_rx.try_recv().is_err(), "rejected before registration");
+    assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");
+    assert!(consumer.drain(16).is_empty(), "never reaches the channel");
+
+    // With ids the same request is admitted: Tokenizing is a no-op hop and it
+    // parks in Encoding.
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-skip-ids");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    assert!(rx.try_recv().is_err(), "no error frame");
+    assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
 }
