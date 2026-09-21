@@ -286,8 +286,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.return_logprob = False
         req.pending_bootstrap = True
         req.metadata_buffer_index = -1
+        req.cache_request_handle = object()
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
+        cache.finish = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=cache,
             clear_pending_chunk_send=MagicMock(),
@@ -315,6 +317,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()
         release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
+        cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         self.assertFalse(req.pending_bootstrap)
 
     def test_write_through_pending_chunk_does_not_publish(self):
