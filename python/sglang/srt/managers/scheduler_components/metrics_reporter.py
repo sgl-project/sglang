@@ -1168,7 +1168,12 @@ class SchedulerMetricsReporter:
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
         host_total = host_pool.logical_size
-        self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
+        allocated_size = getattr(host_pool, "allocated_size", None)
+        self.stats.hicache_host_used_tokens = (
+            allocated_size()
+            if allocated_size is not None
+            else host_total - host_pool.available_size()
+        )
         self.stats.hicache_host_total_tokens = host_total
 
     def _update_lora_metrics(self):

@@ -2152,6 +2152,13 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_HICACHE_KV_COMPRESSION.get() != "off":
+        from sglang.srt.mem_cache.hicache_compression import attach_compressed_hicache
+
+        attach_compressed_hicache(cache, params, load_cache_event)
+        return
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())

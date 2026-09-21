@@ -677,6 +677,9 @@ async def health_generate(request: Request) -> Response:
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
 
+    if getattr(_global_state.tokenizer_manager, "compression_quarantine_reason", None):
+        return Response(status_code=503)
+
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
@@ -727,6 +730,12 @@ async def health_generate(request: Request) -> Response:
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
+        if getattr(
+            _global_state.tokenizer_manager, "compression_quarantine_reason", None
+        ):
+            task.cancel()
+            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            return Response(status_code=503)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)

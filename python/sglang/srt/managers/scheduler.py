@@ -2093,8 +2093,10 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            if (
+                is_health_check_generate_req(recv_req)
+                and self.compression_failure_reason() is None
+                and not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
@@ -2893,6 +2895,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if failure := self.compression_failure_reason():
+            prepare_abort(req, failure, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
+
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
@@ -3611,6 +3618,12 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
+            if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+                from sglang.srt.disaggregation.compression.diagnostics import (
+                    trace_native_cache_state,
+                )
+
+                trace_native_cache_state(self.tree_cache)
             if self.enable_hicache_storage:
                 self._process_storage_prefetch_retries()
 
@@ -3810,11 +3823,31 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _reject_quarantined_waiting(self, reason):
+        retained = getattr(self, "_compression_quarantined_waiting", None)
+        if retained is None:
+            retained = self._compression_quarantined_waiting = []
+        pending = self.waiting_queue
+        self.waiting_queue = []
+        if self.chunked_req is not None:
+            if not any(req is self.chunked_req for req in pending):
+                pending.append(self.chunked_req)
+            self.chunked_req = None
+        for req in pending:
+            retained.append(req)
+            prepare_abort(req, reason, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+            self.output_streamer.stream_output([req], req.return_logprob)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        if failure := self.compression_failure_reason():
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return None, running_batch
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -3903,6 +3936,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            admission_failure_reason=self.compression_failure_reason,
         )
 
         if self.chunked_req is not None:
@@ -4828,7 +4862,22 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        failure = self.compression_failure_reason()
+        if failure:
+            if not getattr(self, "_compression_failure_announced", False):
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(quarantine_reason=failure)
+                )
+                self._compression_failure_announced = True
+            while self.return_health_check_ipcs:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=self.return_health_check_ipcs.popleft(),
+                        quarantine_reason=failure,
+                    )
+                )
+            return
+        if self.return_health_check_ipcs and self.compression_failure_reason() is None:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
@@ -4901,7 +4950,15 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if (
+            if getattr(
+                getattr(self, "tree_cache", None),
+                "has_pending_background_work",
+                lambda: False,
+            )():
+                # L2 compression submits CUDA work from Python workers. Keep
+                # source pins and the not-fully-idle gate; only yield the CPU.
+                time.sleep(0.001)
+            elif (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
             ):
@@ -4973,6 +5030,28 @@ class Scheduler(
         else:
             self.metrics_reporter.record_scheduler_active()
 
+    def compression_failure_reason(self):
+        tree = getattr(self, "tree_cache", None)
+        reason = getattr(tree, "admission_failure_reason", lambda: None)()
+        if reason:
+            return reason
+        queue_name = (
+            "disagg_prefill_bootstrap_queue"
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else "disagg_decode_prealloc_queue"
+        )
+        manager = getattr(getattr(self, queue_name, None), "kv_manager", None)
+        runtime = getattr(manager, "compression_runtime", None)
+        if runtime is not None and (
+            runtime.transport_failed or runtime.shared.is_quarantined()
+        ):
+            return "KV compression transport is quarantined; restart worker"
+        transfer = getattr(self, "disagg_decode_transfer_queue", None)
+        handler = getattr(transfer, "staging_handler", None)
+        if getattr(handler, "is_quarantined", lambda: False)():
+            return "KV restoration is quarantined; restart worker"
+        return None
+
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -5004,16 +5083,34 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
+            compression_manager = None
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                compression_manager = getattr(
+                    self.disagg_prefill_bootstrap_queue, "kv_manager", None
+                )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                compression_manager = getattr(
+                    self.disagg_decode_prealloc_queue, "kv_manager", None
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+
+            if getattr(compression_manager, "compression_mode", "off") != "off":
+                runtime = compression_manager.compression_runtime
+                idle &= not runtime.transport_failed and runtime.shared.idle()
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    transfer = self.disagg_decode_transfer_queue
+                    # Removed requests may still own RDMA destinations or an
+                    # active/quarantined restoration. Never pause/free their
+                    # memory merely because the request queue is empty.
+                    idle &= not transfer.has_pending_deferred_releases()
+                    idle &= transfer.staging_handler.is_idle()
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -5025,6 +5122,7 @@ class Scheduler(
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
+                idle &= getattr(tc, "background_work_is_idle", lambda: True)()
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0

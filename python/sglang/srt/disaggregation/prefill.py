@@ -322,6 +322,15 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        context = getattr(
+            self.scheduler.tree_cache,
+            "get_kv_compression_context",
+            lambda: (None, None),
+        )
+        if hasattr(kv_manager, "compression_mode"):
+            kv_manager.shared_compression_runtime, kv_manager.encoded_kv_provider = (
+                context()
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -832,6 +841,11 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                from sglang.srt.disaggregation.compression.diagnostics import (
+                    trace_handoff,
+                )
+
+                trace_handoff("prefill_sampled", req, next_token_id)
                 if req.grammar is not None:
                     try:
                         req.grammar.accept_token(next_token_id)
@@ -1487,6 +1501,12 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            if getattr(req.disagg_kv_sender, "requires_encoded_kv", False):
+                get_refs = getattr(self.tree_cache, "get_kv_transfer_refs", None)
+                if get_refs is not None:
+                    req.disagg_kv_sender.compression_refs = get_refs(
+                        req, seg_start, seg_end, page_indices
+                    )
             send_state_indices = state_indices if segment_is_last else None
             req.disagg_kv_sender.send(
                 page_indices,

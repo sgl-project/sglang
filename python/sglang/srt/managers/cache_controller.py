@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -107,7 +107,9 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[List[PoolTransfer]] = None,
+        page_refs=None,
     ):
+        self.page_refs = page_refs
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
@@ -167,6 +169,12 @@ class CacheOperation:
             pool_transfers=CacheOperation._merge_pool_transfers(ops),
         )
         merged_op.node_ids = node_ids
+        if any(op.page_refs is not None for op in ops):
+            if any(op.page_refs is None for op in ops):
+                raise ValueError(
+                    "Cannot merge represented and unrepresented L2 operations"
+                )
+            merged_op.page_refs = tuple(ref for op in ops for ref in op.page_refs)
         return merged_op
 
     def __lt__(self, other: CacheOperation):
@@ -184,6 +192,24 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+    completion: Any = None
+
+    def query(self):
+        return (
+            self.completion.query()
+            if self.completion is not None
+            else self.finish_event.query()
+        )
+
+    def result(self):
+        if self.completion is not None:
+            return self.completion.result()
+        return self.finish_event.synchronize()
+
+    def wait(self):
+        if self.completion is not None:
+            return self.completion.wait()
+        return self.finish_event.synchronize()
 
 
 @dataclass
@@ -364,6 +390,7 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self.async_l2 = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -817,13 +844,20 @@ class HiCacheController:
         self.write_queue.clear()
 
         completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
+            self._l2_transfers(host_indices, device_indices, pool_transfers),
+            async_state=self.async_l2,
+            page_refs=op.page_refs,
+            node_ids=op.node_ids,
         )
 
+        if self.async_l2 is not None:
+            for node_id in op.node_ids:
+                self.async_l2.backup_completions[node_id] = completion
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
+                completion=completion,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
@@ -968,6 +1002,7 @@ class HiCacheController:
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
+                completion=completion,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,

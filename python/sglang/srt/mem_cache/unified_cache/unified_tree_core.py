@@ -1479,6 +1479,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         assert cd.value is None
+        if (callback := getattr(self, "on_full_kv_recomputed", None)) is not None:
+            callback(node)
         n = len(fresh_value)
         cd.value = fresh_value.clone()
         if cd.lock_ref > 0:

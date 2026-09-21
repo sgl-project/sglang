@@ -2237,6 +2237,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+        from sglang.srt.disaggregation.compression.diagnostics import trace_handoff
+
+        if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+            trace_handoff(
+                "decode_received",
+                decode_req.req,
+                output_id[0].item(),
+                received_room=int(output_bootstrap_room[0].item()),
+                slot=idx,
+                received_cached_tokens=int(cached_tokens[0].item()),
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -2414,7 +2425,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             DecodeStagingHandler,
         )
 
-        self.staging_handler = DecodeStagingHandler.create(
+        handler_cls = DecodeStagingHandler
+        if getattr(kv_manager, "compression_mode", "off") != "off":
+            from sglang.srt.disaggregation.mooncake.compression import (
+                CompressedDecodeStagingHandler,
+            )
+
+            handler_cls = CompressedDecodeStagingHandler
+        self.staging_handler = handler_cls.create(
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
@@ -2492,6 +2510,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
+                    # Compression restore may still own destination KV pages.
+                    if (
+                        getattr(
+                            decode_req.kv_receiver.kv_mgr, "compression_mode", "off"
+                        )
+                        != "off"
+                    ):
+                        self.staging_handler.unregister_decode_req(
+                            decode_req.req.bootstrap_room
+                        )
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     decode_req.kv_receiver.clear()
@@ -2592,7 +2620,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            compressed = getattr(kv_mgr, "compression_mode", "off") != "off"
+            if not drained and (now < deadline or compressed):
+                if compressed and now >= deadline:
+                    logger.error(
+                        "Quarantining compression buffers for room=%s: remote drain unconfirmed",
+                        room,
+                    )
+                    deadline = float("inf")
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
@@ -2772,6 +2807,10 @@ class SchedulerDisaggregationDecodeMixin:
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
+        if failure := self.compression_failure_reason():
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return None
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
             return self._get_new_prebuilt_batch(running_batch)
@@ -2901,6 +2940,12 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
+        if failure := self.compression_failure_reason():
+            # Preallocation, receive and retraction queues retain ownership.
+            # An uncertain worker cannot allocate or admit more requests.
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

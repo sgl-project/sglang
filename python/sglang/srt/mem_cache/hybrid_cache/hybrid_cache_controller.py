@@ -459,6 +459,7 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
+        page_refs=None,
     ) -> Optional[torch.Tensor]:
         """Queue a D2H backup; flush=False leaves it queued so the caller can
         merge several nodes into one start_writing() submit."""
@@ -481,6 +482,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                page_refs=page_refs,
             )
         )
         if flush:
@@ -496,6 +498,8 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
+        if self.async_l2 is not None:
+            return op.host_indices, op.device_indices, op.pool_transfers
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
         if not getattr(host_group, "supports_per_pool_backup_indices", False):

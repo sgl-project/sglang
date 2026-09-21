@@ -554,6 +554,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def get_restore_reserved_tokens(self, req) -> int:
+        """Request-owned FULL tokens already allocated by an async restore."""
+        return 0
+
+    def admission_failure_reason(self):
+        """An unrecoverable cache failure; normal in-flight work is not failure."""
+        return None
+
+    def has_pending_background_work(self) -> bool:
+        """Whether no-batch polling should yield to background workers."""
+        return False
+
     def check_hicache_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
