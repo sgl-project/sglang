@@ -214,6 +214,9 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
@@ -991,6 +994,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        DefaultModelLoader.postprocess_weights(model, target_device)
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1046,6 +1054,8 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+    @staticmethod
+    def postprocess_weights(model, target_device):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -2036,9 +2046,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
         try:
-            from sglang.srt.distributed import get_world_group
+            from sglang.srt.runtime_context import get_parallel
 
-            group = get_world_group()
+            group = get_parallel().world_group
             if group.world_size <= 1:
                 return local_sig
             all_sigs = group.all_gather_object(local_sig)
@@ -2058,20 +2068,20 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            g = get_world_group()
+            g = get_parallel().world_group
             return g.rank_in_group, g.world_size
         except (AssertionError, AttributeError):
             return 0, 1
 
     @staticmethod
     def _world_barrier() -> None:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            get_world_group().barrier()
+            get_parallel().world_group.barrier()
         except (AssertionError, AttributeError):
             pass
 
@@ -4115,7 +4125,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+        from sglang.srt.utils.runai_utils import (
+            ObjectStorageModel,
+            is_runai_obj_uri,
+            list_safetensors,
+        )
 
         is_object_storage_path = is_runai_obj_uri(model_name_or_path)
         if self._is_distributed is None:
@@ -4156,6 +4170,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 index_file,
                 self.load_config.download_dir,
                 revision,
+            )
+        if is_object_storage_path:
+            index_file = os.path.abspath(
+                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
             )
         hf_weights_files = filter_duplicate_safetensors_files(
             hf_weights_files, hf_folder, index_file

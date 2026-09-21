@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
@@ -58,17 +57,20 @@ def _resolve_elastic_world_dp_size(
         return dp_size
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-    from sglang.srt.layers.dp_attention import get_attention_dp_size
 
-    live_dp_size = get_attention_dp_size()
+    live_dp_size = get_parallel().attn_dp_size
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+    # The group's own membership, not the width it was built at: this is the
+    # one number an out-of-process join moves, and it is the upper bound the
+    # served width has to stay under.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"live_dp_size={live_dp_size} "
+            f"effective_ep_size={effective_ep_size} "
             f"world_size={world_size} server_args_dp_size={dp_size} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
@@ -193,9 +195,9 @@ class MLPSyncBatchInfo:
         )
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
+            tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
         else:
-            tp_active_ranks = get_tp_group().active_ranks
+            tp_active_ranks = get_parallel().tp_group.active_ranks
         if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
             tp_active_ranks = torch.ones(
                 num_ranks_in_tp_info,
@@ -289,9 +291,9 @@ def _local_prefill_cuda_graph_vote(
     model_config,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
-    ranks). Extend/mixed batches vote their own replayability; a decode
-    batch eligible for the decode->extend conversion votes as its 1-token-
-    extend view, so the vote and the post-sync conversion always agree."""
+    ranks). Extend and mixed batches share the runner's rank-local replay
+    policy. A decode batch eligible for the decode->extend conversion votes as
+    its 1-token-extend view, so the vote and post-sync conversion agree."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
@@ -350,6 +352,14 @@ def _local_prefill_cuda_graph_vote(
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
+        is_mixed=mode == ForwardMode.MIXED,
+        batch_max_context_len=(
+            int(local_batch.seq_lens_cpu.max().item())
+            if prefill_graph_runner.max_context_size is not None
+            and local_batch.seq_lens_cpu is not None
+            and local_batch.seq_lens_cpu.numel() > 0
+            else None
+        ),
     )
 
 
@@ -425,9 +435,9 @@ def prepare_mlp_sync_batch_raw(
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
-        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
-        world = get_world_group()
+        world = get_parallel().world_group
         group = torch.distributed.group.WORLD
         device = world.device
     elif len(offload_tags) == 0 and (
@@ -538,8 +548,8 @@ class SchedulerDPAttnAdapter:
             local_batch,
             model_runner=self.model_runner,
             dp_size=get_parallel().dp_size,
-            attn_tp_size=self.ps.attn_tp_size,
-            attn_cp_size=self.ps.attn_cp_size,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),

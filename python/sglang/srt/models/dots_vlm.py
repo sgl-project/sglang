@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -33,6 +32,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 
 from .dots_vlm_vit import DotsVisionTransformer
 
@@ -56,7 +56,7 @@ class DotsVLMForCausalLM(nn.Module):
         self.config = config
         self.image_token_id = config.im_span_id
         self.video_token_id = config.video_span_id
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if not config.encoder_only:
             self.language_model = DeepseekV2ForCausalLM(

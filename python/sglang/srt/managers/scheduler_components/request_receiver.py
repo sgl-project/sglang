@@ -109,7 +109,7 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
-        if self.ps.pp_rank == 0:
+        if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
@@ -119,7 +119,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:
-        if self.ps.pp_rank == 0:
+        if get_parallel().pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
@@ -158,10 +158,10 @@ class SchedulerRequestReceiver:
                 )
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    get_parallel().pp_rank * self.ps.tp_size + dp_offset,
                     self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    (get_parallel().pp_rank - 1) * self.ps.tp_size + dp_offset,
+                    get_parallel().pp_rank * self.ps.tp_size + dp_offset,
                 )
             else:
                 recv_reqs = None
@@ -232,7 +232,7 @@ class SchedulerRequestReceiver:
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
         if (
-            self.ps.pp_rank == 0
+            get_parallel().pp_rank == 0
             and get_disagg().language_only
             and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]

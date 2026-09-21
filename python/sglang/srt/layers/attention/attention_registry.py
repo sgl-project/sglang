@@ -259,13 +259,6 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
-@register_attention_backend("cutlass_mla")
-def create_cutlass_mla_backend(runner):
-    from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend
-
-    return CutlassMLABackend(runner)
-
-
 @register_attention_backend("trtllm_mha")
 def create_trtllm_mha_backend(runner):
     if runner.use_mla_backend:
@@ -297,15 +290,6 @@ def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
     return IntelAMXAttnBackend(runner)
-
-
-@register_attention_backend("dual_chunk_flash_attn")
-def create_dual_chunk_flash_attn_backend(runner):
-    from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
-        DualChunkFlashAttentionBackend,
-    )
-
-    return DualChunkFlashAttentionBackend(runner)
 
 
 def attn_backend_wrapper_for_draft_extend(
@@ -450,7 +434,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 if get_platform().is_sm120:
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
-                    allowed = {"triton", "trtllm_mha", "fa4"}
+                    # FlashInfer paged prefill is also valid for SM100 hybrid
+                    # GDN models. In particular, quantized KV recipes use it
+                    # to expose an FP8 dequant workspace while a different
+                    # backend (for example TRT-LLM GenMHA) owns decode.
+                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (

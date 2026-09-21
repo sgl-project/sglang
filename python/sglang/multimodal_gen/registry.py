@@ -84,6 +84,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
+    VDNH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -95,6 +98,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlusPipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+    QwenImage21PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
@@ -170,6 +176,7 @@ from sglang.multimodal_gen.configs.sample.minimax_h3 import (
     FastH3SamplingParams,
     MiniMaxH3SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import VDNH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -181,6 +188,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
@@ -350,6 +358,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
+    "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -1016,6 +1025,7 @@ def _register_configs():
         model_detectors=[
             lambda model_id: (
                 "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
             )
         ],
     )
@@ -1035,6 +1045,19 @@ def _register_configs():
         model_detectors=[
             lambda model_id: (
                 "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=VDNH3SamplingParams,
+        pipeline_config_cls=VDNH3PipelineConfig,
+        hf_model_paths=[
+            "OpenVDN/vdn-minimax-h3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "vdn" in model_id.lower()
+                and "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )
@@ -1113,6 +1136,12 @@ def _register_configs():
     )
     # Qwen-Image
     register_configs(
+        sampling_param_cls=QwenImage21SamplingParams,
+        pipeline_config_cls=QwenImage21PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
+    )
+    register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
@@ -1122,6 +1151,7 @@ def _register_configs():
                 and "edit" not in hf_id.lower()
                 and "layered" not in hf_id.lower()
                 and "2512" not in hf_id.lower()
+                and "qwen-image-2.1" not in hf_id.lower()
             )
         ],
     )
