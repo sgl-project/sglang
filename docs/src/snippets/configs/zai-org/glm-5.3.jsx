@@ -224,10 +224,7 @@ sgl-eval run aime25 \\
           flags: ["--speculative-algorithm DFLASH",
                   "--speculative-draft-model-path incoai/GLM-5.3-DFlash2",
                   "--speculative-draft-attention-backend fa4"],
-          // The DFlash2 drafter (PR #35371) merged after v0.5.18, so neither the
-          // release wheel nor the lmsysorg/sglang:latest image this page pins
-          // carries it. Drop this note once a release ships it.
-          note: "⚠️ Needs a nightly image: the DFlash2 drafter (PR #35371) is not in the release wheel nor the lmsysorg/sglang:latest image this page pins — install SGLang from main or use a lmsysorg/sglang:dev image. The draft is a separate checkpoint, so fetch incoai/GLM-5.3-DFlash2 alongside the target; it is public but licensed CC BY-NC-ND 4.0 for research and evaluation.",
+          note: "⚠️ The draft is a separate checkpoint: fetch incoai/GLM-5.3-DFlash2 alongside the target. It is public but licensed CC BY-NC-ND 4.0 for research and evaluation.",
           disable: [
             { when: { dpAttnOn: [true] },
               reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above (the high-throughput recipes enable it)." },
