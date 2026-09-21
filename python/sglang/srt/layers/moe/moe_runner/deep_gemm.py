@@ -778,32 +778,50 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.gemm1_alpha is not None:
-            down_input = _apply_oai_swiglu(
+        if not self.config.gate_up_interleaved and self.config.activation != "situ":
+            # PPU: fused activation + per-token fp8 quant via the JIT kernel,
+            # covering plain silu, the DeepSeek-V4 clamp, and oai-swiglu
+            # (MiniMax-M3), each matching its bf16 eager reference below.
+            # SiTU (which reuses gemm1_alpha as situ_beta), and the gpt-oss
+            # interleaved layout fall through to the eager path.
+            from sglang.kernels.ops.elementwise.silu_mul_quant import (
+                silu_and_mul_post_per_token_quant_fp8,
+            )
+
+            down_input_int8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
                 gateup_output,
+                swiglu_limit=self.swiglu_limit,
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
-                gate_up_interleaved=self.config.gate_up_interleaved,
             )
+            del gateup_output
         else:
-            if self.swiglu_limit is not None:
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
+            if self.config.gemm1_alpha is not None:
+                down_input = _apply_oai_swiglu(
+                    gateup_output,
+                    gemm1_alpha=self.config.gemm1_alpha,
+                    gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                    gate_up_interleaved=self.config.gate_up_interleaved,
                 )
+            else:
+                if self.swiglu_limit is not None:
+                    gateup_output = _apply_swiglu_limit(
+                        gateup_output, swiglu_limit=self.swiglu_limit
+                    )
 
-            down_input = torch.empty(
-                (
-                    all_tokens,
-                    N // 2,
-                ),
-                device=gateup_output.device,
-                dtype=torch.bfloat16,
-            )
-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
-        del gateup_output
+                down_input = torch.empty(
+                    (
+                        all_tokens,
+                        N // 2,
+                    ),
+                    device=gateup_output.device,
+                    dtype=torch.bfloat16,
+                )
+                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            del gateup_output
 
-        down_input_int8, down_input_scale = sglang_per_token_quant_fp8(down_input)
-        del down_input
+            down_input_int8, down_input_scale = sglang_per_token_quant_fp8(down_input)
+            del down_input
 
         down_output = torch.empty(
             (all_tokens, K),
@@ -2628,6 +2646,7 @@ def _apply_swiglu_limit(
     return out
 
 
+@torch.compile(dynamic=True)
 def _apply_oai_swiglu(
     gateup_output: torch.Tensor,
     gemm1_alpha: float,

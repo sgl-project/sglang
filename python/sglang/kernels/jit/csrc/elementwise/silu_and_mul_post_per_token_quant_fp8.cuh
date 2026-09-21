@@ -31,6 +31,8 @@ struct alignas(16) SiluMulFp8Params {
   int32_t N;
   float eps;
   float swiglu_limit;
+  float gemm1_alpha;
+  float gemm1_clamp_limit;
 };
 
 __device__ __forceinline__ uint16_t cvt_fp32x2_to_e4m3x2(float lo, float hi) {
@@ -68,6 +70,27 @@ __device__ __forceinline__ __nv_bfloat162 silu_and_mul(__nv_bfloat162 gate, __nv
   return __hmul2(up, silu);
 }
 
+// oai-swiglu (MiniMax-M3 / gpt-oss), matching the bf16 eager reference
+// swiglu_no_interleaved_with_alpha_and_limit:
+//   gate = min(gate, L); up = clamp(up, -L, L);
+//   out  = gate * sigmoid(gate * alpha) * (up + 1)
+// All arithmetic stays in bf16; only the sigmoid input (gate * alpha) is
+// computed in fp32, mirroring torch's fp32 opmath for bf16 ops.
+__device__ __forceinline__ __nv_bfloat162
+oai_swiglu(__nv_bfloat162 gate, __nv_bfloat162 up, float alpha, float clamp_limit) {
+  const __nv_bfloat16 lim = __float2bfloat16_rn(clamp_limit);
+  const __nv_bfloat16 nlim = __float2bfloat16_rn(-clamp_limit);
+  const __nv_bfloat162 lim2 = __halves2bfloat162(lim, lim);
+  const __nv_bfloat162 nlim2 = __halves2bfloat162(nlim, nlim);
+  gate = __hmin2(gate, lim2);
+  up = __hmin2(__hmax2(up, nlim2), lim2);
+  const float a0 = __bfloat162float(__low2bfloat16(gate)) * alpha;
+  const float a1 = __bfloat162float(__high2bfloat16(gate)) * alpha;
+  const __nv_bfloat162 sig = __floats2bfloat162_rn(__ppu_sgmdf(a0), __ppu_sgmdf(a1));
+  const __nv_bfloat162 one2 = __float2bfloat162_rn(1.0f);
+  return __hmul2(__hmul2(gate, sig), __hadd2(up, one2));
+}
+
 template <int kBlockThreads>
 __device__ __forceinline__ float block_reduce_max(float val, float* smem_warp_max) {
   static_assert(kBlockThreads % kWarpThreads == 0, "");
@@ -97,10 +120,11 @@ __device__ __forceinline__ float block_reduce_max(float val, float* smem_warp_ma
   return smem_warp_max[0];
 }
 
-template <int kBlockThreads, bool kApplySwigluLimit, bool kCacheInSmem>
+template <int kBlockThreads, bool kApplySwigluLimit, bool kApplyGemm1Alpha, bool kCacheInSmem>
 __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_quant_fp8_kernel(
     const SiluMulFp8Params __grid_constant__ params) {
   constexpr int kPairsPerThread = kElemPerThread / 2;  // 4
+  static_assert(!(kApplySwigluLimit && kApplyGemm1Alpha), "swiglu_limit and gemm1_alpha are mutually exclusive");
 
   const int token_id = blockIdx.x;
   const int tid = threadIdx.x;
@@ -116,6 +140,7 @@ __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_
   const int n_vec = params.N / kElemPerThread;
   float local_absmax = 0.0f;
 
+  // Pass 1: activation + per-token absmax (products cached in smem when possible).
   for (int v = tid; v < n_vec; v += kBlockThreads) {
     const int elem_off = v * kElemPerThread;
 
@@ -129,7 +154,12 @@ __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_
 
 #pragma unroll
     for (int i = 0; i < kPairsPerThread; ++i) {
-      const __nv_bfloat162 p = silu_and_mul<kApplySwigluLimit>(gate_pairs[i], up_pairs[i], params.swiglu_limit);
+      __nv_bfloat162 p;
+      if constexpr (kApplyGemm1Alpha) {
+        p = oai_swiglu(gate_pairs[i], up_pairs[i], params.gemm1_alpha, params.gemm1_clamp_limit);
+      } else {
+        p = silu_and_mul<kApplySwigluLimit>(gate_pairs[i], up_pairs[i], params.swiglu_limit);
+      }
       prod_pairs[i] = p;
       absmax_v2 = __hmax2(absmax_v2, __habs2(p));
     }
@@ -148,6 +178,9 @@ __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_
   const float inv_scale = 1.0f / scale;
   if (tid == 0) params.output_scale[token_id] = scale;
 
+  // Pass 2: rescale the (cached) products and store packed e4m3. Each thread
+  // re-reads only the smem slots it wrote in pass 1, so no cross-thread sync
+  // is needed between the passes.
   for (int v = tid; v < n_vec; v += kBlockThreads) {
     const int elem_off = v * kElemPerThread;
     __nv_bfloat162 prod_pairs[kPairsPerThread];
@@ -161,7 +194,11 @@ __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_
       auto* up_pairs = reinterpret_cast<__nv_bfloat162*>(&up_pack);
 #pragma unroll
       for (int i = 0; i < kPairsPerThread; ++i) {
-        prod_pairs[i] = silu_and_mul<kApplySwigluLimit>(gate_pairs[i], up_pairs[i], params.swiglu_limit);
+        if constexpr (kApplyGemm1Alpha) {
+          prod_pairs[i] = oai_swiglu(gate_pairs[i], up_pairs[i], params.gemm1_alpha, params.gemm1_clamp_limit);
+        } else {
+          prod_pairs[i] = silu_and_mul<kApplySwigluLimit>(gate_pairs[i], up_pairs[i], params.swiglu_limit);
+        }
       }
     }
 
@@ -177,8 +214,10 @@ __global__ __launch_bounds__(kBlockThreads, 2) void silu_and_mul_post_per_token_
   }
 }
 
-template <int kBlockThreads, bool kApplySwigluLimit>
+template <int kBlockThreads, bool kApplySwigluLimit, bool kApplyGemm1Alpha>
 struct SiluMulFp8TP {
+  static_assert(!kApplySwigluLimit || !kApplyGemm1Alpha, "swiglu_limit and gemm1_alpha are mutually exclusive");
+
   static constexpr int kSmemNMaxDefault = 24000;   // fits in default 48KB
   static constexpr int kSmemNMaxExtended = 49000;  // fits with ~98KB
 
@@ -187,6 +226,8 @@ struct SiluMulFp8TP {
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView output_scale,
       double swiglu_limit,
+      double gemm1_alpha,
+      double gemm1_clamp_limit,
       double eps) {
     using namespace host;
 
@@ -194,8 +235,20 @@ struct SiluMulFp8TP {
     const int two_N = static_cast<int>(input.size(1));
     const int N = two_N / 2;
 
+    RuntimeCheck(input.ndim() == 2, "input must be 2D (M, 2N)");
+    RuntimeCheck(output.ndim() == 2, "output must be 2D (M, N)");
+    RuntimeCheck(output_scale.ndim() == 2, "output_scale must be 2D (M, 1)");
+    RuntimeCheck(output.size(0) == M && output.size(1) == N, "output must have shape (M, N)");
+    RuntimeCheck(output_scale.size(0) == M && output_scale.size(1) == 1, "output_scale must have shape (M, 1)");
+    RuntimeCheck(input.dtype() == DLDataType{DLDataTypeCode::kDLBfloat, 16, 1}, "input dtype must be BFloat16");
+    RuntimeCheck(M > 0, "M must be positive");
     RuntimeCheck(two_N % 2 == 0, "input last dim must be even");
     RuntimeCheck(N % kElemPerThread == 0, "N must be multiple of ", kElemPerThread, ", got N=", N);
+    RuntimeCheck(input.stride(1) == 1, "input must be contiguous in the last dim");
+    RuntimeCheck(
+        input.stride(0) == two_N && output.stride(1) == 1 && output.stride(0) == N,
+        "input/output must be row-major contiguous");
+    RuntimeCheck(output_scale.stride(0) == 1, "output_scale must be contiguous in dim 0");
 
     const bool use_smem = (N <= kSmemNMaxExtended);
     const bool need_ext_smem = (N > kSmemNMaxDefault) && use_smem;
@@ -212,40 +265,33 @@ struct SiluMulFp8TP {
         .N = N,
         .eps = static_cast<float>(eps),
         .swiglu_limit = static_cast<float>(swiglu_limit),
+        .gemm1_alpha = static_cast<float>(gemm1_alpha),
+        .gemm1_clamp_limit = static_cast<float>(gemm1_clamp_limit),
     };
 
     auto device = input.device();
     dim3 grid(M);
 
     if (need_ext_smem) {
-#define SET_EXT_SMEM(APPLY, CACHE)                                                                              \
-  do {                                                                                                          \
-    auto fptr =                                                                                                 \
-        std::bit_cast<const void*>(&silu_and_mul_post_per_token_quant_fp8_kernel<kBlockThreads, APPLY, CACHE>); \
-    ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));  \
+#define SET_EXT_SMEM(CACHE)                                                                                        \
+  do {                                                                                                             \
+    auto fptr = std::bit_cast<const void*>(                                                                        \
+        &silu_and_mul_post_per_token_quant_fp8_kernel<kBlockThreads, kApplySwigluLimit, kApplyGemm1Alpha, CACHE>); \
+    ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));     \
   } while (0)
-      SET_EXT_SMEM(true, true);
-      SET_EXT_SMEM(true, false);
-      SET_EXT_SMEM(false, true);
-      SET_EXT_SMEM(false, false);
+      SET_EXT_SMEM(true);
+      SET_EXT_SMEM(false);
 #undef SET_EXT_SMEM
     }
 
-#define DISPATCH(APPLY, CACHE)                           \
+#define DISPATCH(CACHE)                                  \
   LaunchKernel(grid, kBlockThreads, device, smem_bytes)( \
-      silu_and_mul_post_per_token_quant_fp8_kernel<kBlockThreads, APPLY, CACHE>, params)
+      silu_and_mul_post_per_token_quant_fp8_kernel<kBlockThreads, kApplySwigluLimit, kApplyGemm1Alpha, CACHE>, params)
 
-    if (kApplySwigluLimit) {
-      if (use_smem)
-        DISPATCH(true, true);
-      else
-        DISPATCH(true, false);
-    } else {
-      if (use_smem)
-        DISPATCH(false, true);
-      else
-        DISPATCH(false, false);
-    }
+    if (use_smem)
+      DISPATCH(true);
+    else
+      DISPATCH(false);
 #undef DISPATCH
   }
 };
