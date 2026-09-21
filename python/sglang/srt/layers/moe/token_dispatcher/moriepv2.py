@@ -22,7 +22,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 logger = logging.getLogger(__name__)
-_logged_graph_caps = set()
 MXFP4_BLOCK_SIZE = 32
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -98,6 +97,11 @@ class MoriEPv2NormalDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Optional destination for AITER's post-expert result. Borrowed from this
+    # dispatcher's MORI EPv2 arena, which stays alive through graph replay/combine.
+    expert_output: torch.Tensor | None = None
+    # Safe row bound for AITER input trimming; 0 disables it.
+    recv_cap: int = 0
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -264,11 +268,19 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         self.instance_id = instance_id
         self.async_finish = async_finish
         self.dispatch_dtype = torch.bfloat16
+        tbo_enabled = is_tbo_enabled()
+        # Receive trimming falls back when sender metadata is unavailable,
+        # including TBO children without per-rank token counts.
+        self._trim_recv = get_bool_env_var("SGLANG_MORI_EPV2_TRIM_RECV", "true")
+        # Disable direct output for TBO to preserve buffer/stream ownership.
+        self._direct_output = not tbo_enabled and get_bool_env_var(
+            "SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT", "true"
+        )
         self._comm_stream = _get_tbo_comm_stream(
-            group, tbo_enabled=is_tbo_enabled(), async_finish=async_finish
+            group, tbo_enabled=tbo_enabled, async_finish=async_finish
         )
         self._geometry = _resolve_tbo_geometry(
-            tbo_enabled=is_tbo_enabled(),
+            tbo_enabled=tbo_enabled,
             dispatch_block_num=get_int_env_var(
                 "SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM", 32
             ),
@@ -348,35 +360,21 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             )
             if not eager_cap & (eager_cap - 1):
                 return eager_cap
-        try:
-            from sglang.srt.model_executor.runner import get_is_capture_mode
-        except ImportError:
+        if not self._trim_recv:
             return self.op.cfg.effective_max_recv
-        if not get_is_capture_mode():
-            return self.op.cfg.effective_max_recv
-        try:
-            from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-        except ImportError:
-            return self.op.cfg.effective_max_recv
-        dp_global = get_dp_global_num_tokens()
-        if dp_global is None or len(dp_global) <= 1:
-            return self.op.cfg.effective_max_recv
-        global_capacity = max(int(value) for value in dp_global) * len(dp_global)
-        if global_capacity <= 0:
-            return self.op.cfg.effective_max_recv
-        recv_cap = max(32, 1 << (global_capacity - 1).bit_length())
-        if recv_cap > self.op.cfg.effective_max_recv:
-            return self.op.cfg.effective_max_recv
-        key = (global_capacity, recv_cap)
-        if get_parallel().world_rank == 0 and key not in _logged_graph_caps:
-            _logged_graph_caps.add(key)
-            logger.warning(
-                "[MORI EPv2 graph cap] global_capacity=%d recv_cap=%d physical_cap=%d",
-                global_capacity,
-                recv_cap,
+        # Reuse the MORI EP/AITER receive bound for EPv2's token-major layout.
+        # EPv2 can also pass this bound to MORI builds with a native recv_cap API.
+        from sglang.srt.layers.moe.moe_runner.aiter import _mori_decode_recv_bound
+
+        return (
+            _mori_decode_recv_bound(
                 self.op.cfg.effective_max_recv,
+                self.router_topk,
+                local_rows=self._num_tokens,
+                is_epv2=True,
             )
-        return recv_cap
+            or self.op.cfg.effective_max_recv
+        )
 
     def set_quant_config(self, quant_config: dict) -> None:
         super().set_quant_config(quant_config)
@@ -512,6 +510,11 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         self._routing = routing
         self._recv_topk_ids = recv_indices
         self._recv_cap = recv_cap
+        expert_output = None
+        if self._direct_output:
+            combine_in_view = getattr(self.op, "combine_in_view", None)
+            if combine_in_view is not None:
+                expert_output = combine_in_view()[: recv_hidden.shape[0]]
         return MoriEPv2NormalDispatchOutput(
             hidden_states=recv_hidden,
             hidden_states_scale=recv_scales,
@@ -521,6 +524,8 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            expert_output=expert_output,
+            recv_cap=recv_cap if self._trim_recv else 0,
         )
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
