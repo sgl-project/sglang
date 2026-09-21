@@ -193,14 +193,17 @@ class TestPDPrefixCacheCombos(CustomTestCase):
 
     def test_pd_decode_radix_cache_with_dp_attention_warns(self):
         """PD decode + radix cache + DP attention logs an experimental warning."""
-        with patch("sglang.srt.arg_groups.pd_disaggregation_hook.logger"):
+        with patch("sglang.srt.arg_groups.pd_disaggregation_hook.logger") as mock_logger:
             args = _make_pd_args(
                 disaggregation_mode="decode",
                 disaggregation_decode_enable_radix_cache=True,
                 disaggregation_transfer_backend="mooncake",
                 enable_dp_attention=True,
             )
-        # The warning is emitted; we just verify the config is accepted.
+        mock_logger.warning.assert_called()
+        warn_text = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        self.assertIn("EXPERIMENTAL", warn_text)
+        self.assertIn("DP attention", warn_text)
         self.assertFalse(args.disable_radix_cache)
 
 
