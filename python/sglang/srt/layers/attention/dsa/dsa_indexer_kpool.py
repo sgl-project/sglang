@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -162,6 +163,36 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
+        weights, _ = self.weights_proj(x.float())
+        return weights * self.n_heads**-0.5
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    def _resolve_head_gate_weights(self, x, q_scale, head_weights):
+        if head_weights is not None:
+            return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
+        return self._get_logits_head_gate(x, q_scale)
+
+    def _can_overlap_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        return_indices: bool,
+    ) -> bool:
+        return (
+            self.alt_stream is not None
+            and return_indices
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
+            and not dsa_use_prefill_cp(forward_batch)
+        )
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -538,8 +569,11 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         precompute_compress_gate: bool = False,
+        precompute_head_gate: bool = False,
     ):
         gate_score = None
+        head_weights = None
+        apply_rope = not self.skip_rope and self.rope_head_dim > 0
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -557,6 +591,10 @@ class IndexerKPool(MultiPlatformOp):
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
+            if precompute_head_gate:
+                head_weights = self._project_and_scale_head_gates(x)
+            if not apply_rope:
+                query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
                 key = self.k_norm(key)
@@ -584,15 +622,16 @@ class IndexerKPool(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        if not self.skip_rope:
+        if apply_rope:
             q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
             query[..., : self.rope_head_dim] = q_rope
             key[..., : self.rope_head_dim] = k_rope
 
-        query = rotate_activation(query)
+        if apply_rope or not enable_dual_stream:
+            query = rotate_activation(query)
 
-        return query, key, gate_score
+        return query, key, gate_score, head_weights
 
     def _get_k_bf16(
         self,
@@ -1293,7 +1332,7 @@ class IndexerKPool(MultiPlatformOp):
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        query, key, gate_score_maybe = self._get_q_k_bf16(
+        query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
@@ -1302,6 +1341,7 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=(
                 enable_dual_stream and self.compress_gate_stream is not None
             ),
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
 
         pool = get_token_to_kv_pool()
@@ -1340,7 +1380,7 @@ class IndexerKPool(MultiPlatformOp):
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
@@ -1348,7 +1388,7 @@ class IndexerKPool(MultiPlatformOp):
             _compress_write()
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
         if not return_indices:
             return None
@@ -1476,44 +1516,24 @@ class IndexerKPool(MultiPlatformOp):
             and forward_batch.forward_mode.is_decode_or_idle()
             and self.compress_gate_stream is not None
         )
-        query, key, gate_score = self._get_q_k_bf16(
+        query, key, gate_score, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
             enable_dual_stream,
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
 
-        weights = None
-        kpool_extend_cache = None
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            if gate_score is not None:
-                self.alt_stream.wait_stream(self.compress_gate_stream)
-            with torch.cuda.stream(self.alt_stream):
-                self._compress_write(
-                    x=x,
-                    key=key,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    metadata=metadata,
-                    gate_score=gate_score,
-                )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            weights = self._get_logits_head_gate(x, q_scale)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
-            defer_kpool_cache_write = (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and return_indices
-                and not has_kpool_extend_plan
-            )
-            kpool_extend_cache = self._compress_write(
+        has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        defer_kpool_cache_write = (
+            is_prefill and return_indices and not has_kpool_extend_plan
+        )
+
+        def compress_write():
+            return self._compress_write(
                 x=x,
                 key=key,
                 positions=positions,
@@ -1521,20 +1541,33 @@ class IndexerKPool(MultiPlatformOp):
                 layer_id=layer_id,
                 metadata=metadata,
                 gate_score=gate_score,
-                return_compressed=(
-                    forward_batch.forward_mode.is_extend_without_speculative()
-                    and return_indices
-                ),
+                return_compressed=is_prefill and return_indices,
                 write_cache=not defer_kpool_cache_write,
             )
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not return_indices
-            ):
-                return None
 
-        if weights is None:
-            weights = self._get_logits_head_gate(x, q_scale)
+        overlap_decode = (
+            enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        if overlap_decode or self._can_overlap_prefill(forward_batch, return_indices):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            if gate_score is not None:
+                self.alt_stream.wait_stream(self.compress_gate_stream)
+            with torch.cuda.stream(self.alt_stream):
+                kpool_extend_cache = compress_write()
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            kpool_extend_cache = compress_write()
+            if return_indices:
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+
+        if not return_indices:
+            return None
 
         if is_cuda():
             if (

@@ -57,7 +57,14 @@ def check_pipeline_parallel_compat(
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.disaggregation_mode == "prefill", (
+            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+        )
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+        )
+    elif cfg.speculative_algorithm is not None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"
             and not cfg.enable_multi_layer_eagle
