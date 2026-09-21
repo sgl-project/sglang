@@ -73,6 +73,7 @@
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
 /rust/sglang-radix-tree @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
+/rust/sglang-renderer @sagearc
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
