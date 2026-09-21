@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -18,10 +19,14 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
+transfer_state_per_layer_direct_pf_lf = None
+transfer_state_all_layer_direct_lf_pf = None
+transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -34,8 +39,36 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
+if _is_npu:
+    from sgl_kernel_npu.kvcacheio import TransferDirection
+
+    try:
+        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+    except ImportError:
+        transfer_mamba_state = None
+    try:
+        from sgl_kernel_npu.kvcacheio import (
+            transfer_state_all_layer_direct_lf_pf,
+            transfer_state_per_layer_direct_pf_lf,
+        )
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
+
+
+_NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
+_NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
+
+
+def _npu_hicache_mamba_io_mode() -> str:
+    mode = os.getenv(_NPU_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
+    if mode not in _NPU_HICACHE_MAMBA_IO_MODES:
+        raise ValueError(
+            f"{_NPU_HICACHE_MAMBA_IO_ENV} must be one of "
+            f"{sorted(_NPU_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
+        )
+    return mode
 
 
 class MambaPoolHost(HostKVCache):
@@ -96,7 +129,7 @@ class MambaPoolHost(HostKVCache):
             )
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -128,9 +161,35 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
+        self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _configure_npu_mamba_io(self) -> None:
+        mode = _npu_hicache_mamba_io_mode()
+        if mode == "sync":
+            logger.info("NPU HiCache Mamba state transfer mode: sync torch fallback.")
+            return
+
+        required_ops = (
+            transfer_state_per_layer_direct_pf_lf,
+            transfer_state_all_layer_direct_lf_pf,
+        )
+        required_torch_ops = (
+            "transfer_state_per_layer_direct_pf_lf",
+            "transfer_state_all_layer_direct_lf_pf",
+        )
+        if any(op is None for op in required_ops) or any(
+            not hasattr(torch.ops.npu, op_name) for op_name in required_torch_ops
+        ):
+            raise RuntimeError(
+                "NPU HiCache Mamba async state transfer requires "
+                "the per-layer PF->LF and all-layer LF->PF direct operators "
+                "from sgl-kernel-npu."
+            )
+
+        logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -321,6 +380,13 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # Per-layer indexed copy: this method transfers a single layer
+            # (layer_first layout). The all-layer kernel path is handled by
+            # _copy_tensor_all_layers_lf_pf / load_to_device_per_layer.
+            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
+                dst.device
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -361,6 +427,22 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_per_layer_direct_pf_lf(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    layer_id=layer_id,
+                )
+            else:
+                host_indices = src_indices.to(dtype=torch.int64, device=src.device)
+                device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                values = (
+                    src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
+                )
+                dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -380,12 +462,6 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # When can_use_write_back_jit is True on the HostPoolGroup,
-            # start_writing() keeps host_indices on CPU (for MLA staged kernel).
-            # Move dst_indices to CUDA here to satisfy the kernel's requirement.
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
                 dst=dst,
@@ -404,6 +480,39 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            if _npu_hicache_mamba_io_mode() == "async":
+                transfer_state_all_layer_direct_lf_pf(
+                    device_states=[src_layers],
+                    host_states=[dst],
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                )
+            elif transfer_mamba_state is not None:
+                # NPU: mirror the load path — the dedicated kernel transfers all
+                # layers at once via a single 2D strided copy
+                # (device layer-first -> host page-first).
+                transfer_mamba_state(
+                    device_buf=src_layers,
+                    host_buf=dst,
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                # Per-layer fallback when the dedicated kernel is unavailable.
+                device_indices = src_indices.to(
+                    dtype=torch.int64, device=src_layers.device
+                )
+                host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+                values = (
+                    src_layers.index_select(1, device_indices)
+                    .movedim(0, 1)
+                    .unsqueeze(2)
+                    .contiguous()
+                    .to(device=dst.device)
+                )
+                dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -418,27 +527,50 @@ class MambaPoolHost(HostKVCache):
         is_draft: bool = False,
     ):
         if self.layout in ["page_first", "page_first_direct"]:
-            # no ssm state on conv-only models: nothing to transfer
-            if self.temporal_state_elem_size > 0:
-                self._copy_tensor_pf_lf(
-                    src=self.temporal_buffer,
-                    dst=device_pool.mamba_cache.temporal[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
-            for conv_idx in range(len(self.conv_state_shapes)):
-                self._copy_tensor_pf_lf(
-                    src=self.conv_buffer[conv_idx],
-                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
+            if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
+                # NPU: transfer all layers at once via dedicated kernel.
+                # layer_id == 0 covers every layer, so later calls must skip.
+                if layer_id == 0:
+                    # no ssm state on conv-only models: a 0-size batched
+                    # transfer errors, same guard as the per-layer path below
+                    if self.temporal_state_elem_size > 0:
+                        transfer_mamba_state(
+                            device_buf=device_pool.mamba_cache.temporal,
+                            host_buf=self.temporal_buffer,
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            direction=TransferDirection.H2D,
+                        )
+                    for conv_idx in range(len(self.conv_state_shapes)):
+                        transfer_mamba_state(
+                            device_buf=device_pool.mamba_cache.conv[conv_idx],
+                            host_buf=self.conv_buffer[conv_idx],
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            direction=TransferDirection.H2D,
+                        )
+            else:
+                # no ssm state on conv-only models: nothing to transfer
+                if self.temporal_state_elem_size > 0:
+                    self._copy_tensor_pf_lf(
+                        src=self.temporal_buffer,
+                        dst=device_pool.mamba_cache.temporal[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor_pf_lf(
+                        src=self.conv_buffer[conv_idx],
+                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
@@ -460,6 +592,11 @@ class MambaPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
         if self.layout in ["page_first", "page_first_direct"]:
+            if io_backend == "kernel" and host_indices.device != device_indices.device:
+                # The mamba JIT kernel wants both index tensors on the device;
+                # the staged MHA/MLA write path hands us CPU host indices.
+                # Convert once here rather than per conv/temporal tensor.
+                host_indices = host_indices.to(device_indices.device, non_blocking=True)
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
                 self._copy_tensor_all_layers_lf_pf(

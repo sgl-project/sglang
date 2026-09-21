@@ -349,12 +349,22 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        # Delegated like the read-path translate above: this composite is not a
-        # SWA allocator itself, so it inherits neither the default nor an
-        # override, and the PD payload path calls this on whatever allocator
-        # the scheduler holds.
         return self.logical_attn_allocator.translate_swa_indices_for_transfer(
             kv_indices
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Use this wrapper's capacity, which also includes the compressed pool.
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
         )
 
     def full_available_size(self):
@@ -365,6 +375,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
+
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        # C4 needs no reclaim here: full_available_size prices it into the budget.
+        return self.logical_attn_allocator.reclaim_for_prealloc(
+            tree_cache, full_tokens, swa_tokens
+        )
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
