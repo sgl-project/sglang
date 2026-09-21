@@ -3,13 +3,14 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -29,33 +30,58 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
+_host_memory_budget: ContextVar[Optional[int]] = ContextVar(
+    "hicache_host_memory_budget", default=None
+)
+
+
+@contextmanager
+def host_memory_budget_scope(budget_bytes: int):
+    """Book every pool built inside against one snapshot, not re-sampled psutil."""
+    token = _host_memory_budget.set(budget_bytes)
+    try:
+        yield
+    finally:
+        _host_memory_budget.reset(token)
+
+
 def ranks_per_host() -> int:
     """Number of ranks of this job running on the same machine as this one.
 
-    Derived as world_size // nnodes: the launcher slices ranks uniformly
-    across nodes (resolution asserts divisibility), so no hostname collective
-    is needed — a collective here would have to be issued the same number of
-    times on every rank, and ranks build different numbers of host pools.
+    Derived as the launch width // nnodes: the launcher slices ranks
+    uniformly across nodes (resolution asserts divisibility), so no hostname
+    collective is needed — a collective here would have to be issued the same
+    number of times on every rank, and ranks build different numbers of host
+    pools.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
     try:
-        world_group = get_world_group()
+        launch_world_size = get_parallel().launch_world_size
     except AssertionError:
         return 1
-    if world_group.world_size == 1:
+    if launch_world_size == 1:
         return 1
-    return max(world_group.world_size // get_parallel().nnodes, 1)
+    return max(launch_world_size // get_parallel().nnodes, 1)
 
 
-def host_memory_budget_bytes() -> int:
+def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
-    psutil reports the whole machine, so co-located ranks each see the same free
-    memory; without the split every rank sizes its pool against all of it and
-    the host is oversubscribed by the number of ranks it holds.
+    Bound machine availability by the visible cgroup limits before splitting
+    among local ranks. Independent engines with separate container budgets
+    therefore size against their own remaining allowance.
+
+    Inside host_memory_budget_scope, requested_bytes is booked against the
+    snapshot when it fits; the allowance before booking is returned.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    available = _host_memory_budget.get()
+    if available is not None:
+        if requested_bytes <= available:
+            _host_memory_budget.set(available - requested_bytes)
+        return available
+
+    free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
     return free // ranks_per_host()
 
 
@@ -75,9 +101,9 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        pp_group = get_pp_group()
+        pp_group = get_parallel().pp_group
     except AssertionError:
         return size
 
@@ -172,7 +198,7 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
