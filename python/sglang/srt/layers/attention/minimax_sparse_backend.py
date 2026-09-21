@@ -1801,7 +1801,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
-        self._hisparse_enabled = sparse_backend._loc_mapping is not None
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
