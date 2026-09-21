@@ -3,9 +3,7 @@
 
 //! Plain and PD chat forwarding, including load tracking and streaming metrics.
 
-use super::preparation::{
-    generate_room_id, resolve_engine_rid, BootstrapFields, PreparedChatRequest,
-};
+use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
@@ -87,7 +85,7 @@ pub(super) async fn forward_chat_request(
     // The id the engine will know this request by, so the router can tell it to
     // stop generating when the client goes away. `None` leaves the body's `rid`
     // alone and disables the abort — see `resolve_engine_rid`.
-    let engine_rid = resolve_engine_rid(request.caller_set_rid, pd.is_some(), &headers);
+    let engine_rid = request.engine_rid(pd.is_some(), &headers);
     let body = request.into_outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),

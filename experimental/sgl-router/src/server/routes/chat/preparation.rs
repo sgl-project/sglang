@@ -29,7 +29,10 @@ pub(super) struct PreparedChatRequest {
     pub(super) input_token_count: usize,
     /// Did the caller file this request under its own `rid`? Opts the request
     /// out of abort-on-disconnect — see [`resolve_engine_rid`].
-    pub(super) caller_set_rid: bool,
+    caller_set_rid: bool,
+    /// Will the engine fan this request out into several samples (`n > 1`)?
+    /// Also an abort-on-disconnect opt-out — see [`resolve_engine_rid`].
+    fans_out: bool,
     can_forward_input_ids: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
@@ -74,10 +77,18 @@ impl PreparedChatRequest {
             tokens,
             input_token_count,
             caller_set_rid: fields.caller_set_rid,
+            fans_out: requests_multiple_samples(&fields, &sampling_defaults),
             can_forward_input_ids,
             parsed_body,
             sampling_defaults,
         })
+    }
+
+    /// The engine-facing request id this dispatch will be aborted by if the
+    /// client disconnects, or `None` when the request opts out — see
+    /// [`resolve_engine_rid`].
+    pub(super) fn engine_rid(&self, pd_mode: bool, headers: &HeaderMap) -> Option<String> {
+        resolve_engine_rid(self.caller_set_rid, self.fans_out, pd_mode, headers)
     }
 
     /// `engine_rid` is the router-minted request id to file this request under
@@ -403,6 +414,28 @@ fn should_tokenize_request(
     can_forward_input_ids || policy_needs_request_tokens || bucket_routing_enabled
 }
 
+/// Whether the engine will fan this request out into several samples, which
+/// makes it unabortable by a router-minted rid — see [`resolve_engine_rid`].
+///
+/// Counts the value the ENGINE will see: the caller's `n`, or the configured
+/// default injected for it when the caller omitted one. A value the probe could
+/// not read counts as fan-out — opting out costs one abort, while guessing wrong
+/// costs a futile POST on every disconnect.
+fn requests_multiple_samples(
+    fields: &RoutingFields,
+    sampling_defaults: &[(SamplingField, Number)],
+) -> bool {
+    match fields.sampling_field(SamplingField::N) {
+        SamplingValue::Number(n) => n > 1.0,
+        SamplingValue::Unusable => true,
+        SamplingValue::Absent => sampling_defaults
+            .iter()
+            .find(|(field, _)| *field == SamplingField::N)
+            .and_then(|(_, value)| value.as_f64())
+            .is_some_and(|n| n > 1.0),
+    }
+}
+
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
     (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
@@ -501,7 +534,10 @@ fn correlation_id(headers: &HeaderMap) -> Option<&str> {
 /// injecting one replaces the engine-minted `uuid4().hex` the caller used to
 /// see — the caller's own `x-request-id` included.
 ///
-/// `None`, preserving today's behavior exactly, in two cases:
+/// The only stable shape is the leading `router-`: a request with no usable
+/// correlation header mints `router-<uuid>`, with no middle segment at all.
+///
+/// `None`, preserving today's behavior exactly, in three cases:
 ///
 /// * **PD-disaggregated mode.** Prefill is deliberately detached so it outlives
 ///   the client for KV-transfer correctness; aborting only the decode half
@@ -513,16 +549,27 @@ fn correlation_id(headers: &HeaderMap) -> Option<&str> {
 ///   cancel a worker's entire router-minted population on disconnect.
 ///   Overwriting the caller's `rid` is not an option either — it is the handle
 ///   they asked the engine to file the request under.
+/// * **A request that fans out (`n > 1`).** SGLang converts one to a batch
+///   (`GenerateReqInput._handle_parallel_sampling`), and the batch path calls
+///   `regenerate_rid()` on every sample — a fresh `uuid4().hex` that is not
+///   prefixed by the injected rid. So the minted rid is discarded before the
+///   request is abortable: an abort by it would match nothing, and the response
+///   `id` would not carry it either. Minting one anyway would buy nothing and
+///   cost a futile `/abort_request` on every disconnect. Conservative in one
+///   direction: a beam-search request keeps its rid (beam width means "sequences
+///   returned", not fan-out), so opting out there loses an abort that would have
+///   worked.
 ///
 /// That same prefix rule is why a minted rid ends in a fresh UUID: two callers
 /// can pick colliding `x-request-id` values, but neither can predict the
 /// other's UUID, so one cannot steer an abort onto the other's request.
-pub(super) fn resolve_engine_rid(
+fn resolve_engine_rid(
     caller_set_rid: bool,
+    fans_out: bool,
     pd_mode: bool,
     headers: &HeaderMap,
 ) -> Option<String> {
-    if caller_set_rid || pd_mode {
+    if caller_set_rid || fans_out || pd_mode {
         return None;
     }
     let unique = uuid::Uuid::new_v4().simple();
@@ -1718,7 +1765,8 @@ mod tests {
     /// `router-<uuid>` — self-contained and unique.
     #[test]
     fn resolve_engine_rid_mints_uuid_without_correlation_header() {
-        let rid = resolve_engine_rid(false, false, &HeaderMap::new()).expect("plain mode mints");
+        let rid =
+            resolve_engine_rid(false, false, false, &HeaderMap::new()).expect("plain mode mints");
         assert_eq!(
             rid.len(),
             "router-".len() + 32,
@@ -1730,8 +1778,13 @@ mod tests {
     /// an engine log line against the caller's own request.
     #[test]
     fn resolve_engine_rid_folds_in_the_correlation_header() {
-        let rid = resolve_engine_rid(false, false, &headers_with("x-request-id", "gw-abc-123"))
-            .expect("plain mode mints");
+        let rid = resolve_engine_rid(
+            false,
+            false,
+            false,
+            &headers_with("x-request-id", "gw-abc-123"),
+        )
+        .expect("plain mode mints");
         assert!(
             rid.starts_with("router-gw-abc-123-") && rid.len() > "router-gw-abc-123-".len(),
             "the correlation id must appear verbatim with a unique suffix; got {rid}",
@@ -1744,8 +1797,8 @@ mod tests {
     #[test]
     fn resolve_engine_rid_is_unique_per_request_even_with_a_shared_header() {
         let headers = headers_with("x-request-id", "same-id");
-        let a = resolve_engine_rid(false, false, &headers).unwrap();
-        let b = resolve_engine_rid(false, false, &headers).unwrap();
+        let a = resolve_engine_rid(false, false, false, &headers).unwrap();
+        let b = resolve_engine_rid(false, false, false, &headers).unwrap();
         assert_ne!(a, b);
         assert!(
             !b.starts_with(&a) && !a.starts_with(&b),
@@ -1764,7 +1817,7 @@ mod tests {
             "quote\"inside".to_string(),
             String::new(),
         ] {
-            let rid = resolve_engine_rid(false, false, &headers_with("x-request-id", &bad))
+            let rid = resolve_engine_rid(false, false, false, &headers_with("x-request-id", &bad))
                 .expect("plain mode still mints");
             assert_eq!(
                 rid.len(),
@@ -1774,17 +1827,73 @@ mod tests {
         }
     }
 
-    /// The two opt-outs, which preserve today's behavior exactly: PD mode (prefill
-    /// is detached to outlive the client) and a caller-supplied `rid` (the engine
-    /// aborts by rid PREFIX, so honouring a caller-chosen key would let
-    /// `{"rid": "router-"}` cancel a worker's whole router-minted population).
+    /// The three opt-outs, each preserving today's behavior exactly: PD mode
+    /// (prefill is detached to outlive the client), a caller-supplied `rid` (the
+    /// engine aborts by rid PREFIX, so honouring a caller-chosen key would let
+    /// `{"rid": "router-"}` cancel a worker's whole router-minted population),
+    /// and a fan-out request (the engine regenerates every rid, discarding ours).
     #[test]
-    fn resolve_engine_rid_opts_out_of_pd_and_caller_supplied_rids() {
-        assert!(resolve_engine_rid(false, true, &HeaderMap::new()).is_none());
+    fn resolve_engine_rid_opts_out_of_pd_fan_out_and_caller_supplied_rids() {
+        for (caller_set_rid, fans_out, pd_mode, why) in [
+            (false, false, true, "PD mode"),
+            (true, false, false, "a caller-supplied rid"),
+            (false, true, false, "a fan-out request"),
+        ] {
+            assert!(
+                resolve_engine_rid(caller_set_rid, fans_out, pd_mode, &HeaderMap::new()).is_none(),
+                "{why} must not be minted an abort rid",
+            );
+        }
         assert!(
-            resolve_engine_rid(true, false, &HeaderMap::new()).is_none(),
-            "a caller-supplied rid must neither be reused as an abort key nor overwritten",
+            resolve_engine_rid(false, false, false, &HeaderMap::new()).is_some(),
+            "a plain single-sample request must still mint one",
         );
+    }
+
+    /// `n` is read as the ENGINE will see it: the caller's value, or the default
+    /// the operator configured for a request that omits it. A value the probe
+    /// could not read counts as fan-out, so the router never mints a rid it
+    /// cannot abort by.
+    #[test]
+    fn fan_out_is_judged_on_the_n_the_engine_will_see() {
+        for (body, want, why) in [
+            (r#"{"model":"x"}"#, false, "no n is one sample"),
+            (r#"{"model":"x","n":1}"#, false, "n=1 is one sample"),
+            (r#"{"model":"x","n":2}"#, true, "n>1 fans out"),
+            (
+                r#"{"model":"x","n":"3"}"#,
+                true,
+                "the engine coerces numeric strings",
+            ),
+            (
+                r#"{"model":"x","n":[2]}"#,
+                true,
+                "an unreadable n counts as fan-out",
+            ),
+        ] {
+            assert_eq!(
+                requests_multiple_samples(&fields_of(body), &[]),
+                want,
+                "{why}: {body}"
+            );
+        }
+
+        // A configured `n` default reaches the engine for a request that omits
+        // one, so it decides fan-out just as a caller-supplied value would.
+        let fields = fields_of(r#"{"model":"x"}"#);
+        for (config, want) in [(r#"{"n": 1}"#, false), (r#"{"n": 4}"#, true)] {
+            let defaults = resolve_sampling_defaults(
+                &overrides_of(ConflictPolicy::Reject, config),
+                &fields,
+                &metrics(),
+            )
+            .unwrap();
+            assert_eq!(
+                requests_multiple_samples(&fields, &defaults),
+                want,
+                "configured default {config}"
+            );
+        }
     }
 
     /// SGLang accepts a list-valued `rid` (the batch form). Probing it as a

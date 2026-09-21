@@ -90,6 +90,15 @@ const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// by `POST`ing `/abort_request {rid, abort_all:false}`. The engine's scheduler
 /// cancels every in-flight request whose `rid` starts with this one.
 ///
+/// This is a latency optimization, not a leak fix. SGLang already self-aborts a
+/// disconnected request: `TokenizerManager._wait_one_response` polls
+/// `request.is_disconnected()` after every output chunk and on every
+/// `SGLANG_REQUEST_STATE_WAIT_TIMEOUT` (4s) idle tick, and the router does close
+/// its upstream connection when the handler future drops or the SSE pump breaks.
+/// What an explicit abort adds is promptness — up to one poll interval of
+/// generation saved per disconnect — and coverage of the cases where a closed
+/// socket is not what the engine notices.
+///
 /// `auth` replays the request's own `Authorization` header. SGLang marks
 /// `/abort_request` `ADMIN_OPTIONAL`, so an engine started with `--api-key`
 /// rejects an unauthenticated abort with 401 — silently turning the whole
@@ -97,6 +106,15 @@ const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// generate request carried this header upstream already (see
 /// [`should_forward_request_header`]), so replaying it is the same credential
 /// the worker just accepted.
+///
+/// That covers one of the three key configurations, and only one. SGLang's
+/// `ADMIN_OPTIONAL` check (`srt/utils/auth.py`) accepts the plain `--api-key`
+/// ONLY when no `--admin-api-key` is set; configure an admin key — alone, or
+/// alongside an api key, where the api key is explicitly not accepted — and the
+/// abort needs that admin credential, which is not what the client sent and
+/// which the router holds no configuration for. On such a fleet every abort
+/// 401s and the warning below is the only signal. Closing that gap means giving
+/// the router its own admin-key config; until then this feature is off there.
 ///
 /// Best-effort by construction: the client is already gone, so there is no one
 /// to surface an error to, and a missed abort wastes engine compute but is not
@@ -159,6 +177,14 @@ fn abort_auth(headers: &HeaderMap) -> Option<HeaderValue> {
 ///
 /// A redundant abort costs one POST the engine answers by finding no such rid;
 /// a missed one costs a whole generation, so the doubtful cases abort.
+///
+/// Note when this report arrives, which bounds how fast a streaming abort can
+/// land. The pump only learns the client is gone when it next tries to hand a
+/// chunk downstream, so it is parked in `stream.next()` until the engine emits
+/// one: a client that leaves during a long prefill is not acted on until TTFT,
+/// and `forward_streaming_to` sets no request timeout to cap that (only
+/// `forward_json_to` does). Bounding the wait needs an idle/total-stream
+/// deadline, which is the streaming reaper's job, not this hook's.
 fn engine_may_still_be_generating(end: sse::StreamEnd) -> bool {
     end.client_disconnect || !end.transport_ok
 }

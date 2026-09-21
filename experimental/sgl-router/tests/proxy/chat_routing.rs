@@ -2118,3 +2118,49 @@ async fn concurrent_disconnects_each_abort_with_a_unique_rid() {
          shared (or one overwrote) the other's router-minted rid"
     );
 }
+
+/// A fan-out request (`n > 1`) opts out: SGLang converts one to a batch and
+/// regenerates every rid, so a router-minted one is discarded before the request
+/// is abortable. The router must neither inject it nor POST an abort that could
+/// only match nothing.
+#[tokio::test]
+async fn streaming_disconnect_does_not_abort_a_fan_out_request() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let app = build_router(build_ctx_with_worker(&worker.url));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "n": 2,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    read_one_chunk_then_disconnect(res).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        worker.abort_log.lock().unwrap().is_empty(),
+        "a fan-out request must never trigger an abort: the engine regenerated \
+         every rid, so the minted one could only match nothing"
+    );
+    let forwarded = worker.captured.lock().unwrap().last_body.clone();
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(&forwarded.expect("worker must have seen a body")).unwrap();
+    assert!(
+        forwarded.get("rid").is_none(),
+        "a fan-out request's body must carry no injected rid; got {forwarded:?}",
+    );
+}
