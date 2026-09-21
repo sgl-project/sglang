@@ -50,6 +50,8 @@ class TestDPAttentionDP2TP2(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--constrained-json-max-whitespace-cnt",
+                "4",
                 "--tp",
                 "2",
                 "--enable-dp-attention",
