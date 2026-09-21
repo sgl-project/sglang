@@ -1,0 +1,63 @@
+"""Latency and throughput of the /v1/embeddings endpoint."""
+
+import unittest
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.perf_bench_kit import (
+    at_least,
+    at_most,
+    check_batch_scaling,
+    check_perf,
+)
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
+    run_embeddings_benchmark,
+)
+
+register_cuda_ci(est_time=320, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=315, suite="stage-b-test-1-gpu-large-amd")
+
+
+class TestEmbeddingsAPI(CustomTestCase):
+    def test_embeddings_api_latency_throughput(self):
+        """Test embeddings API latency and throughput performance"""
+        res = run_embeddings_benchmark(
+            model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            num_requests=1000,
+            batch_size=1,
+            input_tokens=500,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        check_perf(
+            self,
+            "test_embeddings_api_latency_throughput",
+            at_most("avg_latency_ms", res["avg_latency_ms"], 20, amd=35, unit="ms"),
+            at_most("p95_latency_ms", res["p95_latency_ms"], 25, amd=40, unit="ms"),
+            at_least("throughput", res["throughput"], 60, amd=30, unit="req/s"),
+        )
+
+    def test_embeddings_api_batch_scaling(self):
+        check_batch_scaling(
+            self,
+            "test_embeddings_api_batch_scaling",
+            lambda batch_size: run_embeddings_benchmark(
+                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+                num_requests=500,
+                batch_size=batch_size,
+                input_tokens=500,
+            ),
+            # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
+            [
+                (10, 60, 65, 80, 90),
+                (25, 115, 120, 140, 150),
+                (50, 190, 195, 230, 240),
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

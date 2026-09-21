@@ -6,15 +6,14 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.perf_bench_kit import at_least, at_most, check_perf
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     auto_config_device,
     get_benchmark_args,
-    is_in_ci,
     run_bench_serving_multi,
-    write_github_step_summary,
 )
 
 register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-small")
@@ -37,7 +36,7 @@ def _local_tokenizer_path():
     return None
 
 
-class TestVLMPerf5090(CustomTestCase):
+class TestVLM5090(CustomTestCase):
     def test_vlm_perf(self):
         common = dict(
             base_url=DEFAULT_URL_FOR_TEST,
@@ -67,16 +66,24 @@ class TestVLMPerf5090(CustomTestCase):
             benchmark_args=[offline, online],
         )
 
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_vlm_perf (5090)\n"
-                f"Output throughput: {res_offline['output_throughput']:.2f} token/s\n"
-                f"median_e2e_latency_ms: {res_online['median_e2e_latency_ms']:.2f} ms\n"
-            )
-            self.assertGreater(res_offline["output_throughput"], 2000)
-            self.assertLess(res_online["median_e2e_latency_ms"], 16500)
-            self.assertLess(res_online["median_ttft_ms"], 150)
-            self.assertLess(res_online["median_itl_ms"], 8)
+        check_perf(
+            self,
+            "test_vlm_perf",
+            at_least(
+                "output_throughput",
+                res_offline["output_throughput"],
+                2000,
+                unit="token/s",
+            ),
+            at_most(
+                "median_e2e_latency_ms",
+                res_online["median_e2e_latency_ms"],
+                16500,
+                unit="ms",
+            ),
+            at_most("median_ttft_ms", res_online["median_ttft_ms"], 150, unit="ms"),
+            at_most("median_itl_ms", res_online["median_itl_ms"], 8, unit="ms"),
+        )
 
 
 if __name__ == "__main__":
