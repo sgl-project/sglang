@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import doctest
 import importlib.util
@@ -28,6 +29,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 import aiohttp
 import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -666,6 +668,7 @@ def unified_radix_tree_server_env(
     return {
         **os.environ,
         **extra_env,
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
     }
@@ -846,14 +849,17 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
+    pids = collect_process_tree_pids(process.pid)
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
     kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
 
 
 def popen_launch_pd_server(
@@ -1997,9 +2003,42 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+@contextlib.contextmanager
+def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
+    """Publish a record describing the parallel topology a test wants.
+
+    Replaces standing a per-process parallel record into the object under
+    test. The widths arrive the way production gets them -- from published
+    configuration -- and the per-process ranks the way a spawned process gets
+    them, so a rank read is answered without building a process group. Stating
+    the topology through the same door production uses also keeps the derived
+    widths honest: a hand-built double can claim an `attn_tp_size` the
+    configuration would never produce.
+
+    `ranks` overrides the spawn identities; by default this process is rank
+    zero of the world, which fixes every other rank. The context is reset on exit, including when the
+    test fails.
+    """
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    bundle = dict(world_rank=0, dp_rank=None)
+    bundle.update(ranks or {})
+    server_args = ServerArgs(model_path="dummy", **server_args_fields)
+    reset_context()
+    publish(server_args, role=role, ranks=SpawnRanks(**bundle))
+    try:
+        yield server_args
+    finally:
+        reset_context()
+
+
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2101,6 +2140,95 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
+
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
 # Names the runner kits stamp onto a record that are not members of it.
 # `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
 # onto the record they hand the runner, and `hasattr` cannot see it.
@@ -2154,6 +2282,17 @@ def enter_override(test_case, override):
     installed = override.install()
     test_case.addCleanup(override.restore)
     return installed
+
+
+def enter_scope(test_case, scope):
+    """Enter a context manager for the length of one test.
+
+    The `with`-statement form of `enter_override` above, and 3.10-safe for the
+    same reason: `enterContext` arrived in 3.11.
+    """
+    entered = scope.__enter__()
+    test_case.addCleanup(scope.__exit__, None, None, None)
+    return entered
 
 
 class CustomTestCase(unittest.TestCase):

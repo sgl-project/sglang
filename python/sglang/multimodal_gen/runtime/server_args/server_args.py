@@ -215,8 +215,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -236,6 +238,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
@@ -507,6 +510,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -589,6 +593,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -772,7 +777,8 @@ class ServerArgs(DisaggServerArgsMixin):
         logger.warning(
             "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
-            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Qwen/Qwen-Image-2.1, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
             "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
@@ -1365,9 +1371,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
@@ -1466,9 +1471,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
@@ -1894,6 +1901,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -2791,6 +2799,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -2890,6 +2904,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
