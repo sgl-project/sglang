@@ -2,9 +2,19 @@
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+
+if os.environ.get("SGLANG_COMPRESSION_STANDALONE_TEST") == "1":
+    # CI registration is a runtime no-op; avoid package initialization here.
+    def register_cpu_ci(**kwargs):
+        pass
+else:
+    from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 spec = importlib.util.spec_from_file_location(

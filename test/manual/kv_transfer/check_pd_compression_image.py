@@ -15,9 +15,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
-    import sglang
     import torch
-    from sglang.srt.disaggregation.compression.protocol import PROTOCOL_VERSION
+
+    import sglang
+    from sglang.srt.disaggregation.compression.protocol import (
+        PROTOCOL_VERSION,
+        REGISTRATION_VERSION,
+    )
     from sglang.srt.kv_compression.types import NVCOMP_VERSION
 
     root = Path(sglang.__file__).resolve().parents[2]
@@ -31,6 +35,7 @@ def main():
             ):
                 raise AssertionError(f"Delivered source mismatch: {path}")
     assert PROTOCOL_VERSION == 2
+    assert REGISTRATION_VERSION == 2
     assert torch.cuda.is_available(), "CUDA is unavailable"
     assert torch.cuda.device_count() == 1, (
         "Bind the allocated GPU before this preflight"
@@ -47,6 +52,7 @@ def main():
     versions = {name: importlib.metadata.version(name) for name in packages}
     assert versions["nvidia-nvcomp-cu" + cuda_major] == NVCOMP_VERSION
     from nvidia import nvcomp
+
     from sglang.srt.kv_compression.provider import HostEncodedKVProvider
     from sglang.srt.mem_cache.hicache_lifecycle import HiCacheLifecycleMixin
     from sglang.srt.mem_cache.l2_completion import RestoreTicket, TransferCompletion
@@ -63,6 +69,7 @@ def main():
             dict(
                 source=str(root),
                 protocol=PROTOCOL_VERSION,
+                registration=REGISTRATION_VERSION,
                 versions=versions,
                 gpu=torch.cuda.get_device_name(0),
                 source_verified=bool(args.manifest),

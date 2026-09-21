@@ -7,6 +7,7 @@ These tests exercise admission and lifetime decisions, not GPU kernels or RDMA.
 from __future__ import annotations
 
 import ast
+import asyncio
 import concurrent.futures
 import dataclasses
 import importlib.util
@@ -41,6 +42,10 @@ protocol = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = protocol
 spec.loader.exec_module(protocol)
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
 
 def load_body(path, symbol, namespace, owner=None):
     tree = ast.parse((SRT / path).read_text())
@@ -52,7 +57,8 @@ def load_body(path, symbol, namespace, owner=None):
     node = next(
         n
         for n in nodes
-        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == symbol
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and n.name == symbol
     )
     module = ast.Module(
         body=[
@@ -172,13 +178,15 @@ class TestBackgroundProgress(unittest.TestCase):
             parent_data.value.tolist() + child_data.value.tolist(), [8, 4, 6]
         )
 
-    def test_no_batch_yields_only_for_compression_or_existing_storage(self):
+    def test_no_batch_preserves_compression_storage_and_pd_yields(self):
         clock = NS(monotonic=lambda: 0, sleep=Mock())
+        modes = NS(NULL="null", PREFILL="prefill", DECODE="decode")
         on_idle = load_body(
             "managers/scheduler.py",
             "on_idle",
             dict(
                 time=clock,
+                DisaggregationMode=modes,
                 LOAD_STALL_REFRESH_S=1,
                 SCHEDULER_STAGE_IDLE="idle",
                 scheduler_stage_method=lambda _: lambda fn: fn,
@@ -193,9 +201,17 @@ class TestBackgroundProgress(unittest.TestCase):
             _last_stall_publish_ts=0,
             tree_cache=NS(has_pending_background_work=lambda: pending),
             enable_hicache_storage=False,
+            disaggregation_mode=modes.NULL,
         )
         on_idle(obj)
         clock.sleep.assert_not_called()
+
+        for mode in (modes.PREFILL, modes.DECODE):
+            obj.disaggregation_mode = mode
+            on_idle(obj)
+            clock.sleep.assert_called_once_with(0)
+            clock.sleep.reset_mock()
+        obj.disaggregation_mode = modes.NULL
         pending = True
         on_idle(obj)
         clock.sleep.assert_called_once_with(0.001)
@@ -843,14 +859,233 @@ class TestConfigurationAndRegistration(unittest.TestCase):
         old = cls.from_zmq(frames)
         self.assertEqual(old.compression_capability, "off")
         self.assertEqual(old.staging_base_ptr, 300)
+        upstream_frames = frames + [struct.pack("2Q", 64, 128)]
+        upstream = cls.from_zmq(upstream_frames)
+        self.assertEqual(upstream.compression_capability, "off")
+        self.assertEqual(upstream.dst_kv_item_lens, [64, 128])
         updated = cls.from_zmq(
-            frames + [protocol.capability("lz4").encode(), b"layout"]
+            upstream_frames + [protocol.capability("lz4").encode(), b"layout"]
         )
+        self.assertEqual(updated.dst_kv_item_lens, [64, 128])
         self.assertEqual(updated.compression_capability, protocol.capability("lz4"))
         self.assertEqual(updated.compression_layout, "layout")
 
+    def test_pre_upstream_registration_rejected_during_negotiation(self):
+        for forced in (False, True):
+            current = protocol.capability("lz4", force=forced)
+            legacy = current.replace("/registration-v2", "")
+            with self.assertRaisesRegex(ValueError, "compression mismatch"):
+                protocol.check_peer(current, legacy)
+
+    def test_registration_writer_reader_roundtrip(self):
+        namespace = dict(
+            __name__=__name__,
+            dataclasses=dataclasses,
+            struct=struct,
+            capability=protocol.capability,
+            pack_int_lists=lambda values, fmt: b"",
+            unpack_int_lists=lambda data, fmt: [],
+            StagingRegisterInfo=NS(from_zmq_fields=lambda *a, **k: None),
+        )
+        parser = load_body(
+            "disaggregation/mooncake/conn.py", "KVArgsRegisterInfo", namespace
+        )
+        send = load_body(
+            "disaggregation/mooncake/conn.py",
+            "_register_kv_args",
+            namespace,
+            owner="MooncakeKVReceiver",
+        )
+        for mode in ("off", "passthrough", "lz4"):
+            with self.subTest(mode=mode):
+                sock = Mock()
+                manager = NS(
+                    compression_mode=mode,
+                    compression_runtime=NS(layout_tag="layout"),
+                    kv_args=NS(
+                        kv_data_ptrs=[100, 101],
+                        aux_data_ptrs=[200],
+                        state_data_ptrs=[],
+                        state_item_lens=[],
+                        state_layer_ids=[],
+                        kv_layer_ids=[0, 1],
+                        engine_rank=0,
+                        kv_item_lens=[64, 128],
+                    ),
+                    attn_tp_size=1,
+                    dcp_size=1,
+                    dcp_rank=0,
+                    enable_staging=False,
+                    local_ip="127.0.0.1",
+                    rank_port=1234,
+                )
+                receiver = NS(
+                    kv_mgr=manager,
+                    bootstrap_infos=[{}],
+                    session_id="peer",
+                    _connect_to_bootstrap_server=lambda _: (sock, threading.Lock()),
+                )
+                self.assertTrue(send(receiver))
+                frames = sock.send_multipart.call_args.args[0]
+                self.assertEqual(len(frames), 20 if mode == "off" else 22)
+                decoded = parser.from_zmq(frames)
+                self.assertEqual(decoded.dst_kv_item_lens, [64, 128])
+                self.assertEqual(decoded.dst_kv_ptrs, [100, 101])
+                self.assertEqual(
+                    decoded.compression_capability, protocol.capability(mode)
+                )
+                self.assertEqual(
+                    decoded.compression_layout, "" if mode == "off" else "layout"
+                )
+
+    def test_bootstrap_preserves_optional_upstream_and_compression_fields(self):
+        namespace = dict(__name__=__name__, dataclasses=dataclasses)
+        info_type = load_body(
+            "disaggregation/common/conn.py", "PrefillServerInfo", namespace
+        )
+        namespace.update(
+            PrefillServerInfo=info_type,
+            web=NS(json_response=lambda data, status: data),
+        )
+        get = load_body(
+            "disaggregation/common/conn.py",
+            "_handle_route_get",
+            namespace,
+            owner="CommonKVBootstrapServer",
+        )
+        request = NS(
+            query={
+                k: "-1"
+                for k in (
+                    "prefill_dp_rank",
+                    "prefill_cp_rank",
+                    "target_tp_rank",
+                    "target_pp_rank",
+                )
+            }
+        )
+        for mode in ("off", "lz4"):
+            for spec in (None, {"draft": "test"}):
+                with self.subTest(mode=mode, spec=spec):
+                    server = NS(
+                        _is_ready=lambda: True,
+                        attn_tp_size=1,
+                        attn_cp_size=1,
+                        dp_size=1,
+                        pp_size=1,
+                        page_size=1,
+                        kv_cache_dtype="bf16",
+                        follow_bootstrap_room=True,
+                        enable_dsa_cache_layer_split=False,
+                        prefill_http_port=30000,
+                        dsv41_spec_layout=spec,
+                        pd_kv_compression=protocol.capability(mode),
+                    )
+                    response = asyncio.run(get(server, request))
+                    self.assertEqual("pd_kv_compression" in response, mode != "off")
+                    self.assertEqual("dsv41_spec_layout" in response, spec is not None)
+                    if spec is not None:
+                        self.assertEqual(response["dsv41_spec_layout"], spec)
+
 
 class TestSenderAdmission(unittest.TestCase):
+    def test_segmented_send_keeps_identities_and_final_state(self):
+        import torch
+
+        state_names = (
+            "MAMBA",
+            "QSA_PENDING",
+            "QSA_COMPRESSED",
+            "SWA",
+            "DSA",
+            "DSA_TAIL",
+            "MINIMAX_INDEX_K",
+            "SWA_RING",
+            "DSV4_REQUEST_STATE",
+            "BLOCK_SCALE",
+            "BLOCK_SCALE_SWA",
+        )
+        namespace = dict(
+            StateType=NS(**{name: name for name in state_names}),
+            _is_npu=False,
+            kv_to_page_indices=lambda values, size: values.numpy(),
+            logger=logging.getLogger(__name__),
+        )
+        namespace["compute_grid_segments"] = load_body(
+            "disaggregation/common/staging_buffer.py", "compute_grid_segments", {}
+        )
+        send = load_body(
+            "disaggregation/prefill.py",
+            "_send_kv_chunk",
+            namespace,
+            owner="SchedulerDisaggregationPrefillMixin",
+        )
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                sent = []
+                sender = NS(
+                    requires_encoded_kv=compressed,
+                    get_max_transfer_tokens=lambda: 4,
+                    should_send_kv_chunk=lambda count, last: count > 0 or last,
+                )
+                sender.send = lambda pages, state, **kw: sent.append(
+                    (
+                        pages.tolist(),
+                        state,
+                        kw["num_kv_tokens"],
+                        getattr(sender, "compression_refs", None),
+                    )
+                )
+                req = NS(
+                    rid="segmented",
+                    kv=NS(req_pool_idx=0),
+                    origin_input_ids=list(range(11)),
+                    extend_range=NS(end=11),
+                    start_send_idx=2,
+                    disagg_decode_prefix_len=2,
+                    disagg_kv_sender=sender,
+                )
+                scheduler = NS(
+                    enable_staging=False,
+                    token_to_kv_pool_allocator=NS(
+                        page_size=1,
+                        translate_kv_indices_for_transfer=lambda values: values,
+                    ),
+                    req_to_token_pool=NS(
+                        req_to_token=torch.tensor(
+                            [[31, 8, 42, 5, 9, 7, 1, 2, 4, 6, 3]]
+                        ),
+                        req_index_to_mamba_index_mapping=torch.tensor([17]),
+                        translate_mamba_indices=lambda values: values,
+                    ),
+                    disagg_metadata_buffers=Mock(),
+                    disagg_prefill_bootstrap_queue=NS(
+                        kv_manager=NS(kv_args=NS(state_types=["MAMBA"]))
+                    ),
+                    disagg_prefill_pending_chunk_rids={req.rid},
+                )
+                if compressed:
+                    scheduler.tree_cache = NS(
+                        get_kv_transfer_refs=lambda req, start, end, pages: tuple(
+                            range(start, end)
+                        )
+                    )
+                send(scheduler, req, last_chunk=True)
+                self.assertEqual([row[2] for row in sent], [4, 4, 1])
+                self.assertEqual(
+                    [page for row in sent for page in row[0]],
+                    [42, 5, 9, 7, 1, 2, 4, 6, 3],
+                )
+                self.assertIsNone(sent[0][1])
+                self.assertIsNone(sent[1][1])
+                self.assertEqual(int(sent[2][1][0][0]), 17)
+                self.assertEqual(
+                    [row[3] for row in sent],
+                    [(2, 3, 4, 5), (6, 7, 8, 9), (10,)] if compressed else [None] * 3,
+                )
+                self.assertEqual(req.start_send_idx, 11)
+                self.assertFalse(scheduler.disagg_prefill_pending_chunk_rids)
+
     def test_failure_and_success_wait_for_source_tasks(self):
         poll = load_body(
             "disaggregation/mooncake/conn.py",

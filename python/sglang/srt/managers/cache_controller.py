@@ -22,6 +22,7 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
+
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -36,7 +37,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -369,8 +369,8 @@ class HiCacheController:
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
-        self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.transfer_layer_id_max = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -722,7 +722,7 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_parallel().attn_tp_rank
             self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_attention_dp_rank()
+            self.dp_rank = get_parallel().attn_dp_rank
         else:
             self.tp_rank = get_parallel().tp_rank
             self.tp_size = get_parallel().tp_size
@@ -995,7 +995,7 @@ class HiCacheController:
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
-            layer_num=self.layer_num,
+            transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
         self.ack_load_queue.append(

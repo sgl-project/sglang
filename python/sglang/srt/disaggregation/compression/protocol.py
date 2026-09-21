@@ -11,6 +11,9 @@ from sglang.srt.kv_compression.types import NVCOMP_VERSION
 from sglang.srt.kv_compression.types import BufferDrainError as BufferDrainError
 
 PROTOCOL_VERSION = 2
+# The chunk payload remains v2; registration now follows upstream's
+# per-entry KV lengths field. Reject the older r4 envelope at bootstrap.
+REGISTRATION_VERSION = 2
 MODES = ("off", "passthrough", "lz4")
 
 
@@ -37,7 +40,10 @@ def capability(mode: str, force=None) -> str:
             "y",
         )
     suffix = "/forced-test" if force else ""
-    return f"pd-kv-v{PROTOCOL_VERSION}/{mode}/nvcomp-{NVCOMP_VERSION}/native-lz4-65536{suffix}"
+    return (
+        f"pd-kv-v{PROTOCOL_VERSION}/{mode}/nvcomp-{NVCOMP_VERSION}"
+        f"/native-lz4-65536/registration-v{REGISTRATION_VERSION}{suffix}"
+    )
 
 
 def check_peer(local: str, remote: str) -> None:

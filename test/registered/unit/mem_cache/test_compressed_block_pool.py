@@ -1,6 +1,7 @@
 """r4 real fixed-budget block/storage tests, independent of fixture adapters."""
 
 import concurrent.futures
+import sys
 import threading
 import time
 from types import SimpleNamespace as NS
@@ -15,6 +16,9 @@ from test_compressed_hicache import BlockPool, materialize_pages, payload
 
 # isort: split
 from sglang.srt.kv_compression.types import BufferDrainError, EncodedPage
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def pool(raw=8192, bound=12288, verify=False):
@@ -347,13 +351,14 @@ def test_actual_pd_assembly_borrows_host_then_owns_wire(undrained):
     import logging
     from unittest.mock import Mock
 
+    from test_compressed_hicache import layout, source_function
+
     from sglang.srt.kv_compression.provider import (
         HostEncodedKVProvider,
         RepresentationSpec,
     )
     from sglang.srt.kv_compression.runtime import KVCompressionRuntime
     from sglang.srt.kv_compression.types import align_bytes
-    from test_compressed_hicache import layout, source_function
 
     model = layout()
     p = BlockPool(model.page_bytes, 8 * 1024**2, pin_memory=False)
@@ -421,3 +426,7 @@ def test_actual_pd_assembly_borrows_host_then_owns_wire(undrained):
                 )
     finally:
         runtime.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

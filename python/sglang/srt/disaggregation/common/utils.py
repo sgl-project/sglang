@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,

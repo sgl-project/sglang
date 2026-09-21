@@ -8,6 +8,7 @@ CUDA/nvCOMP/RDMA and the full scheduler require the separate GPU/E2E tests.
 
 import ast
 import concurrent.futures
+import itertools
 import os
 import sys
 import threading
@@ -46,10 +47,10 @@ from sglang.srt.kv_compression.provider import HostEncodedKVProvider, Representa
 from sglang.srt.kv_compression.runtime import KVCompressionRuntime
 from sglang.srt.kv_compression.store import (
     BLOCK_BYTES,
-    materialize_pages,
 )
+from sglang.srt.kv_compression.store import CompressedHostKVCache as BlockPool
 from sglang.srt.kv_compression.store import (
-    CompressedHostKVCache as BlockPool,
+    materialize_pages,
 )
 from sglang.srt.kv_compression.types import (
     BufferDrainError,
@@ -69,6 +70,9 @@ from sglang.srt.mem_cache.l2_completion import (
     should_skip_full_load,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 class CompressedHostKVCache(BlockPool):
@@ -1505,7 +1509,7 @@ class ControllerBoundaryTests(unittest.TestCase):
             _move_op_indices=lambda op: (torch.tensor([1]), op.device_indices, None),
             _l2_load_transfers=lambda *args: ["native"],
             l2_transfer_engine=NS(submit_host_to_device=Mock(return_value=completion)),
-            layer_num=2,
+            transfer_layer_id_max=2,
             _num_tokens_by_pool=lambda op: {"kv": 1},
             _transfer_num_bytes=lambda op: 4096,
             ack_load_queue=[],
@@ -1525,8 +1529,46 @@ class ControllerBoundaryTests(unittest.TestCase):
             event.complete,
         )
         self.assertTrue(cc.ack_load_queue[0].query())
+        self.assertEqual(
+            cc.l2_transfer_engine.submit_host_to_device.call_args.kwargs[
+                "transfer_layer_id_max"
+            ],
+            2,
+        )
         cc.ack_load_queue[0].result()
         finish.synchronize.assert_called_once()
+
+    def test_hybrid_backup_keeps_upstream_flush_and_page_identities(self):
+        write = source_function(
+            "mem_cache/hybrid_cache/hybrid_cache_controller.py",
+            "write",
+            "HybridCacheController",
+            CacheOperation=NS,
+        )
+        for refs, flush in itertools.product((None, (42,)), (False, True)):
+            with self.subTest(refs=refs, flush=flush):
+                pool = CompressedHostKVCache(1024, 1024**2, pin_memory=False)
+                cc = NS(
+                    mem_pool_host=NS(
+                        alloc=pool.alloc,
+                        free=pool.free,
+                        resolve_host_transfers=lambda *a, **kw: [],
+                    ),
+                    write_queue=[],
+                    start_writing=Mock(),
+                )
+                # CacheOperation's first four arguments are positional.
+                write.__globals__["CacheOperation"] = lambda h, d, n, p, **kw: NS(
+                    host_indices=h, device_indices=d, node_id=n, priority=p, **kw
+                )
+                handles = write(
+                    cc, torch.tensor([3]), None, 7, None, flush, page_refs=refs
+                )
+                self.assertIsNotNone(handles)
+                self.assertEqual(cc.start_writing.call_count, int(flush))
+                self.assertEqual(cc.write_queue[0].page_refs, refs)
+                self.assertIs(cc.write_queue[0].host_indices, handles)
+                pool.free(handles)
 
     def test_backup_parent_failure_prevents_child_io(self):
         runtime = NS(close=Mock(), idle=lambda: True)
@@ -1680,7 +1722,7 @@ class AuditR31Tests(unittest.TestCase):
             None, event, [1], completion=TransferCompletion(finish_event=event)
         )
         cache = NS(
-            cache_controller=NS(ack_write_queue=[ack]),
+            cache_controller=NS(ack_write_queue=[ack], start_writing=Mock()),
             ongoing_write_through={1: object()},
             _log_write_ack_metrics=Mock(),
         )
@@ -2382,10 +2424,6 @@ class HiCacheContractTests(unittest.TestCase):
                 runtime.restore.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FragmentedBatchAllocationTests(unittest.TestCase):
     def pool(self):
         return BlockPool(8192, 32 * 1024**2, reservation_bytes=12288, pin_memory=False)
@@ -2528,14 +2566,16 @@ class BackupAdmissionTimingTests(unittest.TestCase):
             "_execute_kv_backup",
             "UnifiedRadixCache",
         )
-        for outcome in ("success", "skip", "error"):
-            with self.subTest(outcome=outcome):
+        for outcome, trace in itertools.product(("success", "skip", "error"), (0, 1)):
+            with (
+                self.subTest(outcome=outcome, trace=trace),
+                patch.dict(os.environ, SGLANG_KV_COMPRESSION_TRACE_STORE=str(trace)),
+            ):
                 pool = CompressedHostKVCache(1024, 1024**2, pin_memory=False)
+                handles = pool.alloc(1)
                 if outcome == "skip":
                     pool.alloc(pool.available_size())
-                controller = NS(
-                    mem_pool_host=pool, write=Mock(return_value="submitted")
-                )
+                controller = NS(mem_pool_host=pool, write=Mock(return_value=handles))
                 if outcome == "error":
                     controller.write.side_effect = RuntimeError("injected")
                 cache = NS(
@@ -2548,9 +2588,9 @@ class BackupAdmissionTimingTests(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             method(cache, 1, [1], {}, [])
                     else:
-                        self.assertEqual(
+                        self.assertIs(
                             method(cache, 1, [1], {}, []),
-                            None if outcome == "skip" else "submitted",
+                            None if outcome == "skip" else handles,
                         )
                 self.assertEqual(cache.async_l2.stats["backup_admission_seconds"], 2.0)
 
@@ -2600,3 +2640,7 @@ class BackupAdmissionTimingTests(unittest.TestCase):
             exporter.allocator_work, "allocation_blocks", 40000
         )
         exporter.allocator_lock_max.set.assert_called_once_with(1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

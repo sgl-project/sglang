@@ -24,7 +24,7 @@ def attach_compressed_hicache(cache, params, load_cache_event):
     pool = params.token_to_kv_pool_allocator.get_kvcache()
     layout = KVLayoutAdapter(pool.k_buffer, pool.v_buffer, params.page_size)
     budget = int(get_memory().hicache_size * 1e9)
-    if budget > host_memory_budget_bytes():
+    if budget > host_memory_budget_bytes(budget):
         raise ValueError(
             "Compressed L2 exceeds the available HiCache host memory budget"
         )

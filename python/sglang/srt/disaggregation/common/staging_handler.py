@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
 from sglang.srt.runtime_context import (
     get_schedule,
 )
@@ -949,6 +950,7 @@ def prefetch_staging_reqs(
     allocates staging during the GPU forward pass.
     """
     import zmq
+
     from sglang.srt.disaggregation.common.staging_buffer import staging_grid_tokens
     from sglang.srt.utils.network import NetworkAddress
 
