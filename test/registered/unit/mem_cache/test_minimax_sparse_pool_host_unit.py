@@ -70,6 +70,7 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
         cache = object.__new__(HiRadixCache)
         cache.cache_controller = object.__new__(HybridCacheController)
         cache.kv_cache = pool
+        cache.sidecar_pool_specs = []
 
         extra = HiRadixCache._get_extra_pools(cache)
 
