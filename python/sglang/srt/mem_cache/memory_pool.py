@@ -1958,6 +1958,8 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
+    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
     def __init__(
         self,
         size: int,
