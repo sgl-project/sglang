@@ -939,6 +939,21 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
+#[tokio::test]
+async fn unknown_model_without_workers_returns_404() {
+    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
+    ctx.registry.remove(&WorkerId("w1".into()));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"unknown","messages":[]}"#))
+        .unwrap();
+    let response = build_router(ctx).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["x-router-error-code"], "model_not_found");
+}
+
 /// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a
