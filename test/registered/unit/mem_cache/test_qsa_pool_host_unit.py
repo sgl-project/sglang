@@ -9,7 +9,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     alloc_with_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerMirror, qsa_indexer_pool_decl
+from sglang.srt.mem_cache.pool_host.qsa import (
+    QSAIndexerHostPoolBuilder,
+    qsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -64,7 +67,7 @@ class TestQSAIndexerHostTransfer(unittest.TestCase):
 
     def _mirror(self, pool, layout, drafts=()):
         anchor = MHATokenToKVPoolHost(pool.full_kv_pool, 2, 0, PAGE, layout)
-        host = QSAIndexerMirror().build(
+        host = QSAIndexerHostPoolBuilder().build(
             decl=qsa_indexer_pool_decl(pool),
             anchor_host=anchor,
             allocator_type="default",
@@ -104,7 +107,7 @@ class TestQSAIndexerHostTransfer(unittest.TestCase):
             torch.testing.assert_close(restored, saved, rtol=0, atol=0)
         # declared bytes are what the mirror allocated
         self.assertEqual(
-            decl.layout.host_bytes(
+            decl.storage_info.host_bytes(
                 page_num=anchor.page_num, layer_num=2, page_size=PAGE
             ),
             sum(b.nbytes for b in host.get_hybrid_pool_buffer()),

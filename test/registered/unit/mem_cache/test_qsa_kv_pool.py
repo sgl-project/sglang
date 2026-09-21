@@ -57,13 +57,16 @@ def test_host_pool_decls_put_kv_on_the_sub_pool_and_compressed_keys_on_the_hybri
 
     kv, indexer = pool.host_pool_decls()
 
-    assert (kv.name, kv.device_pool) == (PoolName.KV, pool.full_kv_pool)
-    assert (indexer.name, indexer.device_pool) == (PoolName.INDEXER, pool)
-    assert (indexer.index_source, indexer.layout_source) == (PoolName.KV, PoolName.KV)
+    assert (kv.pool_name, kv.device_pool) == (PoolName.KV, pool.full_kv_pool)
+    assert (indexer.pool_name, indexer.device_pool) == (PoolName.INDEXER, pool)
+    assert (indexer.indices_from_pool, indexer.layout_source) == (
+        PoolName.KV,
+        PoolName.KV,
+    )
     # kv_heads 1 x head_dim 128 x bf16 = 256 B per group of 4 tokens; one
     # 64-token page is 16 groups = 4096 B, the byte row the mirror moves.
-    assert indexer.layout.bytes_per_token_per_layer == 64
-    assert indexer.layout.page_bytes(64) == 4096
+    assert indexer.storage_info.bytes_per_token_per_layer == 64
+    assert indexer.storage_info.page_bytes(64) == 4096
 
 
 def test_compressed_group_must_split_into_whole_bytes_per_token():

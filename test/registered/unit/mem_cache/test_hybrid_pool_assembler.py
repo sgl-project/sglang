@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
+    _check_declared_pools_present,
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
@@ -19,8 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
-    _verify_declared_pools,
-    assemble_declared_stack,
+    assemble_host_pools_from_decls,
     build_full_draft_pools,
     build_hybrid_swa_group,
 )
@@ -29,10 +29,10 @@ from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host import qsa as pool_host_qsa
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
-    draft_sidecar_decls,
     kv_pool_decl,
-    packed_draft_pools,
-    plan_host_pools,
+    make_draft_sidecar_decls,
+    prepare_host_pool_configs,
+    validate_packed_draft_pools,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -173,7 +173,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         SimpleNamespace(
                             host_pool_group=MagicMock(),
                             cache_controller=controller,
-                            plans=(),
+                            configs=(),
                             sidecars=[],
                         )
                         if strategy_cls is _MambaStrategy
@@ -260,7 +260,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
     def test_full_builder_registers_separate_dsa_draft_indexer(self):
         """The separate-draft DSA branch must build its indexer mirror from a
-        DRAFT_INDEXER desc; a constructor change that skips this call site
+        DRAFT_INDEXER decl; a constructor change that skips this call site
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
@@ -293,7 +293,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             self.assertIs(decl.device_pool, draft_kv_pool)
             self.assertIs(anchor_host, draft_host_pool)
             self.assertEqual(packed_draft_device_pools, ())
-            seen["desc"] = decl
+            seen["decl"] = decl
             return SimpleNamespace(layer_num=1)
 
         with (
@@ -312,9 +312,9 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 tree_cache=tree_cache,
             )
 
-        self.assertEqual(seen["desc"].name, PoolName.DRAFT_INDEXER)
-        self.assertEqual(seen["desc"].index_source, PoolName.KV)
-        self.assertEqual(specs[1], seen["desc"].sidecar_spec())
+        self.assertEqual(seen["decl"].pool_name, PoolName.DRAFT_INDEXER)
+        self.assertEqual(seen["decl"].indices_from_pool, PoolName.KV)
+        self.assertEqual(specs[1], seen["decl"].sidecar_spec())
         self.assertEqual(entries[1].name, PoolName.DRAFT_INDEXER)
 
 
@@ -525,7 +525,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 ),
             ),
         ):
-            stack = assemble_declared_stack(
+            stack = assemble_host_pools_from_decls(
                 params=_target_params(drafts),
                 decls=pool.host_pool_decls(),
                 full_layer_mapping=dict(full_layer_mapping),
@@ -580,7 +580,7 @@ class TestDeclaredStackStructure(CustomTestCase):
 
     def test_dsa_target_layer_sharded(self):
         # rank 0 of 2 owns local layers 0 and 1 of 3; the permuted stage mapping
-        # is passed through untouched and the mirrors hold only the owned layers.
+        # is passed through untouched and the host_pools hold only the owned layers.
         pool = _dsa_pool_stub(layer_num=3, shard=(0, 2))
         stack = self._run(pool=pool, drafts=(), full_layer_mapping={0: 1, 1: 2, 2: 0})
         mapper = (None, 1, 2, 0, None, None)
@@ -623,9 +623,9 @@ class TestDraftSidecarDeclarations(CustomTestCase):
     """Separate drafts reuse the target's declarations under DRAFT_* names."""
 
     def test_dsa_draft_maps_to_draft_and_draft_indexer(self):
-        decls = draft_sidecar_decls(_dsa_pool_stub(layer_num=1).host_pool_decls())
+        decls = make_draft_sidecar_decls(_dsa_pool_stub(layer_num=1).host_pool_decls())
         self.assertEqual(
-            [(d.name, d.index_source, d.layout_source) for d in decls],
+            [(d.pool_name, d.indices_from_pool, d.layout_source) for d in decls],
             [
                 (PoolName.DRAFT, PoolName.KV, None),
                 (PoolName.DRAFT_INDEXER, PoolName.KV, PoolName.DRAFT),
@@ -634,17 +634,18 @@ class TestDraftSidecarDeclarations(CustomTestCase):
 
     def test_sidecar_group_plans_with_external_index_primary(self):
         pool = _dsa_pool_stub(layer_num=2)
-        plans = plan_host_pools(
-            decls=draft_sidecar_decls(pool.host_pool_decls()),
+        configs = prepare_host_pool_configs(
+            decls=make_draft_sidecar_decls(pool.host_pool_decls()),
             full_layer_mapping={0: 0, 1: 1},
             transfer_layer_id_max=2,
             index_primary=PoolName.KV,
         )
         self.assertEqual(
-            [p.decl.name for p in plans], [PoolName.DRAFT, PoolName.DRAFT_INDEXER]
+            [c.decl.pool_name for c in configs],
+            [PoolName.DRAFT, PoolName.DRAFT_INDEXER],
         )
         with self.assertRaisesRegex(ValueError, "every index from the target"):
-            plan_host_pools(
+            prepare_host_pool_configs(
                 decls=pool.host_pool_decls(),
                 full_layer_mapping={0: 0, 1: 1},
                 transfer_layer_id_max=2,
@@ -653,7 +654,7 @@ class TestDraftSidecarDeclarations(CustomTestCase):
 
 
 class TestPackedDraftPairing(CustomTestCase):
-    """Packing appends draft layers to the target mirrors, so a draft must
+    """Packing appends draft layers to the target host_pools, so a draft must
     declare every target pool with an identical per-layer layout."""
 
     def test_draft_without_indexer_is_rejected(self):
@@ -663,7 +664,7 @@ class TestPackedDraftPairing(CustomTestCase):
         no_index = _dsa_pool_stub(layer_num=1)
         no_index.index_key_cache = SimpleNamespace(buffer=[])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            packed_draft_pools(target.host_pool_decls(), (no_index,))
+            validate_packed_draft_pools(target.host_pool_decls(), (no_index,))
 
     def test_draft_with_empty_index_layers_is_rejected(self):
         # A 0-row placeholder layer would be packed as a null device pointer.
@@ -672,23 +673,23 @@ class TestPackedDraftPairing(CustomTestCase):
         shared.skip_topk_layers = [True]
         shared.index_key_cache = SimpleNamespace(buffer=[object()])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            packed_draft_pools(target.host_pool_decls(), (shared,))
+            validate_packed_draft_pools(target.host_pool_decls(), (shared,))
         partial = _dsa_pool_stub(layer_num=2)
         partial.skip_topk_layers = [False, True]
         with self.assertRaisesRegex(ValueError, "owns buffers on 1 of 2"):
-            packed_draft_pools(target.host_pool_decls(), (partial,))
+            validate_packed_draft_pools(target.host_pool_decls(), (partial,))
 
-    def test_layout_mismatch_is_rejected(self):
+    def test_storage_info_mismatch_is_rejected(self):
         target = _dsa_pool_stub(layer_num=2)
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
-        with self.assertRaisesRegex(ValueError, "layout"):
-            packed_draft_pools(target.host_pool_decls(), (wide,))
+        with self.assertRaisesRegex(ValueError, "storage"):
+            validate_packed_draft_pools(target.host_pool_decls(), (wide,))
 
     def test_pool_with_only_shared_topk_layers_declares_kv_only(self):
         pool = _dsa_pool_stub(layer_num=2)
         pool.skip_topk_layers = [True, True]
-        self.assertEqual([d.name for d in pool.host_pool_decls()], [PoolName.KV])
+        self.assertEqual([d.pool_name for d in pool.host_pool_decls()], [PoolName.KV])
 
 
 class TestKvHostPoolRow(CustomTestCase):
@@ -1050,7 +1051,7 @@ class TestHybridMambaDeclaredQsaIndexer(CustomTestCase):
         self.assertEqual(indexer.packed_draft_device_pools, (draft,))
         self.assertEqual(seen[0]["packed_draft_device_pools"], (draft,))
         self.assertEqual(indexer.host_pool.layer_num, 3)
-        # packed tail: transfer layer 4 -> device layer 2 on both mirrors
+        # packed tail: transfer layer 4 -> device layer 2 on both host_pools
         self.assertEqual((kv.layer_mapper(4), indexer.layer_mapper(4)), (2, 2))
 
     def test_separate_draft_declares_draft_indexer_on_the_hybrid(self):
@@ -1111,8 +1112,8 @@ class TestDeclaredPoolPlanning(CustomTestCase):
     """Sidecar indices resolve from one primary source in HostPoolGroup, so the
     planner must reject self-references and sidecar chains up front."""
 
-    def _plan(self, decls):
-        return plan_host_pools(
+    def _prepare(self, decls):
+        return prepare_host_pool_configs(
             decls=decls,
             full_layer_mapping={0: 0},
             transfer_layer_id_max=1,
@@ -1122,9 +1123,9 @@ class TestDeclaredPoolPlanning(CustomTestCase):
         import msgspec
 
         kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
-        bad = msgspec.structs.replace(indexer, index_source=PoolName.INDEXER)
-        with self.assertRaisesRegex(ValueError, "index_source"):
-            self._plan((kv, bad))
+        bad = msgspec.structs.replace(indexer, indices_from_pool=PoolName.INDEXER)
+        with self.assertRaisesRegex(ValueError, "indices_from_pool"):
+            self._prepare((kv, bad))
 
     def test_rejects_self_referencing_layout_source(self):
         import msgspec
@@ -1132,22 +1133,24 @@ class TestDeclaredPoolPlanning(CustomTestCase):
         kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
         bad = msgspec.structs.replace(indexer, layout_source=PoolName.INDEXER)
         with self.assertRaisesRegex(ValueError, "layout_source"):
-            self._plan((kv, bad))
+            self._prepare((kv, bad))
 
     def test_rejects_primary_that_is_not_kv(self):
         import msgspec
 
         kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
-        swa_primary = msgspec.structs.replace(kv, name=PoolName.SWA)
+        swa_primary = msgspec.structs.replace(kv, pool_name=PoolName.SWA)
         follower = msgspec.structs.replace(
-            indexer, index_source=PoolName.SWA, layout_source=PoolName.SWA
+            indexer, indices_from_pool=PoolName.SWA, layout_source=PoolName.SWA
         )
         with self.assertRaisesRegex(ValueError, "primary KV pool"):
-            self._plan((swa_primary, follower))
+            self._prepare((swa_primary, follower))
 
     def test_accepts_dsa_declaration(self):
-        plans = self._plan(_dsa_pool_stub(layer_num=1).host_pool_decls())
-        self.assertEqual([p.decl.name for p in plans], [PoolName.KV, PoolName.INDEXER])
+        configs = self._prepare(_dsa_pool_stub(layer_num=1).host_pool_decls())
+        self.assertEqual(
+            [c.decl.pool_name for c in configs], [PoolName.KV, PoolName.INDEXER]
+        )
 
 
 class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
@@ -1198,17 +1201,21 @@ class TestDeclaredPoolVerification(CustomTestCase):
     def test_unmigrated_strategy_logs_missing_indexer(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
-            _verify_declared_pools(pool, self._result_with(PoolName.KV), _SwaStrategy())
+            _check_declared_pools_present(
+                pool, self._result_with(PoolName.KV), _SwaStrategy()
+            )
         self.assertIn("indexer", logs.output[0])
 
     def test_migrated_strategy_raises_on_missing_indexer(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
-            _verify_declared_pools(pool, self._result_with(PoolName.KV), _DsaStrategy())
+            _check_declared_pools_present(
+                pool, self._result_with(PoolName.KV), _DsaStrategy()
+            )
 
     def test_complete_stack_passes_silently(self):
         pool = _dsa_pool_stub(layer_num=2)
-        _verify_declared_pools(
+        _check_declared_pools_present(
             pool, self._result_with(PoolName.KV, PoolName.INDEXER), _DsaStrategy()
         )
 
@@ -1218,7 +1225,7 @@ class TestDeclaredPoolVerification(CustomTestCase):
         pool = object.__new__(HybridLinearKVPool)
         pool.full_kv_pool = _dsa_pool_stub(layer_num=2)
         self.assertEqual(
-            [(d.name, d.device_pool) for d in pool.host_pool_decls()],
+            [(d.pool_name, d.device_pool) for d in pool.host_pool_decls()],
             [(PoolName.KV, pool.full_kv_pool), (PoolName.INDEXER, pool.full_kv_pool)],
         )
 
@@ -1231,7 +1238,7 @@ class TestDeclaredPoolVerification(CustomTestCase):
 
         pool = _qsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
-            _verify_declared_pools(
+            _check_declared_pools_present(
                 pool, self._result_with(PoolName.KV, PoolName.MAMBA), _MambaStrategy()
             )
 

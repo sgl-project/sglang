@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
-    HostPoolLayout,
+    HostPoolStorageInfo,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -60,7 +60,7 @@ def dsa_indexer_bytes_per_token_per_layer(
     return elems * DSATokenToKVPool.index_k_with_scale_buffer_dtype.itemsize
 
 
-class DSAIndexerMirror:
+class DSAIndexerHostPoolBuilder:
     def build(
         self,
         *,
@@ -80,22 +80,22 @@ class DSAIndexerMirror:
 def dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
-    """Indexer state riding on the full-KV pages: indices and layout both follow KV."""
+    """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
     return HostPoolDecl(
-        name=name,
+        pool_name=name,
         device_pool=pool,
-        index_source=PoolName.KV,
+        indices_from_pool=PoolName.KV,
         layout_source=PoolName.KV,
-        layout=HostPoolLayout(
+        storage_info=HostPoolStorageInfo(
             bytes_per_token_per_layer=dsa_indexer_bytes_per_token_per_layer(
                 pool.index_head_dim, pool.quant_block_size
             ),
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
         ),
-        mirror=DSAIndexerMirror(),
-        # Shared-topk layers own a 0-row placeholder buffer; they must not be
-        # mirrored or handed to the transfer kernels.
-        device_layers=tuple(
+        host_pool_builder=DSAIndexerHostPoolBuilder(),
+        # Shared-topk layers own a 0-row placeholder buffer; they get no host
+        # layer and must not reach the transfer kernels.
+        owned_device_layers=tuple(
             i for i, skip in enumerate(pool.skip_topk_layers) if not skip
         ),
     )
@@ -119,7 +119,7 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         self._is_dummy = is_dummy
         self.decl = decl
-        desc = decl.layout
+        storage_info = decl.storage_info
         device_pool = decl.device_pool
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
@@ -133,28 +133,28 @@ class DSAIndexerPoolHost(HostKVCache):
         # Host layers are compact: only owned device layers that hold index
         # buffers, then one tail layer per packed draft pool.
         owned_start, owned_end = self._device_owned_layer_range()
-        declared = decl.device_layers
+        declared = decl.owned_device_layers
         self._live_target_layers = [
             layer
             for layer in range(owned_start, owned_end)
             if declared is None or layer in declared
         ]
-        self._host_layer_of = {
+        self._device_to_host_layer = {
             layer: i for i, layer in enumerate(self._live_target_layers)
         }
         self.target_layer_num = len(self._live_target_layers)
         self.mtp_draft_device_pools = tuple(packed_draft_device_pools)
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
-        self.indexer_dtype = desc.dtype
+        self.indexer_dtype = storage_info.dtype
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
         # uint8 storage, so element counts below are byte counts
-        self.indexer_page_stride_size = desc.page_bytes(self.page_size)
+        self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = desc.bytes_per_token_per_layer * self.layer_num
+        self.size_per_token = storage_info.bytes_per_token_per_layer * self.layer_num
 
         self.can_use_jit = False
         self.can_use_write_back_jit = False
@@ -170,7 +170,7 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        requested_bytes = desc.host_bytes(
+        requested_bytes = storage_info.host_bytes(
             page_num=self.page_num, layer_num=self.layer_num, page_size=self.page_size
         )
         available_bytes = host_memory_budget_bytes(requested_bytes)
@@ -204,16 +204,16 @@ class DSAIndexerPoolHost(HostKVCache):
         self.clear()
 
     def get_size_per_token(self):
-        return self.decl.layout.bytes_per_token_per_layer * self.layer_num
+        return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
-        return layer_id in self._host_layer_of
+        return layer_id in self._device_to_host_layer
 
     def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
-        return self._host_layer_of[layer_id]
+        return self._device_to_host_layer[layer_id]
 
     def _owned_device_layer_ids(self, device_pool) -> list[int]:
         return list(self._live_target_layers)

@@ -1,10 +1,12 @@
-"""Host mirror of QSA compressed index keys.
+"""Host pool for QSA compressed index keys.
 
 Compressed keys hold one group per ``compress_ratio`` full-KV slots at
-``full_slot // ratio``, so a full-KV page owns a fixed run of groups. The
-mirror moves that run as one byte row per page with the whole-page kernels of
-DeepSeekV4PagedHostPool; the per-request pending ring is not a cache and stays
-on the device.
+``full_slot // ratio``, so a full-KV page owns a fixed run of groups. The host
+pool moves that run as one byte row per page with the whole-page kernels of
+DeepSeekV4PagedHostPool. The per-request pending ring (index keys of the group
+still being filled) is transient per-request data and is not backed up; a host
+restore is page aligned, so the restored prefix ends on a group boundary and
+the ring starts empty.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
-    HostPoolLayout,
+    HostPoolStorageInfo,
 )
 
 if TYPE_CHECKING:
@@ -36,7 +38,7 @@ def qsa_indexer_bytes_per_token_per_layer(
     return group_bytes // compress_ratio
 
 
-class QSAIndexerMirror:
+class QSAIndexerHostPoolBuilder:
     def build(
         self,
         *,
@@ -58,11 +60,11 @@ def qsa_indexer_pool_decl(
 ) -> HostPoolDecl:
     """Compressed keys riding on the full-KV pages: indices and layout both follow KV."""
     return HostPoolDecl(
-        name=name,
+        pool_name=name,
         device_pool=pool,
-        index_source=PoolName.KV,
+        indices_from_pool=PoolName.KV,
         layout_source=PoolName.KV,
-        layout=HostPoolLayout(
+        storage_info=HostPoolStorageInfo(
             bytes_per_token_per_layer=qsa_indexer_bytes_per_token_per_layer(
                 kv_heads=pool.qsa_index_kv_heads,
                 head_dim=pool.qsa_index_head_dim,
@@ -71,7 +73,7 @@ def qsa_indexer_pool_decl(
             ),
             dtype=pool.index_state_dtype,
         ),
-        mirror=QSAIndexerMirror(),
+        host_pool_builder=QSAIndexerHostPoolBuilder(),
     )
 
 
@@ -90,7 +92,7 @@ class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
         self.decl = decl
         self.device_pool = decl.device_pool
         page_size = anchor_host.page_size
-        item_bytes = decl.layout.page_bytes(page_size)
+        item_bytes = decl.storage_info.page_bytes(page_size)
         rows = []
         for pool in (decl.device_pool, *packed_draft_device_pools):
             if page_size % pool.qsa_compress_ratio:
@@ -108,9 +110,9 @@ class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
                     )
                 rows.append(buffer.view(torch.uint8).reshape(-1, item_bytes))
         if not rows:
-            raise ValueError(f"{decl.name} declared with no compressed key layers")
+            raise ValueError(f"{decl.pool_name} declared with no compressed key layers")
         super().__init__(
-            pool_name=decl.name.value,
+            pool_name=decl.pool_name.value,
             device_buffers=rows,
             item_bytes=item_bytes,
             num_host_pages=anchor_host.page_num,

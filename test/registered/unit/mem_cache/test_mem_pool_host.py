@@ -395,18 +395,18 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
         # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
-        desc = dsa_indexer_pool_decl(self._stub()).layout
-        self.assertEqual(desc.bytes_per_token_per_layer, 132)
-        self.assertEqual(desc.page_bytes(64), 8448)
+        storage_info = dsa_indexer_pool_decl(self._stub()).storage_info
+        self.assertEqual(storage_info.bytes_per_token_per_layer, 132)
+        self.assertEqual(storage_info.page_bytes(64), 8448)
         self.assertEqual(
-            desc.host_bytes(page_num=284256, layer_num=5, page_size=64),
+            storage_info.host_bytes(page_num=284256, layer_num=5, page_size=64),
             12006973440,
         )
 
     def test_mirror_consumes_decl(self):
         stub = self._stub()
         decl = dsa_indexer_pool_decl(stub)
-        desc = decl.layout
+        storage_info = decl.storage_info
         anchor = MLATokenToKVPoolHost(
             stub,
             host_to_device_ratio=2,
@@ -423,12 +423,14 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             is_dummy=True,
         )
         self.assertEqual(mirror.layout, anchor.layout)
-        self.assertEqual(mirror.indexer_page_stride_size, desc.page_bytes(64))
+        self.assertEqual(mirror.indexer_page_stride_size, storage_info.page_bytes(64))
         self.assertEqual(
-            mirror.get_size_per_token(), desc.bytes_per_token_per_layer * 5
+            mirror.get_size_per_token(), storage_info.bytes_per_token_per_layer * 5
         )
         self.assertEqual(
-            desc.host_bytes(page_num=anchor.page_num, layer_num=5, page_size=64),
+            storage_info.host_bytes(
+                page_num=anchor.page_num, layer_num=5, page_size=64
+            ),
             anchor.page_num * mirror.indexer_layout_dim,
         )
 
@@ -440,7 +442,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         stub = self._stub()
         stub.skip_topk_layers = [False, True, True, False, True]
         decl = dsa_indexer_pool_decl(stub)
-        self.assertEqual(decl.device_layers, (0, 3))
+        self.assertEqual(decl.owned_device_layers, (0, 3))
         anchor = MLATokenToKVPoolHost(
             stub,
             host_to_device_ratio=2,
@@ -458,7 +460,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         )
         self.assertEqual(mirror.layer_num, 2)
         self.assertEqual(
-            mirror.get_size_per_token(), decl.layout.bytes_per_token_per_layer * 2
+            mirror.get_size_per_token(), decl.storage_info.bytes_per_token_per_layer * 2
         )
         self.assertEqual(mirror._owned_device_layer_ids(stub), [0, 3])
         self.assertEqual(mirror._host_layer_index(3), 1)
