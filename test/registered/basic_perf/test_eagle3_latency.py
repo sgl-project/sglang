@@ -38,6 +38,12 @@ class TestEagle3Latency(CustomTestCase):
                 "16",
                 "--mem-fraction-static",
                 "0.7",
+                # The draft checkpoint ships fp16 while the target ships bf16.
+                # The CUDA rmsnorm path calls the kernel with the draft's
+                # layernorm weight and the target's activations, and rejects
+                # the pair unless both sit on one dtype.
+                "--dtype",
+                "float16",
             ],
             need_warmup=True,
             seed=42,
