@@ -241,12 +241,12 @@ def _assert_mm_token_array(input_ids: array, name: str) -> None:
     ), f"{name} must be array('q') with 8-byte items"
 
 
-def pad_mm_input_ids(
+def duplicate_pad_mm_input_ids(
     input_ids: array,
     mm_inputs: MultimodalInputs,
     pad_input_ids_func: Callable[[array, MultimodalInputs], array],
 ) -> array:
-    """Check model output and take ownership without per-token conversions."""
+    """Validate and duplicate model-padded tokens for scheduler ownership."""
     padded_ids = pad_input_ids_func(input_ids, mm_inputs)
     _assert_mm_token_array(padded_ids, "pad_input_ids result")
     # Preserve scheduler ownership: no-op models return the unpadded input,

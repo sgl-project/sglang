@@ -24,7 +24,7 @@ from sglang.srt.managers import mm_utils
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     MultiModalityDataPaddingPatternTokenPairs,
-    pad_mm_input_ids,
+    duplicate_pad_mm_input_ids,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -109,7 +109,9 @@ def benchmark_case(pattern_name, num_tokens, num_items, args, baseline):
         return array("q", baseline.pad_input_tokens(input_ids, mm_inputs))
 
     def packed():
-        return pad_mm_input_ids(input_ids, mm_inputs, pattern.pad_input_tokens)
+        return duplicate_pad_mm_input_ids(
+            input_ids, mm_inputs, pattern.pad_input_tokens
+        )
 
     expected = legacy()
     offsets = list(mm_inputs.data_offsets) if token_pairs else None

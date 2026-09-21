@@ -194,7 +194,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
-from sglang.srt.managers.mm_utils import pad_mm_input_ids
+from sglang.srt.managers.mm_utils import duplicate_pad_mm_input_ids
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -3020,7 +3020,7 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                req.origin_input_ids = pad_mm_input_ids(
+                req.origin_input_ids = duplicate_pad_mm_input_ids(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
             req.extend_image_inputs(image_inputs)
@@ -3494,7 +3494,7 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                req.origin_input_ids = pad_mm_input_ids(
+                req.origin_input_ids = duplicate_pad_mm_input_ids(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
 
