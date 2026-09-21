@@ -274,32 +274,66 @@ def handle_data_parallelism(server_args: Any):
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
     if resolving_view(server_args).enable_tp_lm_head_all_to_all:
-        _disable_nccl_graph_buffer_registration()
+        _disable_nccl_graph_buffer_registration(
+            "the graph-captured TP LM-head all-to-all can deadlock with "
+            "registered buffers"
+        )
+    if _graph_pool_is_pausable(server_args):
+        _disable_nccl_graph_buffer_registration(
+            "torch_memory_saver replaces the graph pool's physical memory on "
+            "release/resume and registered buffers keep the released pages"
+        )
 
 
-def _disable_nccl_graph_buffer_registration() -> None:
-    """Keep NCCL from registering the buffers of the graph-captured PyNccl
-    all-to-all.
+def _graph_pool_is_pausable(server_args: Any) -> bool:
+    """Whether decode graphs are captured into the torch_memory_saver region
+    that `release_memory_occupation(tags=["cuda_graph"])` pauses."""
+    return bool(
+        resolving_view(server_args).enable_memory_saver
+        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+    )
+
+
+def _disable_nccl_graph_buffer_registration(reason: str) -> None:
+    """Keep NCCL from registering the buffers of graph-captured collectives.
 
     NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
     collective captured in a CUDA graph for the lifetime of the graph, and
-    peers then move data through those registrations directly. The TP LM-head
-    all-to-all is captured in the decode graphs on graph-pool temporaries,
-    whose addresses the pool also hands to other tensors, and the registered
-    exchange does not survive that: under a burst of new requests (DP ranks
-    ramping at different rates) one rank finishes its step while the others
-    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
-    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
-    deployment; disabling the registration removes the hang while dedicated
-    all-to-all buffers alone do not. Must run before the schedulers create
-    their NCCL communicators, which inherit this environment. An explicit
-    setting wins.
+    peers then move data through those registrations directly. Two captured
+    configurations cannot live with that:
+
+    * The TP LM-head all-to-all is captured in the decode graphs on graph-pool
+      temporaries, whose addresses the pool also hands to other tensors, and
+      the registered exchange does not survive that: under a burst of new
+      requests (DP ranks ramping at different rates) one rank finishes its
+      step while the others spin in ncclDevKernel_SendRecv forever, and every
+      DP rank hangs. Reproduced on tp4/dp4/ep4 and on a multi-node
+      tp16/dp16/ep16 PD decode deployment; disabling the registration removes
+      the hang while dedicated all-to-all buffers alone do not.
+
+    * A pausable graph pool (--enable-memory-saver with
+      SGLANG_MEMORY_SAVER_CUDA_GRAPH) is a torch_memory_saver region: it is
+      allocated through cuMem, so its buffers qualify for registration, and
+      pause/resume unmaps, releases and re-creates the physical memory behind
+      the same virtual addresses. The NVLS multicast and network registrations
+      made at capture keep pointing at the released pages, so after a resume
+      every replay reads the new pages through the addresses and the stale
+      pages through the registered paths, ranks receive different all-reduce
+      results, and the TP group deadlocks once their batches diverge. This is
+      the same rule the custom all-reduce already applies to its own IPC
+      registration under that region (`tms_cudagraph`), extended to NCCL's.
+      Reproduced on a two-node tp16/ep16 engine after a full
+      release/resume cycle; graph-resident memory or no registration both
+      complete the same run.
+
+    Must run before the schedulers create their NCCL communicators, which
+    inherit this environment. An explicit setting wins.
     """
     if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
         logger.warning(
-            "NCCL_GRAPH_REGISTER=%s was set explicitly; the graph-captured TP "
-            "LM-head all-to-all can deadlock with registered buffers.",
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; %s.",
             os.environ["NCCL_GRAPH_REGISTER"],
+            reason,
         )
 
 
