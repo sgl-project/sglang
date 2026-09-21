@@ -294,7 +294,7 @@ pub fn select_decode_with_affinity(
                 DecodeAffinityOutcome::FallbackLoadImbalance
             }
         }
-        // Unparseable prefill URL — affinity was never in play.
+        // Unparsable prefill URL — affinity was never in play.
         None => DecodeAffinityOutcome::FallbackNoSameHost,
     };
 
