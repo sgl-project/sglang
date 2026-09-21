@@ -294,6 +294,46 @@ def _has_dense_fp4_indexer() -> bool:
     return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
 
+def _dense_fp4_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    kv_fp4: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    from deep_gemm import fp8_fp4_mqa_logits as fn
+
+    # q (int8 [T, H, 64], int32 [T, H]) x kv (int8 [L, 64], int32 [L]) -> fp32
+    # [T, max_seqlen_k]; row t column j is k[ks_t + j], garbage past ke_t - ks_t.
+    # DeepGEMM requires int32 sequence offsets on both eager and graph paths.
+    ks = ks.to(torch.int32)
+    ke = ke.to(torch.int32)
+    return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
+
+
+def _prefill_graph_dense_k_layout(
+    req_to_token: torch.Tensor,
+    pool,
+    layer_id: int,
+    ratio: int,
+    width: int,
+    local_req_ids: torch.Tensor,
+    req_ids: torch.Tensor,
+    req_lens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Pack up to eight replayed requests into capture-stable contiguous FP4 K."""
+    req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
+    ks = req_ord.to(torch.int32) * width
+    logical_k = torch.arange(width, device=req_to_token.device)
+    valid_k = logical_k[None, :] < (req_lens[:, None] // ratio)
+    logical_pos = (logical_k[None, :] * ratio).expand_as(valid_k)
+    logical_pos = logical_pos.masked_fill(~valid_k, 0)
+    k_slots = req_to_token[req_ids[:, None], logical_pos].to(torch.int64) // ratio
+    k_slots = k_slots.masked_fill(~valid_k, 0).clamp_min_(0).flatten()
+    return ks, k_slots, pool.get_low_ratio_index_k_fp4(layer_id, k_slots)
+
+
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
@@ -964,11 +1004,9 @@ def _tail_rows(
     return t[token_indices]
 
 
-# Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
-# its width is the graph's max_seq_len, and longer contexts replay eagerly.
+# Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
-# Bound each captured fp32 score chunk to the original 2048 x 16K workspace.
-_PREFILL_GRAPH_INDEXER_MAX_SCORE_ELEMENTS = _PREFILL_GRAPH_INDEXER_ROW_CHUNK * 16 * 1024
+_PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS = 8
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -1013,6 +1051,10 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    low_ratio_local_req_indices: Optional[torch.Tensor] = None
+    low_ratio_dense_req_indices: Optional[torch.Tensor] = None
+    low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
+    prefill_graph_dense_indexer: bool = False
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1063,6 +1105,19 @@ class DSV4Metadata:
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
         )
+        if self.prefill_graph_dense_indexer:
+            maybe_copy_inplace(
+                self.low_ratio_local_req_indices,
+                src=static_metadata.low_ratio_local_req_indices,
+            )
+            maybe_copy_inplace(
+                self.low_ratio_dense_req_indices,
+                src=static_metadata.low_ratio_dense_req_indices,
+            )
+            maybe_copy_inplace(
+                self.low_ratio_dense_seq_lens,
+                src=static_metadata.low_ratio_dense_seq_lens,
+            )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -1544,6 +1599,31 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
+            metadata.prefill_graph_dense_indexer = (
+                cp_active
+                and envs.SGLANG_DSV41_BCG_DENSE_INDEXER.get()
+                and req_pool_indices.numel()
+                <= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+            )
+            if metadata.prefill_graph_dense_indexer:
+                local_index = cp_metadata.local_index
+                if local_index is None:
+                    parallel = get_parallel()
+                    local_index = slice(
+                        parallel.attn_cp_rank, None, parallel.attn_cp_size
+                    )
+                metadata.low_ratio_local_req_indices = req_pool_indices_repeated[
+                    local_index
+                ].contiguous()
+                pad = (
+                    _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS - req_pool_indices.numel()
+                )
+                metadata.low_ratio_dense_req_indices = torch.nn.functional.pad(
+                    req_pool_indices.to(torch.int64), (0, pad)
+                )
+                metadata.low_ratio_dense_seq_lens = torch.nn.functional.pad(
+                    seq_lens.to(torch.int64), (0, pad)
+                )
         return metadata
 
     def _low_ratio_prefill_indexer_metadata(
@@ -1564,11 +1644,7 @@ class DeepseekV4AttnBackend(
         )
         # Unclamped: a token with no completed group scores nothing, as in eager.
         c_seq_lens = (core.seq_lens_casual // compress_ratio).to(torch.int32)
-        width = page_table.shape[1] * index_page_size
-        row_chunk = min(
-            _PREFILL_GRAPH_INDEXER_ROW_CHUNK,
-            max(1, _PREFILL_GRAPH_INDEXER_MAX_SCORE_ELEMENTS // width),
-        )
+        row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size,
@@ -1593,6 +1669,13 @@ class DeepseekV4AttnBackend(
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            envs.SGLANG_DSV41_BCG_DENSE_INDEXER.get()
+            and is_cp_active(forward_batch)
+            and forward_batch.req_pool_indices.numel()
+            > _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+        ):
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
@@ -3425,30 +3508,64 @@ class DeepseekV4AttnBackend(
 
         num_tokens, num_heads = q.shape[0], q.shape[1]
         q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-        q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
-        q_sf = q_sf.view(num_tokens, 1, num_heads)
         weights = w.float()
-
-        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        assert k_cache.dim() == 2
-        page_size = metadata.compressed_page_size
-        k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
-        for chunk_index, (rows, plan) in enumerate(metadata.row_chunks()):
-            logits = deep_gemm_fp4_paged_mqa_logits(
-                (q_fp4[rows], q_sf[rows]),
-                k_cache,
-                weights[rows],
-                lens[rows],
-                page_table[rows],
-                plan,
+        dense = self.forward_metadata.prefill_graph_dense_indexer
+        if dense:
+            req_ids = self.forward_metadata.low_ratio_dense_req_indices
+            req_lens = self.forward_metadata.low_ratio_dense_seq_lens
+            local_req_ids = self.forward_metadata.low_ratio_local_req_indices
+            assert req_ids is not None and req_lens is not None
+            assert local_req_ids is not None and local_req_ids.shape[0] == num_tokens
+            # The graph key contains token count but not request count. Rebuild
+            # the contiguous K layout from the replayed eight-slot request data.
+            ks, k_slots, k_fp4 = _prefill_graph_dense_k_layout(
+                self.req_to_token,
+                pool,
+                layer.layer_id,
+                ratio,
                 width,
+                local_req_ids,
+                req_ids,
+                req_lens,
             )
+            q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
+            q_sf = q_sf.view(num_tokens, num_heads)
+            row_chunks = [(slice(0, num_tokens), None)]
+        else:
+            k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+            assert k_cache.dim() == 2
+            page_size = metadata.compressed_page_size
+            k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+            q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
+            q_sf = q_sf.view(num_tokens, 1, num_heads)
+            row_chunks = metadata.row_chunks()
+
+        for chunk_index, (rows, plan) in enumerate(row_chunks):
+            if dense:
+                logits = _dense_fp4_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    k_fp4,
+                    weights[rows],
+                    ks[rows],
+                    ks[rows] + lens[rows],
+                    width,
+                )
+            else:
+                logits = deep_gemm_fp4_paged_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    k_cache,
+                    weights[rows],
+                    lens[rows],
+                    page_table[rows],
+                    plan,
+                    width,
+                )
             scores = logits
             if candidate_blocks is not None:
                 candidate_blocks.append(
@@ -3468,14 +3585,25 @@ class DeepseekV4AttnBackend(
             selected = torch.empty(
                 (logits.shape[0], topk), dtype=torch.int32, device=logits.device
             )
-            topk_transform_paged_v2(
-                scores,
-                lens[rows],
-                None,
-                selected,
-                page_size,
-                metadata.topk_plan_for_chunk(chunk_index, rows),
-            )
+            if dense:
+                topk_transform_ragged_v2(
+                    scores,
+                    lens[rows],
+                    out_offsets=ks[rows],
+                    out_indices=selected,
+                )
+                selected = torch.where(
+                    selected >= 0, selected - ks[rows, None], selected
+                )
+            else:
+                topk_transform_paged_v2(
+                    scores,
+                    lens[rows],
+                    None,
+                    selected,
+                    page_size,
+                    metadata.topk_plan_for_chunk(chunk_index, rows),
+                )
             reach = selected >= 0
             if consume is not None:
                 selected_for_gather = selected.clamp_min(0).to(torch.int64)
@@ -3484,9 +3612,12 @@ class DeepseekV4AttnBackend(
             selected = torch.where(reach, selected, unselected).sort(dim=-1).values
             reach = selected != unselected
             idx = selected.clamp_max(width - 1).to(torch.int64)
-            slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
-                idx % page_size
-            )
+            if dense:
+                slots = k_slots[ks[rows, None] + idx]
+            else:
+                slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
+                    idx % page_size
+                )
             page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
             if raw_indices is not None:
                 raw_indices[rows, :topk] = torch.where(reach, selected, -1).to(

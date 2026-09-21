@@ -1536,6 +1536,9 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Pack up to eight CP prefill requests into contiguous FP4 index K, then
+    # use dense DeepGEMM and ragged top-k v2 inside the breakable CUDA graph.
+    SGLANG_DSV41_BCG_DENSE_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
