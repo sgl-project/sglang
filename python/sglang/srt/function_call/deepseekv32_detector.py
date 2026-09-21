@@ -300,6 +300,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 current_params = self._parse_parameters_from_xml(
                     invoke_content, allow_partial=not is_tool_end
                 )
+                self._validate_arguments(
+                    func_name, current_params, tools, complete=is_tool_end
+                )
 
                 # 3. Calculate and send incremental arguments
                 sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
@@ -378,6 +381,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def _raise_parse_error(self, error: Exception) -> None:
         """Allow subclasses to reject the legacy raw-text fallback."""
+
+    def _validate_arguments(
+        self,
+        name: str,
+        arguments: str,
+        tools: list[Tool],
+        *,
+        complete: bool,
+    ) -> None:
+        """Allow subclasses to validate arguments before appending stream bytes."""
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         if self._pending_non_string_parameter:

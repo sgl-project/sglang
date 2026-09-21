@@ -12,6 +12,27 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 logger = logging.getLogger(__name__)
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate DSML JSON argument key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid DSML JSON constant {value}")
+
+
+def _strict_json_loads(text: str):
+    return json.loads(
+        text,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
 def _validate_string_parameter(name: str, value: str, *, complete: bool) -> None:
     prefix = "</｜DSML｜parameter"
     if prefix not in value:
@@ -167,36 +188,78 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 # validated; do not repair or reserialize partial JSON.
                 if allow_partial:
                     return ""
-                parameters = json.loads(invoke_content)
+                parameters = _strict_json_loads(invoke_content)
                 for name, value in parameters.items():
                     if isinstance(value, str):
                         _validate_string_parameter(name, value, complete=True)
                 return super()._parse_parameters_from_xml(invoke_content, False)
             last_match_end = 0
+            names: set[str] = set()
             for match in re.finditer(self.parameter_regex, invoke_content, re.DOTALL):
+                if invoke_content[last_match_end : match.start()].strip():
+                    raise ValueError("Malformed DSML parameter boundary")
                 last_match_end = match.end()
-                if match.group(2) == "true":
-                    _validate_string_parameter(
-                        match.group(1), match.group(3), complete=True
-                    )
-                else:
-                    try:
-                        json.loads(match.group(3).strip())
-                    except json.JSONDecodeError as error:
-                        raise ValueError(
-                            f"Invalid JSON in DSML non-string parameter {match.group(1)!r}"
-                        ) from error
+                self._validate_xml_parameter(match, names, complete=True)
+            remaining = invoke_content[last_match_end:]
             if allow_partial:
-                partial = re.search(
-                    self.partial_parameter_regex,
-                    invoke_content[last_match_end:],
-                    re.DOTALL,
-                )
-                if partial and partial.group(2) == "true":
-                    _validate_string_parameter(
-                        partial.group(1), partial.group(3), complete=False
-                    )
+                partial = re.search(self.partial_parameter_regex, remaining, re.DOTALL)
+                if partial:
+                    if remaining[: partial.start()].strip():
+                        raise ValueError("Malformed DSML parameter boundary")
+                    self._validate_xml_parameter(partial, names, complete=False)
+                elif tail := remaining.lstrip():
+                    parameter_start = "<｜DSML｜parameter"
+                    if not (
+                        parameter_start.startswith(tail)
+                        or tail.startswith(parameter_start)
+                        or self.invoke_end_token.startswith(tail)
+                    ):
+                        raise ValueError("Malformed DSML parameter boundary")
+            elif remaining.strip():
+                raise ValueError("Incomplete DSML parameter at end of invoke")
         return super()._parse_parameters_from_xml(invoke_content, allow_partial)
+
+    def _validate_xml_parameter(
+        self, match: re.Match, names: set[str], *, complete: bool
+    ) -> None:
+        name, string_flag, value = match.groups()
+        if name in names:
+            raise ValueError(f"Duplicate DSML parameter {name!r}")
+        names.add(name)
+        if string_flag not in {"true", "false"}:
+            raise ValueError(f"Invalid DSML string flag for parameter {name!r}")
+        if string_flag == "true":
+            _validate_string_parameter(name, value, complete=complete)
+        elif complete:
+            try:
+                _strict_json_loads(value.strip())
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid JSON in DSML non-string parameter {name!r}"
+                ) from error
+
+    def _validate_arguments(
+        self,
+        name: str,
+        arguments: str,
+        tools: list[Tool],
+        *,
+        complete: bool,
+    ) -> None:
+        if not self.strict_output:
+            return
+        sent = self.streamed_args_for_tool[self.current_tool_id]
+        if not arguments.startswith(sent):
+            raise ValueError(f"Non-monotonic DSML argument stream for tool {name!r}")
+        if complete:
+            try:
+                parameters = _strict_json_loads(arguments)
+            except ValueError as error:
+                raise ValueError(
+                    f"Invalid JSON in completed DSML arguments for tool {name!r}"
+                ) from error
+            if not isinstance(parameters, dict):
+                raise ValueError(f"DSML arguments for tool {name!r} must be an object")
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]

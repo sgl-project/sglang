@@ -560,6 +560,132 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             json.loads("".join(call.parameters for call in calls)), {"city": "SF"}
         )
 
+    def test_strict_rejects_nested_invoke_instead_of_rewriting_streamed_arguments(self):
+        source = _wrapped(
+            f'<{DSML}invoke name="get_weather">'
+            + _param("city", "true", "San Francisco")
+            + "\n</"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+        for width in [1, 2, 7, 31, len(source)]:
+            with self.subTest(width=width):
+                detector = DeepSeekV4Detector(strict_output=True)
+                with self.assertRaisesRegex(ValueError, "Malformed DSML parameter"):
+                    for start in range(0, len(source), width):
+                        detector.parse_streaming_increment(
+                            source[start : start + width], self.tools
+                        )
+                    detector.finish(self.tools)
+        with self.assertRaisesRegex(ValueError, "Malformed DSML parameter"):
+            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, self.tools)
+
+    def test_strict_rejects_unclosed_string_parameter_at_invoke_end(self):
+        source = _wrapped(
+            f'<{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="true">SF</{DSML}invoke>'
+        )
+        for width in [1, 2, 7, 31, len(source)]:
+            with self.subTest(width=width):
+                detector = DeepSeekV4Detector(strict_output=True)
+                with self.assertRaisesRegex(ValueError, "Incomplete DSML parameter"):
+                    for start in range(0, len(source), width):
+                        detector.parse_streaming_increment(
+                            source[start : start + width], self.tools
+                        )
+                    detector.finish(self.tools)
+        with self.assertRaisesRegex(ValueError, "Incomplete DSML parameter"):
+            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, self.tools)
+
+    def test_strict_incomplete_later_call_does_not_rewrite_previous_calls(self):
+        detector = DeepSeekV4Detector(strict_output=True)
+        calls = detector.parse_streaming_increment(
+            _weather_call("SF"), self.tools
+        ).calls
+        calls += detector.parse_streaming_increment(
+            _weather_call("NY"), self.tools
+        ).calls
+        self.assertEqual(
+            [json.loads(call.parameters) for call in calls if call.parameters],
+            [{"city": "SF"}, {"city": "NY"}],
+        )
+        with self.assertRaisesRegex(ValueError, "Incomplete DSML parameter"):
+            detector.parse_streaming_increment(
+                _wrapped(
+                    f'<{DSML}invoke name="get_weather">'
+                    f'<{DSML}parameter name="city" string="true">LA</{DSML}invoke>'
+                ),
+                self.tools,
+            )
+
+    def test_strict_rejects_duplicate_xml_parameters_and_invalid_string_flags(self):
+        for body, message in [
+            (_param("city", "true", "SF") + _param("city", "true", "NY"), "Duplicate"),
+            (_param("city", "maybe", '"SF"'), "Invalid DSML string flag"),
+        ]:
+            source = _wrapped(_invoke("get_weather", body))
+            for width in [1, 5, len(source)]:
+                with self.subTest(body=body, width=width):
+                    detector = DeepSeekV4Detector(strict_output=True)
+                    with self.assertRaisesRegex(ValueError, message):
+                        for start in range(0, len(source), width):
+                            detector.parse_streaming_increment(
+                                source[start : start + width], self.tools
+                            )
+                        detector.finish(self.tools)
+
+    def test_strict_argument_stream_cannot_change_emitted_prefix(self):
+        detector = DeepSeekV4Detector(strict_output=True)
+        detector.parse_streaming_increment(
+            f'<{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="true">San Fran',
+            self.tools,
+        )
+        detector.parse_streaming_increment("cisco", self.tools)
+        self.assertIn("San Fran", detector.streamed_args_for_tool[0])
+        with patch.object(
+            detector, "_parse_parameters_from_xml", return_value='{"city": "NY"}'
+        ):
+            with self.assertRaisesRegex(ValueError, "Non-monotonic DSML"):
+                detector.parse_streaming_increment(
+                    f"</{DSML}parameter></{DSML}invoke>", self.tools
+                )
+
+    def test_strict_completed_arguments_must_be_a_json_object(self):
+        for arguments in ['{"city":', "[]", '{"city": NaN}']:
+            with self.subTest(arguments=arguments):
+                detector = DeepSeekV4Detector(strict_output=True)
+                with patch.object(
+                    detector, "_parse_parameters_from_xml", return_value=arguments
+                ):
+                    with self.assertRaisesRegex(ValueError, "JSON|must be an object"):
+                        detector.parse_streaming_increment(_weather_call(), self.tools)
+
+    def test_strict_direct_json_rejects_duplicates_and_non_json_constants(self):
+        for arguments in [
+            '{"city": "SF", "city": "NY"}',
+            '{"city": NaN}',
+            '{"city": Infinity}',
+            '{"city": {"value": 1, "value": 2}}',
+        ]:
+            with self.subTest(arguments=arguments):
+                source = _wrapped(_invoke("get_weather", arguments))
+                with self.assertRaisesRegex(ValueError, "Duplicate|Invalid DSML JSON"):
+                    DeepSeekV4Detector(strict_output=True).detect_and_parse(
+                        source, self.tools
+                    )
+
+    def test_non_strict_duplicate_parameters_retain_legacy_behavior(self):
+        source = _wrapped(
+            _invoke(
+                "get_weather",
+                _param("city", "true", "SF") + _param("city", "true", "NY"),
+            )
+        )
+        parsed = DeepSeekV4Detector(strict_output=False).detect_and_parse(
+            source, self.tools
+        )
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "NY"})
+
 
 if __name__ == "__main__":
     import unittest
