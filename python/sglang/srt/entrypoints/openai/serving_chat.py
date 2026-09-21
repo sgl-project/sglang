@@ -289,16 +289,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     e,
                 )
 
-        # Get default sampling parameters from model's generation config
+        # Apply server defaults before request conversion fills omitted fields.
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
+        if preferred := get_serving().preferred_sampling_params:
+            self.default_sampling_params = {
+                **self.default_sampling_params,
+                **preferred,
+            }
         if (
             self.default_sampling_params
             and not OpenAIServingChat._default_sampling_params_logged
         ):
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                f"Using default chat sampling params: {self.default_sampling_params}",
             )
             OpenAIServingChat._default_sampling_params_logged = True
 

@@ -707,6 +707,66 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_preferred_sampling_defaults_fill_only_omitted_request_fields(self):
+        preferred = {"temperature": 0.7, "top_p": 0.95, "top_k": 32}
+        publish(
+            ServerArgs(model_path="dummy", preferred_sampling_params=preferred),
+            role="tokenizer",
+        )
+        for model_defaults in ({}, {"temperature": 0.1, "top_p": 0.2, "top_k": 2}):
+            self.tm.model_config.get_default_sampling_params.return_value = (
+                model_defaults
+            )
+            chat = OpenAIServingChat(self.tm, self.template_manager)
+            for overrides, expected in (
+                ({}, preferred),
+                ({"temperature": 0}, {**preferred, "temperature": 0}),
+                ({"top_p": 0.8, "top_k": 50}, {**preferred, "top_p": 0.8, "top_k": 50}),
+                ({"top_p": None, "top_k": None}, preferred),
+                ({}, preferred),
+            ):
+                with self.subTest(model_defaults=model_defaults, overrides=overrides):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        input_ids=[101, 102, 103],
+                        **overrides,
+                    )
+                    adapted, _ = chat._convert_to_internal_request(
+                        request, self.fastapi_request
+                    )
+                    self.assertEqual(
+                        {name: adapted.sampling_params[name] for name in preferred},
+                        expected,
+                    )
+
+    def test_partial_preferred_defaults_preserve_model_defaults(self):
+        publish(
+            ServerArgs(model_path="dummy", preferred_sampling_params={"top_k": 32}),
+            role="tokenizer",
+        )
+        model_defaults = {"temperature": 0.2, "top_p": 0.9}
+        self.tm.model_config.get_default_sampling_params.return_value = model_defaults
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        adapted, _ = chat._convert_to_internal_request(
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101],
+            ),
+            self.fastapi_request,
+        )
+
+        self.assertEqual(
+            {
+                name: adapted.sampling_params[name]
+                for name in ("temperature", "top_p", "top_k")
+            },
+            {"temperature": 0.2, "top_p": 0.9, "top_k": 32},
+        )
+        self.assertEqual(model_defaults, {"temperature": 0.2, "top_p": 0.9})
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
