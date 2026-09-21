@@ -1,6 +1,5 @@
 import concurrent.futures
 import unittest
-from queue import Queue
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -301,8 +300,6 @@ class TestDcpPackLifetime(CustomTestCase):
         source = np.array([11], dtype=np.uint8)
         observed = []
         running, release = Event(), Event()
-        progress = Queue()
-        real_wait = concurrent.futures.wait
 
         def transfer(session, blocks):
             if blocks[0][0] == 1000:
@@ -312,10 +309,6 @@ class TestDcpPackLifetime(CustomTestCase):
             self.assertTrue(release.wait(10))
             observed.append(int(source[0]))
             return 0
-
-        def drain(futures):
-            progress.put("draining")
-            return real_wait(futures)
 
         def send(executor):
             result = MooncakeKVManager.send_kvcache_dcp(
@@ -335,7 +328,6 @@ class TestDcpPackLifetime(CustomTestCase):
                 pack_buffer=object(),
             )
             source[0] = 22
-            progress.put("reused")
             return result
 
         manager._transfer_data = transfer
@@ -344,18 +336,18 @@ class TestDcpPackLifetime(CustomTestCase):
                 "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
                 return_value=([1000, 2000], np.array([0], dtype=np.int64)),
             ),
-            patch("concurrent.futures.wait", side_effect=drain),
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as transfers,
             concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker,
         ):
             future = worker.submit(send, transfers)
             try:
-                # Release the reader after either draining starts or the worker reuses.
-                progress.get(timeout=10)
-                release.set()
-                self.assertEqual(future.result(timeout=10), 17)
+                self.assertTrue(running.wait(10))
+                # The send must stay blocked while a transfer still owns the buffer.
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    future.result(timeout=1)
             finally:
                 release.set()
+            self.assertEqual(future.result(timeout=10), 17)
         self.assertEqual(observed, [11])
 
 
