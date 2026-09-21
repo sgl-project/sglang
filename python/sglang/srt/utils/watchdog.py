@@ -8,13 +8,47 @@ import threading
 import time
 from contextlib import contextmanager
 from multiprocessing import Process
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import psutil
 
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
+
+
+def _scheduler_died_error(rank: int, proc) -> RuntimeError:
+    proc.join(timeout=10)
+    return RuntimeError(
+        f"Rank {rank} scheduler died during initialization "
+        f"(exit code: {proc.exitcode}). "
+        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+        f"Run `dmesg -T | grep -i oom` to check."
+    )
+
+
+def wait_for_subprocess_startup(readers: List, processes: List) -> List[Dict]:
+    """Collect scheduler ready messages while checking every child's liveness."""
+    infos = []
+    for i, reader in enumerate(readers):
+        while True:
+            if reader.poll(timeout=5.0):
+                try:
+                    data = reader.recv()
+                except EOFError:
+                    raise _scheduler_died_error(i, processes[i])
+                if data["status"] != "ready":
+                    raise RuntimeError(
+                        "Initialization failed. Please see the error messages above."
+                    )
+                infos.append(data)
+                break
+
+            # A later rank can fail while the current rank is still loading.
+            for j, proc in enumerate(processes):
+                if not proc.is_alive():
+                    raise _scheduler_died_error(j, proc)
+    return infos
 
 
 class Watchdog:
@@ -179,10 +213,12 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        startup: bool = False,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
+        self._startup = startup
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -200,6 +236,9 @@ class SubprocessWatchdog:
             self._thread.join(timeout=self._interval * 2)
             self._thread = None
 
+    def mark_startup_complete(self) -> None:
+        self._startup = False
+
     def _monitor_loop(self) -> None:
         try:
             while not self._stop_event.wait(self._interval):
@@ -210,12 +249,13 @@ class SubprocessWatchdog:
 
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
+            if proc.is_alive() or (proc.exitcode == 0 and not self._startup):
                 continue
 
             logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
+                f"Subprocess {name} (pid={proc.pid}) exited "
+                f"with exit code {proc.exitcode}"
+                f"{' during startup' if self._startup else ''}. "
                 f"Triggering SIGQUIT for cleanup..."
             )
             os.kill(os.getpid(), signal.SIGQUIT)

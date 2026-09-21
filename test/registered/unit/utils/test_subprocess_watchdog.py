@@ -15,17 +15,18 @@
 
 import multiprocessing as mp
 import os
+import queue
 import signal
 import threading
 import time
 import unittest.mock
 
-from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, wait_for_subprocess_startup
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="stage-b-test-cpu-intel")
 
 
 def healthy_worker():
@@ -133,6 +134,74 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+    def test_clean_exit_is_fatal_only_during_startup(self):
+        proc = self._spawn(noop_worker)
+        proc.join(timeout=10)
+        self.assertEqual(proc.exitcode, 0)
+        for ready in (False, True):
+            with self.subTest(ready=ready):
+                self.sigquit_triggered.clear()
+                monitor = SubprocessWatchdog([proc], startup=True)
+                if ready:
+                    monitor.mark_startup_complete()
+                self.assertEqual(monitor._check_processes(), not ready)
+                self.assertEqual(self.sigquit_triggered.is_set(), not ready)
+
+
+class TestSubprocessStartup(CustomTestCase):
+    def test_later_rank_exit_before_ready(self):
+        """Even exit code zero is a startup failure if a rank never sends ready."""
+        context = mp.get_context("spawn")
+        for exitcode in (0, 23):
+            with self.subTest(exitcode=exitcode):
+                release = context.Event()
+                processes = [
+                    context.Process(target=release.wait, args=(30,)),
+                    context.Process(target=os._exit, args=(exitcode,)),
+                ]
+                pipes = [context.Pipe(duplex=False) for _ in processes]
+                results = queue.Queue()
+
+                def wait():
+                    try:
+                        results.put(
+                            wait_for_subprocess_startup(
+                                [reader for reader, _ in pipes], processes
+                            )
+                        )
+                    except Exception as error:
+                        results.put(error)
+
+                waiter = threading.Thread(target=wait, daemon=True)
+                try:
+                    for process in processes:
+                        process.start()
+                    processes[1].join(timeout=10)
+                    self.assertEqual(processes[1].exitcode, exitcode)
+                    # Both writers stay open: neither EOF nor rank 0 can unblock recv.
+                    waiter.start()
+                    error = results.get(timeout=10)
+                    self.assertIsInstance(error, RuntimeError)
+                    self.assertIn("Rank 1", str(error))
+                    self.assertIn(f"exit code: {exitcode}", str(error))
+                    self.assertTrue(processes[0].is_alive())
+                finally:
+                    for _, writer in pipes:
+                        writer.send({"status": "ready"})
+                    if waiter.ident is not None:
+                        waiter.join(timeout=2)
+                    release.set()
+                    for process in processes:
+                        if process.pid is not None:
+                            process.join(timeout=2)
+                            if process.is_alive():
+                                process.kill()
+                                process.join(timeout=2)
+                    for reader, writer in pipes:
+                        reader.close()
+                        writer.close()
+                self.assertFalse(waiter.is_alive())
 
 
 if __name__ == "__main__":

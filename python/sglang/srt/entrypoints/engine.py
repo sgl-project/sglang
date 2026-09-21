@@ -147,7 +147,7 @@ from sglang.srt.utils.network import (
     is_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, wait_for_subprocess_startup
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
 from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
@@ -962,7 +962,7 @@ class Engine(EngineScoreMixin, EngineBase):
         scheduler_infos = []
 
         def wait_for_ready():
-            infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            infos = wait_for_subprocess_startup(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
             if use_dp_controller:
                 for info in infos:
@@ -1250,18 +1250,29 @@ class Engine(EngineScoreMixin, EngineBase):
         for p in detoken_procs:
             scheduler_init_result.all_child_pids.append(p.pid)
 
-        # Init tokenizer manager first, as the bootstrap server is initialized here
-        if get_serving().tokenizer_worker_num == 1:
-            tokenizer_manager, template_manager = init_tokenizer_manager_func(
-                server_args, port_args
-            )
-        else:
-            # Launch multi-tokenizer router
-            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-            template_manager = None
+        # Monitor children during tokenizer initialization and model loading too.
+        # RayEngine uses actors instead of scheduler processes.
+        processes = list(scheduler_procs or [])
+        names = [f"scheduler_{i}" for i in range(len(processes))]
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=processes, process_names=names, startup=True
+        )
+        subprocess_watchdog.start()
 
+        tokenizer_manager = None
         startup_complete = False
         try:
+            # The tokenizer initializes the bootstrap server needed by schedulers.
+            if get_serving().tokenizer_worker_num == 1:
+                tokenizer_manager, template_manager = init_tokenizer_manager_func(
+                    server_args, port_args
+                )
+            else:
+                tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+                template_manager = None
+
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
 
@@ -1272,20 +1283,13 @@ class Engine(EngineScoreMixin, EngineBase):
                 0
             ]["max_req_input_len"]
 
-            # Set up subprocess liveness watchdog to detect crashes
-            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            processes.extend(detoken_procs)
-            names.extend(detoken_names)
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
+            subprocess_watchdog.mark_startup_complete()
             startup_complete = True
         finally:
-            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
-                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            if not startup_complete:
+                subprocess_watchdog.stop()
+                if isinstance(tokenizer_manager, TokenizerManager):
+                    tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
         return (
             tokenizer_manager,
@@ -1773,7 +1777,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
@@ -1905,49 +1908,6 @@ def _log_legacy_kernel_cache_dirs():
         envs.SGLANG_CACHE_DIR.get(),
         ", ".join(legacy_dirs),
     )
-
-
-def _scheduler_died_error(rank: int, proc) -> RuntimeError:
-    """Build a descriptive error for a scheduler process that died during init."""
-    proc.join(timeout=10)
-    return RuntimeError(
-        f"Rank {rank} scheduler died during initialization "
-        f"(exit code: {proc.exitcode}). "
-        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
-        f"Run `dmesg -T | grep -i oom` to check."
-    )
-
-
-def _wait_for_scheduler_ready(
-    scheduler_pipe_readers: List,
-    scheduler_procs: List,
-) -> List[Dict]:
-    """Wait for the model to finish loading and return scheduler infos.
-
-    Uses poll() with timeout instead of blocking recv(), so that child process
-    death (e.g. OOM SIGKILL) is detected promptly instead of hanging forever.
-    """
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        while True:
-            if scheduler_pipe_readers[i].poll(timeout=5.0):
-                try:
-                    data = scheduler_pipe_readers[i].recv()
-                except EOFError:
-                    raise _scheduler_died_error(i, scheduler_procs[i])
-                if data["status"] != "ready":
-                    raise RuntimeError(
-                        "Initialization failed. Please see the error messages above."
-                    )
-                scheduler_infos.append(data)
-                break
-
-            # Poll timed out — check all processes for early death
-            for j in range(len(scheduler_procs)):
-                if not scheduler_procs[j].is_alive():
-                    raise _scheduler_died_error(j, scheduler_procs[j])
-
-    return scheduler_infos
 
 
 def _calculate_rank_ranges(

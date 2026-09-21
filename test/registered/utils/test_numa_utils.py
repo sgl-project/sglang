@@ -1,13 +1,19 @@
 import ctypes
+import errno
+import multiprocessing.spawn
 import os
+import subprocess
+import tempfile
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.numa_utils import (
+    _create_numactl_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -522,6 +528,45 @@ class TestStripMemoryArgs(unittest.TestCase):
         self.assertEqual(_strip_memory_args("--cpunodebind=0"), "--cpunodebind=0")
 
 
+class TestNumactlExecutable(unittest.TestCase):
+    def test_wrapper_uses_tmpdir_and_quotes_python_path(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"TMPDIR": directory}),
+            patch.object(tempfile, "tempdir", None),
+            patch.object(
+                multiprocessing.spawn,
+                "get_executable",
+                return_value=b"/environment with spaces/bin/python",
+            ),
+            patch("sglang.srt.utils.numa_utils.subprocess.run"),
+        ):
+            executable, _ = _create_numactl_executable("--cpunodebind=0")
+            path = Path(executable)
+            self.assertEqual(path.parent, Path(directory))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+            self.assertIn("'/environment with spaces/bin/python'", path.read_text())
+
+    def test_failed_wrapper_probe_removes_script(self):
+        failures = [
+            PermissionError(errno.EACCES, "Permission denied"),
+            subprocess.TimeoutExpired("wrapper", 10),
+            subprocess.CalledProcessError(1, "wrapper", stderr="binding denied"),
+        ]
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(tempfile, "tempdir", directory),
+                patch(
+                    "sglang.srt.utils.numa_utils.subprocess.run", side_effect=failure
+                ),
+            ):
+                with self.assertRaises(type(failure)):
+                    _create_numactl_executable("--cpunodebind=0")
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+
 class TestConfigureSubprocessProbeFailure(unittest.TestCase):
     """Tests the wiring in configure_subprocess when _probe_numactl_args gives up
     (returns None): the worker must start unbound (warn-and-yield) by default, or
@@ -599,6 +644,50 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
+
+    def test_wrapper_failure_obeys_strict_setting(self):
+        failures = [
+            PermissionError(errno.EACCES, "Permission denied", "/tmp/wrapper.sh"),
+            subprocess.TimeoutExpired("/tmp/wrapper.sh", 10),
+            subprocess.CalledProcessError(
+                1, "/tmp/wrapper.sh", stderr="binding denied"
+            ),
+        ]
+        for failure in failures:
+            for strict in (False, True):
+                with self.subTest(failure=type(failure).__name__, strict=strict):
+                    with ExitStack() as stack:
+                        mocks = [stack.enter_context(p) for p in self._common_patches()]
+                        _, _, mock_probe, mock_create, mock_mp = mocks
+                        mock_probe.return_value = ("--cpunodebind=0", "")
+                        mock_create.side_effect = failure
+                        stack.enter_context(
+                            patch.dict(
+                                os.environ,
+                                {
+                                    "SGLANG_NUMA_BIND_V2": "1",
+                                    "SGLANG_CRASH_ON_NUMA_BIND_FAILURE": str(
+                                        int(strict)
+                                    ),
+                                },
+                            )
+                        )
+                        original = multiprocessing.spawn.get_executable()
+                        if strict:
+                            with self.assertRaisesRegex(RuntimeError, "TMPDIR"):
+                                with configure_subprocess(MagicMock(), 0):
+                                    self.fail("strict mode must fail before spawning")
+                        else:
+                            with self.assertLogs("sglang.srt.utils.numa_utils") as logs:
+                                with configure_subprocess(MagicMock(), 0):
+                                    pass
+                            self.assertIn("TMPDIR", logs.output[0])
+                            if isinstance(failure, subprocess.CalledProcessError):
+                                self.assertIn(failure.stderr, logs.output[0])
+                        self.assertEqual(
+                            multiprocessing.spawn.get_executable(), original
+                        )
+                        mock_mp.assert_not_called()
 
 
 if __name__ == "__main__":

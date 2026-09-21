@@ -1,13 +1,14 @@
+import atexit
 import ctypes
 import glob
 import logging
 import math
 import multiprocessing
 import os
-import random
+import shlex
 import shutil
 import subprocess
-import time
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -57,9 +58,24 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     )
                     yield
                     return
-                executable, debug_str = _create_numactl_executable(
-                    numactl_args=numactl_args
-                )
+                try:
+                    executable, debug_str = _create_numactl_executable(
+                        numactl_args=numactl_args
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    detail = str(exc)
+                    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                        detail += f": {exc.stderr.strip()}"
+                    _handle_numa_bind_failure(
+                        numa_node,
+                        reason=(
+                            f"Could not create or execute NUMA wrapper for GPU {gpu_id}: "
+                            f"{detail}. Set TMPDIR to a writable directory that permits "
+                            "execution; skipping NUMA binding."
+                        ),
+                    )
+                    yield
+                    return
                 if _is_xpu:
                     debug_str += (
                         f", logical_gpu_id={gpu_id}, "
@@ -78,14 +94,28 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
 
 
 def _create_numactl_executable(numactl_args: str):
-    old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
+    old_executable = shlex.quote(os.fsdecode(multiprocessing.spawn.get_executable()))
     script = f'''#!/bin/sh
 exec numactl {numactl_args} {old_executable} "$@"'''
-    path = Path(
-        f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
-    )
-    path.write_text(script)
-    path.chmod(0o777)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix="sglang_numactl_", suffix=".sh", delete=False
+    ) as file:
+        path = Path(file.name)
+        # Process.start() may return before the child has opened the script.
+        atexit.register(path.unlink, missing_ok=True)
+        file.write(script)
+    try:
+        path.chmod(0o700)
+        subprocess.run(
+            [str(path), "-c", "pass"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        path.unlink(missing_ok=True)
+        raise
     return str(path), f"{script=}"
 
 
