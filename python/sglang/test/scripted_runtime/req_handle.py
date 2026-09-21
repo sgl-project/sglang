@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
+
+from sglang.test.scripted_runtime.context import queries
 from sglang.test.scripted_runtime.context.radix import _node_lock_ref, resolve_node
 
 if TYPE_CHECKING:
@@ -10,34 +13,46 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
-@dataclass(frozen=True, slots=True)
-class ScriptedReqHandle:
+class _RequestEpoch(msgspec.Struct, kw_only=True):
+    rid: str
+    post_future: Future
+    batch_start: int
+    excluded_reqs: tuple[Req, ...]
+    req: Optional[Req] = None
+    closed: bool = False
+    abort_requested: bool = False
+
+
+class ScriptedReqHandle(msgspec.Struct, frozen=True):
     rid: str
     context: ScriptedContext
+    _epoch: Optional[_RequestEpoch] = None
 
     @property
     def req(self) -> Optional[Req]:
-        return self.context.find_req_by_rid(self.rid)
+        return queries.find_req_by_rid(self.context, rid=self.rid, epoch=self._epoch)
 
     @property
     def finished(self) -> bool:
-        return self.context.is_finished(self.rid)
+        return queries.is_finished(self.context, rid=self.rid, epoch=self._epoch)
 
     @property
     def is_chunking(self) -> bool:
-        return self.context.is_chunking(self.rid)
+        return queries.is_chunking(self.context, rid=self.rid, epoch=self._epoch)
 
     @property
     def chunks_done(self) -> int:
-        return self.context.chunks_done(self.rid)
+        return queries.chunks_done(self.context, rid=self.rid, epoch=self._epoch)
 
     @property
     def status(self) -> str:
-        return self.context.status(self.rid)
+        return queries.status(self.context, rid=self.rid, epoch=self._epoch)
 
     @property
     def remaining_prompt_tokens(self) -> int:
-        return self.context.remaining_prompt_tokens(self.rid)
+        return queries.remaining_prompt_tokens(
+            self.context, rid=self.rid, epoch=self._epoch
+        )
 
     @property
     def kv_pages(self) -> int:
