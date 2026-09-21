@@ -17,11 +17,16 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
 # Maximum k for the fused top-k kernel; larger k should fall back to
 # torch.topk. The per-block selection cost grows with k: measured on GB300
 # at vocab=151936 the fused kernel beats a separate logsumexp + top-k up to
 # k~6 and drops below plain torch.topk near k=32.
 FUSED_TOPK_MAX_K = 8
+# Cap the per-iteration block size. The NPU triton port needs small blocks
+# (register pressure); GPUs keep the original larger cap.
+MAX_BLOCK_N = 2048 if is_npu() else 16384
 
 
 @triton.jit
@@ -95,8 +100,7 @@ def row_logsumexp(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return out_max, out_log_sum
     if num_cols == 0:
         return out_max.fill_(float("-inf")), out_log_sum.zero_()
-
-    BLOCK_N = triton.next_power_of_2(min(num_cols, 16384))
+    BLOCK_N = triton.next_power_of_2(min(num_cols, MAX_BLOCK_N))
     _row_logsumexp_kernel[(num_rows,)](
         x,
         out_max,
@@ -139,7 +143,7 @@ def _pack_key(vals, idxs):
     -inf lanes.
     """
     sortable = _fpval_to_key(vals.to(tl.uint32, bitcast=True))
-    return (sortable.to(tl.int64) << 31) | (2147483647 - idxs).to(tl.int64)
+    return ((sortable.to(tl.int64) & 0xFFFFFFFF) << 31) | (2147483647 - idxs).to(tl.int64)
 
 
 @triton.jit
@@ -280,7 +284,7 @@ def row_logsumexp_topk(
     # 16384 > FUSED_TOPK_MAX_K otherwise: the kernel's first block always
     # sees at least k in-row lanes. The K_PAD floor keeps SEG =
     # BLOCK_N // K_PAD >= 1 for tiny vocabularies.
-    BLOCK_N = max(triton.next_power_of_2(min(num_cols, 16384)), k_pad)
+    BLOCK_N = max(triton.next_power_of_2(min(num_cols, MAX_BLOCK_N)), k_pad)
     _row_logsumexp_topk_kernel[(num_rows,)](
         x,
         out_max,
