@@ -63,19 +63,9 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let formatter = ChatFormatter::load(&m.id, &m.tokenizer_path);
-        let is_kimi = formatter
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .is_some_and(ChatFormatter::is_kimi);
-        let t = if is_kimi {
-            kimi::load(&m.tokenizer_path)?
-        } else {
-            adapter::load(&m.tokenizer_path)?
-        };
+        let t = adapter::load(&m.tokenizer_path)?;
         me.inner.insert(m.id.clone(), t);
-        match formatter {
+        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
             Ok(Some(formatter)) => {
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));

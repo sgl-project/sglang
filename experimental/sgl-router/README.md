@@ -213,14 +213,16 @@ with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
 ## Kimi-K3
 
-Kimi-K3 uses the pinned Dynamo native formatter and segmented tokenizer, loading
-`tiktoken.model` and sibling `config.json` / `tokenizer_config.json` from
-`--tokenizer-path` or its Hugging Face repository. Segmented encoding preserves
-the distinction between protocol markers and literal control spellings in text.
-The existing input-ID forwarding guards still apply. Requests with null
-`thinking_effort`, segments over 400,000 characters, or whitespace/non-whitespace
-runs over 25,000 characters fall back to engine-side tokenization because the
-pinned Dynamo versions do not match Python for those cases.
+Kimi-K3 uses the pinned Dynamo native formatter and tiktoken tokenizer;
+`--tokenizer-path` may name a local `tiktoken.model` or the Hugging Face
+repository, whose `tiktoken.model`, `config.json`, and `tokenizer_config.json`
+are downloaded. Segmented encoding keeps protocol markers distinct from literal
+control spellings in user text, and the existing input-ID forwarding guards
+still apply. Two request shapes fall back to engine-side tokenization because
+the pinned Dynamo versions render them differently from the engine: a null
+`thinking_effort`, and text past the Python encoder's chunking thresholds
+(400,000 characters per segment or a 25,000-character whitespace or
+non-whitespace run). Both guards go away once Dynamo matches the engine.
 
 ## HTTP/2
 

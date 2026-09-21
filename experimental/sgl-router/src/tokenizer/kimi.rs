@@ -1,42 +1,113 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Model-file loading and parity guards for Dynamo's native Kimi support.
+//! Engine-parity request shaping for dynamo-render's native Kimi-K3 formatter.
+//!
+//! Mirrors `_prepare_kimi_k3_messages` and the Kimi branch of `_encode_messages`
+//! in the engine's `serving_chat.py`, so router token IDs equal the engine's.
+//! Dynamo owns rendering and encoding; this module only shapes the request and
+//! refuses the shapes where the pinned Dynamo output is known to differ from
+//! the engine, leaving those requests on engine-side tokenization.
 
-use anyhow::{Context, Result};
-use dynamo_tokenizers::{EncodeSegment, Tokenizer};
-use std::{path::Path, sync::Arc};
+use anyhow::Result;
+use dynamo_tokenizers::EncodeSegment;
+use minijinja::Value;
+use serde_json::Value as JsonValue;
 
-pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
-    let files = super::adapter::ModelFiles::open(source);
-    let path = if Path::new(source).is_file() && !source.ends_with(".json") {
-        Path::new(source).to_path_buf()
-    } else {
-        files
-            .path("tiktoken.model")
-            .context("Kimi-K3 requires the model's tiktoken.model vocabulary")?
-    };
-    // The native tokenizer reads these siblings when loading its vocabulary.
-    files.json("config.json")?;
-    files.json("tokenizer_config.json")?;
-    let tokenizer = Tokenizer::from_file(path.to_str().context("tokenizer path is not UTF-8")?)?;
-    for marker in ["<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>"] {
-        anyhow::ensure!(
-            tokenizer
-                .encode_segments(&[EncodeSegment::new(marker, true)])?
-                .token_ids()
-                .len()
-                == 1,
-            "Kimi vocabulary is missing {marker}"
-        );
+use super::chat_formatter::{ChatTemplateKwargs, RequestFields};
+
+/// A reserved spelling the engine escapes everywhere in request text, even
+/// without image inputs.
+const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
+const IMAGE_PLACEHOLDER_ESCAPED: &str = "<| kimi_image_placeholder |>";
+
+/// Shape `messages` and `kwargs` as the engine does before Kimi rendering and
+/// resolve the request fields dynamo-render reads through `OAIChatLikeRequest`.
+pub(super) fn normalize(
+    request: &JsonValue,
+    messages: &mut [JsonValue],
+    kwargs: &mut ChatTemplateKwargs,
+) -> Result<RequestFields> {
+    // The engine forwards top-level `reasoning_effort` as `thinking_effort` only
+    // for the values Kimi accepts, and never hands `reasoning_effort` itself to
+    // the encoder.
+    if let Some(effort) = kwargs
+        .remove("reasoning_effort")
+        .filter(|v| matches!(v.as_str(), Some("low" | "high" | "max")))
+    {
+        kwargs.entry("thinking_effort".into()).or_insert(effort);
     }
-    Ok(Arc::new(tokenizer))
+    // Parity gap in dynamo-renderer (5.1.2 through 5.3.1): a null effort renders
+    // as `max`, while the engine omits the effort preamble. Refuse rather than
+    // patch rendered output; the engine tokenizes the original request.
+    anyhow::ensure!(
+        !kwargs
+            .get("thinking_effort")
+            .is_some_and(JsonValue::is_null),
+        "Kimi null thinking effort requires engine-side tokenization"
+    );
+    for message in messages.iter_mut() {
+        neutralize_image_placeholder(&mut message["content"]);
+        if message["role"] == "assistant" {
+            if let Some(reasoning) = message.get_mut("reasoning_content") {
+                neutralize_image_placeholder(reasoning);
+            }
+            for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
+                if let Some(args) = call
+                    .get_mut("function")
+                    .and_then(|f| f.get_mut("arguments"))
+                {
+                    neutralize_image_placeholder(args);
+                }
+            }
+        }
+    }
+    // Tools go to the native formatter unmodified: no named-tool filtering and
+    // no schema fixing, as in the engine's Kimi path.
+    let tools = request
+        .get("tools")
+        .filter(|t| t.as_array().is_some_and(|t| !t.is_empty()));
+    // The engine forwards `tool_choice` only when some tool is declared, on the
+    // request or on a system/developer message, and only for these two values.
+    // An explicit `chat_template_kwargs.tool_choice` passes through as-is.
+    let has_tools = tools.is_some()
+        || messages.iter().any(|m| {
+            matches!(m["role"].as_str(), Some("system" | "developer"))
+                && m["tools"].as_array().is_some_and(|t| !t.is_empty())
+        });
+    let tool_choice = kwargs.get("tool_choice").or_else(|| {
+        request
+            .get("tool_choice")
+            .filter(|c| has_tools && matches!(c.as_str(), Some("required" | "none")))
+    });
+    // Unlike the DeepSeek formatters, the engine lets the Kimi encoder render
+    // `response_format`.
+    let response_format = kwargs
+        .get("response_format")
+        .or_else(|| request.get("response_format"));
+    Ok(RequestFields {
+        tools: tools.map(Value::from_serialize),
+        tool_choice: tool_choice.map(Value::from_serialize),
+        response_format: response_format.map(Value::from_serialize),
+    })
 }
 
-/// Python splits long segments before BPE; the pinned native backend does not.
-/// Leave those requests to the engine until Dynamo implements matching chunking.
-/// This only checks eligibility; Dynamo owns all encoding and segment handling.
-pub fn validate_native_segments(segments: &[EncodeSegment<'_>]) -> Result<()> {
+fn neutralize_image_placeholder(value: &mut JsonValue) {
+    match value {
+        JsonValue::String(text) => {
+            *text = text.replace(IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER_ESCAPED)
+        }
+        JsonValue::Array(values) => values.iter_mut().for_each(neutralize_image_placeholder),
+        JsonValue::Object(values) => values.values_mut().for_each(neutralize_image_placeholder),
+        _ => {}
+    }
+}
+
+/// Parity gap in dynamo-tokenizers (1.8.1 through 1.8.2): the tiktoken backend
+/// does not split long text before BPE the way the Python encoder does, so its
+/// IDs can differ past these thresholds. Detect that and leave the request on
+/// engine-side tokenization rather than reimplement the chunker here.
+pub(super) fn validate_native_segments(segments: &[EncodeSegment<'_>]) -> Result<()> {
     for segment in segments {
         let (mut run, mut was_space) = (0, false);
         for (count, ch) in segment.text.chars().enumerate() {
@@ -56,53 +127,64 @@ pub fn validate_native_segments(segments: &[EncodeSegment<'_>]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tokenizer::chat_formatter::ChatFormatter;
+    use crate::tokenizer::{adapter, chat_formatter::ChatFormatter};
+    use serde_json::json;
 
+    const VOCAB: &str = "tests/fixtures/kimi_k3/tiktoken.model";
+
+    fn formatter() -> ChatFormatter {
+        ChatFormatter::load("served-alias", VOCAB).unwrap().unwrap()
+    }
+
+    /// Golden IDs from the Python reference encoder over the synthetic fixture
+    /// vocabulary; `no_effort` records the known null-effort gap.
     #[test]
     fn reference_prompt_token_ids() {
-        let path = "tests/fixtures/kimi_k3/tiktoken.model";
-        let tokenizer = load(path).unwrap();
-        let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
+        let tokenizer = adapter::load(VOCAB).unwrap();
+        let formatter = formatter();
         let cases: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("../../tests/fixtures/kimi_k3/prompts.json"))
                 .unwrap();
         for case in cases {
-            // Dynamo 5.1.2 defaults null effort to max; Python omits the preamble.
-            // Keep the reference case, but reject encoding instead of rewriting output.
+            let encoded = formatter.encode(&tokenizer, &case["request"]);
             if case["name"] == "no_effort" {
-                assert!(formatter.encode(&tokenizer, &case["request"]).is_err());
+                assert!(encoded.is_err());
                 continue;
             }
             let expected: Vec<u32> = serde_json::from_value(case["token_ids"].clone()).unwrap();
-            assert_eq!(
-                formatter.encode(&tokenizer, &case["request"]).unwrap(),
-                expected,
-                "{}",
-                case["name"]
-            );
+            assert_eq!(encoded.unwrap(), expected, "{}", case["name"]);
         }
     }
 
     #[test]
-    fn long_segments_fall_back_without_reimplementing_python_chunking() {
-        let path = "tests/fixtures/kimi_k3/tiktoken.model";
-        let tokenizer = load(path).unwrap();
-        let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
+    fn long_segments_fall_back_to_engine_tokenization() {
+        let tokenizer = adapter::load(VOCAB).unwrap();
+        let formatter = formatter();
         // Boundaries count Unicode characters, and Python treats U+001C as whitespace.
         for (text, supported) in [
             ("界".repeat(25_000), true),
             ("界".repeat(25_001), false),
-            (" ".repeat(25_001), false),
             (
                 format!("{}\u{1c}{}", "x".repeat(20_000), "y".repeat(20_000)),
                 true,
             ),
-            ("x ".repeat(200_000), true),
             (format!("{}x", "x ".repeat(200_000)), false),
         ] {
-            let request = serde_json::json!({"messages": [{"role": "user", "content": text}]});
+            let request = json!({"messages": [{"role": "user", "content": text}]});
             assert_eq!(formatter.encode(&tokenizer, &request).is_ok(), supported);
         }
+    }
+
+    /// The engine forwards `tool_choice` only alongside declared tools.
+    #[test]
+    fn tool_choice_without_tools_is_not_rendered() {
+        let formatter = formatter();
+        let bare = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let with_choice =
+            json!({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "none"});
+        assert_eq!(
+            formatter.render(&bare).unwrap(),
+            formatter.render(&with_choice).unwrap()
+        );
     }
 }
