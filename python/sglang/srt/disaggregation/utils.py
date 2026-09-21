@@ -24,8 +24,9 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_spec,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -46,7 +47,6 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
-_IS_HIP = is_hip()
 
 
 def poll_and_all_reduce_pp(
@@ -76,50 +76,6 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     if not is_deepseek_dsa(hf_config):
         return 0
     return get_dsa_mtp_topk_width(hf_config)
-
-
-def is_dsv4_c128_online_enabled() -> bool:
-    """Return whether DSV4 C128 uses request-scoped online state."""
-    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-
-
-def get_dsv4_c4_state_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    ring_size: int,
-) -> np.ndarray:
-    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
-    # pair the overlap compressor's live rows by logical token position.
-    if ring_size < 8 or ring_size % 4 != 0:
-        raise ValueError(
-            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
-        )
-
-    seq_len = max(0, int(seq_len))
-    state_len = seq_len % 4 + 4
-    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
-    return rows.astype(np.int32)
-
-
-def get_dsv4_c128_state_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    online: bool,
-    ring_size: int,
-) -> np.ndarray:
-    """Return the PD transfer row/page indices for DSV4 C128 state."""
-    if seq_len == 0 or seq_len % 128 == 0:
-        return np.empty((0,), dtype=np.int32)
-    if online:
-        return np.array([int(req_pool_idx)], dtype=np.int32)
-
-    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
-    pages_per_req = ring_size // 128
-    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
-    return np.array([page], dtype=np.int32)
 
 
 def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
@@ -229,6 +185,9 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
+    if dist.get_world_size(group) == 1:
+        return polls
+
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
     return tensor_to_reduce.tolist()
@@ -1380,6 +1339,12 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    # V4's KVCache is organized by compression-ratio buckets rather than by layer.
+    kv_args.mla_compression_ratios = (
+        list(token_to_kv_pool.compression_ratios)
+        if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        else None
+    )
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1711,6 +1676,29 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+    """Describe the positional transfer layout without pool capacities or pointers."""
+    ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return None
+
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if kv_args.state_types.count(StateType.SWA) != 2:
+        raise RuntimeError(
+            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+        )
+
+    return {
+        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+        "compression_ratios": list(ratios),
+        "kv_layer_ids": list(kv_args.kv_layer_ids),
+        "kv_item_lens": list(kv_args.kv_item_lens),
+        "state_types": [state_type.value for state_type in kv_args.state_types],
+        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
+    }
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
