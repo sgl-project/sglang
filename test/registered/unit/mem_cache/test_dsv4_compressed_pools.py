@@ -152,6 +152,63 @@ class TestDSV4CompressedPools(CustomTestCase):
                 actual = list(zip(*pool.get_contiguous_buf_infos()))
                 self.assertEqual(actual, expected)
 
+    def test_init_compressed_pools_unified_hisparse_attr(self):
+        # NVIDIA CPU CI builds this via __new__ and never sets unified_hisparse.
+        # Missing must keep the CUDA assignment; True must not clobber an
+        # already-bound HiSparse C4 pool (kv_pools[4] is None on unified-KV).
+        configs = {
+            4: _CompressedPoolConfig(256, 64, torch.bfloat16, indexer_size=1024),
+            128: _CompressedPoolConfig(512, 8, torch.float32),
+        }
+        dummy_kv = SimpleNamespace(kv_buffer=[])
+        dummy_index = SimpleNamespace()
+
+        with self.subTest("missing_attr_assigns_c4"):
+            pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+            pool._unified_kv = False
+            pool.uniform_fp8 = False
+            pool.kv_layout = KVLayout.V4
+            pool.compressed_kv_layout_option = None
+            pool.compressed_pool_configs = configs
+            pool.indexer_head_dim = 128
+            self.assertFalse(hasattr(pool, "unified_hisparse"))
+            with (
+                patch.object(pool, "_make_kv_pool", return_value=dummy_kv),
+                patch.object(pool, "_make_indexer_pool", return_value=dummy_index),
+            ):
+                pool._init_compressed_pools(
+                    stage_ratios=[4, 128],
+                    page_size=256,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_hisparse=False,
+                    kv_pool_cls=DeepSeekV4SingleKVPool,
+                )
+            self.assertIs(pool.c4_kv_pool, dummy_kv)
+            self.assertIs(pool.c4_kv_pool, pool.kv_pools[4])
+
+        with self.subTest("unified_hisparse_keeps_c4"):
+            sentinel = object()
+            pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+            pool._unified_kv = True
+            pool.unified_hisparse = True
+            pool.c4_kv_pool = sentinel
+            pool.compressed_pool_configs = configs
+            pool.indexer_head_dim = 128
+            with patch.object(pool, "_make_indexer_pool", return_value=dummy_index):
+                pool._init_compressed_pools(
+                    stage_ratios=[4, 128],
+                    page_size=256,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_hisparse=True,
+                    kv_pool_cls=DeepSeekV4SingleKVPool,
+                )
+            self.assertIs(pool.c4_kv_pool, sentinel)
+            self.assertIsNone(pool.kv_pools[4])
+
     def test_shared_state_factory_preserves_layouts(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool.compressed_pool_configs = {
