@@ -1,0 +1,40 @@
+"""Reasoning parser names, kept in a dependency-free module (see
+`function_call/parser_names.py`). A unit test checks that this list matches
+`ReasoningParser.DetectorMap`; add a name here when you register a parser.
+"""
+
+REASONING_PARSER_NAMES = [
+    "apertus2509",
+    "deepseek-r1",
+    "deepseek-v3",
+    "deepseek-v4",
+    "deepseek-v41",
+    "dots",
+    "glm45",
+    "ling3",
+    "hunyuan",
+    "gpt-oss",
+    "k2_horizon",
+    "kimi",
+    "kimi_k2",
+    "kimi_k3",
+    "mimo",
+    "muse",
+    "poolside_v1",
+    "qwen3",
+    "qwen3-thinking",
+    "minimax",
+    "minimax-append-think",
+    "minimax-m3",
+    "nanbeige",
+    "step3",
+    "step3p5",
+    "mistral",
+    "nemotron_3",
+    "granite_thinking_parser",
+    "interns1",
+    "gemma4",
+    "inkling",
+    "cohere_command4",
+    "gigachat35",
+]
