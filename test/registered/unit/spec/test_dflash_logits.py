@@ -11,6 +11,7 @@ from sglang.srt.models.dflash import (
 )
 from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
+    resolve_dflash_num_draft_queries,
     select_dflash_pred_hidden,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -484,10 +485,72 @@ def test_anchor_first_draft_block_is_one_query_narrower():
         assert config.resolve_num_draft_queries(verify_block_size=8) == expected_queries
 
 
+_LAYOUT_CONFIGS = {
+    "undeclared": {},
+    "anchor_first": {"query_zero_predicts_next": True},
+    "one_plus_n": {"query_zero_predicts_next": False},
+    "speculators_spelling": {"sample_from_anchor": True},
+    "domino_shift_label": {
+        "projector_type": "domino",
+        "shift_label": True,
+        "pure_draft_prefix_len": 1,
+        "gru_hidden_dim": 4,
+        "emb_dim": 5,
+    },
+}
+
+
+@pytest.mark.parametrize("layout", sorted(_LAYOUT_CONFIGS))
+def test_capture_width_matches_the_worker_draft_block_width(layout):
+    """The draft CUDA graph is captured at the width ModelRunner derives from the raw
+    HF config, while the worker slices hidden states at the width it derives from the
+    parsed config. If the two disagree the draft forward reshapes to the wrong width
+    and capture dies with an invalid-shape RuntimeError.
+
+    Domino is the trap: it declares the layout as `shift_label`, so a derivation that
+    only reads query_zero_predicts_next / sample_from_anchor returns the wide width
+    for a narrow draft block.
+    """
+    raw = _layout_config(_LAYOUT_CONFIGS[layout])
+    config = parse_dflash_draft_config(draft_hf_config=raw)
+    for verify_block_size in (2, 4, 8, 16):
+        worker_width = config.resolve_num_draft_queries(
+            verify_block_size=verify_block_size
+        )
+        capture_width = resolve_dflash_num_draft_queries(
+            draft_hf_config=raw, num_draft_tokens=verify_block_size
+        )
+        assert worker_width == capture_width
+        # Whatever the layout, the block must yield exactly the drafts verify expects.
+        assert worker_width - config.draft_pred_start == verify_block_size - 1
+
+
 def test_draft_block_layout_defaults_to_one_plus_n():
     config = parse_dflash_draft_config(draft_hf_config=_layout_config({}))
     assert config.anchor_first is False
     assert config.draft_pred_start == 1
+    # Absent must stay distinguishable from an explicit 1+N: the worker warns on it,
+    # because a checkpoint that declares nothing is the one served shifted by one.
+    assert config.anchor_first_declared is False
+    assert (
+        parse_dflash_draft_config(
+            draft_hf_config=_layout_config({"query_zero_predicts_next": False})
+        ).anchor_first_declared
+        is True
+    )
+
+
+def test_same_layout_field_at_both_config_levels_must_agree():
+    """`dflash_config` is a precedence lookup over the top level, so a disagreeing
+    pair would otherwise resolve silently to whichever nesting won."""
+    with pytest.raises(ValueError, match="declared inconsistently"):
+        parse_dflash_draft_config(
+            draft_hf_config={
+                "num_hidden_layers": 5,
+                "sample_from_anchor": False,
+                "dflash_config": {"sample_from_anchor": True},
+            }
+        )
 
 
 @pytest.mark.parametrize("field", ("query_zero_predicts_next", "sample_from_anchor"))

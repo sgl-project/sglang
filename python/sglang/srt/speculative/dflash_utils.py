@@ -511,8 +511,8 @@ def is_nemotron_35_draft_config(config: Any) -> bool:
         return False
 
     # Identity probe, not layout resolution: this family declares the field explicitly,
-    # so an omitting config must fail here. `_parse_dflash_anchor_first` reads the same
-    # field to resolve layout and defaults the other way.
+    # so an omitting config must fail here. `resolve_dflash_anchor_first` reads the
+    # same field to resolve layout and defaults the other way.
     sample_from_anchor = dflash_config.get(
         "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
     )
@@ -540,33 +540,80 @@ def _parse_optional_int(
 _DFLASH_ANCHOR_FIRST_FIELDS = ("query_zero_predicts_next", "sample_from_anchor")
 
 
-def _parse_dflash_anchor_first(
-    *, dflash_cfg: dict, draft_hf_config: Any
-) -> Optional[bool]:
-    """Resolve the declared draft block layout, or None when the config omits it.
+def _collect_dflash_anchor_first(*, dflash_cfg: dict, draft_hf_config: Any) -> dict:
+    """Gather every anchor-first declaration, keyed by where it was found.
 
-    Two published spellings declare the same choice: `query_zero_predicts_next` in
-    DeepSpec serving configs and `sample_from_anchor` in speculators configs.
+    Two published spellings select the same layout -- `query_zero_predicts_next` in
+    DeepSpec serving configs and `sample_from_anchor` in speculators configs -- and
+    either may sit in `dflash_config` or at the top level. All four are collected so
+    that a disagreement is rejected rather than resolved by lookup precedence.
     """
     declared = {}
     for field in _DFLASH_ANCHOR_FIRST_FIELDS:
-        value = dflash_cfg.get(field, _cfg_get(draft_hf_config, field, None))
-        if value is None:
-            continue
-        if not isinstance(value, bool):
-            raise ValueError(
-                f"DFLASH dflash_config.{field} must be a bool, got {value!r} "
-                f"(type={type(value).__name__})."
-            )
-        declared[field] = value
+        for source, value in (
+            (f"dflash_config.{field}", dflash_cfg.get(field, None)),
+            (field, _cfg_get(draft_hf_config, field, None)),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"DFLASH {source} must be a bool, got {value!r} "
+                    f"(type={type(value).__name__})."
+                )
+            declared[source] = value
+    return declared
 
+
+def _require_one_dflash_layout(declared: dict) -> Optional[bool]:
     if len(set(declared.values())) > 1:
         pairs = ", ".join(f"{name}={value}" for name, value in sorted(declared.items()))
         raise ValueError(
             f"DFLASH draft block layout is declared inconsistently: {pairs}. "
-            "Both fields select the same layout and must agree."
+            "Every declaration selects the same layout and they must agree."
         )
     return next(iter(declared.values()), None)
+
+
+def resolve_dflash_anchor_first(draft_hf_config: Any) -> Optional[bool]:
+    """Resolve a raw draft HF config's block layout, or None when it declares none.
+
+    The single derivation of the layout: the worker stores it on
+    `DFlashDraftConfig` and the capture-shape path reaches it through
+    `resolve_dflash_num_draft_queries`. The two must never disagree -- a draft
+    block narrower than the width its CUDA graph was captured at fails capture.
+    """
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+    declared = _collect_dflash_anchor_first(
+        dflash_cfg=dflash_cfg, draft_hf_config=draft_hf_config
+    )
+
+    # Domino spells the same choice `shift_label`; keep one source of truth.
+    projector_type = dflash_cfg.get(
+        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
+    )
+    if projector_type == "domino":
+        shift_label = dflash_cfg.get(
+            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
+        )
+        if isinstance(shift_label, bool):
+            declared["shift_label"] = shift_label
+
+    return _require_one_dflash_layout(declared)
+
+
+def resolve_dflash_num_draft_queries(
+    *, draft_hf_config: Any, num_draft_tokens: Optional[int] = None
+) -> int:
+    """Draft-block width for a DFLASH draft worker, for sizing capture shapes.
+
+    Mirrors `DFlashDraftConfig.resolve_num_draft_queries` for callers that hold only
+    the raw HF config; both route through `resolve_dflash_anchor_first`.
+    """
+    if num_draft_tokens is None:
+        num_draft_tokens = get_spec().speculative_num_draft_tokens
+    anchor_first = bool(resolve_dflash_anchor_first(draft_hf_config))
+    return int(num_draft_tokens) - 1 + (0 if anchor_first else 1)
 
 
 def select_dflash_pred_hidden(
@@ -608,6 +655,9 @@ class DFlashDraftConfig:
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
     anchor_first: bool = False
+    # False means the checkpoint declared no layout and 1+N was assumed, not that it
+    # declared 1+N; the worker warns on that case because a wrong guess is silent.
+    anchor_first_declared: bool = False
 
     @property
     def draft_pred_start(self) -> int:
@@ -675,9 +725,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
 
-    anchor_first = _parse_dflash_anchor_first(
-        dflash_cfg=dflash_cfg, draft_hf_config=draft_hf_config
-    )
+    anchor_first = resolve_dflash_anchor_first(draft_hf_config)
 
     num_hidden_layers = _parse_optional_int(
         _cfg_get(draft_text_config, "num_hidden_layers", None),
@@ -879,16 +927,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
 
-        # Domino spells the same block layout as `shift_label`; keep one source of truth.
-        if anchor_first is not None and anchor_first != shift_label:
-            raise ValueError(
-                "DFLASH Domino draft block layout is declared inconsistently: "
-                f"shift_label={shift_label}, but "
-                f"{'/'.join(_DFLASH_ANCHOR_FIRST_FIELDS)} select "
-                f"anchor_first={anchor_first}."
-            )
-        anchor_first = shift_label
-
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -910,6 +948,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
         anchor_first=bool(anchor_first),
+        anchor_first_declared=anchor_first is not None,
     )
 
 

@@ -830,6 +830,15 @@ class ModelRunner:
                     if num_draft_tokens is None:
                         num_draft_tokens = get_spec().speculative_num_draft_tokens
                     return int(num_draft_tokens)
+            if self.spec_algorithm.is_dflash() and self.is_draft_worker:
+                from sglang.srt.speculative.dflash_utils import (
+                    resolve_dflash_num_draft_queries,
+                )
+
+                return resolve_dflash_num_draft_queries(
+                    draft_hf_config=self.model_config.hf_config,
+                    num_draft_tokens=num_draft_tokens,
+                )
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=self.spec_algorithm,
