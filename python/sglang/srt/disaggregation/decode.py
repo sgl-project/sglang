@@ -1725,11 +1725,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "Host pool must hold a retraction and a receive page; "
                 "increase --hicache-size or --hicache-ratio"
             )
+        device_buffers, host_buffers = group.get_contiguous_buf_infos()
+        if device_buffers != (
+            kv_args.kv_data_ptrs,
+            kv_args.kv_data_lens,
+            kv_args.kv_item_lens,
+        ):
+            raise ValueError(
+                "Host pool group must match the transferred target and draft KV"
+            )
         (
-            kv_args.host_kv_data_ptrs,
-            kv_args.host_kv_data_lens,
-            kv_args.host_kv_item_lens,
-        ) = group.get_host_buffer_infos(kv_args.kv_data_ptrs)
+            (kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens),
+            (
+                kv_args.host_kv_data_ptrs,
+                kv_args.host_kv_data_lens,
+                kv_args.host_kv_item_lens,
+            ),
+        ) = device_buffers, host_buffers
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         if (
@@ -1748,13 +1760,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_tokens = ceil_align(
             len(decode_req.req.origin_input_ids), self.host_pool.page_size
         )
-        if self.host_pool.available_size() < num_tokens + self.host_reserved_tokens:
-            return False
-        backup = self.tree_cache.allocate_host_receive(num_tokens)
+        backup = self.tree_cache.allocate_host_receive(
+            num_tokens, reserved_tokens=self.host_reserved_tokens
+        )
         if backup is None:
             return False
         assert decode_req.req.kv.retraction_backup is None
         decode_req.req.kv.retraction_backup = backup
+        if get_disagg().disaggregation_decode_enable_radix_cache:
+            # A rejected device admission released its prefix lock. Receive the
+            # complete prompt into fresh slots, as for retraction, and let the
+            # normal post-restore cache insertion merge any duplicate prefix.
+            req = decode_req.req
+            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            req.last_node = self.tree_cache.root_node_handle(req.extra_key)
+            req.last_host_node = req.last_node
+            req.best_match_node = req.last_node
+            req.lock_receipt = DecLockRefParams()
+            req.kv.cache_protected_len = 0
+            req.num_matched_prefix_tokens = 0
+            req.host_hit_length = 0
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )

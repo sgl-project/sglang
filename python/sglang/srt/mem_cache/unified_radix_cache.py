@@ -1439,8 +1439,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def allocate_host_receive(self, num_tokens: int) -> Optional[RetractionBackup]:
+    def allocate_host_receive(
+        self, num_tokens: int, *, reserved_tokens: int = 0
+    ) -> Optional[RetractionBackup]:
         """Reserve incoming KV using the same sidecar plan as retraction restore."""
+        required_tokens = num_tokens + reserved_tokens
+        if self.host_pool_group.available_size() < required_tokens:
+            self._reclaim_retraction_host(required_tokens)
+        if self.host_pool_group.available_size() < required_tokens:
+            return None
         host_indices = self.host_pool_group.alloc(num_tokens)
         if host_indices is None:
             return None

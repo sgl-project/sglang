@@ -71,15 +71,21 @@ class HostPoolGroup:
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
 
-    def get_host_buffer_infos(
-        self, device_ptrs: list[int]
-    ) -> tuple[list[int], list[int], list[int]]:
-        """Return host addresses, spans and page strides in device wire order."""
+    def get_contiguous_buf_infos(self):
+        """Return (device_buffers, host_buffers) in matching transfer order.
+
+        Each group contains (data_ptrs, data_lens, item_lens), as returned by
+        a device pool. Packed drafts and sidecars follow their target pool.
+        """
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
         if self.layout != "layer_first":
-            raise ValueError("Host receive requires layer_first host KV layout")
+            raise ValueError(
+                "Host KV transfer requires layer_first layout: the transfer format "
+                "uses the page copy size as the destination stride"
+            )
         host_by_device_ptr = {}
+        device_infos = ([], [], [])
         for entry in self.entries:
             host = entry.host_pool
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
@@ -99,6 +105,10 @@ class HostPoolGroup:
                         "Host receive requires dense NHD MHA or plain MLA target and "
                         "draft KV with matching page sizes"
                     )
+                for combined, values in zip(
+                    device_infos, pool.get_contiguous_buf_infos(), strict=True
+                ):
+                    combined.extend(values)
 
             # Packed MHA stores target/draft K followed by target/draft V,
             # while the wire lists target K/V followed by draft K/V. Associate
@@ -119,14 +129,15 @@ class HostPoolGroup:
                     host_buffer.nbytes,
                     host.token_stride_size * self.page_size,
                 )
-        if host_by_device_ptr.keys() != set(device_ptrs):
+        if host_by_device_ptr.keys() != set(device_infos[0]):
             raise ValueError("Host receive must cover every target and draft KV buffer")
-        infos = [host_by_device_ptr[ptr] for ptr in device_ptrs]
-        return (
+        infos = [host_by_device_ptr[ptr] for ptr in device_infos[0]]
+        host_infos = (
             [info[0] for info in infos],
             [info[1] for info in infos],
             [info[2] for info in infos],
         )
+        return device_infos, host_infos
 
     def alloc(
         self,

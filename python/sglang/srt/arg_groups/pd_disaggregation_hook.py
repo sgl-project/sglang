@@ -60,15 +60,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "--disaggregation-decode-enable-host-receive"
         )
     if cfg.disaggregation_decode_enable_host_receive:
-        if (
-            cfg.enable_hisparse
-            or cfg.hicache_storage_backend is not None
-            or cfg.enable_pd_role_switch
-            or cfg.disaggregation_decode_enable_radix_cache
-        ):
+        if cfg.enable_hisparse or cfg.enable_pd_role_switch:
             raise ValueError(
-                "Decode host receive does not yet support HiSparse, HiCache storage, "
-                "role switching, or decode radix caching"
+                "Decode host receive does not yet support HiSparse or role switching"
             )
 
         if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":

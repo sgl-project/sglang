@@ -1,5 +1,6 @@
 import ctypes
 import unittest
+from array import array
 from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,13 +10,18 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import RetractionBackup, backup_kv_cache
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    backup_kv_cache,
+    release_kv_cache,
+    restore_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
@@ -26,6 +32,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
@@ -98,6 +105,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         page_size=1,
         io_backend="kernel",
         draft_mode=None,
+        radix_cache=False,
     ):
         """Bring up a UnifiedRadixCache over fresh pools, optionally with draft KV."""
         server_args = ServerArgs(
@@ -106,6 +114,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
             hicache_ratio=hicache_ratio,
             hicache_io_backend=io_backend,
             hicache_mem_layout="layer_first" if shared_receive else "page_first",
+            disable_radix_cache=not radix_cache,
+            hicache_write_policy="write_back",
         )
         set_global_server_args_for_scheduler(server_args)
 
@@ -137,7 +147,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             **({"page_size": page_size} if page_size > 1 else {}),
         )
         params = CacheInitParams(
-            disable=True,
+            disable=not radix_cache,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
@@ -385,6 +395,88 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
                 env.allocator.free(received_indices)
                 env.req_to_token_pool.free(req)
+
+    def test_host_receive_merges_existing_radix_prefix_after_restore(self):
+        """A host fallback must neither retain a released lock nor leak duplicate KV."""
+        env = self._build_cache(
+            hicache_ratio=2.0, shared_receive=True, radix_cache=True
+        )
+        cache = env.cache
+        queue = object.__new__(DecodePreallocQueue)
+        queue.tree_cache = cache
+        queue.token_to_kv_pool = env.target_pool
+        queue.token_to_kv_pool_allocator = env.allocator
+        queue.req_to_token_pool = env.req_to_token_pool
+        queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(2)
+        queue._num_published_destinations = 0
+        queue.num_reserved_decode_tokens = 0
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False, enable_decode_hicache=False
+        )
+        kv_args = KVArgs()
+        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+            env.target_pool.get_contiguous_buf_infos()
+        )
+        kv_args.state_types = []
+        queue._init_host_receive(kv_args)
+
+        def make_req(rid, num_tokens):
+            return Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", range(num_tokens)),
+                sampling_params=SamplingParams(max_new_tokens=1),
+                bootstrap_host="localhost",
+            )
+
+        with get_disagg().override(
+            disaggregation_decode_enable_host_receive=True,
+            disaggregation_decode_enable_radix_cache=True,
+        ):
+            cached = make_req("cached", 4)
+            cached.output_ids.append(99)
+            cached.last_node = cache.root_node_handle()
+            cached_indices = queue._pre_alloc(cached)
+            self._seed_pool(env.target_pool, cached_indices, base=500)
+            cached_values = self._snapshot_pool(env.target_pool, cached_indices)
+            cache.cache_unfinished_req(cached)
+
+            req = make_req("receiving", 8)
+            match = queue._match_prefix_and_lock(req)
+            self.assertEqual(match.l1_prefix_len, 4)
+            queue._release_matched_prefix_lock(req)
+            decode_req = DecodeRequest(
+                req=req, kv_receiver=Mock(supports_host_destination=True)
+            )
+            host_free_before = cache.host_pool_group.available_size()
+            self.assertTrue(queue._pre_alloc_host(decode_req))
+            backup = req.kv.retraction_backup
+            for buffer in queue.host_pool.host_kv_data_refs:
+                buffer[backup.host_indices] = 7
+
+            received_indices = queue._pre_alloc(req)
+            req.output_ids.append(99)
+            # Prebuilt preparation retains the full-transfer/root state, then
+            # restores before normal cache insertion deduplicates the prefix.
+            req.init_next_round_input(None)
+            req.set_extend_range(0, 8)
+            restore_kv_cache(
+                req, cache, env.req_to_token_pool, env.allocator, "host_pool"
+            )
+            self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
+            free_before_insert = env.allocator.available_size()
+            cache.cache_unfinished_req(req)
+
+            row = env.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :8]
+            self.assertTrue(torch.equal(row[:4], cached_indices))
+            self.assertTrue(torch.equal(row[4:], received_indices[4:]))
+            self._assert_pool_equal(env.target_pool, cached_indices, cached_values)
+            self.assertEqual(env.allocator.available_size(), free_before_insert + 4)
+            self.assertEqual(cache.protected_size(), 8)
+            release_kv_cache(req, cache, is_insert=False)
+            self.assertEqual(cache.protected_size(), 4)
+            release_kv_cache(cached, cache, is_insert=False)
+            self.assertEqual(cache.protected_size(), 0)
 
     def test_receive_pressure_preserves_shared_retraction_and_restore(self):
         for use_mla, page_size, io_backend in (
