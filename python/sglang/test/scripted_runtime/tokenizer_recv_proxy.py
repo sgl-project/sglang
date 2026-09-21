@@ -23,7 +23,6 @@ _WORK_REQ_TYPES = (
 
 
 class ScriptedTokenizerRecvProxy:
-
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()
@@ -39,6 +38,11 @@ class ScriptedTokenizerRecvProxy:
             raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
         raise RuntimeError(
             "ScriptedTokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
+        )
+
+    def recv(self, flags: int = 0) -> bytes:
+        raise NotImplementedError(
+            "TODO: support ScriptedTokenizerRecvProxy.recv for msgpack IPC"
         )
 
     def wait_until_arrived(

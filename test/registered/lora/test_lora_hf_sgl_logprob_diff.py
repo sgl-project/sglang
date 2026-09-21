@@ -536,8 +536,8 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         saved = {}
         env_overrides = {
-            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "true",
-            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "4",
+            "SGLANG_ENABLE_LOGPROB_CHUNK": "true",
+            "SGLANG_LOGPROB_CHUNK_SIZE": "4",
         }
         for key, val in env_overrides.items():
             saved[key] = os.environ.get(key)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect and save performance metrics from nightly benchmark results.
 
-This script reads benchmark result JSON files from performance profile directories
+This script reads benchmark result JSON files from performance result directories
 and saves them with metadata for artifact collection in CI.
 
 Usage:
@@ -223,9 +223,9 @@ def main():
 
     # Default search directories if none specified
     search_dirs = args.search_dirs or [
-        "test/performance_profiles_8_gpu",
-        "test/performance_profiles_text_models",
-        "test/performance_profiles_vlms",
+        "test/performance_results_8_gpu",
+        "test/performance_results_text_models",
+        "test/performance_results_vlms",
         "test",
         ".",
     ]

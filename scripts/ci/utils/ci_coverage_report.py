@@ -13,9 +13,11 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 # Add the ci_register module path directly to avoid heavy sglang imports
 sys.path.insert(
@@ -32,11 +34,11 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # the report -- if the assert below fires, add the new backend name here in
 # the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
 # (highest test volume historically), then accelerators that have been
-# wired into the registry more recently (XPU, MUSA).
-BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA")
-assert set(BACKEND_DISPLAY_ORDER) == {
-    b.name for b in HWBackend
-}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+# wired into the registry more recently (XPU, MUSA, MLX).
+BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
+assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
+    "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+)
 
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage
@@ -64,9 +66,48 @@ _MM_GEN_SUBDIR_BACKENDS = {
     "server/musa": ("MUSA",),
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
-    "unit": ("CUDA",),
+    # unit/ are portable CPU-style unit tests. The `unit` suite also runs on
+    # ROCm (both 7.0.0 and 7.2.0), as a step of multimodal-gen-test-1-gpu-amd
+    # part 0, so they are AMD-covered too, not CUDA-only.
+    "unit": ("CUDA", "AMD"),
     "cli": ("CUDA",),
     "manual": ("CUDA",),
+    # Standalone server/CLI single-file tests (restructured out of server/).
+    # Run on CUDA CI; AMD parity for these standalone files is TBD, so
+    # CUDA-only for now (previously matched no rule and were dropped entirely).
+    "single_test_file": ("CUDA",),
+    "single_test_file/component_accuracy": ("CUDA",),
+    # Nested unit suites are enabled on AMD incrementally, per file (only the
+    # files that pass on ROCm as-is; see _MM_GEN_FILE_BACKENDS below and
+    # gpu_cases _AMD_READY_NESTED_UNIT_TESTS). The subdir default stays the
+    # pre-existing CUDA tag for files not yet enabled on AMD (follow-up PRs
+    # move each file to AMD as it lands).
+    "unit/realtime": ("CUDA",),
+    "unit/sana_wm": ("CUDA",),
+    "unit/progressive_resolution": ("CUDA",),
+    # musa-named unit layer kernels.
+    "unit/musa/layers": ("MUSA",),
+}
+
+# Per-file backend overrides (checked before the subdir rule). Used to enable
+# individual nested unit/ files on AMD incrementally, as each is verified to
+# pass on ROCm. The CUDA lane does not collect these nested files (see
+# gpu_cases._discover_unit_tests), so they are AMD-only here.
+_MM_GEN_FILE_BACKENDS = {
+    "unit/realtime/test_causal_denoising.py": ("AMD",),
+    "unit/realtime/test_output_materialization.py": ("AMD",),
+    "unit/realtime/test_realtime_consistency_harness.py": ("AMD",),
+    "unit/realtime/test_realtime_control_signals.py": ("AMD",),
+    "unit/realtime/test_realtime_output_transport.py": ("AMD",),
+    "unit/realtime/test_realtime_vae.py": ("AMD",),
+    "unit/sana_wm/test_streaming_cached.py": ("AMD",),
+    "unit/sana_wm/test_streaming_stage.py": ("AMD",),
+    "unit/sana_wm/test_streaming_vae.py": ("AMD",),
+    # Enabled with small test-harness stub fixes.
+    "unit/progressive_resolution/test_progressive.py": ("AMD",),
+    "unit/sana_wm/test_streaming_realtime_path.py": ("AMD",),
+    # Stub gap already fixed upstream; only needs enabling here.
+    "unit/realtime/test_lingbot_causal_denoising.py": ("AMD",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests
@@ -132,11 +173,14 @@ def collect_multimodal_gen_tests(
         stem_tokens = set(filename_only[:-3].split("_"))
         nightly = "nightly" in stem_tokens
 
-        backends: tuple[str, ...] = ()
-        for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
-            if token in stem_tokens:
-                backends = override
-                break
+        # Precedence: explicit per-file override, then filename token, then
+        # the subdir default.
+        backends: tuple[str, ...] = _MM_GEN_FILE_BACKENDS.get(rel.as_posix(), ())
+        if not backends:
+            for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
+                if token in stem_tokens:
+                    backends = override
+                    break
         if not backends:
             backends = _MM_GEN_SUBDIR_BACKENDS.get(subdir, ())
 
@@ -198,15 +242,43 @@ def get_test_basename(filename: str) -> str:
     return Path(filename).name
 
 
+# Suite names carry the runner shape as a `<n>-gpu` / `<n>-npu` token, e.g.
+# `base-b-test-1-gpu-small`, `base-c-test-acc-16-npu-a3`. The token is the
+# only machine-readable record of how many accelerators a test asks for, so
+# the GPU-count grouping parses it back out. Anchored on a dash (or the
+# string start/end) so a trailing `-tp4` or a model name like `qwen3-235b`
+# can't be mistaken for a runner size.
+_SUITE_ACCEL_COUNT_RE = re.compile(r"(?:^|-)(\d+)-(?:gpu|npu)(?:-|$)")
+
+
+def get_accel_count(test: CIRegistry) -> Optional[int]:
+    """Number of GPUs/NPUs a test's suite runs on, or None if unencoded.
+
+    Returns None for suites whose name has no size token -- `stress`,
+    `nightly-amd-vlm`, the CPU suites, and the synthesized `mm-gen-*`
+    suites (multimodal_gen spreads one suite across 1-gpu and 2-gpu
+    runners, so there is no single answer to report).
+    """
+    match = _SUITE_ACCEL_COUNT_RE.search(test.effective_suite or "")
+    return int(match.group(1)) if match else None
+
+
+def accel_count_label(count: Optional[int]) -> str:
+    """Row label for an accelerator count."""
+    return f"{count}-GPU" if count is not None else "Unsized"
+
+
 def organize_test_data(tests: list[CIRegistry]) -> dict:
     """Organize tests into various groupings."""
     by_backend = defaultdict(list)
     by_folder = defaultdict(list)
+    by_accel = defaultdict(list)
     disabled_tests = []
 
     for t in tests:
         by_backend[t.backend.name].append(t)
         by_folder[get_folder_name(t.filename)].append(t)
+        by_accel[get_accel_count(t)].append(t)
         if t.disabled:
             disabled_tests.append(t)
 
@@ -224,8 +296,14 @@ def organize_test_data(tests: list[CIRegistry]) -> dict:
         "disabled_unique_files": len(unique_disabled_files),
         "by_backend": by_backend,
         "by_folder": by_folder,
+        "by_accel": by_accel,
         "disabled_tests": disabled_tests,
     }
+
+
+def sorted_accel_counts(by_accel: dict) -> list:
+    """Accelerator counts in ascending order, with `None` (unsized) last."""
+    return sorted(by_accel.keys(), key=lambda c: (c is None, c if c is not None else 0))
 
 
 def generate_summary_section(data: dict) -> str:
@@ -289,6 +367,36 @@ def generate_summary_section(data: dict) -> str:
 
     lines.append("\n</details>\n")
 
+    # GPU count summary (collapsible). Answers "how many 1-GPU tests do we
+    # have?" without expanding every suite -- the bulk of the fleet is
+    # single-GPU runners, so this is the row that decides capacity.
+    lines.append("<details>")
+    lines.append("<summary><h2>GPU Count Summary</h2></summary>\n")
+    lines.append(
+        "*Enabled registrations, grouped by the `<n>-gpu` / `<n>-npu` size in "
+        "the suite name. `Unsized` covers suites with no size token: the CPU "
+        "suites, `stress`, and `mm-gen-*` (multimodal_gen splits one suite "
+        "across 1-gpu and 2-gpu runners).*\n"
+    )
+    header_cells = ["GPUs", *active_backends, "Total", "Disabled"]
+    lines.append("| " + " | ".join(header_cells) + " |")
+    lines.append("|" + "|".join(["-" * max(len(c), 3) for c in header_cells]) + "|")
+
+    by_accel = data["by_accel"]
+    for count in sorted_accel_counts(by_accel):
+        accel_tests = by_accel[count]
+        enabled = [t for t in accel_tests if not t.disabled]
+        backend_counts = {b.name: 0 for b in HWBackend}
+        for t in enabled:
+            backend_counts[t.backend.name] += 1
+        row = [accel_count_label(count)]
+        row += [str(backend_counts[b]) for b in active_backends]
+        row.append(str(len(enabled)))
+        row.append(str(len(accel_tests) - len(enabled)))
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.append("\n</details>\n")
+
     # Disabled tests section (collapsible)
     if disabled_tests:
         lines.append("<details>")
@@ -343,6 +451,69 @@ def generate_by_folder_section(data: dict) -> str:
                 )
                 lines.append(
                     f"| `{test_name}` | {t.effective_suite} | {t.est_time:.0f}s | {status} |"
+                )
+
+            lines.append("")
+
+        lines.append("</details>\n")
+
+    return "\n".join(lines)
+
+
+def generate_by_gpu_count_section(data: dict) -> str:
+    """Generate the 'All Tests by GPU Count' section.
+
+    Same registrations as the by-suite section, pivoted on runner size
+    instead of suite name, so per-GPU-count fleet demand is readable at a
+    glance (which backend leans on 1-GPU boxes, where the 8-GPU load sits).
+    """
+    lines = []
+    by_accel = data["by_accel"]
+
+    lines.append("# All Tests by GPU Count\n")
+
+    for count in sorted_accel_counts(by_accel):
+        accel_tests = by_accel[count]
+        a_disabled = sum(1 for t in accel_tests if t.disabled)
+        a_enabled = len(accel_tests) - a_disabled
+
+        lines.append("<details>")
+        lines.append(
+            f"<summary><h2>{accel_count_label(count)} "
+            f"({a_enabled} enabled, {a_disabled} disabled)</h2></summary>\n"
+        )
+
+        accel_by_backend = defaultdict(list)
+        for t in accel_tests:
+            accel_by_backend[t.backend.name].append(t)
+
+        for backend in BACKEND_DISPLAY_ORDER:
+            backend_tests = accel_by_backend.get(backend, [])
+            if not backend_tests:
+                continue
+
+            b_disabled = sum(1 for t in backend_tests if t.disabled)
+            b_enabled = len(backend_tests) - b_disabled
+            lines.append(
+                f"### {backend} ({b_enabled} enabled, {b_disabled} disabled)\n"
+            )
+            lines.append("| Suite | Enabled | Disabled | Est. Time | Type |")
+            lines.append("|-------|---------|----------|-----------|------|")
+
+            backend_suites = defaultdict(list)
+            for t in backend_tests:
+                backend_suites[t.effective_suite].append(t)
+
+            for suite in sorted(backend_suites.keys()):
+                suite_tests = backend_suites[suite]
+                s_disabled = sum(1 for t in suite_tests if t.disabled)
+                s_enabled = len(suite_tests) - s_disabled
+                s_est_time = sum(t.est_time for t in suite_tests if not t.disabled)
+                is_nightly = any(t.nightly for t in suite_tests if not t.disabled)
+                suite_type = "Nightly" if is_nightly else "Per-Commit"
+                lines.append(
+                    f"| {suite} | {s_enabled} | {s_disabled} | "
+                    f"{s_est_time:.0f}s | {suite_type} |"
                 )
 
             lines.append("")
@@ -427,6 +598,8 @@ def generate_markdown_report(tests: list[CIRegistry], section: str = "all") -> s
         return generate_by_folder_section(data)
     elif section == "by-suite":
         return generate_by_suite_section(data)
+    elif section == "by-gpu-count":
+        return generate_by_gpu_count_section(data)
     else:  # "all"
         parts = [
             generate_summary_section(data),
@@ -434,6 +607,8 @@ def generate_markdown_report(tests: list[CIRegistry], section: str = "all") -> s
             generate_by_folder_section(data),
             "---",
             generate_by_suite_section(data),
+            "---",
+            generate_by_gpu_count_section(data),
         ]
         return "\n".join(parts)
 
@@ -460,6 +635,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
         "tests_by_suite": {},
         "backend_summary": {},
         "folder_summary": {},
+        "gpu_count_summary": {},
         "disabled_tests": [],
     }
 
@@ -564,6 +740,26 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             "total": len(folder_tests),
         }
 
+    # GPU count summary -- enabled registrations per runner size, keyed by
+    # the same labels the markdown table uses ("1-GPU", ..., "Unsized").
+    by_accel = defaultdict(list)
+    for t in tests:
+        by_accel[get_accel_count(t)].append(t)
+
+    for count in sorted_accel_counts(by_accel):
+        accel_tests = by_accel[count]
+        enabled = [t for t in accel_tests if not t.disabled]
+        backend_counts = {b: 0 for b in BACKEND_DISPLAY_ORDER}
+        for t in enabled:
+            backend_counts[t.backend.name] += 1
+        data["gpu_count_summary"][accel_count_label(count)] = {
+            **backend_counts,
+            "gpus": count,
+            "enabled": len(enabled),
+            "disabled": len(accel_tests) - len(enabled),
+            "suites": sorted({t.effective_suite for t in accel_tests}),
+        }
+
     # Disabled tests
     for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
         data["disabled_tests"].append(
@@ -588,7 +784,7 @@ def main():
     )
     parser.add_argument(
         "--section",
-        choices=["all", "summary", "by-folder", "by-suite"],
+        choices=["all", "summary", "by-folder", "by-suite", "by-gpu-count"],
         default="all",
         help="Which section to output (default: all). Only applies to markdown format.",
     )

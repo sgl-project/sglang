@@ -6,6 +6,7 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, List
 
@@ -18,7 +19,10 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import (
+    SGLDiffusionProfiler,
+    maybe_record_function,
+)
 
 if TYPE_CHECKING:
     # Only for type checkers; avoids runtime circular import
@@ -111,10 +115,11 @@ class PipelineExecutor(ABC):
     ) -> Any:
         stage_name = stage._component_stage_name()
         self.before_stage(stage, stage_index, payload, server_args)
-        with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
-            payload = self.run_stage_with_context(
-                stage, payload, server_args, run_stage
-            )
+        with maybe_record_function(f"STAGE {stage_name}"):
+            with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                payload = self.run_stage_with_context(
+                    stage, payload, server_args, run_stage
+                )
         return payload
 
     @staticmethod
@@ -148,6 +153,21 @@ class PipelineExecutor(ABC):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
+    def execute_group_sequentially_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Run the AR stage as a group, then yield each completed DiT request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                yield from self.execute_group_sequentially(
+                    stages,
+                    batches,
+                    server_args,
+                )
+
     @staticmethod
     @contextlib.contextmanager
     def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
@@ -167,31 +187,7 @@ class PipelineExecutor(ABC):
 
         stage_name = stage._active_component_stage_name()
         for use in stage.component_uses(server_args, stage_name):
-            component_name = use.component_name
-            if server_args.dit_cpu_offload and component_name in (
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "audio_dit",
-            ):
-                return True
-            if server_args.text_encoder_cpu_offload and component_name.startswith(
-                "text_encoder"
-            ):
-                return True
-            if server_args.image_encoder_cpu_offload and component_name in (
-                "image_encoder",
-                "condition_image_encoder",
-            ):
-                return True
-            if server_args.vae_cpu_offload and component_name in (
-                "vae",
-                "video_vae",
-                "audio_vae",
-                "vocoder",
-                "spatial_upsampler",
-                "condition_image_encoder",
-            ):
+            if server_args.should_cpu_offload_component(use.component_name):
                 return True
         return False
 
@@ -203,7 +199,11 @@ class PipelineExecutor(ABC):
         run_stage,
     ):
         with self._stage_execution_context(stage, server_args):
-            return run_stage(stage, payload)
+            self.component_residency_manager.begin_stage()
+            try:
+                return run_stage(stage, payload)
+            finally:
+                self.component_residency_manager.end_stage()
 
     @abstractmethod
     def execute(
@@ -240,6 +240,43 @@ class PipelineExecutor(ABC):
         for stage in stages:
             batches = stage.run_grouped_requests(batches, server_args)
         return batches
+
+    def execute_group_sequentially(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Yield outputs after batched AR and sequential DiT/VAE inference."""
+        batches = self.execute_group(stages[:1], batches, server_args)
+
+        remaining_stages = stages[1:]
+        sequential_start_time = time.monotonic()
+        for parent_batch in batches:
+            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "PipelineExecutor.sequential_wait",
+                        time.monotonic() - sequential_start_time,
+                    )
+                try:
+                    output = self.execute(remaining_stages, batch, server_args)
+                except Exception as e:
+                    logger.error(
+                        "Sequential DiT/VAE inference failed for request %s: %s",
+                        batch.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    output = OutputBatch(
+                        error=f"Error executing grouped request {batch.request_id}: {e}",
+                        metrics=batch.metrics,
+                    )
+                yield output
+                del output
+                del batch
+                if current_platform.is_npu():
+                    torch.get_device_module().empty_cache()
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):
