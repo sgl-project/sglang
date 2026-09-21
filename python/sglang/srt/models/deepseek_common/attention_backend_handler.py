@@ -61,6 +61,7 @@ def _dispatch_mla_subtype(attn, forward_batch):
             attn.rocm_fused_decode_mla
             and forward_batch.forward_mode.is_decode()
             and attn.current_attention_backend == "aiter"
+            and not getattr(attn, "use_glm_bf16_prefill_fp8_decode", False)
         ):
             return AttnForwardMethod.MLA_FUSED_ROPE_ROCM
         else:

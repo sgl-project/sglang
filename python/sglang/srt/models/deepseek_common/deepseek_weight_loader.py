@@ -721,15 +721,45 @@ class DeepseekV2WeightLoaderMixin:
                         torch.bfloat16
                     )
 
-            # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
-            # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
-            if (
+            glm_gfx95_bf16_absorb = bool(
                 _use_aiter_gfx95
                 and self.config.architectures
                 and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
                 and w.dtype == torch.bfloat16
-            ):
-                w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
+            )
+            use_glm_hybrid_absorb = (
+                envs.SGLANG_GLM_BF16_PREFILL_FP8_DECODE.get() and glm_gfx95_bf16_absorb
+            )
+            self_attn.use_glm_bf16_prefill_fp8_decode = use_glm_hybrid_absorb
+
+            if glm_gfx95_bf16_absorb:
+                fp8_w, fp8_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
+
+                if use_glm_hybrid_absorb:
+                    decode_w_kc, decode_w_vc = fp8_w.unflatten(
+                        0,
+                        (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
+                    ).split(
+                        [self_attn.qk_nope_head_dim, self_attn.v_head_dim],
+                        dim=1,
+                    )
+                    self_attn.w_kc_decode = bind_or_assign(
+                        getattr(self_attn, "w_kc_decode", None),
+                        decode_w_kc.transpose(1, 2).contiguous().transpose(1, 2),
+                    )
+                    self_attn.w_vc_decode = bind_or_assign(
+                        getattr(self_attn, "w_vc_decode", None),
+                        decode_w_vc.contiguous().transpose(1, 2),
+                    )
+                    self_attn.w_scale_decode = bind_or_assign(
+                        getattr(self_attn, "w_scale_decode", None),
+                        fp8_scale,
+                    )
+                else:
+                    # Preserve the existing GLM gfx950 path unless the hybrid
+                    # switch explicitly requests a retained BF16 copy.
+                    w = fp8_w
+                    self_attn.w_scale = fp8_scale
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
