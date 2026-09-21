@@ -50,6 +50,14 @@ FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_cutlass"
+        and get_exec().moe.moe_a2a_backend == "deepep"
+    ):
+        # DeepEP receive counts differ by rank (including empty ranks).
+        # MoE profiling would enter different numbers of synchronized tactic
+        # reductions and deadlock. Keep attention/dense tuning enabled.
+        skip_ops.update({"trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"})
     return skip_ops
 
 

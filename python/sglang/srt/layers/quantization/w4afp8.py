@@ -128,6 +128,7 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        self.use_flashinfer = False
 
     def create_weights(
         self,
@@ -141,6 +142,25 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         assert "weight_loader" in extra_weight_attrs
+
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.load_up_proj_weight_first = self.use_flashinfer
+        if self.use_flashinfer:
+            self._validate_flashinfer_config()
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_deepep() and layer.moe_ep_size <= 1:
+                raise ValueError(
+                    "FlashInfer W4AFP8 DeepEP requires expert parallel size > 1."
+                )
+            if params_dtype != torch.bfloat16:
+                raise ValueError("FlashInfer W4AFP8 requires BF16 model activations.")
+            if hidden_size % 128 or intermediate_size_per_partition % 128:
+                raise ValueError(
+                    "FlashInfer W4AFP8 requires group-128 aligned GEMM dimensions."
+                )
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -210,6 +230,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
+        if self.use_flashinfer:
+            return
+
         # Pre-populate the strides
         device = layer.w13_weight.device
 
@@ -255,6 +278,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         return
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_flashinfer:
+            self._process_flashinfer_weights(layer)
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {
+                        "normal_dispatcher_output_dtype": "bf16",
+                        "low_latency_dispatcher_output_dtype": "bf16",
+                    }
+                )
+            return
+
         dtype = torch.bfloat16
         device = layer.w2_weight.device
 
@@ -298,12 +332,168 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_flashinfer:
+            from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass  # noqa: F401
+            from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+            from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+            if (
+                moe_runner_config.activation != "silu"
+                or not moe_runner_config.is_gated
+                or moe_runner_config.apply_router_weight_on_input
+                or moe_runner_config.no_combine
+                or any(
+                    getattr(moe_runner_config, name) is not None
+                    for name in (
+                        "gemm1_alpha",
+                        "gemm1_beta",
+                        "gemm1_clamp_limit",
+                        "swiglu_limit",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "FlashInfer W4AFP8 requires gated SiLU with output router weights "
+                    "and no activation overrides."
+                )
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
+            )
+
+    def _validate_flashinfer_config(self) -> None:
+        import inspect
+
+        from packaging.version import Version
+
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        from sglang.srt.runtime_context import get_exec
+        from sglang.srt.utils import is_flashinfer_available
+
+        a2a = get_moe_a2a_backend()
+        if a2a.is_deepep():
+            if get_exec().moe.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
+                raise ValueError("FlashInfer W4AFP8 DeepEP requires BF16 dispatch.")
+        elif not a2a.is_none():
+            raise ValueError(
+                "FlashInfer W4AFP8 supports A2A backends none or deepep only."
+            )
+        if (
+            self.quant_config.group_size != 128
+            or self.quant_config.moe_activation_scheme != "static"
+        ):
+            raise ValueError(
+                "FlashInfer W4AFP8 requires group-128 weights and static activation scales."
+            )
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            9,
+            0,
+        ):
+            raise ValueError("FlashInfer W4AFP8 requires an SM90 GPU.")
+        if not is_flashinfer_available():
+            raise RuntimeError(
+                "FlashInfer W4AFP8 requires flashinfer-python >= 0.6.18."
+            )
+        import flashinfer
+        from flashinfer import fused_moe
+
+        if Version(flashinfer.__version__) < Version("0.6.18") or not all(
+            callable(getattr(fused_moe, name, None))
+            for name in (
+                "cutlass_fused_moe",
+                "interleave_moe_weights_for_sm90_mixed_gemm",
+                "interleave_moe_scales_for_sm90_mixed_gemm",
+            )
+        ):
+            raise RuntimeError(
+                "FlashInfer W4AFP8 requires the mixed-GEMM APIs from flashinfer-python >= 0.6.18."
+            )
+
+        required_kwargs = {
+            "use_w4_group_scaling",
+            "use_packed_weights",
+            "use_fused_finalize",
+        }
+        if not required_kwargs.issubset(
+            inspect.signature(fused_moe.cutlass_fused_moe).parameters
+        ):
+            raise RuntimeError(
+                "FlashInfer cutlass_fused_moe lacks the packed W4AFP8 API."
+            )
+
+    def _process_flashinfer_weights(self, layer: Module) -> None:
+        if getattr(layer, "_flashinfer_w4afp8_prepared", False):
+            return
+
+        from flashinfer.fused_moe import (
+            interleave_moe_scales_for_sm90_mixed_gemm,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMoeQuantInfo,
+        )
+
+        # The loader already placed FC1 in [up; gate] order, including scales.
+        hidden = layer.w13_weight.shape[-1] * 2
+        intermediate = layer.w2_weight.shape[-1] * 2
+        experts = layer.w2_weight.shape[0]
+        for name in ("w13_weight", "w2_weight"):
+            packed = getattr(layer, name).data.view(torch.uint8)
+            setattr(
+                layer,
+                name,
+                Parameter(
+                    interleave_moe_weights_for_sm90_mixed_gemm(packed, "int4"),
+                    requires_grad=False,
+                ),
+            )
+        for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+            scales = getattr(layer, name).to(torch.bfloat16)
+            setattr(
+                layer,
+                name,
+                Parameter(
+                    interleave_moe_scales_for_sm90_mixed_gemm(scales, 128),
+                    requires_grad=False,
+                ),
+            )
+        # Match the native path: one static scale per GEMM over loaded experts.
+        for name in ("w13_input_scale", "w2_input_scale"):
+            scale = getattr(layer, name).max().float().reshape(1)
+            if not bool(torch.isfinite(scale).all() & (scale > 0).all()):
+                raise ValueError(
+                    "FlashInfer W4AFP8 activation scales must be finite and positive."
+                )
+            setattr(layer, name, Parameter(scale, requires_grad=False))
+        a1, a2 = layer.w13_input_scale, layer.w2_input_scale
+        self.flashinfer_quant_info = FlashInferCutlassMoeQuantInfo(
+            quant_type="w4afp8",
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            quant_scales=[
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                a1.reciprocal().to(torch.bfloat16).expand(hidden).contiguous(),
+                a2.reciprocal().to(torch.bfloat16).expand(intermediate).contiguous(),
+                torch.empty(0, dtype=torch.bfloat16, device=a1.device),
+                torch.empty(0, dtype=torch.bfloat16, device=a2.device),
+                a1.expand(experts).contiguous(),
+                a2.expand(experts).contiguous(),
+            ],
+            moe_tp_size=layer.moe_tp_size,
+            moe_tp_rank=layer.moe_tp_rank,
+            moe_ep_size=layer.moe_ep_size,
+            moe_ep_rank=layer.moe_ep_rank,
+        )
+        layer._flashinfer_w4afp8_prepared = True
 
     def apply(
         self,
         layer: Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if self.use_flashinfer:
+            return self.runner.run(dispatch_output, self.flashinfer_quant_info)
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
