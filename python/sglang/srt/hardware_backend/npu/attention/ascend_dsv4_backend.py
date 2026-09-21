@@ -1016,7 +1016,7 @@ class DeepseekV4AscendAttnBackend(
             out_cache_loc=out_cache_loc,
             block_size=block_size,
         )
-        # The query is padded to an attn_tp multiple (prepare_attn_tp_scatter_input),
+        # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
         # but seq_lens is not, so pad the tail with -1 ("skip") to match.
         num_padded_tokens = out_cache_loc.shape[0]
         if ori_sparse_indices.shape[0] < num_padded_tokens:
