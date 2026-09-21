@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.layers.hc_mix_flydsl import flydsl_hc_mix_supported, weight_cache_key
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
@@ -160,6 +161,8 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            self._mix_flydsl_weights = None
+            self._mix_flydsl_weight_key = None
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -254,6 +257,24 @@ class GatedResidual(HyperConnectionBase):
                 self._mix_up_weight_padded,
                 self.hc_count,
                 self.hidden_size,
+            ).to(self.params_dtype)
+        elif flydsl_hc_mix_supported(
+            hyper_input_normed,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_count,
+            self.hidden_size,
+        ):
+            from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
+
+            down = self.input_mix_weight_down.weight
+            up = self.input_mix_weight_up.weight
+            key = weight_cache_key(down, up)
+            if self._mix_flydsl_weight_key != key:
+                self._mix_flydsl_weights = pack_hc_weights(down, up, self.hc_count)
+                self._mix_flydsl_weight_key = key
+            mixed_input = hc_mix(
+                hyper_input_normed, *self._mix_flydsl_weights
             ).to(self.params_dtype)
         elif fused_hc_mix_supported(
             hyper_input_normed,
