@@ -18,6 +18,33 @@ class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     MODELEXPRESS = "modelexpress"
 
 
+def broadcast_weights(model, *, group, device, is_src: bool) -> None:
+    """Broadcast checkpoint parameters without moving their persistent storage.
+
+    NCCL stages CPU parameters one at a time. Keep one collective per parameter
+    (including CUDA parameters), with the original order, dtype and element count,
+    so peers need not have the same CPU/CUDA placement. The receiver must finish
+    copying all parameters before rebuilding any derived inference layouts.
+    """
+    import torch
+
+    needs_cuda = torch.distributed.get_backend(group) == "nccl"
+    with torch.no_grad():
+        for _, parameter in model.named_parameters():
+            tensor = parameter.detach()
+            stage = needs_cuda and tensor.device.type == "cpu"
+            if stage:
+                tensor = (
+                    tensor.to(device)
+                    if is_src
+                    else torch.empty_like(tensor, device=device)
+                )
+            torch.distributed.broadcast(tensor, src=0, group=group)
+            if stage and not is_src:
+                # Blocking D2H makes the CPU checkpoint safe for post-load packing.
+                parameter.copy_(tensor)
+
+
 def trigger_init_weights_send_group_for_remote_instance_request(
     remote_instance_weight_loader_seed_instance_ip: str,
     remote_instance_weight_loader_seed_instance_service_port: int,
@@ -141,6 +168,7 @@ def register_memory_region_v2(model, transfer_engine):
 
     weight_mr_dict = {}
     weight_addr_set = set()
+    host_storage_regions = {}
     for name, weight in model.named_parameters():
         weight_mr_dict[name] = (
             weight.data_ptr(),
@@ -148,11 +176,18 @@ def register_memory_region_v2(model, transfer_engine):
             weight.element_size(),
         )
         weight_addr_set.add(weight.data_ptr())
+        if weight.device.type == "cpu":
+            # CPU checkpoint weights are absent from the CUDA snapshot. Register
+            # their owning storage once, including aliases with nonzero offsets.
+            # The model keeps this storage alive for the published addresses.
+            storage = weight.untyped_storage()
+            if storage.nbytes():
+                host_storage_regions[storage.data_ptr()] = storage.nbytes()
 
     import torch
 
     memory_snapshot = torch.cuda.memory.memory_snapshot()
-    weight_blocks_for_reg_mr = []
+    weight_blocks_for_reg_mr = list(host_storage_regions.items())
     # Blocks in each segment have continuous physical addresses,
     # so they can be merged for memory registration.
     for segment in memory_snapshot:

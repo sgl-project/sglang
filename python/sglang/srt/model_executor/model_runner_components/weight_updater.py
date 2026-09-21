@@ -361,6 +361,7 @@ class WeightUpdater:
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
+            _model_refresh_hc_weights(self.get_model())
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -422,10 +423,26 @@ class WeightUpdater:
             return False, str(e)
 
 
+def _model_refresh_hc_weights(model):
+    # Opt-in per-module hook. Other models/platforms must not import the
+    # optional HC/Triton backend just because they update their weights.
+    for module in model.modules():
+        prepare = getattr(module, "prepare_sum_state_weights", None)
+        if prepare is not None:
+            prepare(force=True)
+
+
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
+        param = params_dict[name]
+        # Only HC opts in: arbitrary weight_loaders may reshard an already
+        # rank-local direct tensor. Other parameters keep the original copy.
+        loader = getattr(param, "hc_weight_loader", default_weight_loader)
+        loader(param, tensor)
+    # Refresh only after the whole transaction (including both Down/Inject).
+    # Captured graphs must follow the normal recapture lifecycle after reload.
+    _model_refresh_hc_weights(model)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

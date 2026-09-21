@@ -169,6 +169,14 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
+        # HC's packed buffers are already mapped, but its Python operators are
+        # not serialized. Rebuild only client-local state; never repack into the
+        # daemon's shared weights or repeat the full quantization post-load.
+        for module in model.modules():
+            restore_hc = getattr(module, "restore_sum_state_from_ipc", None)
+            if restore_hc is not None:
+                restore_hc()
+
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
         self._start_daemon_liveness_watchdog(cache_data.get("pid"))

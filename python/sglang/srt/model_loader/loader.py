@@ -45,6 +45,7 @@ from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    broadcast_weights,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
@@ -311,6 +312,17 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    _prepare_hc_weights_after_loading(model)
+
+
+def _prepare_hc_weights_after_loading(model: nn.Module) -> None:
+    # Dummy/sharded loaders write state_dict tensors, bypassing parameter
+    # loader hooks. HC keeps CPU checkpoint tensors and must rebuild its CUDA
+    # layouts afterwards. Avoid importing the optional HC backend otherwise.
+    for module in model.modules():
+        prepare = getattr(module, "prepare_sum_state_weights", None)
+        if prepare is not None:
+            prepare(force=True)
 
 
 class BaseModelLoader(ABC):
@@ -2675,6 +2687,10 @@ class PreshardedModelLoader(DefaultModelLoader):
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
+            # The checkpoint already contains post-processed weights. Only
+            # rebuild HC's non-persistent layouts, not all model/quant fixups.
+            _prepare_hc_weights_after_loading(model)
+
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
@@ -3418,12 +3434,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in model.named_parameters():
-                torch.distributed.broadcast(
-                    tensor.data,
-                    src=0,
-                    group=client._model_update_group,
-                )
+            broadcast_weights(
+                model,
+                group=client._model_update_group,
+                device=torch.device(device_config.device_type, device_config.gpu_id),
+                is_src=False,
+            )
             current_platform.synchronize()
 
             _post_load_weights(model)
