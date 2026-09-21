@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -20,6 +20,8 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
+
+mod reorg;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -50,7 +52,7 @@ fn config_for(_worker_url: &str) -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
@@ -1127,6 +1129,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1322,7 +1325,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
 /// streaming response, not just for the handler lifetime.
 ///
 /// Before the fix, the handler dropped `_guard` as soon as it returned
-/// (which happens when headers arrive), so `active_load()` was 0 while
+/// (which happens when headers arrive), so `router_inflight_load()` was 0 while
 /// the SSE pump was still relaying bytes. This test catches that bug.
 #[tokio::test]
 async fn streaming_load_guard_persists_for_body_lifetime() {
@@ -1360,7 +1363,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     ));
     let app = build_router(ctx);
 
-    // Grab the Worker handle so we can assert active_load().
+    // Grab the Worker handle so we can assert router_inflight_load().
     let w_handle: Arc<Worker> = registry
         .workers_for(&ModelId("tiny".into()))
         .into_iter()
@@ -1386,9 +1389,9 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     // first chunk's delay to pass, then assert load is still held.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
-        w_handle.active_load() >= 1,
+        w_handle.router_inflight_load() >= 1,
         "load should be >= 1 mid-stream, got {}",
-        w_handle.active_load()
+        w_handle.router_inflight_load()
     );
 
     // Drain the entire body — this drives the SSE pump to completion.
@@ -1398,25 +1401,25 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     // released.  Give the spawned task a brief moment to clean up.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
-        w_handle.active_load(),
+        w_handle.router_inflight_load(),
         0,
         "load should be 0 after stream completes"
     );
 }
 
-/// Task A: the chat handler mints an `ActiveLoadGuard` from the shared
-/// `ActiveLoadRegistry` and drops it when the request completes. The
+/// Task A: the chat handler mints an `RouterInflightLoadGuard` from the shared
+/// `RouterInflightLoadRegistry` and drops it when the request completes. The
 /// non-streaming path drops the guard on handler exit; this test
 /// asserts the round-trip increment → 0 across a single request.
 #[tokio::test]
 async fn non_streaming_active_load_increments_then_returns_to_zero() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
-    let active_load = Arc::clone(&ctx.active_load);
+    let router_inflight_load = Arc::clone(&ctx.router_inflight_load);
     let app = build_router(ctx);
 
     assert_eq!(
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
         0,
         "registry must start with no in-flight requests",
     );
@@ -1442,19 +1445,19 @@ async fn non_streaming_active_load_increments_then_returns_to_zero() {
     // The handler has returned, so the active-load guard must have
     // dropped — counters are back to zero.
     assert_eq!(
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
         0,
         "active-load registry must be empty after non-streaming handler returns",
     );
     let w_id = WorkerId("w1".into());
     assert_eq!(
-        active_load.prefill_load(&w_id),
+        router_inflight_load.prefill_load(&w_id),
         0,
         "prefill_load must decrement on response end",
     );
 }
 
-/// Task A: the streaming path holds the `ActiveLoadGuard` until the
+/// Task A: the streaming path holds the `RouterInflightLoadGuard` until the
 /// SSE pump finishes. Mid-stream the registry shows `inflight_count >= 1`;
 /// after the body drains it returns to 0. Counterpart to
 /// `streaming_load_guard_persists_for_body_lifetime` — both guards must
@@ -1486,7 +1489,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    let active_load = Arc::clone(&ctx.active_load);
+    let router_inflight_load = Arc::clone(&ctx.router_inflight_load);
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -1508,15 +1511,15 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     // still running, so the registry's per-request entry must remain.
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
-        active_load.inflight_count() >= 1,
+        router_inflight_load.inflight_count() >= 1,
         "registry inflight must be >= 1 mid-stream, got {}",
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
     );
     let w_id = WorkerId("w1".into());
     assert!(
-        active_load.prefill_load(&w_id) >= 1,
+        router_inflight_load.prefill_load(&w_id) >= 1,
         "prefill_load must be > 0 mid-stream, got {}",
-        active_load.prefill_load(&w_id),
+        router_inflight_load.prefill_load(&w_id),
     );
 
     // Drain the body — drives the SSE pump to completion.
@@ -1524,12 +1527,12 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert_eq!(
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
         0,
         "registry must be empty after stream drains",
     );
     assert_eq!(
-        active_load.prefill_load(&w_id),
+        router_inflight_load.prefill_load(&w_id),
         0,
         "prefill_load must be 0 after stream drains",
     );
@@ -1555,7 +1558,7 @@ async fn streaming_active_load_drops_on_client_disconnect() {
     )
     .await;
     let (ctx, body) = stream_chat(&worker.url).await;
-    let active_load = Arc::clone(&ctx.active_load);
+    let router_inflight_load = Arc::clone(&ctx.router_inflight_load);
 
     // Read one chunk to confirm the stream is live, then drop the body.
     use futures::StreamExt;
@@ -1570,7 +1573,7 @@ async fn streaming_active_load_drops_on_client_disconnect() {
     wait_for_metric(&ctx, &expected).await;
 
     assert_eq!(
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
         0,
         "client disconnect must drop the streaming pump's guards within one tick",
     );
@@ -1583,13 +1586,15 @@ async fn streaming_active_load_drops_on_client_disconnect() {
 /// `ApiError::StaleRequestExpired`.
 ///
 /// Wiring: build an `AppContext` with a short
-/// `stale_request_timeout` `ActiveLoadRegistry` + spawn a janitor
+/// `stale_request_timeout` `RouterInflightLoadRegistry` + spawn a janitor
 /// with sub-second cadence + dispatch to a slow upstream that takes
 /// longer than the timeout. The janitor sweeps before the upstream
 /// returns; cancellation fires; handler returns 504.
 #[tokio::test]
 async fn janitor_expiry_returns_504_stale_request_expired() {
-    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    use sgl_router::state::load_monitor::router_inflight_load::{
+        spawn_janitor, RouterInflightLoadRegistry,
+    };
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
     let worker =
@@ -1610,18 +1615,18 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     // Aggressive 50ms timeout: the janitor will sweep on the next
     // tick (every 20ms) and fire the cancellation token before the
     // upstream returns.
-    let active_load = ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+    let router_inflight_load = RouterInflightLoadRegistry::new(
+        Arc::new(sgl_router::state::load_monitor::router_inflight_load::SystemTimeClock),
         Duration::from_millis(50),
     );
-    let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
-    let ctx = Arc::new(AppContext::with_active_load(
+    let _janitor = spawn_janitor(Arc::clone(&router_inflight_load), Duration::from_millis(20));
+    let ctx = Arc::new(AppContext::with_router_inflight_load(
         cfg,
         tokenizers,
         proxy,
         registry,
         policies,
-        active_load,
+        router_inflight_load,
     ));
     let app = build_router(ctx);
 
@@ -1671,7 +1676,7 @@ async fn non_streaming_error_path_drops_active_load_guard() {
     drop(listener);
 
     let ctx = build_ctx_with_worker(&dead_url);
-    let active_load = Arc::clone(&ctx.active_load);
+    let router_inflight_load = Arc::clone(&ctx.router_inflight_load);
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -1692,7 +1697,7 @@ async fn non_streaming_error_path_drops_active_load_guard() {
     // Drain so any drop-on-body-end work runs.
     let _ = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
-        active_load.inflight_count(),
+        router_inflight_load.inflight_count(),
         0,
         "error path must drop the active-load guard",
     );

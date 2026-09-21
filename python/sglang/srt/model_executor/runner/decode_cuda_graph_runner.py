@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import logging
 import os
@@ -384,13 +385,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         # --- buffers ---------------------------------------------------
+        logits_buffer_rows = self._next_token_logits_buffer_capacity_rows(
+            self.max_num_token
+        )
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=self.max_num_token
+                self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
             ),
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
@@ -413,6 +417,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
+            ),
+            pp_proxy_dspark_hidden_size=(
+                self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
         )
         self.buffers.share_buffers()
@@ -467,6 +474,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
+        """Rows reserved for the largest shared logits output."""
+        return max_num_tokens
 
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
@@ -1457,6 +1468,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            output = self._process_output_after_replay(output, forward_batch)
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -1473,7 +1486,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
-            return LogitsProcessorOutput(
+            # Preserve extension fields produced by the eager output processor.
+            return dataclasses.replace(
+                output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -1481,7 +1496,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
-                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
@@ -1494,6 +1508,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     for k, v in output.tensors.items()
                 }
             )
+
+    def _process_output_after_replay(self, output, forward_batch: ForwardBatch):
+        """Optional eager tail executed after graph replay and inside its timer."""
+        return output
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
