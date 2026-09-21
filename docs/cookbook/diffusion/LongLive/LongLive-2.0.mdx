@@ -19,8 +19,6 @@ The model weights use the NVIDIA Open Model License. See the [paper](https://arx
 
 Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation) for installation instructions.
 
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
 ## 3. Deployment
 
 ```bash Command
@@ -44,7 +42,7 @@ sglang serve \
 
 `Rabinovich/LongLive-2.0-5B-Diffusers` is the Diffusers-format conversion of the official `Efficient-Large-Model/LongLive-2.0-5B` weights.
 
-Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected LongLive checkpoint.
+Intel Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected LongLive checkpoint.
 
 ```bash Command
 SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path Rabinovich/LongLive-2.0-5B-Diffusers
