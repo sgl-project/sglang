@@ -6,8 +6,7 @@ const { test } = require('node:test');
 const yaml = fs.readFileSync(path.join(__dirname, 'action.yml'), 'utf8');
 const script = yaml.split('        script: |\n')[1]
   .split('\n').map(line => line.replace(/^          /, '')).join('\n');
-// `require` and GITHUB_WORKSPACE mirror what actions/github-script hands the
-// script at runtime; the action pulls its label logic from .github/scripts.
+// `require` and GITHUB_WORKSPACE mirror what actions/github-script injects.
 const WORKSPACE = path.join(__dirname, '..', '..', '..');
 const run = new (Object.getPrototypeOf(async function () {}).constructor)(
   'github', 'context', 'core', 'process', 'require', script,

@@ -203,10 +203,8 @@ jobs:
         simulator-test-cpu,
         extra-test,
       ]
-    # Same `labeled` guard as check-changes. Without it a run started by an
-    # unrelated label finishes green with nothing executed, superseding the real
-    # run's failure on the commit; skipping it leaves the run `skipped`, which is
-    # what pr-states.yml's `isReal` reads.
+    # Without this guard an unrelated label starts a run that finishes green with
+    # nothing executed, over the real failure; `skipped` is what pr-states.yml reads.
     if: |
       always() &&
       (github.event_name != 'pull_request' ||
@@ -242,8 +240,7 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
-    # Same guard: a green job here would pull the run conclusion back to `success`.
-    # pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
+    # Same guard; pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&

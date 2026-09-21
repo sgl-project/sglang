@@ -1,10 +1,6 @@
 "use strict";
 
 /**
- * Resolve a PR's CI control labels into the axes the pipeline dispatches on.
- * `highest-priority` turns on the other three; the contribution guide says what
- * each one does.
- *
  * Labels come from the API, not `context.payload`: a rerun replays the original
  * event, so the payload carries the label set from when the run was created.
  */
@@ -14,9 +10,7 @@ const PARALLEL_STAGES = "parallel-stages";
 const MAX_CONCURRENCY = "max-concurrency";
 const HIGHEST_PRIORITY = "highest-priority";
 
-// A lookup failure returns no labels, which leaves every axis off -- fail-fast
-// on, stages serialized, shards throttled. Callers gate the whole run on this,
-// so a transient API error must not fail them.
+// Callers gate the whole run on this, so a transient API error must not fail them.
 async function readLabels(github, context) {
   try {
     return await fetchLabels(github, context);

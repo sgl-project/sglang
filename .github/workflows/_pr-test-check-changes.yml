@@ -153,11 +153,7 @@ jobs:
         id: parallel-mode
         run: |
           # `full=true` lifts the matrix-fanout throttle so each suite's
-          # max_parallel = size. Conditions:
-          #   1. Scheduled cron run.
-          #   2. run_all_tests run (manual full dispatch / release) -- a full
-          #      run should mirror the cron's parallelism, not just its test set.
-          #   3. A PR carrying `max-concurrency` (or `highest-priority`).
+          # max_parallel = size.
           FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             FULL=true
@@ -202,10 +198,7 @@ jobs:
         id: partitions
         run: |
           # Emit a single JSON output `partitions` keyed by suite name with
-          # {size, arr, max_parallel} fields per suite. Replaces the prior
-          # full/low max-parallel presets; `--full-parallel` keeps the
-          # `max-concurrency` PR / scheduled cron escape hatch.
-          # See scripts/ci/utils/compute_partitions.py.
+          # {size, arr, max_parallel} fields per suite.
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
             --partition-model-file /tmp/partition-model.json \
