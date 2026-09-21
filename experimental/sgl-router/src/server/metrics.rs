@@ -375,12 +375,12 @@ impl PolicySelectionFailureReason {
 
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
-pub enum ActiveLoadKind {
+pub enum RouterInflightLoadKind {
     PrefillTokens,
     DecodeBlocks,
 }
 
-impl ActiveLoadKind {
+impl RouterInflightLoadKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::PrefillTokens => "prefill_tokens",
@@ -408,7 +408,7 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
-    active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
+    router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -470,12 +470,12 @@ pub struct WorkerSnapshot {
     pub healthy: bool,
     /// Circuit breaker state code: 0=closed, 1=open, 2=half_open.
     pub cb_state: u8,
-    /// In-flight request count for this worker (`Worker::active_load`).
+    /// In-flight request count for this worker (`Worker::router_inflight_load`).
     pub inflight: i64,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct ActiveLoadKey {
+struct RouterInflightLoadKey {
     worker_url: String,
     kind: &'static str,
 }
@@ -657,12 +657,17 @@ impl MetricsRegistry {
 
     /// Set `sgl_router_active_load` for the given worker + kind. Replaces the
     /// previous value (gauge semantics).
-    pub fn set_active_load(&self, worker_url: &str, kind: ActiveLoadKind, value: i64) {
-        let key = ActiveLoadKey {
+    pub fn set_router_inflight_load(
+        &self,
+        worker_url: &str,
+        kind: RouterInflightLoadKind,
+        value: i64,
+    ) {
+        let key = RouterInflightLoadKey {
             worker_url: worker_url.to_owned(),
             kind: kind.as_str(),
         };
-        let mut guard = self.active_load.lock();
+        let mut guard = self.router_inflight_load.lock();
         let gauge = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicI64::new(0)))
@@ -984,13 +989,13 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // active_load gauge
+        // router_inflight_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
         );
         out.push_str("# TYPE sgl_router_active_load gauge\n");
-        let guard = self.active_load.lock();
-        let mut entries: Vec<(&ActiveLoadKey, i64)> = guard
+        let guard = self.router_inflight_load.lock();
+        let mut entries: Vec<(&RouterInflightLoadKey, i64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
@@ -1651,8 +1656,8 @@ mod tests {
     #[test]
     fn set_active_load_gauge_overwrites() {
         let reg = MetricsRegistry::new();
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 100);
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 250);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 100);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 250);
         let out = reg.render();
         assert!(out.contains(
             r#"sgl_router_active_load{worker_url="http://w:30000",kind="prefill_tokens"} 250"#,
