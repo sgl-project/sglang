@@ -9,6 +9,8 @@ under spec, see MambaPool). If the MambaPool allocation changes shape, update
 both the allocation and this expectation together.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -19,7 +21,10 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+    _pp_local_per_request_bytes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +67,16 @@ def _gdn_params(temporal_dtype=torch.float32):
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
+    def test_non_kimi_kda_model_supports_spec_replay(self):
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(is_kda=True)
+        )
+        configurator.hybrid_gdn_config = None
+
+        self.assertTrue(configurator._is_kda_model())
+        self.assertTrue(configurator._supports_replayssm_spec())
+
     def test_gdn_fold(self):
         # d 512 + normalized k 512 + scalar g 128 + d/k low parts 1024 = 2176
         self.assertEqual(
