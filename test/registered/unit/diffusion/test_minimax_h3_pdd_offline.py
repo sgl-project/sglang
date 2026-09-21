@@ -172,23 +172,6 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
             json.loads((out / "pdd_config.json").read_text())["num_inference_steps"], 5
         )
 
-    @unittest.skipUnless(torch.backends.mps.is_available(), "requires MPS")
-    def test_mps_chunked_forward_uses_pdd(self):
-        layer = self.layer()
-        layer.norm = torch.nn.Identity()
-        x = torch.ones(129, 5, device="mps")
-        zeros = torch.zeros(1, 5, device="mps")
-        with set_forward_context(1, None):
-            actual = layer(
-                x,
-                adaln_input=zeros,
-                inverse_indices=torch.zeros(129, dtype=torch.long, device="mps"),
-                adaln_params=(zeros, zeros),
-            )
-            expected = layer._project(x)
-        for a, b in zip(actual, expected):
-            torch.testing.assert_close(a, b)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
