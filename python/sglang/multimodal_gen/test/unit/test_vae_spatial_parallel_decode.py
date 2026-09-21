@@ -222,24 +222,6 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertFalse(vae.used_parallel_tiled_decode)
         torch.testing.assert_close(out, z)
 
-    def test_sliced_decode_runs_one_sample_at_a_time(self):
-        config = VAEConfig()
-        config.arch_config.temporal_compression_ratio = 1
-        config.arch_config.spatial_compression_ratio = 1
-        config.use_tiling = False
-        vae = _DispatchProbeVAE(config)
-        z = torch.randn(3, 1, 1, 2, 2)
-        batch_sizes = []
-        vae._decode = lambda z: batch_sizes.append(z.shape[0]) or z
-
-        torch.testing.assert_close(vae.decode(z), z)
-        self.assertEqual(batch_sizes, [3])
-
-        batch_sizes.clear()
-        vae.enable_slicing()
-        torch.testing.assert_close(vae.decode(z), z)
-        self.assertEqual(batch_sizes, [1, 1, 1])
-
     def test_spatial_alias_still_uses_spatial_shard_dispatch(self):
         self.assertTrue(is_spatial_shard_parallel_decode_mode("spatial"))
 

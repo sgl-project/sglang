@@ -108,7 +108,6 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         self.tile_sample_stride_num_frames = config.tile_sample_stride_num_frames
         self.blend_num_frames = config.blend_num_frames
         self.use_tiling = config.use_tiling
-        self.use_slicing = False
         self.use_temporal_tiling = config.use_temporal_tiling
         self.use_parallel_tiling = config.use_parallel_tiling
         self.use_parallel_decode = config.use_parallel_decode
@@ -157,8 +156,6 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         return DiagonalGaussianDistribution(latents)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        if self.use_slicing and z.shape[0] > 1:
-            return torch.cat([self.decode(z_slice) for z_slice in z.split(1)])
         batch_size, num_channels, num_frames, height, width = z.shape
         tile_latent_min_height = (
             self.tile_sample_min_height // self.spatial_compression_ratio
@@ -741,9 +738,6 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         self.use_tiling = use_tiling or self.use_tiling
         self.use_temporal_tiling = use_temporal_tiling or self.use_temporal_tiling
         self.use_parallel_tiling = use_parallel_tiling or self.use_parallel_tiling
-
-    def enable_slicing(self) -> None:
-        self.use_slicing = True
 
     def disable_tiling(self) -> None:
         r"""

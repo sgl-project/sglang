@@ -48,12 +48,13 @@ class TestDecodingStageParallelism(unittest.TestCase):
 
         self.assertEqual(component_use.target_dtype, torch.float16)
 
-    def test_decode_enables_vae_slicing_only_when_configured(self):
-        for vae_slicing in (False, True):
+    def test_vae_slicing_decodes_one_sample_at_a_time(self):
+        latents = torch.randn(3, 1, 1, 2, 2)
+        for vae_slicing, expected_batch_sizes in ((False, [3]), (True, [1, 1, 1])):
             vae = FakeVAE()
             vae.weight = nn.Parameter(torch.zeros(1))
-            vae.sliced = False
-            vae.enable_slicing = lambda vae=vae: setattr(vae, "sliced", True)
+            batch_sizes = []
+            vae.decode = lambda z: batch_sizes.append(z.shape[0]) or z
             stage = DecodingStage(vae)
             stage.scale_and_shift = lambda latents, server_args: latents
             server_args = SimpleNamespace(
@@ -69,10 +70,9 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
                 return_value=torch.device("cpu"),
             ):
-                stage.decode(
-                    torch.zeros(2, 1, 1, 2, 2), server_args, vae_dtype=torch.float32
-                )
-            self.assertIs(vae.sliced, vae_slicing)
+                image = stage.decode(latents, server_args, vae_dtype=torch.float32)
+            self.assertEqual(batch_sizes, expected_batch_sizes)
+            torch.testing.assert_close(image, (latents / 2 + 0.5).clamp(0, 1))
 
     def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
         self,

@@ -254,14 +254,6 @@ class DecodingStage(PipelineStage):
                         "by its VAE config.",
                         type(self.vae).__name__,
                     )
-            if server_args.pipeline_config.vae_slicing:
-                try:
-                    self.vae.enable_slicing()
-                except AttributeError:
-                    logger.warning(
-                        "--vae-slicing has no effect: %s does not support slicing.",
-                        type(self.vae).__name__,
-                    )
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
@@ -269,7 +261,16 @@ class DecodingStage(PipelineStage):
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
                 try:
-                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                    decode_fn = self._get_vae_decode_fn(vae, server_args)
+                    if server_args.pipeline_config.vae_slicing:
+                        decode_output = torch.cat(
+                            [
+                                _ensure_tensor_decode_output(decode_fn(z))
+                                for z in latents.split(1)
+                            ]
+                        )
+                    else:
+                        decode_output = decode_fn(latents)
                 except Exception as error:
                     if "out of memory" in str(error).lower():
                         # decode runs after denoising, so the DiT and encoders
