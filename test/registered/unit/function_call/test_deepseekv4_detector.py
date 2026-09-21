@@ -799,6 +799,89 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "required"):
                 FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
 
+    def test_opt_in_marker_policy_rejects_quoted_document_payload_without_rewriting(
+        self,
+    ):
+        value = 'python3 <<\'PY\'\ntext = """Notes.</think>"""\nprint(text)\nPY'
+        source = _weather_call(value)
+        for width in [1, 2, 7, len(source)]:
+            with self.subTest(width=width):
+                detector = DeepSeekV4Detector(
+                    strict_output=True, reject_reasoning_markers=True
+                )
+                arguments = ""
+                with self.assertRaisesRegex(ValueError, "Reasoning marker"):
+                    for start in range(0, len(source), width):
+                        result = detector.parse_streaming_increment(
+                            source[start : start + width], self.tools
+                        )
+                        arguments += "".join(call.parameters for call in result.calls)
+                    detector.finish(self.tools)
+                self.assertNotIn("</think>", arguments)
+        with self.assertRaisesRegex(ValueError, "Reasoning marker"):
+            DeepSeekV4Detector(
+                strict_output=True, reject_reasoning_markers=True
+            ).detect_and_parse(source, self.tools)
+        parsed = DeepSeekV4Detector(
+            strict_output=True, reject_reasoning_markers=False
+        ).detect_and_parse(source, self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
+
+    def test_opt_in_marker_policy_checks_nested_values_and_keys(self):
+        for arguments in [
+            {"city": "literal <think> text"},
+            {"city": [{"notes": "literal </think> text"}]},
+            {"city": {"</think>": "value"}},
+        ]:
+            for body in [
+                json.dumps(arguments),
+                _param("city", "false", json.dumps(arguments["city"])),
+            ]:
+                with self.subTest(arguments=arguments, body=body):
+                    with self.assertRaisesRegex(ValueError, "Reasoning marker"):
+                        DeepSeekV4Detector(
+                            strict_output=True, reject_reasoning_markers=True
+                        ).detect_and_parse(
+                            _wrapped(_invoke("get_weather", body)), self.tools
+                        )
+
+    def test_opt_in_marker_policy_preserves_clean_arguments(self):
+        source = _weather_call("San Francisco")
+        detector = DeepSeekV4Detector(
+            strict_output=True,
+            validate_tool_schema=True,
+            reject_reasoning_markers=True,
+        )
+        arguments = ""
+        for character in source:
+            result = detector.parse_streaming_increment(character, self.tools)
+            arguments += "".join(call.parameters for call in result.calls)
+        detector.finish(self.tools)
+        self.assertEqual(json.loads(arguments), {"city": "San Francisco"})
+
+    def test_opt_in_marker_policy_does_not_filter_ordinary_text(self):
+        text = "Literal `<think>` and `</think>` in an explanation."
+        result = DeepSeekV4Detector(
+            strict_output=True, reject_reasoning_markers=True
+        ).detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
+    def test_opt_in_marker_policy_requires_strict_mode_and_wires_public_parser(self):
+        with self.assertRaisesRegex(ValueError, "requires strict"):
+            DeepSeekV4Detector(strict_output=False, reject_reasoning_markers=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
+                "SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS": "1",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "Reasoning marker"):
+                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
+                    _weather_call("quoted '</think>'")
+                )
+
 
 if __name__ == "__main__":
     import unittest

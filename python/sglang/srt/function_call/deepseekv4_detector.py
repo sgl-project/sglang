@@ -148,6 +148,11 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     calls that violate the provided tool schema. It requires strict output,
     is disabled by default, and resolves only local schema references.
     A rejected generation is not repaired into a guessed tool invocation.
+    SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS=1 optionally rejects
+    literal <think> / </think> text anywhere in parsed arguments, including
+    quoted code and document strings. It requires strict output and defaults
+    off so legitimate protocol examples remain usable. It does not inspect
+    artifacts produced by executing a command, and never edits argument text.
 
     Reference: DeepSeek V4 format specification
     """
@@ -157,6 +162,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         strict_output: bool | None = None,
         *,
         validate_tool_schema: bool | None = None,
+        reject_reasoning_markers: bool | None = None,
     ):
         super().__init__()
         self.bot_token = "<｜DSML｜tool_calls>"
@@ -175,6 +181,15 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         if self.validate_tool_schema and not self.strict_output:
             raise ValueError(
                 "DeepSeek V4 tool schema validation requires strict output"
+            )
+        self.reject_reasoning_markers = (
+            envs.SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS.get()
+            if reject_reasoning_markers is None
+            else reject_reasoning_markers
+        )
+        if self.reject_reasoning_markers and not self.strict_output:
+            raise ValueError(
+                "DeepSeek V4 argument marker rejection requires strict output"
             )
         self._schema_validators: dict[str, Draft202012Validator] = {}
         self._quote_history: list[str] = []
@@ -223,6 +238,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 for name, value in parameters.items():
                     if isinstance(value, str):
                         _validate_string_parameter(name, value, complete=True)
+                self._check_argument_markers("arguments", parameters)
                 return super()._parse_parameters_from_xml(invoke_content, False)
             last_match_end = 0
             names: set[str] = set()
@@ -257,17 +273,37 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         if name in names:
             raise ValueError(f"Duplicate DSML parameter {name!r}")
         names.add(name)
+        self._check_argument_markers(name, name)
         if string_flag not in {"true", "false"}:
             raise ValueError(f"Invalid DSML string flag for parameter {name!r}")
         if string_flag == "true":
             _validate_string_parameter(name, value, complete=complete)
+            self._check_argument_markers(name, value)
         elif complete:
             try:
-                _strict_json_loads(value.strip())
+                parsed = _strict_json_loads(value.strip())
             except ValueError as error:
                 raise ValueError(
                     f"Invalid JSON in DSML non-string parameter {name!r}"
                 ) from error
+            self._check_argument_markers(name, parsed)
+
+    def _check_argument_markers(self, name: str, value: object) -> None:
+        if not self.reject_reasoning_markers:
+            return
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                if "<think>" in item or "</think>" in item:
+                    raise ValueError(
+                        f"Reasoning marker in DeepSeek V4 tool argument {name!r}"
+                    )
+            elif isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
 
     def _validate_arguments(
         self,
@@ -291,6 +327,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 ) from error
             if not isinstance(parameters, dict):
                 raise ValueError(f"DSML arguments for tool {name!r} must be an object")
+            self._check_argument_markers(name, parameters)
             if self.validate_tool_schema:
                 self._validate_against_tool_schema(name, parameters, tools)
 
@@ -386,6 +423,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         detector = type(self)(
             strict_output=self.strict_output,
             validate_tool_schema=self.validate_tool_schema,
+            reject_reasoning_markers=self.reject_reasoning_markers,
         )
         parsed = detector.parse_streaming_increment(text, tools)
         tail = detector.finish(tools)
