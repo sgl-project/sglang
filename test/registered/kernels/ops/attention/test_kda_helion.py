@@ -28,6 +28,7 @@ else:
     )
     from sglang.kernels.ops.attention.helion.kda_prefill import (
         _intra_matrices_wide,
+        _l2norm_qk,
     )
     from sglang.kernels.ops.attention.helion.kda_prefill import (
         chunk_kda as helion_chunk_kda,
@@ -705,6 +706,7 @@ def _compare_prefill(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    beta_is_raw: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.size(-1)
@@ -739,7 +741,8 @@ def _compare_prefill(
     k_rows = reference_k.view(batch * tokens, heads, key_dim)
     v_rows = v.view(batch * tokens, heads, value_dim).float()
     gate_rows = reference_gate.view(batch * tokens, heads, key_dim)
-    beta_rows = beta.view(batch * tokens, heads).float()
+    reference_beta = beta.float().sigmoid() if beta_is_raw else beta
+    beta_rows = reference_beta.view(batch * tokens, heads).float()
     out_rows = reference_out.view(batch * tokens, heads, value_dim)
 
     if cu_seqlens is None:
@@ -810,6 +813,7 @@ def _compare_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        beta_is_raw=beta_is_raw,
     )
 
     assert helion_out.data_ptr() == helion_v.data_ptr()
@@ -849,6 +853,158 @@ def test_fixed_partial_prefill_and_state_pool_contract() -> None:
 
     untouched = torch.tensor([0, 2, 4], device="cuda")
     assert torch.equal(helion_state[untouched], state[untouched])
+
+
+def test_raw_beta_prefill_contract() -> None:
+    torch.manual_seed(811)
+    batch, tokens, heads, key_dim, value_dim = 2, 17, 2, 32, 32
+    q = torch.randn(batch, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+    # Keep the unnormalized recurrence numerically contractive while still
+    # exercising the no-QK-L2-normalization path. Unit-scale random keys make
+    # (I - beta * k k^T) expansive and obscure the raw-beta contract with
+    # exponentially amplified BF16 round-off.
+    k = torch.randn_like(q) * 0.05
+    v = torch.randn(
+        batch, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+    # Keep the recurrent decay contractive so the raw-beta check measures the
+    # sigmoid conversion instead of amplifying BF16 round-off exponentially.
+    gate = -torch.rand_like(q) * 0.2
+    raw_beta = torch.linspace(
+        -2,
+        2,
+        steps=batch * tokens * heads,
+        device="cuda",
+    ).reshape(batch, tokens, heads)
+    indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    state = torch.randn(5, heads, value_dim, key_dim, device="cuda") * 0.01
+
+    _compare_prefill(
+        q,
+        k,
+        v,
+        gate,
+        raw_beta,
+        state,
+        indices,
+        beta_is_raw=True,
+    )
+
+
+@pytest.mark.parametrize("is_varlen", [False, True], ids=["fixed", "varlen"])
+def test_single_token_prefill_does_not_poison_later_shapes(
+    is_varlen: bool,
+) -> None:
+    """Keep a size-one first trace from specializing later prefill calls."""
+    torch.manual_seed(991)
+    heads, key_dim, value_dim = 2, 32, 32
+    a_log = torch.full([heads], -2.0, device="cuda")
+    dt_bias = torch.zeros(heads * key_dim, device="cuda")
+    indices = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    _l2norm_qk.reset()
+    try:
+        for tokens in (1, 3):
+            q = torch.randn(
+                1, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16
+            )
+            k = torch.randn_like(q)
+            v = torch.randn(
+                1, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16
+            )
+            gate = torch.randn_like(q) * 0.2
+            beta = torch.rand(1, tokens, heads, device="cuda")
+            state = (
+                torch.randn(
+                    1, heads, value_dim, key_dim, device="cuda", dtype=torch.float32
+                )
+                * 0.01
+            )
+            cu_seqlens = (
+                torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+                if is_varlen
+                else None
+            )
+
+            _compare_prefill(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                state,
+                indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+                A_log=a_log,
+                dt_bias=dt_bias,
+            )
+    finally:
+        _l2norm_qk.reset()
+
+
+@pytest.mark.parametrize("is_varlen", [False, True], ids=["fixed", "varlen"])
+def test_prefill_ignores_padded_gate_rows(is_varlen: bool) -> None:
+    torch.manual_seed(997)
+    tokens, padded_tokens, heads, key_dim, value_dim = 51, 64, 2, 32, 32
+    q = torch.randn(1, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16)
+    gate = -torch.rand(
+        1, padded_tokens, heads, key_dim, device="cuda", dtype=torch.float32
+    )
+    beta = torch.rand(1, padded_tokens, heads, device="cuda")
+    gate[:, tokens:] = 1e4
+    beta[:, tokens:] = 1e4
+    cu_seqlens = (
+        torch.tensor([0, 17, tokens], device="cuda", dtype=torch.int32)
+        if is_varlen
+        else None
+    )
+    indices = (
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        if is_varlen
+        else torch.zeros(1, device="cuda", dtype=torch.int32)
+    )
+    initial_state = torch.randn(
+        indices.numel(),
+        heads,
+        value_dim,
+        key_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    def run(
+        gate_input: torch.Tensor, beta_input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = initial_state.clone()
+        output, chunks = helion_chunk_kda(
+            q,
+            k,
+            v.clone(),
+            gate_input,
+            beta_input,
+            initial_state=state,
+            initial_state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            output_intermediate_states=True,
+        )
+        return output, chunks, state
+
+    trimmed = run(gate[:, :tokens], beta[:, :tokens])
+    padded = run(gate, beta)
+    for padded_value, trimmed_value in zip(padded, trimmed):
+        assert torch.equal(padded_value, trimmed_value)
+
+    short_inputs = (
+        (gate[:, : tokens - 1], beta[:, :tokens]),
+        (gate[:, :tokens], beta[:, : tokens - 1]),
+    )
+    for short_gate, short_beta in short_inputs:
+        with pytest.raises(ValueError, match="g and beta must cover every q token"):
+            run(short_gate, short_beta)
 
 
 def test_prefill_uses_stable_subchunk_gates() -> None:

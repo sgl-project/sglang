@@ -14,7 +14,7 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_lora
+from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -173,6 +173,7 @@ class SchedulerLoadInquirer:
         prefill_bootstrap = prefill_inflight = 0
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
+        num_prealloc_ready_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
@@ -184,11 +185,13 @@ class SchedulerLoadInquirer:
             decode_retracted = len(
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
-            decode_prealloc_ready = sum(
-                1
+            ready_reqs = [
+                decode_req.req
                 for decode_req in self.get_disagg_decode_prealloc_queue().queue
                 if decode_req.waiting_for_input
-            )
+            ]
+            decode_prealloc_ready = len(ready_reqs)
+            num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
@@ -212,7 +215,9 @@ class SchedulerLoadInquirer:
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
-            dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
+            dp_rank=int(get_parallel().dp_rank)
+            if get_parallel().dp_rank is not None
+            else 0,
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
@@ -220,6 +225,7 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
+            num_prealloc_ready_tokens=num_prealloc_ready_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=721, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=687, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=1450, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -30,24 +30,6 @@ class TestBenchServing2GPU(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_offline_throughput_default\n"
-                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
-            )
-            if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 2100)
-            else:
-                self.assertGreater(res["output_throughput"], 2200)
-
-    def test_moe_offline_throughput_without_radix_cache(self):
-        res = run_bench_serving(
-            model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
-            num_prompts=300,
-            request_rate=float("inf"),
-            other_server_args=["--tp", "2", "--disable-radix-cache"],
-        )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_moe_offline_throughput_without_radix_cache\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():

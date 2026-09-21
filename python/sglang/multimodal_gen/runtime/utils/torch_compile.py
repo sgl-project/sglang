@@ -8,7 +8,6 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import get_compiler_backend
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -20,13 +19,38 @@ def maybe_enable_inductor_compute_comm_overlap() -> None:
         pass
 
 
-def build_torch_compile_kwargs(*, mode: str | None) -> dict[str, object]:
+def build_torch_compile_kwargs(
+    *,
+    mode: str | None,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
+) -> dict[str, object]:
     compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-    if current_platform.is_npu():
+    if current_platform.is_out_of_tree():
+        backend = current_platform.get_compile_backend(mode)
+        compile_kwargs["backend"] = backend
+        if module is not None:
+            options = current_platform.get_compile_options(module)
+            if options is not None:
+                compile_kwargs["options"] = options
+        if (
+            "options" not in compile_kwargs
+            and backend == "inductor"
+            and mode is not None
+        ):
+            compile_kwargs["mode"] = mode
+    elif current_platform.is_npu():
+        from sglang.srt.utils.common import get_compiler_backend
+
         compile_kwargs["backend"] = get_compiler_backend()
         compile_kwargs["dynamic"] = False
     elif mode is not None:
         compile_kwargs["mode"] = mode
+    if (
+        enable_inductor_compute_comm_overlap
+        and compile_kwargs.get("backend", "inductor") == "inductor"
+    ):
+        maybe_enable_inductor_compute_comm_overlap()
     return compile_kwargs
 
 
@@ -43,6 +67,24 @@ def resolve_torch_compile_mode(
     if mode:
         return mode
     return default
+
+
+def resolve_torch_compile_kwargs(
+    *env_names: str,
+    config: object | None = None,
+    default: str,
+    module: nn.Module | None = None,
+    enable_inductor_compute_comm_overlap: bool = False,
+) -> tuple[dict[str, object], str | None]:
+    mode = None
+    if not current_platform.is_npu():
+        mode = resolve_torch_compile_mode(*env_names, config=config, default=default)
+    compile_kwargs = build_torch_compile_kwargs(
+        mode=mode,
+        module=module,
+        enable_inductor_compute_comm_overlap=enable_inductor_compute_comm_overlap,
+    )
+    return compile_kwargs, mode
 
 
 def compile_matching_submodules(

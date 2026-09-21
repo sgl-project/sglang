@@ -60,6 +60,7 @@ from sglang.kernels.ops.diffusion.common.numerics import (
     round_bf16_to_fp32,
     rsqrt_approx_f32,
 )
+from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -171,7 +172,11 @@ def can_use_fused_rmsnorm_scale_shift(
     shift: torch.Tensor,
 ) -> bool:
     return (
-        x.dtype is torch.bfloat16
+        # ROCm cannot compile the inline PTX above: LLVM makes the unusable
+        # `=f` constraint a fatal error that kills the process, so reject
+        # before the first launch rather than rely on the caller's fallback.
+        is_cuda()
+        and x.dtype is torch.bfloat16
         and x.is_cuda
         and x.dim() == 3
         and x.is_contiguous()

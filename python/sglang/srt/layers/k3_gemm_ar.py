@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import RowParallelLinear
@@ -33,7 +34,6 @@ def _init() -> bool:
     _INITIALIZED = True
     if not envs.SGLANG_K3_GEMM_AR.get():
         return False
-    from sglang.srt.runtime_context import get_parallel
 
     world_size = get_parallel().tp_size
     if not (2 <= world_size <= 8):
@@ -56,7 +56,6 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     if not _init():
         return
     from sglang.kernels.ops.kimi_k3 import gemm_ar as mod
-    from sglang.srt.distributed.parallel_state import get_tp_group
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
@@ -74,7 +73,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     mod.init(
         world_size=world_size,
         rank=parallel.tp_rank,
-        group=get_tp_group().cpu_group,
+        group=get_parallel().tp_group.cpu_group,
         k=weight.shape[1],
     )
     # per-K compile + base-address stash, pre-capture
