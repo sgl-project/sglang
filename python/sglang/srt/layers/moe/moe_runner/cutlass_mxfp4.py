@@ -45,8 +45,10 @@ def fused_experts_none_to_cutlass_mxfp4(
     from sglang.srt.layers.moe.cutlass_mxfp4_moe import cutlass_mxfp4_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    # The second GEMM's input comes straight from silu_and_mul over a [gate; up] buffer, so
-    # the clamped-swiglu family (gemm1_alpha / limits, GPT-OSS) has no path here.
+    # The second GEMM's input comes straight from silu_and_mul over a [gate; up] buffer. The
+    # plain swiglu limit (DeepSeek-V4's pre-SiLU rail) is forwarded, but the Baling GPT-OSS
+    # family's gemm1_alpha / gemm1_clamp_limit pair is not: alpha rescales the gate and
+    # gemm1_clamp_limit clamps *after* the SiLU, neither of which silu_and_mul_clamp expresses.
     if (
         runner_config.activation != "silu"
         or not runner_config.is_gated
@@ -73,5 +75,6 @@ def fused_experts_none_to_cutlass_mxfp4(
         problem_sizes1=quant_info.problem_sizes1,
         problem_sizes2=quant_info.problem_sizes2,
         routed_scaling_factor=runner_config.routed_scaling_factor or 1.0,
+        swiglu_limit=runner_config.swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)

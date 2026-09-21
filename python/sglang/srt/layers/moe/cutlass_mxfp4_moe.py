@@ -22,6 +22,19 @@ from sglang.kernels.ops.moe.mxfp4_moe_grouped_metadata import (
 )
 
 
+def park_foreign_experts(topk_ids: torch.Tensor, *, num_local_experts: int) -> torch.Tensor:
+    """Move the dispatcher's ``-1`` pad to the sentinel the reorder kernels test for.
+
+    Under EP the standard dispatcher hands this rank local expert ids and pads the
+    remaining top-k slots of a token with ``-1``. Both reorder kernels skip a slot by
+    testing ``expert_id != num_local_experts``, so a raw ``-1`` is *not* skipped and the
+    gather follows it to row -1 of the pooled buffer. Remapping to ``num_local_experts``
+    is also what the metadata kernel expects: ids outside ``[0, num_experts)`` -- parked
+    ids included -- leave ``src2dst`` at -1.
+    """
+    return torch.where(topk_ids == -1, num_local_experts, topk_ids).to(torch.int32)
+
+
 def cutlass_mxfp4_moe(
     *,
     hidden_states: torch.Tensor,
@@ -35,6 +48,7 @@ def cutlass_mxfp4_moe(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     routed_scaling_factor: float,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Runs one MXFP4 MoE layer: gather -> grouped GEMM -> SiLU -> grouped GEMM -> scatter.
 
@@ -46,6 +60,12 @@ def cutlass_mxfp4_moe(
     :param expert_offsets: [E + 1] int32 scratch, filled here.
     :param problem_sizes1: [E, 3] int32 scratch, filled here.
     :param problem_sizes2: [E, 3] int32 scratch, filled here.
+    :param routed_scaling_factor: applied once per token by the post-reorder kernel.
+    :param swiglu_limit: clamps gate to <= L and up to [-L, L] before the SiLU, matching
+        the reference MLP. DeepSeek-V4 sets it (10.0) and every other DSV4 MoE path
+        forwards it, so dropping it here both diverges from the checkpoint's semantics
+        and, on the rare row whose pre-activation exceeds the rail, injects a
+        deterministic error into the layer output.
     """
     num_local_experts = w13_weight.size(0)
     num_tokens = hidden_states.size(0)
@@ -55,7 +75,7 @@ def cutlass_mxfp4_moe(
     device = hidden_states.device
     rows = num_tokens * topk
 
-    topk_ids = topk_ids.to(torch.int32)
+    topk_ids = park_foreign_experts(topk_ids, num_local_experts=num_local_experts)
     if num_local_experts > MXFP4_MOE_FUSED_METADATA_MAX_EXPERTS:
         raise NotImplementedError(
             "moe_runner_backend=cutlass_mxfp4 scans the experts in one CTA, so it caps at "
@@ -101,7 +121,12 @@ def cutlass_mxfp4_moe(
     )
 
     down_input = torch.empty((rows, intermediate), device=device, dtype=torch.bfloat16)
-    silu_and_mul(gateup, down_input)
+    if swiglu_limit is None:
+        silu_and_mul(gateup, down_input)
+    else:
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+
+        silu_and_mul_clamp(gateup, down_input, swiglu_limit)
 
     down_output = pool
     mxfp4_a16_moe_mm(
