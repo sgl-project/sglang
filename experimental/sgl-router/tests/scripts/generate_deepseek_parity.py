@@ -25,6 +25,10 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
 ROOT = Path(__file__).resolve().parents[1] / "fixtures/deepseek"
 MODELS = {
+    "v41": (
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "dba1be0a40aa45a94ad051997016db3960a90277",
+    ),
     "v4": ("deepseek-ai/DeepSeek-V4-Flash", "60d8d70770c6776ff598c94bb586a859a38244f1"),
 }
 
@@ -45,12 +49,18 @@ class RecordingTokenizer:
 def main():
     ROOT.mkdir(exist_ok=True)
     for family, (model, revision) in MODELS.items():
-        path = snapshot_download(model, revision=revision, local_files_only=True)
+        path = snapshot_download(
+            model,
+            revision=revision,
+            local_files_only=True,
+            allow_patterns=["config.json", "tokenizer*.json"],
+        )
         tok = RecordingTokenizer(
             AutoTokenizer.from_pretrained(path, local_files_only=True)
         )
         server = object.__new__(OpenAIServingChat)
         server.chat_encoding_spec = "ds" + family
+        server._dsv41_default_reasoning_effort = "high"
         server.tokenizer_manager = SimpleNamespace(tokenizer=tok)
         server.template_manager = SimpleNamespace(
             jinja_template_content_format="string"

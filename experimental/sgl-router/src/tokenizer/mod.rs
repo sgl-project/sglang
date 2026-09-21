@@ -85,7 +85,7 @@ impl TokenizerRegistry {
             tracing::warn!(model = %m.id,
                 "router-generated input_ids forwarding enabled: requires matching worker model \
                  files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
-                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
+                 and default SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
                  (including --tool-call-parser deepseekv32), content-format detection, and \
                  conversation-template stop strings are not replicated. Use \
                  --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
@@ -357,7 +357,8 @@ mod tests {
             .render(&request)
             .unwrap()
             .contains("<|open|>message"));
-        assert!(resolve("deepseek_v41").is_none());
+        assert_eq!(resolve("deepseek_v41").unwrap().render(&serde_json::json!({"messages":[{"role":"system","content":"S"},{"role":"user","content":"hi"}]})).unwrap(),
+            "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>hi<｜Assistant｜></think>");
         assert_eq!(
             resolve("deepseek_v4").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
