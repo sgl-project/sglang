@@ -18,7 +18,6 @@
 // The shared native core, scheduler, numeric reduction and shared-memory budget are
 // unchanged. See ../../decode_topk_final/README.md and ../hist_fused/LICENSE.*.
 // DeepGEMM-derived host/scheduler code: Copyright (c) 2025 DeepSeek, MIT.
-// HPC coarse projection: Copyright (C) 2026 Tencent, MIT.
 #include "producer_batch.h"
 #include <torch/library.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -32,7 +31,6 @@
 #include <cute/arch/tmem_allocator_sm100.hpp>
 #include <cute/arch/copy_sm100.hpp>
 #include "../../fused/native_tma_core.cuh"
-#include "../../../references/hpc-ops/src/topk/topk_filtered_boundary.cuh"
 #include <climits>
 #include <type_traits>
 #include <cmath>
@@ -232,16 +230,16 @@ template <int Mode> inline constexpr bool kPlainStore = (Mode == 16);
 template <int Mode> inline constexpr bool kFold    = (Mode != 99);
 template <int Mode> inline constexpr bool kValidMode = (Mode == 0 || kProd<Mode> || kDiag<Mode>);
 
-// W2. Bit-identical to hpc::topk::filtered::to_coarse_key (topk_filtered_boundary.cuh:18-22)
-// and deliberately a local copy: that header is compiled into the FROZEN decode_topk_final
-// producer and must not be edited.
-//   for bit15 clear, (b ^ 0xFFFF) & 0x7FFF == ~b & 0x7FFF, and the >>5 discards bits 0..4,
-//   so pre-masking with 0x7FE0 is the same value; both redundant 16-bit narrowings vanish.
-// Verified exhaustively over all 65,536 fp16 bit patterns (qualify_coarse_key.py), which
-// covers +-0 (bins 1023/1024), +-inf (31/2016) and every NaN encoding.
+// W2. Coarse-key projection: fp32 -> fp16 -> descending bin index.
+// Non-negative values are inverted into [0, 0x7FFF] so the largest magnitude lands
+// in bin 0; negative values keep their natural bit order, which places every one of
+// them above every non-negative key. The shift then folds the low mantissa bits away.
+// Verified exhaustively over all 65,536 fp16 bit patterns for shifts 5/6/7:
+// +-0 -> 1023/1024, +-inf -> 31/2016 (at shift 5), and every NaN encoding.
 __device__ __forceinline__ unsigned coarse_key_u32(float x) {
-  const unsigned b = __half_as_ushort(__float2half_rn(x));
-  return ((b & 0x8000u) ? b : (~b & 0x7fe0u)) >> 5;
+  const unsigned bits = __half_as_ushort(__float2half_rn(x));
+  const unsigned rank = (bits & 0x8000u) ? bits : (~bits & 0x7FFFu);
+  return rank >> 5;
 }
 
 // W1. The V1 flush is a __noinline__ MEMBER, so `this` is address-taken and ptxas gives

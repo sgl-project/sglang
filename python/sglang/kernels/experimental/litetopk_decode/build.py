@@ -111,15 +111,11 @@ def _build_producer(
     result = Path(
         load(
             name=namespace,
-            sources=[
-                str(source),
-                str(HERE / "references/hpc-ops/src/utils/utils.cc"),
-            ],
+            sources=[str(source)],
             build_directory=str(directory),
             extra_include_paths=[
                 str(include),
                 str(HERE),
-                str(HERE / "references/hpc-ops"),
             ],
             extra_cflags=flags + ["-I" + str(path) for path in host_includes],
             extra_cuda_cflags=flags

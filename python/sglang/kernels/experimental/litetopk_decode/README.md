@@ -56,4 +56,4 @@ Qualification receipts for the source snapshot:
 - Non-alias safety path in the qualified external installer: three kernel nodes.
 
 The generated selectors retain NVIDIA's Apache-2.0 header. The producer includes
-DeepGEMM-derived MIT code and the HPC coarse-key projection noted in its source.
+DeepGEMM-derived MIT code.

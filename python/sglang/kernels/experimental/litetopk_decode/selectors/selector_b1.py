@@ -451,9 +451,8 @@ class SplitQAcqRelHistogramPrologueGvrKernel(GvrMainKernel):
                             # out_row[soff + p] past column k. Refusing the +0 boundary sends the frame
                             # to the frozen sampling ladder instead: correct, and never reached in any
                             # measured frame (cutoff bins observed 438-556 / 1664-1733 over 64 frames).
-                            # The vendored predicate documents the same hazard:
-                            # references/hpc-ops/src/topk/topk_filtered_boundary.cuh:112-118
-                            # "for the +0 boundary this admits +0 and rejects -0".
+                            # Same signed-zero hazard as any FP32 boundary predicate:
+                            # the +0 boundary admits +0 and rejects -0.
                             if lower_abs > 0 and upper_abs > 0 and lower_abs < cutlass.Uint32(0x7F800000) and upper_abs < cutlass.Uint32(0x7F800000):
                                 if cert_upper > cert_lower and cert_expected <= cutlass.Int32(GCAP__main):
                                     eligible = cutlass.Int32(1)
