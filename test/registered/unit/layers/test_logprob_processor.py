@@ -2,7 +2,7 @@
 
 Both DECODE producers call ``get_token_ids_logprobs(..., no_copy_to_cpu=True)``
 unconditionally (``OutputLogprobProcessor.compute_logprobs`` for the normal
-decode path, ``compute_spec_v2_logprobs`` for spec v2), and a batch is
+decode path, ``compute_spec_logprobs`` for speculative decoding), and a batch is
 processed whenever ANY request asks for token-ids logprobs -- requests that
 did not ask contribute a ``None`` entry. Every val entry must stay
 tensor-typed: the non-overlap result path
@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     LogprobStage,
     get_token_ids_logprobs_raw,
@@ -26,7 +27,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDecodeTokenIdsLogprobsMixedBatch(CustomTestCase):
@@ -60,19 +61,15 @@ class TestDecodeTokenIdsLogprobsMixedBatch(CustomTestCase):
         # The REAL non-overlap consumer: move_logprobs_to_cpu calls
         # `v.tolist()` on every val entry unconditionally.
         vals, idxs = self._mixed_vals_idxs()
-        logits_output = SimpleNamespace(
-            next_token_logprobs=None,
-            input_token_logprobs=None,
-            next_token_top_logprobs_val=None,
-            next_token_top_logprobs_idx=None,
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=None,
             next_token_token_ids_logprobs_val=vals,
             next_token_token_ids_logprobs_idx=idxs,
         )
-        batch = SimpleNamespace(return_logprob=True)
 
         SchedulerBatchResultProcessor.move_logprobs_to_cpu(
-            object.__new__(SchedulerBatchResultProcessor),
-            batch=batch,
+            None,
+            batch=SimpleNamespace(return_logprob=True),
             logits_output=logits_output,
         )
 
