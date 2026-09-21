@@ -994,6 +994,13 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Dequantize a block-fp8 dense weight to bf16 at load so oneDNN serves the
+    # GEMM instead of the block-fp8 kernel. Opt-in for A/B.
+    SGLANG_OPT_XPU_FP8_TO_BF16_GEMM = EnvBool(False)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
