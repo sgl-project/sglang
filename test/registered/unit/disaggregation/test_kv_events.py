@@ -8,6 +8,7 @@ the router can subscribe per replica (the `dp_size` it reads from
 """
 
 import unittest
+from typing import Optional
 
 import msgspec
 
@@ -25,6 +26,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _SharedBlockStored(msgspec.Struct, tag="BlockStored"):
+    """Consumer contract: nullable metadata is required, not defaulted."""
+
+    block_hashes: list[int]
+    parent_block_hash: Optional[int]
+    token_ids: list[int]
+    block_size: int
+    lora_id: Optional[int]
+    medium: Optional[str]
+    lora_name: Optional[str]
+    extra_keys: Optional[list[Optional[tuple[str]]]] = None
+
+
+class _LegacyBlockStored(msgspec.Struct, tag="BlockStored"):
+    block_hashes: list[int]
+    parent_block_hash: Optional[int]
+    token_ids: list[int]
+    block_size: int
+    lora_id: Optional[int]
+    medium: Optional[str] = None
+    cache_salt: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -193,6 +218,7 @@ class TestBlockStoredWireFormat(CustomTestCase):
             token_ids=[1, 2],
             block_size=2,
             lora_id=None,
+            lora_name=None,
             medium=StorageMedium.GPU,
             **extra,
         )
@@ -211,8 +237,43 @@ class TestBlockStoredWireFormat(CustomTestCase):
                 "block_size",
                 "lora_id",
                 "medium",
+                "lora_name",
             },
         )
+
+    def test_shared_consumer_decodes_required_nullable_fields(self):
+        event = self._event()
+        event.medium = None
+        encoded = msgspec.msgpack.encode(event)
+        wire = msgspec.msgpack.decode(encoded)
+        self.assertIsNone(wire["medium"])
+        self.assertIsNone(wire["lora_name"])
+        decoded = msgspec.msgpack.decode(encoded, type=_SharedBlockStored)
+        self.assertEqual(decoded.block_hashes, event.block_hashes)
+        self.assertIsNone(decoded.lora_name)
+        self.assertIsNone(decoded.extra_keys)
+
+        removed = BlockRemoved(block_hashes=[123], medium=None)
+        self.assertEqual(
+            msgspec.msgpack.decode(msgspec.msgpack.encode(removed)),
+            {"type": "BlockRemoved", "block_hashes": [123], "medium": None},
+        )
+
+    def test_extra_keys_round_trip_and_legacy_consumer_ignores_them(self):
+        event = self._event(
+            cache_salt="tenant-a",
+            session_id="session-a",
+            extra_keys=[("tenant-a",)],
+        )
+        encoded = msgspec.msgpack.encode(event)
+        wire = msgspec.msgpack.decode(encoded)
+        self.assertEqual(wire["extra_keys"], [["tenant-a"]])
+        shared = msgspec.msgpack.decode(encoded, type=_SharedBlockStored)
+        self.assertEqual(shared.extra_keys, [("tenant-a",)])
+        legacy = msgspec.msgpack.decode(encoded, type=_LegacyBlockStored)
+        self.assertEqual(legacy.block_hashes, event.block_hashes)
+        self.assertEqual(legacy.cache_salt, "tenant-a")
+        self.assertEqual(legacy.session_id, "session-a")
 
     def test_salt_and_session_are_named_fields(self):
         event = self._event(cache_salt="tenant-a", session_id="session-a")

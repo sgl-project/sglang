@@ -248,8 +248,8 @@ class KVCacheEvent(
     """Base class for all KV cache-related events.
 
     Events are tagged msgpack maps: ``type`` carries the class name and every
-    other key is a field name. Optional fields left at ``None`` are omitted, so
-    adding an optional field never changes the shape an older consumer sees.
+    other key is a field name. Fields equal to their defaults are omitted;
+    required nullable fields remain on the wire even when their value is None.
     This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
     such as Dynamo decodes both engines with one code path.
 
@@ -281,7 +281,13 @@ class BlockStored(KVCacheEvent):
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
-    medium: Optional[str] = None
+    medium: Optional[str]
+    # Always emit this nullable field for consumers sharing vLLM's schema.
+    # Populating the adapter name requires namespaced LoRA event hashes too.
+    lora_name: Optional[str]
+    # One entry per block_hashes item. The prefix's first block carries its
+    # cache salt; subsequent blocks inherit the namespace through the chain.
+    extra_keys: Optional[list[Optional[tuple[Any, ...]]]] = None
     # Salt of the request that stored these blocks. Block hashes are already
     # namespaced by it; consumers index the emitted hashes rather than
     # recompute them.
@@ -293,7 +299,7 @@ class BlockStored(KVCacheEvent):
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
-    medium: Optional[str] = None
+    medium: Optional[str]
 
 
 class AllBlocksCleared(KVCacheEvent):

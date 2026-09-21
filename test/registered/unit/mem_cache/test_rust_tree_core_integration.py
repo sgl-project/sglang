@@ -6,6 +6,7 @@ import sys
 from array import array
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -50,6 +51,11 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    UnifiedTreeCoreInterface,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
 
@@ -87,7 +93,7 @@ def _binding(**init_overrides):
     )
 
 
-def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResult:
+def _pump_insert(core: UnifiedTreeCoreInterface, params: InsertParams) -> InsertResult:
     """Drive the resumable-insert protocol, folding step actions into the result."""
     step = core.begin_insert(params)
     actions = list(step.actions)
@@ -947,6 +953,7 @@ def test_insert_emits_block_stored_events():
             token_ids=[1, 2, 7, 8],
             block_size=2,
             lora_id=None,
+            lora_name=None,
             medium=StorageMedium.GPU,
         ),
     ]
@@ -975,8 +982,10 @@ def test_salted_events_match_python_hash_and_metadata_contract():
             token_ids=[1, 2, 7, 8],
             block_size=2,
             lora_id=None,
+            lora_name=None,
             medium=StorageMedium.GPU,
             cache_salt="tenant-a",
+            extra_keys=[("tenant-a",), None],
         )
     ]
 
@@ -1016,10 +1025,52 @@ def test_salted_eagle_events_match_the_bigram_hash_contract():
             token_ids=[(1, 2), (2, 3), (3, 4), (4, 5)],
             block_size=2,
             lora_id=None,
+            lora_name=None,
             medium=StorageMedium.GPU,
             cache_salt="tenant-a",
+            extra_keys=[("tenant-a",), None],
         )
     ]
+
+
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-a", "tenant-\u03b1"])
+def test_event_wire_metadata_matches_python_after_extend_and_split(cache_salt):
+    rust_core = _tree_core(enable_kv_cache_events=True, page_size=2)
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        page_size=2,
+        enable_kv_cache_events=True,
+    )
+    component = FullComponent(SimpleNamespace(enable_session_radix_cache=False), params)
+    python_core = UnifiedTreeCore(params, {ComponentType.FULL: component})
+    for core in (rust_core, python_core):
+        core.take_events()  # Discard construction-time reset events.
+    for tokens in ([1, 2, 3, 4], [1, 2, 3, 4, 5, 6], [1, 2, 7, 8]):
+        values = torch.tensor(tokens, dtype=torch.int64)
+        for core in (rust_core, python_core):
+            _pump_insert(
+                core,
+                InsertParams(
+                    key=RadixKey(array("q", tokens), cache_salt=cache_salt),
+                    value=values.clone(),
+                    session_id="session-a",
+                ),
+            )
+        expected = python_core.take_events()
+        actual = rust_core.take_events()
+        assert len(actual) == 1
+        assert actual == expected
+        assert msgspec.msgpack.encode(actual) == msgspec.msgpack.encode(expected)
+        for event in actual:
+            assert event.lora_name is None
+            if cache_salt and event.parent_block_hash is None:
+                assert event.extra_keys == [(cache_salt,)] + [None] * (
+                    len(event.block_hashes) - 1
+                )
+            else:
+                assert event.extra_keys is None
 
 
 def test_demote_emits_block_removed():
