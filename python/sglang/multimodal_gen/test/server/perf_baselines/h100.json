@@ -39,7 +39,32 @@
         ]
     },
     "scenarios": {
+        "sana_wm_ti2v": {
+            "expected_load_ms": 32625.62,
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 7239.81,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
+        "sana_video_2b_t2v": {
+            "expected_load_ms": 25382.51,
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 2472.55,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
+        "pi05_action_http": {
+            "expected_load_ms": 25954.41,
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 21.37,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "qwen_image_t2i": {
+            "expected_load_ms": 40799.72,
             "stages_ms": {
                 "TextEncodingStage": 232.03,
                 "DenoisingStage": 12402.12,
@@ -110,6 +135,7 @@
             "estimated_full_test_time_s": 133.1
         },
         "qwen_image_t2i_2_gpus": {
+            "expected_load_ms": 41606.84,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 457.66,
@@ -188,33 +214,101 @@
             "estimated_full_test_time_s": 300.0
         },
         "qwen_image_t2i_2_gpus_extra_high": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
+            "expected_load_ms": 46120.38,
+            "notes": "H100 CI run 34695613376, job 103558583416, head 5ae9847fc7092a7c75a275556d672f7507a1f933; request 1 after server warmup. E2E also agrees with runs 34693958419 and 34687251777. Existing tolerances are unchanged.",
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 455.77,
+                "LatentPreparationStage": 0.16,
+                "TimestepPreparationStage": 18.03,
+                "DenoisingStage": 9335.7,
+                "DecodingStage": 51.15
+            },
+            "denoise_step_ms": {
+                "0": 203.41,
+                "1": 191.47,
+                "2": 188.81,
+                "3": 186.65,
+                "4": 184.78,
+                "5": 185.17,
+                "6": 190.42,
+                "7": 191.36,
+                "8": 190.9,
+                "9": 183.73,
+                "10": 187.01,
+                "11": 184.09,
+                "12": 183.56,
+                "13": 182.9,
+                "14": 182.7,
+                "15": 197.53,
+                "16": 191.23,
+                "17": 188.21,
+                "18": 186.65,
+                "19": 184.42,
+                "20": 186.86,
+                "21": 185.31,
+                "22": 185.24,
+                "23": 184.98,
+                "24": 184.09,
+                "25": 183.76,
+                "26": 183.12,
+                "27": 182.28,
+                "28": 183.34,
+                "29": 183.79,
+                "30": 182.83,
+                "31": 182.17,
+                "32": 181.26,
+                "33": 182.59,
+                "34": 182.78,
+                "35": 182.32,
+                "36": 182.42,
+                "37": 182.26,
+                "38": 182.04,
+                "39": 183.17,
+                "40": 182.72,
+                "41": 181.68,
+                "42": 187.57,
+                "43": 190.77,
+                "44": 185.43,
+                "45": 185.76,
+                "46": 190.02,
+                "47": 182.43,
+                "48": 181.89,
+                "49": 183.58
+            },
+            "expected_e2e_ms": 9878.54,
+            "expected_avg_denoise_ms": 185.67,
+            "expected_median_denoise_ms": 184.09,
+            "load_peak_vram_mb": 42026.0,
+            "runtime_peak_vram_mb": 46696.0,
+            "warmup_peak_vram_mb": 43424.0,
+            "load_peak_allocated_mb": 41798.14,
+            "runtime_peak_allocated_mb": 44854.98,
             "estimated_full_test_time_s": 54.4
         },
         "flux2_modelopt_fp8_tp2_t2i": {
+            "expected_load_ms": 50693.24,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2089.62,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 75.4
         },
         "joy_echo_t2v_2gpu": {
+            "expected_load_ms": 46333.83,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2469.07,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 62.8
         },
         "ideogram4_fp8_tp2_t2i": {
+            "expected_load_ms": 33515.44,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 8975.57,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 60.8
@@ -283,6 +377,7 @@
             "estimated_full_test_time_s": 120.0
         },
         "flux_image_t2i": {
+            "expected_load_ms": 29629.92,
             "stages_ms": {
                 "TimestepPreparationStage": 32.58,
                 "DenoisingStage": 6447.42,
@@ -353,6 +448,7 @@
             "estimated_full_test_time_s": 127.4
         },
         "flux_2_image_t2i": {
+            "expected_load_ms": 55239.13,
             "stages_ms": {
                 "TimestepPreparationStage": 15.77,
                 "DenoisingStage": 22276.29,
@@ -424,6 +520,7 @@
             "estimated_full_test_time_s": 145.2
         },
         "flux_2_klein_image_t2i": {
+            "expected_load_ms": 28510.14,
             "stages_ms": {
                 "DecodingStage": 6.41,
                 "InputValidationStage": 0.03,
@@ -449,6 +546,7 @@
             "estimated_full_test_time_s": 120.5
         },
         "flux_2_klein_base_image_t2i": {
+            "expected_load_ms": 26405.08,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 53.19,
@@ -520,6 +618,7 @@
             "estimated_full_test_time_s": 124.4
         },
         "flux_2_ti2i": {
+            "expected_load_ms": 54947.9,
             "stages_ms": {
                 "TextEncodingStage": 364.98,
                 "DenoisingStage": 44465.25,
@@ -591,6 +690,7 @@
             "estimated_full_test_time_s": 168.9
         },
         "flux_2_ti2i_multi_image_cache_dit": {
+            "expected_load_ms": 54569.41,
             "stages_ms": {
                 "ImageVAEEncodingStage": 156.01,
                 "DenoisingStage": 23101.61,
@@ -662,6 +762,7 @@
             "estimated_full_test_time_s": 148.6
         },
         "flux_image_t2i_2_gpus": {
+            "expected_load_ms": 31766.33,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 28.24,
@@ -732,6 +833,7 @@
             "estimated_full_test_time_s": 44.9
         },
         "zimage_image_t2i": {
+            "expected_load_ms": 28221.57,
             "stages_ms": {
                 "DecodingStage": 6.23,
                 "InputValidationStage": 0.03,
@@ -761,6 +863,7 @@
             "estimated_full_test_time_s": 116.3
         },
         "zimage_image_t2i_fp8": {
+            "expected_load_ms": 27623.5,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 131.15,
@@ -790,6 +893,7 @@
             "estimated_full_test_time_s": 123.7
         },
         "zimage_image_t2i_multi_lora": {
+            "expected_load_ms": 36426.15,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 129.63,
@@ -819,6 +923,7 @@
             "estimated_full_test_time_s": 162.1
         },
         "zimage_image_t2i_2_gpus": {
+            "expected_load_ms": 31619.48,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 255.84,
@@ -848,6 +953,7 @@
             "estimated_full_test_time_s": 39.3
         },
         "qwen_image_edit_ti2i": {
+            "expected_load_ms": 36793.38,
             "stages_ms": {
                 "InputValidationStage": 24.78,
                 "ImageEncodingStage": 714.55,
@@ -919,6 +1025,7 @@
             "estimated_full_test_time_s": 153.6
         },
         "joyai_image_edit_ti2i": {
+            "expected_load_ms": 34589.89,
             "stages_ms": {
                 "InputValidationStage": 16.43,
                 "ImageEncodingStage": 602.8,
@@ -980,6 +1087,7 @@
             "estimated_full_test_time_s": 117.6
         },
         "qwen_image_t2i_cache_dit_enabled": {
+            "expected_load_ms": 34703.95,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 231.07,
@@ -1050,6 +1158,7 @@
             "estimated_full_test_time_s": 124.9
         },
         "wan2_1_t2v_1.3b_teacache_enabled": {
+            "expected_load_ms": 32869.61,
             "stages_ms": {
                 "TextEncodingStage": 534.94,
                 "DenoisingStage": 3853.51,
@@ -1120,6 +1229,7 @@
             "estimated_full_test_time_s": 126.0
         },
         "wan2_1_t2v_1.3b": {
+            "expected_load_ms": 30234.05,
             "stages_ms": {
                 "DecodingStage": 361.6,
                 "InputValidationStage": 0.03,
@@ -1190,6 +1300,7 @@
             "estimated_full_test_time_s": 129.3
         },
         "wan2_1_t2v_1.3b_cfg_parallel": {
+            "expected_load_ms": 30166.76,
             "stages_ms": {
                 "LatentPreparationStage": 0.1,
                 "InputValidationStage": 0.05,
@@ -1260,6 +1371,7 @@
             "estimated_full_test_time_s": 45.5
         },
         "turbo_wan2_1_t2v_1.3b": {
+            "expected_load_ms": 27199.67,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 364.61,
@@ -1285,6 +1397,7 @@
             "estimated_full_test_time_s": 124.7
         },
         "ltx_2_two_stage_t2v": {
+            "expected_load_ms": 47470.86,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 403.5,
@@ -1356,6 +1469,7 @@
             "estimated_full_test_time_s": 100.4
         },
         "wan2_2_ti2v_5b": {
+            "expected_load_ms": 37605.69,
             "stages_ms": {
                 "InputValidationStage": 706.07,
                 "TextEncodingStage": 327.65,
@@ -1426,6 +1540,7 @@
             "estimated_full_test_time_s": 141.7
         },
         "qwen_image_edit_2509_ti2i": {
+            "expected_load_ms": 37508.7,
             "stages_ms": {
                 "ImageEncodingStage": 587.89,
                 "DenoisingStage": 37539.33,
@@ -1487,6 +1602,7 @@
             "estimated_full_test_time_s": 160.2
         },
         "qwen_image_layered_i2i": {
+            "expected_load_ms": 37439.25,
             "stages_ms": {
                 "QwenImageLayeredBeforeDenoisingStage": 144.26,
                 "TimestepPreparationStage": 0.0,
@@ -1555,6 +1671,7 @@
             "estimated_full_test_time_s": 161.5
         },
         "fastwan2_2_ti2v_5b": {
+            "expected_load_ms": 31379.65,
             "stages_ms": {
                 "InputValidationStage": 400.0,
                 "TextEncodingStage": 327.82,
@@ -1578,6 +1695,7 @@
             "estimated_full_test_time_s": 125.2
         },
         "fast_hunyuan_video": {
+            "expected_load_ms": 32322.52,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 252.98,
@@ -1606,6 +1724,7 @@
             "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
+            "expected_load_ms": 78667.8,
             "stages_ms": {
                 "InputValidationStage": 15.59,
                 "ImageVAEEncodingStage": 1484.2,
@@ -1667,6 +1786,7 @@
             "estimated_full_test_time_s": 168.7
         },
         "wan2_1_i2v_14b_480P_2gpu": {
+            "expected_load_ms": 46402.22,
             "stages_ms": {
                 "InputValidationStage": 7.88,
                 "LatentPreparationStage": 0.1,
@@ -1740,6 +1860,7 @@
             "estimated_full_test_time_s": 128.8
         },
         "wan2_1_i2v_14b_720P_2gpu": {
+            "expected_load_ms": 37549.49,
             "stages_ms": {
                 "InputValidationStage": 11.58,
                 "TextEncodingStage": 327.33,
@@ -1812,6 +1933,7 @@
             "estimated_full_test_time_s": 182.2
         },
         "wan2_2_t2v_a14b_2gpu": {
+            "expected_load_ms": 61832.44,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 314.11,
@@ -1873,6 +1995,7 @@
             "estimated_full_test_time_s": 188.0
         },
         "wan2_1_t2v_14b_2gpu": {
+            "expected_load_ms": 45201.26,
             "stages_ms": {
                 "TextEncodingStage": 325.79,
                 "DecodingStage": 637.43,
@@ -1943,6 +2066,7 @@
             "estimated_full_test_time_s": 96.3
         },
         "wan2_2_t2v_a14b_lora_2gpu": {
+            "expected_load_ms": 61440.19,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 325.03,
@@ -2003,6 +2127,7 @@
             "estimated_full_test_time_s": 576.3
         },
         "wan2_1_t2v_1_3b_lora_1gpu": {
+            "expected_load_ms": 30139.26,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 329.6,
@@ -2073,6 +2198,7 @@
             "estimated_full_test_time_s": 129.6
         },
         "wan2_1_i2v_14b_lora_2gpu": {
+            "expected_load_ms": 66554.82,
             "stages_ms": {
                 "InputValidationStage": 12.06,
                 "TextEncodingStage": 325.79,
@@ -2145,6 +2271,7 @@
             "estimated_full_test_time_s": 509.3
         },
         "flux_2_image_t2i_2_gpus": {
+            "expected_load_ms": 53086.36,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 372.55,
@@ -2216,6 +2343,7 @@
             "estimated_full_test_time_s": 75.0
         },
         "qwen_image_edit_2511_ti2i": {
+            "expected_load_ms": 38727.15,
             "stages_ms": {
                 "DecodingStage": 18.69,
                 "InputValidationStage": 48.98,
@@ -2277,6 +2405,7 @@
             "estimated_full_test_time_s": 143.7
         },
         "fsdp-inference": {
+            "expected_load_ms": 31380.54,
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "LatentPreparationStage": 0.11,
@@ -2306,6 +2435,7 @@
             "estimated_full_test_time_s": 61.3
         },
         "hunyuan3d_shape_gen": {
+            "expected_load_ms": 31925.92,
             "stages_ms": {
                 "Hunyuan3DShapeBeforeDenoisingStage": 54.28,
                 "Hunyuan3DShapeDenoisingStage": 1698.03,
@@ -2377,6 +2507,7 @@
             "estimated_full_test_time_s": 420.1
         },
         "wan2_1_t2v_1.3b_frame_interp_2x": {
+            "expected_load_ms": 30176.3,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 534.56,
@@ -2447,6 +2578,7 @@
             "estimated_full_test_time_s": 129.3
         },
         "flux_2_image_t2i_upscaling_4x": {
+            "expected_load_ms": 52489.37,
             "stages_ms": {
                 "TextEncodingStage": 373.42,
                 "DenoisingStage": 21888.49,
@@ -2518,6 +2650,7 @@
             "estimated_full_test_time_s": 145.1
         },
         "wan2_1_t2v_1.3b_upscaling_4x": {
+            "expected_load_ms": 31719.84,
             "stages_ms": {
                 "DecodingStage": 362.62,
                 "InputValidationStage": 0.04,
@@ -2588,6 +2721,7 @@
             "estimated_full_test_time_s": 129.3
         },
         "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x": {
+            "expected_load_ms": 30083.06,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 532.52,
@@ -2658,6 +2792,7 @@
             "estimated_full_test_time_s": 129.4
         },
         "ltx_2.3_one_stage_ti2v": {
+            "expected_load_ms": 39264.11,
             "stages_ms": {
                 "InputValidationStage": 3.49,
                 "TextEncodingStage": 397.91,
@@ -2711,6 +2846,7 @@
             "estimated_full_test_time_s": 167.9
         },
         "ltx_2.3_two_stage_t2v_2gpus": {
+            "expected_load_ms": 45206.77,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 399.08,
@@ -2772,14 +2908,41 @@
             "estimated_full_test_time_s": 186.0
         },
         "ltx_2_5_diffusion_decoder_2gpus": {
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
+            "expected_load_ms": 28133.24,
+            "stages_ms": {
+                "InputValidationStage": 0.05,
+                "TextEncodingStage": 634.13,
+                "LTX2TextConnectorStage": 317.43,
+                "LTX2DurationStage": 0.01,
+                "LTX2SigmaPreparationStage": 0.03,
+                "TimestepPreparationStage": 246.11,
+                "LTX2AVLatentPreparationStage": 0.31,
+                "LTX2ImageEncodingStage": 0.02,
+                "LTX2AVDenoisingStage": 3750.7,
+                "LTX2AVDecodingStage": 3382.33
+            },
+            "denoise_step_ms": {
+                "0": 292.65,
+                "1": 259.94,
+                "2": 256.47,
+                "3": 256.26,
+                "4": 259.62,
+                "5": 255.44,
+                "6": 258.02,
+                "7": 255.91
+            },
+            "expected_e2e_ms": 10141.6,
+            "expected_avg_denoise_ms": 261.79,
+            "expected_median_denoise_ms": 257.25,
+            "load_peak_vram_mb": 1906,
+            "runtime_peak_vram_mb": 69546,
+            "warmup_peak_vram_mb": 28396,
+            "load_peak_allocated_mb": 1876.14,
+            "runtime_peak_allocated_mb": 48399,
             "estimated_full_test_time_s": 545.1
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
+            "expected_load_ms": 50003.37,
             "stages_ms": {
                 "InputValidationStage": 3.21,
                 "TextEncodingStage": 411.15,
@@ -2841,6 +3004,7 @@
             "estimated_full_test_time_s": 101.4
         },
         "longlive2_t2v": {
+            "expected_load_ms": 29328.4,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "LongLive2TextEncodingStage": 328.05,
@@ -2861,6 +3025,7 @@
             "estimated_full_test_time_s": 153.1
         },
         "longlive2_i2v": {
+            "expected_load_ms": 27107.25,
             "stages_ms": {
                 "InputValidationStage": 23.02,
                 "LongLive2TextEncodingStage": 327.98,
@@ -2881,6 +3046,7 @@
             "estimated_full_test_time_s": 149.4
         },
         "lingbot_video_moe_t2v": {
+            "expected_load_ms": 22654.46,
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "LingBotVideoTextEncodingStage": 89.03,
@@ -2913,6 +3079,7 @@
             "estimated_full_test_time_s": 600.0
         },
         "lingbot_world_realtime_plastic_beach": {
+            "expected_load_ms": 31600.49,
             "stages_ms": {
                 "RealtimeInputValidationStage": 0.09,
                 "RealtimeTextEncodingStage": 0.04,
@@ -2924,7 +3091,7 @@
                 "CausalVaeDecodingStage": 217.75
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 1912.29,
+            "expected_e2e_ms": 18687.61,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "load_peak_vram_mb": 42814.0,
@@ -2934,6 +3101,7 @@
             "estimated_full_test_time_s": 126.0
         },
         "ltx_2_3_hq_pipeline": {
+            "expected_load_ms": 116530.53,
             "stages_ms": {
                 "InputValidationStage": 4.63,
                 "TextEncodingStage": 401.75,
@@ -2982,6 +3150,7 @@
             "estimated_full_test_time_s": 363.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
+            "expected_load_ms": 35585.13,
             "stages_ms": {
                 "DiffusersExecutionStage": 1075.16
             },
@@ -2996,6 +3165,7 @@
             "estimated_full_test_time_s": 98.3
         },
         "cosmos3_nano_t2i": {
+            "expected_load_ms": 28691.77,
             "stages_ms": {
                 "Cosmos3ImagePreprocessStage": 0.01,
                 "Cosmos3TokenizationStage": 155.89,
@@ -3047,6 +3217,7 @@
             "estimated_full_test_time_s": 65.0
         },
         "cosmos3_nano_t2v": {
+            "expected_load_ms": 30688.3,
             "stages_ms": {
                 "Cosmos3ImagePreprocessStage": 0.01,
                 "Cosmos3TokenizationStage": 143.82,
@@ -3068,30 +3239,34 @@
             "estimated_full_test_time_s": 65.0
         },
         "flux_2_t2i_customized_vae_path": {
+            "expected_load_ms": 52103.72,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 23073.55,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 574.4
         },
         "wan2_2_t2v_a14b_teacache_2gpu": {
+            "expected_load_ms": 63938.03,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 82478.23,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 186.4
         },
         "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
+            "expected_load_ms": 34366.19,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 1077.99,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 52.2
         },
         "minimax_h3_ref2va_video_audio_2gpu_h100": {
+            "expected_load_ms": 68100.42,
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "MiniMaxH3PartitionAdmissionStage": 0.04,
@@ -3120,6 +3295,7 @@
             "estimated_full_test_time_s": 340.0
         },
         "minimax_h3_t2va_2gpu_h100": {
+            "expected_load_ms": 79373.57,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "MiniMaxH3PartitionAdmissionStage": 0.03,
@@ -3151,14 +3327,16 @@
             "estimated_full_test_time_s": 235.0
         },
         "mova_360p_tp2": {
+            "expected_load_ms": 60480.85,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 58242.09,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 141.9
         },
         "zimage_image_t2i_2_gpus_non_square": {
+            "expected_load_ms": 30675.16,
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 259.45,
@@ -3188,9 +3366,10 @@
             "estimated_full_test_time_s": 40.5
         },
         "flux1_modelopt_fp8_t2i": {
+            "expected_load_ms": 33073.38,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 1138.33,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 50.3
@@ -3204,14 +3383,16 @@
             "estimated_full_test_time_s": 498.1
         },
         "wan22_modelopt_fp8_t2v": {
+            "expected_load_ms": 63380.1,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 7908.23,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 89.5
         },
         "hunyuanvideo_modelopt_fp8_t2v": {
+            "expected_load_ms": 25315.9,
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 33.67,
@@ -3244,17 +3425,19 @@
             "estimated_full_test_time_s": 64.3
         },
         "qwen_image_modelopt_fp8_t2i": {
+            "expected_load_ms": 47967.61,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 3038.04,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 65.5
         },
         "qwen_image_edit_modelopt_fp8_ti2i": {
+            "expected_load_ms": 49282.42,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2964.8,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 73.7
