@@ -28,10 +28,12 @@ register_cuda_ci(
     disabled="no LiLiCorr draft checkpoint is published yet",
 )
 
-# The drafter is unpublished. Set it and drop the `disabled=` argument above in the same
-# change; the non-repo string fails loudly if the test is enabled before it is filled in.
+# Set DRAFT_MODEL, drop the `disabled=` argument above, and this starts running. The
+# `disabled=` keeps it out of suite selection; the skip in setUpClass covers `/rerun-test`
+# and a direct `python3 <file>`, neither of which consults `disabled=`.
+UNPUBLISHED = "<unpublished>"
 TARGET_MODEL = "Qwen/Qwen3-8B"
-DRAFT_MODEL = "<unpublished>"
+DRAFT_MODEL = UNPUBLISHED
 
 
 class TestLiLiCorrServer(CustomTestCase, GSM8KMixin, SpecDecodingMixin):
@@ -55,6 +57,11 @@ class TestLiLiCorrServer(CustomTestCase, GSM8KMixin, SpecDecodingMixin):
 
     @classmethod
     def setUpClass(cls):
+        if cls.draft_model == UNPUBLISHED:
+            raise unittest.SkipTest(
+                "no LiLiCorr draft checkpoint is published yet; set DRAFT_MODEL and drop "
+                "the disabled= argument on register_cuda_ci in the same change"
+            )
         cls.base_url = DEFAULT_URL_FOR_TEST
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True))
