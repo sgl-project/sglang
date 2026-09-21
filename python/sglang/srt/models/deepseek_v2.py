@@ -925,7 +925,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         num_token_non_padded = (
-            forward_batch.num_token_non_padded if forward_batch is not None else None
+            forward_batch.num_token_non_padded
+            if forward_batch is not None and get_parallel().attn_dp_size == 1
+            else None
         )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
