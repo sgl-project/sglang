@@ -89,8 +89,10 @@ See [references/npu-trace-layout.md](references/npu-trace-layout.md).
 Run the helper script on the `ASCEND_PROFILER_OUTPUT` directory:
 
 ```bash
+# Expand the real ASCEND_PROFILER_OUTPUT path first (shell glob, not Python).
+TRACE_DIR=$(echo ./sglang_profile/*/*_ascend_pt/ASCEND_PROFILER_OUTPUT | awk '{print $1}')
 python .claude/skills/sglang-npu-profiler-analysis/scripts/summarize_npu_trace.py \
-  --trace-dir ./sglang_profile/<timestamp>/<host>_*_ascend_pt/ASCEND_PROFILER_OUTPUT \
+  --trace-dir "$TRACE_DIR" \
   --top 20 \
   --markdown-out ./npu_profile_report.md
 ```
@@ -98,8 +100,11 @@ python .claude/skills/sglang-npu-profiler-analysis/scripts/summarize_npu_trace.p
 If only raw `*_ascend_pt/` exists (interrupted capture), re-parse with:
 
 ```python
+from pathlib import Path
 from torch_npu.profiler.profiler import analyse
-analyse("./sglang_profile/<host>_*_ascend_pt/")
+
+pt_dirs = sorted(Path("./sglang_profile").glob("*/*_ascend_pt"))
+analyse(str(pt_dirs[-1]))  # pick the latest capture directory
 ```
 
 ### Step 4 — Classify bottlenecks

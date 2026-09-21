@@ -48,8 +48,16 @@ def _pick_time(row: dict[str, str]) -> float:
                 return val
             return val / 1000.0
     for key, raw in row.items():
-        if "duration" in key.lower() and "(us)" in key.lower() and raw:
-            return float(str(raw).replace(",", "").strip()) / 1000.0
+        if not raw:
+            continue
+        kl = key.lower()
+        if "duration" not in kl and "time" not in kl:
+            continue
+        val = float(str(raw).replace(",", "").strip())
+        if "(ms)" in kl or kl.endswith("_ms") or " ms" in kl:
+            return val
+        if "(us)" in kl or kl.endswith("_us") or " us" in kl:
+            return val / 1000.0
     return 0.0
 
 
