@@ -815,7 +815,7 @@ class SchedulerPPMixin:
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank
+                get_parallel().attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
@@ -834,7 +834,7 @@ class SchedulerPPMixin:
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank
+                get_parallel().attn_dp_rank
                 * get_parallel().attn_cp_size
                 * get_parallel().attn_tp_size
             )
