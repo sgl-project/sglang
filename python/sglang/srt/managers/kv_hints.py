@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Versioned KV-hint envelope carried on a request.
 
-A trusted orchestrator attaches KV hints after selecting a worker. SGLang transports them from the entrypoint to HiCache unchanged; core code does not read payloads.
-
 Each action names its own type and version. Consumers ignore actions they do not implement, and the component that implements an action validates its payload.
 """
 

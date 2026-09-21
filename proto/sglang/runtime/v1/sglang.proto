@@ -137,7 +137,7 @@ message GenerateRequest {
   optional KVHintsEnvelope kv_hints = 17;
 }
 
-// Versioned KV-hint envelope forwarded from a trusted orchestrator to HiCache.
+// Versioned KV-hint envelope forwarded from a trusted orchestrator.
 message KVHintsEnvelope {
   string protocol_version = 1;
   string message_id = 2;
