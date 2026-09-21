@@ -8,6 +8,7 @@ nobody would own that value, and which module supplied it would come down to
 the order of the imports below. Keep each field owned by one family module.
 """
 
+from sglang.srt.arg_groups.model_overrides import bailing_moe_v3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v4  # noqa: F401
@@ -15,6 +16,7 @@ from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import falcon_h1  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma2_gemma3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma4  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import gigachat35  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import glm4_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gpt_oss  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import granitemoehybrid  # noqa: F401

@@ -88,7 +88,7 @@ impl ErrorEventScanner {
 /// pump finishes (stream exhausted, client disconnects, or upstream errors).
 /// The opaque `Box<dyn Send + 'static>` accepts any drop-only payload — most
 /// commonly a tuple of [`crate::workers::LoadGuard`] and
-/// [`crate::policies::active_load::ActiveLoadGuard`]. The proxy does not
+/// [`crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard`]. The proxy does not
 /// inspect the value; it relies entirely on `Drop` semantics, so callers can
 /// pack arbitrary cleanup state in. Pass `None` for callers that manage the
 /// guard externally (e.g. non-streaming paths where the handler itself is the
