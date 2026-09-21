@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -741,10 +741,10 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
-    from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -836,7 +836,7 @@ def eagle_sample(
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
-                else get_tp_group()
+                else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
@@ -872,7 +872,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -999,7 +999,7 @@ def eagle_sample(
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
-            else get_tp_group()
+            else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
