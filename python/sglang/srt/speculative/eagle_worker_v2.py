@@ -338,6 +338,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_attention_backends(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -347,6 +348,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_cuda_graphs(self):
         with (
+            draft_pp_context(),
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -910,6 +912,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                if self.draft_runner.model_config.model_is_mrope:
+                    forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
                     0,
