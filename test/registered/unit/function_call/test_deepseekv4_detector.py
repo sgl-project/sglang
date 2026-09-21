@@ -686,6 +686,119 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         )
         self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "NY"})
 
+    def test_optional_schema_validation_rejects_missing_unknown_and_wrong_types(self):
+        self.tools[0].function.parameters["additionalProperties"] = False
+        for arguments, constraint in [
+            ({}, "required"),
+            ({"city": "SF", "other": 1}, "additionalProperties"),
+            ({"city": 7}, "type"),
+        ]:
+            for body in [
+                json.dumps(arguments),
+                "".join(
+                    _param(name, "false", json.dumps(value))
+                    for name, value in arguments.items()
+                ),
+            ]:
+                source = _wrapped(_invoke("get_weather", body))
+                for width in [1, 7, len(source)]:
+                    with self.subTest(arguments=arguments, width=width, body=body):
+                        detector = DeepSeekV4Detector(
+                            strict_output=True, validate_tool_schema=True
+                        )
+                        with self.assertRaisesRegex(ValueError, constraint):
+                            for start in range(0, len(source), width):
+                                detector.parse_streaming_increment(
+                                    source[start : start + width], self.tools
+                                )
+                            detector.finish(self.tools)
+                with self.assertRaisesRegex(ValueError, constraint):
+                    DeepSeekV4Detector(
+                        strict_output=True, validate_tool_schema=True
+                    ).detect_and_parse(source, self.tools)
+
+    def test_optional_schema_validation_keeps_valid_arguments_unchanged(self):
+        for source in [
+            _weather_call("SF"),
+            _wrapped(_invoke("get_weather", '{"city": "SF"}')),
+        ]:
+            detector = DeepSeekV4Detector(strict_output=True, validate_tool_schema=True)
+            arguments = ""
+            for character in source:
+                result = detector.parse_streaming_increment(character, self.tools)
+                arguments += "".join(call.parameters for call in result.calls)
+            detector.finish(self.tools)
+            self.assertEqual(json.loads(arguments), {"city": "SF"})
+            self.assertEqual(len(detector._schema_validators), 1)
+
+    def test_optional_schema_validation_supports_local_references(self):
+        self.tools[0].function.parameters = {
+            "type": "object",
+            "properties": {"city": {"$ref": "#/$defs/city"}},
+            "$defs": {"city": {"type": "string", "enum": ["SF"]}},
+            "required": ["city"],
+        }
+        parsed = DeepSeekV4Detector(
+            strict_output=True, validate_tool_schema=True
+        ).detect_and_parse(_weather_call("SF"), self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "SF"})
+        with self.assertRaisesRegex(ValueError, "enum"):
+            DeepSeekV4Detector(
+                strict_output=True, validate_tool_schema=True
+            ).detect_and_parse(_weather_call("NY"), self.tools)
+
+    def test_optional_schema_validation_never_fetches_remote_references(self):
+        self.tools[0].function.parameters["properties"]["city"] = {
+            "$ref": "https://example.invalid/city.json"
+        }
+        with patch(
+            "urllib.request.urlopen", side_effect=AssertionError("network forbidden")
+        ):
+            with self.assertRaisesRegex(ValueError, "external retrieval is disabled"):
+                DeepSeekV4Detector(
+                    strict_output=True, validate_tool_schema=True
+                ).detect_and_parse(_weather_call(), self.tools)
+
+    def test_optional_schema_validation_reuses_normalization_without_mutation(self):
+        schema = self.tools[0].function.parameters
+        schema["properties"]["city"]["type"] = "varchar"
+        parsed = DeepSeekV4Detector(
+            strict_output=True, validate_tool_schema=True
+        ).detect_and_parse(_weather_call(), self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "SF"})
+        self.assertEqual(schema["properties"]["city"]["type"], "varchar")
+
+    def test_optional_schema_validation_preserves_unknown_tool_forwarding_policy(self):
+        source = _wrapped(_invoke("unknown_tool", "{}"))
+        with patch.dict(os.environ, {"SGLANG_FORWARD_UNKNOWN_TOOLS": "0"}):
+            with self.assertRaisesRegex(ValueError, "Undefined DSML tool"):
+                DeepSeekV4Detector(
+                    strict_output=True, validate_tool_schema=True
+                ).detect_and_parse(source, self.tools)
+        with patch.dict(os.environ, {"SGLANG_FORWARD_UNKNOWN_TOOLS": "1"}):
+            parsed = DeepSeekV4Detector(
+                strict_output=True, validate_tool_schema=True
+            ).detect_and_parse(source, self.tools)
+            self.assertEqual(parsed.calls[0].name, "unknown_tool")
+
+    def test_optional_schema_validation_is_off_by_default_and_requires_strict(self):
+        source = _wrapped(_invoke("get_weather", "{}"))
+        parsed = DeepSeekV4Detector(
+            strict_output=True, validate_tool_schema=False
+        ).detect_and_parse(source, self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {})
+        with self.assertRaisesRegex(ValueError, "requires strict"):
+            DeepSeekV4Detector(strict_output=False, validate_tool_schema=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
+                "SGLANG_DSV4_VALIDATE_TOOL_SCHEMA": "1",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "required"):
+                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
+
 
 if __name__ == "__main__":
     import unittest

@@ -1,13 +1,19 @@
 import json
 import logging
 import re
+from copy import deepcopy
 from html.parser import HTMLParser
+
+from jsonschema import Draft202012Validator, SchemaError
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv4_format import mask_literals as _mask_literals
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +37,10 @@ def _strict_json_loads(text: str):
         object_pairs_hook=_unique_json_object,
         parse_constant=_reject_json_constant,
     )
+
+
+def _reject_schema_retrieval(uri: str):
+    raise NoSuchResource(ref=uri)
 
 
 def _validate_string_parameter(name: str, value: str, *, complete: bool) -> None:
@@ -133,10 +143,21 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     - Parameters: Either XML tags or direct JSON format
     - Supports multiple tool calls
 
+    Strict output validates protocol structure without rewriting arguments.
+    Optional SGLANG_DSV4_VALIDATE_TOOL_SCHEMA=1 additionally rejects completed
+    calls that violate the provided tool schema. It requires strict output,
+    is disabled by default, and resolves only local schema references.
+    A rejected generation is not repaired into a guessed tool invocation.
+
     Reference: DeepSeek V4 format specification
     """
 
-    def __init__(self, strict_output: bool | None = None):
+    def __init__(
+        self,
+        strict_output: bool | None = None,
+        *,
+        validate_tool_schema: bool | None = None,
+    ):
         super().__init__()
         self.bot_token = "<｜DSML｜tool_calls>"
         self.eot_token = "</｜DSML｜tool_calls>"
@@ -146,6 +167,16 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             if strict_output is None
             else strict_output
         )
+        self.validate_tool_schema = (
+            envs.SGLANG_DSV4_VALIDATE_TOOL_SCHEMA.get()
+            if validate_tool_schema is None
+            else validate_tool_schema
+        )
+        if self.validate_tool_schema and not self.strict_output:
+            raise ValueError(
+                "DeepSeek V4 tool schema validation requires strict output"
+            )
+        self._schema_validators: dict[str, Draft202012Validator] = {}
         self._quote_history: list[str] = []
         self._normal_chunks: list[str] = []
         self._active_invoke_start = 0
@@ -260,6 +291,48 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 ) from error
             if not isinstance(parameters, dict):
                 raise ValueError(f"DSML arguments for tool {name!r} must be an object")
+            if self.validate_tool_schema:
+                self._validate_against_tool_schema(name, parameters, tools)
+
+    def _validate_against_tool_schema(
+        self, name: str, parameters: dict, tools: list[Tool]
+    ) -> None:
+        validator = self._schema_validators.get(name)
+        if validator is None:
+            tool = next(
+                (tool for tool in reversed(tools) if tool.function.name == name), None
+            )
+            if tool is None:
+                if envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    logger.warning("No schema for forwarded DeepSeek V4 tool: %s", name)
+                    return
+                raise ValueError(f"Undefined DSML tool {name!r}")
+            schema = deepcopy(tool.function.parameters or {})
+            normalize_json_schema_types(schema)
+            try:
+                Draft202012Validator.check_schema(schema)
+            except SchemaError as error:
+                raise ValueError(f"Invalid schema for DSML tool {name!r}") from error
+            validator = Draft202012Validator(
+                schema, registry=Registry(retrieve=_reject_schema_retrieval)
+            )
+            self._schema_validators[name] = validator
+        try:
+            error = next(validator.iter_errors(parameters), None)
+        except Unresolvable as error:
+            raise ValueError(
+                f"Unresolvable schema reference for DSML tool {name!r}; "
+                "external retrieval is disabled"
+            ) from error
+        if error is not None:
+            path = "/".join(
+                str(part).replace("~", "~0").replace("/", "~1")
+                for part in error.absolute_path
+            )
+            raise ValueError(
+                f"DSML tool arguments violate schema for {name!r}: "
+                f"{error.validator} at /{path}"
+            )
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -310,7 +383,10 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         return StreamingParseResult(normal_text=normal)
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
-        detector = type(self)(strict_output=self.strict_output)
+        detector = type(self)(
+            strict_output=self.strict_output,
+            validate_tool_schema=self.validate_tool_schema,
+        )
         parsed = detector.parse_streaming_increment(text, tools)
         tail = detector.finish(tools)
         accumulated: dict[int, ToolCallItem] = {}
