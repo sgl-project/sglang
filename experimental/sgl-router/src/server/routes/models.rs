@@ -50,6 +50,7 @@ mod tests {
         ctx.config.model = crate::config::ModelConfig {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -59,6 +60,7 @@ mod tests {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

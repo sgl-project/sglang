@@ -28,6 +28,10 @@ class TboAttnBackend(AttentionBackend):
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
 
+    @property
+    def supports_prefill_cuda_graph_max_context_size(self) -> bool:
+        return self.primary.supports_prefill_cuda_graph_max_context_size
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(
@@ -259,4 +263,5 @@ def _build_tbo_child_replay_fb_view(
             else None
         ),
         spec_info=child_spec_info,
+        max_seq_len_override=fb_view.max_seq_len_override,
     )

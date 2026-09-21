@@ -114,6 +114,7 @@ class StorageAttachment:
             )
 
         try:
+            prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -252,6 +253,16 @@ class StorageAttachment:
             )
         else:
             cache.storage_metrics_collector = None
+
+    def resolve_prefetch_threshold(self, configured: int) -> int:
+        """Use the same complete-window minimum for every buffer-mode anchor."""
+        cache = self._cache
+        window = cache.sliding_window_size
+        if not window or cache.host_memory_mode != "buffer_only":
+            return configured
+        page_size = cache.page_size
+        window_tokens = ((window + page_size - 1) // page_size) * page_size
+        return max(configured, window_tokens)
 
     def _resolve_metrics_collector(
         self,
@@ -409,3 +420,4 @@ class StorageAttachment:
             cache.discard_storage_prefetch_accounting(handle)
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
+        cache.storage_prefetch_retries.clear()
