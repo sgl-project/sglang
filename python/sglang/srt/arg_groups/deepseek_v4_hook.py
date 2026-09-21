@@ -247,7 +247,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
         if (
-            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            (
+                cfg.disaggregation_mode == "prefill"
+                and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            )
             or cfg.disaggregation_transfer_backend != "mooncake"
             or cfg.dp_size != 1
             or cfg.enable_dp_attention
@@ -255,7 +258,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "DeepSeek-V4.1 DSpark PD requires static verify on prefill, Mooncake, "
                 "DP=1 and CP=1. Both servers must enable DSpark with the same "
                 "block size and TP size."
             )

@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import add_prefix
 
 
@@ -63,6 +64,17 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        layout = resolve_ragged_verify_layout(forward_batch)
+        if layout is not None:
+            # Capped graph layouts may leave a padding tail after qo_indptr[-1].
+            # A fixed-size row lookup supports this tail and empty rows without
+            # repeat_interleave's requirement that sum(lengths) == output_size.
+            num_tokens = layout.graph_num_tokens if num_tokens is None else num_tokens
+            tokens = torch.arange(num_tokens, device=req.device)
+            row = torch.searchsorted(layout.qo_indptr_device[1:], tokens, right=True)
+            return req[row.clamp_max(req.numel() - 1)].masked_fill(
+                tokens >= layout.qo_indptr_device[-1], 0
+            )
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
