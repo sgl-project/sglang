@@ -211,6 +211,22 @@ Detailed content-format parity coverage follows in #39133.
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
+## DeepSeek V4
+
+Native V4 rendering mirrors SGLang's tool schema defaults and ordering, preserves
+all declared tools for native tool-choice handling, and flattens text parts before
+assistant continuation extraction. Reasoning effort comes from the request's
+`reasoning` / `reasoning_effort`, not `chat_template_kwargs.reasoning_effort`;
+`drop_thinking` kwargs are ignored as they are in SGLang's native serving path.
+
+The router recognizes the official checkpoint encoder's low-effort default and
+`REASONING_EFFORT_PROMPTS` declarations in `encoding/encoding_dsv4.py`; otherwise
+it uses SGLang's preview-profile fallback. A `dsv4_reasoning_effort_profile` value
+of `preview` or `official` in the local `config.json` overrides detection. Keep
+this file and the encoder source consistent with the worker's model and config
+overrides. Worker environment defaults still require the forwarding precautions
+above. V4.1 requires a separate encoder and does not use the V4 formatter.
+
 ## Kimi-K3
 
 Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
