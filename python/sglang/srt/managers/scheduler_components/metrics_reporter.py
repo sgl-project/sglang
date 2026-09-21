@@ -308,7 +308,7 @@ class SchedulerMetricsReporter:
         self.scheduler.enable_fpm = False
         if (
             get_observability().enable_forward_pass_metrics
-            and self.scheduler.ps.attn_tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
             from sglang.srt.observability.forward_pass_metrics import (
@@ -316,9 +316,7 @@ class SchedulerMetricsReporter:
             )
 
             self.scheduler._fpm_dp_rank = (
-                self.scheduler.ps.dp_rank
-                if self.scheduler.ps.dp_rank is not None
-                else 0
+                get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
             )
             self.scheduler._fpm_worker_id = (
                 get_observability().forward_pass_metrics_worker_id
@@ -483,9 +481,9 @@ class SchedulerMetricsReporter:
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
-            model_config.get_num_attention_heads(self.scheduler.ps.tp_size)
+            model_config.get_num_attention_heads(get_parallel().tp_size)
         )
-        num_kv_heads = float(model_config.get_num_kv_heads(self.scheduler.ps.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(get_parallel().tp_size))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
