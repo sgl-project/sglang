@@ -55,7 +55,9 @@ pub(super) async fn chat_completions(
             None,
         ));
     }
+    let prefix = crate::policies_reorg::cache_aware::PrefixMemo::default();
     let bucket_request = BucketRequest {
+        prefix: Some(&prefix),
         model: &request.model,
         input_tokens,
         expected_peak_tokens,
