@@ -115,6 +115,15 @@ async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, re
         .contains("sgl_router_ingress_tokenize_errors_total{"));
 }
 
+async fn assert_rendered(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
+    let ids = ctx.tokenizers.encode_chat(MODEL, request).unwrap();
+    assert!(!ids.is_empty());
+    assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
+    let mut expected = request.clone();
+    expected["input_ids"] = json!(ids);
+    assert_eq!(captured(mock), expected);
+}
+
 async fn send(ctx: Arc<AppContext>, body: Value) -> StatusCode {
     let app = build_router(ctx);
     let req = Request::builder()
@@ -166,28 +175,39 @@ async fn round_robin_plain_chat_forwards_input_ids() {
 }
 
 #[tokio::test]
-async fn v41_system_marker_reaches_worker_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokenizer.json");
-    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &path).unwrap();
-    std::fs::write(
-        dir.path().join("config.json"),
-        r#"{"model_type":"deepseek_v41"}"#,
-    )
-    .unwrap();
-    let mut cfg = config();
-    cfg.model.tokenizer_path = path.to_str().unwrap().into();
-    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
-    let request = json!({"model":MODEL,"messages":[{"role":"system","content":"S"},{"role":"user","content":"Hi"}]});
-    assert_eq!(send(Arc::clone(&ctx), request).await, StatusCode::OK);
-    let tokenizer = ctx.tokenizers.get(MODEL).unwrap();
-    let expected = sgl_router::tokenizer::adapter::encode(
-        &tokenizer,
-        "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>Hi<｜Assistant｜></think>",
-    )
-    .unwrap();
-    assert_eq!(captured(&mock)["input_ids"], json!(expected));
+async fn native_system_markers_reach_worker_input_ids() {
+    for (model_type, prompt) in [
+        (
+            "deepseek_v41",
+            "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>Hi<｜Assistant｜></think>",
+        ),
+        (
+            "inkling_mm_model",
+            concat!(
+                "<|message_system|><|content_text|>S<|end_message|>",
+                "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+                "<|message_user|><|content_text|>Hi<|end_message|><|message_model|>",
+            ),
+        ),
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let (dir, cfg) = template_config(json!({}));
+        std::fs::write(
+            dir.path().join("config.json"),
+            json!({"model_type":model_type}).to_string(),
+        )
+        .unwrap();
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        let request = json!({"model":MODEL,"messages":[{"role":"system","content":"S"},{"role":"user","content":"Hi"}]});
+        let tokenizer = ctx.tokenizers.get(MODEL).unwrap();
+        let expected = sgl_router::tokenizer::adapter::encode(&tokenizer, prompt).unwrap();
+        assert_eq!(send(ctx, request).await, StatusCode::OK);
+        assert_eq!(
+            captured(&mock)["input_ids"],
+            json!(expected),
+            "{model_type}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -232,7 +252,7 @@ async fn forwarding_opt_out_keeps_ingress_tokens_for_routing() {
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Array-only deployments must opt out until Dynamo exposes its conversion flag.
+/// Operators can still choose worker rendering for array-only templates.
 #[tokio::test]
 async fn array_only_template_opt_out_preserves_engine_processing() {
     let (_dir, cfg) = template_config(json!({
@@ -282,36 +302,29 @@ async fn disabled_forwarding_does_not_count_routing_render_failures_as_offload_e
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Even under round-robin, a tool request omits `input_ids` (the safe predicate
-/// is policy-independent too).
 #[tokio::test]
-async fn round_robin_tool_request_omits_input_ids() {
+async fn template_requests_forward_dynamo_ids() {
+    let (_dir, cfg) = template_config(json!({
+        "chat_template": "{{ tools | tojson }}{{ enable_thinking }}{% for m in messages %}{{ m.content }}{% endfor %}"
+    }));
     let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids under any policy; got {body}"
-    );
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    for content in [json!("hi"), json!([{"type":"text","text":"hi"}])] {
+        let mut request = json!({"model":MODEL,
+            "messages":[{"role":"user","content":content}],
+            "tools":[{"type":"function","function":{"name":"f"}}],
+            "chat_template_kwargs":{"enable_thinking":true}, "reasoning_effort":"high"
+        });
+        assert_rendered(&ctx, &mock, &request).await;
+        request["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"assistant","content":"prefix"}));
+        request["continue_final_message"] = json!(true);
+        assert_rendered(&ctx, &mock, &request).await;
+    }
 }
 
-/// A successful plain-chat forward on a chat-formatter model must NOT emit
-/// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
-/// offload was expected but the encoder failed. A tool request on the same model
-/// is an *expected* omission (its ids are still engine-equivalent; the
-/// safe-predicate withholds forwarding for other reasons), so it must not emit
-/// the error counter either.
 #[tokio::test]
 async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     let mock = MockWorker::start(vec![]).await;
@@ -345,41 +358,29 @@ async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     );
     assert!(
         !m.contains("sgl_router_ingress_tokenize_errors_total{"),
-        "healthy forwards (and expected omissions) must not emit the error counter; got:\n{m}",
+        "healthy forwards must not emit the error counter; got:\n{m}",
     );
 }
 
-/// History that dynamo-render rewrites stays intact for engine-side tokenization.
+/// Dynamo tokens accompany the original history, including reasoning content.
 #[tokio::test]
-async fn reasoning_history_preserves_messages_without_forwarding_ids() {
+async fn reasoning_history_forwards_ids_and_preserves_messages() {
     let (_dir, cfg) = template_config(json!({
         "chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"
     }));
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
-    let mut request = json!({"model": MODEL, "messages": [
+    let request = json!({"model": MODEL, "messages": [
         {"role":"user", "content":"hi"},
         {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
         {"role":"user", "content":"next"}
     ]});
-    assert!(!ctx
-        .tokenizers
-        .encode_chat(MODEL, &request)
-        .unwrap()
-        .is_empty());
-    assert_forwarded_unchanged(&ctx, &mock, &request).await;
-
-    request["messages"][1]
-        .as_object_mut()
-        .unwrap()
-        .remove("reasoning_content");
-    assert_eq!(send(ctx, request).await, StatusCode::OK);
-    assert!(captured(&mock).get("input_ids").is_some());
+    assert_rendered(&ctx, &mock, &request).await;
 }
 
-/// Strict-template rewrites are used for routing only; the engine gets the original turns.
+/// Strict-template rewrites affect tokens while the original turns remain intact.
 #[tokio::test]
-async fn role_rewrites_preserve_messages_without_forwarding_ids() {
+async fn role_rewrites_forward_ids_and_preserve_messages() {
     let template = concat!(
         "{%- set ns = namespace(prev='') -%}",
         "{%- for m in messages -%}",
@@ -408,21 +409,8 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
             .map(|role| json!({"role": role, "content": "text"}))
             .collect();
         let request = json!({"model": MODEL, "messages": messages});
-        assert!(!ctx
-            .tokenizers
-            .encode_chat(MODEL, &request)
-            .unwrap()
-            .is_empty());
-        assert_forwarded_unchanged(&ctx, &mock, &request).await;
+        assert_rendered(&ctx, &mock, &request).await;
     }
-    let request = json!({"model": MODEL, "messages": [
-        {"role": "system", "content": "instructions"},
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello"},
-        {"role": "user", "content": "next"}
-    ]});
-    assert_eq!(send(ctx, request).await, StatusCode::OK);
-    assert!(captured(&mock).get("input_ids").is_some());
 }
 
 #[path = "../fixtures/kimi_k3.rs"]
