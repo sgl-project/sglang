@@ -138,28 +138,39 @@ async def async_request_sglang_generate(
 
                         data = json.loads(chunk)
 
-                        if "text" in data and data["text"]:
+                        # [FIX] Decouple token counting from a non-empty "text" chunk: update the
+                        # output length from meta_info.completion_tokens on ANY chunk that carries
+                        # it (monotonic max). Under high concurrency / long streams some requests
+                        # never hit the "text is non-empty" branch, leaving output_len at 0 while
+                        # the server actually generated tokens -> systematically under-counted TPS.
+                        meta = data.get("meta_info") or {}
+                        cur = meta.get("completion_tokens")
+                        text = data.get("text", "")
+                        if text:
+                            generated_text = text
+                        if cur is not None:
                             timestamp = time.perf_counter()
-                            generated_text = data["text"]
-                            current_output_len = data["meta_info"]["completion_tokens"]
-
-                            if ttft == 0.0:
+                            if ttft == 0.0 and cur > 0:
                                 ttft = timestamp - st
                                 output.ttft = ttft
-                            else:
-                                num_new_tokens = current_output_len - last_output_len
-                                if num_new_tokens == 0:
-                                    continue
+                                most_recent_timestamp = timestamp
+                            elif cur > last_output_len:
+                                num_new_tokens = cur - last_output_len
                                 chunk_gap = timestamp - most_recent_timestamp
-                                adjust_itl = chunk_gap / num_new_tokens
-                                output.itl.extend([adjust_itl] * num_new_tokens)
-
-                            most_recent_timestamp = timestamp
-                            last_output_len = current_output_len
-                            output.output_len = current_output_len
+                                output.itl.extend([chunk_gap / num_new_tokens] * num_new_tokens)
+                                most_recent_timestamp = timestamp
+                            if cur > last_output_len:
+                                last_output_len = cur
+                                output.output_len = cur
 
                     output.generated_text = generated_text
-                    output.success = True
+                    # [FIX] A 200 response that yielded no counted tokens must NOT be recorded
+                    # as a successful zero-token request (it silently deflates throughput).
+                    if output.output_len > 0:
+                        output.success = True
+                    else:
+                        output.success = False
+                        output.error = output.error or "stream closed with 0 generated tokens (HTTP 200)"
                     output.latency = latency
                 else:
                     output.error = (
