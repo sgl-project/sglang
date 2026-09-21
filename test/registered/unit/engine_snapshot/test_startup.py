@@ -56,6 +56,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
             base_gpu_id=0,
             ssl_keyfile=None,
             ssl_certfile=None,
+            host="0.0.0.0",
             port=30184,
         )
         fields.update(overrides)
@@ -108,6 +109,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
             ({"base_gpu_id": 1}, "CUDA"),
             ({"port": 0}, "listen port"),
             ({"port": 70000}, "listen port"),
+            ({"host": "::1"}, "IPv6"),
             ({"ssl_certfile": "/cert.pem"}, "plain HTTP"),
         )
         for overrides, expected in cases:
