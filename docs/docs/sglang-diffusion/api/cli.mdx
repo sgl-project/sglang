@@ -382,6 +382,8 @@ sglang serve --model-path <MODEL> \
   --layerwise-residency-lifetime transformer=permanent
 ```
 
+The `component=value` maps take the loaded component's name — `transformer`, `text_encoder`, `video_vae` — not a group alias: `--layerwise-offload-components` understands `dit`, but `--layerwise-resident-layers dit=4` matches no component and is silently ignored.
+
 - `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
 - `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Fractional values are a share of the stack. Resident layers pay for a component that runs its layers many times per request — a DiT across the denoise steps, a video VAE across the latent chunks — and do nothing for one that runs them once per request, such as a text encoder.
 - `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
