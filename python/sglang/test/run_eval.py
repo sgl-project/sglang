@@ -275,7 +275,7 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
+        filename = getattr(args, "gpqa_data_path", None) or (
             "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         )
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
@@ -307,6 +307,7 @@ def run_eval(args):
             args.num_examples,
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
+            data_path=getattr(args, "mmmu_data_path", None),
         )
     elif args.eval_name == "mmmu_pro_vision":
         # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
@@ -316,11 +317,20 @@ def run_eval(args):
         from sglang.test.simple_eval_aime import AIMEEval
 
         year = int(args.eval_name.replace("aime", ""))
-        eval_obj = AIMEEval(year, args.num_examples, args.num_threads)
+        eval_obj = AIMEEval(
+            year,
+            args.num_examples,
+            args.num_threads,
+            data_path=getattr(args, "aime_data_path", None),
+        )
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
-        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+        eval_obj = AIME25Eval(
+            args.num_examples,
+            args.num_threads,
+            data_path=getattr(args, "aime_data_path", None),
+        )
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot

@@ -2821,6 +2821,27 @@ def cli_main():
         help="Optional local GSM8K test.jsonl path.",
     )
     parser.add_argument(
+        "--gpqa-data-path",
+        type=str,
+        default=None,
+        help="Optional local GPQA-Diamond CSV path "
+        "(default: download gpqa_diamond.csv).",
+    )
+    parser.add_argument(
+        "--aime-data-path",
+        type=str,
+        default=None,
+        help="Optional local AIME JSON/JSONL/CSV path with question+answer fields "
+        "(skips HuggingFace download).",
+    )
+    parser.add_argument(
+        "--mmmu-data-path",
+        type=str,
+        default=None,
+        help="Optional local MMMU path: HF datasets save_to_disk dir, or a "
+        "JSON/JSONL of prepared VLM samples.",
+    )
+    parser.add_argument(
         "--fake-prefill",
         action="store_true",
         default=False,

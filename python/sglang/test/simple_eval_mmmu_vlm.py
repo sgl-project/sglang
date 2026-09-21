@@ -59,11 +59,13 @@ class MMMUVLMEval(Eval):
         num_threads: int = 32,
         seed: int = 42,
         response_answer_regex: str = None,
+        data_path: Optional[str] = None,
     ):
         """Create MMMU VLM eval (Math subset, 100 fixed samples by default)."""
         self.num_examples = num_examples
         self.num_threads = num_threads
         self.seed = seed
+        self.data_path = data_path
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
         # For example, "<\|begin_of_box\|>foo<\|end_of_box\|>" could be used to extract "foo" as the answer from the response text
@@ -91,6 +93,9 @@ class MMMUVLMEval(Eval):
         return index2ans, all_choices
 
     def _prepare_mmmu_samples(self, k: int) -> List[dict]:
+        if self.data_path:
+            return self._prepare_mmmu_samples_from_path(self.data_path, k)
+
         # Subjects and domains copied from MMMU data_utils to categorize results
         subjects: List[str] = []
         for subs in self.DOMAIN_CAT2SUB_CAT.values():
@@ -110,14 +115,71 @@ class MMMUVLMEval(Eval):
             raise RuntimeError("Failed to load MMMU datasets")
 
         merged = concatenate_datasets(datasets)
+        return self._samples_from_merged(merged, k)
 
+    def _prepare_mmmu_samples_from_path(self, path: str, k: int) -> List[dict]:
+        """Load MMMU from a local save_to_disk dir or prepared JSON/JSONL."""
+        import json
+        from pathlib import Path
+
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"MMMU data path not found: {path}")
+
+        if p.is_file() and p.suffix.lower() in {".json", ".jsonl"}:
+            rows: List[dict] = []
+            if p.suffix.lower() == ".jsonl":
+                with p.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+            else:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    payload = payload.get("samples") or payload.get("data") or []
+                if not isinstance(payload, list):
+                    raise ValueError(f"Expected list of MMMU samples in {path}")
+                rows = payload
+            required = {"final_input_prompt", "image_data", "answer"}
+            for i, row in enumerate(rows):
+                missing = required - set(row)
+                if missing:
+                    raise KeyError(
+                        f"MMMU local sample {i} missing fields {sorted(missing)}"
+                    )
+            if k is not None:
+                rows = rows[:k]
+            return rows
+
+        # HF datasets.save_to_disk directory (Dataset or DatasetDict)
+        from datasets import DatasetDict, load_from_disk
+
+        loaded = load_from_disk(str(p))
+        if isinstance(loaded, DatasetDict):
+            # Prefer validation/test; otherwise concatenate all splits.
+            if "validation" in loaded:
+                merged = loaded["validation"]
+            elif "test" in loaded:
+                merged = loaded["test"]
+            else:
+                merged = concatenate_datasets(list(loaded.values()))
+        else:
+            merged = loaded
+        if "__subject__" not in merged.column_names:
+            merged = merged.add_column(
+                "__subject__", ["local"] * len(merged)
+            )
+        return self._samples_from_merged(merged, k)
+
+    def _samples_from_merged(self, merged, k: int) -> List[dict]:
         # Deterministic selection: sort by id (fallback to subject+index)
         def _key(idx):
             ex = merged[idx]
             return str(ex.get("id", f"{ex['__subject__']}:{idx}"))
 
         order = sorted(range(len(merged)), key=_key)
-        picked_indices = order[:k]
+        picked_indices = order[:k] if k is not None else order
 
         samples: List[dict] = []
         for idx in picked_indices:

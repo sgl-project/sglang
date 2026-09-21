@@ -58,27 +58,33 @@ class AIME25Eval(Eval):
         self,
         num_examples: Optional[int],
         num_threads: int,
+        data_path: Optional[str] = None,
     ):
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "The 'datasets' package is required for AIME25 evaluation. "
-                "Please install it with: pip install datasets"
-            )
+        if data_path:
+            from sglang.test.simple_eval_aime import _load_local_aime_examples
 
-        # Load AIME 2025 dataset from HuggingFace
-        dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
-        dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
-        examples1 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset1
-        ]
-        examples2 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset2
-        ]
-        examples = examples1 + examples2
+            examples = _load_local_aime_examples(data_path)
+        else:
+            try:
+                from datasets import load_dataset
+            except ImportError:
+                raise ImportError(
+                    "The 'datasets' package is required for AIME25 evaluation. "
+                    "Please install it with: pip install datasets"
+                )
+
+            # Load AIME 2025 dataset from HuggingFace
+            dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+            dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+            examples1 = [
+                {"question": row["question"], "answer": str(row["answer"])}
+                for row in dataset1
+            ]
+            examples2 = [
+                {"question": row["question"], "answer": str(row["answer"])}
+                for row in dataset2
+            ]
+            examples = examples1 + examples2
 
         if num_examples:
             examples = examples[: min(num_examples, len(examples))]

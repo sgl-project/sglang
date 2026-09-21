@@ -90,6 +90,9 @@ def _build_run_eval_args(args, base_url: str, eval_name: str) -> SimpleNamespace
         repeat=1,
         num_shots=getattr(args, "gsm8k_num_shots", 5),
         gsm8k_data_path=getattr(args, "gsm8k_data_path", None),
+        gpqa_data_path=getattr(args, "gpqa_data_path", None),
+        aime_data_path=getattr(args, "aime_data_path", None),
+        mmmu_data_path=getattr(args, "mmmu_data_path", None),
         response_answer_regex=getattr(args, "response_answer_regex", None),
         return_latency=False,
     )

@@ -91,7 +91,60 @@ def _load_source(source: AimeSource) -> List[Dict[str, str]]:
     return []
 
 
-def load_aime_examples(year: int) -> List[Dict[str, str]]:
+def _load_local_aime_examples(path: str) -> List[Dict[str, str]]:
+    """Load AIME examples from a local JSON / JSONL / CSV file."""
+    import json
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"AIME data path not found: {path}")
+
+    rows: List[Dict[str, Any]] = []
+    suffix = p.suffix.lower()
+    if suffix == ".csv":
+        import pandas
+
+        df = pandas.read_csv(p)
+        rows = [row.to_dict() for _, row in df.iterrows()]
+    elif suffix == ".jsonl":
+        with p.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    else:
+        with p.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if isinstance(payload, dict):
+            payload = payload.get("examples") or payload.get("data") or []
+        if not isinstance(payload, list):
+            raise ValueError(f"Expected list of examples in {path}")
+        rows = payload
+
+    examples: List[Dict[str, str]] = []
+    for row in rows:
+        q = row.get("question") or row.get("problem") or row.get("Problem")
+        a = (
+            row.get("answer")
+            or row.get("Answer")
+            or row.get("ground_truth")
+            or row.get("final_answer")
+        )
+        if q is None or a is None:
+            raise KeyError(
+                f"AIME local row missing question/answer fields in {path}: {row!r}"
+            )
+        examples.append({"question": str(q), "answer": str(a)})
+    if not examples:
+        raise ValueError(f"No AIME examples loaded from {path}")
+    return examples
+
+
+def load_aime_examples(year: int, data_path: Optional[str] = None) -> List[Dict[str, str]]:
+    if data_path:
+        return _load_local_aime_examples(data_path)
+
     if year not in _AIME_SOURCES:
         raise ValueError(f"Unsupported AIME year: {year}")
 
@@ -114,8 +167,9 @@ class AIMEEval(Eval):
         year: int,
         num_examples: Optional[int],
         num_threads: int,
+        data_path: Optional[str] = None,
     ):
-        self.examples = load_aime_examples(year)
+        self.examples = load_aime_examples(year, data_path=data_path)
         if num_examples is not None:
             self.examples = self.examples[: min(num_examples, len(self.examples))]
         self.num_threads = num_threads
