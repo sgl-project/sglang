@@ -3547,9 +3547,7 @@ class AiterAttnBackend(AttentionBackend):
             # faster; gathering the paged fp8 KV into a contiguous varlen
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
-            # This applies to Qwen3.5 full-attention layers and any other model
-            # meeting the guards below: gfx950, 256-dim Q/K/V, supported GQA,
-            # non-vectorized FP8 KV, and no sliding window, sinks, or soft cap.
+            # This applies to Qwen3.5 full-attention layers only currently,
             # Other configurations fall through to the attention paths below.
             if (
                 is_gfx95_supported()
