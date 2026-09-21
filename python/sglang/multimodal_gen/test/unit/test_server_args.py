@@ -3440,9 +3440,11 @@ def test_resident_layer_help_describes_the_actual_scope():
 
     dit_help = help_by_option["--dit-layerwise-resident-layers"]
     assert "permanently resident" not in dit_help
-    assert "per use" in dit_help or "each use" in dit_help
+    assert "once per request" in dit_help
+    assert "life of the server" in dit_help
 
     per_component_help = help_by_option["--layerwise-resident-layers"]
     assert "once at startup" not in per_component_help
     assert "still benefits" not in per_component_help
-    assert "scoped to one use" in per_component_help
+    assert "once per request" in per_component_help
+    assert "has no effect" in per_component_help

@@ -2830,7 +2830,7 @@ class LayerwiseOffloadableModuleMixin:
             log_anon_vmas(f"layerwise offload ready for {component_name}")
         logger.info(
             "Layerwise offload ready for %s in %.2fs: groups=%d, layers=%d, "
-            "prefetch/group=%s, resident=%d/%d (per use), policy=%s",
+            "prefetch/group=%s, resident=%d/%d (per request), policy=%s",
             component_label,
             perf_counter() - started_at,
             len(managers),
