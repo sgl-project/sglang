@@ -206,7 +206,6 @@ def _pp_local_per_request_bytes(
 
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
         UnifiedKVPool,
         UnifiedPoolBundle,
@@ -260,7 +259,10 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
 class KVCacheConfigurator:
     device: str
     gpu_id: int
-    ps: ParallelState
+    # Frozen at construction, not asked for later: this configurator is built
+    # inside the scope that describes a draft runner and used outside it.
+    attn_dp_size: int
+    pp_size: int
     pp_group: Any
     model: Any
     model_config: ModelConfig
@@ -2324,7 +2326,7 @@ class KVCacheConfigurator:
 
         max_num_reqs = get_schedule().max_running_requests
         if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
+            requested_per_worker = max_num_reqs // self.attn_dp_size
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
             requested_per_worker = None
@@ -2433,16 +2435,16 @@ class KVCacheConfigurator:
         # allocates its own [start_layer, end_layer) slice. Charge the largest
         # per-stage share so every rank derives the same pool without a collective.
         all_mamba_layers = config.mamba2_cache_params.layers
-        if self.ps.pp_size > 1 and all_mamba_layers:
+        if self.pp_size > 1 and all_mamba_layers:
             max_stage_mamba_layers = max(
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
                         self.model_config.num_hidden_layers,
                         rank,
-                        self.ps.pp_size,
+                        self.pp_size,
                     )
-                    for rank in range(self.ps.pp_size)
+                    for rank in range(self.pp_size)
                 )
             )
         else:
@@ -2474,7 +2476,7 @@ class KVCacheConfigurator:
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
         if replayssm_active and self.hybrid_kda_config is None:
             replay_req_slots = (
-                get_schedule().max_running_requests // self.ps.attn_dp_size + 1
+                get_schedule().max_running_requests // self.attn_dp_size + 1
             )
             replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
             replayssm_ring_per_slot = 0
@@ -2490,7 +2492,7 @@ class KVCacheConfigurator:
             get_context().override(
                 "mamba_pool.per_dp_shard",
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
-                // self.ps.attn_dp_size,
+                // self.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
@@ -2498,7 +2500,7 @@ class KVCacheConfigurator:
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    get_schedule().max_running_requests // self.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -2515,7 +2517,7 @@ class KVCacheConfigurator:
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=get_schedule().max_running_requests
-                // self.ps.attn_dp_size,
+                // self.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
@@ -2555,7 +2557,7 @@ class KVCacheConfigurator:
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    get_schedule().max_running_requests // self.ps.attn_dp_size,
+                    get_schedule().max_running_requests // self.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * (capped_reqs + 1) * D

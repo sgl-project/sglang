@@ -91,6 +91,10 @@ def _make_prefill_aware_swa_runner(
         kv_cache_dtype=torch.float16,
         kv_cache_dtype_str="auto",
         page_size=1,
+        attn_cp_size=1,
+        tp_size=1,
+        # The backend still reads the runner's frozen record for these two;
+        # same single-rank placement, stated where it looks for it.
         ps=SimpleNamespace(attn_cp_size=1, tp_size=1),
         is_draft_worker=False,
         server_args=server_args,
