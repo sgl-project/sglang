@@ -1867,6 +1867,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
+            pack_capacity_bytes=rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
 
