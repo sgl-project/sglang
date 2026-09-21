@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)
@@ -386,7 +387,7 @@ class CommitKvProj:
         wkv_linears: list[torch.nn.Module],
         allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
+        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears) and not is_npu_arch35():
             return cls.triton(
                 main_x=main_x,
                 wkv_linears=wkv_linears,

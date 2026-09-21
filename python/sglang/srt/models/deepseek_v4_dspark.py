@@ -66,6 +66,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
@@ -782,7 +783,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
 
     @classmethod
     def shared_experts_fusion_disable_reason(
@@ -790,7 +791,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if cls.uses_own_vocab_modules:
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -1086,7 +1087,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for name, loaded_weight in weights:
             mapped = (
                 self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
