@@ -185,7 +185,7 @@ def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
 
 
 # Cross-check the per-batch fast indices against the generic gather (syncs).
-_ASM_CTX_GATHER_CHECK = os.environ.get("SGLANG_ASM_CTX_GATHER_CHECK", "0") == "1"
+_GFX_ASM_CTX_GATHER_CHECK = os.environ.get("SGLANG_ASM_CTX_GATHER_CHECK", "0") == "1"
 
 
 def _asm_context_prefill_gather_indices(
@@ -1098,7 +1098,7 @@ class AiterAttnBackend(AttentionBackend):
             cu_k = fm.kv_indptr[: bs + 1]
             if cu_k.dtype != torch.int32:
                 cu_k = cu_k.to(torch.int32)
-            if _ASM_CTX_GATHER_CHECK:
+            if _GFX_ASM_CTX_GATHER_CHECK:
                 ref = _asm_context_prefill_gather_indices(
                     fm.kv_indptr[: bs + 1],
                     fm.kv_indices,
@@ -3547,6 +3547,10 @@ class AiterAttnBackend(AttentionBackend):
             # faster; gathering the paged fp8 KV into a contiguous varlen
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
+            # This applies to Qwen3.5 full-attention layers and any other model
+            # meeting the guards below: gfx950, 256-dim Q/K/V, supported GQA,
+            # non-vectorized FP8 KV, and no sliding window, sinks, or soft cap.
+            # Other configurations fall through to the attention paths below.
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
