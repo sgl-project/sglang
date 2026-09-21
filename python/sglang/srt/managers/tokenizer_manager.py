@@ -210,6 +210,38 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
         )
 
 
+def _merge_sampling_kwargs(
+    preferred_sampling_params: Optional[Dict[str, Any]],
+    request_sampling_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge server-wide --preferred-sampling-params with per-request ones.
+
+    `ChatCompletionRequest.to_sampling_params()` always emits every sampling
+    field, including ones the caller never set (as an explicit `None`, e.g.
+    `custom_params`). A naive `{**preferred, **request}` merge therefore lets
+    an unset request field silently clobber a preferred default -- only
+    fields the caller actually set should override it. `custom_params` is
+    merged key-by-key on top of that, so a preferred default there (e.g. a
+    default `thinking_budget`) survives requests that only set unrelated
+    custom params.
+    """
+    if not preferred_sampling_params:
+        return request_sampling_params
+
+    explicit_request_params = {
+        k: v for k, v in request_sampling_params.items() if v is not None
+    }
+    merged = {**preferred_sampling_params, **explicit_request_params}
+
+    preferred_custom_params = preferred_sampling_params.get("custom_params")
+    if preferred_custom_params or "custom_params" in explicit_request_params:
+        merged["custom_params"] = {
+            **(preferred_custom_params or {}),
+            **(explicit_request_params.get("custom_params") or {}),
+        }
+    return merged
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -1457,10 +1489,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
-        else:
-            sampling_kwargs = obj.sampling_params
+        sampling_kwargs = _merge_sampling_kwargs(
+            self.preferred_sampling_params, obj.sampling_params
+        )
         if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
             sampling_kwargs = dict(sampling_kwargs)
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
