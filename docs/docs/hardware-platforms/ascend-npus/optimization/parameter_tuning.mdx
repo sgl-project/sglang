@@ -757,6 +757,8 @@ Breaks large prefill computations into smaller, fixed-size chunks for better sch
 
 ### NPU Graph (`--cuda-graph-bs`)
 
+Heading keeps the legacy `--cuda-graph-bs` label so the existing `#npu-graph---cuda-graph-bs` anchor stays stable; use `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` in commands.
+
 Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs-decode`, and `--cuda-graph-bs-prefill` when prefill graphs are enabled). `--cuda-graph-bs` is deprecated. Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
 
 <Note>
