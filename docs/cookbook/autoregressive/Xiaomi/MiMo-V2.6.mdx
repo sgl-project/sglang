@@ -34,16 +34,8 @@ Then run the **Python** command from the panel below. Checkpoint paths refer to 
 Build a local image from the official development image and install the same SGLang revision:
 
 ```bash Command
-docker build -t mimo-v2.6-sglang:983e643854 - <<'DOCKERFILE'
-FROM lmsysorg/sglang:dev
-RUN python3 -m pip install --no-cache-dir \
-    'git+https://github.com/sgl-project/sglang.git@983e643854f15cf9ef4370a49dfd74b6af54c3e3#subdirectory=python'
-DOCKERFILE
+docker pull lmsysorg/sglang:dev
 ```
-
-`mimo-v2.6-sglang:983e643854` is the local image name used by the **Docker** command panel; it is not a published tag. This pins the SGLang source revision. The `dev` base image and dependencies remain mutable; record the base-image digest and dependency versions when recording benchmark results.
-
-The generated Docker command mounts the host's **Host model directory (Docker)** at `/model` read-only. Set model and draft paths to their locations inside that mount. For example, a host directory `/data/models` containing `MiMo-V2.6-Flash` is exposed as `/model/MiMo-V2.6-Flash`.
 
 </Tab>
 </Tabs>
