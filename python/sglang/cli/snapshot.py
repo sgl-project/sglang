@@ -6,7 +6,11 @@ import argparse
 
 
 def snapshot(args, extra_argv):
-    from sglang.srt.engine_snapshot.cli import add_cli_args, execute
+    from sglang.srt.engine_snapshot.cli import (
+        add_cli_args,
+        execute,
+        require_separator,
+    )
     from sglang.srt.engine_snapshot.errors import SnapshotError, SnapshotUsageError
 
     parser = argparse.ArgumentParser(
@@ -14,8 +18,9 @@ def snapshot(args, extra_argv):
         description="Create, inspect, or restore an initialized engine snapshot.",
     )
     add_cli_args(parser)
-    options = parser.parse_args(extra_argv)
     try:
+        require_separator(extra_argv)
+        options = parser.parse_args(extra_argv)
         code = execute(options)
     except SnapshotUsageError as exc:
         parser.error(str(exc))
