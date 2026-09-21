@@ -8,11 +8,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models.kimi_k3 import (
-    KimiK3DeltaAttention,
-    _get_k3_dense_weight,
-    _should_fuse_kda_projections,
-)
+from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _get_k3_dense_weight
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -58,36 +54,6 @@ def _make_owner(with_stream: bool):
 def _run(owner, x):
     out = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
     return [t.clone() for t in out]
-
-
-class TestKimiK3ProjectionFusionPolicy(unittest.TestCase):
-    def test_full_rank_gate_supports_dp_attention(self):
-        self.assertTrue(
-            _should_fuse_kda_projections(
-                use_full_rank_gate=True,
-                quant_config=object(),
-                tp_size=16,
-                attn_tp_size=1,
-            )
-        )
-
-    def test_low_rank_layout_still_requires_matching_tp(self):
-        self.assertTrue(
-            _should_fuse_kda_projections(
-                use_full_rank_gate=False,
-                quant_config=None,
-                tp_size=16,
-                attn_tp_size=16,
-            )
-        )
-        self.assertFalse(
-            _should_fuse_kda_projections(
-                use_full_rank_gate=False,
-                quant_config=None,
-                tp_size=16,
-                attn_tp_size=1,
-            )
-        )
 
 
 class TestKimiK3BfaOverlap(CustomTestCase):

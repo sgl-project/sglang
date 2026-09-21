@@ -14,6 +14,7 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -102,6 +103,8 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         serving_patch.start()
         observability_patch.start()
+        # The streamer asks the context which rank it is streaming from.
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 

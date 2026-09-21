@@ -35,6 +35,8 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 _FULL_L = 2
@@ -135,6 +137,7 @@ class TestPassthrough(unittest.TestCase):
             device=_DEV,
         )
         self.assertFalse(src.is_translating)
+        self.assertEqual(src.capture_token_capacity(17), 18)
         rows = torch.tensor([2, 0])
         view = src.build_index_table(
             req_pool_indices=rows, seq_lens=torch.tensor([5, 3])
@@ -594,7 +597,7 @@ class TestViewMemo(unittest.TestCase):
         self.assertEqual(v2.ids.shape[0], 1)
 
 
-class TestWriteLoc(unittest.TestCase):
+class TestWriteLoc(CustomTestCase):
     """The two-phase write contract: `rebind_write_loc` rebinds the full side
     once at ForwardBatch construction, and the sliding-window write loc derives
     POINTWISE from the full-side values -- pads, slices, and fresh copies
@@ -629,6 +632,121 @@ class TestWriteLoc(unittest.TestCase):
             self.assertIsNot(fb.out_cache_loc, virt)
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
             self.assertTrue(torch.equal(virt, keep))
+
+    def test_capture_capacity_covers_dcp_widened_mamba_ids(self):
+        """A capturer must store the highest virtual IDs issued under DCP."""
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.runtime_context import get_parallel
+
+        for dcp_size in (1, 2, 4):
+            with (
+                self.subTest(dcp_size=dcp_size),
+                get_parallel().override(attn_dcp_size=dcp_size),
+            ):
+                pool = UnifiedKVPool(
+                    total_bytes=2048,
+                    sub_pool_specs=[
+                        MHASubPoolSpec(
+                            name="full",
+                            layer_num=1,
+                            head_num=1,
+                            head_dim=4,
+                            store_dtype=torch.float16,
+                            grow_direction="up",
+                        ),
+                        MambaSubPoolSpec(
+                            name="mamba",
+                            layer_num=1,
+                            conv_state_shapes=((2, 2),),
+                            conv_dtype=torch.float16,
+                            temporal_state_shape=(2, 2),
+                            temporal_dtype=torch.float16,
+                            grow_direction="down",
+                        ),
+                    ],
+                    device="cpu",
+                    enable_memory_saver=False,
+                    page_size=4,
+                )
+                allocator = UnifiedMambaTokenToKVPoolAllocator(
+                    unified_buffer=pool,
+                    kvcache=SimpleNamespace(full_kv_pool=None, mamba_pool=None),
+                    device="cpu",
+                    page_size=4,
+                )
+                virt = allocator.alloc(allocator.available_size())
+                self.assertIsNotNone(virt)
+                src = _make_source(allocator, virt[None, :], 4)
+                cap = object.__new__(BaseTopkCapturer)
+                cap.topk_size = 1
+                expected = torch.arange(len(virt), dtype=torch.int32).reshape(-1, 1, 1)
+                cap.device_cache = SimpleNamespace(buffer=expected)
+                cap.host_cache = SimpleNamespace(
+                    buffer=torch.zeros(
+                        src.capture_token_capacity(1), 1, 1, dtype=torch.int32
+                    )
+                )
+                fb = _FakeForwardBatch(out_cache_loc=virt)
+                fb.out_cache_loc_virtual = virt
+                cap.on_forward_end(fb, False, None, no_copy_to_cpu=False)
+                req_pool = SimpleNamespace(req_to_token=virt[None, :])
+                self.assertTrue(
+                    torch.equal(cap.get_topk(0, len(virt) + 1, req_pool), expected)
+                )
+
+    def test_topk_capture_round_trips_request_token_ids(self):
+        for ps in (1, 4, 64):
+            for translating in (False, True):
+                for overlap in (False, True):
+                    with self.subTest(
+                        page_size=ps, translating=translating, overlap=overlap
+                    ):
+                        src, _, _, _, virt, _, _ = self._built(ps=ps, n=3 * ps)
+                        req_pool = SimpleNamespace(req_to_token=virt.clone()[None, :])
+                        fb = _FakeForwardBatch(out_cache_loc=virt.clone())
+                        if translating:
+                            src.rebind_write_loc(fb)
+                            fb.out_cache_loc = torch.cat(
+                                [fb.out_cache_loc, virt.new_zeros(2)]
+                            )
+                        else:
+                            fb.out_cache_loc_virtual = None
+
+                        # Admission may be capped below IDs issued after reuse.
+                        capacity = src.capture_token_capacity(ps)
+                        self.assertGreater(capacity, int(virt.max()))
+                        expected = (
+                            torch.arange(len(virt) * 4, dtype=torch.int32).reshape(
+                                -1, 2, 2
+                            )
+                            + 1
+                        )
+                        cap = object.__new__(BaseTopkCapturer)
+                        cap.topk_size = 2
+                        cap.device_cache = SimpleNamespace(
+                            buffer=torch.cat([expected, expected.new_zeros(2, 2, 2)])
+                        )
+                        cap.host_cache = SimpleNamespace(
+                            buffer=torch.zeros(capacity, 2, 2, dtype=torch.int32)
+                        )
+                        result = cap.on_forward_end(
+                            fb, False, None, no_copy_to_cpu=overlap
+                        )
+                        if overlap:
+                            fb.out_cache_loc.zero_()
+                            if translating:
+                                fb.out_cache_loc_virtual.zero_()
+                            cap.device_cache.buffer.zero_()
+                            result.map_device_tensors(lambda value: value.cpu())
+                            result.finalize()
+                        self.assertTrue(
+                            torch.equal(
+                                cap.get_topk(0, len(virt) + 1, req_pool), expected
+                            )
+                        )
 
     def test_swa_write_loc_round_trips_from_full_side(self):
         """Derived property: `field(full(t)) == swa(t)` for any virtual run t,
