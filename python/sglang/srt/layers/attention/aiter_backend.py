@@ -70,7 +70,10 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.dcp_kernels import (
+    compact_dcp_verify_table_to_ragged,
+    create_mla_kv_page_table_for_dcp,
+)
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -101,6 +104,27 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
+
+# Longest query length the asm persistent MLA kernels serve; aiter ships no
+# wider .co and its dispatch asserts instead of falling back.
+_MLA_ASM_PS_MAX_QLEN = 4
+
+# Query lengths the gfx950 fp8 cp round-robin path serves. The limit is the
+# packed query row count (128) over the 16 heads the cp fold lands on, not the
+# qseqlen in the .co file names, so qlen <= 8. That covers Kimi-K3's default
+# DSpark block size of 7 (q_len = block_size + 1).
+_MLA_ASM_CPRR_MAX_PACKED_QO = 128
+_MLA_ASM_CPRR_FOLDED_HEADS = 16
+_MLA_ASM_CPRR_QLENS = frozenset(
+    range(3, _MLA_ASM_CPRR_MAX_PACKED_QO // _MLA_ASM_CPRR_FOLDED_HEADS + 1)
+)
+
+# Gathered head counts aiter can fold down to 16 for the cp kernel.
+_MLA_ASM_FOLDABLE_HEADS = frozenset(range(32, 128 + 1, 16))
+
+# LSE that drops a row from the cross-rank merge. Finite, not -inf, so a row
+# that is empty on every rank does not merge as 0 / 0.
+_CPRR_EMPTY_LSE = -1e30
 
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
 # instantiation. This map is copied from MLA_REDUCE_ROUTER in
@@ -158,6 +182,19 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # Cumulative global kv length per request, kept before the DCP planner
+    # rewrites kv_indptr. The cp kernel maps a local index j to global j * W + r.
+    global_kv_indptr: Optional[torch.Tensor] = None
+    # True when this forward runs DCP verify on the asm cp round-robin kernel.
+    # Decided once here, so the KV range and the kernel choice cannot disagree.
+    use_asm_cprr_verify: bool = False
+    # This rank's verify shard as a ragged pair, built in the metadata phase
+    # because the compaction shape depends on data and a graph cannot record it.
+    cprr_kv_indices: Optional[torch.Tensor] = None
+    cprr_kv_indptr: Optional[torch.Tensor] = None
+    # [n_rows] true where this rank owns no kv for that query row. Those rows ran
+    # on a filler slot and are dropped before the cross-rank merge.
+    cprr_empty_rows: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -275,6 +312,9 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
+        # Read once here, never per layer: the DCP verify path calls the gate
+        # for every layer of every forward.
+        self.disable_asm_cprr_verify = envs.SGLANG_DISABLE_ASM_CPRR_VERIFY.get()
 
         # Get v_head_dim based on model type
         if self.use_mla:
@@ -503,14 +543,18 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
+            # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel,
+            # unless the asm PS kernels cover every mode this server can run.
             if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
-                if prefer_mla_gluon_decode(
-                    head_pad_mode=self.head_pad_mode,
-                    num_head=self.num_head,
-                    kv_cache_dtype=self.kv_cache_dtype,
+                if (
+                    prefer_mla_gluon_decode(
+                        head_pad_mode=self.head_pad_mode,
+                        num_head=self.num_head,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                    and not self._asm_ps_serves_all_modes()
                 ):
                     _use_mla_ps_kernel = False
                     fast_mode = False
@@ -521,6 +565,23 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.num_draft_tokens is None and _use_mla_ps_kernel:
                 self.max_split_per_batch = 64
+
+            if (
+                _use_mla_ps_kernel
+                and self.dcp_world_size > 1
+                and envs.SGLANG_ENABLE_ASM_CPRR_SPLITS_PER_CU.get()
+            ):
+                # At DCP decode the KV shard is the only long axis to split, so
+                # 32 splits can leave most CUs idle on a long shard. Buffer
+                # sizing, scheduling and the kernel call all read this same
+                # attribute, so they stay consistent.
+                self.max_split_per_batch = torch.cuda.get_device_properties(
+                    model_runner.device
+                ).multi_processor_count
+                logger.info(
+                    "aiter MLA DCP: max_split_per_batch=%d (one per CU)",
+                    self.max_split_per_batch,
+                )
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
@@ -574,7 +635,13 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
-    def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
+    def make_mla_decode_meta_data_buffer(
+        self, max_seqlen_qo, batch_size, is_cp_round_robin=False
+    ):
+        """Allocate the PS work-schedule buffers."""
+        # is_cp_round_robin must match what make_mla_meta_data gets: aiter sizes
+        # these buffers from the same head fold, and sizing for the unfolded
+        # shape would truncate the schedule.
         nhead = self.mla_kernel_num_head_padded
         dtype = self.kv_cache_dtype
 
@@ -603,6 +670,7 @@ class AiterAttnBackend(AttentionBackend):
             fast_mode=fast_mode,
             num_kv_splits=self.max_split_per_batch,
             intra_batch_mode=intra_batch_mode,
+            is_cp_round_robin=is_cp_round_robin,
         )
 
         # aiter implementation
@@ -652,6 +720,7 @@ class AiterAttnBackend(AttentionBackend):
         fast_mode,
         max_split_per_batch,
         intra_batch_mode,
+        is_cp_round_robin=False,
     ):
         nhead_kv = 1
         page_size = self.page_size
@@ -676,6 +745,9 @@ class AiterAttnBackend(AttentionBackend):
             fast_mode=fast_mode,
             max_split_per_batch=max_split_per_batch,
             intra_batch_mode=intra_batch_mode,
+            # Tells the scheduler the kv_indices are a round-robin shard, and
+            # drives the same head fold as the buffer sizing above.
+            is_cp_round_robin=is_cp_round_robin,
             dtype_q=dtype,
             dtype_kv=dtype,
         )
@@ -1079,6 +1151,50 @@ class AiterAttnBackend(AttentionBackend):
                 f"Got topk={self.topk}."
             )
 
+    def _asm_ps_serves_all_modes(self) -> bool:
+        """Whether the asm PS MLA kernels cover every mode this server runs."""
+        # Target verify is the widest mode; decode is 1. Both are decided here
+        # because the PS metadata is built under one flag, so turning the kernel
+        # on for decode alone would leave verify without its metadata.
+        verify_q_len = self.num_draft_tokens or 1
+        # Under DCP verify runs on the cp kernel, which reaches qlen 8, while
+        # decode stays on Gluon. So the DCP bound is cprr's, not the PS one.
+        max_q_len = (
+            max(_MLA_ASM_CPRR_QLENS)
+            if self.dcp_world_size > 1
+            else _MLA_ASM_PS_MAX_QLEN
+        )
+        if verify_q_len <= max_q_len:
+            return True
+        logger.info(
+            "aiter MLA decode and verify stay on the Gluon kernel: target "
+            "verify is %d tokens wide and the asm kernels serve at most %d "
+            "here. A DSPARK block size of %d or lower would fit.",
+            verify_q_len,
+            max_q_len,
+            max_q_len - 1,
+        )
+        return False
+
+    def _use_asm_ps_mla(self, max_q_len: Optional[int]) -> bool:
+        """Whether this forward's query length can run on the asm PS kernel."""
+        return _use_mla_ps_kernel and (max_q_len or 1) <= _MLA_ASM_PS_MAX_QLEN
+
+    def _asm_cprr_verify_shape_ok(self, q_len: Optional[int]) -> bool:
+        """Whether this topology has an asm cp kernel for DCP target verify."""
+        # The only gate for that path. The metadata phase stores the answer in
+        # ForwardMetadata.use_asm_cprr_verify, so the kv range and the kernel
+        # choice cannot disagree and count the verify window twice.
+        return (
+            _use_mla_ps_kernel
+            and not self.disable_asm_cprr_verify
+            and self.dcp_world_size > 1
+            and self.kv_cache_dtype == fp8_dtype
+            and q_len in _MLA_ASM_CPRR_QLENS
+            # aiter folds the gathered heads down to 16 for the cp kernel.
+            and self.num_head * self.dcp_world_size in _MLA_ASM_FOLDABLE_HEADS
+        )
+
     def _mla_decode_fwd_with_head_pad(
         self,
         q: torch.Tensor,
@@ -1174,7 +1290,7 @@ class AiterAttnBackend(AttentionBackend):
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
-        ):
+        ) and not self._use_asm_ps_mla(max_q_len):
             return mla_gluon_decode(
                 q=q,
                 k_buffer=k_buffer,
@@ -1218,10 +1334,19 @@ class AiterAttnBackend(AttentionBackend):
             num_kv_splits=num_kv_splits,
         )
 
-    def _get_dcp_graph_max_local_kv_len(self) -> int:
-        """Static upper bound on this rank's shard, ceil(max_context_len / W)."""
+    def _dcp_max_local_kv_len(self, max_global_kv_len: int) -> int:
+        """Widest shard one rank can hold for a global kv length."""
         w = max(self.dcp_world_size, 1)
-        return (self.max_context_len + w - 1) // w
+        return (max_global_kv_len + w - 1) // w
+
+    def _get_dcp_graph_max_local_kv_len(self) -> int:
+        """Static upper bound on this rank's shard under a cuda graph."""
+        max_global_kv_len = self.max_context_len
+        if self._asm_cprr_verify_shape_ok(self.num_draft_tokens):
+            # The cp verify path keeps the draft window in the kv range, so the
+            # bound has to cover it too, same as the eager path.
+            max_global_kv_len += self.num_draft_tokens
+        return self._dcp_max_local_kv_len(max_global_kv_len)
 
     def _forward_decode_dcp(self, q, k_buffer, layer, k_descale):
         """Attend this rank's KV shard for decode -> (out, natural-log lse)."""
@@ -1242,19 +1367,127 @@ class AiterAttnBackend(AttentionBackend):
         )
         return out, lse.view(bs, num_heads)
 
-    def _forward_verify_dcp(self, q, k_window, layer, k_descale):
-        """Attend the committed prefix and the verify window separately, then
-        merge -> (out, natural-log lse).
+    def _verify_asm_cprr(self, q, layer, k_descale, n_rows):
+        """DCP target verify on the asm cp round-robin kernel: one masked pass."""
+        # The kv range holds the prefix and the verify window, because
+        # forward_mla_rocm writes the window into the paged cache before
+        # attention. The kernel masks on global positions itself, so there is
+        # no second pass and no merge here.
+        fm = self.forward_metadata
+        num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
+        # torch.full, not torch.as_tensor: as_tensor copies from host memory,
+        # which a cuda graph capture cannot record.
+        scale = torch.full(
+            (),
+            self._resolve_fp8_kv_scale_float(layer, k_descale),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        kv_indices, kv_indptr = fm.cprr_kv_indices, fm.cprr_kv_indptr
+        out = q.new_empty((n_rows, num_heads, layer.v_head_dim), dtype=self.input_dtype)
+        _, lse = mla_decode_fwd(
+            q.view(n_rows, num_heads, layer.qk_head_dim).to(fp8_dtype),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, 1, 1, layer.qk_head_dim
+            ),
+            out,
+            fm.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            # fm's, not self's: under a graph this must be the same buffer the
+            # schedule was built against.
+            fm.kv_last_page_len,
+            fm.max_q_len,
+            sm_scale=layer.scaling,
+            work_meta_data=fm.work_metadata,
+            work_indptr=fm.work_indptr,
+            work_info_set=fm.work_info_set,
+            reduce_indptr=fm.reduce_indptr,
+            reduce_final_map=fm.reduce_final_map,
+            reduce_partial_map=fm.reduce_partial_map,
+            q_scale=scale,
+            kv_scale=scale,
+            intra_batch_mode=intra_batch_mode,
+            num_kv_splits=fm.num_kv_splits,
+            return_lse=True,
+            g_kv_indptr=fm.global_kv_indptr,
+            cp_world_size=self.dcp_world_size,
+            cp_rank=get_parallel().attn_dcp_rank,
+            # Picks the masked variant: the range holds the window, so each
+            # query must not see the window tokens after it.
+            causal=True,
+        )
+        return out, lse.view(n_rows, num_heads)
 
-        Splitting at the window boundary avoids the one thing the decode kernel
-        cannot do under DCP: mask on the GLOBAL position g(j) = j * W + r.
-        """
+    def _build_dcp_verify_ragged_indices(
+        self,
+        verify_token_table: torch.Tensor,
+        local_kv_lens: torch.Tensor,
+        bs: int,
+        q_len: int,
+        out_indices: Optional[torch.Tensor] = None,
+        out_indptr: Optional[torch.Tensor] = None,
+        out_empty: Optional[torch.Tensor] = None,
+    ):
+        """This rank's verify shard as ragged (kv_indices, kv_indptr, empty_rows)."""
+        # Pass out_* for the graph's address-stable buffers, or omit to allocate.
+        # .contiguous() matters: the slice has stride q_len, and .to() on an
+        # already-int32 tensor returns it unchanged, so the kernel would read
+        # lens[req] instead of lens[req * q_len]. Only bs 1 hides this.
+        lens = local_kv_lens[: bs * q_len : q_len].to(torch.int32).contiguous()
+        # The kernel faults on a zero-length shard, so give every shard a slot.
+        clamped = lens.clamp_min(1)
+        if out_indptr is None:
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=lens.device)
+        else:
+            kv_indptr = out_indptr[: bs + 1]
+            # Not kv_indptr[0] = 0: that copies from host memory, which a
+            # cuda graph capture cannot record.
+            kv_indptr[:1].zero_()
+        torch.cumsum(clamped, dim=0, out=kv_indptr[1:])
+
+        if out_indices is None:
+            kv_indices = verify_token_table.new_empty(
+                (int(clamped.sum().item()),), dtype=torch.int32
+            )
+        else:
+            kv_indices = out_indices
+        compact_dcp_verify_table_to_ragged[(bs,)](
+            verify_token_table,
+            lens,
+            kv_indptr,
+            kv_indices,
+            table_stride=verify_token_table.shape[1],
+            Q_LEN=q_len,
+            BLOCK_SIZE=_DCP_VERIFY_TABLE_COLS_PER_BLOCK,
+        )
+        empty_rows = local_kv_lens[: bs * q_len].eq(0)
+        if out_empty is not None:
+            empty_rows = out_empty[: bs * q_len].copy_(empty_rows)
+        return kv_indices, kv_indptr, empty_rows
+
+    def _forward_verify_dcp(self, q, k_window, layer, k_descale):
+        """DCP target verify -> (out, natural-log lse) for the cross-rank merge."""
+        # The asm cp kernel does this in one masked pass. Gluon cannot mask on
+        # global positions, so its fallback attends prefix and window
+        # separately and merges them, with only rank 0 taking the window: the
+        # window is the same on every rank, so any other split counts it twice.
         fm = self.forward_metadata
         q_len = fm.max_q_len
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
         seqused_k = fm.local_kv_lens
         n_rows = seqused_k.shape[0]
         bs = n_rows // q_len
+
+        if fm.use_asm_cprr_verify:
+            out_a, lse_a = self._verify_asm_cprr(q, layer, k_descale, n_rows)
+            # Rows with no kv on this rank ran on a filler slot, so drop them
+            # before the merge. The LSE floor is finite, not -inf, so a row that
+            # is empty on every rank does not merge as 0 / 0.
+            empty = fm.cprr_empty_rows
+            out_a.masked_fill_(empty[:, None, None], 0.0)
+            lse_a.masked_fill_(empty[:, None], _CPRR_EMPTY_LSE)
+            return out_a, lse_a
 
         out_a, lse_a = mla_gluon_decode(
             q=q.view(n_rows, num_heads, layer.qk_head_dim),
@@ -1456,6 +1689,9 @@ class AiterAttnBackend(AttentionBackend):
         # dcp metadata
         local_kv_lens = None
         verify_token_table = None
+        global_kv_indptr = None
+        cprr_ok = False
+        cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -1686,10 +1922,19 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 device = forward_batch.seq_lens.device
-                if self.dcp_world_size > 1:
+                # One decision for the whole forward: it sets the kv range, the
+                # buffer sizes and the kernel. Splitting it would let the Gluon
+                # fallback run with the window already in range and count it
+                # twice.
+                cprr_ok = self._asm_cprr_verify_shape_ok(draft_num)
+                if self.dcp_world_size > 1 and not cprr_ok:
+                    # The Gluon DCP fallback attends the window separately from
+                    # k_window, so the window must stay out of the kv range.
                     kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
                     kv_lens_sum = forward_batch.seq_lens_sum
                 else:
+                    # The window tokens are already in the paged cache, so one
+                    # masked pass covers prefix and window.
                     kv_lens = forward_batch.seq_lens + draft_num
                     kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
 
@@ -1720,6 +1965,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if self.dcp_world_size > 1:
+                    # The planner rewrites kv_indptr in place, so keep the
+                    # global lengths the cp kernel masks on before it runs.
+                    global_kv_indptr = kv_indptr.clone()
                     self._plan_dcp_decode_metadata(
                         kv_indptr,
                         kv_indices,
@@ -1735,11 +1983,24 @@ class AiterAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices,
                         bs,
                         draft_num,
-                        (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
+                        self._dcp_max_local_kv_len(
+                            max_kv_len + (draft_num if cprr_ok else 0)
+                        ),
                     )
 
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if cprr_ok:
+                    (
+                        cprr_kv_indices,
+                        cprr_kv_indptr,
+                        cprr_empty_rows,
+                    ) = self._build_dcp_verify_ragged_indices(
+                        verify_token_table, local_kv_lens, bs, draft_num
+                    )
+                if _use_mla_ps_kernel and (self.dcp_world_size <= 1 or cprr_ok):
                     max_seqlen_qo = draft_num
+                    # aiter folds the schedule to gqa16 for a cp launch, but
+                    # only if it is told the request is cp.
+                    is_cp_round_robin = self.dcp_world_size > 1
                     (
                         work_metadata,
                         work_indptr,
@@ -1747,13 +2008,17 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(
+                        max_seqlen_qo, bs, is_cp_round_robin=is_cp_round_robin
+                    )
 
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        kv_indptr,
+                        # The schedule must describe the lengths the kernel
+                        # walks, which on the cp path is the clamped ragged pair.
+                        cprr_kv_indptr if cprr_ok else kv_indptr,
                         self.kv_last_page_len[:bs],
                         work_metadata,
                         work_info_set,
@@ -1765,6 +2030,7 @@ class AiterAttnBackend(AttentionBackend):
                         fast_mode=fast_mode,
                         max_split_per_batch=num_kv_splits,
                         intra_batch_mode=intra_batch_mode,
+                        is_cp_round_robin=is_cp_round_robin,
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1785,6 +2051,11 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    global_kv_indptr=global_kv_indptr,
+                    use_asm_cprr_verify=cprr_ok,
+                    cprr_kv_indices=cprr_kv_indices,
+                    cprr_kv_indptr=cprr_kv_indptr,
+                    cprr_empty_rows=cprr_empty_rows,
                 )
             else:
                 draft_num = forward_batch.input_ids.shape[0] // bs
@@ -2126,8 +2397,8 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_verify_local_kv_lens = torch.zeros(
                     (n_verify_rows,), dtype=torch.int32, device=self.device
                 )
-                # Capture-stable token table, filled out-of-graph. One column per
-                # TOKEN, so the width is the worst-case shard ceil(ctx_len / W).
+                # Capture-stable token table, filled out-of-graph. One column
+                # per token, so the width is the worst-case shard.
                 self.cuda_graph_verify_token_table = torch.zeros(
                     (n_verify_rows, self._get_dcp_graph_max_local_kv_len()),
                     dtype=torch.int32,
@@ -2140,6 +2411,25 @@ class AiterAttnBackend(AttentionBackend):
                     self._get_dcp_graph_max_local_kv_len(),
                     dtype=torch.int32,
                     device="cpu",
+                )
+                # Buffers for the asm cp round-robin verify path. All are
+                # refilled out-of-graph before every replay and only read
+                # inside the graph, which is what makes that path capturable.
+                self.cuda_graph_global_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_cprr_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+                # One slot per request over the worst-case shard, for the filler
+                # entry an empty shard gets.
+                self.cuda_graph_cprr_kv_indices = torch.zeros(
+                    (max_bs * (self._get_dcp_graph_max_local_kv_len() + 1),),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.cuda_graph_cprr_empty_rows = torch.zeros(
+                    (n_verify_rows,), dtype=torch.bool, device=self.device
                 )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -2199,6 +2489,10 @@ class AiterAttnBackend(AttentionBackend):
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
             )
 
+            # Size for the folded gqa16 schedule when DCP verify can take the cp
+            # kernel: folding turns one request into nhead / 16 pseudo-batches,
+            # so it needs more entries. Other users only need capacity, so this
+            # larger set serves them too.
             (
                 self.work_metadata,
                 self.work_indptr,
@@ -2206,7 +2500,11 @@ class AiterAttnBackend(AttentionBackend):
                 self.reduce_indptr,
                 self.reduce_final_map,
                 self.reduce_partial_map,
-            ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
+            ) = self.make_mla_decode_meta_data_buffer(
+                max_seqlen_qo,
+                max_bs,
+                is_cp_round_robin=self._asm_cprr_verify_shape_ok(self.num_draft_tokens),
+            )
 
         else:
             self.work_metadata = None
@@ -2259,6 +2557,9 @@ class AiterAttnBackend(AttentionBackend):
         # DCP metadata which will be populated for MLA decode when dcp enabled
         local_kv_lens = None
         verify_token_table = None
+        global_kv_indptr = None
+        cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
+        cprr_ok = False
 
         swa_page_table = None
         max_kv_len = (
@@ -2430,9 +2731,12 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.use_mla:
+                # Same single decision as the eager branch: only the Gluon DCP
+                # fallback keeps the window out of the kv range.
+                cprr_ok = self._asm_cprr_verify_shape_ok(self.num_draft_tokens)
                 kv_lens = (
                     seq_lens
-                    if self.dcp_world_size > 1
+                    if (self.dcp_world_size > 1 and not cprr_ok)
                     else seq_lens + self.num_draft_tokens
                 )
             else:
@@ -2466,6 +2770,10 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla and self.dcp_world_size > 1:
+                # Keep the global lengths before the planner rewrites kv_indptr,
+                # same as the eager path, but into a capture-stable buffer.
+                global_kv_indptr = self.cuda_graph_global_kv_indptr[: bs + 1]
+                global_kv_indptr.copy_(kv_indptr[: bs + 1])
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
@@ -2489,15 +2797,32 @@ class AiterAttnBackend(AttentionBackend):
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
                 )
+                if cprr_ok:
+                    (
+                        cprr_kv_indices,
+                        cprr_kv_indptr,
+                        cprr_empty_rows,
+                    ) = self._build_dcp_verify_ragged_indices(
+                        verify_token_table,
+                        local_kv_lens,
+                        bs,
+                        self.num_draft_tokens,
+                        out_indices=self.cuda_graph_cprr_kv_indices,
+                        out_indptr=self.cuda_graph_cprr_kv_indptr,
+                        out_empty=self.cuda_graph_cprr_empty_rows,
+                    )
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                if _use_mla_ps_kernel and (self.dcp_world_size <= 1 or cprr_ok):
                     num_kv_splits = self.max_split_per_batch
+                    is_cp_round_robin = self.dcp_world_size > 1
 
                     self.make_mla_meta_data(
                         qo_indptr,
-                        kv_indptr,
+                        # Must describe the lengths the kernel walks, which on
+                        # the cp path is the clamped ragged pair.
+                        cprr_kv_indptr if cprr_ok else kv_indptr,
                         kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
@@ -2509,6 +2834,7 @@ class AiterAttnBackend(AttentionBackend):
                         fast_mode=fast_mode,
                         max_split_per_batch=num_kv_splits,
                         intra_batch_mode=intra_batch_mode,
+                        is_cp_round_robin=is_cp_round_robin,
                     )
 
                     work_metadata = self.work_metadata
@@ -2535,6 +2861,11 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    global_kv_indptr=global_kv_indptr,
+                    use_asm_cprr_verify=cprr_ok,
+                    cprr_kv_indices=cprr_kv_indices,
+                    cprr_kv_indptr=cprr_kv_indptr,
+                    cprr_empty_rows=cprr_empty_rows,
                 )
             else:
                 max_q_len = verify_tokens_per_req
@@ -2925,8 +3256,9 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and self.dcp_world_size > 1
             ):
-                # two-stage dcp verify, dispatched before the dims below: the
-                # model provides the per rank kvcache slices.
+                # DCP verify, dispatched before the dims below: the model
+                # provides the per-rank kvcache slices. k is the verify window,
+                # which only the Gluon fallback needs.
                 return self._forward_verify_dcp(q, k, layer, k_descale)
 
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -3092,7 +3424,7 @@ class AiterAttnBackend(AttentionBackend):
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
-                ):
+                ) and not self._use_asm_ps_mla(self.forward_metadata.max_q_len):
                     return mla_gluon_decode(
                         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         k_buffer=K_Buffer,

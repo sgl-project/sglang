@@ -926,6 +926,12 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
+    # Set to 1 to keep DCP target verify on the Gluon two-stage path even when
+    # the aiter asm cp round-robin kernel could run it. A/B control.
+    SGLANG_DISABLE_ASM_CPRR_VERIFY = EnvBool(False)
+    # Set to 1 to use one KV split per CU (~256) instead of 32 for DCP decode.
+    # Off by default: measured no gain at 131k context, concurrency 1.
+    SGLANG_ENABLE_ASM_CPRR_SPLITS_PER_CU = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
