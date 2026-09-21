@@ -130,7 +130,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -280,6 +280,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
+      - name: Record retry deadline
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -327,7 +330,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload diffusion failure artifacts
         if: always()
