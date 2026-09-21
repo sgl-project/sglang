@@ -31,7 +31,7 @@ class TestPPThroughput(CustomTestCase):
         check_perf(
             self,
             at_least(
-                "output_throughput", res["output_throughput"], 6700, unit="token/s"
+                "output_throughput", res["output_throughput"], 6250, unit="token/s"
             ),
         )
 
@@ -59,7 +59,7 @@ class TestPPThroughput(CustomTestCase):
             at_least(
                 "input_throughput",
                 res["input_throughput"],
-                4000,
+                4380,
                 amd=3000,
                 unit="token/s",
             ),

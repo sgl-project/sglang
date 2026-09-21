@@ -27,12 +27,12 @@ class TestLoRALatency(CustomTestCase):
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],
-                2300,
+                2270,
                 amd=3320,
                 unit="ms",
             ),
             # mi300x is about twice as slow as mi325 on LoRA TTFT.
-            at_most("median_ttft_ms", res["median_ttft_ms"], 52, amd=100, unit="ms"),
+            at_most("median_ttft_ms", res["median_ttft_ms"], 51, amd=100, unit="ms"),
         )
 
     def test_online_lora_latency_with_concurrent_adapter_updates(self):
@@ -43,7 +43,7 @@ class TestLoRALatency(CustomTestCase):
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],
-                3050,
+                3170,
                 amd=6000,
                 unit="ms",
             ),

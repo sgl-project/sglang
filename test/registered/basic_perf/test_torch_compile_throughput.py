@@ -24,7 +24,7 @@ class TestTorchCompileThroughput(CustomTestCase):
         check_perf(
             self,
             at_least(
-                "output_throughput", output_throughput, 220, amd=200, unit="token/s"
+                "output_throughput", output_throughput, 255, amd=200, unit="token/s"
             ),
         )
 

@@ -15,9 +15,10 @@ class TestVLMServingFa3(CustomTestCase):
             self,
             "fa3",
             # No offline bound: never measured on this lane.
-            e2e_ms=16500,
-            ttft_ms=100,
-            itl_ms=8,
+            output_throughput=16700,
+            e2e_ms=11000,
+            ttft_ms=84,
+            itl_ms=5.2,
         )
 
 
