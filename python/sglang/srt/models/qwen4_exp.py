@@ -508,20 +508,32 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
-        )
-        self.ngram_embedding.register_buffer(
+        offload_embedding = bool(config.ple_offload_embedding)
+        # Offload only needs this embedding's metadata: build it on meta so the
+        # shard is never allocated on the device.
+        with torch.device("meta") if offload_embedding else nullcontext():
+            ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
+        # weight_scale stays a real device tensor.
+        ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
+        if offload_embedding:
+            ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                ngram_embedding,
+                backend=getattr(config, "ple_offload_backend", "pinned"),
+                table_dir=getattr(config, "ple_offload_dir", None),
+            )
+        self.ngram_embedding = ngram_embedding
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -771,6 +783,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
+
+    The source weight may be on the meta device; only its metadata is used.
     """
 
     _COPIED_ATTRIBUTES = (
@@ -931,12 +945,6 @@ class Qwen4ExpPLELayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
-        if config.ple_offload_embedding:
-            self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding,
-                backend=getattr(config, "ple_offload_backend", "pinned"),
-                table_dir=getattr(config, "ple_offload_dir", None),
-            )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
             self.conv_kernel_size - 1
