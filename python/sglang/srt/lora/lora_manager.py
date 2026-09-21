@@ -37,10 +37,10 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    _KNOWN_LORA_TARGET_MODULES,
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
     LoRAType,
-    _KNOWN_LORA_TARGET_MODULES,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
