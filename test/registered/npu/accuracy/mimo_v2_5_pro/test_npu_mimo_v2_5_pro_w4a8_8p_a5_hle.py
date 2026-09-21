@@ -6,7 +6,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=4800,
+    est_time=10000,
     suite="nightly-acc-8-npu-a5-test",
     nightly=True,
 )
