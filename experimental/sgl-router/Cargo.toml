@@ -94,6 +94,7 @@ url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [dev-dependencies]
+base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).

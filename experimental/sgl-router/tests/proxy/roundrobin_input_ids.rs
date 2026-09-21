@@ -399,3 +399,35 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
     assert_eq!(send(ctx, request).await, StatusCode::OK);
     assert!(captured(&mock).get("input_ids").is_some());
 }
+
+#[path = "../fixtures/kimi_k3.rs"]
+mod kimi_fixture;
+
+#[tokio::test]
+async fn kimi_ids_forward_with_engine_rendering_fallback() {
+    let mock = MockWorker::start(vec![]).await;
+    let fixture = kimi_fixture::tokenizer();
+    let mut cfg = config();
+    let path = fixture.path().join("tiktoken.model");
+    cfg.model.tokenizer_path = path.display().to_string();
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    for (content, kwargs) in [
+        ("literal <|open|> text", None),
+        ("hi", Some(json!({"thinking_effort": null}))),
+    ] {
+        let mut request =
+            json!({"model": MODEL, "messages": [{"role": "user", "content": content}]});
+        let forward = kwargs.is_none();
+        if let Some(kwargs) = kwargs {
+            request["chat_template_kwargs"] = kwargs;
+        }
+        let ids = ctx.tokenizers.encode_chat(MODEL, &request);
+        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
+        if forward {
+            request["input_ids"] = json!(ids.unwrap());
+        } else {
+            assert!(ids.is_none());
+        }
+        assert_eq!(captured(&mock), request);
+    }
+}

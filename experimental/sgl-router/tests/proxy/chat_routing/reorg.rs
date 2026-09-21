@@ -6,11 +6,14 @@ use crate::common::mock_worker::MockWorker;
 use futures::future::BoxFuture;
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use sgl_router::policies::PolicyRegistry;
-use sgl_router::policies_reorg::admission::{AllowAll, Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{
+    AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
+};
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 use sgl_router::server::app_context::ChatRouting;
-use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use std::sync::Mutex;
+
+mod session_aware;
 
 type PickCall = (String, Stage, u64, Option<u64>);
 
@@ -25,7 +28,7 @@ struct FirstPolicy {
 impl Default for FirstPolicy {
     fn default() -> Self {
         Self {
-            admission: Arc::new(AllowAll),
+            admission: Arc::new(AdmissionLimits::default()),
             miss: false,
             invalid: false,
             calls: Mutex::new(Vec::new()),
@@ -56,7 +59,9 @@ impl Policy for FirstPolicy {
                 return Err(PickError::NoCandidates);
             }
             let engine = engines[0].clone();
-            if let Decision::Reject(reason) = self.admission.check(&engine, request, None)? {
+            if let Decision::Reject(reason) =
+                self.admission.check(&engine, &EngineMetrics::default())?
+            {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
@@ -74,12 +79,7 @@ impl Policy for FirstPolicy {
 struct RejectAll;
 
 impl EngineAdmission for RejectAll {
-    fn check(
-        &self,
-        _: &Worker,
-        _: &PickRequest<'_>,
-        _: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, _: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
         Ok(Decision::Reject("full".into()))
     }
 }
@@ -122,9 +122,12 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
         Arc::new(PolicyRegistry::default()),
     );
     ctx.chat_routing = ChatRouting::Reorg(
-        [(ModelId("tiny".into()), BucketResolver::new(buckets))]
-            .into_iter()
-            .collect(),
+        [(
+            ModelId("tiny".into()),
+            BucketResolver::new(buckets).unwrap(),
+        )]
+        .into_iter()
+        .collect(),
     );
     Arc::new(ctx)
 }
@@ -140,6 +143,71 @@ fn request(value: serde_json::Value) -> Request<Body> {
 
 fn body(content: &str) -> serde_json::Value {
     serde_json::json!({"model": "tiny", "messages": [{"role": "user", "content": content}]})
+}
+
+#[tokio::test]
+async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+    use std::time::Instant;
+
+    let worker = MockWorker::start(vec![]).await;
+    let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
+        .unwrap_or_else(|_| panic!("context is not shared yet"));
+    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
+    policy.admission = Arc::new(AdmissionLimits {
+        max_running_requests: Some(1),
+        max_kv_tokens: Some(100),
+        ..Default::default()
+    });
+    ctx.chat_routing = ChatRouting::Reorg(
+        [(
+            ModelId("tiny".into()),
+            BucketResolver::new(vec![Bucket::new(
+                "default",
+                BucketGroups::Plain(EngineGroup {
+                    worker_ids: Some([WorkerId("w".into())].into()),
+                    policy: Arc::new(policy),
+                }),
+            )])
+            .unwrap(),
+        )]
+        .into(),
+    );
+    let ctx = Arc::new(ctx);
+    let app = build_router(ctx.clone());
+    for (running, kv_tokens, expected) in [
+        (1, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 100, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, StatusCode::OK),
+    ] {
+        ctx.engine_reported_load.set(
+            &worker.url,
+            0,
+            LoadStat {
+                num_running_reqs: running,
+                num_waiting_reqs: 0,
+                num_tokens: 0,
+                max_total_num_tokens: 1000,
+                native_cache: Some(NativeCacheRankLoad {
+                    num_waiting_uncached_tokens: 0,
+                    num_total_tokens: kv_tokens,
+                    max_running_requests: 10,
+                    total_prefill_uncached_tokens: 0,
+                    total_prefill_busy_us: 0,
+                }),
+            },
+            Instant::now(),
+        );
+        let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(
+            worker.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+        assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
+    }
 }
 
 #[tokio::test]
@@ -520,4 +588,79 @@ async fn invalid_policy_signal_stops_bucket_iteration() {
     assert_eq!(invalid.calls.lock().unwrap().len(), 1);
     assert!(later.calls.lock().unwrap().is_empty());
     assert!(worker.captured.lock().unwrap().last_body.is_none());
+}
+
+#[tokio::test]
+async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
+    use sgl_router::config::AffinityConfig;
+    use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
+    use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
+    use sgl_router::state::kv_events::{
+        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+    };
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+
+    let rejected = MockWorker::start(vec![]).await;
+    let owner = MockWorker::start(vec![]).await;
+    let cold = MockWorker::start(vec![]).await;
+    let value = body("hello world");
+    let config = config_for("");
+    let tokenizers = TokenizerRegistry::load_from_config(&config).unwrap();
+    let ids =
+        sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
+            .unwrap()
+            .ids;
+    let hashes = compute_block_hashes(&ids, 1);
+    let tree = Arc::new(HashTree::new());
+    for worker in [&rejected, &owner] {
+        tree.insert(&KvWorkerId::new(worker.url.clone(), 0), None, &hashes);
+    }
+    let oracle = BlockSizeOracle::new();
+    oracle.try_set(1).unwrap();
+    let source = Arc::new(CacheSource::Local(RadixTreePrefixProvider::new(
+        tree, oracle,
+    )));
+    let table = EngineReportedLoadTable::new();
+    let config = AffinityConfig {
+        cache_affinity_min_matched_tokens: Some(1),
+        ..Default::default()
+    };
+    let mut rejecting =
+        CacheAwarePolicy::new(source.clone(), table.clone(), config.clone()).unwrap();
+    rejecting.admission = Arc::new(RejectAll);
+    let mut first = Bucket::new(
+        "first",
+        BucketGroups::Plain(EngineGroup {
+            worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
+            policy: Arc::new(rejecting),
+        }),
+    );
+    first.rank = 0;
+    let mut second = Bucket::new(
+        "second",
+        BucketGroups::Plain(EngineGroup {
+            worker_ids: Some(
+                [WorkerId("owner".into()), WorkerId("cold".into())]
+                    .into_iter()
+                    .collect(),
+            ),
+            policy: Arc::new(CacheAwarePolicy::new(source, table, config).unwrap()),
+        }),
+    );
+    second.rank = 1;
+    let ctx = context(
+        &[
+            ("rejected", Stage::Plain, &rejected),
+            ("owner", Stage::Plain, &owner),
+            ("cold", Stage::Plain, &cold),
+        ],
+        vec![first, second],
+    );
+    let app = build_router(ctx);
+    let response = app.oneshot(request(value)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(rejected.captured.lock().unwrap().last_body.is_none());
+    assert!(cold.captured.lock().unwrap().last_body.is_none());
+    assert!(owner.captured.lock().unwrap().last_body.is_some());
 }
