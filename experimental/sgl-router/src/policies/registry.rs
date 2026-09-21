@@ -306,6 +306,7 @@ mod tests {
 
     fn spec(id: &str, mode: WorkerMode, model: &str) -> WorkerSpec {
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId(id.into()),
             url: format!("http://{id}"),
             mode,
@@ -497,6 +498,7 @@ mod tests {
     /// directly, not the generated `http://{id}` form.
     fn spec_with_url(id: &str, url: &str, mode: WorkerMode, model: &str) -> WorkerSpec {
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId(id.into()),
             url: url.into(),
             mode,

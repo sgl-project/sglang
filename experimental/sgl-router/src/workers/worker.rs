@@ -179,6 +179,7 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    pub transfer_group: Option<String>,
 }
 
 impl Worker {
@@ -212,6 +213,7 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            transfer_group: spec.transfer_group,
         }
     }
 
@@ -298,6 +300,7 @@ mod tests {
     #[test]
     fn load_guard_increments_and_decrements() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Plain,
@@ -346,6 +349,7 @@ mod tests {
     fn mode_accessor_round_trips_all_variants() {
         for m in [WorkerMode::Plain, WorkerMode::Prefill, WorkerMode::Decode] {
             let w = Worker::new(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId("w".into()),
                 url: "http://x".into(),
                 mode: m,
@@ -359,6 +363,7 @@ mod tests {
     #[test]
     fn set_mode_updates_in_place() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Prefill,
@@ -375,6 +380,7 @@ mod tests {
     #[test]
     fn protocol_is_carried_from_construction() {
         let spec = || WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Plain,
@@ -393,6 +399,7 @@ mod tests {
     #[test]
     fn bootstrap_port_returns_spec_value_for_prefill() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Prefill,
@@ -405,6 +412,7 @@ mod tests {
     #[test]
     fn bootstrap_port_defaults_to_none() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
@@ -417,6 +425,7 @@ mod tests {
     #[test]
     fn bootstrap_host_parses_ipv4_from_url() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Prefill,
@@ -429,6 +438,7 @@ mod tests {
     #[test]
     fn bootstrap_host_parses_dns_name_from_url() {
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: "http://prefill-0.svc.cluster.local:30000".into(),
             mode: WorkerMode::Prefill,
@@ -445,6 +455,7 @@ mod tests {
         // prefill worker will reject the request body-side if the host
         // really is unreachable.
         let w = Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: "not a url".into(),
             mode: WorkerMode::Prefill,
@@ -456,6 +467,7 @@ mod tests {
 
     fn test_worker() -> Worker {
         Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Plain,

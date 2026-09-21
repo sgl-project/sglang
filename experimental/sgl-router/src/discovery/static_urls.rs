@@ -38,6 +38,7 @@ pub async fn spawn(
     let handle = tokio::spawn(async move {
         for url in cfg.urls {
             let spec = WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(url.clone()),
                 url,
                 mode: WorkerMode::Plain,

@@ -51,6 +51,14 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+PD workers can be partitioned with the EndpointSlice label `sglang.ai/transfer-group`
+(or `--transfer-group-label`). Prefill and decode must have the same label value;
+unlabeled workers pair only with other unlabeled workers. The router skips prefill
+workers without a compatible decode peer and reports unready without a complete
+pair. Prefill failures cancel decode promptly: engine 4xx responses are preserved,
+while transport and server failures return 502. Prefill continues after client
+disconnect so KV transfer can finish.
+
 External KV indexer as the cache-aware signal source:
 
 ```bash

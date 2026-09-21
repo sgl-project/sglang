@@ -57,6 +57,7 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
     // /server_info introspection.  Pre-populating here would lie about
     // what discovery backends actually emit.
     WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url: url.into(),
         mode,

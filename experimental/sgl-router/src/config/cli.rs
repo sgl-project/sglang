@@ -135,6 +135,10 @@ pub struct ServerArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct DiscoveryArgs {
+    /// EndpointSlice label identifying compatible prefill/decode workers.
+    #[arg(long, default_value = "sglang.ai/transfer-group")]
+    pub transfer_group_label: String,
+
     /// Static worker URLs, space-separated or repeated. Conflicts with --service-discovery.
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
@@ -439,6 +443,7 @@ impl DiscoveryArgs {
                     join_selector(&self.decode_selector).as_deref(),
                 )?;
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
+                    transfer_group_label: self.transfer_group_label,
                     namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                 })

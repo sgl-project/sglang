@@ -74,6 +74,7 @@ fn build_ctx_with_config(url: String, cfg: Config) -> Arc<AppContext> {
     assert!(tokenizers.has_chat_formatter(MODEL));
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,

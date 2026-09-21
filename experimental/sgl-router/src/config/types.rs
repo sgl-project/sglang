@@ -570,6 +570,7 @@ pub struct StaticUrlsDiscoveryConfig {
 /// and bootstrap ports come from `/server_info` introspection.
 #[derive(Debug, Clone)]
 pub struct K8sDiscoveryConfig {
+    pub transfer_group_label: String,
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,

@@ -16,6 +16,7 @@ use sgl_router::workers::Worker;
 
 fn engine(id: &str, active: usize) -> Arc<Worker> {
     let engine = Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url: format!("http://{id}"),
         mode: Stage::Plain,

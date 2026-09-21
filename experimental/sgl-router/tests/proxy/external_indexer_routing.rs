@@ -93,6 +93,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
     for url in [&cached.url, &uncached.url] {
         registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(url.clone()),
                 url: url.clone(),
                 mode: WorkerMode::Plain,

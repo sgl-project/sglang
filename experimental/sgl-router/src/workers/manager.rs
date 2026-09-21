@@ -409,6 +409,7 @@ fn reconcile_unresolved_workers(
         // re-resolves them; current mode + bootstrap_port as the seed
         // (`register_one` re-applies any `/server_info` override).
         let spec = WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url: worker_url.clone(),
             mode: worker.mode(),
@@ -618,6 +619,7 @@ mod tests {
     fn cb_config_for_spec_carries_threshold_and_cool_down() {
         let cfg = cfg_with_model_cb("m", 5, 60);
         let spec = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w".into()),
             url: "http://x".into(),
             mode: WorkerMode::Plain,
@@ -733,6 +735,7 @@ mod tests {
         ));
 
         let spec = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w-1".into()),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -777,6 +780,7 @@ mod tests {
         ));
 
         let spec = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w-2".into()),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -826,6 +830,7 @@ mod tests {
 
         for (id, url) in [("w-no-field", no_field_url), ("w-empty", empty_url)] {
             let spec = WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(id.into()),
                 url,
                 mode: WorkerMode::Plain,
@@ -896,6 +901,7 @@ mod tests {
         ));
 
         let spec = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w-1".into()),
             url: worker_url.clone(),
             mode: WorkerMode::Plain,
@@ -997,6 +1003,7 @@ mod tests {
 
         let id = WorkerId("w-1".into());
         let spec = WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -1077,6 +1084,7 @@ mod tests {
         // Backend says Plain + None — the shape the K8s backend always
         // emits today.
         let spec = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w-prefill".into()),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -1195,6 +1203,7 @@ mod tests {
 
         let id = WorkerId("w-warming".into());
         tx.send(DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -1258,6 +1267,7 @@ mod tests {
         let id = WorkerId("w-slow".into());
         let model = ModelId("m".into());
         let spec = WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -1347,6 +1357,7 @@ mod tests {
 
         let id = WorkerId("w-warming".into());
         tx.send(DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url: worker_url,
             mode: WorkerMode::Plain,
@@ -1471,6 +1482,7 @@ mod tests {
         let id = WorkerId("w-race".into());
         let model = ModelId("m".into());
         tx.send(DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url,
             mode: WorkerMode::Plain,
@@ -1598,6 +1610,7 @@ mod tests {
         ));
 
         tx.send(DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w-stuck".into()),
             url,
             mode: WorkerMode::Plain,
@@ -1669,6 +1682,7 @@ mod tests {
 
         let id = WorkerId("w-resolved".into());
         tx.send(DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: id.clone(),
             url,
             mode: WorkerMode::Plain,

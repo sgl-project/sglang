@@ -58,6 +58,9 @@ pub struct WorkerSpec {
     pub model_ids: Vec<ModelId>,
     #[serde(default)]
     pub bootstrap_port: Option<u16>,
+    /// Only workers in the same group can exchange KV; unlabeled workers form one group.
+    #[serde(default)]
+    pub transfer_group: Option<String>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -92,6 +95,7 @@ mod tests {
     #[test]
     fn worker_spec_serde_round_trip() {
         let w = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w1".into()),
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Plain,
@@ -106,6 +110,7 @@ mod tests {
     #[test]
     fn worker_spec_with_bootstrap_port_round_trip() {
         let w = WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: "http://10.0.0.1:30000".into(),
             mode: WorkerMode::Prefill,
@@ -147,6 +152,7 @@ mod tests {
     #[test]
     fn discovery_event_round_trip() {
         let e = DiscoveryEvent::Added(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w1".into()),
             url: "http://x:30000".into(),
             mode: WorkerMode::Plain,

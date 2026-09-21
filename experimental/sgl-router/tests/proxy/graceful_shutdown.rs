@@ -75,6 +75,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
     let registry = Arc::new(WorkerRegistry::default());
     registry
         .add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w1".into()),
             url: worker_url.to_string(),
             mode: WorkerMode::Plain,

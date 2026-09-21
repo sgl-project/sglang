@@ -30,6 +30,7 @@ fn report(table: &EngineReportedLoadTable, rank: u32, running: u64, at: Instant)
 
 fn engine() -> Arc<Worker> {
     Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("a".into()),
         url: URL.into(),
         mode: Stage::Plain,
@@ -72,6 +73,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
     let alternative = Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("b".into()),
         url: "http://other".into(),
         mode: Stage::Plain,

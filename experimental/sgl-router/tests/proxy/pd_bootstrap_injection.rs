@@ -35,6 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
+mod reliability;
+
 fn config() -> Config {
     Config {
         server: ServerConfig {
@@ -145,6 +147,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -152,6 +155,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             bootstrap_port: Some(8997),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -201,6 +205,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -208,6 +213,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
             bootstrap_port: Some(8997),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -238,6 +244,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
 async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
     let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
@@ -275,6 +282,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("pA".into()),
             url: prefill_a.url.clone(),
             mode: WorkerMode::Prefill,
@@ -282,6 +290,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             bootstrap_port: Some(11111),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("pB".into()),
             url: prefill_b.url.clone(),
             mode: WorkerMode::Prefill,
@@ -289,6 +298,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             bootstrap_port: Some(22222),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -322,15 +332,8 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// Pin Pattern B's "prefill failure is invisible to the client"
-/// contract: when the spawned prefill task gets a 5xx (or any other
-/// upstream error), the decode response still reaches the client
-/// unmodified. The router intentionally does not wire fail-fast here —
-/// the decode side will eventually hang on `bootstrap_room` and time
-/// out, but the chat handler itself doesn't propagate the prefill
-/// error. Matches llm-d / aibrix behaviour.
 #[tokio::test]
-async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
+async fn pd_prefill_failure_overrides_decode_success() {
     let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         json!({"error": "simulated prefill failure"}),
@@ -339,6 +342,7 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -346,6 +350,7 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             bootstrap_port: Some(8997),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -355,19 +360,10 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     ]);
     let app = build_router(ctx);
 
-    // Client must see decode's 200 — the failing prefill is invisible.
     let res = app.oneshot(chat_request()).await.unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "decode response should reach the client even when prefill returned 5xx",
-    );
-
-    // Decode received its body (proves dual dispatch fired despite
-    // the prefill failure).
-    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
-    let v = parse_body(&decode_body);
-    assert_eq!(bootstrap_port(&v), Some(8997));
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res.headers()["x-router-error-code"], "prefill_failed");
+    assert_eq!(res.headers()["x-router-upstream-status"], "500");
 
     // Prefill also received its body — it just returned 5xx. The
     // bootstrap fields are present so the engine WOULD have honoured

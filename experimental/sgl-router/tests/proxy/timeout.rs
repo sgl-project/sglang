@@ -68,6 +68,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Plain,

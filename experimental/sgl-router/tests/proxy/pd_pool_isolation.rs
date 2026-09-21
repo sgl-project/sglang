@@ -110,6 +110,7 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
     let registry = Arc::new(WorkerRegistry::default());
     registry
         .add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -119,6 +120,7 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
         .unwrap();
     registry
         .add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -205,6 +207,7 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
 async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
+        transfer_group: None,
         id: WorkerId("d1".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Decode,
@@ -258,6 +261,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -265,6 +269,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             bootstrap_port: Some(8997),
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode.url.clone(),
             mode: WorkerMode::Decode,
@@ -331,6 +336,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
     // selected by the role-local policy is reflected on the P request.
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill_a.url.clone(),
             mode: WorkerMode::Prefill,
@@ -338,6 +344,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             bootstrap_port: None,
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p2".into()),
             url: prefill_b.url.clone(),
             mode: WorkerMode::Prefill,
@@ -345,6 +352,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             bootstrap_port: None,
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode_a.url.clone(),
             mode: WorkerMode::Decode,
@@ -352,6 +360,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
             bootstrap_port: None,
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d2".into()),
             url: decode_b.url.clone(),
             mode: WorkerMode::Decode,
@@ -401,6 +410,7 @@ async fn pd_mode_chat_dispatch_sets_final_decode_header() {
 async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
     let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
@@ -427,6 +437,7 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
 async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
+        transfer_group: None,
         id: WorkerId("p1".into()),
         url: prefill.url.clone(),
         mode: WorkerMode::Prefill,
@@ -455,6 +466,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
     let decode_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("p1".into()),
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
@@ -462,6 +474,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             bootstrap_port: None,
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d1".into()),
             url: decode_a.url.clone(),
             mode: WorkerMode::Decode,
@@ -469,6 +482,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             bootstrap_port: None,
         },
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId("d2".into()),
             url: decode_b.url.clone(),
             mode: WorkerMode::Decode,
@@ -507,6 +521,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
 async fn plain_mode_chat_response_omits_decode_affinity_header() {
     let plain = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: plain.url.clone(),
         mode: WorkerMode::Plain,
