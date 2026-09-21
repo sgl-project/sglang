@@ -1117,13 +1117,15 @@ class InklingForConditionalGeneration(nn.Module):
     @staticmethod
     def get_lora_target_module_name(name: str) -> str:
         parent, _, leaf = name.rpartition(".")
-        if parent.endswith(".attn") and leaf in ("wq_du", "wk_dv", "wv_dv", "wr_du"):
-            return "qkvr"
-        if parent.endswith((".mlp.experts", ".mlp.shared_experts")):
-            if leaf in ("w1", "w3"):
-                return "gate_up_proj"
-            if leaf == "w2":
-                return "down_proj"
+        if parent.endswith(".attn"):
+            mappings = ATTENTION_PARAMS_MAPPING
+        elif parent.endswith((".mlp.experts", ".mlp.shared_experts")):
+            mappings = STACKED_DENSE_PARAMS_MAPPING
+        else:
+            return name
+        for module_name, weight_name, _ in mappings:
+            if leaf == weight_name:
+                return module_name
         return name
 
     def get_stacked_multiply(self, module_name: str) -> int:
