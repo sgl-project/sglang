@@ -97,8 +97,12 @@ def _get_offloaded_device_state(module: torch.nn.Module, device: torch.device):
 
 
 def _get_resident_parameter_ids(module: torch.nn.Module):
+    # functional_call only replaces registered parameters and buffers, so cached
+    # tensors held as ordinary attributes need their backing weights to stay put.
     resident = set()
     for owner in module.modules():
+        # MLA post_load_weights derives w_kc/w_vc from kv_b_proj weights on
+        # their current device. These attributes already exist before loading.
         projection = getattr(owner, "kv_b_proj", None)
         if (
             isinstance(projection, torch.nn.Module)
@@ -106,6 +110,8 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
             and hasattr(owner, "w_vc")
         ):
             resident.update(id(parameter) for parameter in projection.parameters())
+        # KDA caches a storage-sharing view of qkv_conv1d.weight in conv_weights
+        # during construction. Offloading the weight would leave that view stale.
         projection = getattr(owner, "qkv_conv1d", None)
         attention = getattr(owner, "attn", None)
         if isinstance(projection, torch.nn.Module) and isinstance(
