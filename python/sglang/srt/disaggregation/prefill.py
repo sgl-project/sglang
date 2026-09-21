@@ -1449,15 +1449,21 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page
             # counter marks only the final sub-send of the final chunk as
             # is_last, routing aux/state correctly.
+            transfer_chunk_tokens = staging_grid_tokens(
+                get_schedule().chunked_prefill_size, page_size
+            )
+        if transfer_chunk_tokens is not None:
+            # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(
                 start_idx,
                 end_idx,
                 req.disagg_decode_prefix_len,
-                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
+                transfer_chunk_tokens,
             )
         else:
             segments = [(start_idx, end_idx)]
@@ -1510,7 +1516,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache)
+        # Mamba insertion donates the checkpoint and clears its sequence marker.
+        release_kv_cache(
+            req, self.tree_cache, is_insert=not self.tree_cache.supports_mamba()
+        )
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
