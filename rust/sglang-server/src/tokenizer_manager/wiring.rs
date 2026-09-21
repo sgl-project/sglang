@@ -6,6 +6,7 @@ use crate::message::buffers::Buffer;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::request::Request;
+use crate::message::types::TokenIds;
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.
@@ -30,7 +31,7 @@ pub enum TmEvent {
     /// the request. Nobody parked: dropping them releases any shm.
     MmEncoded {
         rid: Rid,
-        input_ids: Vec<i64>,
+        input_ids: TokenIds,
         buffers: Vec<Buffer>,
     },
     /// An MM worker rejected a request parked in `Encoding` (bad media URL,

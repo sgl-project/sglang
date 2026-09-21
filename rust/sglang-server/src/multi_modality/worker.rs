@@ -155,9 +155,11 @@ fn tensor_data(data: TensorData) -> BufferData {
 
 /// Lay each item's feature tensor out as `mm.feature.{i}`: in its own shm
 /// segment when `shm` is set — the unit Python's `ShmPointerMMData` maps —
-/// else inline. Any shm failure (`/dev/shm` full) falls the whole request
-/// back to inline, as Python's `_wrap_shm_or_inline` does: degrade to the slow
-/// path, never fail the request. `segment_name` names each item's segment.
+/// else inline. An empty tensor stays inline even under `shm`: a zero-length
+/// segment cannot be mapped on either side, and there is nothing to share.
+/// Any shm failure (`/dev/shm` full) falls the whole request back to inline,
+/// as Python's `_wrap_shm_or_inline` does: degrade to the slow path, never
+/// fail the request. `segment_name` names each item's segment.
 fn place_features(
     features: Vec<Tensor>,
     shm: bool,
@@ -172,7 +174,10 @@ fn place_features(
         let parked: Result<Vec<Buffer>, String> = features
             .iter()
             .enumerate()
-            .map(|(i, (shape, data))| Buffer::shm(name(i), segment_name(i), shape.clone(), data))
+            .map(|(i, (shape, data))| match data.len() {
+                0 => Buffer::inline_shaped(name(i), shape.clone(), BufferData::empty(data.dtype())),
+                _ => Buffer::shm(name(i), segment_name(i), shape.clone(), data),
+            })
             .collect();
         match parked {
             Ok(buffers) => return buffers,
@@ -427,6 +432,38 @@ mod tests {
         }
         drop(buffers);
         assert!(names.iter().all(|n| !shm_path(n).exists()), "drop unlinks");
+    }
+
+    /// An empty tensor has no segment to make: it stays inline while its
+    /// siblings still go to shm, with no request-wide fallback.
+    #[test]
+    fn shm_keeps_empty_items_inline() {
+        let names: Vec<String> = (0..2).map(|_| unique_name("test")).collect();
+        let namer = names.clone();
+        let features = vec![
+            Tensor {
+                shape: vec![0, 2],
+                data: TensorData::F32(vec![]),
+            },
+            Tensor {
+                shape: vec![1, 2],
+                data: TensorData::F32(vec![5.0, 6.0]),
+            },
+        ];
+        let buffers = place_features(features, true, move |i| namer[i].clone());
+        assert!(
+            matches!(&buffers[0].store, BufferStore::Inline(BufferData::F32(v)) if v.is_empty())
+        );
+        assert_eq!(buffers[0].shape, [0, 2]);
+        assert!(
+            !shm_path(&names[0]).exists(),
+            "no segment for the empty item"
+        );
+        assert!(matches!(buffers[1].store, BufferStore::Shm { .. }));
+        assert!(
+            shm_path(&names[1]).exists(),
+            "the sibling still goes to shm"
+        );
     }
 
     /// A segment that cannot be created degrades the whole request to inline

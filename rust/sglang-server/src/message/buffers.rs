@@ -61,6 +61,18 @@ impl BufferData {
         }
     }
 
+    /// An empty vector of `dtype`.
+    pub fn empty(dtype: DType) -> Self {
+        match dtype {
+            DType::I64 => BufferData::I64(Vec::new()),
+            DType::F32 => BufferData::F32(Vec::new()),
+            DType::U32 => BufferData::U32(Vec::new()),
+            DType::U64 => BufferData::U64(Vec::new()),
+            DType::U16 => BufferData::U16(Vec::new()),
+            DType::U8 => BufferData::U8(Vec::new()),
+        }
+    }
+
     /// Element count.
     pub fn len(&self) -> usize {
         match self {
@@ -246,6 +258,17 @@ mod tests {
         let segment = unique_name("test");
         assert!(Buffer::shm("x", segment.clone(), vec![3], &BufferData::I64(vec![1, 2])).is_err());
         assert!(!shm_path(&segment).exists());
+    }
+
+    /// Empty data never becomes a segment (nothing could map it): `shm`
+    /// refuses it and leaves nothing behind; the caller keeps it inline.
+    #[test]
+    fn empty_data_is_refused_without_a_segment() {
+        let segment = unique_name("test");
+        let err =
+            Buffer::shm("x", segment.clone(), vec![0, 4], &BufferData::F32(vec![])).unwrap_err();
+        assert!(err.contains("empty payload"), "{err}");
+        assert!(!shm_path(&segment).exists(), "no segment for empty data");
     }
 
     #[test]

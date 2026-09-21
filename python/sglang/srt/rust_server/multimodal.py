@@ -122,7 +122,10 @@ class _ModalityTable(dict):
         self.update(
             {"image": Modality.IMAGE, "video": Modality.VIDEO, "audio": Modality.AUDIO}
         )
-        return self[name]
+        # An unknown name must raise here, not recurse.
+        if name not in self:
+            raise KeyError(name)
+        return dict.__getitem__(self, name)
 
 
 _MODALITIES = _ModalityTable()
@@ -290,7 +293,6 @@ class RustMmProcessor:
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
         from sglang.srt.managers.schedule_batch import (
-            Modality,
             MultimodalDataItem,
             MultimodalProcessorOutput,
         )

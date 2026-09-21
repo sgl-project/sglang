@@ -25,6 +25,10 @@ impl ShmSegment {
     /// Create the segment `name` holding exactly `bytes`. No leading slash —
     /// the name must suit Python's `SharedMemory(name=…)` (shm_open adds one).
     pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
+        // Rejected before anything is opened: mmap refuses length 0.
+        if bytes.is_empty() {
+            return Err(format!("shm({name}): empty payload"));
+        }
         let fd = open(
             format!("/{name}"),
             OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
@@ -111,6 +115,16 @@ mod tests {
         assert_eq!(std::fs::read(shm_path(&name)).unwrap(), payload);
         drop(segment);
         assert!(!shm_path(&name).exists(), "drop must unlink");
+    }
+
+    /// An empty payload is refused before the segment exists: nothing to
+    /// map, nothing left in `/dev/shm`.
+    #[test]
+    fn empty_payload_is_rejected_without_a_segment() {
+        let name = test_name();
+        let err = ShmSegment::create(name.clone(), &[]).unwrap_err();
+        assert!(err.contains("empty payload"), "{err}");
+        assert!(!shm_path(&name).exists(), "no segment may be created");
     }
 
     /// `into_name` transfers the unlink duty to the caller (Python's

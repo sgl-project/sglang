@@ -8,6 +8,7 @@ use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{MmRequest, Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
+use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -410,7 +411,7 @@ impl Intake {
     /// PreSendValidating`, and resume driving (pre-send checks → ring). No
     /// pending entry means the request was already rejected or aborted, so the
     /// result is dropped — and with it any shm segment it parked.
-    fn on_mm_encoded(&mut self, rid: Rid, input_ids: Vec<i64>, buffers: Vec<Buffer>) {
+    fn on_mm_encoded(&mut self, rid: Rid, input_ids: TokenIds, buffers: Vec<Buffer>) {
         let Some(mut req) = self.pending_mm.remove(&rid) else {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
             drop(buffers);
