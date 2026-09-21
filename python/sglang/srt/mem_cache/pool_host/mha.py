@@ -108,7 +108,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+            page_size=self.page_size,
+            element_size=self.element_dim * self.dtype.itemsize,
         )
 
         if self.layout == "page_first":
@@ -276,6 +277,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer(
+                        page_size=self.page_size,
                         k_cache_dst=device_pool.k_buffer[device_layer_id],
                         v_cache_dst=device_pool.v_buffer[device_layer_id],
                         k_cache_src=self.k_buffer[host_layer_id],
@@ -300,6 +302,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     # index by layer_id to get a per-layer view with strided layout.
                     # The kernel handles different src/dst strides automatically.
                     jit_transfer_hicache_one_layer(
+                        page_size=self.page_size,
                         k_cache_dst=device_pool.k_buffer[device_layer_id],
                         v_cache_dst=device_pool.v_buffer[device_layer_id],
                         k_cache_src=self.k_data_refs[host_layer_id],
@@ -437,6 +440,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer(
+                        page_size=self.page_size,
                         k_ptr_dst=self.k_data_ptrs,
                         v_ptr_dst=self.v_data_ptrs,
                         indices_dst=host_indices,
@@ -783,7 +787,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.clear()
 
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.token_stride_size
+            page_size=self.page_size, element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_pool.k_buffer],
@@ -855,6 +859,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.k_buffer[layer_id],
                         cache_src=self.k_buffer[layer_id],
                         indices_dst=device_indices,
@@ -872,6 +877,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.k_buffer[layer_id],
                         cache_src=self.k_data_refs[layer_id],
                         indices_dst=device_indices,
@@ -921,6 +927,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 if self.can_use_jit:
                     for layer_id in range(self.layer_num):
                         jit_transfer_hicache_one_layer_mla(
+                            page_size=self.page_size,
                             cache_dst=self.k_buffer[layer_id],
                             cache_src=device_pool.k_buffer[layer_id],
                             indices_dst=host_indices,
@@ -939,6 +946,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
+                        page_size=self.page_size,
                         ptr_dst=self.k_data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=self.k_device_ptrs,
