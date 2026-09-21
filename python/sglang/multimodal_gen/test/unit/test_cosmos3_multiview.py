@@ -35,6 +35,9 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.models.dits import (
+    cosmos3_multiview_maskless as maskless_module,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     pack_state,
     unpack_state,
@@ -55,10 +58,12 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
     padded_multiview_flex_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_maskless import (
+    MASKLESS_KERNEL_ENV_VAR,
     build_multiview_maskless_plan,
     maskless_unavailable_reason,
     merge_attentions,
     multiview_maskless_attention,
+    resolve_maskless_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_vision,
@@ -2080,7 +2085,7 @@ class TestMasklessAttention(unittest.TestCase):
         expected, _ = attend(torch.cat([k1, k2]), torch.cat([v1, v2]))
         torch.testing.assert_close(merged, expected, atol=1e-5, rtol=1e-5)
 
-    def _run(self, layout, device, dtype, atol, rtol, batch_size=1):
+    def _run(self, layout, device, dtype, atol, rtol, batch_size=1, kernel=None):
         torch.manual_seed(0)
         heads, kv_heads, head_dim = 4, 2, 16
         und = sum(layout.caption_lengths) or 5
@@ -2095,7 +2100,9 @@ class TestMasklessAttention(unittest.TestCase):
             batch_size, und, kv_heads, head_dim, device=device, dtype=dtype
         )
         context = MultiviewAttentionContext(layout, {}, {})
-        out = multiview_maskless_attention(q, k, v, k_und, v_und, context)
+        out = multiview_maskless_attention(
+            q, k, v, k_und, v_und, context, kernel=kernel
+        )
         self.assertEqual(tuple(out.shape), (batch_size, gen, heads, head_dim))
         expected = _maskless_oracle(
             q.cpu(), k.cpu(), v.cpu(), k_und.cpu(), v_und.cpu(), layout
@@ -2161,14 +2168,91 @@ class TestMasklessAttention(unittest.TestCase):
         )
         self.assertGreater((maskless - masked).abs().mean().item(), 1e-3)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA for the flash kernel")
+    def test_kernel_resolution(self):
+        cpu = torch.device("cpu")
+        available = {"fa2", "fa3", "fa4"}
+
+        def fake_import(name):
+            if name not in available:
+                raise ImportError(f"{name} missing")
+            return maskless_module._fa2_varlen
+
+        with (
+            mock.patch.object(maskless_module, "_import_kernel", fake_import),
+            mock.patch.dict(maskless_module._resolved_kernels, clear=True),
+            mock.patch.dict(os.environ, {MASKLESS_KERNEL_ENV_VAR: ""}),
+        ):
+            # auto: FA4 on Blackwell, FA3 on Hopper, torch FA2 below.
+            self.assertEqual(resolve_maskless_kernel(cpu, capability_major=10), "fa4")
+            self.assertEqual(resolve_maskless_kernel(cpu, capability_major=12), "fa4")
+            self.assertEqual(resolve_maskless_kernel(cpu, capability_major=9), "fa3")
+            self.assertEqual(resolve_maskless_kernel(cpu, capability_major=8), "fa2")
+            # A missing package degrades auto to FA2 but makes an explicit request fail.
+            available.discard("fa4")
+            maskless_module._resolved_kernels.clear()
+            self.assertEqual(resolve_maskless_kernel(cpu, capability_major=10), "fa2")
+            with self.assertRaises(ImportError):
+                resolve_maskless_kernel(cpu, "fa4", capability_major=10)
+            available.add("fa4")
+            # An explicit kernel below its architecture floor is refused up front.
+            with self.assertRaisesRegex(ValueError, "compute capability"):
+                resolve_maskless_kernel(cpu, "fa4", capability_major=8)
+            with self.assertRaisesRegex(ValueError, MASKLESS_KERNEL_ENV_VAR):
+                resolve_maskless_kernel(cpu, "flex", capability_major=10)
+            # The env override wins over auto.
+            with mock.patch.dict(os.environ, {MASKLESS_KERNEL_ENV_VAR: "fa2"}):
+                maskless_module._resolved_kernels.clear()
+                self.assertEqual(
+                    resolve_maskless_kernel(cpu, capability_major=10), "fa2"
+                )
+            # Off-CUDA always takes the reference path's FA2 label.
+            self.assertEqual(resolve_maskless_kernel(cpu), "fa2")
+
+    def _available_cuda_kernels(self):
+        kernels = ["fa2"]
+        major = torch.cuda.get_device_capability()[0]
+        for name, floor in (("fa3", 8), ("fa4", 9)):
+            if major < floor:
+                continue
+            try:
+                maskless_module._import_kernel(name)
+            except ImportError:
+                continue
+            kernels.append(name)
+        return kernels
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA for the flash kernels")
     def test_cuda_flash_path_matches_oracle(self):
+        # Every kernel the device offers computes the same three passes; the merge
+        # then makes them agree with the multiset oracle to bf16 rounding.
         cuda = torch.device("cuda")
-        self._run(self._joint_layout(), cuda, torch.bfloat16, 3e-2, 3e-2)
-        self._run(self._joint_layout(), cuda, torch.bfloat16, 3e-2, 3e-2, batch_size=2)
-        self._run(
-            self._joint_layout(caption_lengths=()), cuda, torch.bfloat16, 3e-2, 3e-2
-        )
+        for kernel in self._available_cuda_kernels():
+            with self.subTest(kernel=kernel):
+                self._run(
+                    self._joint_layout(),
+                    cuda,
+                    torch.bfloat16,
+                    3e-2,
+                    3e-2,
+                    kernel=kernel,
+                )
+                self._run(
+                    self._joint_layout(),
+                    cuda,
+                    torch.bfloat16,
+                    3e-2,
+                    3e-2,
+                    batch_size=2,
+                    kernel=kernel,
+                )
+                self._run(
+                    self._joint_layout(caption_lengths=()),
+                    cuda,
+                    torch.bfloat16,
+                    3e-2,
+                    3e-2,
+                    kernel=kernel,
+                )
 
 
 class TestRegistry(unittest.TestCase):

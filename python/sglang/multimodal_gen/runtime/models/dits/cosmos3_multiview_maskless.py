@@ -24,20 +24,31 @@ maskless exports were trained with; it is not a drop-in for the masked backends.
 
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import msgspec
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 MASKLESS_BACKEND = "maskless"
+# Varlen kernels that return the per-row log-sum-exp the merge needs. "auto" picks
+# FA4 on Blackwell (sm100+), FA3 on Hopper (sm90) and torch's FA2 elsewhere; the
+# three agree to bf16 rounding (measured 1 ulp on GB200 and H200), so this is a
+# speed knob, not a semantics one.
+MASKLESS_KERNELS = ("auto", "fa4", "fa3", "fa2")
+MASKLESS_KERNEL_ENV_VAR = "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL"
 # LiDAR sweeps and camera frames live on separate view axes; a LiDAR sweep is a
 # one-view item on axis 1 so its group is distinct from camera view 0.
 _CAMERA_AXIS = 0
@@ -329,6 +340,154 @@ def _varlen_attention_reference(
     return out, lse
 
 
+VarlenKernel = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        float,
+    ],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
+def _fa2_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+    out, lse, *_ = torch.ops.aten._flash_attention_forward(
+        q, k, v, cu_q, cu_k, max_q, max_k, 0.0, False, False, scale=scale
+    )
+    return out, lse.transpose(0, 1)
+
+
+@functools.lru_cache(maxsize=None)
+def _import_kernel(name: str) -> VarlenKernel:
+    """The varlen kernel ``name`` as ``(q, k, v, cu_q, cu_k, max_q, max_k, scale)``.
+
+    Every kernel returns ``([N, H, D], [N, H] fp32 LSE)``; FA3 and FA4 hand back the
+    LSE as ``[H, N]`` and are transposed here. Raises ImportError when the package
+    is missing.
+    """
+    if name == "fa2":
+        return _fa2_varlen
+    if name == "fa3":
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        def _fa3_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+            # Returns (out, softmax_lse[H, N], *accumulators) when the LSE is requested.
+            out, lse, *_ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_q,
+                max_k,
+                softmax_scale=scale,
+                causal=False,
+                return_softmax_lse=True,
+            )
+            return out, lse.transpose(0, 1)
+
+        return _fa3_varlen
+    if name == "fa4":
+        from flash_attn.cute import flash_attn_varlen_func as fa4_varlen
+
+        def _fa4_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale):
+            out, lse = fa4_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softmax_scale=scale,
+                causal=False,
+                return_lse=True,
+            )
+            return out, lse.transpose(0, 1)
+
+        return _fa4_varlen
+    raise ValueError(
+        f"Unknown maskless kernel {name!r}; expected one of {list(MASKLESS_KERNELS)}."
+    )
+
+
+# FA4's CuTe kernels target sm90 and sm100+; its sm80 fallback fails to compile
+# (seen on Ada), so "auto" never picks it below Hopper and an explicit request is
+# refused there instead of failing inside the first forward.
+_FA4_MIN_CAPABILITY_MAJOR = 9
+_FA3_MIN_CAPABILITY_MAJOR = 8
+
+_resolved_kernels: dict[tuple[str, int, str], str] = {}
+
+
+def resolve_maskless_kernel(
+    device: torch.device,
+    requested: str | None = None,
+    *,
+    capability_major: int | None = None,
+) -> str:
+    """Pick the varlen kernel for ``device``; env override, else by compute capability."""
+    if requested is None:
+        requested = envs.SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL or "auto"
+    if requested not in MASKLESS_KERNELS:
+        raise ValueError(
+            f"{MASKLESS_KERNEL_ENV_VAR} must be one of {list(MASKLESS_KERNELS)}, got {requested!r}."
+        )
+    if capability_major is None:
+        if device.type != "cuda":
+            return "fa2"
+        capability_major = torch.cuda.get_device_capability(device)[0]
+    key = (str(device), capability_major, requested)
+    cached = _resolved_kernels.get(key)
+    if cached is not None:
+        return cached
+    if requested == "auto":
+        preferred = (
+            "fa4"
+            if capability_major >= 10
+            else "fa3"
+            if capability_major == 9
+            else "fa2"
+        )
+        try:
+            _import_kernel(preferred)
+            kernel = preferred
+        except ImportError as exc:
+            logger.warning(
+                "Cosmos3 maskless attention: %s is unavailable (%s); falling back to torch FA2.",
+                preferred,
+                exc,
+            )
+            kernel = "fa2"
+    else:
+        minimum = {
+            "fa4": _FA4_MIN_CAPABILITY_MAJOR,
+            "fa3": _FA3_MIN_CAPABILITY_MAJOR,
+        }.get(requested, 0)
+        if capability_major < minimum:
+            raise ValueError(
+                f"Cosmos3 maskless kernel {requested!r} needs compute capability {minimum}.x or "
+                f"newer; this device is {capability_major}.x."
+            )
+        _import_kernel(
+            requested
+        )  # an explicit choice fails loudly rather than falling back
+        kernel = requested
+    _resolved_kernels[key] = kernel
+    logger.info(
+        "Cosmos3 maskless attention kernel: %s (%s, sm%d0)",
+        kernel,
+        torch.cuda.get_device_name(device) if device.type == "cuda" else device.type,
+        capability_major,
+    )
+    return kernel
+
+
 def _varlen_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -338,14 +497,12 @@ def _varlen_attention(
     max_q: int,
     max_k: int,
     scale: float,
+    kernel: str = "fa2",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unmasked varlen attention; returns ``([N, H, D], [N, H] fp32 LSE)``."""
     if q.device.type != "cuda":
         return _varlen_attention_reference(q, k, v, cu_q, cu_k, scale)
-    out, lse, *_ = torch.ops.aten._flash_attention_forward(
-        q, k, v, cu_q, cu_k, max_q, max_k, 0.0, False, False, scale=scale
-    )
-    return out, lse.transpose(0, 1)
+    return _import_kernel(kernel)(q, k, v, cu_q, cu_k, max_q, max_k, scale)
 
 
 def _scatter(
@@ -407,8 +564,13 @@ def multiview_maskless_attention(
     k_und: torch.Tensor,
     v_und: torch.Tensor,
     context: MultiviewAttentionContext,
+    kernel: str | None = None,
 ) -> torch.Tensor:
-    """Three unmasked passes merged by LSE. Inputs ``[B, S, H, D]``; returns the same."""
+    """Three unmasked passes merged by LSE. Inputs ``[B, S, H, D]``; returns the same.
+
+    ``kernel`` pins one of ``MASKLESS_KERNELS``; ``None`` resolves it from the env
+    override and the device once per process.
+    """
     batch_size, gen_tokens = q.shape[:2]
     if k.shape[:2] != (batch_size, gen_tokens) or k.shape != v.shape:
         raise ValueError(
@@ -429,6 +591,7 @@ def multiview_maskless_attention(
         context, und_tokens=k_und.shape[1], batch_size=batch_size, device=q.device
     )
     scale = 1.0 / math.sqrt(q.shape[-1])
+    kernel = resolve_maskless_kernel(q.device, kernel)
     tokens = batch_size * gen_tokens
     q_flat = q.reshape(tokens, *q.shape[2:])
     k_flat = k.reshape(tokens, *k.shape[2:])
@@ -452,6 +615,7 @@ def multiview_maskless_attention(
         plan.same_view_max_len,
         plan.same_view_max_len,
         scale,
+        kernel,
     )
     out, lse = _scatter(out, lse, gather, tokens)
     outputs.append(out)
@@ -468,6 +632,7 @@ def multiview_maskless_attention(
             plan.cross_view_max_len,
             plan.cross_view_max_len,
             scale,
+            kernel,
         )
         out, lse = _scatter(out, lse, gather, tokens)
         outputs.append(out)
@@ -482,6 +647,7 @@ def multiview_maskless_attention(
         plan.caption_q_max_len,
         plan.caption_kv_max_len,
         scale,
+        kernel,
     )
     out, lse = _scatter(out, lse, plan.caption_q_gather, tokens)
     outputs.append(out)

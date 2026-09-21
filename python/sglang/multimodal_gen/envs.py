@@ -235,6 +235,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
     ),
+    # Varlen kernel behind the maskless backend's three passes: "auto" (default;
+    # FA4 on Blackwell, FA3 on Hopper, torch FA2 elsewhere), "fa4", "fa3", "fa2".
+    # A/B knob only: every kernel computes the same attention.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_MASKLESS_KERNEL"
+    ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
