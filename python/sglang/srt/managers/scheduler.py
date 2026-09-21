@@ -6088,10 +6088,14 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        if artifact_path := envs.SGLANG_SNAPSHOT_DIR.get():
-            from sglang.srt.engine_snapshot.startup import scheduler_barrier
+        if envs.SGLANG_SNAPSHOT_ENGINE.get():
+            from sglang.srt.engine_snapshot.startup import (
+                active_artifact_path,
+                scheduler_barrier,
+            )
 
-            scheduler_barrier(scheduler, artifact_path)
+            if artifact_path := active_artifact_path():
+                scheduler_barrier(scheduler, artifact_path)
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 

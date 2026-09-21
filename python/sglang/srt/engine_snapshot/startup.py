@@ -255,6 +255,26 @@ def _reload_and_verify(scheduler, server_args_view, expected):
     return _verify_canary(scheduler, expected)
 
 
+def active_artifact_path():
+    """The artifact directory when this process tree is a snapshot engine.
+
+    The snapshot entry marks the tree it starts, so a plain ``sglang serve``
+    that inherited ``SGLANG_SNAPSHOT_DIR`` from the operator's shell (or a
+    shared ``.env``) never enters the barrier: the variable only says where an
+    artifact lives, while the marker says a controller asked for this engine.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_SNAPSHOT_ENGINE.get():
+        return None
+    artifact_path = envs.SGLANG_SNAPSHOT_DIR.get()
+    if not artifact_path:
+        raise SnapshotUsageError(
+            "SGLANG_SNAPSHOT_ENGINE is set but SGLANG_SNAPSHOT_DIR is not"
+        )
+    return artifact_path
+
+
 def scheduler_barrier(scheduler, artifact_path):
     """Rehearse the reload, park released, then resume and re-verify on restore.
 
@@ -349,6 +369,10 @@ if __name__ == "__main__":
             "SGLANG_SNAPSHOT_DIR is not set; start the engine through "
             "`sglang snapshot create`"
         )
+    # The barriers key off this marker rather than off SGLANG_SNAPSHOT_DIR:
+    # only this entry - the one a controller launches - knows that a snapshot
+    # run asked for the engine, and the tree inherits the marker from here.
+    envs.SGLANG_SNAPSHOT_ENGINE.set(True)
     control_dir = Path(artifact_path) / control.CONTROL_DIRNAME
     try:
         args = validate_server_args(sys.argv[1:])
