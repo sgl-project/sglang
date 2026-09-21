@@ -624,29 +624,29 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
-        """PD-transfer registration: ONE entry, the raw buffer, addressed as
-        ``raw_ptr + physical_page_id * page_envelope_bytes``.
+        """Register the raw buffer as physical page envelopes for PD transfer.
 
-        Same whole-envelope contract as `UnifiedMLATokenToKVPool`: the transfer
-        item is one page across ALL layers and both K and V, because the
-        per-layer views overlap inside the envelope and index in kernel-facing
-        ids. A peer must therefore build an identical spec -- enforced on the
-        wire by `_validate_envelope_kv_layout`.
+        Full and SWA expose the same allocation with different envelope sizes;
+        the transfer backend preserves both logical entries while deduplicating
+        the underlying memory registration.
         """
-        # The address formula omits the anchor; a nonzero one would mis-address.
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
-        )
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
-        )
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
@@ -737,6 +737,22 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
+        views are indexed by; the formula is the one in the class docstring."""
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
@@ -1676,7 +1692,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         swa_cpu = None
         if bool(valid.any().item()):
             swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu}
+        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
@@ -1689,7 +1705,14 @@ class UnifiedSWAKVPool(SWAKVPool):
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
+            old_swa_mask = kv_cache_cpu["swa_mask"].to(indices.device)
+            assert old_swa_mask.shape == indices.shape
+            row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
+            swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
+            if swa_phys.numel() == 0:
+                return
+            swa_cpu = self._filter_swa_cpu_copy(kv_cache_cpu["swa"], row_mask)
+            self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
 
 
 class UnifiedSWAPoolBundle(NamedTuple):
@@ -1713,13 +1736,13 @@ def init_unified_swa_pools(
     end_layer: int,
     swa_attention_layer_ids: List[int],
     full_attention_layer_ids: List[int],
-    full_max_total_num_tokens: int,
-    swa_max_total_num_tokens: int,
+    full_max_total_num_tokens: Optional[int] = None,
+    swa_max_total_num_tokens: Optional[int] = None,
+    total_bytes: Optional[int] = None,
     enable_memory_saver: bool,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
-    unified_total_bytes: Optional[int] = None,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
@@ -1758,15 +1781,20 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    if unified_total_bytes is not None:
-        # PROFILED byte budget, sized from directly: the re-sum's floor losses
-        # stay out of the buffer, and the token counts remain boot labels.
-        total_bytes = unified_total_bytes
-    else:
+    legacy_allocator_capacities = {}
+    if total_bytes is None:
+        if full_max_total_num_tokens is None or swa_max_total_num_tokens is None:
+            raise ValueError(
+                "total_bytes or both legacy full/SWA capacities must be provided"
+            )
         total_bytes = (
             full_max_total_num_tokens * full_spec.entry_bytes()
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
         )
+        legacy_allocator_capacities = {
+            "full_max_total_num_tokens": full_max_total_num_tokens,
+            "swa_max_total_num_tokens": swa_max_total_num_tokens,
+        }
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
         # page-granular walk) + the slot-0 sink. The full side is not charged
@@ -1785,6 +1813,8 @@ def init_unified_swa_pools(
             ],
             factory="init_unified_swa_pools",
         )
+    if total_bytes <= 0:
+        raise ValueError(f"total_bytes must be positive, got {total_bytes}")
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
@@ -1805,12 +1835,11 @@ def init_unified_swa_pools(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
         device=device,
-        full_max_total_num_tokens=full_max_total_num_tokens,
-        swa_max_total_num_tokens=swa_max_total_num_tokens,
         page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        **legacy_allocator_capacities,
     )
 
     logger.info(
@@ -1841,12 +1870,12 @@ def init_unified_swa_pools(
         page_size,
     )
     logger.info(
-        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), full_max_total_num_tokens=%d, "
-        "swa_max_total_num_tokens=%d, joint_available=%d slots",
+        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), "
+        "full_capacity=%d, swa_capacity=%d, joint_available=%d slots",
         total_bytes,
         total_bytes / GB,
-        full_max_total_num_tokens,
-        swa_max_total_num_tokens,
+        allocator.size_full,
+        allocator.size_swa,
         allocator.available_size(),
     )
     logger.info(

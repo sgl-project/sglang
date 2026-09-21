@@ -140,3 +140,8 @@ def test_qwen_quality_variants_use_the_same_generation_request():
     assert extra_high.prompt == lossless.prompt
     assert extra_high.output_size == lossless.output_size
     assert extra_high.extras == {"quality": "extra-high"}
+
+    scenarios = json.loads(_H100_BASELINE_PATH.read_text())["scenarios"]
+    for case_id in ("qwen_image_t2i_2_gpus", "qwen_image_t2i_2_gpus_extra_high"):
+        assert cases[case_id].run_perf_check
+        assert scenarios[case_id]["expected_e2e_ms"] > 0
