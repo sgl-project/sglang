@@ -95,7 +95,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -266,8 +265,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -582,6 +583,16 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
+    # Resolve from the platform checks: torch.get_device_module() with no
+    # argument initializes the CUDA runtime, which poisons fork() startup.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
     return torch.get_device_module()
 
 
@@ -630,8 +641,55 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    # Compute capability of torch device 0, read while torch.cuda stays
+    # uninitialized; None when NVML cannot answer and the caller falls back.
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("get_device_sm: pynvml is not installed, using torch.cuda")
+        return None
+    # Private torch API, read defensively: it maps the torch ordinal to the NVML
+    # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if getter is None:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index is missing, "
+            "using torch.cuda"
+        )
+        return None
+    try:
+        idx = getter(0)
+    except Exception:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index(0) failed, "
+            "using torch.cuda",
+            exc_info=True,
+        )
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        logger.debug(
+            "get_device_sm: NVML query failed, using torch.cuda", exc_info=True
+        )
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Called at import time (e.g. by the DeepGEMM configurer): initializing
+        # torch.cuda here would create a context and poison fork() startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -1859,6 +1917,8 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -2060,8 +2120,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2374,6 +2451,8 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    configure_hf_hub_logger()
 
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
