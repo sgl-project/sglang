@@ -6,7 +6,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (

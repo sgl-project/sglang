@@ -5,16 +5,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 import transformers
 from safetensors.torch import save_file
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyFullPrecisionNvfp4LinearMethod,
     ComfyNvfp4Config,
-    ComfyRowwiseInt8EmbeddingMethod,
+    ComfyNvfp4LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
@@ -27,6 +32,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -35,11 +43,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
     TextEncoderLoader,
     _configure_encoder_quantization,
     _get_encoder_quant_config,
-    _process_quantized_encoder_weights,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    checkpoint_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
     TextEncoder,
@@ -49,7 +59,223 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    inspect_comfy_quant_markers,
+    process_model_weights_after_loading,
+)
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+
+
+@pytest.mark.parametrize("backend", ["int8", "nvfp4"])
+@pytest.mark.parametrize("tensorwise", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_size):
+    embed = "model.embed_tokens"
+    linear = "model.layers.0.self_attn.q_proj"
+    weights = (
+        torch.arange(7 * 256).reshape(7, 256).remainder(251).sub(125).to(torch.int8)
+    )
+    scale = (
+        torch.tensor(0.0137)
+        if tensorwise
+        else torch.arange(1, 8).float().reshape(7, 1) / 113
+    )
+    marker = (
+        {"format": "nvfp4", "full_precision_matrix_mult": True}
+        if backend == "nvfp4"
+        else {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+    )
+    tensors = {
+        f"{embed}.weight": weights,
+        f"{embed}.weight_scale": scale,
+        f"{linear}.weight": torch.ones(
+            (128, 128 if backend == "nvfp4" else 256),
+            dtype=torch.uint8 if backend == "nvfp4" else torch.int8,
+        ),
+        f"{linear}.weight_scale": torch.ones(
+            (128, 16 if backend == "nvfp4" else 1),
+            dtype=torch.float8_e4m3fn if backend == "nvfp4" else torch.float32,
+        ),
+    }
+    if backend == "nvfp4":
+        tensors[f"{linear}.weight_scale_2"] = torch.tensor(0.5)
+    else:
+        tensors[f"{linear}.comfy_quant"] = torch.tensor(
+            list(json.dumps({**marker, "per_row": True}).encode()), dtype=torch.uint8
+        )
+    checkpoint = tmp_path / "encoder.safetensors"
+    save_file(
+        tensors,
+        checkpoint,
+        metadata={
+            "_quantization_metadata": json.dumps(
+                {"layers": {embed: {"format": "int8_tensorwise"}, linear: marker}}
+            )
+        },
+    )
+    config = _get_encoder_quant_config(
+        {}, str(tmp_path), str(checkpoint), MiniMaxH3Qwen3VLEncoder
+    )
+    prefix = "model.language_model.embed_tokens"
+    assert config.quantizes_embedding(prefix)
+    for rank in range(tp_size):
+        embedding = VocabParallelEmbedding(
+            7,
+            256,
+            params_dtype=torch.bfloat16,
+            padding_size=8,
+            quant_config=config,
+            prefix=prefix,
+            tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=rank),
+        )
+        embedding.weight_loader(embedding.weight, weights)
+        embedding.weight_loader(embedding.weight_scale, scale)
+        start = embedding.shard_indices.org_vocab_start_index
+        count = embedding.shard_indices.org_vocab_end_index - start
+        indices = torch.arange(count)
+        actual = embedding.quant_method.embedding(embedding, indices)
+        if tensorwise:
+            expected = (weights[start : start + count].float() * scale).bfloat16()
+            assert embedding.weight_scale.shape == ()
+        else:
+            expected = (
+                weights[start : start + count].bfloat16()
+                * scale[start : start + count].bfloat16()
+            )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert embedding.weight.dtype == torch.int8
+        assert torch.count_nonzero(embedding.weight[count:]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_comfy_nvfp4_dynamic_matmul(dtype):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires NVFP4 tensor cores")
+    ck = pytest.importorskip("comfy_kitchen")
+    layout = pytest.importorskip("comfy_kitchen.tensor.nvfp4").TensorCoreNVFP4Layout
+    torch.manual_seed(42)
+    x = torch.randn(33, 256, device="cuda", dtype=dtype)
+    w = torch.randn(128, 256, device="cuda", dtype=dtype)
+    weight_scale = w.abs().amax().float() / (448 * 6)
+    packed, scales = ck.quantize_nvfp4(w, weight_scale)
+    layer = nn.Module()
+    layer.weight = nn.Parameter(packed, requires_grad=False)
+    layer.weight_scale = nn.Parameter(scales, requires_grad=False)
+    layer.weight_scale_2 = nn.Parameter(weight_scale, requires_grad=False)
+    layer.output_size_per_partition = 128
+    config = ComfyNvfp4Config({"proj": {"format": "nvfp4"}})
+    method = ComfyNvfp4LinearMethod(config, has_pre_quant_scale=False)
+    actual = method.apply(layer, x)
+    x_packed, x_params = layout.quantize(x)
+    expected = ck.scaled_mm_nvfp4(
+        x_packed,
+        packed,
+        tensor_scale_a=x_params.scale,
+        tensor_scale_b=weight_scale,
+        block_scale_a=x_params.block_scale,
+        block_scale_b=scales,
+        out_dtype=x.dtype,
+    )[:33]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()
+    zero = method.apply(layer, torch.zeros_like(x))
+    assert torch.isfinite(zero).all()
+    assert torch.count_nonzero(zero) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_comfy_scalar_embedding_matches_kitchen_kernel():
+    pytest.importorskip("comfy_kitchen")
+    method = ComfyInt8EmbeddingMethod(tensorwise=True)
+    layer = nn.Module()
+    method.create_weights(layer, 256, [128], 256, 128, torch.bfloat16)
+    layer.to("cuda")
+    layer.weight.data.copy_(
+        torch.arange(128 * 256, device="cuda")
+        .reshape(128, 256)
+        .remainder(251)
+        .sub(125)
+        .to(torch.int8)
+    )
+    layer.weight_scale.data.fill_(0.0137)
+    indices = torch.tensor([0, 63, 127, 0], device="cuda")
+    expected = (layer.weight[indices].float() * layer.weight_scale).bfloat16()
+    torch.testing.assert_close(
+        method.embedding(layer, indices), expected, rtol=0, atol=0
+    )
+
+
+def test_comfy_marker_conflicting_values_rejected(tmp_path):
+    checkpoint = tmp_path / "encoder.safetensors"
+    marker = {"format": "int8_tensorwise", "convrot": True}
+    save_file(
+        {
+            "layer.comfy_quant": torch.tensor(
+                list(json.dumps({**marker, "convrot": False}).encode()),
+                dtype=torch.uint8,
+            )
+        },
+        checkpoint,
+        metadata={"_quantization_metadata": json.dumps({"layers": {"layer": marker}})},
+    )
+    with pytest.raises(ValueError, match="Conflicting Comfy quantization markers"):
+        inspect_comfy_quant_markers([str(checkpoint)])
+
+
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("competing_index", [False, True])
+def test_native_encoder_restoration_checks_checkpoint_before_fallback(
+    tmp_path, missing, competing_index
+):
+    config = transformers.T5Config(
+        vocab_size=32,
+        d_model=8,
+        d_kv=4,
+        d_ff=16,
+        num_layers=1,
+        num_heads=2,
+        architectures=["T5EncoderModel"],
+    )
+    reference = transformers.T5EncoderModel(config)
+    config.save_pretrained(tmp_path)
+    weights = {name: tensor.clone() for name, tensor in reference.state_dict().items()}
+    required = "encoder.final_layer_norm.weight"
+    if missing:
+        weights.pop(required)
+    save_file(weights, tmp_path / "model.safetensors")
+    if competing_index:
+        # LTX-2 ships both indexes in text_encoder; only the HF one owns this model
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {name: "model.safetensors" for name in weights}})
+        )
+        alternate = "diffusion_pytorch_model.safetensors"
+        save_file({"diffusion.weight": torch.ones(2, 2)}, tmp_path / alternate)
+        (tmp_path / "diffusion_pytorch_model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"diffusion.weight": alternate}})
+        )
+        alternate_weights = dict(checkpoint_weights_iterator(str(tmp_path)))
+        assert set(alternate_weights) == {"diffusion.weight"}
+    args = ServerArgs(
+        model_path="x",
+        component_precisions={"text_encoder": "fp32"},
+        component_residency={"text_encoder": "component-offload"},
+    )
+    args.pipeline_config.text_encoder_configs = (T5Config(),)
+    loader = TextEncoderLoader()
+    with mock.patch.object(
+        loader, "load_native", side_effect=AssertionError("fallback")
+    ):
+        if missing:
+            with pytest.raises(ComponentCheckpointUnsupportedError, match=required):
+                loader.load(str(tmp_path), args, "text_encoder", "transformers")
+        else:
+            model, _ = loader.load(str(tmp_path), args, "text_encoder", "transformers")
+            torch.testing.assert_close(
+                model.state_dict()[required], weights[required], rtol=0, atol=0
+            )
+            assert all(not parameter.requires_grad for parameter in model.parameters())
 
 
 class TestTextEncoderWeightDiscovery(unittest.TestCase):
@@ -59,22 +285,13 @@ class TestTextEncoderWeightDiscovery(unittest.TestCase):
             canonical = model_dir / "model.safetensors"
             variant = model_dir / "model.fp16.safetensors"
 
-            canonical.touch()
-            variant.touch()
+            weight = torch.ones(2, 2)
+            save_file({"weight": weight}, canonical)
+            save_file({"weight": weight.half()}, variant)
 
-            (
-                hf_folder,
-                weight_files,
-                use_safetensors,
-            ) = TextEncoderLoader()._prepare_weights(
-                str(model_dir),
-                fall_back_to_pt=True,
-                allow_patterns_overrides=None,
-            )
-
-            self.assertEqual(hf_folder, str(model_dir))
-            self.assertTrue(use_safetensors)
-            self.assertEqual(weight_files, [str(canonical)])
+            state = dict(checkpoint_weights_iterator(str(model_dir)))
+            self.assertEqual(state["weight"].dtype, torch.float32)
+            torch.testing.assert_close(state["weight"], weight)
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -653,7 +870,7 @@ class TestTextEncoderQuantization(unittest.TestCase):
 
         torch.testing.assert_close(output, torch.full((1, 128), 32.0))
 
-        embedding_method = ComfyRowwiseInt8EmbeddingMethod()
+        embedding_method = ComfyInt8EmbeddingMethod()
         embedding = nn.Module()
         embedding_method.create_weights(
             embedding,
@@ -757,7 +974,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 ),
             ):
                 _resolve_and_configure_encoder_quantization(
-                    SimpleNamespace(architectures=[architecture], quant_config=None),
+                    SimpleNamespace(
+                        arch_config=SimpleNamespace(architectures=[architecture]),
+                        quant_config=None,
+                    ),
                     component_config,
                     "/model/text_encoder",
                     "/model/text_encoder",
@@ -791,7 +1011,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
-                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                    arch_config=SimpleNamespace(
+                        architectures=["ThirdPartyTextEncoder"]
+                    ),
+                    quant_config=None,
                 ),
                 {
                     "quantization_config": {
@@ -812,7 +1035,10 @@ class TestTextEncoderQuantization(unittest.TestCase):
         ):
             _resolve_and_configure_encoder_quantization(
                 SimpleNamespace(
-                    architectures=["ThirdPartyTextEncoder"], quant_config=None
+                    arch_config=SimpleNamespace(
+                        architectures=["ThirdPartyTextEncoder"]
+                    ),
+                    quant_config=None,
                 ),
                 {
                     "quantization_config": {
@@ -887,10 +1113,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _SRTQuantizedLinear(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cpu"),
-            "image_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -926,10 +1152,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cpu"),
-            "text_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -941,10 +1167,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_encoder_weights(
+        processed = process_model_weights_after_loading(
             model,
             torch.device("cuda", torch.cuda.current_device()),
-            "text_encoder",
+            quantized_only=True,
         )
 
         self.assertEqual(processed, 1)
@@ -957,10 +1183,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         model = _QuantizedEncoder(_RecordingQuantMethod(error=RuntimeError("boom")))
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            _process_quantized_encoder_weights(
+            process_model_weights_after_loading(
                 model,
                 torch.device("cuda", torch.cuda.current_device()),
-                "text_encoder",
+                quantized_only=True,
             )
 
         self.assertEqual(model.quantized.weight.device, torch.device("cpu"))

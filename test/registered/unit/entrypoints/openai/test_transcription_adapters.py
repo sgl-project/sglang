@@ -24,7 +24,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 # Per-second scaling rate every speech-LM adapter uses for max_new_tokens.

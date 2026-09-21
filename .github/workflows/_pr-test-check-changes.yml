@@ -19,6 +19,8 @@ on:
     outputs:
       main_package:
         value: ${{ jobs.run.outputs.main_package }}
+      simulator:
+        value: ${{ jobs.run.outputs.simulator }}
       sgl_kernel:
         value: ${{ jobs.run.outputs.sgl_kernel }}
       jit_kernel:
@@ -44,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      simulator: ${{ steps.filter.outputs.simulator || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
@@ -86,6 +89,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
+              - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
@@ -94,6 +98,11 @@ jobs:
               - "test/**/!(*.md)"
               - "rust/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+            simulator:
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-simulator-cpu.yml"
+              - "benchmark/simulator/**/!(*.md)"
+              - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
@@ -104,6 +113,7 @@ jobs:
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"

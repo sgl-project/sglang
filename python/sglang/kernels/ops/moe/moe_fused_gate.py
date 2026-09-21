@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    get_jit_cuda_arch,
+    is_arch_support_pdl,
+    load_jit,
+)
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
 
@@ -88,12 +94,15 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N (+ SHARED_SINK)] fp32, GEMM output (raw logits)
+    scores_ptr,  # [M, N (+ SHARED_SINK)] raw logits, fp32/fp16/bf16 (upcast on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
+    bias_alt_ptr,
+    input_ids_ptr,
+    num_token_non_padded_ptr,
     out_weights_ptr,  # [M, K] fp32 (LOGSIGMOID_SINK: [M, K_ROUTED])
     out_indices_ptr,  # [M, K] int32 (LOGSIGMOID_SINK: [M, K_ROUTED])
+    out_packed_ptr,  # [M, K] int32 (HAS_PACKED / LOGSIGMOID_SINK + RETURN_PACKED)
     out_shared_ptr,  # [M, SHARED_SINK] fp32 (LOGSIGMOID_SINK only)
-    out_packed_ptr,  # [M, K_ROUTED] int32 (LOGSIGMOID_SINK + RETURN_PACKED only)
     global_scale_ptr,  # [1] fp32 (HAS_GLOBAL_SCALE only)
     M,
     routed_scaling_factor,
@@ -109,19 +118,30 @@ def _router_triton_kernel(
     EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
     BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
     SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
+    SQRTSOFTPLUS_LOG1P: tl.constexpr,  # sqrtsoftplus via log1p (V4.1 numerics)
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
     HAS_BIAS: tl.constexpr,
+    HAS_TOKEN_BIAS: tl.constexpr,
+    BIAS_ALT_TOKEN_ID: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+    HAS_PACKED: tl.constexpr,
+    RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
+    stride_bias,
+    stride_bias_alt,
+    stride_input_ids,
     stride_sm,
     stride_sn,
     stride_wm,
     stride_wk,
     stride_im,
     stride_ik,
+    stride_pm,
+    stride_pk,
     # Epilogue parameterization. EPILOGUE 0 (SUM_NORM) is the historical
-    # behaviour and the only one any existing call site reaches. EPILOGUE 1
+    # behaviour and the only one any pre-existing call site reaches. EPILOGUE 1
     # (LOGSIGMOID_SINK) is Inkling's gate: the last SHARED_SINK columns of the
     # row are shared-expert sink logits that take no bias and never enter the
     # top-k, but do join the normalizer, and the quantity normalized is the
@@ -140,19 +160,39 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # Prefetch a real bias before the PDL wait. Plain softmax routing has no
-    # bias, so keep the zero value in registers rather than materializing and
-    # clearing a device tensor for every routing call.
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-    else:
-        bias = tl.zeros([BLOCK_N], dtype=tl.float32)
-
+    # PDL may start this grid before prior kernel stores are visible. Bias can
+    # be produced by a preceding cast or fill kernel, so wait before loading
+    # either bias or scores.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
 
+    # Plain softmax routing has no bias, so keep the zero value in registers
+    # rather than materializing and clearing a device tensor per call.
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n * stride_bias, mask=mask_n, other=0.0).to(
+            tl.float32
+        )
+    else:
+        bias = tl.zeros([BLOCK_N], dtype=tl.float32)
+    if HAS_TOKEN_BIAS:
+        bias_alt = tl.load(
+            bias_alt_ptr + offs_n * stride_bias_alt, mask=mask_n, other=0.0
+        ).to(tl.float32)
+
+    live_m = mask_m
+    if HAS_PADDING:
+        live_m = live_m & (offs_m < tl.load(num_token_non_padded_ptr))
+    row_bias = bias[None, :]
+    if HAS_TOKEN_BIAS:
+        input_ids = tl.load(
+            input_ids_ptr + offs_m * stride_input_ids, mask=live_m, other=0
+        )
+        row_bias = tl.where(
+            (input_ids == BIAS_ALT_TOKEN_ID)[:, None], bias_alt[None, :], row_bias
+        )
+
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
-    mask2d = mask_m[:, None] & mask_n[None, :]
+    mask2d = live_m[:, None] & mask_n[None, :]
     scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
         tl.float32
     )  # [BLOCK_M, BLOCK_N]
@@ -160,12 +200,21 @@ def _router_triton_kernel(
     if SCORING_FUNC == 0:
         # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
         activated = tl.sigmoid(scores)
-        biased = activated + bias[None, :]
+        biased = activated + row_bias
     elif SCORING_FUNC == 1:
-        # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large.
-        sp = tl.where(scores > 20.0, scores, tl.log(1.0 + tl.exp(scores)))
-        activated = tl.sqrt(sp)
-        biased = activated + bias[None, :]
+        if SQRTSOFTPLUS_LOG1P:
+            # log1p preserves small positive scores for negative logits.
+            sp = tl.where(scores > 20.0, scores, libdevice.log1p(libdevice.exp(scores)))
+            activated = libdevice.sqrt(sp)
+        else:
+            # Open-coded log1p; reproduces the DeepSeek-V4 sqrtsoftplus numerics.
+            z = tl.exp(-tl.abs(scores))
+            u = 1.0 + z
+            exact = u == 1.0
+            log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
+            sp = tl.maximum(scores, 0.0) + log1p_z
+            activated = tl.sqrt(sp)
+        biased = activated + row_bias
     else:
         # softmax over the row: weight is the softmax probability (bias kept), with
         # optional tanh softcapping. Ranking by the (softcapped, biased) logit is
@@ -175,7 +224,7 @@ def _router_triton_kernel(
             # tanh(z) = 2*sigmoid(2z) - 1 (avoids relying on tl.math.tanh availability).
             z = logit / moe_softcapping
             logit = moe_softcapping * (2.0 * tl.sigmoid(2.0 * z) - 1.0)
-        biased = logit + bias[None, :]
+        biased = logit + row_bias
         biased = tl.where(mask_n[None, :], biased, -float("inf"))
         row_max = tl.max(biased, axis=1)[:, None]  # [BLOCK_M, 1]
         exp_row = tl.where(mask_n[None, :], tl.exp(biased - row_max), 0.0)
@@ -184,8 +233,11 @@ def _router_triton_kernel(
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
-    # Map NaN -> a finite floor
-    biased = tl.where(biased == biased, biased, -1e30)  # [BLOCK_M, BLOCK_N]
+    if SCORING_FUNC == 1 and SQRTSOFTPLUS_LOG1P:
+        # Rank NaNs above finite scores, matching torch.topk.
+        biased = tl.where(biased == biased, biased, float("inf"))
+    else:
+        biased = tl.where(biased == biased, biased, -1e30)
 
     # Grouped routing (DeepSeek-V3 noaux_tc): per-group score = sum of the top-2
     # biased values; keep TOPK_GROUP groups (lowest group id wins ties); mask the
@@ -230,9 +282,10 @@ def _router_triton_kernel(
         carried = activated
 
     cur = biased  # [BLOCK_M, BLOCK_N]
+    remaining = tl.broadcast_to(mask_n[None, :], (BLOCK_M, BLOCK_N))
     for k in tl.static_range(K_ROUTED):
         max_val = tl.max(cur, axis=1)[:, None]  # [BLOCK_M, 1]
-        is_max = cur == max_val
+        is_max = remaining & (cur == max_val)
         lane_id = tl.where(is_max, offs_n[None, :], N + 1)  # lowest expert id wins ties
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)  # [BLOCK_M, 1]
         win_carried = tl.sum(
@@ -241,7 +294,8 @@ def _router_triton_kernel(
         slot = offs_k[None, :] == k  # [1, BLOCK_K]
         selected_vals = tl.where(slot, win_carried, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
-        cur = tl.where(offs_n[None, :] == win_lane, -float("inf"), cur)
+        remaining = remaining & (offs_n[None, :] != win_lane)
+        cur = tl.where(remaining, cur, -float("inf"))
 
     if EPILOGUE == 1:
         # Sink columns N .. N + SHARED_SINK of the same row occupy slots
@@ -283,12 +337,15 @@ def _router_triton_kernel(
         # [M, SHARED_SINK] output rather than trailing slots of the routed one.
         store_mask = mask_m[:, None] & mask_k_routed[None, :]
         if RETURN_PACKED:
-            weight_bits = (
+            # Must stay bitwise identical to fused_pack_topk.
+            w_bits = (
                 selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
             )
             tl.store(
-                out_packed_ptr + offs_m[:, None] * K_ROUTED + offs_k[None, :],
-                (selected_idx << 16) | weight_bits,
+                out_packed_ptr
+                + offs_m[:, None] * stride_pm
+                + offs_k[None, :] * stride_pk,
+                (selected_idx << 16) | (w_bits & 0xFFFF),
                 mask=store_mask,
             )
         else:
@@ -329,10 +386,16 @@ def _router_triton_kernel(
             tl.extra.cuda.gdc_launch_dependents()
 
         if RENORMALIZE:
-            norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)  # [BLOCK_M, 1]
+            if RENORMALIZE_EPSILON > 0.0:
+                norm = routed_sum + RENORMALIZE_EPSILON
+            else:
+                norm = tl.where(routed_sum > 0.0, routed_sum, 1.0)  # [BLOCK_M, 1]
             selected_vals = selected_vals / norm
         if APPLY_SCALE:
             selected_vals = selected_vals * routed_scaling_factor
+        if HAS_PADDING:
+            selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
+            selected_idx = tl.where(live_m[:, None], selected_idx, -1)
 
         out_w_ptr = (
             out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
@@ -343,6 +406,29 @@ def _router_triton_kernel(
         store_mask = mask_m[:, None] & mask_k_total[None, :]
         tl.store(out_w_ptr, selected_vals, mask=store_mask)
         tl.store(out_i_ptr, selected_idx, mask=store_mask)
+        if HAS_PACKED:
+            # Must stay bitwise identical to fused_pack_topk.
+            w_bits = (
+                selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+            )
+            packed = (selected_idx << 16) | (w_bits & 0xFFFF)
+            out_p_ptr = (
+                out_packed_ptr
+                + offs_m[:, None] * stride_pm
+                + offs_k[None, :] * stride_pk
+            )
+            tl.store(out_p_ptr, packed, mask=store_mask)
+
+
+_DUMMY_I32: Dict[torch.device, torch.Tensor] = {}
+
+
+def _dummy_i32(device: torch.device) -> torch.Tensor:
+    # Placeholder pointer for kernel args whose constexpr flag is off.
+    t = _DUMMY_I32.get(device)
+    if t is None:
+        t = _DUMMY_I32[device] = torch.empty(1, dtype=torch.int32, device=device)
+    return t
 
 
 @debug_kernel_api
@@ -358,8 +444,16 @@ def moe_fused_gate(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    *,
+    bias_alt: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+    bias_alt_token_id: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    renormalize_epsilon: float = 0.0,
+    packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
     shared_sink: int = 0,
-    global_scale: torch.Tensor | None = None,
+    global_scale: Optional[torch.Tensor] = None,
     return_packed: bool = False,
 ) -> (
     Tuple[torch.Tensor, torch.Tensor]
@@ -367,11 +461,18 @@ def moe_fused_gate(
 ):
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    Mirrors :func:`moe_fused_gate_jit` (the CUDA JIT kernel) for the shared
+    parameters; the keyword-only extras are Triton-only.
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
-    within). The first argument is named ``scores`` (raw GEMM logits) to match
-    the existing call sites.
+    within). ``scores`` contains raw GEMM logits.
+
+    Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
+    Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
+    ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
+    (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
+    ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
+    ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
 
     ``shared_sink > 0`` selects the Inkling gate epilogue: ``scores`` is
     ``[M, num_experts + shared_sink]``, the trailing ``shared_sink`` columns are
@@ -379,7 +480,8 @@ def moe_fused_gate(
     join the normalizer, the normalized quantity is the winner's RAW logit rather
     than its activated score, and the weights are renormalized in log space (see
     :mod:`sglang.kernels.ops.moe.sigmoid_gate_topk_renorm`). It returns a 4-tuple
-    ``(routed_weights, topk_indices, shared_weights, packed_topk)``.
+    ``(routed_weights, topk_indices, shared_weights, packed_topk)``; ``return_packed``
+    emits the packed form in place of the routed weights/ids.
 
     At the default ``shared_sink == 0`` every code path, launch geometry and
     output tensor is unchanged and the return value is the historical 2-tuple.
@@ -399,7 +501,6 @@ def moe_fused_gate(
         assert scoring_func.lower() == "softmax", (
             "bias is required for non-softmax routing"
         )
-        assert shared_sink == 0, "shared_sink requires a bias"
     else:
         # The kernel loads the bias and upcasts it to fp32 in-register (see
         # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
@@ -424,9 +525,20 @@ def moe_fused_gate(
         assert num_expert_group <= 1, "shared_sink does not support grouped routing"
         assert scoring_func.lower() == "sigmoid", "shared_sink is sigmoid-gate only"
         assert moe_softcapping == 0.0, "shared_sink does not support softcapping"
+        assert packed_out is None, "shared_sink uses return_packed, not packed_out"
+        assert num_token_non_padded is None, "shared_sink does not support padding"
     else:
         assert global_scale is None, "global_scale requires shared_sink > 0"
         assert not return_packed, "return_packed requires shared_sink > 0"
+    if input_ids is not None:
+        assert bias_alt is not None and bias_alt_token_id is not None
+        assert bias is not None and bias_alt.shape == bias.shape
+        assert input_ids.shape == (scores.size(0),)
+    if packed_out is not None:
+        assert packed_out.dtype == torch.int32, "packed_out must be int32"
+        assert packed_out.shape == (scores.size(0), topk), (
+            "packed_out must be [M, topk]"
+        )
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -442,7 +554,12 @@ def moe_fused_gate(
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
+        and input_ids is None
+        and num_token_non_padded is None
+        and renormalize_epsilon == 0.0
+        and packed_out is None
         and shared_sink == 0
+        and bias.stride(0) == 1
     ):
         radix_args = (
             scores,
@@ -478,14 +595,12 @@ def moe_fused_gate(
         shared_weights = torch.empty(
             (M, shared_sink), dtype=torch.float32, device=scores.device
         )
-        # In packed mode the kernel writes only the packed tensor; the unused
-        # pointer args still need a valid (never-stored) address.
         if return_packed:
+            # In packed mode the kernel writes only the packed tensor.
             packed_topk = torch.empty(
                 (M, K_routed), dtype=torch.int32, device=scores.device
             )
             weights = indices = None
-            w_arg = i_arg = p_arg = packed_topk
         else:
             weights = torch.empty(
                 (M, K_routed), dtype=torch.float32, device=scores.device
@@ -493,12 +608,13 @@ def moe_fused_gate(
             indices = torch.empty(
                 (M, K_routed), dtype=torch.int32, device=scores.device
             )
-            w_arg, i_arg, p_arg = weights, indices, indices
-        s_arg = shared_weights
+        if M == 0:
+            return weights, indices, shared_weights, packed_topk
     else:
         weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
         indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
-        w_arg, i_arg, p_arg, s_arg = weights, indices, indices, indices
+        if M == 0:
+            return weights, indices
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
@@ -513,15 +629,30 @@ def moe_fused_gate(
     num_warps = 1 if BLOCK_N <= 512 else 4
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
+    if use_pdl and scoring_func_int == 1 and N == 384 and K == 6 and M <= 8:
+        # On SM103, early-launching the small DSV4.1 target router increases
+        # latency when it overlaps with mHC/shared-expert work. Use ordinary
+        # stream dependencies; keep PDL for the draft router and larger batches.
+        arch = get_jit_cuda_arch()
+        use_pdl = (arch.major, arch.minor) != (10, 3)
     extra = {"launch_pdl": True} if use_pdl else {}
+    # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
+    # pointer arg; aliasing an output as an unused arg's fallback clobbers it.
+    _unused_i32 = _dummy_i32(scores.device)
+    # LOGSIGMOID_SINK writes either the routed pair or the packed tensor, never
+    # both, so the other one is an unused arg and takes the dummy too.
+    packed_arg = packed_topk if packed_topk is not None else packed_out
     _router_triton_kernel[grid](
         scores,
         bias if bias is not None else scores,
-        w_arg,
-        i_arg,
-        s_arg,
-        p_arg,
-        global_scale if global_scale is not None else scores,
+        bias_alt,
+        input_ids,
+        num_token_non_padded,
+        weights if weights is not None else _unused_i32,
+        indices if indices is not None else _unused_i32,
+        packed_arg if packed_arg is not None else _unused_i32,
+        shared_weights if shared_weights is not None else _unused_i32,
+        global_scale if global_scale is not None else _unused_i32,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
@@ -536,17 +667,28 @@ def moe_fused_gate(
         EXPERTS_PER_GROUP=experts_per_group,
         BLOCK_G=BLOCK_G,
         SCORING_FUNC=scoring_func_int,
+        SQRTSOFTPLUS_LOG1P=bool(sqrtsoftplus_log1p),
         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         HAS_BIAS=bias is not None,
+        HAS_TOKEN_BIAS=input_ids is not None,
+        BIAS_ALT_TOKEN_ID=bias_alt_token_id,
+        HAS_PADDING=num_token_non_padded is not None,
+        HAS_PACKED=packed_out is not None,
+        RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,
+        stride_bias=bias.stride(0) if bias is not None else 0,
+        stride_bias_alt=bias_alt.stride(0) if bias_alt is not None else 0,
+        stride_input_ids=input_ids.stride(0) if input_ids is not None else 0,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),
-        stride_wm=w_arg.stride(0),
-        stride_wk=w_arg.stride(1),
-        stride_im=i_arg.stride(0),
-        stride_ik=i_arg.stride(1),
+        stride_wm=weights.stride(0) if weights is not None else 0,
+        stride_wk=weights.stride(1) if weights is not None else 0,
+        stride_im=indices.stride(0) if indices is not None else 0,
+        stride_ik=indices.stride(1) if indices is not None else 0,
+        stride_pm=packed_arg.stride(0) if packed_arg is not None else 0,
+        stride_pk=packed_arg.stride(1) if packed_arg is not None else 0,
         EPILOGUE=1 if shared_sink > 0 else 0,
         SHARED_SINK=shared_sink,
         HAS_GLOBAL_SCALE=global_scale is not None,
