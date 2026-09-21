@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Bake alibaba-pai's PDD LoRA into the official MiniMax-H3 weights.
 
     python3 -m sglang.multimodal_gen.tools.build_minimax_h3_pdd_weights \
@@ -6,8 +7,7 @@
 
 Produces two things:
 
-* a complete transformer checkpoint with the 2D LoRA deltas merged in (sglang and
-  VideoX-Fun both load it as an ordinary checkpoint);
+* `transformer/`: a complete checkpoint with the 2D LoRA deltas merged in;
 * `pdd_heads.safetensors`: the 32 position-level output heads, plus a
   `pdd_config.json` recording num_steps / block_size. Those cannot be merged --
   they are what PDD *is*. See below.
@@ -33,9 +33,13 @@ over the per-step sigma deltas, because the h in
     x_{n+L} = x_n + sum_j dsigma_{n+j} * W_{n+j} h
 
 is shared and the sum can be moved onto the weights. This script does NOT do that
-fusion: the caller applies the 4 heads one at a time through 4 scheduler steps,
-which is bit-equivalent to the fused form without us having to re-derive the sigma
-grid and the weighting. The arithmetic saved is negligible (a 96x5376 GEMM).
+fusion: run `fuse_minimax_h3_pdd_heads.py` on the output directory before serving.
+Keep the head files outside `transformer/` so the model loader does not treat
+them as ordinary checkpoint shards.
+
+Serve with `--transformer-weights-path <out dir>/transformer` and set
+`SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS=<out dir>/pdd_fused_heads.safetensors`.
+Keep `pdd_config.json` beside the fused heads for schedule validation.
 """
 
 from __future__ import annotations
@@ -152,8 +156,9 @@ def main() -> int:
     print(f"2D deltas to merge: {len(deltas)} ({len(qkv)} of them qkv)")
 
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    applied, shards = 0, []
+    transformer_out = out / "transformer"
+    transformer_out.mkdir(parents=True, exist_ok=True)
+    applied = 0
     for shard in sorted(glob.glob(os.path.join(args.base_dir, "*.safetensors"))):
         with safe_open(shard, "pt") as f:
             tensors = {k: f.get_tensor(k) for k in f.keys()}
@@ -167,19 +172,21 @@ def main() -> int:
                 tensors[key] = merged.to(base.dtype)
                 applied += 1
         name = os.path.basename(shard)
-        save_file(tensors, str(out / name), metadata={"format": "pt"})
-        shards.append(name)
+        save_file(tensors, str(transformer_out / name), metadata={"format": "pt"})
     print(f"merged {applied}/{len(deltas)} tensors")
     if applied != len(deltas):
-        missing = sorted(set(deltas) - set())
         raise SystemExit(
             f"{len(deltas) - applied} deltas found no target; do not use this output"
         )
 
-    for extra in ("config.json", "diffusion_pytorch_model.safetensors.index.json"):
+    for extra in (
+        "config.json",
+        "model.safetensors.index.json",
+        "diffusion_pytorch_model.safetensors.index.json",
+    ):
         src = os.path.join(args.base_dir, extra)
         if os.path.exists(src):
-            shutil.copy(src, out / extra)
+            shutil.copy(src, transformer_out / extra)
 
     heads = {
         k: lora[k]

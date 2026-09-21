@@ -1538,15 +1538,26 @@ class MiniMaxH3FinalLayer(nn.Module):
         PDD replicates the final linear layer once per time interval and lets one
         backbone evaluation advance a whole block of them; the per-block heads
         fuse into one because H3's euler-eta0 step is linear in the predicted
-        velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline, so what arrives
-        here is already one head per denoise step and the loop is unchanged --
-        only which weight the projection uses varies.
+        velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline,
+        leaving one head per denoise step.
         """
         from safetensors import safe_open
 
         with safe_open(path, "pt") as f:
-            self._pdd_heads = {k: f.get_tensor(k) for k in f.keys()}
-        steps = self._pdd_heads["video_out.weight"].shape[0]
+            heads = {k: f.get_tensor(k) for k in f.keys()}
+        steps = heads["video_out.weight"].shape[0]
+        for name in ("video_out", "audio_out"):
+            projection = getattr(self, name)
+            for suffix, shape in (
+                ("weight", (steps, projection.output_size, projection.input_size)),
+                ("bias", (steps, projection.output_size)),
+            ):
+                key = f"{name}.{suffix}"
+                if steps == 0 or heads[key].shape != shape:
+                    raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}")
+                width = projection.output_size_per_partition
+                heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
+        self._pdd_heads = heads
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
     def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
@@ -1562,6 +1573,13 @@ class MiniMaxH3FinalLayer(nn.Module):
         weight = stack[step].to(device=h.device, dtype=h.dtype)
         bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
         return torch.nn.functional.linear(h, weight, bias)
+
+    def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._pdd_heads is not None:
+            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
+        video, _ = self.video_out(h)
+        audio, _ = self.audio_out(h)
+        return video, audio
 
     def forward(
         self,
@@ -1595,8 +1613,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                     inverse_indices[start:stop],
                     dtype=_BF16_DTYPE,
                 ).to(_FP32_DTYPE)
-                video_chunk, _ = self.video_out(h)
-                audio_chunk, _ = self.audio_out(h)
+                video_chunk, audio_chunk = self._project(h)
                 if video is None:
                     video = torch.empty(
                         (x.shape[0], video_chunk.shape[-1]),
@@ -1619,11 +1636,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
-        if self._pdd_heads is not None:
-            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
-        video, _ = self.video_out(h)
-        audio, _ = self.audio_out(h)
-        return video, audio
+        return self._project(h)
 
 
 def _reject_adaln_lora(names: list[str]) -> None:
@@ -2023,9 +2036,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
             use_adaln_cache=self._adaln_precomputed,
         )
-        # An env var rather than a server arg: this is a comparison harness for
-        # one third-party checkpoint, not a serving feature. Empty on every
-        # ordinary run, and the weights are only read when it is set.
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             self.final_layer.load_pdd_fused_heads(pdd_heads)

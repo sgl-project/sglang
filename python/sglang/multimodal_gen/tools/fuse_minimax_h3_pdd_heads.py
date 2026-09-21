@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Fuse PDD's 32 position-level output heads into one per block, i.e. 8.
 
     python3 -m sglang.multimodal_gen.tools.fuse_minimax_h3_pdd_heads <pdd dir> \
@@ -46,6 +47,8 @@ def sigma_grid(num_points: int, shift: float) -> torch.Tensor:
 def fuse(heads: torch.Tensor, sigmas: torch.Tensor, block: int) -> torch.Tensor:
     """heads: (N, ...) -> (N//block, ...), averaged within a block weighted by dsigma."""
     steps = heads.shape[0]
+    if block <= 0 or steps == 0 or steps % block:
+        raise ValueError("PDD head count must be positive and divisible by block size")
     if sigmas.numel() != steps + 1:
         raise SystemExit(
             f"sigma grid has {sigmas.numel()} points but there are {steps} heads"
