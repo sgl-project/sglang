@@ -15,7 +15,6 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
     SanaWMCameraCondStage,
     SanaWMNoiseState,
@@ -29,7 +28,6 @@ from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
-from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 MC = 8
 
@@ -37,23 +35,6 @@ MC = 8
 class _TestRealtimeStage(SanaWMRealtimeStage):
     def forward(self, batch, server_args):
         raise NotImplementedError
-
-
-@pytest.fixture
-def _global_args():
-    prev = _sa_mod._global_server_args
-    set_global_server_args(
-        SimpleNamespace(
-            comfyui_mode=False,
-            enable_cfg_parallel=False,
-            enable_torch_compile=False,
-            attention_backend=None,
-        )
-    )
-    try:
-        yield
-    finally:
-        set_global_server_args(prev)
 
 
 def _prep_stage():
@@ -153,7 +134,7 @@ def test_realtime_camera_conditioning_uses_requested_size():
     assert plucker.shape == (1, 48, 3, 15, 26)
 
 
-def test_latent_prep_plan_and_noise_discipline(_global_args):
+def test_latent_prep_plan_and_noise_discipline():
     stage = _prep_stage()
     session = RealtimeSession()
     fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
@@ -193,7 +174,7 @@ def test_latent_prep_plan_and_noise_discipline(_global_args):
     assert torch.isfinite(batch.latents).all()
 
 
-def test_latent_prep_open_ended_uniform_chunk0(_global_args):
+def test_latent_prep_open_ended_uniform_chunk0():
     stage = _prep_stage()
     session = RealtimeSession()
     fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
