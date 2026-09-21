@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 
 
 @dataclass

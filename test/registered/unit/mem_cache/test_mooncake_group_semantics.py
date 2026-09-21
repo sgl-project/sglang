@@ -4,11 +4,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageConfig,
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.pool_transfer import PoolName, PoolTransfer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -120,7 +120,7 @@ if TYPE_CHECKING:
         MatchResult,
     )
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
-    from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+    from sglang.srt.mem_cache.pool_transfer import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         BackupKV,
