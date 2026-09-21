@@ -45,8 +45,8 @@ env:
 jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
-    # Gated here rather than on the caller so unrelated changes still emit a
-    # skipped entry for wait-for-jobs to match. The schedule /
+    # Gated here rather than on the caller so a main_package-less run still
+    # emits a skipped entry for wait-for-jobs to match. The schedule /
     # parallel-dispatch / !failure() half stays on the caller, where the
     # `needs` context it guards actually lives.
     if: fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).renderer == 'true'
