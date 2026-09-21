@@ -72,10 +72,12 @@ def materialize_swiglu_params_for_cutlass(
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Per-expert SwiGLU (alpha, beta, limit) tensors for the CUTLASS kernel.
 
-    Returns all-None unless a clamp limit is configured; alpha and beta then
-    default to the silu-neutral 1.0 / 0.0. The kernel clamps dequantized
-    values, so the limit is in physical units (no g1_alphas conversion,
-    unlike trtllm-gen). SiTU carries its clamp in the activation itself.
+    Returns all-None unless a clamp limit is configured. ``gemm1_alpha``
+    implies the GPT-OSS-style ``+1`` up term, so beta then defaults to 1.0;
+    without alpha, alpha/beta stay silu-neutral at 1.0 / 0.0. The kernel
+    clamps dequantized values, so the limit is in physical units (no
+    g1_alphas conversion, unlike trtllm-gen). SiTU carries its clamp in the
+    activation itself.
     """
     if runner_config.activation == "situ":
         return None, None, None
@@ -83,7 +85,9 @@ def materialize_swiglu_params_for_cutlass(
     if clamp_limit is None:
         return None, None, None
     alpha = runner_config.gemm1_alpha if runner_config.gemm1_alpha is not None else 1.0
-    beta = runner_config.gemm1_beta if runner_config.gemm1_beta is not None else 0.0
+    beta = runner_config.gemm1_beta
+    if beta is None:
+        beta = 1.0 if runner_config.gemm1_alpha is not None else 0.0
     return (
         torch.full(
             (num_local_experts,), float(alpha), dtype=torch.float32, device=device
