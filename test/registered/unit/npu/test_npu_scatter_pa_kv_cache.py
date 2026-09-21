@@ -16,9 +16,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 class TestNPUScatterPaKVCache(unittest.TestCase):
     @staticmethod
-    def _make_pool(*, enabled=True, use_fia=True, dtype=torch.bfloat16):
+    def _make_pool(*, use_fia=True, dtype=torch.bfloat16):
         pool = object.__new__(NPUMHATokenToKVPool)
-        pool.use_scatter_pa_kv_cache = enabled
         pool.use_fia = use_fia
         pool.dtype = dtype
         pool.store_dtype = dtype
@@ -43,9 +42,22 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
         cache_v = torch.arange(20, dtype=torch.float32).to(dtype).view(2, 2, 5)
         return layer, loc, cache_k, cache_v
 
-    def test_scatter_pa_receives_norm_paged_layout(self):
-        pool = self._make_pool()
-        layer, loc, cache_k, cache_v = self._inputs()
+    def test_default_fia_write(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.int8):
+            with self.subTest(dtype=dtype):
+                self._check_default_write(use_fia=True, dtype=dtype)
+
+    def test_default_paged_write(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.int8):
+            with self.subTest(dtype=dtype):
+                self._check_default_write(use_fia=False, dtype=dtype)
+
+    def _check_default_write(self, *, use_fia, dtype):
+        pool = self._make_pool(use_fia=use_fia, dtype=dtype)
+        layer, loc, cache_k, cache_v = self._inputs(dtype=dtype)
+        # Projections can expose non-contiguous views of fused QKV outputs.
+        cache_k = cache_k.transpose(1, 2).contiguous().transpose(1, 2)
+        cache_v = cache_v.transpose(1, 2).contiguous().transpose(1, 2)
 
         def scatter_pa(key, value, key_cache, value_cache, slot_mapping, **kwargs):
             self.assertEqual(kwargs, {"cache_mode": "Norm"})
@@ -67,7 +79,6 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                 loc,
                 cache_k,
                 cache_v,
-                use_scatter_pa_kv_cache=True,
             )
 
         fake_torch_npu.npu_scatter_nd_update_.assert_not_called()
@@ -89,90 +100,57 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
             pool.v_buffer[0].view(-1, pool.head_num, pool.v_head_dim)[loc], cache_v
         )
 
-    def test_prefill_keeps_scatter_nd_when_decode_hint_is_false(self):
-        pool = self._make_pool(enabled=True)
-        layer, loc, cache_k, cache_v = self._inputs()
-        fake_torch_npu = SimpleNamespace(
-            npu_scatter_pa_kv_cache=MagicMock(),
-            npu_scatter_nd_update_=MagicMock(),
-        )
+    def test_missing_operator_uses_existing_writers(self):
+        for use_fia in (True, False):
+            with self.subTest(use_fia=use_fia):
+                pool = self._make_pool(use_fia=use_fia)
+                layer, loc, cache_k, cache_v = self._inputs()
+                fake = SimpleNamespace(
+                    npu_scatter_nd_update_=MagicMock(),
+                    _npu_reshape_and_cache=MagicMock(),
+                )
+                with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+                self.assertEqual(
+                    fake.npu_scatter_nd_update_.call_count, 2 if use_fia else 0
+                )
+                self.assertEqual(
+                    fake._npu_reshape_and_cache.call_count, 0 if use_fia else 1
+                )
 
-        with patch.object(memory_pool_npu, "torch_npu", fake_torch_npu, create=True):
-            pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+    def test_unsupported_storage_dtype_uses_existing_writers(self):
+        for use_fia in (True, False):
+            with self.subTest(use_fia=use_fia):
+                pool = self._make_pool(use_fia=use_fia, dtype=torch.uint8)
+                layer, loc, cache_k, cache_v = self._inputs(dtype=torch.uint8)
+                fake = SimpleNamespace(
+                    npu_scatter_pa_kv_cache=MagicMock(),
+                    npu_scatter_nd_update_=MagicMock(),
+                    _npu_reshape_and_cache=MagicMock(),
+                )
+                with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+                fake.npu_scatter_pa_kv_cache.assert_not_called()
+                self.assertEqual(
+                    fake.npu_scatter_nd_update_.call_count, 2 if use_fia else 0
+                )
+                self.assertEqual(
+                    fake._npu_reshape_and_cache.call_count, 0 if use_fia else 1
+                )
 
-        fake_torch_npu.npu_scatter_pa_kv_cache.assert_not_called()
-        self.assertEqual(fake_torch_npu.npu_scatter_nd_update_.call_count, 2)
-
-    def test_disabled_environment_flag_keeps_scatter_nd(self):
-        pool = self._make_pool(enabled=False)
-        layer, loc, cache_k, cache_v = self._inputs()
-        fake_torch_npu = SimpleNamespace(
-            npu_scatter_pa_kv_cache=MagicMock(),
-            npu_scatter_nd_update_=MagicMock(),
-        )
-
-        with patch.object(memory_pool_npu, "torch_npu", fake_torch_npu, create=True):
-            pool.set_kv_buffer(
-                layer,
-                loc,
-                cache_k,
-                cache_v,
-                use_scatter_pa_kv_cache=True,
-            )
-
-        fake_torch_npu.npu_scatter_pa_kv_cache.assert_not_called()
-        self.assertEqual(fake_torch_npu.npu_scatter_nd_update_.call_count, 2)
-
-    def test_scatter_pa_requires_fia(self):
-        pool = self._make_pool(use_fia=False)
-        layer, loc, cache_k, cache_v = self._inputs()
-
-        with self.assertRaisesRegex(RuntimeError, "requires ASCEND_USE_FIA=1"):
-            pool.set_kv_buffer(
-                layer,
-                loc,
-                cache_k,
-                cache_v,
-                use_scatter_pa_kv_cache=True,
-            )
-
-    def test_scatter_pa_requires_torch_npu_operator(self):
+    def test_row_mismatch_is_rejected(self):
         pool = self._make_pool()
         layer, loc, cache_k, cache_v = self._inputs()
-        fake_torch_npu = SimpleNamespace(npu_scatter_nd_update_=MagicMock())
-
+        fake = SimpleNamespace(npu_scatter_pa_kv_cache=MagicMock())
         with (
-            patch.object(memory_pool_npu, "torch_npu", fake_torch_npu, create=True),
-            self.assertRaisesRegex(RuntimeError, "provides npu_scatter_pa_kv_cache"),
+            patch.object(memory_pool_npu, "torch_npu", fake, create=True),
+            self.assertRaisesRegex(ValueError, "row mismatch"),
         ):
-            pool.set_kv_buffer(
-                layer,
-                loc,
-                cache_k,
-                cache_v,
-                use_scatter_pa_kv_cache=True,
-            )
+            pool.set_kv_buffer(layer, loc[:1], cache_k, cache_v)
+        fake.npu_scatter_pa_kv_cache.assert_not_called()
 
-    def test_scatter_pa_rejects_nonportable_cache_dtype(self):
-        pool = self._make_pool(dtype=torch.float32)
-        layer, loc, cache_k, cache_v = self._inputs(dtype=torch.float32)
-        fake_torch_npu = SimpleNamespace(npu_scatter_pa_kv_cache=MagicMock())
-
-        with (
-            patch.object(memory_pool_npu, "torch_npu", fake_torch_npu, create=True),
-            self.assertRaisesRegex(RuntimeError, "supports fp16, bf16, and int8"),
-        ):
-            pool.set_kv_buffer(
-                layer,
-                loc,
-                cache_k,
-                cache_v,
-                use_scatter_pa_kv_cache=True,
-            )
-
-    def test_swa_pool_forwards_decode_hint_to_selected_npu_pool(self):
+    def test_swa_pool_forwards_locations_to_selected_npu_pool(self):
         inner_pool = SimpleNamespace(
-            use_scatter_pa_kv_cache=True,
             set_kv_buffer=MagicMock(),
         )
         pool = object.__new__(SWAKVPool)
@@ -190,7 +168,6 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
             KVWriteLoc(loc, swa_loc),
             cache_k,
             cache_v,
-            use_scatter_pa_kv_cache=True,
         )
 
         inner_pool.set_kv_buffer.assert_called_once_with(
@@ -201,7 +178,6 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
             1.0,
             1.0,
             layer_id_override=0,
-            use_scatter_pa_kv_cache=True,
         )
 
 

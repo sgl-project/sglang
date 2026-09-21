@@ -79,7 +79,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
         )
-        self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         super().__init__(
             size=size,
             page_size=page_size,
@@ -199,7 +198,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
-        use_scatter_pa_kv_cache: bool = False,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
@@ -218,15 +216,13 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        use_scatter_pa_kv_cache = (
-            self.use_scatter_pa_kv_cache and use_scatter_pa_kv_cache
+        # Both FIA and paged-attention buffers share the same physical layout.
+        # Prefer the fused K/V write for all forward modes. Keep the existing
+        # writers for older torch_npu builds and unsupported storage dtypes.
+        use_scatter_pa = hasattr(torch_npu, "npu_scatter_pa_kv_cache") and (
+            self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
-        if use_scatter_pa_kv_cache and not self.use_fia:
-            raise RuntimeError(
-                "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE requires ASCEND_USE_FIA=1."
-            )
-
-        if self.use_fia:
+        if self.use_fia or use_scatter_pa:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
@@ -237,30 +233,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 or cache_v.numel() != expected_v_numel
             ):
                 raise ValueError(
-                    "NPU FIA KV scatter row mismatch: "
+                    "NPU KV scatter row mismatch: "
                     f"loc_rows={num_rows}, cache_k_shape={tuple(cache_k.shape)}, "
                     f"cache_v_shape={tuple(cache_v.shape)}, "
                     f"head_num={self.head_num}, head_dim={self.head_dim}, "
                     f"v_head_dim={self.v_head_dim}."
                 )
 
-            if use_scatter_pa_kv_cache:
-                if not hasattr(torch_npu, "npu_scatter_pa_kv_cache"):
-                    raise RuntimeError(
-                        "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE requires a torch_npu "
-                        "build that provides npu_scatter_pa_kv_cache."
-                    )
-                if self.store_dtype not in (
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.int8,
-                ):
-                    raise RuntimeError(
-                        "npu_scatter_pa_kv_cache supports fp16, bf16, and int8 "
-                        "KV cache on all supported Ascend platforms, but got "
-                        f"{self.store_dtype}."
-                    )
-
+            if use_scatter_pa:
                 torch_npu.npu_scatter_pa_kv_cache(
                     cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),

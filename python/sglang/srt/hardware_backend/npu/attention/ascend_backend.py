@@ -2133,7 +2133,6 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
-                    use_scatter_pa_kv_cache=True,
                 )
 
         if not self.use_mla:
@@ -2435,7 +2434,6 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
-                    use_scatter_pa_kv_cache=True,
                 )
 
         if sinks is not None or self.is_hybrid_swa:
@@ -2757,11 +2755,7 @@ class AscendAttnBackend(AttentionBackend):
                     else None
                 )
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(cache_loc, swa_loc),
-                    k,
-                    v,
-                    use_scatter_pa_kv_cache=True,
+                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
                 )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
