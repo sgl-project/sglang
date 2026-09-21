@@ -627,6 +627,18 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@torch.compile
+def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    # Same numerics as swiglu_with_alpha_and_limit, for w13 stored as two
+    # contiguous [gate; up] halves instead of gpt-oss' row-interleaved pairs.
+    # MiniMax-M3 builds its fused MoE with gate_up_interleaved=False.
+    # Twin of triton_utils.fused_moe.swiglu_no_interleaved_with_alpha_and_limit.
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
 def deep_moe_impl_fused(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -649,6 +661,7 @@ def deep_moe_impl_fused(
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
     activation: str = "silu",
+    gate_up_interleaved: bool = True,
     out_hidden_states: Optional[torch.Tensor] = None,
 ):
     block_align = 1
@@ -853,7 +866,12 @@ def deep_moe_impl_fused(
                 gemm1_limit,
             )
         elif gemm1_alpha is not None:
-            out2 = swiglu_with_alpha_and_limit(
+            swiglu_alpha_limit = (
+                swiglu_with_alpha_and_limit
+                if gate_up_interleaved
+                else swiglu_no_interleaved_with_alpha_and_limit
+            )
+            out2 = swiglu_alpha_limit(
                 out1,
                 gemm1_alpha,
                 gemm1_limit,
@@ -978,6 +996,7 @@ def fused_experts_none_to_deep_gemm(
         gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         swiglu_limit=moe_runner_config.swiglu_limit,
         activation=moe_runner_config.activation,
+        gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         out_hidden_states=output,
     )
 
