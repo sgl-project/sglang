@@ -8,7 +8,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -18,6 +17,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu as mlir_gpu
 from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import vector
 from flydsl._mlir.dialects import vector as mlir_vector
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.arith import ArithValue
