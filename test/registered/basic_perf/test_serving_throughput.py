@@ -30,7 +30,7 @@ class TestServingThroughput(CustomTestCase):
             at_least(
                 "output_throughput",
                 res["output_throughput"],
-                3800,
+                4000,
                 amd=3050,
                 unit="token/s",
             ),
@@ -55,7 +55,7 @@ class TestServingThroughput(CustomTestCase):
             at_least(
                 "output_throughput",
                 res["output_throughput"],
-                1050,
+                1100,
                 amd=1000,
                 unit="token/s",
             ),
@@ -100,7 +100,7 @@ class TestServingThroughput(CustomTestCase):
             at_least(
                 "output_throughput",
                 res["output_throughput"],
-                4300,
+                4850,
                 amd=3500,
                 unit="token/s",
             ),

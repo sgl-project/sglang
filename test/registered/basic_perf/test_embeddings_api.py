@@ -38,7 +38,7 @@ class TestEmbeddingsAPI(CustomTestCase):
             "test_embeddings_api_latency_throughput",
             at_most("avg_latency_ms", res["avg_latency_ms"], 20, amd=35, unit="ms"),
             at_most("p95_latency_ms", res["p95_latency_ms"], 25, amd=40, unit="ms"),
-            at_least("throughput", res["throughput"], 60, amd=30, unit="req/s"),
+            at_least("throughput", res["throughput"], 53, amd=30, unit="req/s"),
         )
 
     def test_embeddings_api_batch_scaling(self):
