@@ -113,6 +113,7 @@ logger = logging.getLogger(__name__)
 def _broadcast_profile_latency_from_tp_rank0(value: float) -> float:
     """Broadcast TP rank 0's profile latency so every rank shares a cost table."""
     import torch
+
     from sglang.srt.distributed import (
         get_tp_group,
         model_parallel_is_initialized,

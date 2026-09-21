@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
-    SpecRuntimeState,
     SpecProfilePoint,
+    SpecRuntimeState,
 )
 from sglang.srt.speculative.throughput_aware_controller import (
     ThroughputAwarePolicy,
