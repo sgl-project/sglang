@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -20,6 +21,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -75,6 +77,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    draft_pp_context,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
@@ -126,6 +129,8 @@ def _configure_target_hidden_projection(
 
 
 class DSparkWorkerV2(BaseSpecWorker):
+    """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -145,6 +150,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
+        self._draft_worker = None
+        self._hosts_draft = get_pp_group().is_last_rank
+        if not self._hosts_draft:
+            return
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
@@ -166,7 +175,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with self._draft_context():
+        with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -178,6 +187,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
                 draft_worker_cls=draft_worker_cls,
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -334,8 +344,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
+        target_is_dsv41 = (
+            getattr(
+                self.target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
+        static_epilogue_supported = (
+            target_is_dsv41
+            and self._verify_planner.mode_value == "static"
+            and self._draft_is_moe
+            and not get_parallel().enable_dp_attention
+            and self.ps.pp_size == 1
+        )
         if (
-            self._verify_planner.is_compact_mode
+            (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
             and is_cuda()
         ):
@@ -344,6 +369,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
+                fused_argmax=target_is_dsv41,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -351,6 +377,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    kv_injector=self._kv_injector,
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -409,10 +436,12 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        return self._verify_planner.carries_confidence
+        return self._hosts_draft and self._verify_planner.carries_confidence
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if not self._hosts_draft:
+            return super().spec_v2_attn_backends
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -434,6 +463,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft:
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -441,7 +472,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        with self._draft_context():
+        if not self._hosts_draft:
+            return
+        with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
@@ -461,6 +494,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if not self._hosts_draft:
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -476,7 +511,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        with self._draft_context():
+        with draft_pp_context(), self._draft_context():
             if capture_decode_cuda_graph:
                 # Keep the draft model graph enabled when folded proposal is
                 # disabled, but do not capture the proposal head as a tail
@@ -522,19 +557,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         pass
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if not self._hosts_draft:
+            return
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if not self._hosts_draft:
+            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
+        if not self._hosts_draft:
+            return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if not self._hosts_draft:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if not self._hosts_draft:
+            return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
@@ -542,16 +587,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        *,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        if not self._hosts_draft:
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
@@ -561,7 +621,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -620,9 +682,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos = torch.repeat_interleave(
                 (draft_seq_lens + ctx_lens - 1).to(torch.int64), repeats
             )
+        cache_loc = batch.out_cache_loc
+        token_indices = logits_output.hidden_states_token_indices
+        if token_indices is not None:
+            cache_loc = cache_loc[token_indices]
+            positions = positions[token_indices]
+            if state_slot is not None:
+                state_slot = state_slot[token_indices]
+                final_pos = final_pos[token_indices]
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
+            cache_loc=cache_loc,
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
@@ -630,6 +700,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        logits_output.hidden_states_token_indices = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -810,6 +881,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
+                if (
+                    self._verify_epilogue is not None
+                    and self._verify_planner.mode_value == "static"
+                ):
+                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -834,7 +910,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 grammar_mask.apply(logits_output.next_token_logits)
 
         epilogue = self._verify_executor.verify_epilogue
-        folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        folded_accept = (
+            fold_eligible
+            and can_run_cuda_graph
+            and (run_compact or self._verify_planner.mode_value == "static")
+        )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -846,6 +926,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        self.model_runner.ngram_embedding_manager.update_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=batch.req_pool_indices,
+            commit_lens=accept.commit_lens,
         )
         if batch.return_logprob:
             compute_spec_logprobs(
@@ -995,4 +1080,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
+        if not self._hosts_draft:
+            return None
         return self._verify_planner.confidence_budget_prepare()
