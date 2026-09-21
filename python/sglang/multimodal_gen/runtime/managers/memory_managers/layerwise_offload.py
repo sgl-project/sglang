@@ -1145,6 +1145,19 @@ class LayerwiseOffloadManager:
             total_bytes += local_tensor.numel() * local_tensor.element_size()
         return total_bytes
 
+    def retained_parameter_bytes(self) -> int:
+        """Device bytes this manager's resident set holds, 0 when it has none.
+
+        What a caller weighing `retain_resident_layers` is trading away. Sized
+        from the managed layer weights rather than measured, so it is available
+        before the placement is applied.
+        """
+        if not self.enabled or self.resident_layers <= 0 or self.num_layers <= 0:
+            return 0
+        return int(
+            self._managed_parameter_bytes() * self.resident_layers / self.num_layers
+        )
+
     def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
         placeholder = self._offload_placeholders.get(dtype)
         if placeholder is None:
