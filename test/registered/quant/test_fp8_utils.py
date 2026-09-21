@@ -25,7 +25,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestMxfp8MoeScaleLayout(CustomTestCase):

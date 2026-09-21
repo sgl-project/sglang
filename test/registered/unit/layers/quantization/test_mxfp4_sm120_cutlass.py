@@ -14,7 +14,7 @@ import torch
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=212, stage="base-b", runner_config="1-gpu-small")
 
 
 @pytest.fixture

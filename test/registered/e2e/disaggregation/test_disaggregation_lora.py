@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=400, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=213, stage="base-b", runner_config="2-gpu-large")
 
 ADAPTERS = {
     "fact": "algoprog/fact-generation-llama-3.1-8b-instruct-lora",

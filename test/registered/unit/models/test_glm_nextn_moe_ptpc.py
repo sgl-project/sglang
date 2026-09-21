@@ -24,7 +24,7 @@ from sglang.srt.models.glm4_moe import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 LAYER = 78
 PREFIX = f"model.layers.{LAYER}"
