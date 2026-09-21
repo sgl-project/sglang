@@ -15,10 +15,6 @@ register_npu_ci(
     disabled="accuracy testcase",
 )
 
-# Environment variables shared by prefill/decode nodes, ported from
-# scripts_shell/pd/flash_1p1d/dsv4_flash_pd.sh.
-# FORCE_DRAFT_MODEL_NON_QUANT is intentionally NOT set: the bundled DSPARK
-# draft weights are modelslim-quantized.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -82,7 +78,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
 }
 
 # Prefill node (1 node x 16 NPUs, TP16 DP16) launch arguments.
-# Radix cache is intentionally ENABLED on prefill (no --disable-radix-cache).
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
