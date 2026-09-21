@@ -9,9 +9,14 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    record_weight_version_events,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -31,6 +36,7 @@ class _FakeReq:
         )
         self.finished_output = False
         self.finished_len = None
+        self.beam_group = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             stream_interval=None,
@@ -58,6 +64,7 @@ class _FakeReq:
         self.mm_video_tokens = 0
         self.multimodal_inputs = None
         self.customized_info = customized_info
+        self.weight_version_events = []
 
     def finished(self):
         return self._finished
@@ -69,11 +76,26 @@ class _FakeReq:
         return False
 
 
+def _accumulator(current_weight_version="default"):
+    return _GenerationStreamAccumulator(
+        return_logprob=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        return_indexer_topk=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        default_stream_interval=1,
+        default_force_stream_interval=1,
+        get_cached_tokens_details=lambda req: None,
+        current_weight_version=current_weight_version,
+    )
+
+
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def setUp(self):
         serving_patch = patch(
             "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1),
+            return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
         )
         observability_patch = patch(
             "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
@@ -81,25 +103,12 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         serving_patch.start()
         observability_patch.start()
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 
-    @staticmethod
-    def _accumulator():
-        return _GenerationStreamAccumulator(
-            return_logprob=False,
-            return_hidden_states=False,
-            return_routed_experts=False,
-            return_indexer_topk=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            default_stream_interval=1,
-            default_force_stream_interval=1,
-            get_cached_tokens_details=lambda req: None,
-        )
-
     def test_customized_info_is_padded_for_mixed_batches(self):
-        accumulator = self._accumulator()
+        accumulator = _accumulator()
 
         accumulator.accept(req=_FakeReq("r0", [10, 11]))
         accumulator.accept(
@@ -138,7 +147,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -171,7 +179,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -208,7 +215,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -248,7 +254,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -276,7 +281,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -302,7 +306,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -324,7 +327,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
-                ps=SimpleNamespace(),
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -332,6 +334,39 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )
+
+
+class TestOutputStreamerWeightVersions(unittest.TestCase):
+    def test_payload_carries_spans_for_finished_requests(self):
+        """Finished requests report their spans; still-generating ones report nothing."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20, 21, 22], finished=True)
+        record_weight_version_events([finished_req], old_version="v1")
+        finished_req.output_ids.extend([23, 24])
+
+        accumulator = _accumulator(current_weight_version="v2")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v1", start=0, end=3),
+                    WeightVersionSpan(version="v2", start=3, end=5),
+                ],
+            ],
+        )
+
+    def test_payload_omits_spans_while_all_requests_stream(self):
+        """A batch of unfinished requests puts nothing on the wire."""
+        accumulator = _accumulator(current_weight_version="v2")
+        accumulator.accept(req=_FakeReq("r0", [10]))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.weight_versions)
 
 
 if __name__ == "__main__":

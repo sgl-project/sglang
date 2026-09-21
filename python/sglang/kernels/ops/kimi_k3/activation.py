@@ -6,9 +6,8 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
+    get_activation_cuda_cflags,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -21,16 +20,6 @@ def _make_name(*args):
     return "kimi_k3_" + "_".join(str(a) for a in args)
 
 
-def _fast_math_flags() -> list[str]:
-    # Mirrors sgl-kernel's CMake policy: fast-math on SM90, precise on
-    # SM100+ (Blackwell needs bit-exact expf), off on HIP (clang rejects).
-    if is_hip_runtime():
-        return []
-    if get_jit_cuda_arch().major >= 10:
-        return []
-    return ["--use_fast_math"]
-
-
 @cache_once
 def _jit_situ_and_mul_module(in_dtype: torch.dtype, out_dtype: torch.dtype) -> Module:
     """Compile and cache the JIT SiTU-and-mul module for an (in, out) dtype pair."""
@@ -40,7 +29,7 @@ def _jit_situ_and_mul_module(in_dtype: torch.dtype, out_dtype: torch.dtype) -> M
         *args,
         cuda_files=["kimi_k3/situ_and_mul.cuh"],
         cuda_wrappers=[("run", f"SituAndMulKernel<{args}>::run")],
-        extra_cuda_cflags=_fast_math_flags(),
+        extra_cuda_cflags=get_activation_cuda_cflags(),
     )
 
 

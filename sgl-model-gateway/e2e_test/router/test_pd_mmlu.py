@@ -55,7 +55,7 @@ class TestPDMMLU:
         )
         metrics = run_eval(args)
 
-        assert (
-            metrics["score"] >= 0.65
-        ), f"PD MMLU score {metrics['score']:.2f} below threshold 0.65"
+        assert metrics["score"] >= 0.65, (
+            f"PD MMLU score {metrics['score']:.2f} below threshold 0.65"
+        )
         logger.info("PD MMLU score: %.2f (threshold: 0.65)", metrics["score"])

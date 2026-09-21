@@ -16,16 +16,17 @@ on `/metrics` (text/plain, version 0.0.4) on the router's serving port
 
 ## Metrics covered
 
-The dashboard graphs every family the router emits:
+Families the router emits. The dashboard graphs all of them except the
+`sgl_router_kv_*` series, whose panels ship separately:
 
 | Metric | Type | What it shows |
 |---|---|---|
 | `sgl_router_requests_total` | Counter | **Edge intake** — every request received at the router HTTP boundary, by `route`, `method`, counted before worker dispatch (true intake) |
 | `sgl_router_responses_total` | Counter | **Edge responses** — every response returned, by `route`, `method`, `status_code` (incl. early-exit 400/413/503). `requests_total - responses_total` = received-but-not-answered |
-| `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops) |
+| `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops). See [Dispatch outcomes](#dispatch-outcomes) |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
-| `sgl_router_overlap_blocks` | Histogram | Cache-aware-zmq overlap blocks by `model_id` |
+| `sgl_router_stream_outcome_total` | Counter | Streaming outcomes by `worker_url`, `model_id`, and `outcome` (`ok`, `stream_error_event`, `upstream_error`, or `client_disconnect`). Counts committed 2xx streams only — non-2xx responses are counted by status in `responses_total` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |
@@ -34,10 +35,44 @@ The dashboard graphs every family the router emits:
 | `sgl_router_stale_requests_total` | Counter | Stale-request cancellations |
 | `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes |
 | `sgl_router_sticky_total` | Counter | Sticky-session selection outcomes |
+| `sgl_router_kv_events_total` | Counter | KV-cache events the pump consumed, by `event` and storage `medium` |
+| `sgl_router_kv_event_blocks_total` | Counter | Block hashes those events carried, by `event` and `medium` |
+| `sgl_router_kv_tree_blocks` | Gauge | Blocks the tree attributes to a `worker_url` / `dp_rank`, by storage `tier` |
+| `sgl_router_kv_block_size` | Gauge | Tokens per block hash, as established from the fleet (0 until a worker reports) |
+| `sgl_router_kv_event_batches_lost_total` | Counter | KV-event batches dropped in transit, from gaps in each publisher's sequence |
+| `sgl_router_kv_tree_accounting_errors_total` | Counter | Occupancy-bookkeeping contradictions, by `reason`. Always 0 on a correct tree |
+| `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
+
+The legacy `sgl_router_overlap_blocks` metric was removed with the
+`cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,
+and dashboard panels that depend on this metric before upgrading.
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting
-series immediately rather than leaving a stale value.
+series immediately rather than leaving a stale value. The `sgl_router_kv_*`
+series are pulled from the KV-event index the same way.
+
+`sgl_router_kv_tree_blocks * sgl_router_kv_block_size` for one worker and
+tier, divided by that pod's own occupancy of the tier (device:
+`sglang_kv_used_tokens + sglang_kv_evictable_tokens`; host:
+`sglang_hicache_host_used_tokens`; `tp_rank="0"`), is the tree's coverage of
+that tier. Scope both sides to the same deployment before dividing — block
+size and fleet membership both vary between them, and an unscoped ratio
+divides one fleet's tree by another's occupancy.
+
+Read it as: about 1, the tree mirrors the engine; about 0, the engine holds a
+tier routing cannot see; **above 1, the tree holds tiers a worker has already
+released** — check `sgl_router_kv_event_batches_lost_total`, because a tagged
+removal clears only its own tier and a lost batch strands the rest.
+
+`sgl_router_kv_events_total` renders every `(event, medium)` cell including
+zeros, so a `CPU_PINNED` row pinned at 0 on a hierarchical-cache fleet is
+visible rather than absent. A nonzero `block_stored/unknown` row is the
+upgrade signal: the engine is publishing a storage tier this build cannot
+rank, so the tree drops those stores rather than filing them under a guess. Comparing `sgl_router_kv_event_blocks_total` for
+`block_stored/CPU_PINNED` against the engine's `sglang_hicache_backup_tokens_total`
+needs `sum without(pool)` on the engine side, and the two are not equal
+anyway: the engine also evicts device blocks it never backed up.
 
 ## Prometheus scrape config
 
@@ -68,3 +103,43 @@ default to *All*) to scope the panels.
 The JSON is generated programmatically to keep the ~20 panels consistent. If
 the metric surface changes, update the generator and overwrite the JSON
 rather than hand-editing — hand-edits drift from the panel conventions.
+
+## Dispatch outcomes
+
+`sgl_router_worker_requests_total{outcome}` is derived from the status the
+client saw, not from whether the router's internal dispatch returned `Ok` — a
+worker error the router forwards is a successful *proxy* operation and a failed
+*request*.
+
+| `outcome` | Source | Counts as a worker fault? |
+|---|---|---|
+| `success` | 2xx | no |
+| `client_error` | 4xx except 429 | no — the caller sent something invalid |
+| `backpressure` | 429, 503 | no — responsive but at capacity |
+| `error` | 5xx except 503, plus transport failures, timeouts and incomplete bodies | **yes** |
+| `cancelled` | the router's own stale-request deadline | no |
+
+`error` is the only bucket that means *this worker failed*, which is why the
+Error-ratio panel uses it alone. The split matters during an incident: a
+saturated fleet answering with its own queue-full 503s registers as
+`backpressure`, and the circuit breaker likewise declines to open on those
+statuses — so the two agree, and the error ratio keeps pointing at genuine
+faults instead of pegging at 100% exactly when it is being read.
+
+A hung worker surfaces as `error` (the router's upstream timeout), *not* as
+`cancelled`. Only the stale-request deadline produces `cancelled`;
+`sgl_router_stale_requests_total{outcome="expired"}` counts the same events.
+
+## Access log
+
+The router emits one `http_request` event per request from a single middleware,
+so requests that never reach a handler (a body-limit 413, an unrouted 404, a
+panic-500) are logged too. Fields: `pod_id`, `request_id`, `method`, `path`,
+`status`, `outcome`, `worker`, `model`, `stream`, `latency_ms`.
+
+`worker` and `model` are empty when the request was rejected before dispatch or
+hit a route that does not dispatch — that is normal, not a gap. Successful infra
+polls (`/healthz`, `/readyz`, `/metrics`) log at DEBUG so they do not bury real
+traffic; a *failing* probe keeps the INFO line. For a stream the line is written
+when the response head is ready, so `status=200` there does not mean the stream
+finished — `sgl_router_stream_outcome_total` carries that.

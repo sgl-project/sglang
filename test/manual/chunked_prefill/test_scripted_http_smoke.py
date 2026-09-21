@@ -26,9 +26,9 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert (
-            saw_chunking
-        ), "expected the req to hold the chunked_req slot at least once"
+        assert saw_chunking, (
+            "expected the req to hold the chunked_req slot at least once"
+        )
 
     def test_two_reqs_finish(self):
         self.server.execute_script(self._script_two_reqs_finish)
