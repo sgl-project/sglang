@@ -61,7 +61,6 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -1167,6 +1166,29 @@ def run_score_benchmark(
     device="auto",
 ):
     """Score API benchmark function compatible with run_bench_serving pattern"""
+    return run_score_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_score_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size.
+
+    Batch size is a property of the request, not of the server, so the launch
+    is shared rather than repeated per size.
+    """
     if other_server_args is None:
         other_server_args = []
 
@@ -1182,7 +1204,7 @@ def run_score_benchmark(
         other_args=other_server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1205,7 +1227,7 @@ def run_score_benchmark(
                 )
             return text
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "query": generate_text_with_token_count(score_query_tokens),
                 "items": [
@@ -1253,12 +1275,16 @@ def run_score_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_embeddings_benchmark(
@@ -1271,6 +1297,27 @@ def run_embeddings_benchmark(
     device="auto",
 ):
     """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    return run_embeddings_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        input_tokens=input_tokens,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_embeddings_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size. See run_score_benchmark_multi."""
     if other_server_args is None:
         other_server_args = []
 
@@ -1289,7 +1336,7 @@ def run_embeddings_benchmark(
         other_args=server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
 
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
@@ -1300,7 +1347,7 @@ def run_embeddings_benchmark(
         # Generate input text
         input_text = generate_text_with_token_count(input_tokens)
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "input": input_text,
                 "model": model,
@@ -1340,12 +1387,16 @@ def run_embeddings_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_bench_serving_multi(
@@ -2031,6 +2082,41 @@ def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
         yield server_args
     finally:
         reset_context()
+
+
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """State the widths `initialize_model_parallel` is about to build at.
+
+    The build reads every width from the runtime context, so a test that wants
+    a particular topology publishes it here rather than passing it in -- the
+    same door production uses, which also keeps the derived widths honest.
+
+    Unlike `published_topology` this is not a scope: the groups it is about to
+    build outlive any block, so the configuration describing them has to as
+    well. Callers that tear the groups down are already resetting the process.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Callers that go on to build groups have already run
+    # `init_distributed_environment`, which states the WORLD group -- and the
+    # build below places every group it creates by reading that back. The reset
+    # above drops it, so hand it over again: publishing a configuration does not
+    # unbuild a process group.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
 
 
 _GPU_IDLE_TIMEOUT_SECS = 30.0

@@ -711,10 +711,10 @@ def draft_pp_context():
 
 
 @contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
+def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
         yield
 
 

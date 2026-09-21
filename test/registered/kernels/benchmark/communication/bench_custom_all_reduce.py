@@ -14,6 +14,7 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -61,6 +62,9 @@ def _init_cpu_group() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
+    # The context answers a handle from what was stated on it, not from
+    # this module global, so a rank stood up by hand says so itself.
+    get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     torch.cuda.set_stream(torch.cuda.Stream())
     return coord.cpu_group
