@@ -287,3 +287,46 @@ def select_candidate_blocks(
         logits, compress_lens, topk_blocks, block_size
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., : logits.shape[-1]]
+
+
+def select_candidate_block_mask_v2(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Graph-safe level-one candidate selection using the fused block-amax and
+    top-k-v2 kernels. The returned fixed-width mask has the same meaning as
+    :func:`select_candidate_block_mask`, while the kernels only read each row
+    through ``compress_lens`` instead of scanning padded logits columns."""
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+        CANDIDATE_BLOCK_SIZE,
+        amax_topk_blocks,
+    )
+
+    assert block_size == CANDIDATE_BLOCK_SIZE, (
+        f"top-k-v2 candidate selection requires block_size={CANDIDATE_BLOCK_SIZE}, "
+        f"got {block_size}"
+    )
+    lens = compress_lens.reshape(-1).to(torch.int32).contiguous()
+    nblocks = (lens + block_size - 1) // block_size
+    blocks = amax_topk_blocks(
+        logits,
+        lens,
+        nblocks,
+        topk_blocks,
+        max_seq_len=logits.shape[1],
+    )
+
+    num_blocks = (logits.shape[1] + block_size - 1) // block_size
+    valid = blocks >= 0
+    # Invalid top-k slots use a dedicated sentinel column. This avoids their
+    # clamped indices racing with a valid write to block zero under scatter_.
+    scatter_indices = torch.where(valid, blocks, num_blocks).to(torch.int64)
+    keep = torch.zeros(
+        (logits.shape[0], num_blocks + 1),
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    keep.scatter_(-1, scatter_indices, valid)
+    return keep[:, :num_blocks]

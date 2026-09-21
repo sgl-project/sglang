@@ -19,6 +19,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4 import (
+    topk_transform_paged_v2,
+    topk_transform_ragged_v2,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -66,7 +70,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     make_candidate_indexer,
     mask_topk_scores,
     published_masks,
-    select_candidate_block_mask,
+    select_candidate_block_mask_v2,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -1570,7 +1574,7 @@ class DeepseekV4AttnBackend(
             compressed_page_size=index_page_size,
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
-            use_topk_v2=False,
+            use_topk_v2=True,
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
@@ -3435,8 +3439,7 @@ class DeepseekV4AttnBackend(
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
-        columns = torch.arange(width, device=lens.device)
-        for rows, plan in metadata.row_chunks():
+        for chunk_index, (rows, plan) in enumerate(metadata.row_chunks()):
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
                 k_cache,
@@ -3446,14 +3449,12 @@ class DeepseekV4AttnBackend(
                 plan,
                 width,
             )
-            lens_c = lens[rows].unsqueeze(-1)
-            # Columns past a row's length hold garbage.
-            s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
+            scores = logits
             if candidate_blocks is not None:
                 candidate_blocks.append(
-                    select_candidate_block_mask(
-                        s,
-                        lens_c,
+                    select_candidate_block_mask_v2(
+                        logits,
+                        lens[rows],
                         indexer.candidate_topk_blocks,
                         indexer.candidate_block_size,
                     )
@@ -3462,20 +3463,35 @@ class DeepseekV4AttnBackend(
                 mask = consume[rows].repeat_interleave(
                     indexer.candidate_block_size, dim=-1
                 )[..., :width]
-                s = s.masked_fill(~mask, -torch.inf)
-            idx = s.topk(topk, dim=-1, sorted=False).indices
-            reach = idx < lens_c
+                scores = logits.masked_fill(~mask, -torch.inf)
+
+            selected = torch.empty(
+                (logits.shape[0], topk), dtype=torch.int32, device=logits.device
+            )
+            topk_transform_paged_v2(
+                scores,
+                lens[rows],
+                None,
+                selected,
+                page_size,
+                metadata.topk_plan_for_chunk(chunk_index, rows),
+            )
+            reach = selected >= 0
             if consume is not None:
-                reach = reach & (s.gather(-1, idx) > -torch.inf)
-            idx = torch.where(reach, idx, width).sort(dim=-1).values
-            reach = idx < width
-            idx = idx.clamp_max(width - 1)
+                selected_for_gather = selected.clamp_min(0).to(torch.int64)
+                reach = reach & (scores.gather(-1, selected_for_gather) > -torch.inf)
+            unselected = torch.iinfo(torch.int32).max
+            selected = torch.where(reach, selected, unselected).sort(dim=-1).values
+            reach = selected != unselected
+            idx = selected.clamp_max(width - 1).to(torch.int64)
             slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
                 idx % page_size
             )
             page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
             if raw_indices is not None:
-                raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
+                raw_indices[rows, :topk] = torch.where(reach, selected, -1).to(
+                    torch.int32
+                )
         if candidate_blocks is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 block_mask=(

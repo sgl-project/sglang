@@ -134,6 +134,49 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             destination.compressed_seq_lens, source.compressed_seq_lens
         )
 
+    def test_chunked_topk_v2_plans_are_capture_stable_and_replayable(self):
+        def fake_plan(lengths):
+            value = int(lengths[0])
+            return torch.full((lengths.numel() + 1, 2), value, dtype=torch.int32)
+
+        def make_metadata(lengths):
+            with (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.plan_topk_v2",
+                    side_effect=fake_plan,
+                ),
+            ):
+                return PagedIndexerMetadata(
+                    page_size=256,
+                    compressed_page_size=64,
+                    page_table=torch.zeros((len(lengths), 2), dtype=torch.int32),
+                    compressed_seq_lens=torch.tensor(lengths, dtype=torch.int32),
+                    use_topk_v2=True,
+                    row_chunk=2,
+                )
+
+        destination = make_metadata([10, 20, 30, 40, 50])
+        self.assertEqual(destination.topk_metadata.shape, (3, 3, 2))
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(0, slice(0, 2)),
+            torch.full((3, 2), 10, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(1, slice(2, 4)),
+            torch.full((3, 2), 30, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(2, slice(4, 5)),
+            torch.full((2, 2), 50, dtype=torch.int32),
+        )
+
+        source = make_metadata([11, 21, 31, 41, 51])
+        plan_ptr = destination.topk_metadata.data_ptr()
+        destination.copy_(source)
+        self.assertEqual(destination.topk_metadata.data_ptr(), plan_ptr)
+        torch.testing.assert_close(destination.topk_metadata, source.topk_metadata)
+
 
 class TestDSV4FlashInferTopK(CustomTestCase):
     def test_compact_page_transform_respects_fuse_topk(self):
