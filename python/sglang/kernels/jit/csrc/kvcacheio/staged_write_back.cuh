@@ -102,6 +102,21 @@ inline bool try_copy_page_first_pages_batch(
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
   return false;
 #else
+  // cudaMemcpyBatchAsync writes to raw destination pointers without translating
+  // host addresses. Registered host memory is only device-accessible at the
+  // same VA when the device reports it; where it does not (e.g. GPU
+  // paravirtualization), the batch call faults asynchronously, so take the
+  // per-page fallback, whose cudaMemcpyAsync does the translation instead.
+  int can_use_host_pointer = 0;
+  const cudaError_t attr_err = cudaDeviceGetAttribute(
+      &can_use_host_pointer, cudaDevAttrCanUseHostPointerForRegisteredMem, device_id);
+  if (attr_err != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  if (!can_use_host_pointer) {
+    return false;
+  }
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
   constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
   thread_local std::vector<CudaMemcpyBatchPtr> batch_srcs;
