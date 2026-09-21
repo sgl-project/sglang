@@ -9,6 +9,7 @@ from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,6 +38,40 @@ class _Attention:
 
 
 class DSparkTargetHiddenProjectionTest(CustomTestCase):
+    def test_nonfinal_prefill_stage_only_forwards_target_proxies(self) -> None:
+        proxy = object()
+        target = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=object(), spec_algorithm=None),
+            device="cpu",
+            forward_batch_generation=lambda batch, *, pp_proxy_tensors, capture_hidden_mode: (
+                SimpleNamespace(pp_hidden_states_proxy_tensors=pp_proxy_tensors)
+            ),
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=False),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_schedule",
+                return_value=SimpleNamespace(page_size=1),
+            ),
+        ):
+            worker = DSparkWorkerV2(None, 0, None, 0, target)
+        worker.alloc_memory_pool()
+        worker.init_attention_backends()
+        worker.init_cuda_graphs()
+        batch = SimpleNamespace(seq_lens=torch.tensor([8]))
+        result = worker.forward_batch_generation(batch, pp_proxy_tensors=proxy)
+        self.assertIs(result.pp_hidden_states_proxy_tensors, proxy)
+        self.assertIs(result.new_seq_lens, batch.seq_lens)
+        self.assertIsNone(worker.get_confidence_budget_prepare())
+        self.assertIsNone(worker.primary_draft_kv_pool)
+        self.assertEqual(worker.preloaded_weights_bytes, 0)
+        self.assertEqual(
+            worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
+        )
+
     def test_single_aux_hidden_state_is_returned_without_copy(self) -> None:
         hidden_states = torch.empty(2, 3)
 
