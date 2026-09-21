@@ -13,7 +13,7 @@ def test_fragmented_bf16_kv_roundtrip(tokens):
         gather_all_layers_to_staging,
         scatter_staging_to_kv,
     )
-    from sglang.srt.disaggregation.compression.backend import NvcompLZ4Backend
+    from sglang.srt.kv_compression.backend import NvcompLZ4Backend
 
     torch.manual_seed(42)
     device = torch.device("cuda", 0)
@@ -51,7 +51,7 @@ def test_fragmented_bf16_kv_roundtrip(tokens):
 
 
 def test_uncompressed_size_mismatch_is_rejected():
-    from sglang.srt.disaggregation.compression.backend import NvcompLZ4Backend
+    from sglang.srt.kv_compression.backend import NvcompLZ4Backend
 
     device = torch.device("cuda", 0)
     stream = torch.cuda.Stream(device=device)

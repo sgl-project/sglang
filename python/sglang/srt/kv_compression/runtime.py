@@ -17,7 +17,6 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
@@ -132,7 +131,6 @@ class KVCompressionRuntime:
         self.trace_reuse = os.environ.get(
             "SGLANG_KV_COMPRESSION_TRACE_REUSE", "0"
         ).lower() in ("1", "true", "yes", "y")
-        self._dumped = False
         self.layout, self.mode = layout, mode
         self.device = layout.device
         self.budget_bytes = budget_bytes
@@ -577,24 +575,6 @@ class KVCompressionRuntime:
                     )
                 )
             self.drain()
-            dump_dir = os.environ.get("SGLANG_KV_COMPRESSION_DUMP_DIR")
-            if dump_dir and not self._dumped:
-                # One bounded real-KV batch per process. Diagnostic I/O is
-                # explicitly outside GPU phase timings and disabled by default.
-                path = Path(dump_dir)
-                path.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "raw": raw.cpu(),
-                        "indices": [i for _, i, _ in batch],
-                        "refs": [key[0] for key, _, _ in batch],
-                        "layout": self.layout.tag,
-                        "actual_lengths": lengths,
-                        "capacity": self.output_bound,
-                    },
-                    path / f"kv-{os.getpid()}.pt",
-                )
-                self._dumped = True
             with self._lock:
                 self._live_bytes -= charge
                 charged = False
@@ -723,16 +703,7 @@ class KVCompressionRuntime:
                 if self.verify and any(d is None for d in expected):
                     self.stats["restore_verification_failures"] += 1
                     raise KVVerificationError("Missing L2 source KV checksum")
-                host = next((p for p in pages if isinstance(p, HostEncodedPage)), None)
-                if host is not None:
-                    host.pool.test_fault.check(
-                        f"restore:{host.handle}", "before_restore"
-                    )
                 raw = self._decode_pages(pages)
-                if host is not None:
-                    host.pool.test_fault.check(
-                        f"restore:{host.handle}", "after_restore_copy"
-                    )
                 events = (
                     [torch.cuda.Event(enable_timing=True) for _ in range(2)]
                     if self.stream is not None

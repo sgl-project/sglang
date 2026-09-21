@@ -786,7 +786,6 @@ class Envs:
     # Diagnostic only: requires LZ4 + VERIFY; Prefill LZ4 L2 is optional.
     SGLANG_PD_KV_COMPRESSION_FORCE = EnvBool(False)
     SGLANG_KV_COMPRESSION_TRACE_LENGTHS = EnvBool(False)
-    SGLANG_KV_COMPRESSION_DUMP_DIR = EnvStr(None)
     SGLANG_PD_KV_COMPRESSION_VERIFY = EnvBool(False)
     SGLANG_KV_COMPRESSION_TRACE_HANDOFF = EnvBool(False)
     SGLANG_KV_COMPRESSION_TRACE_REUSE = EnvBool(False)

@@ -57,8 +57,6 @@ if [[ "$ROLE" == decode && "${ENABLE_HICACHE:-0}" == 1 ]]; then
 fi
 export SGLANG_KV_COMPRESSION_WORKSPACE_MB="${SGLANG_KV_COMPRESSION_WORKSPACE_MB:-512}"
 export SGLANG_KV_COMPRESSION_TRACE_STORE="${SGLANG_KV_COMPRESSION_TRACE_STORE:-0}"
-# Exact-operation fault injection is opt-in and disabled in normal runs.
-export SGLANG_KV_COMPRESSION_TEST_FAULT="${SGLANG_KV_COMPRESSION_TEST_FAULT:-}"
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 export SGLANG_DISAGG_STAGING_POOL_SIZE_MB="${SGLANG_DISAGG_STAGING_POOL_SIZE_MB:-512}"
 # Keep worker counts fixed for comparisons; the feature also enforces these.

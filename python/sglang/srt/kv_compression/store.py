@@ -20,7 +20,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from sglang.srt.kv_compression.faults import TestFault
 from sglang.srt.kv_compression.types import (
     BufferDrainError,
     EncodedPage,
@@ -102,14 +101,12 @@ class WriteLease:
         )
         self.pool.allocation_stats["scatter_seconds"] += time.perf_counter() - started
         self.written = True
-        self.pool.test_fault.check(f"write:{self.handles[0]}", "after_scatter")
 
     def publish(self, refs, pages, checksums):
         if not self.written or self.closed or self.quarantined:
             raise ValueError("Cannot publish before scatter completion")
         if not (len(refs) == len(pages) == len(checksums) == len(self.handles)):
             raise ValueError("Publication count mismatch")
-        self.pool.test_fault.check(f"write:{self.handles[0]}", "before_publish")
         # Validate the whole window first, including duplicate identities.
         with self.pool.lock:
             if len(set(map(int, refs))) != len(refs):
@@ -225,7 +222,6 @@ class CompressedHostKVCache:
         ) = 0
         self.active_readers = self.active_writers = 0
         self.allocation_stats = defaultdict(float)
-        self.test_fault = TestFault()
         self.trace_identities = (
             os.environ.get("SGLANG_KV_COMPRESSION_TRACE_STORE", "0") == "1"
         )

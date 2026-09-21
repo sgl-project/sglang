@@ -6,26 +6,10 @@ KV tensors. HiCache owns prefix matching, backup, restoration, eviction and ACKs
 P/D owns transfer ranges and remote completion. The shared compression executor
 owns representation conversion and bounded execution resources.
 
-## Revision and validation boundary
-
-The original r4 snapshot is commit `d88215a2e6`, based on
-`8ae4a39b50ffcdb44175cd2fc5594032740ba888`. It passed a reported six-group,
-180-request normal-path run with Qwen3-8B on two H20 GPUs. Ordinary LZ4 fell back
-to raw data throughout that workload; forced LZ4 increased encoded payload by
-about 0.348%, excluding descriptors. These results establish neither a speedup
-nor a storage-capacity benefit. The full online fault matrix remains pending.
-
-This branch integrates upstream main at
-`1da8ac10e1` and requires a new image and new GPU/RDMA acceptance run.
-Build from the complete branch checkout. The old r4 overlay, file hashes and
-online results describe the old snapshot and must not be used to certify this
-revision. Source delivery must identify both the base revision and all overlay hashes.
-
-The LZ4 payload and chunk descriptor remain v2, with nvCOMP `5.3.0.16`.
-Upstream added per-entry KV lengths to registration frame 19; compression now
-uses frames 20 and 21. The advertised capability includes `registration-v2` and the `verify-0`/`verify-1` requirement so
-older experimental peers are rejected during bootstrap. Upgrade both workers
-together. With compression disabled, no compression fields are appended.
+The LZ4 payload and chunk descriptor use v2, with nvCOMP `5.3.0.16`.
+The capability includes the registration layout and VERIFY policy; incompatible
+experimental peers are rejected during bootstrap. Update both workers together.
+With compression disabled, the original transfer path is used.
 
 ## Supported configuration
 
@@ -100,21 +84,6 @@ wait are recorded separately. Timers overlap and must not be summed as request
 latency. `SGLANG_KV_COMPRESSION_TRACE_STORE=1` adds node, handle, generation and
 page-identity logs; shared cache operations do not invent request ownership.
 
-## Local capacity replay
-
-For a capacity replay, supply the frozen workload and request order:
-
-```bash
-python test/manual/kv_transfer/replay_block_capacity.py \
-  --workload workload.json --order request-order.jsonl \
-  --node-pages 1024 8192 --output capacity.json
-```
-
-The replay uses the production pool geometry and a simplified split-aware LRU.
-Default encoded lengths are synthetic, not captured KV. `--lengths` accepts
-measured lengths keyed by prefix SHA256 and fails on missing entries. It does
-not execute actual HiCache scheduling, CUDA or RDMA.
-
 ## Image and online validation
 
 Build the complete updated checkout with the existing dependencies. Generate a
@@ -175,26 +144,18 @@ Stop on a failed gate. Old-image results cannot substitute for this run.
 
 ## Fault validation
 
-Fault injection is off by default. A test must target one explicit operation,
-for example:
+Faults belong in the test harness, not in worker environment variables. The
+manual GPU tests patch copy/write methods or alter actual KV bytes to exercise
+failure paths. Preserve the original source digest when corrupting data, and
+verify that the intended operation failed rather than skipping it.
 
-```text
-SGLANG_KV_COMPRESSION_TEST_FAULT={"operation":"write:4294967296","point":"after_scatter","kind":"error"}
-```
+Online acceptance must cover cancellation, bad descriptors/checksums, partial
+writes, restoration failure and in-flight RDMA disconnects. Failed targets must
+not be published. Confirmed drain permits reclamation and a subsequent request;
+uncertain drain retains resources and marks the worker unavailable. Local/GPU
+injection does not replace actual transport-failure testing.
 
-Obtain the exact `write:<first handle>` or `restore:<first handle>` identity
-from the current run. Supported points are after_scatter, before_publish,
-before_restore and after_restore_copy; kinds are error, checksum and undrained.
-A test is invalid unless its specified injection actually executes.
-
-Cover cancellation and late completion, partial writes/publication failures,
-bad descriptors or hashes, restoration failure, RDMA disconnect and peer exit.
-Never publish failed targets. Safe failures must drain before reclamation and
-allow a subsequent request; uncertain CUDA/RDMA drain must retain ownership
-and quarantine the worker. Local injection is not a real RDMA failure test.
-The complete online fault matrix and performance assessment remain required.
-
-## Review repair: admission, ownership and evidence
+## Admission and resource ownership
 
 A completed compressed restore already owns destination GPU pages. HiCache now
 exposes only the matching request's ready, generation-checked reservation to
@@ -216,8 +177,8 @@ wire buffers, receive rings and model KV are separate; this is not a total CUDA
 memory cap. Record process/device peaks separately in image testing.
 
 Compression quarantine now blocks incoming requests, Prefill admission and
-Decode preallocation/prebuilt admission. It retains uncertain resources and sends an explicit unhealthy signal to the
-tokenizer. `/ready`, `/health` and `/health_generate` remain unavailable until
+Decode preallocation/prebuilt admission. It retains uncertain resources and
+sends an explicit unhealthy signal to the tokenizer. `/ready`, `/health` and `/health_generate` remain unavailable until
 worker replacement; successful old responses do not clear quarantine. GPU byte
 corruption that drains safely remains a request failure and can be followed by
 a healthy request. These are different fault classes.
@@ -227,7 +188,7 @@ must contain source_manifest_sha256, image_digest, model, model_revision, dtype,
 kv_cache_dtype, topology, page_size and chunk_tokens. Use the same contract for
 all six groups of the same image; group switches are captured by phase and
 startup diagnostics. Retain the actual expanded launcher configuration beside
-it. Do not use the original r4 digest. A template is provided in
+it. A template is provided in
 `execution_contract.example.json`; replace every placeholder before running.
 Comparisons reject self-comparison, incompatible phase pairs and contract or
 sampling differences. Historical evidence without a contract may be audited,
