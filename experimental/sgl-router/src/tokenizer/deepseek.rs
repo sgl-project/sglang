@@ -86,7 +86,10 @@ impl V4Profile {
                 messages[index].as_object_mut().unwrap().remove("task");
             }
         }
-        let effort = match (self, request_effort(request).and_then(Value::as_str)) {
+        let effort = match (
+            self,
+            request_effort(request).as_ref().and_then(Value::as_str),
+        ) {
             (Self::Official, Some("high")) | (Self::Preview, Some("max")) => {
                 Some(ReasoningEffort::High)
             }
@@ -112,15 +115,31 @@ impl V4Profile {
     }
 }
 
-pub(super) fn request_effort(request: &Value) -> Option<&Value> {
-    [
+/// `serving_chat._convert_to_internal_request`: `chat_template_kwargs.reasoning_effort`
+/// replaces the validated request effort verbatim (thinking was already derived
+/// from the request fields); request-level values are coerced as pydantic does.
+pub(super) fn request_effort(request: &Value) -> Option<Value> {
+    if let Some(effort) = request["chat_template_kwargs"]
+        .get("reasoning_effort")
+        .filter(|v| !v.is_null())
+    {
+        return Some(effort.clone());
+    }
+    let effort = [
         request["reasoning"].get("effort"),
         request["reasoning"].get("reasoning_effort"),
         request.get("reasoning_effort"),
     ]
     .into_iter()
     .flatten()
-    .find(|v| !v.is_null())
+    .find(|v| !v.is_null())?;
+    Some(match effort {
+        Value::String(s) => s
+            .parse::<f64>()
+            .map_or_else(|_| effort.clone(), Value::from),
+        Value::Number(n) => n.as_f64().map_or_else(|| effort.clone(), Value::from),
+        _ => effort.clone(),
+    })
 }
 
 /// Before continuation extraction, SGLang flattens V4 parts with spaces and

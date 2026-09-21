@@ -61,6 +61,11 @@ def main():
             server._dsv4_reasoning_effort_profile = case["profile"]
             tok.texts.clear()
             request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
+            # _convert_to_internal_request: kwargs effort replaces the request effort.
+            if request.chat_template_kwargs:
+                effort = request.chat_template_kwargs.pop("reasoning_effort", None)
+                if effort is not None:
+                    request.reasoning_effort = effort
             ids = server._apply_jinja_template(
                 request, tools=None, is_multimodal=False
             ).prompt_ids
