@@ -213,6 +213,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return self.qsa_rope_position_buffer[loc.long()]
 
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        # The indexer reads compressed keys before attention reads the full KV,
+        # so a host restore in flight must be fenced here, not only in the KV getter.
+        self._wait_for_layer(layer_id)
         return self.qsa_compressed_k_buffer_pool[
             self._transfer_full_attention_id(layer_id)
         ]
@@ -268,6 +271,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_compressed_k_buffer_pool,
             self.qsa_compressed_page_size,
         )
+
+    def host_pool_decls(self):
+        # pool_host imports this module; resolve the mirror side lazily.
+        from sglang.srt.mem_cache.pool_host.qsa import qsa_indexer_pool_decl
+
+        return super().host_pool_decls() + (qsa_indexer_pool_decl(self),)
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()
