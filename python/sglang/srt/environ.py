@@ -2127,6 +2127,8 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # ROCm gfx950 only: fused Conv1D + QKV + gate producer for Qwen3.8 GDN prefill.
+    SGLANG_QWEN38_GDN_PREFILL_PROLOGUE_FUSION = EnvBool(False)
 
     # ===================================================================
     # Plugin system
