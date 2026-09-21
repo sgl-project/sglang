@@ -178,6 +178,75 @@ def test_condition_slots_expand_to_actual_latent_grid():
     torch.testing.assert_close(collapsed[slots][0], hidden[2])
 
 
+class _RecordingBlock(torch.nn.Module):
+    def __init__(self, layer_id):
+        super().__init__()
+        self._layer_id = layer_id
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        caches = [cache[self._layer_id] for cache in args[-1]]
+        self.seen = caches[0]
+        return hidden_states
+
+
+class _UnifiedBlocks(torch.nn.Module):
+    def __init__(self, blocks):
+        super().__init__()
+        self.transformer_blocks = torch.nn.ModuleList(blocks)
+
+    def forward(self, hidden_states, *args):
+        x = hidden_states
+        for block in self.transformer_blocks:
+            x = block(x, *args)
+        return x
+
+
+def _run_blocks(blocks, prefix_caches):
+    x = torch.zeros(1)
+    for block in blocks:
+        x = block(x, prefix_caches)
+    return x
+
+
+def test_cache_dit_wrapper_keeps_per_layer_prefix_kv():
+    inner = [_RecordingBlock(0), _RecordingBlock(1), _RecordingBlock(2)]
+    wrapped = torch.nn.ModuleList([_UnifiedBlocks(inner)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}, {"layer": 2}]]
+
+    _run_blocks(wrapped, prefix_caches)
+    assert [block.seen for block in inner] == prefix_caches[0]
+
+
+def test_plain_blocks_still_get_per_layer_prefix_kv():
+    blocks = torch.nn.ModuleList([_RecordingBlock(0), _RecordingBlock(1)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    _run_blocks(blocks, prefix_caches)
+    assert [block.seen for block in blocks] == prefix_caches[0]
+
+
+class _FirstSlotBlock(torch.nn.Module):
+    """Old loop body: take caches[0] and broadcast it to every layer."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        self.seen = args[-1][0]
+        return hidden_states
+
+
+def test_first_slot_only_caches_are_shared_across_layers():
+    inner = [_FirstSlotBlock(), _FirstSlotBlock()]
+    unified = _UnifiedBlocks(inner)
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    unified(torch.zeros(1), [cache[0] for cache in prefix_caches])
+    assert [block.seen for block in inner] == [prefix_caches[0][0], prefix_caches[0][0]]
+
+
 def test_adjacent_image_slots_stay_distinct():
     layout = build_layout(
         [False, True, True, False], [(1, 2, 2), (1, 4, 2), (1, 2, 2)], (4, 6, 6), "cpu"
