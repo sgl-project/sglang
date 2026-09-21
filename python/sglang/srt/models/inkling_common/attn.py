@@ -72,6 +72,24 @@ except ImportError:
     fused_qk_norm_rope = None
 
 
+def xpu_q_norm_geometry(
+    *,
+    head_dim: int,
+    num_tp_heads: int,
+    num_tp_kv_heads: int,
+    d_rel: int,
+) -> tuple[int, bool]:
+    """V-head padding that hides the KV+R tail, and whether the row admits it.
+
+    fused_qk_norm_rope walks num_heads_q+num_heads_k heads but strides rows by
+    all three counts, so the KV+R tail passes as untouched V heads -- only when
+    it is a whole number of head_dim columns, i.e. d_rel * num_tp_heads % 128 == 0
+    (TP <= 8 at d_rel=16, head_dim=128).
+    """
+    kvr_width = 2 * head_dim * num_tp_kv_heads + d_rel * num_tp_heads
+    return kvr_width // head_dim, kvr_width % head_dim == 0
+
+
 @cache
 def get_inkling_relative_attention_score_mod(rel_extent: int) -> Callable:
     if cute is None or Float32 is None or SeqlenInfoQK is None:
@@ -370,18 +388,14 @@ class InklingAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
-        # fused_qk_norm_rope walks num_heads_q+num_heads_k heads but strides rows by
-        # all three counts, so the KV+R tail passes as untouched V heads -- only when
-        # it is a whole number of head_dim columns, i.e. d_rel * num_tp_heads % 128 == 0
-        # (TP <= 8 at d_rel=16, head_dim=128).
-        kvr_width = (
-            2 * self.head_dim * self.num_tp_kv_heads + self.d_rel * self.num_tp_heads
+        self._xpu_q_norm_pad, geometry_admits_q_norm = xpu_q_norm_geometry(
+            head_dim=self.head_dim,
+            num_tp_heads=self.num_tp_heads,
+            num_tp_kv_heads=self.num_tp_kv_heads,
+            d_rel=self.d_rel,
         )
-        self._xpu_q_norm_pad = kvr_width // self.head_dim
         self._xpu_q_norm_ok = (
-            _is_xpu
-            and fused_qk_norm_rope is not None
-            and kvr_width % self.head_dim == 0
+            _is_xpu and fused_qk_norm_rope is not None and geometry_admits_q_norm
         )
         self._xpu_q_norm_pos = None
 
