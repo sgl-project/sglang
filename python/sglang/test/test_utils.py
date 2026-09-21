@@ -2084,6 +2084,41 @@ def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
         reset_context()
 
 
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """State the widths `initialize_model_parallel` is about to build at.
+
+    The build reads every width from the runtime context, so a test that wants
+    a particular topology publishes it here rather than passing it in -- the
+    same door production uses, which also keeps the derived widths honest.
+
+    Unlike `published_topology` this is not a scope: the groups it is about to
+    build outlive any block, so the configuration describing them has to as
+    well. Callers that tear the groups down are already resetting the process.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Callers that go on to build groups have already run
+    # `init_distributed_environment`, which states the WORLD group -- and the
+    # build below places every group it creates by reading that back. The reset
+    # above drops it, so hand it over again: publishing a configuration does not
+    # unbuild a process group.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
+
+
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
