@@ -10,8 +10,10 @@ import os
 import pathlib as _pathlib
 import shutil
 import tempfile
+import types
 import unittest
 import warnings
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
@@ -44,6 +46,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     derive_parallel_widths,
     get_context,
+    get_device,
     get_exec,
     get_flags,
     get_parallel,
@@ -59,40 +62,109 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 _SRT = _pathlib.Path(next(iter(_sglang.__path__))).resolve() / "srt"
+_PACKAGE = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
+
+
+def _sources():
+    """Every Python file this checkout ships, package and siblings alike.
+
+    The package alone is the wrong subject set for anything about entries or
+    public names: `benchmark/`, `examples/` and the top-level `test/` call the
+    same doors and are not covered by any suite that would notice them break.
+    An installed package has no siblings, and then this is the package alone."""
+    roots = [_PACKAGE]
+    checkout = _PACKAGE.parents[1]
+    roots += [
+        checkout / name
+        for name in ("benchmark", "examples", "scripts", "test")
+        if (checkout / name).is_dir()
+    ]
+    for root in roots:
+        for path in root.rglob("*.py"):
+            yield path
+
+
+def _scope_entries_that_say_nothing(paths):
+    """Draft-scope entries that do not state `owns_attention`, as `path:line`.
+
+    The scope either narrows the draft's attention and expert identity or
+    leaves the target's in place, and only the worker knows which -- so the
+    keyword has no default. Omitting it is a `TypeError`, but only on the path
+    that runs, and those paths want a GPU and a draft model.
+    """
+    import ast
+
+    missing = []
+    for path in paths:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
+                continue
+            if not any(kw.arg == "owns_attention" for kw in node.keywords):
+                missing.append(f"{path}:{node.lineno}")
+    return missing
+
+
 _PS = "sglang.srt.distributed.parallel_state"
+
+
+def _parallel_state():
+    from sglang.srt.distributed import parallel_state
+
+    return parallel_state
+
+
 _DP = "sglang.srt.layers.dp_attention"
 
-# Ranks and the launch width are asked of the group: they are not implied by
-# anything, so there is nothing to derive them from. The quotients are not
-# here -- `attn_tp_size` and its siblings are functions of the configured
-# leaves, and `TestDerivedWidths` pins them. `attn_dp_rank` is not here either: no group coordinator
-# knows it, so it is stamped when the attention topology is initialized and
-# `TestStampedRanks` is what pins it. The other world width is not here
-# because the group does not know it; `TestTheTwoWorldWidths` pins it.
-SIZE_RANK_DELEGATIONS = [
-    ("launch_world_size", f"{_PS}.get_world_size"),
-    ("launch_world_rank", f"{_PS}.get_world_rank"),
-    ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
-    ("dcp_rank", f"{_PS}.get_dcp_rank"),
-    ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
-    ("moe_ep_rank", f"{_PS}.get_moe_expert_parallel_rank"),
-    ("moe_dp_rank", f"{_PS}.get_moe_data_parallel_rank"),
-    ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
-    ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
-    ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
-]
+#: The groups `initialize_model_parallel` states on the context, by the module
+#: global it builds each one into. WORLD is not among them: it is built and
+#: stated by `init_distributed_environment`, one call earlier.
+GROUP_STAMPS = {
+    "tp_group": "_TP",
+    "dcp_group": "_DCP",
+    "pp_group": "_PP",
+    "moe_ep_group": "_MOE_EP",
+    "moe_dp_group": "_MOE_DP",
+    "moe_tp_group": "_MOE_TP",
+    "attn_tp_group": "_ATTN_TP",
+    "attn_cp_group": "_ATTN_CP",
+    "shared_experts_tp_group": "_SHARED_EXPERTS_TP",
+}
 
-GROUP_DELEGATIONS = [
-    ("world_group", f"{_PS}.get_world_group"),
-    ("tp_group", f"{_PS}.get_tp_group"),
-    ("dcp_group", f"{_PS}.get_dcp_group"),
-    ("pp_group", f"{_PS}.get_pp_group"),
-    ("moe_ep_group", f"{_PS}.get_moe_ep_group"),
-    ("moe_dp_group", f"{_PS}.get_moe_dp_group"),
-    ("moe_tp_group", f"{_PS}.get_moe_tp_group"),
-    ("attn_tp_group", f"{_PS}.get_attn_tp_group"),
-    ("attn_cp_group", f"{_PS}.get_attn_cp_group"),
-]
+
+def _groups_the_build_states() -> dict:
+    """What `initialize_model_parallel` hands the context, read out of its
+    source: `{context name: the module global it passes}`.
+
+    Out of the source because that is the only place the whole set appears at
+    once -- calling the function needs ten live process groups.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.distributed import parallel_state
+
+    body = textwrap.dedent(inspect.getsource(parallel_state.initialize_model_parallel))
+    for node in ast.walk(ast.parse(body)):
+        keys = getattr(node, "keys", None)
+        if (
+            isinstance(node, ast.Dict)
+            and keys
+            and all(
+                isinstance(k, ast.Constant) and str(k.value).endswith("_group")
+                for k in keys
+            )
+        ):
+            return {k.value: v.id for k, v in zip(node.keys, node.values)}
+    raise AssertionError("initialize_model_parallel states no group at all")
 
 
 class TestRuntimeContextSingletons(CustomTestCase):
@@ -120,29 +192,91 @@ class _IsolatedOverrides(CustomTestCase):
         super().tearDown()
 
 
+class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
+    """Nothing derives a group, so one the build forgets to state is a name
+    that answers "not written" for the rest of the process -- and the reader
+    that finds out is a model layer, a long way from here."""
+
+    def test_the_build_states_every_group_the_context_declares(self):
+        from sglang.srt.runtime_context import _parallel_fields
+
+        declared = {name for name in _parallel_fields() if name.endswith("_group")}
+        self.assertEqual(declared, set(GROUP_STAMPS) | {"world_group"})
+
+    def test_the_world_group_is_stated_where_it_is_built(self):
+        """`initialize_model_parallel` places every group it builds by reading
+        `get_world_group().local_rank`, so WORLD has to be answerable before it
+        runs -- one function earlier, where it is constructed."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed import parallel_state
+
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.init_distributed_environment)
+        )
+        stated = {
+            kw.arg
+            for node in ast.walk(ast.parse(body))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "override_permanently"
+            for kw in node.keywords
+        }
+        self.assertIn("world_group", stated)
+
+    def test_nothing_reads_a_name_this_build_has_not_stated_yet(self):
+        """The stamp is at the end, so a getter called before it answers a name
+        nothing has written -- a crash at startup, in a process no unit test
+        runs. What the function may read is what a *previous* call stated, and
+        that is WORLD alone: a rank belongs to the spawn, and this build does
+        not get to assume the spawn ran first."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed import parallel_state
+
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.initialize_model_parallel)
+        )
+        read = set()
+        for node in ast.walk(ast.parse(body)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                name = parallel_state._CONTEXT_NAME_OF.get(node.func.id)
+                if name is not None:
+                    read.add(name)
+        self.assertTrue(read, "no getter is called here; this proves nothing")
+        self.assertEqual(read - {"world_group"}, set())
+
+    def test_each_group_is_stated_from_the_global_it_was_built_into(self):
+        self.assertEqual(_groups_the_build_states(), GROUP_STAMPS)
+
+    def test_a_dimension_the_configuration_has_not_got_is_left_unstated(self):
+        """`_DCP` is None without decode context parallelism, and every one of
+        these getters has always refused to answer for a group that was never
+        built rather than handing back a None to fail on at the collective."""
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed import parallel_state
+
+        body = textwrap.dedent(
+            inspect.getsource(parallel_state.initialize_model_parallel)
+        )
+        stamp = next(
+            node
+            for node in ast.walk(ast.parse(body))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "override_permanently"
+        )
+        self.assertIn("is not None", ast.unparse(stamp))
+
+
 class TestParallelDelegation(_IsolatedOverrides):
-    def test_size_rank_delegate_to_canonical_getters(self):
-        # Patch each getter to a distinct sentinel: a miswired attribute would read
-        # a different (unpatched) getter and fail.
-        for i, (attr, target) in enumerate(SIZE_RANK_DELEGATIONS):
-            sentinel = 1000 + i
-            with patch(target, return_value=sentinel):
-                self.assertEqual(
-                    getattr(get_parallel(), attr),
-                    sentinel,
-                    msg=f"{attr} must delegate to {target}",
-                )
-
-    def test_groups_delegate_to_canonical_getters(self):
-        for attr, target in GROUP_DELEGATIONS:
-            sentinel = object()
-            with patch(target, return_value=sentinel):
-                self.assertIs(
-                    getattr(get_parallel(), attr),
-                    sentinel,
-                    msg=f"{attr} must delegate to {target}",
-                )
-
     def test_wrapper_holds_no_resolved_state(self):
         # __slots__: no __dict__; the only instance state is the override hook.
         self.assertFalse(hasattr(get_parallel(), "__dict__"))
@@ -153,50 +287,46 @@ class TestParallelDelegation(_IsolatedOverrides):
 
 
 class TestTheTwoWorldWidths(_IsolatedOverrides):
-    """Two questions about the WORLD group: what it was built at, and what it
-    has room for.
+    """Two questions about the WORLD group: what it was launched at, and what
+    it has room for.
 
-    Neither is stored here. How much of that room is serving after a scale-up
-    is elastic-EP state, and is asked of the manager that owns it rather than
-    mirrored onto this namespace.
+    Both are arithmetic over the configured leaves and are worked out at
+    publish, so they answer in a process that never builds the group -- which
+    is where a good half of the readers are. How much of that room is serving
+    after a scale-up is neither of them: that is elastic-EP state, asked of the
+    manager that owns it rather than mirrored onto this namespace.
     """
 
-    def test_the_launch_width_is_what_the_group_was_built_at(self):
-        with patch(f"{_PS}.get_world_size", return_value=4):
-            self.assertEqual(get_parallel().launch_world_size, 4)
+    def _published(self, **fields):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", **fields), role="test")
+        return get_parallel()
+
+    def test_the_launch_width_is_a_rank_per_stage_of_each_group(self):
+        self.assertEqual(self._published(tp_size=4, pp_size=2).launch_world_size, 8)
+
+    def test_the_launch_width_spans_the_ranks_a_joiner_came_in_above(self):
+        """A scale joiner lays its own groups out at `tp * pp`, while its WORLD
+        spans the cohort already running underneath it as well."""
+        parallel = self._published(tp_size=4, pp_size=1, ep_join_rank_offset=8)
+        self.assertEqual(parallel.launch_world_size, 12)
 
     def test_the_ceiling_is_the_configured_one_when_there_is_one(self):
-        parallel = get_parallel()
-        with (
-            parallel.override(max_ep_size=32),
-            patch(
-                f"{_PS}.get_world_size",
-                side_effect=AssertionError("the built group must not be asked"),
-            ),
-        ):
-            self.assertEqual(parallel.max_world_size, 32)
+        self.assertEqual(self._published(tp_size=4, max_ep_size=32).max_world_size, 32)
 
     def test_without_a_configured_ceiling_the_room_is_the_launch_width(self):
-        parallel = get_parallel()
-        with (
-            parallel.override(max_ep_size=None),
-            patch(f"{_PS}.get_world_size", return_value=8),
-        ):
-            self.assertEqual(parallel.max_world_size, 8)
+        parallel = self._published(tp_size=8)
+        self.assertEqual(parallel.launch_world_size, 8)
+        self.assertEqual(parallel.max_world_size, 8)
 
     def test_each_width_can_be_stated_on_its_own(self):
         """Stating one must not answer for the other: they are two names."""
-        parallel = get_parallel()
-        with (
-            parallel.override(launch_world_size=2, max_ep_size=None),
-            patch(
-                f"{_PS}.get_world_size",
-                side_effect=AssertionError("the built group must not be asked"),
-            ),
-        ):
+        parallel = self._published(tp_size=8)
+        with parallel.override(launch_world_size=2):
             self.assertEqual(parallel.launch_world_size, 2)
-            self.assertEqual(parallel.max_world_size, 2)
-            with parallel.override(max_ep_size=6):
+            self.assertEqual(parallel.max_world_size, 8)
+            with parallel.override(max_world_size=6):
                 self.assertEqual(parallel.max_world_size, 6)
                 self.assertEqual(parallel.launch_world_size, 2)
 
@@ -237,6 +367,35 @@ class TestSpawnIdentities(_IsolatedOverrides):
         self.assertEqual(parallel.pp_rank, 1)
         self.assertEqual(parallel.dp_rank, 2)
 
+    def test_the_spawn_states_the_device_and_the_record_stays_clean(self):
+        """The parent picks the device, so it arrives with the rest of the
+        placement. It is stamped onto the bag: the record is the startup
+        input and stays as the caller handed it over."""
+        server_args = ServerArgs(model_path="dummy")
+        publish(
+            server_args,
+            role="test",
+            ranks=SpawnRanks(world_rank=0, gpu_id=3),
+        )
+        self.assertEqual(get_device().gpu_id, 3)
+        # Not on the record at all. An `Arg` is the operator's input and is
+        # collected into `ServerArgs`; nobody types this one, so it is
+        # declared rather than carried, and the startup input has no field
+        # for the spawn to have to leave alone.
+        self.assertNotIn(
+            "gpu_id", {f.name for f in msgspec.structs.fields(type(server_args))}
+        )
+
+    def test_a_process_on_no_device_is_told_nothing(self):
+        """Most roles run on no device at all, so the bundle leaves it out and
+        the bag keeps the declared default rather than inventing a zero."""
+        publish(
+            ServerArgs(model_path="dummy"),
+            role="test",
+            ranks=SpawnRanks(world_rank=0),
+        )
+        self.assertIsNone(get_device().gpu_id)
+
     def test_no_controller_is_an_answer_not_a_failure(self):
         """`dp_rank=None` means "not under a data parallel controller", which
         is a fact about the deployment, unlike never having been told. The
@@ -265,7 +424,7 @@ class TestSpawnIdentities(_IsolatedOverrides):
 class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
     """With a spawn bundle, a rank read works before any group exists.
 
-    This is what `ParallelState` provided by being a plain frozen record, and
+    This is what the per-runner record provided by being a plain frozen object, and
     what the topology init could not: it needs the groups. Deriving at publish
     is what lets a reader ask the context in a process that never initialises
     distributed -- every unit test that builds a scheduler component, for one.
@@ -329,27 +488,28 @@ class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
             role="test",
             ranks=SpawnRanks(world_rank=5),
         )
-        with patch(
-            f"{_PS}.get_attn_tensor_model_parallel_rank",
-            side_effect=AssertionError("no group must be consulted"),
-        ):
+        with patch.object(_parallel_state(), "_ATTN_TP", None):
             self.assertEqual(get_parallel().attn_tp_rank, 1)
             self.assertEqual(get_parallel().attn_dp_rank, 1)
 
-    def test_without_a_bundle_it_still_asks_the_group(self):
-        """Unchanged for every process that publishes without a placement."""
+    def test_without_a_bundle_a_rank_read_says_what_is_missing(self):
+        """There is nothing to fall back to. Deriving one from whatever group
+        happens to be installed would answer a different question -- where this
+        process sits in that group, not where the launcher put it."""
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
-        with patch(f"{_PS}.get_attn_tensor_model_parallel_rank", return_value=3):
-            self.assertEqual(get_parallel().attn_tp_rank, 3)
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_tp_rank
+        message = str(caught.exception)
+        self.assertIn("has not been written in this process", message)
+        self.assertIn("override(attn_tp_rank=...)", message)
 
 
 class TestStampedRanks(_IsolatedOverrides):
     """`attn_dp_rank` comes from the stamp, and says so when there is none.
 
     It is the one rank no group answers with: `initialize_dp_attention`
-    computes it from this process's `tp_rank`, and an elastic scale-up
-    replaces it with a rank in the expanded WORLD. Falling back to anything
-    would be inventing a placement for this process.
+    computes it from this process's `tp_rank`. Falling back to anything would
+    be inventing a placement for this process.
     """
 
     def setUp(self):
@@ -407,21 +567,71 @@ class TestStampedRanks(_IsolatedOverrides):
             )
         self.assertIs(mode, DpPaddingMode.SUM_LEN)
 
-    def test_a_scale_up_stamps_the_width_and_the_rank_together(self):
-        """The two describe one topology; a reader that saw only one moved
-        would place this process in a group it is not in."""
+    def test_the_gather_slot_follows_the_list_that_was_gathered(self):
+        """The DP sync gathers over the attention-DP replicas, or over the
+        expanded WORLD once a scale-up has moved the gather there. The index
+        into that list is a property of the gather, so it is read beside the
+        flag that says which one happened rather than kept on the topology."""
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        self.addCleanup(reset_context)
+        dp_flags = get_flags().dp
+        saved = (
+            dp_flags.use_world_group_for_gather,
+            dp_flags.joiner_skip_all_gather,
+        )
+
+        def restore():
+            (
+                dp_flags.use_world_group_for_gather,
+                dp_flags.joiner_skip_all_gather,
+            ) = saved
+
+        self.addCleanup(restore)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3),
+        )
+        parallel = get_parallel()
+        dp_flags.use_world_group_for_gather = False
+        self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
+
+        # After a scale-up the gather spans the expanded WORLD, and the joining
+        # cohort is numbered from its offset.
+        dp_flags.use_world_group_for_gather = True
+        dp_flags.joiner_skip_all_gather = False
+        parallel.override_permanently(ep_join_rank_offset=8)
+        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
+        # and the topology it was read off is untouched
+        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(parallel.tp_size, 8)
+
+    def test_a_scale_up_writes_no_width(self):
+        """The identities stay unconditional because nothing overrides them:
+        the scale-up only points the gather at the expanded WORLD."""
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
 
-        # It also flips a process-wide gather flag; put it back, or every
-        # later test in this process runs as if a scale-up had happened.
         dp_flags = get_flags().dp
         saved_gather = dp_flags.use_world_group_for_gather
         self.addCleanup(setattr, dp_flags, "use_world_group_for_gather", saved_gather)
-
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=8, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3),
+        )
         parallel = get_parallel()
+        before = (parallel.attn_dp_size, parallel.attn_dp_rank, parallel.tp_size)
         update_dp_attention_post_scale(new_dp_size=16, new_dp_rank=11)
-        self.assertEqual(parallel.attn_dp_size, 16)
-        self.assertEqual(parallel.attn_dp_rank, 11)
+        self.assertTrue(dp_flags.use_world_group_for_gather)
+        self.assertEqual(
+            (parallel.attn_dp_size, parallel.attn_dp_rank, parallel.tp_size), before
+        )
 
 
 class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
@@ -468,16 +678,14 @@ class TestEveryDeclaredParallelNameIsStatable(_IsolatedOverrides):
 
         The bag carries the declared quotients as well as the operator's
         leaves, and both are ahead of the live getter once a configuration is
-        published: a name in `_LIVE_READS` and in either of them would answer
+        published: a declared name that is also a leaf would answer
         from the getter before publish and from the bag after."""
         from sglang.srt.runtime_context import (
-            _LIVE_READS,
             _derived_widths,
             _parallel_config_leaves,
         )
 
-        self.assertEqual(set(_LIVE_READS) & _parallel_config_leaves(), set())
-        self.assertEqual(set(_LIVE_READS) & set(_derived_widths()), set())
+        self.assertEqual(set(_derived_widths()) & _parallel_config_leaves(), set())
 
     def test_an_undeclared_name_is_refused(self):
         with self.assertRaises(ValueError):
@@ -641,19 +849,43 @@ class TestParallelDCP(_IsolatedOverrides):
         self.assertTrue(parallel.dcp_enabled)
         self.assertEqual(parallel.attn_dcp_size, 8)
 
-    def test_the_dcp_rank_still_reads_the_group(self):
-        """A rank is not implied by the configuration, so it reads the group --
-        gated on a width that is."""
-        with (
-            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=False),
-            patch(f"{_PS}.get_dcp_rank", side_effect=AssertionError),
-        ):
-            self.assertEqual(get_parallel().attn_dcp_rank, 0)
-        with (
-            get_parallel().override(tp_size=8, dcp_size=8, dcp_enabled=True),
-            patch(f"{_PS}.get_dcp_rank", return_value=3),
-        ):
-            self.assertEqual(get_parallel().attn_dcp_rank, 3)
+    def _placed(self, world_rank, **fields):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", **fields),
+            role="test",
+            ranks=SpawnRanks(world_rank=world_rank),
+        )
+        return get_parallel()
+
+    def test_the_dcp_rank_is_where_the_tp_rank_falls_in_its_slice(self):
+        """A DCP group is a contiguous slice of the TP group, so the place in
+        one is the TP rank folded by the width."""
+        parallel = self._placed(5, tp_size=8, dcp_size=4)
+        self.assertEqual(parallel.dcp_rank, 1)
+        self.assertEqual(parallel.attn_dcp_rank, 1)
+
+    def test_the_gated_off_rank_answers_without_a_spawn_bundle(self):
+        """Zero for every process when decode context parallelism is off, so a
+        reader on a path that never publishes a bundle -- a memory pool, an
+        attention backend built in a unit test -- still gets an answer. It
+        stood for a group that was never built before, and it has to keep
+        answering the same way."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
+        self.assertEqual(get_parallel().attn_dcp_rank, 0)
+
+    def test_the_dcp_rank_is_gated_on_a_width_the_configuration_carries(self):
+        """Zero where decode context parallelism is off, so a reader does not
+        have to ask whether it is on before asking where it sits -- and the
+        gated-off name is not answered at all, because no group holds it."""
+        parallel = self._placed(5, tp_size=8, dcp_size=1)
+        self.assertFalse(parallel.dcp_enabled)
+        self.assertEqual(parallel.attn_dcp_rank, 0)
+        with self.assertRaises(RuntimeError):
+            parallel.dcp_rank
 
     def test_the_width_does_not_consult_the_platform(self):
         with patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda:
@@ -1898,14 +2130,26 @@ class TestDerivedWidths(_IsolatedOverrides):
 
     def test_a_topology_is_stated_by_naming_the_width(self):
         """Overriding a leaf does not move the quotient -- the quotient is not
-        recomputed on read. Naming it is how a test states one."""
+        recomputed on read. Naming it is how a caller states one, and naming
+        only some of them is refused: the caller owns the arithmetic, the
+        context only checks it."""
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
         self.assertEqual(get_parallel().attn_tp_size, 8)
-        with get_parallel().override(tp_size=2):
-            self.assertEqual(get_parallel().attn_tp_size, 8)
-        with get_parallel().override(attn_tp_size=4):
+
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(tp_size=2):
+                pass
+        self.assertIn(
+            "tp_size == attn_tp_size * attn_dp_size * attn_cp_size",
+            str(caught.exception),
+        )
+
+        with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
+            self.assertEqual(get_parallel().tp_size, 2)
+            self.assertEqual(get_parallel().attn_tp_size, 2)
+        with get_parallel().override(attn_tp_size=4, tp_size=4, moe_tp_size=4):
             self.assertEqual(get_parallel().attn_tp_size, 4)
 
     def test_an_unstated_topology_still_fails(self):
@@ -1962,10 +2206,16 @@ class TestDerivedWidths(_IsolatedOverrides):
             {name for name in widths if "world" in name},
             set(),
         )
-        parallel = get_parallel()
-        parallel.override_permanently(attn_tp_size=4)
-        with patch(f"{_PS}.get_world_size", return_value=9):
-            self.assertEqual(parallel.launch_world_size, 9)
+        # Its own arithmetic spans the offset, which is the leaf the quotients
+        # above are not given and could not account for.
+        from sglang.srt.runtime_context import launch_world_size_of
+
+        self.assertEqual(
+            launch_world_size_of(
+                SimpleNamespace(ep_join_rank_offset=8, tp_size=4, pp_size=1)
+            ),
+            12,
+        )
 
     def test_the_bare_name_is_gone(self):
         """It answered two questions, so every reader had to remember which.
@@ -2127,17 +2377,11 @@ class TestDerivedWidths(_IsolatedOverrides):
                 )
                 self.assertEqual(published, recomputed)
 
-    def test_initialize_model_parallel_no_longer_touches_the_bag(self):
-        """`initialize_model_parallel` used to recompute and
-        permanently override the six derived widths on `get_parallel()`
-        after building its groups; that call is gone. Publish a placeholder
-        config (tp_size defaults to 1), then build real groups at a
-        different width -- the published leaf must now stay exactly what it
-        was, because nothing corrects it. This is the behavior a caller
-        relies on being told about, loudly, the first time it publishes and
-        builds inconsistently -- see
-        `test_recomputing_from_published_leaves_matches_the_publish_bag`
-        for why every real caller must not do that.
+    def test_initialize_model_parallel_builds_at_the_published_widths(self):
+        """The build takes every width from the context rather than from an
+        argument, so "published one width, built another" is no longer a state
+        a caller can reach -- there is nothing left to translate, and nothing
+        to correct afterwards either.
         """
         from unittest.mock import Mock
 
@@ -2145,11 +2389,11 @@ class TestDerivedWidths(_IsolatedOverrides):
 
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="test")
-        self.assertEqual(get_parallel().attn_tp_size, 1)
-        self.assertEqual(get_parallel().moe_ep_size, 1)
-
         world_size = 8
+        publish(ServerArgs(model_path="dummy", tp_size=world_size), role="test")
+        self.assertEqual(get_parallel().attn_tp_size, world_size)
+
+        built_at = []
         with (
             patch.object(parallel_state, "_WORLD", None),
             patch.object(parallel_state, "_TP", None),
@@ -2168,25 +2412,20 @@ class TestDerivedWidths(_IsolatedOverrides):
             patch.object(
                 parallel_state,
                 "init_model_parallel_group",
-                return_value=Mock(device_group=Mock()),
+                side_effect=lambda group_ranks, *a, **k: (
+                    built_at.append(group_ranks),
+                    Mock(device_group=Mock()),
+                )[1],
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
             mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=world_size,
-                expert_model_parallel_size=world_size,
-            )
+            parallel_state.initialize_model_parallel()
         self.addCleanup(parallel_state.destroy_model_parallel)
 
-        self.assertEqual(
-            get_parallel().attn_tp_size,
-            1,
-            "initialize_model_parallel must not touch the published leaf -- "
-            "a caller that needs it corrected must publish a config that "
-            "already matches the width it is about to build",
-        )
-        self.assertEqual(get_parallel().moe_ep_size, 1)
+        # The first group built is TP, one group spanning the published width.
+        self.assertEqual(built_at[0], [list(range(world_size))])
+        self.assertEqual(get_parallel().attn_tp_size, world_size)
 
 
 class TestTheDerivedHalfIsDeclared(CustomTestCase):
@@ -2214,15 +2453,27 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
                 f"{name} is declared but no property was installed",
             )
 
-    def test_the_declared_set_is_what_derive_parallel_widths_produces(self):
-        """The declaration is not a second list to keep in step: it names
-        exactly the quotients the derivation returns."""
-        from sglang.srt.arg_groups.arg_utils import Derived
-        from sglang.srt.arg_groups.fields.parallel import Parallel
+    def test_a_computed_name_names_the_function_that_computes_it(self):
+        """The declaration is not a second list to keep in step: a name that
+        is a function of the leaves points at a function called after it, and
+        that function existing is the whole of what publish needs."""
+        import importlib
 
-        declared = {
-            name for name, value in vars(Parallel).items() if isinstance(value, Derived)
-        }
+        from sglang.srt.runtime_context import _derived_widths
+
+        computed = {n: d.fn for n, d in _derived_widths().items() if d.fn}
+        self.assertTrue(computed, "nothing is computed from the leaves")
+        for name, fn in computed.items():
+            module, _, attr = fn.rpartition(".")
+            self.assertEqual(attr, f"{name}_of", f"{name} is computed by {attr}")
+            self.assertTrue(callable(getattr(importlib.import_module(module), attr)))
+
+    def test_the_arithmetic_produces_nothing_that_is_not_declared(self):
+        """The other side of it: a key the derivation returns and no
+        declaration names is a width the namespace never answers with, and the
+        group build re-states it into a name nobody can read."""
+        from sglang.srt.runtime_context import _derived_widths
+
         produced = set(
             derive_parallel_widths(
                 tp_size=8,
@@ -2234,7 +2485,7 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
                 dcp_enabled=False,
             )
         )
-        self.assertEqual(declared, produced)
+        self.assertEqual(produced - set(_derived_widths()), set())
 
     def test_a_declared_quotient_is_not_a_record_field(self):
         """It has no operator input to preserve, and the record is what crosses
@@ -2263,9 +2514,8 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
     def test_every_publisher_that_builds_a_runner_passes_a_bundle(self):
         import ast as _ast
 
-        root = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
         offenders = []
-        for path in root.rglob("*.py"):
+        for path in _sources():
             text = path.read_text(encoding="utf-8-sig")
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
@@ -2284,13 +2534,468 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
                     and getattr(node.func, "id", None) == "publish"
                     and not any(kw.arg == "ranks" for kw in node.keywords)
                 ):
-                    offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+                    offenders.append(f"{path}:{node.lineno}")
         self.assertEqual(
             offenders,
             [],
             "these publish without a spawn bundle and then build a ModelRunner, "
             "whose construction reads a recorded identity:\n  "
             + "\n  ".join(offenders),
+        )
+
+
+class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
+    """`parallel_state`'s getters are the definition, not a second spelling.
+
+    Business code asks `get_parallel()`; a call that goes straight to the getter
+    is a read the context cannot redirect, which is what a scope needs it to be
+    able to do. The package that defines them is exempt -- a read there would
+    go through the context back into itself -- and so is `multimodal_gen`, which
+    has its own parallel state.
+    """
+
+    #: May have callers. `get_self_pp_group` builds the single-rank group a
+    #: draft pipeline scope installs, so there is nothing for the context to
+    #: answer with until the scope has installed it; the other two are not
+    #: topology at all.
+    ALLOWED = {
+        "get_self_pp_group",
+        "get_default_distributed_backend",
+        "get_mooncake_transfer_engine",
+    }
+
+    #: Zero callers required, but not deprecated either: the context has no
+    #: name that answers the same question.
+    #:
+    #: The three widths read a group the build does not check against the
+    #: configuration, so "the group's width" and "the configured width" are two
+    #: facts -- the MoE-DP group is the attention-CP group when the latter is
+    #: wider, and the other two are simply not pinned yet. Pinning them in
+    #: `_WIDTH_AND_GROUP` is what would let them move.
+    NOT_ANSWERED_BY_THE_CONTEXT = {
+        "get_moe_data_parallel_world_size",
+        "get_moe_tensor_parallel_world_size",
+        "get_dcp_world_size",
+        # Answers `None` where the context asserts, which is the whole point of
+        # the caller that wants it.
+        "get_dcp_group_no_assert",
+        "get_torch_distributed_pg_options",
+    }
+
+    def _accessors(self):
+        """Derived from the source, not listed here: a guard whose subject set
+        is written by hand stops watching whatever gets added next."""
+        from sglang.srt.distributed import parallel_state as parallel_state_module
+
+        source = _pathlib.Path(parallel_state_module.__file__).read_text().splitlines()
+        return {
+            line[len("def ") : line.index("(")]
+            for line in source
+            if line.startswith("def get_") or line.startswith("def is_")
+        }
+
+    def _callers(self, name):
+        """Every call in business code, including one hiding behind an import
+        alias -- `from ... import get_moe_dp_group as _g` then `_g()` is the
+        same reach past the context, and searching for the original spelling
+        alone reports zero while it is right there."""
+        import re
+
+        from sglang.srt.distributed import parallel_state as parallel_state_module
+
+        root = _pathlib.Path(parallel_state_module.__file__).parents[2]
+        hits = []
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
+                continue
+            text = path.read_text()
+            spellings = (
+                {name}
+                | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
+                | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
+            )
+            pattern = re.compile(
+                r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
+            )
+            for number, line in enumerate(text.splitlines(), 1):
+                if line.lstrip().startswith(("def ", "#")):
+                    continue
+                if pattern.search(line):
+                    hits.append(f"{rel}:{number}")
+        return hits
+
+    def test_no_business_code_calls_them(self):
+        offenders = {}
+        for name in sorted(self._accessors() - self.ALLOWED):
+            callers = self._callers(name)
+            if callers:
+                offenders[name] = callers
+        self.assertEqual(
+            offenders,
+            {},
+            "read these through get_parallel() instead, or say here why the "
+            "context cannot answer them",
+        )
+
+    #: How many callers each exempt accessor has outside the defining package.
+    #: A ratchet, not a description: these may go down and never up, and a name
+    #: that reaches zero comes off the list. Anything not here must have none.
+    ALLOWED_CALLERS = {
+        "get_self_pp_group": 1,
+        "get_default_distributed_backend": 1,
+        "get_mooncake_transfer_engine": 6,
+    }
+
+    def test_the_exempt_accessors_do_not_grow_new_callers(self):
+        """The zero-caller rule above cannot cover the three that are not
+        topology, so they get a count instead. Ratchets only turn one way: a
+        number that has to go up means a new business-code reader of a name the
+        context should be answering."""
+        for name, allowed in sorted(self.ALLOWED_CALLERS.items()):
+            callers = self._callers(name)
+            self.assertLessEqual(
+                len(callers),
+                allowed,
+                f"{name} grew a caller: {callers}. Read it through "
+                f"get_parallel() if the context can answer it; if it truly "
+                f"cannot, lower this number only when one goes away.",
+            )
+
+    def test_every_getter_the_context_answers_is_deprecated(self):
+        """The other half of the ratchet: the deprecation set is derived from
+        the table that maps a context name to the getter behind it, so dropping
+        a getter out of that table would quietly take it off the list. This
+        fails if one of them stops being marked."""
+        from sglang.srt.distributed import parallel_state
+
+        marked = set(parallel_state._CONTEXT_NAME_OF)
+        unclassified = (
+            self._accessors() - self.ALLOWED - self.NOT_ANSWERED_BY_THE_CONTEXT
+        )
+        for name in sorted(unclassified):
+            if name in marked:
+                continue
+            # Not answered by the context and not exempt: a getter that is
+            # neither is a name with no home, which is what this module exists
+            # to prevent.
+            self.assertIn(
+                name,
+                marked,
+                f"{name} is neither deprecated nor listed as exempt -- give it "
+                "a context name or say here why it has none",
+            )
+
+    def test_calling_one_from_outside_the_package_is_deprecated(self):
+        """The getters stay -- they are the definition -- but a call that comes
+        from outside the package that defines them cannot be redirected by a
+        scope, so it says what to read instead."""
+        import warnings
+
+        from sglang.srt.distributed import parallel_state
+
+        parallel_state._ALREADY_WARNED.discard("get_tensor_model_parallel_rank")
+        self.addCleanup(
+            parallel_state._ALREADY_WARNED.discard, "get_tensor_model_parallel_rank"
+        )
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            try:
+                parallel_state.get_tensor_model_parallel_rank()
+            except Exception:
+                pass
+        messages = [str(w.message) for w in seen]
+        self.assertTrue(
+            any("get_parallel().tp_rank" in m for m in messages),
+            f"expected the replacement to be named, got {messages}",
+        )
+
+    def test_nothing_the_context_answers_with_calls_back_into_the_package(self):
+        """The read path reaches the stored group, not the getter that used to
+        wrap it -- which is what lets the getters be deprecated without the
+        replacement tripping the warning meant for people who bypass it."""
+
+        import inspect
+
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import ParallelContext, _derived_widths
+
+        written = {n for n, d in _derived_widths().items() if not d.fn}
+        self.assertTrue(written, "no written-at-runtime names; this proves nothing")
+        self.assertIn("tp_group", written)
+
+        # The read path is lookups only -- override, stamp, bag. Nothing in it
+        # can reach a getter, which is what lets them be deprecated without the
+        # replacement tripping the warning meant for people who bypass it.
+        body = inspect.getsource(ParallelContext._read)
+        self.assertNotIn("_ps()", body)
+        self.assertNotIn("parallel_state", body)
+        self.assertNotIn("sglang.srt.runtime_context", parallel_state._EXEMPT_CALLERS)
+
+    def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
+        """The getters read the context, so redirecting a group redirects them
+        too. PD multiplexing needs exactly this: the in-package readers have to
+        follow the prefill communicator, not just the ones asking the context."""
+        from sglang.srt.distributed import parallel_state
+
+        stand_in = SimpleNamespace(world_size=1, rank_in_group=0)
+        with get_parallel().override(tp_group=stand_in):
+            self.assertIs(get_parallel().tp_group, stand_in)
+            self.assertIs(parallel_state.get_tp_group(), stand_in)
+
+    def test_the_package_that_defines_them_is_not_warned_at(self):
+        """`srt/distributed/` keeps calling them: a read there would go through
+        the context back into itself."""
+        import warnings
+
+        from sglang.srt.distributed import parallel_state
+
+        parallel_state._ALREADY_WARNED.discard("get_tensor_model_parallel_rank")
+        self.addCleanup(
+            parallel_state._ALREADY_WARNED.discard, "get_tensor_model_parallel_rank"
+        )
+        caller = types.ModuleType("sglang.srt.distributed.pretend_internal")
+        caller.__dict__["call"] = lambda: (
+            parallel_state.get_tensor_model_parallel_rank()
+        )
+        exec(
+            "def call():\n    from sglang.srt.distributed import parallel_state\n"
+            "    return parallel_state.get_tp_group()",
+            caller.__dict__,
+        )
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            try:
+                caller.call()
+            except Exception:
+                pass
+        self.assertEqual([str(w.message) for w in seen], [])
+
+    def test_the_guard_would_notice_a_caller(self):
+        """The subject set is derived, so this checks the search finds a real
+        call rather than that the list happens to be empty: `get_self_pp_group`
+        is exempt and does have one caller."""
+        self.assertTrue(self._callers("get_self_pp_group"))
+
+
+class TestTheTopologyIdentities(CustomTestCase):
+    """One set of identities, checked wherever the layout is written.
+
+    Each one is injected in the direction that breaks it and in the direction
+    that keeps it: a guard that only ever fires is as uninformative as one that
+    never does. They hold unconditionally -- a caller that states one leaf owes
+    the quotients that follow from it, because a namespace describing no real
+    layout is what the guard exists to refuse.
+    """
+
+    def _publish_square(self):
+        """tp=4 over two attention-DP replicas of two: every identity holds."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=3, dp_rank=1),
+        )
+
+    def test_a_published_topology_is_consistent(self):
+        """The quiet direction, and the reason publish can check everything:
+        it is the one write that establishes the whole layout."""
+        self._publish_square()
+        parallel = get_parallel()
+        self.assertEqual(parallel.tp_size, 4)
+        self.assertEqual(parallel.attn_dp_size, 2)
+        self.assertEqual(parallel.attn_tp_size, 2)
+        self.assertEqual(parallel.tp_rank, 3)
+
+    def test_a_width_that_does_not_factor_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
+            ):
+                pass
+        message = str(caught.exception)
+        self.assertIn("set by override", message)
+        self.assertIn("attn_tp_size * attn_dp_size * attn_cp_size", message)
+        self.assertIn("4 != 3 * 1 * 1", message)
+
+    def test_a_rank_at_its_width_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(tp_rank=4, tp_size=4):
+                pass
+        self.assertIn("0 <= tp_rank < tp_size", str(caught.exception))
+
+    def test_a_moe_width_that_does_not_factor_is_refused(self):
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_size=4, moe_ep_size=1, moe_dp_size=1, moe_tp_size=3
+            ):
+                pass
+        message = str(caught.exception)
+        self.assertIn("moe_ep_size * moe_dp_size * moe_tp_size", message)
+        self.assertIn("4 != 1 * 1 * 3", message)
+
+    def test_a_rank_the_attention_layout_cannot_produce_is_refused(self):
+        """`tp_rank` is not free of the attention ranks: the layout derives one
+        from the other, so a set that does not satisfy it places this process
+        in two different seats at once."""
+        self._publish_square()
+        with self.assertRaises(ValueError) as caught:
+            with get_parallel().override(
+                tp_rank=0,
+                attn_dp_rank=1,
+                attn_cp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_size=1,
+                attn_tp_size=2,
+            ):
+                pass
+        self.assertIn("attn_tp_size + attn_tp_rank", str(caught.exception))
+
+    def test_the_published_ranks_satisfy_the_layout(self):
+        """The quiet direction for the same identity: publish derives the
+        attention ranks from `tp_rank` through that very equation, so a
+        published process always sits in one seat."""
+        self._publish_square()
+        parallel = get_parallel()
+        self.assertEqual(
+            parallel.tp_rank,
+            (parallel.attn_dp_rank * parallel.attn_cp_size + parallel.attn_cp_rank)
+            * parallel.attn_tp_size
+            + parallel.attn_tp_rank,
+        )
+
+    def test_a_refused_write_leaves_nothing_behind(self):
+        """The scope never opened, so the value it tried to state must not be
+        readable afterwards -- a half-applied override is the state this guard
+        exists to prevent."""
+        self._publish_square()
+        with self.assertRaises(ValueError):
+            with get_parallel().override(
+                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
+            ):
+                pass
+        self.assertEqual(get_parallel().attn_tp_size, 2)
+
+    def test_a_group_built_at_another_width_is_refused(self):
+        """The other end of the same identity: what the configuration says and
+        what the coordinators were actually built at. Stating a group is how
+        the build hands it over, so that write is where the disagreement
+        surfaces -- still attributable to the build, and before a collective
+        runs on the wrong peers."""
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        wrong = GroupCoordinator.__new__(GroupCoordinator)
+        wrong.world_size = 8
+        wrong.rank_in_group = 0
+        with self.assertRaises(ValueError) as caught:
+            get_parallel().override_permanently(tp_group=wrong)
+        message = str(caught.exception)
+        self.assertIn("tp_group.world_size == tp_size", message)
+        self.assertIn("built 8, configured 4", message)
+        # The refused write left nothing behind: the name is unwritten, not
+        # holding a group no identity accepts.
+        with self.assertRaises(RuntimeError):
+            get_parallel().tp_group
+
+    def test_a_group_built_at_the_configured_width_is_quiet(self):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        right = GroupCoordinator.__new__(GroupCoordinator)
+        right.world_size = 4
+        right.rank_in_group = 3
+        get_parallel().override_permanently(tp_group=right)
+        self.assertIs(get_parallel().tp_group, right)
+
+    def test_a_draft_scope_states_a_consistent_topology(self):
+        """The scope narrows four names at once, so the identity applies to it
+        -- and holds, which is what lets the guard stay on."""
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        self._publish_square()
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = 2
+        group.rank_in_group = 1
+        with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+            self.assertEqual(get_parallel().attn_tp_size, 2)
+
+
+class TestTheParallelPhase(CustomTestCase):
+    """Publish says what the topology is; one phase builds it, once.
+
+    Before this, whichever runner was constructed first brought the groups up
+    on its way past, so whether they existed depended on construction order --
+    and a draft runner, which must not build them, went down the same path.
+    """
+
+    def test_building_twice_is_refused(self):
+        from sglang.srt.distributed import bootstrap
+
+        bootstrap.reset_parallel_initialised()
+        self.addCleanup(bootstrap.reset_parallel_initialised)
+        with (
+            patch.object(bootstrap, "_resolve_backend", return_value="gloo"),
+            patch.object(bootstrap, "_resolve_dist_init_method", return_value="env://"),
+            patch.object(bootstrap, "_set_all_reduce_flags"),
+            patch.object(bootstrap, "_init_parallel_groups"),
+            patch.object(bootstrap, "monkey_patch_p2p_access_check"),
+            patch.object(bootstrap, "_init_cpu_threads_env"),
+            patch.object(bootstrap, "_bind_threads_if_cpu", return_value=None),
+            patch.object(bootstrap, "maybe_init_shared_mooncake_transfer_engine"),
+        ):
+            reset_context()
+            self.addCleanup(reset_context)
+            publish(
+                ServerArgs(model_path="dummy"),
+                role="test",
+                ranks=SpawnRanks(world_rank=0),
+            )
+            kwargs = dict(
+                server_args=ServerArgs(model_path="dummy"),
+                model_config=None,
+                device="cpu",
+                dist_port=12345,
+            )
+            bootstrap.init_parallel_runtime(**kwargs)
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.init_parallel_runtime(**kwargs)
+        self.assertIn("ran twice", str(caught.exception))
+
+    def test_every_publisher_that_builds_a_runner_runs_the_phase(self):
+        """The companion to the bundle census: an entry that publishes and then
+        builds a runner has to bring the parallel runtime up
+        itself, because the runner no longer does it on the way past."""
+        import ast as _ast
+
+        offenders = []
+        for path in _sources():
+            text = path.read_text(encoding="utf-8-sig")
+            if "ModelRunner(" not in text or "publish(" not in text:
+                continue
+            tree = _ast.parse(text)
+            builds = any(
+                isinstance(n, _ast.Call)
+                and getattr(n.func, "id", getattr(n.func, "attr", None))
+                == "ModelRunner"
+                for n in _ast.walk(tree)
+            )
+            if not builds:
+                continue
+            if "init_parallel_runtime(" not in text:
+                offenders.append(str(path))
+        self.assertEqual(
+            offenders,
+            [],
+            "these publish and then build a ModelRunner without bringing the "
+            "parallel runtime up first:\n  " + "\n  ".join(offenders),
         )
 
 
@@ -2330,27 +3035,397 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         group = self._single_member_group()
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)
-        with patch.object(parallel_state, "_PP", group):
-            with parallel_state.patch_pipeline_parallel_group(group):
-                self.assertEqual(get_parallel().pp_size, 1)
-                self.assertEqual(get_parallel().pp_rank, 0)
-                self.assertIs(get_parallel().pp_group, group)
+        with parallel_state.patch_pipeline_parallel_group(group):
+            self.assertEqual(get_parallel().pp_size, 1)
+            self.assertEqual(get_parallel().pp_rank, 0)
+            self.assertIs(get_parallel().pp_group, group)
         self.assertEqual(get_parallel().pp_size, 2)
         self.assertEqual(get_parallel().pp_rank, 1)
+
+    def _group(self, world_size, rank):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = world_size
+        group.rank_in_group = rank
+        return group
+
+    def test_the_tensor_swap_states_the_draft_has_no_attention_replica(self):
+        """The draft runs the whole model on the group being installed. Its
+        attention identity is therefore that group, with one replica -- while
+        the target this process also serves is attention-DP over four ranks."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().attn_tp_size, 2)
+
+        group = self._group(world_size=2, rank=1)
+        with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+            parallel = get_parallel()
+            self.assertEqual(parallel.tp_size, 2)
+            self.assertEqual(parallel.attn_tp_size, 2)
+            self.assertEqual(parallel.attn_tp_rank, 1)
+            self.assertEqual(parallel.attn_dp_size, 1)
+            self.assertEqual(parallel.attn_dp_rank, 0)
+            self.assertEqual(parallel.attn_cp_size, 1)
+            self.assertEqual(parallel.attn_cp_rank, 0)
+            # `dp_size` is the deployment's replica count, not a property of
+            # the group being installed, so the scope leaves it alone --
+            # `require_mlp_tp_gather` asserts on it under dp attention.
+            self.assertEqual(parallel.dp_size, 2)
+            # The whole point of stating the rest: the identity the override
+            # path and the group build both check holds in here.
+            self.assertEqual(
+                parallel.tp_size,
+                parallel.attn_tp_size * parallel.attn_dp_size * parallel.attn_cp_size,
+            )
+        self.assertEqual(get_parallel().attn_dp_size, 2)
+        self.assertEqual(get_parallel().dp_size, 2)
+
+    def test_every_caller_says_whether_the_draft_owns_its_attention(self):
+        """The scope cannot work it out from the group it is handed: the same
+        call site passes an attention-TP slice for one draft and the target's
+        whole TP group for another, and the two want opposite answers. So the
+        worker states it, and a caller that forgets is the bug this catches --
+        `owns_attention` has no default, but a missing one is a TypeError only
+        on the path that runs, and these paths need a GPU and a draft model."""
+        self.assertEqual(
+            _scope_entries_that_say_nothing(_sources()),
+            [],
+            "these enter the draft scope without saying",
+        )
+
+    def test_the_census_would_notice_one(self):
+        """Two ways for it to report zero and still be wrong: the matcher does
+        not recognise the call, or the walk never reaches the file. A draft
+        scope entered from `benchmark/` breaks the same way as one in the
+        package and no suite covers it, so the roots are part of the check."""
+        trees = {
+            part
+            for path in _sources()
+            for part in ("benchmark", "examples", "scripts", "test")
+            if f"/{part}/" in path.as_posix()
+        }
+        self.assertEqual(
+            trees,
+            {"benchmark", "examples", "scripts", "test"},
+            "the walk misses a tree that can enter the scope",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = _pathlib.Path(tmp) / "probe.py"
+            probe.write_text(
+                "with self.draft_tp_context(runner.tp_group):\n    pass\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_scope_entries_that_say_nothing([probe]), [f"{probe}:1"])
+
+    def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
+        """The other caller. A draft built outside any scope carries the
+        target's whole TP group, and the graph capture installs *that* -- so
+        the process is still one of two attention-DP replicas and still gathers
+        with the other one. Narrowing here would claim a replica count it does
+        not have, and the reader that acts on it is a collective: the DP gather
+        takes its buffer size from the replica count and its communicator from
+        this group, so the two stop agreeing and the all-gather is refused."""
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=2, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        whole_tp = self._group(world_size=4, rank=0)
+        with patch.object(parallel_state, "_TP", whole_tp):
+            with parallel_state.patch_tensor_parallel_group(
+                whole_tp, owns_attention=False
+            ):
+                parallel = get_parallel()
+                self.assertEqual(parallel.tp_size, 4)
+                self.assertEqual(parallel.attn_dp_size, 2)
+                self.assertEqual(parallel.attn_tp_size, 2)
+                self.assertEqual(parallel.dp_size, 2)
 
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         """A weight check is an on-demand request served from the scheduler
         loop, so it runs outside the scope that describes a draft runner. Its
-        report has to name the runner it was built for, which is why it holds
-        a record instead of asking the context."""
-        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        report has to name the runner it was built for, which is why it reads
+        the placement once, where it is built, instead of asking again when the
+        request arrives."""
+        from sglang.srt.distributed import parallel_state
         from sglang.srt.utils.weight_checker import WeightChecker
 
-        draft = ParallelState.trivial(pp_rank=0, pp_size=1)
-        checker = WeightChecker(get_model=lambda: None, ps=draft)
         self._two_stage_pipeline()
+        self.assertEqual(get_parallel().pp_size, 2)
+        group = self._single_member_group()
+        with parallel_state.patch_pipeline_parallel_group(group):
+            checker = WeightChecker(get_model=lambda: None)
+
+        # The scope has closed and the context answers the target's shape again.
+        self.assertEqual(get_parallel().pp_size, 2)
         info = checker._parallelism_info()
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
+
+
+class TestTheRecordIsNeverWrittenTo(CustomTestCase):
+    """`server_args` is the startup record; the bags are the truth afterwards.
+
+    Writing a field onto it after `resolve_once()` has sealed it puts a second
+    answer where there is supposed to be one, and it is invisible to anything
+    reading the bag. The sanctioned writer is `RuntimeContext.override`, which
+    writes the bag and says so in its own contract. `arg_groups/` is exempt: it
+    is the resolution pipeline, so building the record is its job.
+    """
+
+    #: Assignments here are the record being built, not mutated behind a reader.
+    EXEMPT = ("srt/arg_groups/",)
+
+    def test_nothing_assigns_a_field_of_the_record(self):
+        import ast as _ast
+
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.server_args import ServerArgs
+
+        fields = set(namespace_of(ServerArgs))
+        offenders = []
+        for path in _sources():
+            rel = path.as_posix()
+            if "sglang/srt/" not in rel and "sglang/benchmark/" not in rel:
+                continue
+            if any(part in rel for part in self.EXEMPT):
+                continue
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                targets = (
+                    node.targets
+                    if isinstance(node, _ast.Assign)
+                    else [node.target]
+                    if isinstance(node, (_ast.AugAssign, _ast.AnnAssign))
+                    else []
+                )
+                for target in targets:
+                    if not isinstance(target, _ast.Attribute):
+                        continue
+                    base = target.value
+                    name = getattr(base, "id", getattr(base, "attr", None))
+                    if target.attr.startswith("_"):
+                        continue
+                    if name == "server_args" and target.attr in fields:
+                        offenders.append(f"{rel}:{target.lineno} .{target.attr}")
+        self.assertEqual(
+            offenders,
+            [],
+            "write the bag through get_context().override(source, ...) instead "
+            "-- the record is not a channel:\n  " + "\n  ".join(offenders),
+        )
+
+
+class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
+    """The package stopped re-exporting the getters and the build stopped
+    taking widths. Both are import-time or call-time failures in whatever tree
+    they survive in, and the trees beside the package have no suite to notice.
+    """
+
+    def _retired(self):
+        from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
+
+        return set(_CONTEXT_NAME_OF)
+
+    def test_nothing_imports_a_retired_name_from_the_package(self):
+        import ast as _ast
+
+        retired = self._retired()
+        offenders = []
+        for path in _sources():
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.ImportFrom)
+                    and node.module == "sglang.srt.distributed"
+                ):
+                    for alias in node.names:
+                        if alias.name in retired:
+                            offenders.append(f"{path}:{node.lineno} {alias.name}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these import a name the package no longer re-exports; import it "
+            "from parallel_state, or read get_parallel():\n  " + "\n  ".join(offenders),
+        )
+
+    def test_nothing_passes_a_width_to_the_build(self):
+        """`multimodal_gen` is out: it has a function of this name that builds
+        its own parallelism from its own degrees."""
+        import ast as _ast
+        import inspect
+
+        from sglang.srt.distributed.parallel_state import initialize_model_parallel
+
+        takes = set(inspect.signature(initialize_model_parallel).parameters)
+        offenders = []
+        for path in _sources():
+            if "multimodal_gen" in path.parts:
+                continue
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.Call)
+                    and getattr(node.func, "id", getattr(node.func, "attr", None))
+                    == "initialize_model_parallel"
+                ):
+                    stale = [
+                        kw.arg for kw in node.keywords if kw.arg and kw.arg not in takes
+                    ]
+                    if stale or node.args:
+                        offenders.append(
+                            f"{path}:{node.lineno} {stale or 'positional'}"
+                        )
+        self.assertEqual(
+            offenders,
+            [],
+            "the build reads every width from the context; publish the "
+            "topology instead of passing it:\n  " + "\n  ".join(offenders),
+        )
+
+
+class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
+    """`ModelRunner.__init__` freezes its placement partway through.
+
+    A method called before that point reads an attribute that does not exist
+    yet, and only on the configuration that reaches it -- a remote weight
+    transporter, a NUMA binding -- so the suites say nothing and a GPU job is
+    where it surfaces. The order is what makes it wrong, so the order is what
+    is checked.
+    """
+
+    def _model_runner(self):
+        import ast as _ast
+
+        source = (_SRT / "model_executor" / "model_runner.py").read_text()
+        for node in _ast.parse(source).body:
+            if isinstance(node, _ast.ClassDef) and node.name == "ModelRunner":
+                return {m.name: m for m in node.body if isinstance(m, _ast.FunctionDef)}
+        raise AssertionError("ModelRunner not found")
+
+    def _frozen_names(self, methods):
+        import ast as _ast
+
+        return {
+            target.attr
+            for node in _ast.walk(methods["init_torch_distributed"])
+            if isinstance(node, _ast.Assign)
+            for target in node.targets
+            if isinstance(target, _ast.Attribute)
+            and isinstance(target.value, _ast.Name)
+            and target.value.id == "self"
+        }
+
+    def _reads(self, methods, fn, frozen, depth=0):
+        import ast as _ast
+
+        found = set()
+        for node in _ast.walk(fn):
+            if (
+                isinstance(node, _ast.Attribute)
+                and isinstance(node.value, _ast.Name)
+                and node.value.id == "self"
+                and isinstance(node.ctx, _ast.Load)
+                and node.attr in frozen
+            ):
+                found.add(node.attr)
+            if (
+                depth < 2
+                and isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Attribute)
+                and isinstance(node.func.value, _ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr in methods
+                and node.func.attr != "init_torch_distributed"
+            ):
+                found |= self._reads(
+                    methods, methods[node.func.attr], frozen, depth + 1
+                )
+        return found
+
+    def _calls_before_the_freeze(self, methods):
+        import ast as _ast
+
+        calls = []
+        for statement in methods["__init__"].body:
+            for node in _ast.walk(statement):
+                if (
+                    isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and isinstance(node.func.value, _ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    calls.append((node.lineno, node.func.attr))
+        calls.sort()
+        names = [name for _, name in calls]
+        self.assertIn(
+            "init_torch_distributed",
+            names,
+            "the freeze moved; this census is keyed on where it happens",
+        )
+        return calls[: names.index("init_torch_distributed")]
+
+    def test_no_method_called_before_the_freeze_reads_what_it_freezes(self):
+        methods = self._model_runner()
+        frozen = self._frozen_names(methods)
+        self.assertGreater(len(frozen), 5, "found no frozen names; census is broken")
+        offenders = []
+        for lineno, name in self._calls_before_the_freeze(methods):
+            fn = methods.get(name)
+            if fn is None:
+                continue
+            read = self._reads(methods, fn, frozen)
+            if read:
+                offenders.append(
+                    f"__init__:{lineno} self.{name}() reads {sorted(read)}"
+                )
+        self.assertEqual(
+            offenders,
+            [],
+            "these run before init_torch_distributed and read what it sets; "
+            "ask get_parallel() there, or move the call after the freeze:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_the_census_would_notice_one(self):
+        """The positive control: the walk has to find a read that is there."""
+        import ast as _ast
+        import textwrap
+
+        methods = {
+            m.name: m
+            for m in _ast.parse(
+                textwrap.dedent(
+                    """
+                    class R:
+                        def init_torch_distributed(self):
+                            self.tp_rank = 0
+
+                        def early(self):
+                            return self.tp_rank
+                    """
+                )
+            )
+            .body[0]
+            .body
+        }
+        frozen = self._frozen_names(methods)
+        self.assertEqual(frozen, {"tp_rank"})
+        self.assertEqual(self._reads(methods, methods["early"], frozen), {"tp_rank"})
 
 
 if __name__ == "__main__":
