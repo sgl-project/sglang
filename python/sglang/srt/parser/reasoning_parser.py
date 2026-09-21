@@ -128,7 +128,9 @@ class BaseReasoningFormatDetector:
         idx = text.find(self.tool_start_token)
         while idx != -1:
             prev = text[idx - 1] if idx > 0 else preceded_by
-            if not self.tool_start_at_line_start or prev == "\n":
+            # Nothing precedes the token at the absolute start of generation;
+            # that counts as line start too.
+            if not self.tool_start_at_line_start or prev in ("", "\n"):
                 return idx
             idx = text.find(self.tool_start_token, idx + 1)
         return -1
