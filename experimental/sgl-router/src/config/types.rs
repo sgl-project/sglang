@@ -11,7 +11,7 @@ pub struct Config {
     /// Discovery mode resolved from CLI options; static URLs are checked by [`Config::validate`].
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
-    pub active_load: ActiveLoadConfig,
+    pub router_inflight_load: InflightLoadConfig,
 }
 
 /// Outbound request timeout settings.
@@ -19,6 +19,8 @@ pub struct Config {
 pub struct ProxyConfig {
     /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
+    /// Maximum silence between streamed upstream chunks before the stream fails.
+    pub stream_idle_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -29,13 +31,14 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            stream_idle_timeout_secs: 180,
         }
     }
 }
 
 /// Request-tracking timeout; defaults above the proxy timeout.
 #[derive(Debug, Clone, Copy)]
-pub struct ActiveLoadConfig {
+pub struct InflightLoadConfig {
     /// Maximum request-entry lifetime before cancellation with 504 `stale_request_expired`.
     pub stale_request_timeout_secs: u64,
 }
@@ -44,7 +47,7 @@ pub fn default_stale_request_timeout_secs() -> u64 {
     600
 }
 
-impl Default for ActiveLoadConfig {
+impl Default for InflightLoadConfig {
     fn default() -> Self {
         Self {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
