@@ -250,6 +250,49 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
+def _dense_fp4_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    kv_fp4: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    from deep_gemm import fp8_fp4_mqa_logits
+
+    return fp8_fp4_mqa_logits(
+        q_fp4,
+        kv_fp4,
+        weights,
+        ks.to(torch.int32),
+        ke.to(torch.int32),
+        False,
+        max_seqlen_k,
+    )
+
+
+def _prefill_graph_dense_k_layout(
+    req_to_token: torch.Tensor,
+    pool,
+    layer_id: int,
+    ratio: int,
+    width: int,
+    local_req_ids: torch.Tensor,
+    req_ids: torch.Tensor,
+    req_lens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Pack up to eight replayed requests into capture-stable contiguous FP4 K."""
+    req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
+    ks = req_ord.to(torch.int32) * width
+    logical_k = torch.arange(width, device=req_to_token.device)
+    valid_k = logical_k[None, :] < (req_lens[:, None] // ratio)
+    logical_pos = (logical_k[None, :] * ratio).expand_as(valid_k)
+    logical_pos = logical_pos.masked_fill(~valid_k, 0)
+    k_slots = req_to_token[req_ids[:, None], logical_pos].to(torch.int64) // ratio
+    k_slots = k_slots.masked_fill(~valid_k, 0).clamp_min_(0).flatten()
+    return ks, k_slots, pool.get_low_ratio_index_k_fp4(layer_id, k_slots)
+
+
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
@@ -946,6 +989,7 @@ def _tail_rows(
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
+_PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS = 8
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -990,6 +1034,10 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    low_ratio_local_req_indices: Optional[torch.Tensor] = None
+    low_ratio_dense_req_indices: Optional[torch.Tensor] = None
+    low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
+    prefill_graph_dense_indexer: bool = False
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1040,6 +1088,19 @@ class DSV4Metadata:
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
         )
+        if self.prefill_graph_dense_indexer:
+            maybe_copy_inplace(
+                self.low_ratio_local_req_indices,
+                src=static_metadata.low_ratio_local_req_indices,
+            )
+            maybe_copy_inplace(
+                self.low_ratio_dense_req_indices,
+                src=static_metadata.low_ratio_dense_req_indices,
+            )
+            maybe_copy_inplace(
+                self.low_ratio_dense_seq_lens,
+                src=static_metadata.low_ratio_dense_seq_lens,
+            )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -1522,6 +1583,31 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
+            metadata.prefill_graph_dense_indexer = (
+                cp_active
+                and envs.SGLANG_DSV41_BCG_DENSE_INDEXER.get()
+                and req_pool_indices.numel()
+                <= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+            )
+            if metadata.prefill_graph_dense_indexer:
+                local_index = cp_metadata.local_index
+                if local_index is None:
+                    parallel = get_parallel()
+                    local_index = slice(
+                        parallel.attn_cp_rank, None, parallel.attn_cp_size
+                    )
+                metadata.low_ratio_local_req_indices = req_pool_indices_repeated[
+                    local_index
+                ].contiguous()
+                pad = (
+                    _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS - req_pool_indices.numel()
+                )
+                metadata.low_ratio_dense_req_indices = torch.nn.functional.pad(
+                    req_pool_indices.to(torch.int64), (0, pad)
+                )
+                metadata.low_ratio_dense_seq_lens = torch.nn.functional.pad(
+                    seq_lens.to(torch.int64), (0, pad)
+                )
         return metadata
 
     def _low_ratio_prefill_indexer_metadata(
@@ -1560,6 +1646,13 @@ class DeepseekV4AttnBackend(
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            envs.SGLANG_DSV41_BCG_DENSE_INDEXER.get()
+            and is_cp_active(forward_batch)
+            and forward_batch.req_pool_indices.numel()
+            > _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+        ):
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
