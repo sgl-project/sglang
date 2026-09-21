@@ -1,6 +1,14 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import ClassVar, Literal
 
 import torch
+
+LinearAttnKind = Literal["gdn", "kda"]
+LinearAttnPhase = Literal["decode", "extend"]
+LinearAttnKernelFactory = Callable[
+    ["LinearAttnKernelBase"], "LinearAttnKernelBase"
+]
 
 
 class LinearAttnKernelBase(ABC):
@@ -20,6 +28,42 @@ class LinearAttnKernelBase(ABC):
     # unwritten and corrupts prefix-cache restores. Kernels that reject
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
+
+    _oot_kernel_registry: ClassVar[
+        dict[
+            str,
+            dict[tuple[LinearAttnKind, LinearAttnPhase], LinearAttnKernelFactory],
+        ]
+    ] = {}
+
+    @classmethod
+    def register_oot_kernel(
+        cls,
+        kind: LinearAttnKind,
+        phase: LinearAttnPhase,
+        factory: LinearAttnKernelFactory,
+        platform_key: str,
+    ) -> None:
+        """Register an OOT factory for one linear-attention kernel phase."""
+        registry = cls._oot_kernel_registry.setdefault(platform_key, {})
+        registry[(kind, phase)] = factory
+
+    @classmethod
+    def resolve_oot_kernel(
+        cls,
+        kind: LinearAttnKind,
+        phase: LinearAttnPhase,
+        fallback: "LinearAttnKernelBase",
+    ) -> "LinearAttnKernelBase":
+        """Return the active OOT kernel or the selected in-tree fallback."""
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            return fallback
+        factory = cls._oot_kernel_registry.get(
+            current_platform.get_dispatch_key_name(), {}
+        ).get((kind, phase))
+        return fallback if factory is None else factory(fallback)
 
     @abstractmethod
     def decode(
