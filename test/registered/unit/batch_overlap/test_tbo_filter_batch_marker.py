@@ -80,6 +80,17 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+    def test_filter_batch_children_inherit_deferred_logits(self):
+        """A graph that defers logits to an eager tail defers them for both
+        TBO halves; a child that reset the flag would run the logits processor
+        inside the captured body."""
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                parent = _make_target_verify_batch(8)
+                parent.defer_logits_to_eager = deferred
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.defer_logits_to_eager, deferred)
+
 
 def _make_valued_batch(bs: int) -> ForwardBatch:
     # Distinct per-position values so a filtered slice is unambiguous.
