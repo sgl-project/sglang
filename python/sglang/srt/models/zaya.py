@@ -53,7 +53,6 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -1389,7 +1388,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1489,7 +1488,7 @@ class ZayaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = ZayaModel(
             config=config,

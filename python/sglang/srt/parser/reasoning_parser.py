@@ -2166,6 +2166,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV4Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
@@ -2191,6 +2192,7 @@ class ReasoningParser:
         "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }

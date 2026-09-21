@@ -6,7 +6,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
@@ -614,7 +613,7 @@ class HYV4DecoderLayer(nn.Module):
 class HYV4Model(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
-        if get_pp_group().world_size != 1:
+        if get_parallel().pp_group.world_size != 1:
             raise ValueError("HYV4 pipeline parallelism is not supported")
         self.config = config
         self.start_layer = 0
@@ -675,7 +674,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.model = HYV4Model(config, quant_config, f"{prefix}.model")
         self.num_fused_shared_experts = max(
             (
