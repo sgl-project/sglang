@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.layernorm import mhc
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,7 +35,7 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
         self.allocators = (
             patch.object(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext()),
             patch.object(mhc, "is_allocation_symmetric", return_value=False),
-            patch.object(mhc, "get_tp_group", return_value=None),
+            get_parallel().override(tp_group=None),
         )
         for item in self.allocators:
             item.start()
