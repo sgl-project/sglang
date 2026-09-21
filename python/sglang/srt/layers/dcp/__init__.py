@@ -42,6 +42,7 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
     dcp_enabled,
+    draft_forward_guard,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
     init_fi_a2a_workspace,
@@ -51,7 +52,10 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
 )
-from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.metadata import (
+    DecodeContextParallelMetadata,
+    SupportsDecodeContextParallelMetadata,
+)
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
 # (get_server_args), whereas this package-init executes at module-load time
@@ -63,6 +67,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "SupportsDecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
@@ -74,6 +79,7 @@ __all__ = [
     "cp_lse_ag_out_rs_mla",
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
+    "draft_forward_guard",
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",

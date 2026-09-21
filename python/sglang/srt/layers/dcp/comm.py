@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import contextlib
 import warnings
 from typing import Optional
 
@@ -49,6 +50,13 @@ def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
         DeprecationWarning,
         stacklevel=2,
     )
+
+
+def draft_forward_guard(is_draft: bool):
+    """Run a draft forward with DCP disabled (the draft KV pool is not sharded)."""
+    if not is_draft:
+        return contextlib.nullcontext()
+    return get_parallel().override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0)
 
 
 def dcp_enabled() -> bool:
