@@ -17,15 +17,17 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
+          core.info(`[health-check] START -- event=${context.eventName}, runId=${context.runId}`);
+
           // Skip when explicitly requested via env var (e.g. release branch cut)
           if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
-            core.info('Skipping health check (SKIP_PR_TEST_HEALTH_CHECK=true)');
+            core.info('[health-check] SKIP: SKIP_PR_TEST_HEALTH_CHECK=true');
             return;
           }
 
           // Skip for scheduled runs -- they should collect all failures, not fail-fast
           if (context.eventName === 'schedule') {
-            core.info('Skipping health check for scheduled run');
+            core.info('[health-check] SKIP: scheduled run');
             return;
           }
 
@@ -33,6 +35,7 @@ runs:
           // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
           // checks.listForRef which queries by commit SHA across ALL workflows.
           const ref = context.payload.pull_request?.head?.sha || context.sha;
+          core.info(`[health-check] Checking lint for ref=${ref}`);
           const { data } = await github.rest.checks.listForRef({
             owner: context.repo.owner,
             repo: context.repo.repo,
@@ -42,6 +45,7 @@ runs:
           const lintRun = data.check_runs.find(
             cr => cr.app?.slug === 'github-actions'
           );
+          core.info(`[health-check] Lint check: status=${lintRun?.status}, conclusion=${lintRun?.conclusion}`);
           if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
             core.setFailed('Fail-fast: lint check failed');
             return;
@@ -51,9 +55,10 @@ runs:
           const { resolveCiLabels } = require(
             `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
           );
-          const { bypassFailFast } = await resolveCiLabels(github, context);
-          if (bypassFailFast) {
-            core.info('Skipping jobs-failed check (bypass-fail-fast label present)');
+          const axes = await resolveCiLabels(github, context);
+          core.info(`[health-check] PR labels: [${axes.labels.join(', ')}]`);
+          if (axes.bypassFailFast) {
+            core.info('[health-check] SKIP jobs-failed check: bypass-fail-fast label present');
             return;
           }
 
@@ -63,6 +68,10 @@ runs:
             run_id: context.runId,
             per_page: 100,
           });
+          core.info(`[health-check] Total jobs in run: ${jobs.length}`);
+          const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
+          core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
+
           // Find jobs that failed from a real error, not from fail-fast cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
@@ -74,15 +83,26 @@ runs:
             // 'h20' with the 'h200' prefix.
             const baseName = j.name.split(/[ /]/)[0];
             if (baseName === 'base-c-test-8-gpu-h20') {
+              core.info(`[health-check] Filtered out h20 job: ${j.name}`);
               return false;
             }
-            // If the failing step is the health check, it's a cascade — skip it
+            // multimodal-gen NPU tests should not cascade fail-fast to perf/accuracy stages.
+            if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+              core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
+              return false;
+            }
+            // If the failing step is the health check, it's a cascade -- skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
+              core.info(`[health-check] Filtered out cascade failure: ${j.name} (failed step: ${failedStep.name})`);
               return false;
             }
             return true;
           });
+          core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
+
           if (rootCauseFailures.length > 0) {
             core.setFailed(`Fail-fast: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
+          } else {
+            core.info('[health-check] PASS: no root cause failures detected');
           }
