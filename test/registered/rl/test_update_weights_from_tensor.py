@@ -14,7 +14,12 @@ import requests
 import torch
 
 import sglang as sgl
-from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    get_device,
+    get_device_module,
+    kill_process_tree,
+)
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -26,8 +31,10 @@ from sglang.test.test_utils import (
 
 
 def test_update_weights_from_tensor(tp_size):
-    assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
-    torch.cuda.empty_cache()
+    assert get_device_module().device_count() >= tp_size, (
+        f"At least {tp_size} GPUs are required"
+    )
+    get_device_module().empty_cache()
 
     engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, tp_size=tp_size)
 
@@ -35,8 +42,8 @@ def test_update_weights_from_tensor(tp_size):
 
     _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
 
-    memory_before = torch.cuda.memory_allocated()
-    new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+    memory_before = get_device_module().memory_allocated()
+    new_tensor = torch.full((16384, 2048), 1.5, device=get_device())
 
     time_start = time.perf_counter()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
@@ -44,14 +51,15 @@ def test_update_weights_from_tensor(tp_size):
 
     for param_name in param_names[:3]:
         _check_param(engine, param_name, [1.5] * 5)
-
     engine.shutdown()
 
     del new_tensor
     gc.collect()
-    torch.cuda.ipc_collect()
-    torch.cuda.empty_cache()
-    memory_after = torch.cuda.memory_allocated()
+    if torch.cuda.is_available():
+        # torch.xpu has no ipc_collect; drop the guard once it gains one.
+        torch.cuda.ipc_collect()
+    get_device_module().empty_cache()
+    memory_after = get_device_module().memory_allocated()
     assert memory_after <= memory_before + 1024, (
         f"Memory leak detected: {memory_after - memory_before} bytes"
     )
@@ -61,7 +69,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:
-            if torch.cuda.device_count() < tp_size:
+            if get_device_module().device_count() < tp_size:
                 continue
 
             with self.subTest(tp_size=tp_size):
@@ -142,7 +150,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         for _, name in enumerate(param_names):
             # Create tensors with different values for each parameter
             value = 2.0  # Different value for each parameter
-            new_tensor = torch.full((16384, 2048), value, device="cuda")
+            new_tensor = torch.full((16384, 2048), value, device=get_device())
             new_tensors.append((name, new_tensor))
 
         # Create a flattened bucket
@@ -257,7 +265,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
             time.sleep(2)
 
             param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
-            new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+            new_tensor = torch.full((16384, 2048), 1.5, device=get_device())
             named_tensors = [(x, new_tensor) for x in param_names]
 
             # abort mode ensures server is totally idle before returning

@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
+from sglang.srt.utils import get_device, get_device_module, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -99,7 +100,7 @@ class EngineWrapper:
 
 def get_gpu_memory_mb(device_id: int) -> float:
     """Return device-level GPU memory used in MB."""
-    free, total = torch.cuda.mem_get_info(device_id)
+    free, total = get_device_module().mem_get_info(device_id)
     return (total - free) / (1024**2)
 
 
@@ -124,6 +125,10 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
+    # torch-xpu-ops has no supportsSplitting override, so ProcessGroupXCCL reports
+    # supports_splitting=False and DeviceMesh's split_group path raises. Drop once
+    # torch-xpu-ops implements comm splitting.
+    @unittest.skipIf(is_xpu(), "XPU: ProcessGroupXCCL has no comm splitting")
     def test_multi_instance_release_memory_occupation(self):
         master_port = find_available_port(23456)
 
@@ -171,10 +176,10 @@ def _run_sglang_subprocess(
         os.environ["MASTER_PORT"] = str(master_port)
         dist.init_process_group(
             rank=rank,
-            device_id=torch.device(f"cuda:{rank}"),
+            device_id=torch.device(f"{get_device()}:{rank}"),
             world_size=dp_size * tp_size,
         )
-        torch.cuda.set_device(rank)
+        get_device_module().set_device(rank)
 
         base_gpu_id = rank // tp_size * tp_size
         mesh_kwargs = dict(
@@ -225,7 +230,7 @@ def _run_sglang_subprocess(
             hf_model = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-            ).to(f"cuda:{rank}")
+            ).to(f"{get_device()}:{rank}")
             mem_after = get_gpu_memory_mb(rank)
             assert_memory_increased(mem_before, mem_after, "load HF model")
         dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())
@@ -242,7 +247,7 @@ def _run_sglang_subprocess(
             print(f"GPU{rank} before releasing HF model: {mem_before:.0f} MB")
             del hf_model
             gc.collect()
-            torch.cuda.empty_cache()
+            get_device_module().empty_cache()
             mem_after = get_gpu_memory_mb(rank)
             assert_memory_decreased(mem_before, mem_after, "release HF model")
         dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())
