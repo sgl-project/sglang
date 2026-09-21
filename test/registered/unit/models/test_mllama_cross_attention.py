@@ -4,10 +4,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from transformers.models.mllama.processing_mllama import (
-    convert_sparse_cross_attention_mask_to_dense,
-    get_cross_attention_token_mask,
-)
 
 from sglang.srt.layers.attention import torch_native_backend
 from sglang.srt.layers.attention.cross_attention_mask import (
@@ -37,6 +33,7 @@ def _item(positions, tile_counts, value=1):
         pad_value=value,
         offsets=[(pos, pos) for pos in positions],
         model_specific_data={
+            "mllama_prompt_length": 7,
             "aspect_ratio_mask": torch.stack(
                 [torch.arange(2) < count for count in tile_counts]
             )[None],
@@ -49,32 +46,54 @@ def _model():
     model = object.__new__(MllamaForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.vision_model = SimpleNamespace(num_patches=2)
+    model.max_num_tiles = 2
     model.image_size = 2
     return model
 
 
-def test_image_visibility_matches_transformers():
-    input_ids = [0, 99, 99, 0, 0, 99, 0]
-    tile_counts = [1, 2, 1]
-    reference = convert_sparse_cross_attention_mask_to_dense(
-        [get_cross_attention_token_mask(input_ids, 99)],
-        [tile_counts],
-        max_num_tiles=2,
-        length=len(input_ids),
-    )[0]
-    expected = torch.from_numpy(reference).flatten(1).repeat_interleave(2, dim=1).bool()
-
-    # Full prefill, cached prefix, and generation share the image visibility rules.
-    for start, rows in ((0, expected), (3, expected[3:6]), (7, expected[-1:])):
+def test_image_visibility():
+    # Meta create_vision_mask/_pad_masks: markers at 1, 2, 5, two tiles per image.
+    expected = torch.tensor(
+        [
+            [False, False, False, False, False, False],
+            [True, False, False, False, False, False],
+            [True, False, True, True, False, False],
+            [True, False, True, True, False, False],
+            [True, False, True, True, False, False],
+            [False, False, False, False, True, False],
+            [False, False, False, False, True, False],
+        ]
+    ).repeat_interleave(2, dim=1)
+    for start, rows in (
+        (0, expected),
+        (3, expected[3:6]),
+        (5, torch.cat([expected[5:], torch.zeros_like(expected[:2])])),
+    ):
         actual = build_mllama_cross_attention_mask(
-            [1, 2, 5],
-            [torch.arange(2) < count for count in tile_counts],
+            image_positions=[1, 2, 5],
+            tile_masks=[torch.arange(2) < count for count in [1, 2, 1]],
             num_patches=2,
             query_start=start,
             query_length=len(rows),
+            prompt_length=7,
             device=torch.device("cpu"),
         )
         torch.testing.assert_close(actual, rows)
+
+    for positions in ([1], [1, 2], [1, 4]):
+        actual = build_mllama_cross_attention_mask(
+            image_positions=positions,
+            tile_masks=[torch.tensor([True, False])] * len(positions),
+            num_patches=2,
+            query_start=7,
+            query_length=1,
+            prompt_length=7,
+            device=torch.device("cpu"),
+        )
+        expected_decode = torch.zeros_like(actual)
+        if len(positions) == 1:
+            expected_decode[:, :2] = True
+        torch.testing.assert_close(actual, expected_decode)
 
 
 def test_processor_preserves_adjacent_image_markers():
@@ -104,7 +123,11 @@ def test_multiple_items_contribute_all_encoder_tokens():
     text = array("q", [1, 99, 99, 2])
     padded = model.pad_input_ids(text, mm_input)
     assert mm_input.num_image_tokens == 8
+    assert mm_input.mm_items[0].model_specific_data["mllama_prompt_length"] == len(text)
     assert padded[8:] == text
+    longer = model.pad_input_ids(text + array("q", [3]), mm_input)
+    assert longer[0] != padded[0]
+    assert model.pad_input_ids(text, mm_input) == padded
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         mm_inputs=[mm_input],
@@ -163,13 +186,33 @@ def test_mixed_batch_masks_with_cached_encoder():
 
     batch.forward_mode = ForwardMode.DECODE
     model.prepare_forward_batch(batch)
+    assert model.get_full_text_row_masked_out_mask(batch).flatten().tolist() == [
+        True,
+        False,
+        False,
+    ]
     indices, indptr = filter_cross_attention_kv_indices(
         torch.arange(12, dtype=torch.int32),
         torch.tensor([0, 4, 4, 12], dtype=torch.int32),
         batch.cross_attention_custom_mask,
     )
-    assert indices.tolist() == [0, 1, 8, 9]
-    assert indptr.tolist() == [0, 2, 2, 4]
+    # The inactive multi-image row uses finite attention before residual gating.
+    assert indices.tolist() == [0, 1, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert indptr.tolist() == [0, 2, 2, 10]
+
+    # Recomputed generated tokens retain the original prompt boundary.
+    batch.forward_mode = ForwardMode.EXTEND
+    batch.extend_prefix_lens_cpu = [7, 7, 7]
+    batch.extend_seq_lens_cpu = [2, 2, 2]
+    model.prepare_forward_batch(batch)
+    assert model.get_full_text_row_masked_out_mask(batch).flatten().tolist() == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
 
 
 @pytest.mark.parametrize("masked", [False, True])

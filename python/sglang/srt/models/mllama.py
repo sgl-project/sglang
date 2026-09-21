@@ -37,7 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs, _compute_pad_value
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -849,11 +849,17 @@ class MllamaForConditionalGeneration(nn.Module):
     def pad_input_ids(
         self, input_ids: array[int], mm_inputs: MultimodalInputs
     ) -> array[int]:
+        mm_inputs.mm_items[0].model_specific_data["mllama_prompt_length"] = len(
+            input_ids
+        )
         pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
         image_len = self.vision_model.num_patches * sum(
             item.feature.shape[1] * item.feature.shape[2] for item in mm_inputs.mm_items
         )
         mm_inputs.num_image_tokens = image_len
+        if image_len > self.vision_model.num_patches * self.max_num_tiles:
+            # Multi-image decoder KV depends on the original prompt boundary.
+            pad_values[0] = _compute_pad_value(hash((pad_values[0], len(input_ids))))
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
@@ -957,10 +963,14 @@ class MllamaForConditionalGeneration(nn.Module):
             q_len = 1 if is_decode else forward_batch.extend_seq_lens_cpu[i]
             if encoder_len == 0 or q_len == 0:
                 continue
-            positions, tile_masks = mllama_image_layout(forward_batch.mm_inputs[i])
-            # Generation repeats the last prompt row's image visibility.
+            mm_input = forward_batch.mm_inputs[i]
+            positions, tile_masks = mllama_image_layout(mm_input)
+            prompt_length = mm_input.mm_items[0].model_specific_data[
+                "mllama_prompt_length"
+            ]
+            # Image visibility stays constant beyond the prompt boundary.
             query_start = (
-                positions[-1] if is_decode else forward_batch.extend_prefix_lens_cpu[i]
+                prompt_length if is_decode else forward_batch.extend_prefix_lens_cpu[i]
             )
             mask = build_mllama_cross_attention_mask(
                 image_positions=positions,
@@ -968,10 +978,11 @@ class MllamaForConditionalGeneration(nn.Module):
                 num_patches=self.vision_model.num_patches,
                 query_start=query_start,
                 query_length=q_len,
+                prompt_length=prompt_length,
                 device=device,
             )
-            # Text before the first image uses a finite attention row. The
-            # cross-attention block zeros its attention and MLP residuals.
+            # Fully masked rows use finite attention, with both visual residuals
+            # zeroed by get_full_text_row_masked_out_mask.
             mask |= ~mask.any(dim=1, keepdim=True)
             mask_parts.append(mask.flatten())
 
@@ -979,8 +990,11 @@ class MllamaForConditionalGeneration(nn.Module):
             forward_batch.cross_attention_custom_mask = torch.cat(mask_parts)
 
     def get_full_text_row_masked_out_mask(self, forward_batch: ForwardBatch):
+        image_length = self.vision_model.num_patches * self.max_num_tiles
         if forward_batch.forward_mode.is_decode():
-            return (forward_batch.encoder_lens != 0).reshape(-1, 1)
+            # Meta extends image visibility during generation for single-image
+            # prompts. Each image occupies a fixed number of encoder slots.
+            return (forward_batch.encoder_lens == image_length).reshape(-1, 1)
 
         device = forward_batch.seq_lens.device
         parts = []
@@ -988,12 +1002,18 @@ class MllamaForConditionalGeneration(nn.Module):
             if forward_batch.encoder_lens_cpu[i] == 0:
                 parts.append(torch.zeros(q_len, dtype=torch.bool, device=device))
                 continue
-            first_image_pos = forward_batch.mm_inputs[i].mm_items[0].offsets[0][0]
+            first_item = forward_batch.mm_inputs[i].mm_items[0]
             query_start = forward_batch.extend_prefix_lens_cpu[i]
-            parts.append(
-                torch.arange(query_start, query_start + q_len, device=device)
-                >= first_image_pos
+            query_positions = torch.arange(
+                query_start, query_start + q_len, device=device
             )
+            visible = query_positions >= first_item.offsets[0][0]
+            if forward_batch.encoder_lens_cpu[i] != image_length:
+                visible &= (
+                    query_positions
+                    < first_item.model_specific_data["mllama_prompt_length"]
+                )
+            parts.append(visible)
         return torch.cat(parts).reshape(-1, 1)
 
     def forward(
@@ -1129,19 +1149,22 @@ def build_mllama_cross_attention_mask(
     num_patches: int,
     query_start: int,
     query_length: int,
+    prompt_length: int,
     device: torch.device,
 ) -> torch.Tensor:
     """Build a boolean [text queries, encoder tokens] visibility mask.
 
     An image is visible from its marker through the text preceding the next
-    image group. Consecutive markers share an end position, matching the
-    Transformers Mllama processor. The final group remains visible during
-    generation. Each tile contributes ``num_patches`` encoder tokens.
+    image group. Consecutive markers share an end position. Meta's reference
+    implementation extends single-image visibility during generation and ends
+    multi-image visibility at the prompt boundary. Each tile contributes
+    ``num_patches`` encoder tokens.
     """
     query_positions = torch.arange(
         query_start, query_start + query_length, device=device
     )
-    ends = [*image_positions[1:], query_start + query_length]
+    last_end = prompt_length if len(image_positions) > 1 else query_start + query_length
+    ends = [*image_positions[1:], last_end]
     for i in range(len(ends) - 2, -1, -1):
         if image_positions[i] + 1 == image_positions[i + 1]:
             ends[i] = ends[i + 1]
