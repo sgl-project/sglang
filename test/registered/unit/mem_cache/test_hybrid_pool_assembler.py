@@ -516,6 +516,74 @@ def _legacy_build_anchor_sidecar_stack(
     return host_pool_group, cache_controller
 
 
+def _legacy_build_kv_only_stack(
+    *,
+    params,
+    kv_pool,
+    full_layer_mapping,
+    load_cache_event,
+    storage_backend,
+    use_mla,
+    override_kv_cache_dim=None,
+    prefetch_threshold=256,
+    model_name=None,
+    storage_backend_extra_config=None,
+    enable_storage_metrics=False,
+):
+    """Pre-declaration plain KV assembly (_PlainKvStrategy before the
+    consolidation), kept here only as the parity oracle."""
+    transfer_layer_id_max = len(full_layer_mapping)
+    mtp_draft_device_pools = params.mtp_draft_device_pools
+    kv_host_pool = hybrid_pool_assembler.build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=params.page_size,
+        use_mla=use_mla,
+        override_kv_cache_dim=override_kv_cache_dim,
+        mtp_draft_device_pools=mtp_draft_device_pools,
+    )
+    if mtp_draft_device_pools:
+        full_layer_mapping = hybrid_pool_assembler._with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
+    host_pool_group = hybrid_pool_assembler.HostPoolGroup(
+        [
+            hybrid_pool_assembler.build_pool_entry(
+                name=PoolName.KV,
+                host_pool=kv_host_pool,
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_draft_device_pools),
+                is_anchor=True,
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        ]
+    )
+    cache_controller = hybrid_pool_assembler.HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=hybrid_pool_assembler.get_memory().hicache_write_policy,
+        io_backend=hybrid_pool_assembler.get_memory().hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=hybrid_pool_assembler.get_memory().hicache_host_memory_mode,
+    )
+    return host_pool_group, cache_controller
+
+
 class TestDeclaredStackParity(CustomTestCase):
     """assemble_declared_stack must build the same mirrors (real dummy host
     pools: size, page_num, layers, byte stride), entries, layer mapping,
@@ -635,6 +703,45 @@ class TestDeclaredStackParity(CustomTestCase):
                 self.assertEqual(
                     stack.sidecars, [dsa_indexer_pool_decl(pool).sidecar_spec()]
                 )
+
+    def test_matches_legacy_kv_only_assembly(self):
+        # A plain MLA pool declares KV only; the declared assembler must build
+        # the same anchor-only group the removed build_kv_only_stack built.
+        for name, drafts in (("no_draft", 0), ("packed_draft", 1)):
+            with self.subTest(case=name):
+                pool = _kv_pool_stub(layer_num=3)
+                params = SimpleNamespace(
+                    page_size=64,
+                    mtp_draft_device_pools=tuple(
+                        _kv_pool_stub(layer_num=1) for _ in range(drafts)
+                    ),
+                    token_to_kv_pool_allocator=None,
+                    tp_cache_group=None,
+                    attn_cp_cache_group=None,
+                    attn_tp_cache_group=None,
+                    pp_cache_group=None,
+                )
+                mapping = {0: 0, 1: 1, 2: 2}
+                (legacy_group, _), legacy_ctrl = self._run(
+                    _legacy_build_kv_only_stack,
+                    pool=pool,
+                    params=params,
+                    full_layer_mapping=mapping,
+                    kv_pool=pool,
+                )
+                stack, new_ctrl = self._run(
+                    assemble_declared_stack,
+                    pool=pool,
+                    params=params,
+                    full_layer_mapping=mapping,
+                    decls=pool.host_pool_decls(),
+                )
+                self.assertEqual(
+                    _entry_shape(stack.host_pool_group, 3 + drafts),
+                    _entry_shape(legacy_group, 3 + drafts),
+                )
+                self.assertEqual(new_ctrl, legacy_ctrl)
+                self.assertEqual(stack.sidecars, [])
 
 
 class TestDraftSidecarDeclarations(CustomTestCase):
