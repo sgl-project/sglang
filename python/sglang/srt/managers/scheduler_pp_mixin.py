@@ -103,7 +103,9 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
@@ -184,6 +186,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
+                self._sched_idled = True
                 self.on_idle()
 
     @DynamicGradMode()
@@ -242,7 +245,9 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -362,8 +367,10 @@ class SchedulerPPMixin:
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.on_idle()
+            if server_is_idle:
+                self._sched_idled = True
+                if len(self.disagg_prefill_inflight_queue) == 0:
+                    self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -388,7 +395,9 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (
+                    mb_id + get_parallel().pp_size
+                ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -552,11 +561,15 @@ class SchedulerPPMixin:
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
-            if server_is_idle and queue_size == 0:
-                self.on_idle()
+            if server_is_idle:
+                self._sched_idled = True
+                if queue_size == 0:
+                    self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self.pp_loop_size: int = (
+            get_parallel().pp_size + get_parallel().pp_async_batch_depth
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -568,7 +581,7 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
             envs.SGLANG_ENABLE_PP_SPEC.get()
-            and self.ps.pp_size > 1
+            and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
 
@@ -800,31 +813,39 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                self.ps.attn_dp_rank
+                * get_parallel().attn_cp_size
+                * get_parallel().attn_tp_size
             )
             p2p_work = point_to_point_pyobj(
                 data,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 self.world_group.cpu_group,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                ((get_parallel().pp_rank + 1) % get_parallel().pp_size)
+                * get_parallel().tp_size
+                + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
-                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                self.ps.attn_dp_rank
+                * get_parallel().attn_cp_size
+                * get_parallel().attn_tp_size
             )
             data = point_to_point_pyobj(
                 [],
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 self.world_group.cpu_group,
-                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                ((get_parallel().pp_rank - 1) % get_parallel().pp_size)
+                * get_parallel().tp_size
+                + dp_offset,
+                get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
             )
         else:
             data = None
@@ -865,10 +886,19 @@ class SchedulerPPMixin:
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
+        if (
+            draft_input is not None
+            and not batch.spec_algorithm.is_dspark()
+            and draft_input.topk_p is not None
+        ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            # Preserve the DSA IndexShare seed when rebuilding spec_info on each rank.
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["draft_dsa_topk_indices"] = (
+                    draft_input.dsa_topk_indices.contiguous()
+                )
 
         has_sampling_mask_output = (
             result.logits_output is not None
@@ -1109,6 +1139,17 @@ class SchedulerPPMixin:
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
+                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+            )
+            batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
 
@@ -1465,7 +1506,7 @@ class SchedulerPPMixin:
         # posted, so the parity-based send-first/recv-first ordering used
         # for NPU is replaced by batch_isend_irecv which submits all
         # send/recv operations atomically.
-        if _is_npu and self.ps.pp_size == 2:
+        if _is_npu and get_parallel().pp_size == 2:
             return self._pp2_only_send_recv_output_tensors_npu(
                 next_first_rank_mb_id,
                 next_mb_id,
@@ -1493,7 +1534,7 @@ class SchedulerPPMixin:
         # makes rank 1 post its recv first, which breaks the cycle for any
         # pp_size > 1.
         needs_pairing = is_xpu() or self._pp_spec_relay
-        send_first = (not needs_pairing) or ((self.ps.pp_rank % 2) == 0)
+        send_first = (not needs_pairing) or ((get_parallel().pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
