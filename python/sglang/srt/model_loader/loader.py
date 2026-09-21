@@ -994,6 +994,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        DefaultModelLoader.load_weights_only(model, weights, target_device)
+        DefaultModelLoader.postprocess_weights(model, target_device)
+
+    @staticmethod
+    def load_weights_only(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -1049,6 +1054,8 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+    @staticmethod
+    def postprocess_weights(model, target_device):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -2039,9 +2046,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
         try:
-            from sglang.srt.distributed import get_world_group
+            from sglang.srt.runtime_context import get_parallel
 
-            group = get_world_group()
+            group = get_parallel().world_group
             if group.world_size <= 1:
                 return local_sig
             all_sigs = group.all_gather_object(local_sig)
@@ -2061,21 +2068,21 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _world_rank_and_size() -> Tuple[int, int]:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            g = get_world_group()
+            g = get_parallel().world_group
             return g.rank_in_group, g.world_size
-        except (AssertionError, AttributeError):
+        except (AssertionError, AttributeError, RuntimeError):
             return 0, 1
 
     @staticmethod
     def _world_barrier() -> None:
-        from sglang.srt.distributed import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            get_world_group().barrier()
-        except (AssertionError, AttributeError):
+            get_parallel().world_group.barrier()
+        except (AssertionError, AttributeError, RuntimeError):
             pass
 
     @staticmethod

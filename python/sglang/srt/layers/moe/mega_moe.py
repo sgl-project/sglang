@@ -47,7 +47,9 @@ _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_SHARED_SF_INDEX: dict = {}
 
 
-def _mega_moe_mma_type() -> str:
+def _mega_moe_mma_type(experts=None) -> str:
+    if experts is not None and experts._mega_moe_nvfp4:
+        return "nvfp4xnvfp4"
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
@@ -88,6 +90,20 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.set_num_sms(current_num_sms)
 
 
+def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
+    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
+    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+    scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
+    align = 16 * scale_group
+    if hidden % align != 0 or intermediate % align != 0:
+        raise ValueError(
+            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
+            f"moe_intermediate_size to be multiples of {align}; got "
+            f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
+            "Use another --moe-a2a-backend for this model."
+        )
+
+
 def _get_mega_moe_symm_buffer(
     group,
     num_experts: int,
@@ -96,34 +112,38 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     num_shared_experts: int = 0,
+    mma_type: Optional[str] = None,
 ) -> SymmBuffer:
     import deep_gemm
 
-    mma_type = _mega_moe_mma_type()
-    key = (
-        id(group),
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-        mma_type,
-        num_shared_experts,
-    )
-    buf = _MEGA_MOE_SYMM_BUFFER.get(key)
-    if buf is None:
-        buf = deep_gemm.get_symm_buffer_for_mega_moe(
-            group,
-            num_experts,
+    if mma_type is None:
+        mma_type = _mega_moe_mma_type()
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        key = (
+            id(group),
             num_max_tokens_per_rank,
+            num_experts,
             num_topk,
             hidden,
             intermediate_hidden,
-            num_shared_experts=num_shared_experts,
-            mma_type=mma_type,
-            activation="swiglu",
+            mma_type,
+            num_shared_experts,
+            deep_gemm.get_num_sms(),
         )
-        _MEGA_MOE_SYMM_BUFFER[key] = buf
+        buf = _MEGA_MOE_SYMM_BUFFER.get(key)
+        if buf is None:
+            buf = deep_gemm.get_symm_buffer_for_mega_moe(
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                num_shared_experts=num_shared_experts,
+                mma_type=mma_type,
+                activation="swiglu",
+            )
+            _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
 
@@ -154,14 +174,20 @@ def _fill_mega_moe_shared_l1_acts_sf(buf: SymmBuffer, num_tokens: int) -> None:
     buf.shared_l1_acts_sf[index[:num_tokens]] = buf.x_sf[:num_tokens]
 
 
+def is_mega_moe_experts_ready(experts) -> bool:
+    if not experts._mega_moe_weights_built:
+        return False
+    if _device_sm == 90:
+        return is_sm90_fp8_mega_moe_available(experts)
+    # The SM100 mega kernels exist for compute capability 10.x only.
+    return _device_sm // 10 == 10
+
+
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    if not getattr(moe.experts, "_mega_moe_weights_built", False):
+    if not is_mega_moe_experts_ready(moe.experts):
         return False
-    if _device_sm == 90:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
-            return False
     if get_is_capture_mode():
         return True
 
@@ -235,10 +261,6 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
-
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
@@ -263,10 +285,52 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
-    ep_group = get_moe_ep_group().device_group
-    num_experts = moe.experts.num_experts
-    top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
-    intermediate_size = moe.config.moe_intermediate_size
+    return run_mega_routed_experts(
+        moe.experts,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        hidden_size=hidden_size,
+        intermediate_size=moe.config.moe_intermediate_size,
+        top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
+        num_tokens=num_tokens,
+        activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
+        routed_scaling_factor=(
+            1.0
+            if moe.experts.should_fuse_routed_scaling_factor_in_topk
+            else float(moe.routed_scaling_factor)
+        ),
+        num_shared_experts=(
+            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+        ),
+        shared_l1_weights=moe.mega_shared_l1_weights,
+        shared_l2_weights=moe.mega_shared_l2_weights,
+    )
+
+
+def run_mega_routed_experts(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_tokens: int,
+    activation_clamp: Optional[float] = None,
+    routed_scaling_factor: float = 1.0,
+    num_shared_experts: int = 0,
+    shared_l1_weights=None,
+    shared_l2_weights=None,
+) -> torch.Tensor:
+    # Rows are this rank's tokens; the returned rows are fully combined.
+    import deep_gemm
+
+    from sglang.srt.runtime_context import get_parallel
+
+    ep_group = get_parallel().moe_ep_group.device_group
+    num_experts = experts.num_experts
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -277,6 +341,7 @@ def _run_mega_routed(
         f"--cuda-graph-max-bs-decode / --chunked-prefill-size accordingly"
     )
 
+    mma_type = _mega_moe_mma_type(experts)
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -284,9 +349,8 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
-        num_shared_experts=(
-            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
-        ),
+        num_shared_experts=num_shared_experts,
+        mma_type=mma_type,
     )
 
     if num_tokens > 0:
@@ -298,19 +362,45 @@ def _run_mega_routed(
 
     if _device_sm == 90:
         return run_sm90_mega_routed(
-            moe,
+            experts,
             hidden_states,
             topk_ids_in,
             topk_weights_in,
             buf,
             num_tokens,
+            hidden_size=hidden_size,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        topk_weights_in = topk_weights_in * moe.routed_scaling_factor
+    if routed_scaling_factor != 1.0:
+        topk_weights_in = topk_weights_in * routed_scaling_factor
 
-    mma_type = _mega_moe_mma_type()
-    if mma_type == "mxf4xmxf4":
+    mega_kwargs = {"recipe": (1, 1, 32)}
+    if mma_type == "nvfp4xnvfp4":
+        # Per-token outer scales go to buf.x_scales; the kernel folds them with
+        # the per-expert alphas in the L1 / L2 epilogues.
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=16,
+            mma_type=mma_type,
+            buf_x_scales=buf.x_scales,
+        )
+        mega_kwargs = {
+            "recipe": (1, 1, 16),
+            "use_x_scales": True,
+            "l1_alphas": experts.mega_l1_alphas,
+            "l2_alphas": experts.mega_l2_alphas,
+            "l2_act_scales": experts.mega_l2_act_scales,
+        }
+    elif mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
         # only emits FP8.
@@ -345,21 +435,20 @@ def _run_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    if moe.mega_shared_l1_weights is not None:
+    if shared_l1_weights is not None:
         _fill_mega_moe_shared_l1_acts_sf(buf, num_tokens=y.shape[0])
-    swiglu_limit = getattr(moe.config, "swiglu_limit", None)
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
             y,
-            moe.experts.mega_l1_weights,
-            moe.experts.mega_l2_weights,
+            experts.mega_l1_weights,
+            experts.mega_l2_weights,
             buf,
-            shared_l1_weights=moe.mega_shared_l1_weights,
-            shared_l2_weights=moe.mega_shared_l2_weights,
-            recipe=(1, 1, 32),
+            shared_l1_weights=shared_l1_weights,
+            shared_l2_weights=shared_l2_weights,
             activation="swiglu",
-            activation_clamp=swiglu_limit,
+            activation_clamp=activation_clamp,
             fast_math=True,
+            **mega_kwargs,
         )
     return y[:num_tokens]
 
@@ -419,6 +508,7 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     num_groups, n1, half_k1 = w13.shape
     k1 = half_k1 * 2
+    check_mega_moe_shapes(hidden=k1, intermediate=n1 // 2, mma_type=mma_type)
     _, n2, half_k2 = w2.shape
     k2 = half_k2 * 2
 
