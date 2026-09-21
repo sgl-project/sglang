@@ -148,7 +148,7 @@ mkdir -p cann-custom-ops
     unzip ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip &&
     chmod +x *.run &&
     ./CANN-custom_ops-none-linux.$(arch).run --install-path=${ASCEND_HOME_PATH}/opp &&
-    ./cann-ops-transformer-custom_linux.$(arch).run --install-path=${ASCEND_HOME_PATH}/opp &&
+    ./cann-ops-transformer-custom_linux-$(arch).run --install-path=${ASCEND_HOME_PATH}/opp &&
     source_env "${ASCEND_HOME_PATH}/opp/vendors/customize/bin/set_env.bash" &&
     source_env "${ASCEND_HOME_PATH}/opp/vendors/custom_transformer/bin/set_env.bash" &&
     source_env /usr/local/Ascend/ascend-toolkit/latest/set_env.sh &&
