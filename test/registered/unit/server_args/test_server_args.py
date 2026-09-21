@@ -4002,5 +4002,72 @@ class TestDcpCommBackendDefault(CustomTestCase):
             )
 
 
+class TestParserChoices(CustomTestCase):
+    """The choices come from dependency-free name lists, but `cli/serve.py`
+    loads plugins before parsing, so a plugin's parser must still be accepted."""
+
+    def test_a_plugin_registered_parser_is_accepted(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        ReasoningParser.DetectorMap["plugin-reasoning"] = object
+        FunctionCallParser.ToolCallParserEnum["plugin-toolcall"] = object
+        try:
+            parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args = parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy-model",
+                    "--reasoning-parser",
+                    "plugin-reasoning",
+                    "--tool-call-parser",
+                    "plugin-toolcall",
+                ]
+            )
+        finally:
+            del ReasoningParser.DetectorMap["plugin-reasoning"]
+            del FunctionCallParser.ToolCallParserEnum["plugin-toolcall"]
+        self.assertEqual(args.reasoning_parser, "plugin-reasoning")
+        self.assertEqual(args.tool_call_parser, "plugin-toolcall")
+
+    def test_name_lists_are_used_when_the_registries_are_not_imported(self):
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        with patch.dict(server_args_module.sys.modules):
+            server_args_module.sys.modules.pop(
+                "sglang.srt.parser.reasoning_parser", None
+            )
+            server_args_module.sys.modules.pop(
+                "sglang.srt.function_call.function_call_parser", None
+            )
+            self.assertEqual(
+                server_args_module._reasoning_parser_choices(),
+                list(REASONING_PARSER_NAMES),
+            )
+            self.assertEqual(
+                server_args_module._tool_call_parser_choices(),
+                list(TOOL_CALL_PARSER_NAMES),
+            )
+
+
+class TestLazyReexports(CustomTestCase):
+    def test_the_names_that_lost_their_eager_import_are_still_attributes(self):
+        # Out-of-tree code reaches these through `sglang.srt.server_args`; they
+        # now resolve through the module __getattr__ instead of a top import.
+        from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        self.assertIs(server_args_module.FunctionCallParser, FunctionCallParser)
+        self.assertIs(server_args_module.ReasoningParser, ReasoningParser)
+        self.assertIs(server_args_module.RealKvHashMode, RealKvHashMode)
+
+    def test_an_unknown_attribute_still_raises(self):
+        with self.assertRaises(AttributeError):
+            server_args_module.NotAThing
+
+
 if __name__ == "__main__":
     unittest.main()
