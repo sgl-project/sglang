@@ -40,7 +40,7 @@ Use this order when standing up a new model on Ascend NPU:
 2. **Pick deploy mode** — PD Mixed (simpler ops) vs PD Disaggregation (scale prefill/decode independently). Large MoE models (DeepSeek-R1 / V3.2 class) usually need PD Disaggregation for published low-latency points.
 3. **Start from the model Best Practices row** that matches your **dataset shape** (e.g. 3.5k+1.5k) and latency target — do not copy GPU-only flags.
 4. **Choose quantization** with the [decision guide](#quantization-decision-guide): BF16 for accuracy baselines; W8A8 for most production latency; W4A8 when memory/throughput dominates on supported MoE paths.
-5. **Enable NPU Graph** with a **small** `--cuda-graph-bs` list from the model page (often ≤10 sizes). See [NPU Graph Mode Usage Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode).
+5. **Enable NPU Graph** with a **small** `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` list from the model page (often ≤10 sizes). See [NPU Graph Mode Usage Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode).
 6. **Validate** with [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) and, for correctness-sensitive changes, [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 7. **Profile** only after functional smoke: [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
 
@@ -63,7 +63,7 @@ Use this order when standing up a new model on Ascend NPU:
 | CPU governor | `performance` governor before large benchmarks |
 | Memory allocator | `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` is common on Ascend serving scripts |
 | A3 TP math | Cards × 2 ≈ `--tp-size` unless the model page says otherwise |
-| Capture cardinality | Keep `--cuda-graph-bs` short; too many graphs can trigger ACL Fill / stream conflicts |
+| Capture cardinality | Keep `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` short; too many graphs can trigger ACL Fill / stream conflicts |
 
 ## Quantization Decision Guide
 
@@ -123,7 +123,7 @@ flowchart LR
   B -->|1| C[Dense / small MoE<br/>PD Mixed + W8A8]
   B -->|2-8| D[Mid/large dense or MoE<br/>PD Mixed]
   B -->|16-32| E[Frontier MoE<br/>PD Disaggregation]
-  C --> F[Tune cuda-graph-bs]
+  C --> F[Tune cuda-graph-bs-decode/prefill]
   D --> F
   E --> F
   F --> G[bench_serving + accuracy]
@@ -167,7 +167,7 @@ Each row links to the **tutorial** (deployment steps) and **best practices** (fu
 
 | Switch / env | Purpose | Deep dive |
 | --- | --- | --- |
-| `--cuda-graph-bs` | NPU Graph capture sizes | [NPU Graph Mode Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode) |
+| `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` | NPU Graph capture sizes | [NPU Graph Mode Guide](/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode) |
 | `--disable-radix-cache` | Prefix cache control | [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) |
 | `SGLANG_NPU_USE_MLAPO=1` | MLA fusion for DeepSeek-style models | Parameter Tuning |
 | `SGLANG_NPU_USE_MULTI_STREAM=1` | MoE shared/routed overlap | Parameter Tuning |
@@ -188,7 +188,7 @@ python3 -m sglang.launch_server \
   --attention-backend ascend \
   --tp-size <dies-or-cards-per-page> \
   --quantization <bf16-or-modelslim> \
-  --cuda-graph-bs <short-list-from-page> \
+  --cuda-graph-bs-decode <short-list-from-page> \
   --host 127.0.0.1 --port 6688
 ```
 
