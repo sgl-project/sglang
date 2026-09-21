@@ -24,7 +24,6 @@ class TestLoRALatency(CustomTestCase):
 
         check_perf(
             self,
-            "test_online_lora_latency",
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],
@@ -41,7 +40,6 @@ class TestLoRALatency(CustomTestCase):
 
         check_perf(
             self,
-            "test_online_lora_latency_with_concurrent_adapter_updates",
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],

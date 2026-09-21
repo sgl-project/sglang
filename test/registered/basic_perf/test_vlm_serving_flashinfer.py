@@ -9,11 +9,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=195, stage="extra-a", runner_config="1-gpu-small")
 
 
-class TestVLMServingFlashInfer(CustomTestCase):
+class TestVLMServingFlashinfer(CustomTestCase):
     def test_vlm_serving_flashinfer(self):
         check_vlm_serving_perf(
             self,
-            "test_vlm_serving_flashinfer",
             "flashinfer",
             output_throughput=2000,
             e2e_ms=16500,

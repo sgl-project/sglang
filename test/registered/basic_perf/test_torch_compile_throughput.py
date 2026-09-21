@@ -14,7 +14,7 @@ register_cuda_ci(est_time=75, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=280, suite="stage-b-test-2-gpu-large-amd")
 
 
-class TestTorchCompile2GPU(CustomTestCase):
+class TestTorchCompileThroughput(CustomTestCase):
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
@@ -23,7 +23,6 @@ class TestTorchCompile2GPU(CustomTestCase):
 
         check_perf(
             self,
-            "test_torch_compile_tp2_bs1",
             at_least(
                 "output_throughput", output_throughput, 220, amd=200, unit="token/s"
             ),

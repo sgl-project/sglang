@@ -34,7 +34,6 @@ class TestScoreAPI(CustomTestCase):
         self.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             self,
-            "test_score_api_latency_throughput",
             at_most("avg_latency_ms", res["avg_latency_ms"], 48, amd=60, unit="ms"),
             at_most("p95_latency_ms", res["p95_latency_ms"], 50, amd=65, unit="ms"),
             at_least("throughput", res["throughput"], 20, amd=16, unit="req/s"),
@@ -43,7 +42,6 @@ class TestScoreAPI(CustomTestCase):
     def test_score_api_batch_scaling(self):
         check_batch_scaling(
             self,
-            "test_score_api_batch_scaling",
             lambda batch_sizes: run_score_benchmark_multi(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
                 batch_sizes,

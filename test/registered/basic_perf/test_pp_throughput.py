@@ -15,7 +15,7 @@ register_cuda_ci(est_time=490, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=1030, suite="stage-b-test-2-gpu-large-amd")
 
 
-class TestPP2GPU(CustomTestCase):
+class TestPPThroughput(CustomTestCase):
     def test_pp_offline_throughput_default_decode(self):
         res = run_bench_serving(
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -30,7 +30,6 @@ class TestPP2GPU(CustomTestCase):
 
         check_perf(
             self,
-            "test_pp_offline_throughput_default_decode",
             at_least(
                 "output_throughput", res["output_throughput"], 6700, unit="token/s"
             ),
@@ -57,7 +56,6 @@ class TestPP2GPU(CustomTestCase):
 
         check_perf(
             self,
-            "test_pp_long_context_prefill",
             at_least(
                 "input_throughput",
                 res["input_throughput"],

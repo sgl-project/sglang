@@ -25,7 +25,6 @@ class TestServingLatency(CustomTestCase):
 
         check_perf(
             self,
-            "test_online_latency_default",
             at_most(
                 "median_e2e_latency_ms",
                 res["median_e2e_latency_ms"],

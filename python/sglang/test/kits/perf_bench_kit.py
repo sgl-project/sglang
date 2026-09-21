@@ -48,7 +48,9 @@ def reported(name, value, *, unit="") -> Metric:
     return Metric(name, value, unit)
 
 
-def check_perf(test_case, label: str, *metrics: Metric) -> None:
+def check_perf(test_case, *metrics: Metric, suffix: str = "") -> None:
+    """Report every metric under the caller's test name, then enforce in CI."""
+    label = test_case._testMethodName + suffix
     report = f"### {label}\n" + "".join(m.line() + "\n" for m in metrics)
     print(report, end="")
     if not is_in_ci():
@@ -60,7 +62,6 @@ def check_perf(test_case, label: str, *metrics: Metric) -> None:
 
 def check_batch_scaling(
     test_case,
-    label: str,
     run_all: Callable[[Sequence[int]], Sequence[dict]],
     bounds: Sequence[tuple],
 ) -> None:
@@ -76,8 +77,8 @@ def check_batch_scaling(
         test_case.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             test_case,
-            f"{label}_size_{batch_size}",
             at_most("avg_latency_ms", res["avg_latency_ms"], avg_ms, amd=amd_avg_ms),
             at_most("p95_latency_ms", res["p95_latency_ms"], p95_ms, amd=amd_p95_ms),
             reported("throughput", res["throughput"], unit="req/s"),
+            suffix=f"_size_{batch_size}",
         )

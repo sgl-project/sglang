@@ -36,7 +36,6 @@ def _local_tokenizer_path():
 
 def check_vlm_serving_perf(
     test_case,
-    label: str,
     attention_backend: str,
     *,
     e2e_ms: float,
@@ -83,7 +82,6 @@ def check_vlm_serving_perf(
     throughput = res_offline["output_throughput"]
     check_perf(
         test_case,
-        label,
         (
             at_least("output_throughput", throughput, output_throughput, unit="token/s")
             if output_throughput is not None

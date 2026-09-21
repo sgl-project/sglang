@@ -35,7 +35,6 @@ class TestEmbeddingsAPI(CustomTestCase):
         self.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             self,
-            "test_embeddings_api_latency_throughput",
             at_most("avg_latency_ms", res["avg_latency_ms"], 20, amd=35, unit="ms"),
             at_most("p95_latency_ms", res["p95_latency_ms"], 25, amd=40, unit="ms"),
             at_least("throughput", res["throughput"], 53, amd=30, unit="req/s"),
@@ -44,7 +43,6 @@ class TestEmbeddingsAPI(CustomTestCase):
     def test_embeddings_api_batch_scaling(self):
         check_batch_scaling(
             self,
-            "test_embeddings_api_batch_scaling",
             lambda batch_sizes: run_embeddings_benchmark_multi(
                 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
                 batch_sizes,

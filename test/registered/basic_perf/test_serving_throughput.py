@@ -26,7 +26,6 @@ class TestServingThroughput(CustomTestCase):
 
         check_perf(
             self,
-            "test_offline_throughput_default",
             at_least(
                 "output_throughput",
                 res["output_throughput"],
@@ -51,7 +50,6 @@ class TestServingThroughput(CustomTestCase):
 
         check_perf(
             self,
-            "test_offline_throughput_non_stream_small_batch_size",
             at_least(
                 "output_throughput",
                 res["output_throughput"],
@@ -76,7 +74,6 @@ class TestServingThroughput(CustomTestCase):
 
         check_perf(
             self,
-            "test_offline_throughput_with_triton_attention_backend",
             at_least(
                 "output_throughput",
                 res["output_throughput"],
@@ -96,7 +93,6 @@ class TestServingThroughput(CustomTestCase):
 
         check_perf(
             self,
-            "test_offline_throughput_default_fp8",
             at_least(
                 "output_throughput",
                 res["output_throughput"],

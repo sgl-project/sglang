@@ -9,11 +9,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestVLMServingFA3(CustomTestCase):
+class TestVLMServingFa3(CustomTestCase):
     def test_vlm_serving_fa3(self):
         check_vlm_serving_perf(
             self,
-            "test_vlm_serving_fa3",
             "fa3",
             # Offline throughput on this lane has never been measured; the number is
             # reported so a bound can be set from the first run.

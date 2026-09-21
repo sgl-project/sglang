@@ -13,7 +13,6 @@ class TestVLMServingAiter(CustomTestCase):
     def test_vlm_serving_aiter(self):
         check_vlm_serving_perf(
             self,
-            "test_vlm_serving_aiter",
             "aiter",
             output_throughput=2000,
             e2e_ms=16500,

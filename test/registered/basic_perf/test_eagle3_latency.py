@@ -51,7 +51,6 @@ class TestEagle3Latency(CustomTestCase):
 
         check_perf(
             self,
-            "test_online_latency_eagle3",
             at_most(
                 "median_e2e_latency_ms", res["median_e2e_latency_ms"], 900, unit="ms"
             ),

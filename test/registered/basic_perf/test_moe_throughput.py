@@ -15,7 +15,7 @@ register_cuda_ci(est_time=290, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=770, suite="stage-b-test-2-gpu-large-amd")
 
 
-class TestMoE2GPU(CustomTestCase):
+class TestMoEThroughput(CustomTestCase):
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -26,7 +26,6 @@ class TestMoE2GPU(CustomTestCase):
 
         check_perf(
             self,
-            "test_moe_offline_throughput_default",
             at_least(
                 "output_throughput",
                 res["output_throughput"],
@@ -44,7 +43,6 @@ class TestMoE2GPU(CustomTestCase):
 
         check_perf(
             self,
-            "test_moe_tp2_bs1",
             at_least(
                 "output_throughput", output_throughput, 125, amd=85, unit="token/s"
             ),
