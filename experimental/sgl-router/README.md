@@ -176,7 +176,7 @@ HF Jinja template from `tokenizer_config.json` or a sibling
 `chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
 for template-less models. Cache-aware routing hashes the rendered tokens so its
 prefix queries match the blocks the engine caches. Models the engine encodes in
-code but dynamo-render cannot tokenize here (Inkling, Kimi K3) route via raw prompt
+code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
 text, as does any model whose template fails to load or render.
 
 Plain text chat requests (string `content`, no tools, no template kwargs or
@@ -210,6 +210,16 @@ Detailed content-format parity coverage follows in #39133.
 
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
+## Kimi-K3
+
+Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
+request semantics (reasoning controls, tools, `response_format`, continuations)
+and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
+local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
+and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
+An explicit null `thinking_effort` with thinking enabled is not representable
+in the pinned formatter and falls back to engine-side rendering.
 
 ## HTTP/2
 
