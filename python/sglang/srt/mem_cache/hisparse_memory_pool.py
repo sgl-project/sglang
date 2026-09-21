@@ -5,23 +5,27 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
+    translate_padded_hisparse_locations,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
-# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
+# sgl_kernel.kvcacheio is only available in CUDA/ROCm/XPU sgl-kernel builds (not MPS/NPU/CPU).
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-if _is_cuda or _is_hip:
+_is_xpu = is_xpu()
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 else:
 
     def transfer_kv_all_layer_mla(*args, **kwargs):
         raise RuntimeError(
-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
-            "It is not available on this backend."
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio "
+            "(CUDA/ROCm/XPU). It is not available on this backend."
         )
 
 
@@ -40,6 +44,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
     ):
         super().__init__(
@@ -56,6 +65,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            index_kpool=index_kpool,
+            index_kpool_compress=index_kpool_compress,
+            tail_extra_slots=tail_extra_slots,
+            max_running_requests=max_running_requests,
+            skip_topk_layers=skip_topk_layers,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 
@@ -64,7 +78,18 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             full_to_hisparse_device_index_mapping
         )
 
-    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+    def translate_loc_to_hisparse_device(
+        self, compressed_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map logical locations to physical slots with the same shape.
+
+        CUDA and ROCm use a fused kernel for 1D GPU slot lists, preserving
+        negative padding. Page tables and CPU inputs keep the direct gather.
+        """
+        if compressed_indices.is_cuda and compressed_indices.ndim == 1:
+            return translate_padded_hisparse_locations(
+                self.full_to_hisparse_device_index_mapping, compressed_indices
+            )
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
@@ -115,8 +140,10 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             num_layers=self.layer_num,
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")

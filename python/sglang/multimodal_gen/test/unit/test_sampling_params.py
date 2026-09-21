@@ -28,8 +28,10 @@ from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingPara
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     QUALITY_LEVELS,
     SamplingParams,
+    SkipSoftmaxParams,
     _json_safe,
     quality_allows_kernel_fusions,
+    resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
@@ -68,6 +70,29 @@ class TestSamplingParamsValidate(unittest.TestCase):
         for bad in ("ultra", "draft", "fast", "", True, 1):
             with self.assertRaisesRegex(ValueError, r"quality must be one of"):
                 SamplingParams(quality=bad)  # type: ignore[arg-type]
+
+    def test_skip_softmax_params(self):
+        params = {"threshold_scale_factor": 500, "start_step": 14}
+        self.assertEqual(
+            resolve_skip_softmax_params(params),
+            SkipSoftmaxParams(threshold_scale_factor=500.0, start_step=14),
+        )
+        self.assertEqual(
+            SamplingParams(skip_softmax_params=params).skip_softmax_params, params
+        )
+
+    def test_skip_softmax_params_reject_invalid_values(self):
+        invalid = (
+            {},
+            {"threshold_scale_factor": 0},
+            {"threshold_scale_factor": math.inf},
+            {"threshold_scale_factor": 1, "start_step": -1},
+            {"threshold_scale_factor": 1, "unknown": True},
+        )
+        for params in invalid:
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(ValueError, "skip_softmax_params"):
+                    SamplingParams(skip_softmax_params=params)
 
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)

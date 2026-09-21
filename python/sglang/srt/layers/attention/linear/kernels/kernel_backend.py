@@ -13,6 +13,14 @@ class LinearAttnKernelBase(ABC):
     uses_state_checkpoints: bool = False
     supports_fused_chain_verify: bool = False
 
+    # True when extend() honors the fp32 track snapshot (track_state /
+    # track_chunk_idx), natively or by routing tracked batches to a kernel
+    # that does. KDAAttnBackend asserts this before allocating the snapshot
+    # buffer: a kernel that silently ignores those arguments leaves the buffer
+    # unwritten and corrupts prefix-cache restores. Kernels that reject
+    # tracked batches loudly (NotImplementedError) keep the default False.
+    supports_track_state_snapshot: bool = False
+
     @abstractmethod
     def decode(
         self,

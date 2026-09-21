@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -661,10 +661,10 @@ def _validate_mova_config(
                 "the released checkpoints persist float32 dtype metadata but "
                 "their weights and validated runtime contract are BF16."
             )
-        if quant_config is not None:
+        if quant_config is not None and quant_config.get_name() != "compressed_tensors":
             raise ValueError(
-                "Native xLLM/K2 Horizon serving does not support quantized "
-                "model weights"
+                "Native xLLM/K2 Horizon serving supports only "
+                "compressed-tensors quantized model weights"
             )
 
         runtime = get_exec()
@@ -1604,7 +1604,7 @@ class XllmModel(nn.Module):
         self.config = config
 
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1686,6 +1686,14 @@ class XllmModel(nn.Module):
 class XllmForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
+    # Quantized checkpoints store these projections separately. This mapping
+    # lets quantization configs resolve fused runtime modules and their ignore
+    # lists consistently.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1693,7 +1701,7 @@ class XllmForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         _validate_mova_config(config, quant_config)

@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -26,7 +27,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -147,6 +148,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         # NPU: per-forward cached metadata for the triton paths (rebuilt each forward).
         self._prefill_meta: Optional[SimpleNamespace] = None
+        # (owning ForwardBatch, cu_seqlens, seq_lens, prefix_lens, cu_seqblocks_q,
+        # max_seqblock_q, all_seqblock_q). The owner is part of the key because one
+        # metadata init can be followed by more than one ForwardBatch reaching the
+        # layers (two-batch overlap splits into two children with different
+        # extend_seq_lens); a hit requires the SAME object, not just a live cache.
+        self._prefill_seqblock_meta: Optional[tuple] = None
         self._extend_meta: Optional[SimpleNamespace] = None
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
@@ -276,10 +283,45 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
+        self.index_topk_freq = (
+            max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+            if is_hip() and is_gfx95_supported() and not is_tbo_enabled()
+            else 1
+        )
+        self.index_cache_enabled = self.index_topk_freq > 1
+        # topk_index_reduce widens the last dim to idx_group_size * topk_blocks
+        # (union of the group's selections), so the shared decode buffer must be
+        # that wide. Head split mirrors MiniMaxM3 sparse attention's.
+        self._idx_group_size = 1
+        if self.index_cache_enabled:
+            from sglang.srt.runtime_context import get_parallel
+
+            _num_idx_heads = max(
+                sparse_cfg["sparse_num_index_heads"] // get_parallel().attn_tp_size, 1
+            )
+            self._idx_group_size = max(
+                _num_idx_heads // self.kv_pool.main_pool.head_num, 1
+            )
+        # Persistent per-bs device buffer for decode top-k reuse. Allocated eagerly
+        # outside CUDA-graph capture; the captured graph only copies into and reads
+        # from a fixed address.
+        self._decode_topk_buf: dict = {}
+        self._topk_group_of_layer: dict[int, int] = {}
+        self._topk_is_source: dict[int, bool] = {}
+        for ordinal, lid in enumerate(
+            lid for lid in self.sparse_layer_ids if lid in self.disable_value_layer_ids
+        ):
+            group = ordinal // self.index_topk_freq
+            self._topk_group_of_layer[lid] = group
+            self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
+        self._topk_cache: dict = {}
+        self._topk_cache_owner: Optional[ForwardBatch] = None
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
@@ -330,6 +372,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        # New forward -> drop the per-forward index-cache top-k (prefill only).
+        if self.index_cache_enabled:
+            self._topk_cache = {}
+            self._topk_cache_owner = None
+        # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
+        # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
+        if self.index_cache_enabled and forward_batch.forward_mode.is_decode_or_idle():
+            bs = forward_batch.seq_lens.shape[0]
+            if bs > 0 and bs not in self._decode_topk_buf:
+                _nkv = self.kv_pool.main_pool.head_num
+                self._decode_topk_buf[bs] = torch.empty(
+                    (_nkv, bs, self.topk_blocks * self._idx_group_size),
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
+        # Per-forward cache of the layer-invariant prefill seqblock trio.
+        self._prefill_seqblock_meta = None
         if self.is_npu:
             # Invalidate cached prefill/extend metadata; rebuilt on first sparse layer.
             self._prefill_meta = None
@@ -1347,7 +1406,46 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
+        cached = self._prefill_seqblock_meta
+        if cached is None or cached[0] is not forward_batch:
+            cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
+                forward_batch, q
+            )
+            if self.is_npu:
+                cu_seqblocks_q = max_seqblock_q = all_seqblock_q = None
+            else:
+                from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+                    get_cu_seqblocks,
+                )
+
+                cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
+                    get_cu_seqblocks(
+                        cu_seqlens,
+                        self._max_seqlen_q,
+                        self.block_size_q,
+                        self.block_size_k,
+                        forward_batch.extend_seq_lens_cpu,
+                    )
+                )
+            cached = (
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                cu_seqblocks_q,
+                max_seqblock_q,
+                all_seqblock_q,
+            )
+            self._prefill_seqblock_meta = cached
+        (
+            _,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            cu_seqblocks_q,
+            max_seqblock_q,
+            all_seqblock_q,
+        ) = cached
 
         # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
         if forward_batch.extend_seq_lens_cpu is not None:
@@ -1398,7 +1496,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 minimax_sparse_prefill,
             )
 
-            idx_o, o = minimax_sparse_prefill(
+            # Index cache: only for disable_value layers (idx_o is None,
+            # so skipping the indexer has no output side effect). A group's source
+            # layer computes + stores the reduced top-k; the other layers reuse it.
+            use_index_cache = self.index_cache_enabled and disable_value
+            cached_topk_idx = None
+            want_topk = False
+            if use_index_cache:
+                if self._topk_cache_owner is not forward_batch:
+                    self._topk_cache = {}
+                    self._topk_cache_owner = forward_batch
+                group = self._topk_group_of_layer[layer.layer_id]
+                if self._topk_is_source[layer.layer_id]:
+                    want_topk = True  # compute and store for this group
+                else:
+                    cached_topk_idx = self._topk_cache.get(group)
+                    # Miss (e.g. source layer chunked differently) -> recompute safely.
+
+            result = minimax_sparse_prefill(
                 q,
                 k_cache,
                 v_cache,
@@ -1423,13 +1538,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+                cu_seqblocks_q=cu_seqblocks_q,
+                max_seqblock_q=max_seqblock_q,
+                all_seqblock_q=all_seqblock_q,
                 q_scale=layer.q_scale_float,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                cached_topk_idx=cached_topk_idx,
+                return_topk_idx=want_topk,
             )
+            if want_topk:
+                idx_o, o, reduced_topk_idx = result
+                self._topk_cache[group] = reduced_topk_idx
+            else:
+                idx_o, o = result
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
@@ -1499,18 +1624,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_fused_kv_index_buffer(
-            layer,
-            forward_batch.out_cache_loc,
-            k,
-            v,
-            idx_k,
-            None if disable_value else idx_v,
-            layer.k_scale_float,
-            layer.v_scale_float,
-            layer.idx_k_scale_float,
-            layer.idx_v_scale_float,
-        )
+        if not self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id):
+            self.kv_pool.set_fused_kv_index_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                idx_k,
+                None if disable_value else idx_v,
+                layer.k_scale_float,
+                layer.v_scale_float,
+                layer.idx_k_scale_float,
+                layer.idx_v_scale_float,
+            )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
@@ -1565,6 +1691,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 minimax_sparse_decode,
             )
 
+            # Decode top-k reuse: group source layer computes+stores; skips reuse.
+            _use_reuse = self.index_cache_enabled and disable_value and attn_fn is None
+            _topk_buf = self._decode_topk_buf.get(q.shape[0]) if _use_reuse else None
+            _cached_topk = None
+            _want_topk = False
+            if _use_reuse and _topk_buf is not None:
+                if self._topk_is_source.get(layer.layer_id, True):
+                    _want_topk = True
+                else:
+                    _cached_topk = _topk_buf
+
             idx_o, o = minimax_sparse_decode(
                 q,
                 None,
@@ -1596,6 +1733,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                cached_topk_idx=_cached_topk,
+                topk_out=_topk_buf if _want_topk else None,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

@@ -32,7 +32,7 @@ from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-c-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
 
 
 class _TestDispatchRunnerCore(DispatchMoeRunnerCore):
@@ -147,7 +147,7 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
     with (
@@ -346,7 +346,7 @@ def test_fused_moe_layer_runner_is_none_when_method_builds_no_runner(
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
     with (
