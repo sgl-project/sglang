@@ -110,7 +110,7 @@ Use this decision table:
 | --- | --- | --- |
 | Attention / FIA / MLA ops dominate | Compute or memory bandwidth | quant, MLAPO, page size, graph mode |
 | AllGather / ReduceScatter / HCCL | Communication | TP/EP layout, DP attention, batch size |
-| Small op fan-out + launch gaps | Launch overhead | `--cuda-graph-bs`, reduce capture sizes |
+| Small op fan-out + launch gaps | Launch overhead | `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`, reduce capture sizes |
 | Prefill-heavy timeline | Prefill scheduling | chunked prefill, PD split |
 | Decode steady-state gaps | Decode batching | `--max-running-requests`, graph sizes |
 
@@ -118,8 +118,8 @@ Use this decision table:
 
 | Goal | Server flag | Output |
 | --- | --- | --- |
-| Production-like decode with graphs | default / `--cuda-graph-bs ...` | normal `ASCEND_PROFILER_OUTPUT` |
-| Python stack visibility | `--disable-cuda-graph` | clearer stacks, slower decode |
+| Production-like decode with graphs | default / `--cuda-graph-bs-decode ...` | normal `ASCEND_PROFILER_OUTPUT` |
+| Python stack visibility | `--cuda-graph-backend-decode=disabled` (and prefill if needed) | clearer stacks, slower decode |
 | Capture overhead debugging | `--enable-profile-cuda-graph` | `graph_capture_profile/` traces |
 
 See [NPU Graph Mode Usage Guide](../../../docs/docs/hardware-platforms/ascend-npus/optimization/npu_graph_mode.mdx).
@@ -150,7 +150,7 @@ Before marking analysis complete:
 ## Anti-Patterns
 
 - Do not compare traces captured with different graph-mode settings without labeling the delta.
-- Do not use `--disable-cuda-graph` numbers as production TPOT baselines.
+- Do not use `--cuda-graph-backend-decode=disabled` (profiling-only) numbers as production TPOT baselines. Prefer new flags over deprecated `--disable-cuda-graph`.
 - Do not merge multi-node Ascend traces unless validated; prefer per-node `trace_view.json`.
 - Do not run `analyse()` on already parsed trees unless you backed up `ASCEND_PROFILER_OUTPUT`.
 
