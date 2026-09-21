@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -24,8 +23,11 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # Unit tests run without distributed initialization. Backends that size buffers by
-# attention tensor-parallel degree should see the single-rank default.
-_parallel_override = get_parallel().override(attn_tp_size=1)
+# attention tensor-parallel degree should see the single-rank default, and a
+# backend that places itself in the decode context-parallel group needs a
+# position: nothing publishes here, so there is no configuration to derive the
+# zero these tests run at from.
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
 _parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
@@ -274,6 +276,7 @@ class TinyModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
@@ -335,7 +338,6 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.is_draft_worker = False
         self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
