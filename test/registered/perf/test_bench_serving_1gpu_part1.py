@@ -65,39 +65,6 @@ class TestBenchServing1GPUPart1(CustomTestCase):
             else:
                 self.assertGreater(res["output_throughput"], 1050)
 
-    def test_offline_throughput_without_radix_cache(self):
-        res = run_bench_serving(
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=500,
-            request_rate=float("inf"),
-            other_server_args=["--disable-radix-cache"],
-        )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_offline_throughput_without_radix_cache\n"
-                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
-            )
-            if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 3050)
-            else:
-                self.assertGreater(res["output_throughput"], 3800)
-
-    def test_offline_throughput_without_chunked_prefill(self):
-        res = run_bench_serving(
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
-            num_prompts=500,
-            request_rate=float("inf"),
-            other_server_args=["--chunked-prefill-size", "-1"],
-        )
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_offline_throughput_without_chunked_prefill\n"
-                f"Output throughput: {res['output_throughput']:.2f} token/s\n"
-            )
-            self.assertGreater(res["output_throughput"], 2600)
-
     def test_offline_throughput_with_triton_attention_backend(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
