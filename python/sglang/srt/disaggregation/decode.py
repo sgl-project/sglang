@@ -4,17 +4,15 @@ Life cycle of a request in the decode server
 1. PreallocQueue:
     a. Initialize a receiver for each request
     b. The request handshakes first, and pre-allocate kv once there is available kv.
-       Host buffering can receive KV while device admission is blocked.
     c. Move the request to TransferQueue.
 
 2. TransferQueue:
     a. Poll the receiver to check the transfer state
     b. If the transfer has finished, move the request to waiting queue
-       Host transfers wait here until device KV can be allocated.
 
 3. WaitingQueue:
     a. Use the requests in the queue to construct a PrebuiltExtendBatch
-    b. Load any host-received KV and populate metadata without a prefill forward.
+    b. Skip the prefill forward but only populate metadata
 
 4. RunningBatch:
     a. Merge the resolved PrebuiltExtendBatch into running batch to run decoding

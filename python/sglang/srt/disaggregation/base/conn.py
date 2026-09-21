@@ -120,8 +120,6 @@ class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
     enable_deferred_decode_kv_release: bool = False
-    # Opt-in requires registering host KV buffers and reporting when aborted
-    # transfers have drained so the scheduler can release their destination pages.
     supports_host_destination: bool = False
 
     @abstractmethod
