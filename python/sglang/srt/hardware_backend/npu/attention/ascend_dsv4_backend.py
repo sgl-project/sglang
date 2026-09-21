@@ -56,7 +56,9 @@ def _sparse_attn_ops(is_dspark=False):
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
-        torch.ops.custom.npu_sparse_attn_sharedkv if not is_dspark else torch.ops.npu.sparse_attn_sharedkv,
+        torch.ops.custom.npu_sparse_attn_sharedkv
+        if not is_dspark
+        else torch.ops.npu.sparse_attn_sharedkv,
     )
 
 

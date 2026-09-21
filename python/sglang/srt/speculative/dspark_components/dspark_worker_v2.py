@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -83,7 +84,6 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +443,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             from sglang.srt.hardware_backend.npu.extra_ops_loader import (
                 initialize_dspark_a5_sparse_attn_ops,
             )
+
             initialize_dspark_a5_sparse_attn_ops()
 
         with draft_pp_context(), self._draft_context():

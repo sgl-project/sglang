@@ -387,7 +387,11 @@ class CommitKvProj:
         wkv_linears: list[torch.nn.Module],
         allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears) and not is_npu_arch35():
+        if (
+            main_x.is_cuda
+            and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears)
+            and not is_npu_arch35()
+        ):
             return cls.triton(
                 main_x=main_x,
                 wkv_linears=wkv_linears,

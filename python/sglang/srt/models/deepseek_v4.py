@@ -885,9 +885,7 @@ class MqaAttentionBase(nn.Module):
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
             )
-        if self.use_npu_arch35_mxfp8_wo_a and hasattr(
-            self.wo_a, "weight_scale_inv"
-        ):
+        if self.use_npu_arch35_mxfp8_wo_a and hasattr(self.wo_a, "weight_scale_inv"):
             # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
