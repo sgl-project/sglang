@@ -27,7 +27,6 @@ use crate::api_server::core::generate::{
 use crate::api_server::core::openai::completions::completion_usage;
 use crate::api_server::core::openai::matched_stop_value;
 use crate::api_server::core::openai::reasoning::ReasoningStreamSplitter;
-use crate::api_server::core::openai::template::ChatFormatter;
 use crate::api_server::core::openai::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
     parse_chat_tool_calls,
@@ -61,18 +60,13 @@ pub(crate) fn chat_stream_usage_options(
 /// `skip_special_tokens`, since the template owns its special tokens).
 pub(crate) async fn prepare_chat_request(
     state: &CoreState,
-    mut request: CreateChatCompletionRequest,
+    request: CreateChatCompletionRequest,
 ) -> Result<(CreateChatCompletionRequest, String), ApiError> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(ApiError::bad_request(
             "this model has no usable chat template",
         ));
     };
-    // Template stops first, then the request's own — Python
-    // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
-    // token-id stop cannot be merged into the string list (Python has no such
-    // field), so it is kept alone.
-    merge_template_stops(&mut request, &formatter);
     let prompt = formatter
         .render(&request)
         .map_err(|error| ApiError::bad_request(format!("chat template render failed: {error}")))?;
@@ -86,22 +80,23 @@ pub(crate) async fn prepare_chat_request(
 pub(crate) fn chat_sampling(
     request: &CreateChatCompletionRequest,
     defaults: SamplingDefaults,
+    template_stops: Option<OneOrMany<String>>,
     parser: Option<&str>,
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
-    parallel_tool_calls: Option<bool>,
     server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
         &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
+        template_stops,
     )?;
     apply_tool_constraint(
         &mut sampling,
         parser,
         tool_choice,
         tools,
-        parallel_tool_calls,
+        request.parallel_tool_calls,
     )?;
     sampling
         .normalize(
@@ -110,29 +105,6 @@ pub(crate) fn chat_sampling(
         )
         .map_err(|error| error.to_string())?;
     Ok(sampling)
-}
-
-/// Merge the formatter's template stops into the request's `stop`.
-///
-/// Python `_apply_conversation_template`: `stop = copy.copy(conv.stop_str or [])
-/// + request.stop` (a string request stop appends as one entry). Without this,
-/// generation with a legacy/builtin template would run past the template's own
-/// delimiters (e.g. chatml's `<|im_end|>`) whenever they are not model EOS ids.
-fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &ChatFormatter) {
-    let Some(template_stops) = formatter.stop_strs() else {
-        return;
-    };
-    let mut stops = match template_stops {
-        OneOrMany::One(one) => vec![one],
-        OneOrMany::Many(many) => many,
-    };
-    if let Some(request_stop) = &request.stop {
-        let Some(request_stops) = request_stop.strings() else {
-            return;
-        };
-        stops.extend(request_stops);
-    }
-    request.stop = Some(Stop::StringArray(stops));
 }
 
 /// Where an omitted `temperature` / `top_p` gets its value. Mirrors Python's
@@ -170,17 +142,23 @@ impl SamplingDefaults {
 pub(crate) fn chat_sampling_params(
     request: &CreateChatCompletionRequest,
     defaults: &SamplingDefaults,
+    template_stops: Option<OneOrMany<String>>,
 ) -> Result<SamplingParams, String> {
-    let mut stop = None;
+    let mut stops = match template_stops {
+        None => Vec::new(),
+        Some(OneOrMany::One(stop)) => vec![stop],
+        Some(OneOrMany::Many(stops)) => stops,
+    };
     let mut stop_token_ids = None;
     match request.stop.as_ref() {
-        Some(Stop::String(value)) => stop = Some(OneOrMany::One(value.clone())),
-        Some(Stop::StringArray(values)) => stop = Some(OneOrMany::Many(values.clone())),
+        Some(Stop::String(value)) => stops.push(value.clone()),
+        Some(Stop::StringArray(values)) => stops.extend(values.clone()),
         Some(Stop::TokenIdArray(values)) => {
             stop_token_ids = Some(values.iter().map(|&id| id as i64).collect())
         }
         None => {}
     }
+    let stop = (!stops.is_empty()).then_some(OneOrMany::Many(stops));
     let mut logit_bias = BTreeMap::new();
     if let Some(values) = request.logit_bias.as_ref() {
         for (token, bias) in values {
@@ -338,6 +316,10 @@ pub(crate) async fn unary_chat(
     // always present (null when none) with a per-call `index`, and its
     // logprobs have no `refusal` key.
     let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
+    if let Some(object) = value.as_object_mut() {
+        object.remove("service_tier");
+        object.remove("system_fingerprint");
+    }
     if let Some(choices) = value["choices"].as_array_mut() {
         for (choice, matched_stop) in choices.iter_mut().zip(&matched_stops) {
             choice["matched_stop"] = matched_stop.clone().unwrap_or(serde_json::Value::Null);
@@ -737,6 +719,7 @@ pub(crate) fn chat_event_stream(
         },
     )
     .flat_map(futures::stream::iter);
+    let parser_active = parser.is_some();
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
@@ -751,7 +734,7 @@ pub(crate) fn chat_event_stream(
         Box::pin(raw)
     };
     async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
+        let mut kept_tool_call_index: Vec<Option<u32>> = vec![None; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(mut response) = item.data.take() {
@@ -759,14 +742,14 @@ pub(crate) fn chat_event_stream(
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
                         if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
+                            let kept = kept_tool_call_index.get(index).copied().flatten();
+                            if let Some(kept) = kept {
+                                calls.retain(|call| call.index == kept);
+                            } else if let Some(first) = calls.first() {
+                                let first_index = first.index;
+                                calls.retain(|call| call.index == first_index);
+                                if let Some(slot) = kept_tool_call_index.get_mut(index) {
+                                    *slot = Some(first_index);
                                 }
                             }
                             if calls.is_empty() {
@@ -785,6 +768,7 @@ pub(crate) fn chat_event_stream(
                         &state,
                         continuous_usage,
                         enable_cache_report,
+                        parser_active,
                     ));
                 } else {
                     for choice in std::mem::take(&mut response.choices) {
@@ -795,6 +779,7 @@ pub(crate) fn chat_event_stream(
                             &state,
                             continuous_usage,
                             enable_cache_report,
+                            parser_active,
                         ));
                     }
                 }
@@ -831,6 +816,10 @@ pub(crate) fn chat_event_stream(
             };
             let mut value =
                 serde_json::to_value(trailer).expect("OpenAI response must serialize");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("service_tier");
+                object.remove("system_fingerprint");
+            }
             value["usage"] = usage_value(usage, details);
             yield CoreEvent::Item(value);
         }
@@ -845,6 +834,7 @@ fn chat_chunk_value(
     state: &Mutex<ChatStreamState>,
     continuous_usage: bool,
     enable_cache_report: bool,
+    parser_active: bool,
 ) -> serde_json::Value {
     let index = chunk.choices.first().map(|choice| choice.index as usize);
     let carries_delta = chunk.choices.first().is_some_and(choice_carries_delta);
@@ -869,7 +859,33 @@ fn chat_chunk_value(
             .flatten();
         (usage, details, matched_stop)
     };
+    // Python's tool-parser stream builds Pydantic `ChatCompletionStreamResponse`
+    // chunks, which retain `"usage": null`; ordinary content/reasoning via
+    // `build_sse_content` omits it. Keep that field-specific split.
+    let parser_keeps_null_usage = parser_active
+        && chunk.choices.first().is_some_and(|choice| {
+            choice
+                .delta
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+                || choice
+                    .delta
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| match content {
+                        ChatCompletionMessageContent::Text(text) => !text.is_empty(),
+                        _ => true,
+                    })
+        });
     let mut value = serde_json::to_value(chunk).expect("OpenAI response must serialize");
+    if let Some(object) = value.as_object_mut() {
+        object.remove("service_tier");
+        object.remove("system_fingerprint");
+        if usage.is_none() && !parser_keeps_null_usage {
+            object.remove("usage");
+        }
+    }
     if let Some(usage) = usage {
         value["usage"] = usage_value(usage, details);
     }
@@ -877,6 +893,11 @@ fn chat_chunk_value(
         .pointer_mut("/choices/0/delta")
         .and_then(serde_json::Value::as_object_mut)
     {
+        // Python's role prelude carries an empty string `content`; the typed
+        // delta omits `None` content, so restore only for the role-only frame.
+        if delta.contains_key("role") && !delta.contains_key("content") {
+            delta.insert("content".into(), serde_json::Value::String(String::new()));
+        }
         delta
             .entry("reasoning_content")
             .or_insert(serde_json::Value::Null);
@@ -983,14 +1004,14 @@ pub(crate) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::{
         ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_logprobs,
-        chat_sampling_params, chat_stream_usage_options, merge_template_stops, unary_chat,
+        chat_sampling_params, chat_stream_usage_options, unary_chat,
     };
-    use crate::api_server::core::openai::template::ChatFormatter;
     use crate::api_server::core::test_utils::{
         abort_senders, aborted_guard_rids, chunk, chunk_with_metadata, plan, planned, senders,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan};
+    use crate::message::types::OneOrMany;
     use dynamo_protocols::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
@@ -1105,6 +1126,7 @@ mod tests {
             let sampling = chat_sampling_params(
                 &request(),
                 &SamplingDefaults::CHAT.with_model_defaults(&model),
+                None,
             )
             .unwrap();
             assert_eq!(sampling.temperature, temperature);
@@ -1118,6 +1140,7 @@ mod tests {
         let sampling = chat_sampling_params(
             &request,
             &SamplingDefaults::CHAT.with_model_defaults(&model),
+            None,
         )
         .unwrap();
         assert!((sampling.temperature - 0.2).abs() < 1e-6);
@@ -1127,72 +1150,56 @@ mod tests {
     /// Python `_apply_conversation_template`: template `stop_str` first, then
     /// the request's own stops.
     #[test]
-    fn template_stops_merge_before_request_stops() {
-        let chatml = crate::api_server::core::openai::template::builtin_template("chatml").unwrap();
-        let formatter = ChatFormatter::Legacy(Box::new(
-            crate::api_server::core::openai::template::LegacyFormatter { spec: chatml },
-        ));
-        assert_eq!(
-            formatter.stop_strs(),
-            Some(crate::message::types::OneOrMany::Many(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into()
-            ]))
-        );
+    fn sampling_merges_template_stops_before_request_stops() {
+        let template_stops = OneOrMany::Many(vec!["<|endoftext|>".into(), "<|im_end|>".into()]);
+
         // No request stop → the template's delimiters alone.
-        let mut req = request();
-        merge_template_stops(&mut req, &formatter);
+        let sampling = chat_sampling_params(
+            &request(),
+            &SamplingDefaults::CHAT,
+            Some(template_stops.clone()),
+        )
+        .unwrap();
         assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
+            sampling.stop,
+            Some(OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
         );
-        // A string request stop appends as one entry.
+
+        // A string request stop appends after the template's stops.
         let mut req = request();
         req.stop = Some(Stop::String("<stop>".into()));
-        merge_template_stops(&mut req, &formatter);
+        let sampling =
+            chat_sampling_params(&req, &SamplingDefaults::CHAT, Some(template_stops)).unwrap();
         assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
+            sampling.stop,
+            Some(OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into(),
                 "<stop>".into()
             ]))
         );
-        // A list request stop extends the list.
-        let mut req = request();
-        req.stop = Some(Stop::StringArray(vec!["a".into(), "b".into()]));
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into(),
-                "a".into(),
-                "b".into()
-            ]))
-        );
-        // Token-id stops cannot be merged (Python has no such field) — kept alone.
+    }
+
+    /// Token-ID stops and template string stops are both retained; the match
+    /// bound is computed over the string stops by the normal normalization path.
+    #[test]
+    fn sampling_keeps_token_id_stops_with_template_stops() {
         let mut req = request();
         req.stop = Some(Stop::TokenIdArray(vec![2, 3]));
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
-
-        // A formatter with no template stops — the HuggingFace renderer's shape
-        // (Python's jinja path keeps only the request's stops); the empty legacy
-        // spec is that branch's constructible twin — leaves the request alone.
-        let legacy = ChatFormatter::Legacy(Box::new(
-            crate::api_server::core::openai::template::LegacyFormatter {
-                spec: crate::api_server::core::openai::template::LegacySpec::default(),
-            },
-        ));
-        assert!(legacy.stop_strs().is_none());
-        let mut req = request();
-        req.stop = Some(Stop::String("x".into()));
-        merge_template_stops(&mut req, &legacy);
-        assert_eq!(req.stop, Some(Stop::String("x".into())));
+        let mut sampling = chat_sampling_params(
+            &req,
+            &SamplingDefaults::CHAT,
+            Some(OneOrMany::Many(vec!["<|im_end|>".into()])),
+        )
+        .unwrap();
+        assert_eq!(sampling.stop_token_ids, Some(vec![2, 3]));
+        sampling.normalize(false, 1000).unwrap();
+        assert_eq!(sampling.stop_strs, vec!["<|im_end|>".to_string()]);
+        assert_eq!(sampling.stop_token_ids, Some(vec![2, 3]));
+        assert_eq!(sampling.stop_str_max_len, "<|im_end|>".len());
     }
 
     /// A request with no `max_tokens`/`max_completion_tokens` stays unbounded —
@@ -1205,7 +1212,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            chat_sampling_params(&request, &SamplingDefaults::CHAT)
+            chat_sampling_params(&request, &SamplingDefaults::CHAT, None)
                 .unwrap()
                 .max_new_tokens,
             None
@@ -1390,7 +1397,10 @@ mod tests {
         let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
         let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(role["choices"][0]["delta"]["content"], "");
         assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
+        assert!(role.get("service_tier").is_none());
+        assert!(role.get("system_fingerprint").is_none());
         assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
         assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
         assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
@@ -1420,7 +1430,7 @@ mod tests {
         assert_eq!(frames.len(), 3, "role + delta + terminal, no usage chunk");
         let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-        assert!(terminal["usage"].is_null());
+        assert!(terminal.get("usage").is_none());
     }
 
     /// Usage must recover the prompt count when an early frame carries 0: the
@@ -1490,7 +1500,7 @@ mod tests {
         );
         assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
         assert!(
-            frames[0]["usage"].is_null(),
+            frames[0].get("usage").is_none(),
             "role prelude carries no usage"
         );
         assert_eq!(frames[1]["usage"]["completion_tokens"], 1);
@@ -1560,6 +1570,74 @@ mod tests {
         assert!(trailer["choices"].as_array().unwrap().is_empty());
         assert_eq!(trailer["usage"]["prompt_tokens"], 5);
         assert_eq!(trailer["usage"]["completion_tokens"], 2);
+    }
+
+    /// Python's tool-parser stream uses the Pydantic serializer, which keeps
+    /// `"usage": null` on parser chunks; ordinary `build_sse_content` chunks
+    /// omit the key when continuous usage is disabled.
+    #[tokio::test]
+    async fn parser_tool_chunks_keep_null_usage_when_continuous_usage_disabled() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk(
+            "r0",
+            r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            false,
+        ))
+        .await
+        .unwrap();
+        tx.send(chunk("r0", "", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            ChatRenderingOptions {
+                parser: Some("llama3_json".into()),
+                ..chat_options()
+            },
+            false,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::chat_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        let tool_chunk = frames
+            .iter()
+            .find(|frame| !frame["choices"][0]["delta"]["tool_calls"].is_null())
+            .expect("tool-call chunk");
+        assert!(
+            tool_chunk.get("usage").is_some(),
+            "parser chunk must retain Python's null usage key"
+        );
+        assert!(tool_chunk["usage"].is_null());
+
+        let role = frames
+            .iter()
+            .find(|frame| frame["choices"][0]["delta"]["role"] == "assistant")
+            .expect("role prelude");
+        assert_eq!(role["choices"][0]["delta"]["content"], "");
+        assert!(
+            role.get("usage").is_none(),
+            "role prelude must omit Python's null usage key"
+        );
+
+        let empty_terminal = frames
+            .iter()
+            .find(|frame| {
+                !frame["choices"][0]["finish_reason"].is_null()
+                    && frame["choices"][0]["delta"]["tool_calls"].is_null()
+                    && frame["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+            })
+            .expect("empty terminal chunk");
+        assert!(
+            empty_terminal.get("usage").is_none(),
+            "empty terminal chunk must omit usage"
+        );
     }
 
     /// The parser can flush several buffered choices in one packed event; the
@@ -1731,11 +1809,14 @@ mod tests {
 
         let mut completion_by_choice = std::collections::BTreeMap::new();
         for frame in &frames[..frames.len() - 1] {
-            if frame["choices"][0]["delta"]["content"].is_null() {
-                continue; // the role prelude carries no usage (Python parity)
+            if frame["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_none_or(str::is_empty)
+            {
+                continue; // role prelude/empty content carries no usage (Python parity)
             }
             assert!(
-                !frame["usage"].is_null(),
+                frame.get("usage").is_some(),
                 "every content chunk carries usage"
             );
             let index = frame["choices"][0]["index"].as_u64().unwrap();
@@ -1916,11 +1997,11 @@ mod tests {
         };
 
         // Early arrival: choice 1's chunk carries its own count.
-        let second = super::chat_chunk_value(chunk(1), &state, true, true);
+        let second = super::chat_chunk_value(chunk(1), &state, true, true, false);
         assert_eq!(second["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
 
         state.lock().unwrap().record(0, &event(3), 2);
-        let first = super::chat_chunk_value(chunk(0), &state, true, true);
+        let first = super::chat_chunk_value(chunk(0), &state, true, true, false);
         assert_eq!(first["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
 
         // The trailer's usage is shaped exactly like the production trailer:
@@ -1955,6 +2036,8 @@ mod tests {
         assert!(message["tool_calls"].is_null());
         assert!(message.get("refusal").is_none());
         assert!(message["reasoning_content"].is_null());
+        assert!(value.get("service_tier").is_none());
+        assert!(value.get("system_fingerprint").is_none());
 
         // Populated logprobs: no `refusal`, no `token_id`.
         let (choice, tx) = planned("r0");

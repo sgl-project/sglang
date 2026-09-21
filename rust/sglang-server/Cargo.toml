@@ -86,4 +86,3 @@ tonic = { workspace = true }
 tower = { workspace = true }
 
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
-

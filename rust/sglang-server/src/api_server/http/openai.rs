@@ -167,6 +167,7 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
         Ok(prepared) => prepared,
         Err(e) => return openai_error(e.http_status(), e.message, false),
     };
+    let template_stops = state.chat_formatter.as_ref().and_then(|f| f.stop_strs());
 
     // The renderer is done with the tools, so move them out instead of cloning
     // every function name and parameter schema.
@@ -185,10 +186,10 @@ pub(in crate::api_server) async fn chat_completions<B: http_body::Body>(
     let sampling = match chat_sampling(
         &request,
         SamplingDefaults::CHAT,
+        template_stops,
         parser.as_deref(),
         &tool_choice,
         tools_slice,
-        request.parallel_tool_calls,
         &state.server_args,
     ) {
         Ok(sampling) => sampling,
@@ -460,9 +461,17 @@ pub(in crate::api_server) async fn retrieve_model(
     model: &str,
 ) -> HttpResponse {
     if model != state.server_args.served_model_name {
-        return openai_error(
+        // Python's `http_server.retrieve_model` 404 body: nested `error`, `invalid_request_error`,
+        return error_response(
             StatusCode::NOT_FOUND,
-            format!("The model `{model}` does not exist"),
+            serde_json::json!({
+                "error": {
+                    "message": format!("The model '{model}' does not exist"),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            }),
             false,
         );
     }

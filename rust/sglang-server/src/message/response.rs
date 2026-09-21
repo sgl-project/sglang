@@ -280,6 +280,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     {
         reject!()
     }
+    // Python emits `weight_versions` with one entry per request. When that
+    // column is present, the per-request reasoning/cached columns must be
+    // present too; otherwise a producer bug would silently decode as zero.
+    if !h.weight_versions.is_empty()
+        && (h.reasoning_tokens.len() != n || h.cached_tokens.len() != n)
+    {
+        reject!()
+    }
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
     let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
@@ -837,6 +845,23 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = [10i32, 20].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let framed = frame_decode_batch_cols(&header, &[&data]);
+        assert!(!for_each_chunk(&framed[1..], |_| {}).ok);
+
+        // A present `weight_versions` column means Python's per-request metadata
+        // family was sent, so empty reasoning/cached columns are a producer bug,
+        // not an "absent metadata" frame.
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1"), Value::from("2")]),
+            Value::Array(vec![Value::Nil, Value::Nil]),
+            arr_u(&[3, 4]),
+            arr_u(&[1, 1]),
+            arr_u(&[]),                                 // reasoning_tokens: empty
+            arr_u(&[]),                                 // cached_tokens: empty
+            Value::Array(vec![Value::Nil, Value::Nil]), // weight_versions present
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let framed = frame_decode_batch_cols(&header, &[&data]);
         assert!(!for_each_chunk(&framed[1..], |_| {}).ok);
     }

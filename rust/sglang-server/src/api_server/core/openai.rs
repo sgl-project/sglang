@@ -34,6 +34,21 @@ pub(crate) fn matched_stop_value(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::matched_stop_value;
+    use crate::message::finish_reason::{FinishReason, Matched};
+
+    #[test]
+    fn multi_token_matched_stop_keeps_its_token_list() {
+        let reason = FinishReason::stop(Some(Matched::Tokens(vec![9, 10].into())));
+        assert_eq!(
+            matched_stop_value(&reason),
+            Some(serde_json::json!([9, 10]))
+        );
+    }
+}
+
 /// Usage details Dynamo's `CompletionUsage` cannot express on the wire.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct UsageDetails {
