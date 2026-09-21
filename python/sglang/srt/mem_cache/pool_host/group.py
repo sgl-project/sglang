@@ -71,6 +71,63 @@ class HostPoolGroup:
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
 
+    def get_host_buffer_infos(
+        self, device_ptrs: list[int]
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Return host addresses, spans and page strides in device wire order."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+        if self.layout != "layer_first":
+            raise ValueError("Host receive requires layer_first host KV layout")
+        host_by_device_ptr = {}
+        for entry in self.entries:
+            host = entry.host_pool
+            pools = (entry.device_pool, *entry.packed_draft_device_pools)
+            for pool in pools:
+                dense_mha = (
+                    type(pool) is MHATokenToKVPool
+                    and pool.kv_cache_layout == "nhd"
+                    and pool.v_head_dim == pool.head_dim
+                )
+                plain_mla = type(pool) is MLATokenToKVPool and not pool.use_dsa
+                if (
+                    not (dense_mha or plain_mla)
+                    or pool.layer_shard_enabled
+                    or pool.page_size != self.page_size
+                ):
+                    raise ValueError(
+                        "Host receive requires dense NHD MHA or plain MLA target and "
+                        "draft KV with matching page sizes"
+                    )
+
+            # Packed MHA stores target/draft K followed by target/draft V,
+            # while the wire lists target K/V followed by draft K/V. Associate
+            # each host view with its device buffer before applying wire order.
+            if type(entry.device_pool) is MHATokenToKVPool:
+                device_buffers = [b for p in pools for b in p.k_buffer] + [
+                    b for p in pools for b in p.v_buffer
+                ]
+                host_buffers = host.host_kv_data_refs
+            else:
+                device_buffers = [b for p in pools for b in p.kv_buffer]
+                host_buffers = host.data_refs
+            for device_buffer, host_buffer in zip(
+                device_buffers, host_buffers, strict=True
+            ):
+                host_by_device_ptr[device_buffer.data_ptr()] = (
+                    host_buffer.data_ptr(),
+                    host_buffer.nbytes,
+                    host.token_stride_size * self.page_size,
+                )
+        if host_by_device_ptr.keys() != set(device_ptrs):
+            raise ValueError("Host receive must cover every target and draft KV buffer")
+        infos = [host_by_device_ptr[ptr] for ptr in device_ptrs]
+        return (
+            [info[0] for info in infos],
+            [info[1] for info in infos],
+            [info[2] for info in infos],
+        )
+
     def alloc(
         self,
         need_size: int,

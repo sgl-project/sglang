@@ -89,7 +89,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
-    RetractionBackup,
     discard_kv_cache_backup,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
@@ -103,8 +102,6 @@ from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1711,19 +1708,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _init_host_receive(self, kv_args) -> None:
         pool = self.token_to_kv_pool
-        dense_mha = (
-            type(pool) is MHATokenToKVPool
-            and pool.kv_cache_layout == "nhd"
-            and pool.v_head_dim == pool.head_dim
-        )
-        plain_mla = type(pool) is MLATokenToKVPool and not pool.use_dsa
-        if (
-            not (dense_mha or plain_mla)
-            or pool.layer_shard_enabled
-            or kv_args.state_types
+        group = self.tree_cache.host_pool_group
+        if kv_args.state_types or any(
+            spec.indices_from_pool != PoolName.KV
+            for spec in self.tree_cache.sidecar_pool_specs
         ):
-            raise ValueError("Host receive requires dense NHD MHA or plain MLA KV")
-        self.host_pool = self.tree_cache.host_pool_group.get_pool(PoolName.KV)
+            raise ValueError(
+                "Host receive requires KV pools sharing the primary indices"
+            )
+        self.host_pool = group.get_pool(PoolName.KV)
         self.host_reserved_tokens = decode_retraction_max_tokens(
             self.req_to_token_pool, pool
         )
@@ -1732,14 +1725,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "Host pool must hold a retraction and a receive page; "
                 "increase --hicache-size or --hicache-ratio"
             )
-        buffers = (
-            self.host_pool.data_refs if plain_mla else self.host_pool.host_kv_data_refs
-        )
-        kv_args.host_kv_data_ptrs = [buffer.data_ptr() for buffer in buffers]
-        kv_args.host_kv_data_lens = [buffer.nbytes for buffer in buffers]
-        kv_args.host_kv_item_lens = [
-            self.host_pool.token_stride_size * pool.page_size
-        ] * len(buffers)
+        (
+            kv_args.host_kv_data_ptrs,
+            kv_args.host_kv_data_lens,
+            kv_args.host_kv_item_lens,
+        ) = group.get_host_buffer_infos(kv_args.kv_data_ptrs)
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         if (
@@ -1760,19 +1750,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.host_pool.available_size() < num_tokens + self.host_reserved_tokens:
             return False
-        host_indices = self.host_pool.alloc(num_tokens)
-        if host_indices is None:
+        backup = self.tree_cache.allocate_host_receive(num_tokens)
+        if backup is None:
             return False
         assert decode_req.req.kv.retraction_backup is None
-        decode_req.req.kv.retraction_backup = RetractionBackup(
-            host_indices=host_indices
-        )
+        decode_req.req.kv.retraction_backup = backup
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
         assert decode_req.metadata_buffer_index is not None
         page_indices = kv_to_page_indices(
-            host_indices, self.token_to_kv_pool_allocator.page_size
+            backup.host_indices, self.token_to_kv_pool_allocator.page_size
         ).astype(np.int32)
         decode_req.kv_receiver.send_metadata(
             page_indices,

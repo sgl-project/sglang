@@ -1,8 +1,14 @@
+import ctypes
 import unittest
+from itertools import product
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -19,18 +25,19 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
     HiCacheDraftPlan,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestDecodeRetractionBackup(unittest.TestCase):
+class TestDecodeRetractionBackup(CustomTestCase):
     pool_size = 32
     num_tokens = 8
     dtype = torch.bfloat16
@@ -90,6 +97,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         use_mla=False,
         page_size=1,
         io_backend="kernel",
+        draft_mode=None,
     ):
         """Bring up a UnifiedRadixCache over fresh pools, optionally with draft KV."""
         server_args = ServerArgs(
@@ -108,6 +116,15 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             enable_memory_saver=False,
         )
         target_pool = self._make_pool(layer_num=2, page_size=page_size, use_mla=use_mla)
+        if draft_mode is None:
+            draft_mode = (
+                HiCacheDraftMode.NONE if shared_receive else HiCacheDraftMode.SIDECAR
+            )
+        draft_pool = (
+            self._make_pool(layer_num=1, page_size=page_size, use_mla=use_mla)
+            if draft_mode != HiCacheDraftMode.NONE
+            else None
+        )
         allocator_cls = (
             PagedTokenToKVPoolAllocator if page_size > 1 else TokenToKVPoolAllocator
         )
@@ -124,16 +141,17 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            is_eagle=not shared_receive,
+            is_eagle=draft_pool is not None,
             tree_components=(ComponentType.FULL,),
+            mtp_draft_device_pools=(draft_pool,)
+            if draft_mode == HiCacheDraftMode.PACKED
+            else (),
         )
         cache = UnifiedRadixCache(params)
         cache.init_hicache(server_args, params)
         self.addCleanup(cache.release_host_resources)
 
-        draft_pool = None
-        if not shared_receive:
-            draft_pool = self._make_pool(layer_num=1)
+        if draft_mode == HiCacheDraftMode.SIDECAR:
             maybe_register_hicache_draft(
                 tree_cache=cache,
                 draft_plan=HiCacheDraftPlan(
@@ -236,6 +254,137 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         allocator.free(blocker_indices)
         allocator.free(destination_indices)
         req_to_token_pool.free(req)
+
+    def test_host_receive_restores_target_and_draft_kv(self):
+        """Wire-order writes must restore both pools, including packed MHA K/V.
+
+        Sidecar KV must follow the primary host indices through restore and
+        release without allocating or freeing those indices a second time.
+        """
+        for use_mla, draft_mode, io_backend in product(
+            (False, True),
+            (HiCacheDraftMode.SIDECAR, HiCacheDraftMode.PACKED),
+            ("kernel", "direct"),
+        ):
+            with self.subTest(
+                use_mla=use_mla, draft_mode=draft_mode, io_backend=io_backend
+            ):
+                page_size = 1 if use_mla else 16
+                num_slots = max(self.num_tokens, page_size)
+                num_tokens = num_slots - int(page_size > 1)
+                env = self._build_cache(
+                    hicache_ratio=2.0,
+                    shared_receive=True,
+                    use_mla=use_mla,
+                    page_size=page_size,
+                    io_backend=io_backend,
+                    draft_mode=draft_mode,
+                )
+                cache = env.cache
+                queue = object.__new__(DecodePreallocQueue)
+                queue.tree_cache = cache
+                queue.token_to_kv_pool = env.target_pool
+                queue.token_to_kv_pool_allocator = env.allocator
+                queue.req_to_token_pool = env.req_to_token_pool
+                queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    2
+                )
+                queue._num_published_destinations = 0
+                kv_args = KVArgs()
+                kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = (
+                    env.target_pool.get_contiguous_buf_infos()
+                )
+                draft_ptrs, draft_lens, draft_items = (
+                    env.draft_pool.get_contiguous_buf_infos()
+                )
+                kv_args.kv_data_ptrs += draft_ptrs
+                kv_args.kv_data_lens += draft_lens
+                kv_args.kv_item_lens += draft_items
+                kv_args.state_types = []
+                queue._init_host_receive(kv_args)
+
+                req = SimpleNamespace(
+                    rid="host-receive",
+                    kv=ReqKvInfo(),
+                    bootstrap_host="localhost",
+                    origin_input_ids=[1] * num_tokens,
+                    seqlen=num_tokens + 1,
+                    time_stats=Mock(),
+                )
+                receiver = Mock(supports_host_destination=True)
+                decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                host_free_before = cache.host_pool_group.available_size()
+                with get_disagg().override(
+                    disaggregation_decode_enable_host_receive=True
+                ):
+                    self.assertTrue(queue._pre_alloc_host(decode_req))
+                backup = req.kv.retraction_backup
+                self.assertEqual(
+                    cache.host_pool_group.available_size(), host_free_before - num_slots
+                )
+                page_indices = receiver.send_metadata.call_args.args[0]
+                self.assertEqual(
+                    receiver.send_metadata.call_args.kwargs["destination"],
+                    KVTransferDestination.HOST,
+                )
+
+                # Emulate the transport's page writes using the advertised
+                # addresses and strides, independently of host-pool ordering.
+                device_buffers = [
+                    buffer
+                    for pool in (env.target_pool, env.draft_pool)
+                    for buffer in (
+                        pool.kv_buffer if use_mla else pool.k_buffer + pool.v_buffer
+                    )
+                ]
+                expected = []
+                for index, (buffer, host_ptr, host_len, item_len) in enumerate(
+                    zip(
+                        device_buffers,
+                        kv_args.host_kv_data_ptrs,
+                        kv_args.host_kv_data_lens,
+                        kv_args.host_kv_item_lens,
+                        strict=True,
+                    )
+                ):
+                    values = torch.arange(
+                        num_slots * buffer[0].numel(), dtype=torch.float32
+                    ).reshape(num_slots, *buffer.shape[1:])
+                    values = ((values + 37 * index) % 251).to(self.dtype)
+                    for page, host_page in enumerate(page_indices):
+                        page_values = values[page * page_size : (page + 1) * page_size]
+                        offset = int(host_page) * item_len
+                        self.assertEqual(page_values.nbytes, item_len)
+                        self.assertLessEqual(offset + item_len, host_len)
+                        ctypes.memmove(
+                            host_ptr + offset, page_values.data_ptr(), item_len
+                        )
+                    expected.append(values[:num_tokens])
+                    buffer.fill_(-1)
+
+                # Device slots are assigned only after the host transfer.
+                self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
+                received_indices = env.allocator.alloc(num_slots)
+                env.req_to_token_pool.write(
+                    (req.kv.req_pool_idx, slice(0, num_tokens)),
+                    received_indices[:num_tokens],
+                )
+                cache.restore_kv_cache(req, backup)
+                for buffer, values in zip(device_buffers, expected, strict=True):
+                    self.assertTrue(
+                        torch.equal(buffer[received_indices[:num_tokens]].cpu(), values)
+                    )
+                self.assertEqual(
+                    cache.host_pool_group.available_size(), host_free_before
+                )
+                # Abort cleanup uses the same descriptor, including sidecars.
+                backup = cache.allocate_host_receive(num_slots)
+                cache.discard_kv_cache_backup(backup)
+                self.assertEqual(
+                    cache.host_pool_group.available_size(), host_free_before
+                )
+                env.allocator.free(received_indices)
+                env.req_to_token_pool.free(req)
 
     def test_receive_pressure_preserves_shared_retraction_and_restore(self):
         for use_mla, page_size, io_backend in (

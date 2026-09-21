@@ -1439,6 +1439,24 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
+    def allocate_host_receive(self, num_tokens: int) -> Optional[RetractionBackup]:
+        """Reserve incoming KV using the same sidecar plan as retraction restore."""
+        host_indices = self.host_pool_group.alloc(num_tokens)
+        if host_indices is None:
+            return None
+        extra_transfers = self._build_sidecar_transfers(
+            CacheTransferPhase.LOAD_BACK,
+            PoolTransfer(name=PoolName.KV, host_indices=host_indices),
+            {},
+        )
+        resolved = self.host_pool_group.resolve_host_transfers(
+            extra_transfers or None, primary_host_indices=host_indices
+        )
+        if resolved is None and extra_transfers:
+            self.host_pool_group.free(host_indices)
+            return None
+        return RetractionBackup(host_indices=host_indices, pool_transfers=resolved)
+
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
