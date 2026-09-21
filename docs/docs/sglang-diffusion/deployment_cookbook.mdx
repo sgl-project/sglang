@@ -195,6 +195,8 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 There are three placements, not two. A component can be in the list and still hold its blocks — `--layerwise-offload-components dit,text_encoder,vae` together with `--layerwise-resident-layers video_vae=36` transfers them once instead of per pass, and gives the VRAM back when the component finishes rather than holding it through denoise. On MiniMax-H3 at 864x480 / 124 frames that is 13 s of decode against 150 s streamed.
 
+That hand-back is the default lifetime, `forward`, and it is what lets the DiT's resident layers and the VAE's share one budget: each set is on the GPU only while its component runs. When both sets fit at once, `--layerwise-residency-lifetime video_vae=permanent` (or `--dit-layerwise-residency-lifetime permanent` for the DiT) places them at load instead — no transfer per request, and no host copy pinned for a reload that never comes. The trade is peak memory: `permanent` adds every component's resident set together, `forward` only the largest. On a card where the sum does not fit, `permanent` fails at startup rather than slowly; keep `forward` there.
+
 So do not read "drop it from the list" as the fix for a one-shot component: that keeps it resident for the whole process. With no resident blocks on either side, moving H3's 10.4 GB video VAE out of the list took decode from 39.9 s to 5.3 s on one RTX 4090 — but it also added 5.8 GB of peak, which is the budget a 12 GB card does not have.
 
 ### How deep to prefetch
