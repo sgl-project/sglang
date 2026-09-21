@@ -21,13 +21,11 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.dsa import (
-    DSAIndexerPoolHost,
-    dsa_indexer_pool_decl,
-)
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     HostPoolPlan,
+    draft_sidecar_decls,
+    packable_draft_pools,
     plan_host_pools,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -1284,6 +1282,49 @@ class DeclaredStack(msgspec.Struct, frozen=True, kw_only=True):
         return [p.decl.sidecar_spec() for p in self.plans if not p.decl.is_primary]
 
 
+def _build_declared_entries(
+    plans: tuple[HostPoolPlan, ...], *, root_mirror: Any
+) -> list[PoolEntry]:
+    """Mirrors in layout-dependency order from the given root; entries in
+    declaration order."""
+    mirrors: dict[PoolName, Any] = {}
+    pending = list(plans)
+    while pending:
+        ready = [
+            p
+            for p in pending
+            if p.decl.is_layout_root or p.decl.layout_source in mirrors
+        ]
+        if not ready:
+            raise ValueError(
+                f"unresolvable layout_source chain: {[p.decl.name for p in pending]}"
+            )
+        for plan in ready:
+            decl = plan.decl
+            if decl.is_layout_root:
+                mirrors[decl.name] = root_mirror
+            else:
+                mirrors[decl.name] = decl.mirror.build(
+                    decl=decl,
+                    device_pool=plan.device_pool,
+                    anchor_host=mirrors[decl.layout_source],
+                    allocator_type=_get_allocator_type(),
+                )
+            pending.remove(plan)
+    return [
+        build_pool_entry(
+            name=plan.decl.name,
+            host_pool=mirrors[plan.decl.name],
+            device_pool=plan.device_pool,
+            layer_mapping=plan.layers.transfer_to_device,
+            transfer_layer_id_max=plan.layers.transfer_layer_id_max,
+            is_anchor=plan.decl.is_primary,
+            packed_draft_device_pools=plan.packed_draft_device_pools,
+        )
+        for plan in plans
+    ]
+
+
 def assemble_declared_stack(
     *,
     params: CacheInitParams,
@@ -1299,16 +1340,14 @@ def assemble_declared_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> DeclaredStack:
-    """Build the anchor KV mirror plus every declared dependent state.
+    """Build the KV mirror plus every declared dependent pool of ``kv_pool``.
 
-    Packed MTP drafts keep the pre-declaration path: tail layers appended to
-    each mirror and remapped by the controller. Separate drafts are not built
-    here.
+    Packed MTP drafts that declare the same pools with the same layout are
+    appended as tail layers of each mirror and remapped by the controller.
+    Separate drafts are built by build_hicache_draft_sidecars.
     """
     transfer_layer_id_max = len(full_layer_mapping)
-    mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
-    )
+    mtp_draft_device_pools = packable_draft_pools(decls, params.mtp_draft_device_pools)
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -1324,50 +1363,14 @@ def assemble_declared_stack(
         transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
         packed_draft_device_pools=mtp_draft_device_pools,
     )
-
-    # Mirrors in layout-dependency order; entries in declaration order.
-    mirrors: dict[PoolName, Any] = {}
-    pending = list(plans)
-    while pending:
-        ready = [
-            p
-            for p in pending
-            if p.decl.layout_source is None or p.decl.layout_source in mirrors
-        ]
-        if not ready:
-            raise ValueError(
-                f"unresolvable layout_source chain: {[p.decl.name for p in pending]}"
-            )
-        for plan in ready:
-            decl = plan.decl
-            if decl.is_primary:
-                mirrors[decl.name] = build_kv_host_pool(
-                    kv_pool=kv_pool,
-                    page_size=params.page_size,
-                    use_mla=use_mla,
-                    override_kv_cache_dim=override_kv_cache_dim,
-                    mtp_draft_device_pools=mtp_draft_device_pools,
-                )
-            else:
-                mirrors[decl.name] = decl.mirror.build(
-                    decl=decl,
-                    device_pool=plan.device_pool,
-                    anchor_host=mirrors[decl.layout_source],
-                    allocator_type=_get_allocator_type(),
-                )
-            pending.remove(plan)
-    entries = [
-        build_pool_entry(
-            name=plan.decl.name,
-            host_pool=mirrors[plan.decl.name],
-            device_pool=plan.device_pool,
-            layer_mapping=plan.layers.transfer_to_device,
-            transfer_layer_id_max=plan.layers.transfer_layer_id_max,
-            is_anchor=plan.decl.is_primary,
-            packed_draft_device_pools=plan.packed_draft_device_pools,
-        )
-        for plan in plans
-    ]
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=params.page_size,
+        use_mla=use_mla,
+        override_kv_cache_dim=override_kv_cache_dim,
+        mtp_draft_device_pools=mtp_draft_device_pools,
+    )
+    entries = _build_declared_entries(plans, root_mirror=kv_host_pool)
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1432,8 +1435,9 @@ def build_full_draft_pools(
     draft_kv_pool: Any,
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
-    """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    """Build the separate draft sidecars declared by a full-attention draft pool;
+    their indices follow target KV and their layout roots on the draft KV mirror."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -1455,46 +1459,15 @@ def build_full_draft_pools(
         allocator_type=_get_allocator_type(),
         pool_label="draft",
     )
-    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
-
-    specs = [
-        SidecarPoolSpec(
-            pool_name=PoolName.DRAFT,
-            indices_from_pool=PoolName.KV,
-        )
-    ]
-    entries = [
-        build_pool_entry(
-            name=PoolName.DRAFT,
-            host_pool=draft_host_pool,
-            device_pool=pool,
-            layer_mapping=draft_layer_mapping,
-            transfer_layer_id_max=draft_host_pool.layer_num,
-        )
-    ]
-
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        # Separate draft indexer: its own host mirror laid out on the draft KV
-        # mirror, but transfer indices still follow the target KV anchor.
-        indexer_decl = dsa_indexer_pool_decl(pool, name=PoolName.DRAFT_INDEXER)
-        indexer_host_pool = DSAIndexerPoolHost(
-            decl=indexer_decl,
-            device_pool=pool,
-            anchor_host=draft_host_pool,
-            allocator_type=_get_allocator_type(),
-        )
-        specs.append(indexer_decl.sidecar_spec())
-        entries.append(
-            build_pool_entry(
-                name=indexer_decl.name,
-                host_pool=indexer_host_pool,
-                device_pool=pool,
-                layer_mapping=draft_layer_mapping,
-                transfer_layer_id_max=indexer_host_pool.layer_num,
-            )
-        )
-
-    return specs, entries
+    plans = plan_host_pools(
+        decls=draft_sidecar_decls(pool.host_pool_decls()),
+        device_pool=pool,
+        full_layer_mapping={i: i for i in range(pool.layer_num)},
+        transfer_layer_id_max=draft_host_pool.layer_num,
+        index_primary=PoolName.KV,
+    )
+    entries = _build_declared_entries(plans, root_mirror=draft_host_pool)
+    return [p.decl.sidecar_spec() for p in plans], entries
 
 
 def build_swa_draft_pools(

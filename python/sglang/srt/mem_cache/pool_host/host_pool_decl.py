@@ -64,14 +64,19 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     index_source: Optional[PoolName]
     # Whose mirror decides this state's capacity and layout. None: self.
     layout_source: Optional[PoolName]
-    layout: HostPoolLayout
-    # None only for the primary KV pool, which the assembler builds itself.
+    # None for a layout root (KV, DRAFT): its mirror is built by the assembler
+    # from the device pool, so no byte facts are declared for it.
+    layout: Optional[HostPoolLayout]
     mirror: Optional[MirrorAdapter]
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
     @property
     def is_primary(self) -> bool:
         return self.index_source is None
+
+    @property
+    def is_layout_root(self) -> bool:
+        return self.layout_source is None
 
     def sidecar_spec(self) -> SidecarPoolSpec:
         if self.index_source is None:
@@ -92,36 +97,111 @@ class HostPoolPlan(msgspec.Struct, frozen=True, kw_only=True):
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
+def kv_pool_decl() -> HostPoolDecl:
+    """The primary KV pool every device pool declares; its mirror is built by
+    the assembler, so no layout is declared here."""
+    return HostPoolDecl(
+        name=PoolName.KV,
+        index_source=None,
+        layout_source=None,
+        layout=None,
+        mirror=None,
+    )
+
+
+# Separate (non-packed) drafts mirror each target-role pool under its own name
+# while reusing the target KV transfer indices.
+_DRAFT_NAMES = {
+    PoolName.KV: PoolName.DRAFT,
+    PoolName.INDEXER: PoolName.DRAFT_INDEXER,
+}
+
+
+def draft_sidecar_decls(
+    draft_decls: tuple[HostPoolDecl, ...],
+) -> tuple[HostPoolDecl, ...]:
+    """Rename a draft pool's declarations into the target's sidecar namespace:
+    KV -> DRAFT (own capacity), INDEXER -> DRAFT_INDEXER laid out on DRAFT,
+    every transfer index taken from target KV."""
+    out = []
+    for d in draft_decls:
+        if d.name not in _DRAFT_NAMES:
+            raise ValueError(f"no separate-draft sidecar defined for {d.name}")
+        out.append(
+            msgspec.structs.replace(
+                d,
+                name=_DRAFT_NAMES[d.name],
+                index_source=PoolName.KV,
+                layout_source=(
+                    None if d.layout_source is None else _DRAFT_NAMES[d.layout_source]
+                ),
+            )
+        )
+    return tuple(out)
+
+
+def packable_draft_pools(
+    target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
+) -> tuple[Any, ...]:
+    """Draft pools whose declarations cover every target pool with the same
+    per-layer layout, so their layers can be appended to the target mirrors.
+    A draft that declares fewer pools is skipped; a layout mismatch is an error."""
+    targets = {d.name: d for d in target_decls}
+    packable = []
+    for pool in draft_pools:
+        drafts = {d.name: d for d in pool.host_pool_decls()}
+        if set(drafts) != set(targets):
+            continue
+        for name, target in targets.items():
+            if drafts[name].layout != target.layout:
+                raise ValueError(
+                    f"packed draft {name} layout {drafts[name].layout} differs from "
+                    f"target {target.layout}"
+                )
+        packable.append(pool)
+    return tuple(packable)
+
+
 def plan_host_pools(
     *,
     decls: tuple[HostPoolDecl, ...],
     device_pool: Any,
     full_layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
-    packed_draft_device_pools: tuple[Any, ...],
+    packed_draft_device_pools: tuple[Any, ...] = (),
+    index_primary: Optional[PoolName] = None,
 ) -> tuple[HostPoolPlan, ...]:
-    """Bind declarations to a stack after checking they form one primary KV
-    pool plus sidecars that resolve their indices from it."""
+    """Bind declarations to a stack. A target group contains its own primary
+    KV pool; a draft sidecar group reuses an external ``index_primary``. Either
+    way exactly one layout root anchors the others' capacity, and sidecar
+    indices come from one real source (HostPoolGroup resolves no chains)."""
     names = [d.name for d in decls]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate host pool names: {names}")
-    primaries = [d for d in decls if d.is_primary]
-    if len(primaries) != 1 or primaries[0].name != PoolName.KV:
+    roots = [d for d in decls if d.is_layout_root]
+    if len(roots) != 1:
         raise ValueError(
-            f"expected exactly one primary KV pool, got {[d.name for d in primaries]}"
+            f"expected exactly one layout root, got {[d.name for d in roots]}"
         )
-    primary = primaries[0].name
+    root = roots[0]
+    if index_primary is None:
+        if not root.is_primary or root.name != PoolName.KV:
+            raise ValueError(
+                f"expected the layout root to be the primary KV pool, got {root.name}"
+            )
+        index_primary = root.name
+    elif any(d.is_primary for d in decls):
+        raise ValueError("a sidecar group must take every index from the target")
     for d in decls:
         if d.is_primary:
             continue
-        # HostPoolGroup resolves sidecar indices from one real source, so no
-        # self-reference and no sidecar-to-sidecar chains.
-        if d.index_source != primary:
+        if d.index_source != index_primary:
             raise ValueError(
-                f"{d.name}.index_source must be the primary pool {primary}, "
-                f"got {d.index_source}"
+                f"{d.name}.index_source must be {index_primary}, got {d.index_source}"
             )
-        if d.layout_source is None or d.layout_source == d.name:
+        if d.is_layout_root:
+            continue
+        if d.layout_source == d.name:
             raise ValueError(f"{d.name}.layout_source must name another pool")
         if d.layout_source not in names:
             raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")

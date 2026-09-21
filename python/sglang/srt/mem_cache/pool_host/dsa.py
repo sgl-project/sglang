@@ -77,19 +77,6 @@ class DSAIndexerMirror:
         )
 
 
-def dsa_kv_pool_decl(pool: DSATokenToKVPool) -> HostPoolDecl:
-    return HostPoolDecl(
-        name=PoolName.KV,
-        index_source=None,
-        layout_source=None,
-        layout=HostPoolLayout(
-            bytes_per_token_per_layer=pool.kv_cache_dim * pool.store_dtype.itemsize,
-            dtype=pool.store_dtype,
-        ),
-        mirror=None,
-    )
-
-
 def dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:

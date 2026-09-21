@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
@@ -26,7 +26,13 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
-from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl, plan_host_pools
+from sglang.srt.mem_cache.pool_host.host_pool_decl import (
+    HostPoolDecl,
+    draft_sidecar_decls,
+    kv_pool_decl,
+    packable_draft_pools,
+    plan_host_pools,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -204,7 +210,9 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool = SimpleNamespace(
+            layer_num=1, size=800, host_pool_decls=lambda: (kv_pool_decl(),)
+        )
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
             cache_controller=SimpleNamespace(
@@ -284,9 +292,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
-            patch.object(
-                hybrid_pool_assembler, "DSAIndexerPoolHost", fake_indexer_host
-            ),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", fake_indexer_host),
         ):
             specs, entries = build_full_draft_pools(
                 draft_kv_pool=draft_kv_pool,
@@ -382,7 +388,7 @@ def _legacy_build_anchor_sidecar_stack(
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
-    sidecar_host_pool = hybrid_pool_assembler.DSAIndexerPoolHost(
+    sidecar_host_pool = pool_host_dsa.DSAIndexerPoolHost(
         indexer_decl,
         kv_pool,
         kv_host_pool,
@@ -473,9 +479,6 @@ class TestDeclaredStackParity(CustomTestCase):
         controller = MagicMock()
         with (
             patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
-            patch.object(
-                hybrid_pool_assembler, "DSAIndexerPoolHost", dummy_indexer_host
-            ),
             patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
             patch.object(hybrid_pool_assembler, "HybridCacheController", controller),
             patch.object(
@@ -519,8 +522,7 @@ class TestDeclaredStackParity(CustomTestCase):
             with self.subTest(case=name):
                 pool = _dsa_pool_stub(layer_num=3, shard=case["shard"])
                 drafts = tuple(
-                    SimpleNamespace(index_k_with_scale_buffer=[object()])
-                    for _ in range(case["drafts"])
+                    _dsa_pool_stub(layer_num=1) for _ in range(case["drafts"])
                 )
                 params = SimpleNamespace(
                     page_size=64,
@@ -558,6 +560,213 @@ class TestDeclaredStackParity(CustomTestCase):
                 self.assertEqual(
                     stack.sidecars, [dsa_indexer_pool_decl(pool).sidecar_spec()]
                 )
+
+
+class TestDraftSidecarDeclarations(CustomTestCase):
+    """Separate drafts reuse the target's declarations under DRAFT_* names."""
+
+    def test_dsa_draft_maps_to_draft_and_draft_indexer(self):
+        decls = draft_sidecar_decls(_dsa_pool_stub(layer_num=1).host_pool_decls())
+        self.assertEqual(
+            [(d.name, d.index_source, d.layout_source) for d in decls],
+            [
+                (PoolName.DRAFT, PoolName.KV, None),
+                (PoolName.DRAFT_INDEXER, PoolName.KV, PoolName.DRAFT),
+            ],
+        )
+
+    def test_sidecar_group_plans_with_external_index_primary(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        plans = plan_host_pools(
+            decls=draft_sidecar_decls(pool.host_pool_decls()),
+            device_pool=pool,
+            full_layer_mapping={0: 0, 1: 1},
+            transfer_layer_id_max=2,
+            index_primary=PoolName.KV,
+        )
+        self.assertEqual(
+            [p.decl.name for p in plans], [PoolName.DRAFT, PoolName.DRAFT_INDEXER]
+        )
+        with self.assertRaisesRegex(ValueError, "every index from the target"):
+            plan_host_pools(
+                decls=pool.host_pool_decls(),
+                device_pool=pool,
+                full_layer_mapping={0: 0, 1: 1},
+                transfer_layer_id_max=2,
+                index_primary=PoolName.KV,
+            )
+
+
+class TestPackedDraftPairing(CustomTestCase):
+    """Packing appends draft layers to the target mirrors, so a draft must
+    declare every target pool with an identical per-layer layout."""
+
+    def test_draft_without_indexer_is_not_packed(self):
+        # Pre-declaration code filtered on ``pool.index_k_with_scale_buffer``.
+        target = _dsa_pool_stub(layer_num=2)
+        no_index = _dsa_pool_stub(layer_num=1)
+        no_index.index_key_cache = SimpleNamespace(buffer=[])
+        full = _dsa_pool_stub(layer_num=1)
+        self.assertEqual(
+            packable_draft_pools(target.host_pool_decls(), (no_index, full)), (full,)
+        )
+
+    def test_layout_mismatch_is_rejected(self):
+        target = _dsa_pool_stub(layer_num=2)
+        wide = _dsa_pool_stub(layer_num=1)
+        wide.index_head_dim = 256
+        with self.assertRaisesRegex(ValueError, "layout"):
+            packable_draft_pools(target.host_pool_decls(), (wide,))
+
+
+def _legacy_build_full_draft_pools(
+    *,
+    draft_kv_pool,
+    tree_cache,
+):
+    """Pre-2b separate-draft assembly (isinstance DSA branch), kept only as the
+    parity oracle for the declaration-driven build_full_draft_pools."""
+
+    pool = draft_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        # Hybrid draft runners keep their sole attention layer in this sub-pool.
+        pool = pool.full_kv_pool
+    if pool.layer_num == 0:
+        return [], []
+
+    controller = tree_cache.cache_controller
+    host_pool_group = controller.mem_pool_host
+
+    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
+    # loc space, so match the target host's logical_size instead of physical size.
+    draft_host_pool = hybrid_pool_assembler._build_mha_mla_host_pool(
+        pool=pool,
+        host_to_device_ratio=host_pool_group.logical_size / pool.size,
+        page_size=controller.page_size,
+        layout=hybrid_pool_assembler.get_memory().hicache_mem_layout,
+        allocator_type=hybrid_pool_assembler._get_allocator_type(),
+        pool_label="draft",
+    )
+    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
+
+    specs = [
+        SidecarPoolSpec(
+            pool_name=PoolName.DRAFT,
+            indices_from_pool=PoolName.KV,
+        )
+    ]
+    entries = [
+        hybrid_pool_assembler.build_pool_entry(
+            name=PoolName.DRAFT,
+            host_pool=draft_host_pool,
+            device_pool=pool,
+            layer_mapping=draft_layer_mapping,
+            transfer_layer_id_max=draft_host_pool.layer_num,
+        )
+    ]
+
+    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
+        # Separate draft indexer: its own host mirror laid out on the draft KV
+        # mirror, but transfer indices still follow the target KV anchor.
+        indexer_decl = pool_host_dsa.dsa_indexer_pool_decl(
+            pool, name=PoolName.DRAFT_INDEXER
+        )
+        indexer_host_pool = pool_host_dsa.DSAIndexerPoolHost(
+            decl=indexer_decl,
+            device_pool=pool,
+            anchor_host=draft_host_pool,
+            allocator_type=hybrid_pool_assembler._get_allocator_type(),
+        )
+        specs.append(indexer_decl.sidecar_spec())
+        entries.append(
+            hybrid_pool_assembler.build_pool_entry(
+                name=indexer_decl.name,
+                host_pool=indexer_host_pool,
+                device_pool=pool,
+                layer_mapping=draft_layer_mapping,
+                transfer_layer_id_max=indexer_host_pool.layer_num,
+            )
+        )
+
+    return specs, entries
+
+
+class TestSeparateDraftParity(CustomTestCase):
+    """Declaration-driven build_full_draft_pools must match the isinstance-based
+    assembly it replaces, including skipping the indexer for a draft pool that
+    owns no index buffers."""
+
+    def _run(self, builder, pool):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+
+        def dummy_draft_host(
+            *, pool, host_to_device_ratio, page_size, layout, allocator_type, pool_label
+        ):
+            return MLATokenToKVPoolHost(
+                pool,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=pool.kv_cache_dim,
+                pool_label=pool_label,
+            )
+
+        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+            return real_indexer_host(
+                decl=decl,
+                device_pool=device_pool,
+                anchor_host=anchor_host,
+                allocator_type=allocator_type,
+                pin_memory=False,
+                is_dummy=True,
+            )
+
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=8192, logical_size=8192),
+                page_size=64,
+            )
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler, "_build_mha_mla_host_pool", dummy_draft_host
+            ),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+        ):
+            return builder(draft_kv_pool=pool, tree_cache=tree_cache)
+
+    def test_matches_legacy_separate_draft_assembly(self):
+        for name, with_index in (
+            ("dsa_with_indexer", True),
+            ("dsa_no_index_buffers", False),
+        ):
+            with self.subTest(case=name):
+                pool = _dsa_pool_stub(layer_num=2, size=4096)
+                if not with_index:
+                    pool.index_key_cache = SimpleNamespace(buffer=[])
+                legacy_specs, legacy_entries = self._run(
+                    _legacy_build_full_draft_pools, pool
+                )
+                specs, entries = self._run(build_full_draft_pools, pool)
+                self.assertEqual(specs, legacy_specs)
+                self.assertEqual(
+                    _entry_shape(SimpleNamespace(entries=entries), 2),
+                    _entry_shape(SimpleNamespace(entries=legacy_entries), 2),
+                )
+                self.assertEqual(len(entries), 2 if with_index else 1)
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):

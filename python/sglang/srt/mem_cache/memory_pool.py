@@ -1870,6 +1870,14 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def host_pool_decls(self):
+        """Host pools HiCache must mirror for this pool. Base: the KV pool itself,
+        whose mirror the assembler builds; subclasses append dependent pools."""
+        # pool_host imports this module; resolve the declaration types lazily.
+        from sglang.srt.mem_cache.pool_host.host_pool_decl import kv_pool_decl
+
+        return (kv_pool_decl(),)
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -3992,6 +4000,10 @@ class HybridLinearKVPool(KVCache):
             self.mem_usage = (k_size + v_size) / GB
 
     @property
+    def host_pool_decls(self):
+        # Mamba state lives in req_to_token_pool and keeps its own host path.
+        return self.full_kv_pool.host_pool_decls()
+
     def post_capture_active(self) -> bool:
         return self.full_kv_pool.post_capture_active
 
@@ -4967,14 +4979,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return not self.skip_topk_layers[local_layer_idx]
 
     def host_pool_decls(self):
-        """Host pools HiCache must mirror for this pool: KV plus the indexer sidecar."""
         # pool_host imports this module; resolve the mirror side lazily.
-        from sglang.srt.mem_cache.pool_host.dsa import (
-            dsa_indexer_pool_decl,
-            dsa_kv_pool_decl,
-        )
+        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_pool_decl
 
-        return (dsa_kv_pool_decl(self), dsa_indexer_pool_decl(self))
+        decls = super().host_pool_decls()
+        # Layers that skip top-k own no index buffer; such a pool has no indexer
+        # state to mirror (this is what packed-draft eligibility used to test).
+        if self.index_k_with_scale_buffer:
+            decls += (dsa_indexer_pool_decl(self),)
+        return decls
 
     @property
     def index_k_with_scale_buffer(self):
