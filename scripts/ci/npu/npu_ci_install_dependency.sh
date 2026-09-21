@@ -31,8 +31,13 @@ GITHUB_PROXY_URL="${GITHUB_PROXY_URL:-}"
 
 source_env() {
     if [ -f "$1" ]; then
+        # Vendor set_env scripts (e.g. opp/vendors/*/bin/set_env.bash) append to
+        # variables like ASCEND_CUSTOM_OPP_PATH via ${VAR} without a default, which
+        # aborts under `set -u`. Relax nounset only while sourcing them.
+        set +u
         # shellcheck disable=SC1090
         source "$1"
+        set -u
     else
         echo "[skip] set_env not found: $1"
     fi
