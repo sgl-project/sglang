@@ -40,7 +40,7 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    is_deepseek_v4: bool,
+    deepseek_v4: Option<super::deepseek::V4Profile>,
     is_kimi_k3: bool,
 }
 
@@ -48,9 +48,8 @@ impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
         let files = super::adapter::ModelFiles::open(tokenizer_path);
-        let model_type = files
-            .json("config.json")?
-            .and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
+        let config = files.json("config.json")?.unwrap_or_default();
+        let model_type = config["model_type"].as_str().map(str::to_owned);
         if let Some(kimi) = Self::kimi_native(model_type.as_deref(), model_id) {
             return Ok(Some(kimi));
         }
@@ -58,7 +57,12 @@ impl ChatFormatter {
             // These require tokenization paths not yet supported by this adapter.
             Some("inkling_mm_model") => return Ok(None),
             Some(t) if t.starts_with("deepseek_v4") => {
-                return Ok(Self::deepseek_native(model_type.as_deref(), model_id));
+                let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
+                if let Some(formatter) = &mut formatter {
+                    formatter.deepseek_v4 =
+                        Some(super::deepseek::V4Profile::load(&files, &config)?);
+                }
+                return Ok(formatter);
             }
             _ => {}
         }
@@ -66,8 +70,14 @@ impl ChatFormatter {
             .json("tokenizer_config.json")?
             .unwrap_or_else(|| serde_json::json!({}));
         let jinja = files.text("chat_template.jinja")?;
-        Ok(Self::from_tokenizer_config(cfg, jinja.as_deref())?
-            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id)))
+        let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
+            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
+        if let Some(formatter) = &mut formatter {
+            if formatter.deepseek_v4.is_some() {
+                formatter.deepseek_v4 = Some(super::deepseek::V4Profile::load(&files, &config)?);
+            }
+        }
+        Ok(formatter)
     }
 
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
@@ -136,7 +146,7 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token,
-            is_deepseek_v4: false,
+            deepseek_v4: None,
             is_kimi_k3: false,
         }))
     }
@@ -151,25 +161,25 @@ impl ChatFormatter {
             formatter,
             defaults: HashMap::new(),
             bos_token: Some("[BOS]".into()),
-            is_deepseek_v4: false,
+            deepseek_v4: None,
             is_kimi_k3: true,
         })
     }
 
-    /// dynamo-render's code-based DeepSeek encoders, for V4 (including variants
-    /// such as V4.1) and V3.2 non-Exp: the only built-in formatters verified
-    /// against the engine. `model_type` (from `config.json`) is authoritative;
-    /// the model id's last path segment is the fallback.
+    /// Native V4 and V3.2 formatters. Other V4-family encoders must be
+    /// supported explicitly; a V4.1 checkpoint cannot use the V4 wire format.
     pub fn deepseek_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
         let name = model_name(model_id);
-        // The engine treats every `deepseek_v4*` variant (e.g. V4.1) as V4.
-        let model_type = model_type.map(str::to_lowercase).map(|t| {
-            if t.starts_with("deepseek_v4") {
-                "deepseek_v4".into()
-            } else {
-                t
-            }
-        });
+        let model_type = model_type.map(str::to_lowercase);
+        if model_type.is_none() && (name.contains("v4.1") || name.contains("v41")) {
+            return None;
+        }
+        if model_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("deepseek_v4") && t != "deepseek_v4")
+        {
+            return None;
+        }
         let PromptFormatter::OAI(formatter) = deepseek_formatter_for(&model_type, &name)?;
         // Same rule dynamo-render applies for the name fallback: `deepseek` + one
         // separator + a `v4` segment.
@@ -190,7 +200,7 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token: Some("<｜begin▁of▁sentence｜>".into()),
-            is_deepseek_v4,
+            deepseek_v4: is_deepseek_v4.then(Default::default),
             is_kimi_k3: false,
         })
     }
@@ -241,12 +251,7 @@ impl ChatFormatter {
                 .entry("enable_thinking".into())
                 .or_insert(thinking.into());
         }
-        if let Some(mut effort) = effort {
-            // The engine's official V4 profile accepts only these; others map to
-            // no preamble.
-            if self.is_deepseek_v4 && !matches!(effort.as_str(), Some("low" | "high" | "max")) {
-                effort = "low".into();
-            }
+        if let Some(effort) = effort {
             if self.is_kimi_k3 {
                 if matches!(effort.as_str(), Some("low" | "high" | "max")) {
                     kwargs.entry("thinking_effort".into()).or_insert(effort);
@@ -275,6 +280,9 @@ impl ChatFormatter {
         if self.is_kimi_k3 {
             super::kimi::normalize(request, &mut messages, &mut kwargs)?;
         }
+        if self.deepseek_v4.is_some() {
+            super::deepseek::normalize_messages(&mut messages)?;
+        }
         let mut prefix = String::new();
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
             if let Some(content) = last["content"].as_str() {
@@ -286,7 +294,7 @@ impl ChatFormatter {
                 }
             }
         }
-        if self.is_deepseek_v4 {
+        if self.deepseek_v4.is_some() {
             if let Some(task) = request.get("task").filter(|v| !v.is_null()).cloned() {
                 let message = messages
                     .iter_mut()
@@ -295,6 +303,12 @@ impl ChatFormatter {
                     .context("task requires a user or developer message")?;
                 message["task"] = task;
             }
+        }
+        if let Some(profile) = self.deepseek_v4 {
+            return Ok((
+                RenderedPrompt::text(profile.render(request, messages, &kwargs)?),
+                prefix,
+            ));
         }
         let prompt = self
             .formatter
@@ -643,7 +657,7 @@ mod tests {
         assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V4-Flash").is_some());
         assert!(ChatFormatter::deepseek_native(None, "deepseek-v4-tiny").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").is_some());
-        assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_none());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
         assert!(ChatFormatter::deepseek_native(Some("inkling_mm_model"), "inkling").is_none());
         assert!(ChatFormatter::deepseek_native(Some("llama"), "deepseek-v4").is_none());
@@ -700,27 +714,25 @@ mod tests {
 
     #[test]
     fn request_controls_reach_dynamo() {
-        let jinja = jinja(
+        let formatter = jinja(
             json!({"chat_template": "{{ tools | tojson }} {{ thinking }} {{ reasoning_effort }}"}),
         );
-        for formatter in [jinja, deepseek_v4()] {
-            let mut req = request(json!([{"role":"user","content":"hi"}]));
-            req["tools"] = json!([
-                {"type":"function","function":{"name":"first"}},
-                {"type":"function","function":{"name":"second"}}
-            ]);
-            req["tool_choice"] = json!({"type":"function","function":{"name":"second"}});
-            req["reasoning"] = json!({"effort":"high"});
-            let out = formatter.render(&req).unwrap();
-            assert!(out.contains("second") && !out.contains("first"));
-            assert!(out.contains("high") || out.contains("Reasoning Effort:"));
-            req["tool_choice"] = json!("none");
-            req["reasoning_effort"] = json!("none");
-            req["reasoning"] = JsonValue::Null;
-            let out = formatter.render(&req).unwrap();
-            assert!(!out.contains("first") && !out.contains("second"));
-            assert!(out.contains("False none") || out.ends_with("</think>"));
-        }
+        let mut req = request(json!([{"role":"user","content":"hi"}]));
+        req["tools"] = json!([
+            {"type":"function","function":{"name":"first"}},
+            {"type":"function","function":{"name":"second"}}
+        ]);
+        req["tool_choice"] = json!({"type":"function","function":{"name":"second"}});
+        req["reasoning"] = json!({"effort":"high"});
+        let out = formatter.render(&req).unwrap();
+        assert!(out.contains("second") && !out.contains("first"));
+        assert!(out.contains("high") || out.contains("Reasoning Effort:"));
+        req["tool_choice"] = json!("none");
+        req["reasoning_effort"] = json!("none");
+        req["reasoning"] = JsonValue::Null;
+        let out = formatter.render(&req).unwrap();
+        assert!(!out.contains("first") && !out.contains("second"));
+        assert!(out.contains("False none") || out.ends_with("</think>"));
     }
 
     /// Mirrors `protocol.py::normalize_reasoning_inputs`: effort decides both

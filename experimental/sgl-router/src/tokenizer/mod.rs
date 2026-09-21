@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod deepseek;
 mod kimi;
 
 use anyhow::Result;
@@ -334,7 +335,7 @@ mod tests {
         assert_eq!(cfg["chat_template"], "X");
     }
 
-    /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
+    /// Families the engine encodes in code skip a shipped template.
     #[test]
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
@@ -356,8 +357,9 @@ mod tests {
             .render(&request)
             .unwrap()
             .contains("<|open|>message"));
+        assert!(resolve("deepseek_v41").is_none());
         assert_eq!(
-            resolve("deepseek_v41").unwrap().render(&request).unwrap(),
+            resolve("deepseek_v4").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
         );
     }
