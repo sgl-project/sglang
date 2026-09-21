@@ -676,7 +676,10 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
         and logits.dim() == 2
         and logits.dtype == torch.float32
         and logits.stride(1) == 1
-        and logits.shape[0] <= 64
+        and (
+            logits.shape[0] <= 64
+            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+        )
         and logits.shape[1] >= 4096
     ):
         from sglang.kernels.ops.speculative.row_argmax import row_argmax

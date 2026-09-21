@@ -243,6 +243,9 @@ class LogitsProcessorOutput:
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
+    # Completion of input-logprob copies from borrowed graph storage.
+    input_logprobs_copy_done: Optional[torch.cuda.Event] = None
+
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
@@ -262,6 +265,22 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    def finalize_input_logprobs(self) -> None:
+        if self.input_logprobs_copy_done is None:
+            return
+        self.input_logprobs_copy_done.synchronize()
+        self.input_logprobs_copy_done = None
+        # Only borrowed results contain spans within each sequence. Other
+        # producers (including multi-item scoring) keep their existing layout.
+        for sequences in (
+            self.input_top_logprobs_val,
+            self.input_top_logprobs_idx,
+            self.input_token_ids_logprobs_val,
+        ):
+            if sequences is not None:
+                for i, spans in enumerate(sequences):
+                    sequences[i] = [row for span in spans for row in span.tolist()]
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -278,6 +297,8 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    sample_indices_cpu: Optional[List[int]] = None
+    input_logprob_indices_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing
@@ -464,9 +485,7 @@ class LogitsProcessor(nn.Module):
         ):
             parallel = get_parallel()
             group = (
-                parallel.attn_tp_group
-                if self.use_attn_tp_group
-                else parallel.tp_group
+                parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
             )
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(
@@ -739,6 +758,8 @@ class LogitsProcessor(nn.Module):
                     else [torch.cat(lst) for lst in aux_pruned_states_lists]
                 )
 
+            logits_metadata.sample_indices_cpu = sample_indices
+            logits_metadata.input_logprob_indices_cpu = input_logprob_indices
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
             sample_indices = torch.tensor(

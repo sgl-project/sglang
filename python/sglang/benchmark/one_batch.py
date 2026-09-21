@@ -93,10 +93,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
+    SpawnRanks,
     get_model,
     get_parallel,
     get_schedule,
     publish,
+    spawn_world_rank,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -707,7 +709,15 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    publish(server_args, role="scheduler")
+    # With the placement this process was spawned with, so a rank read here
+    # does not need a process group -- the same bundle the runner is handed.
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+        ),
+    )
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -912,7 +922,13 @@ def latency_test(
     cfg = resolving_view(server_args)
     # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
     # a spawned child arrives with nothing published.
-    publish(server_args, role="scheduler")
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0)
+        ),
+    )
     initialize_moe_config()
     initialize_fp8_gemm_config()
     initialize_fp4_gemm_config()
