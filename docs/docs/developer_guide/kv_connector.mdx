@@ -113,10 +113,14 @@ follows this lifecycle:
    the existing layer counters, or `-1` if the provider establishes ordering
    itself. Keep transfer events and referenced pages alive until completion.
 5. `cache_unfinished_req()` and `cache_finished_req()` can submit writes.
-   `finish(handle, outcome)` and `release_aborted_request(handle)` must release
-   attempt state correctly on completion, abort, and retraction. Successful
-   request completion must not release pages still read by an asynchronous
-   store. Consumer-only providers must not store.
+   Use `cache_finished_req()` to release per-attempt state when an admitted
+   request completes or releases its KV on retraction. This includes unused
+   prefetch state when another request has already restored the prefix and
+   local matching skips `init_load_back()`. Colocated serving does not call
+   `finish(handle, SUCCESS)` on normal completion. Implement
+   `finish(handle, ABORT)` / `release_aborted_request(handle)` for aborts before
+   admission as well. Successful completion must not release pages still read
+   by an asynchronous store. Consumer-only providers must not store.
 6. `has_pending_cache_operations()` must cover all operations retaining cache
    resources. Such work prevents full idle, local flush/reset, and sleeping.
    `release_host_resources()` drains and closes resources during shutdown and

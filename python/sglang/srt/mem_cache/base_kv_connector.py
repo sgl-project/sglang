@@ -100,6 +100,9 @@ class BaseKVConnector(BasePrefixCache):
     def release_host_resources(self) -> None:
         """Idempotently drain and close provider resources on worker shutdown.
 
-        Request completion/abort must also implement BasePrefixCache.finish and
-        release_aborted_request as needed; shutdown is not per-request cleanup.
+        Clean up admitted requests in BasePrefixCache.cache_finished_req,
+        including unused prefetch state after a concurrent local cache hit.
+        Use finish/release_aborted_request for aborts before admission;
+        colocated serving does not call finish(SUCCESS) on normal completion.
+        Shutdown is not per-request cleanup.
         """
