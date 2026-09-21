@@ -178,13 +178,6 @@ fn insert_disaggregated_params(
     }
 }
 
-/// Convert a `google.protobuf.Value` to JSON.
-///
-/// An integral `number_value` becomes a JSON integer: the Python side decodes
-/// action payloads into typed fields (block hashes and the like), where a float
-/// would not convert. Struct only carries f64, so a value above 2^53 has already
-/// lost precision on the wire -- an action that needs exact 64-bit integers must
-/// encode them as strings.
 fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     use prost_types::value::Kind;
     match &value.kind {

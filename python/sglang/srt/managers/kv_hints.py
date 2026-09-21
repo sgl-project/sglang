@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Versioned KV-hint envelope carried on a request.
 
-A KV hint is advisory routing metadata attached by a trusted orchestrator (a
-router or a scheduler) *after* it has picked a worker -- never by an application
-client. SGLang transports it unchanged from the entrypoint down to the HiCache
-storage backends; nothing in the core reads a payload.
+A trusted orchestrator attaches KV hints after selecting a worker. SGLang transports them from the entrypoint to HiCache unchanged; core code does not read payloads.
 
-The envelope is a list of independent actions. Each action names its own type
-and version, so one consumer implementing ``foo.bar@1.0`` must ignore -- not
-reject -- an action it does not implement sitting next to it in the same
-envelope. ``payload`` is therefore deliberately untyped here: the component
-that implements an action owns its schema and validates it.
-
-Wire-compatible with vLLM's ``vllm.v1.kv_hints`` (vllm-project/vllm#53423) so
-one orchestrator can address either engine with the same envelope.
+Each action names its own type and version. Consumers ignore actions they do not implement, and the component that implements an action validates its payload.
 """
 
 from __future__ import annotations
@@ -50,12 +40,6 @@ class KvHintsEnvelope(msgspec.Struct, frozen=True, kw_only=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
-
-
-# Envelope version this transport was specified against. Not enforced: an
-# action carries its own version, and a consumer that finds no action it
-# implements already falls back to normal behavior.
-KV_HINTS_PROTOCOL_VERSION = "0.1"
 
 
 def decode_kv_hints_envelope(value: Any) -> KvHintsEnvelope:

@@ -423,8 +423,6 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
-        # Versioned KV-hint envelope forwarded untouched to the HiCache storage
-        # backends. See GenerateReqInput.kv_hints.
         kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
@@ -540,8 +538,6 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
-        # Versioned KV-hint envelope forwarded untouched to the HiCache storage
-        # backends. See GenerateReqInput.kv_hints.
         kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,

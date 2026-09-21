@@ -137,10 +137,7 @@ message GenerateRequest {
   optional KVHintsEnvelope kv_hints = 17;
 }
 
-// Versioned KV-hint envelope attached by a trusted orchestrator after worker
-// selection. Forwarded untouched to the HiCache storage backends; each reads
-// only the action types it implements. Wire-compatible with vLLM's
-// KVHintsEnvelope (vllm-project/vllm#53423).
+// Versioned KV-hint envelope forwarded from a trusted orchestrator to HiCache.
 message KVHintsEnvelope {
   string protocol_version = 1;
   string message_id = 2;

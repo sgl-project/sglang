@@ -853,9 +853,6 @@ class GenerateReqInput:
         if self.kv_hints is None:
             return
         if isinstance(self.kv_hints, (dict, KvHintsEnvelope)):
-            # One envelope broadcast to the batch: every request shares the
-            # orchestrator's routing decision, which is what a router sending a
-            # single decision for a fanned-out prompt means.
             self.kv_hints = [decode_kv_hints_envelope(self.kv_hints)] * num
         elif isinstance(self.kv_hints, list):
             if len(self.kv_hints) != self.batch_size:
