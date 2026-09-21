@@ -339,6 +339,10 @@ class Envs:
     # sets it for the engine child; it is not a user-facing knob, and it is
     # excluded from the artifact's own environment identity.
     SGLANG_SNAPSHOT_DIR = EnvStr("")
+    # Set by the snapshot engine entry for the tree it starts; the engine-side
+    # barriers engage on this marker, so a leftover SGLANG_SNAPSHOT_DIR in an
+    # operator's environment cannot park a plain serve.
+    SGLANG_SNAPSHOT_ENGINE = EnvBool(False)
     # External tools used by `sglang snapshot`, so the commands can be pointed
     # at wrappers when the binaries are not named or not on PATH.
     SGLANG_CRIU = EnvStr("criu")
