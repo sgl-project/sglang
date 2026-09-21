@@ -89,7 +89,9 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
 
 def register():
-    from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
+    from sglang.multimodal_gen.configs.sample.qwenimage21 import (
+        QwenImage21SamplingParams,
+    )
     from sglang.multimodal_gen.registry import register_configs
 
     register_configs(
