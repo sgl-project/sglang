@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21RMS_norm,
+    QwenImage21Upsample,
     _patchify,
     _unpatchify,
 )
@@ -48,6 +49,28 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21InputValidationStage,
     collapse_image_slots,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["contiguous", "channels_last", "transposed"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nearest_upsample_preserves_every_finite_low_precision_value(
+    dtype, layout, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(dtype)
+    values = values[torch.isfinite(values)].reshape(1, 2, -1, 128).to(device)
+    if layout == "channels_last":
+        values = values.contiguous(memory_format=torch.channels_last)
+    elif layout == "transposed":
+        values = values.transpose(2, 3)
+    upsample = QwenImage21Upsample(scale_factor=2, mode="nearest-exact")
+    expected = torch.nn.functional.interpolate(
+        values.float(), scale_factor=2, mode="nearest-exact"
+    ).to(dtype)
+    actual = upsample(values)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("prompt", ["edit", ""])
