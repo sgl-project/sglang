@@ -117,7 +117,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ### 3.1 Reasoning
 
-GLM-5.3 is a reasoning model, and generated commands enable `--reasoning-parser glm45` by default so thinking is separated from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Without the parser the server returns the thinking and the answer as one `content` string with a stray `</think>` between them, because the chat template opens `<think>` in the generation prompt. You can disable **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground) when an integration needs that raw format. The chat template defaults `clear_thinking` to `false`; for multi-turn chat, pass `chat_template_kwargs: {"clear_thinking": True}` so previous reasoning is cleared before the next response.
+GLM-5.3 is a reasoning model, and generated commands enable `--reasoning-parser auto` (which resolves to `glm45` for GLM-5.3) by default so thinking is separated from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Without the parser the server returns the thinking and the answer as one `content` string with a stray `</think>` between them, because the chat template opens `<think>` in the generation prompt. You can disable **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground) when an integration needs that raw format. The chat template defaults `clear_thinking` to `false`; for multi-turn chat, pass `chat_template_kwargs: {"clear_thinking": True}` so previous reasoning is cleared before the next response.
 
 **Reasoning effort.** Pass `chat_template_kwargs: {"reasoning_effort": ...}` to select `low`, `high`, or `max`. If you omit it or pass another value, the template uses `max`.
 
@@ -164,7 +164,7 @@ Here is how you can calculate it:
 
 ### 3.2 Tool Calling
 
-Generated commands enable `--tool-call-parser glm47` by default, so structured calls are returned in `message.tool_calls` with `finish_reason: "tool_calls"`. GLM-5.3 emits the newer `<tool_call>…<arg_key>…<arg_value>…` format, so it needs the **`glm47`** parser — the older `glm45` parser does not parse it (the call would be left as raw text in `content`). Running with no tool-call parser fails the same way, and `finish_reason` stays `"stop"`, so an agent loop never sees the call. You can disable **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) when tool calling is not needed. On thinking mode the turn also fills `reasoning_content`, so print both fields.
+Generated commands enable `--tool-call-parser auto` by default, so structured calls are returned in `message.tool_calls` with `finish_reason: "tool_calls"`. `auto` resolves to **`glm47`** for GLM-5.3: the model emits the newer `<tool_call>…<arg_key>…<arg_value>…` format, which the older `glm45` parser does not parse (the call would be left as raw text in `content`). Running with no tool-call parser fails the same way, and `finish_reason` stays `"stop"`, so an agent loop never sees the call. You can disable **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) when tool calling is not needed. On thinking mode the turn also fills `reasoning_content`, so print both fields.
 
 <Accordion title="Tool Calling Example (Python)">
 
@@ -218,7 +218,7 @@ For long-context, prefix-heavy workloads, enable hierarchical KV caching to spil
 
 ### 3.4 Claude Code Integration
 
-GLM-5.3's strong reasoning + tool-calling makes it a good backend for [Claude Code](https://code.claude.com/docs/en/overview), Anthropic's agentic CLI. SGLang exposes the Anthropic-compatible `/v1/messages` endpoint on every server, so Claude Code can talk to a GLM-5.3 server with only environment variables — no code change. Launch the server with `--reasoning-parser glm45 --tool-call-parser glm47` (any recipe from the Deployment panel above works), then:
+GLM-5.3's strong reasoning + tool-calling makes it a good backend for [Claude Code](https://code.claude.com/docs/en/overview), Anthropic's agentic CLI. SGLang exposes the Anthropic-compatible `/v1/messages` endpoint on every server, so Claude Code can talk to a GLM-5.3 server with only environment variables — no code change. Launch the server with `--reasoning-parser auto --tool-call-parser auto` (any recipe from the Deployment panel above works), then:
 
 ```bash Command
 export ANTHROPIC_BASE_URL="http://127.0.0.1:30000"
