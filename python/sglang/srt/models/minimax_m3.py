@@ -29,7 +29,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
 )
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -91,6 +90,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -101,7 +101,16 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_gfx95_supported = _is_hip and is_gfx95_supported()
 _device_sm = get_device_sm()
+
+if _is_gfx95_supported:
+    from sglang.kernels.ops.gemm.router_gemv import (
+        router_gemv,
+        router_gemv_supported,
+    )
+else:
+    router_gemv = router_gemv_supported = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -512,6 +521,10 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if router_gemv is not None and router_gemv_supported(
+                hidden_states, self.gate.weight
+            ):
+                return router_gemv(hidden_states, self.gate.weight)
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
@@ -1071,9 +1084,9 @@ class MiniMaxM3Attention(nn.Module):
     ):
         """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1427,7 +1440,7 @@ class MiniMaxM3Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
         if self.pp_group.is_first_rank:
@@ -1545,7 +1558,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+        # no index_v_proj in the M3 checkpoint
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
@@ -1559,7 +1573,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -1597,10 +1611,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():
@@ -1612,9 +1628,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for MiniMax-M3"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for MiniMax-M3"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):

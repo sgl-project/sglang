@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
@@ -129,6 +132,55 @@ class TestMultiOutputGrouping(unittest.TestCase):
         self.assertEqual(
             [item.request_id for item in outputs],
             ["rid:0", "rid:1"],
+        )
+
+    def test_sequential_stage_matches_entrypoint_output_expansion(self):
+        def make_req():
+            req = Req(
+                sampling_params=SamplingParams(
+                    request_id="rid",
+                    prompt="p",
+                    output_path="/tmp",
+                    output_file_name="image.png",
+                    num_outputs_per_prompt=2,
+                    seed=[100, 101],
+                )
+            )
+            return req
+
+        entrypoint_outputs = expand_request_outputs(make_req())
+        sequential_parent = make_req()
+        sequential_outputs = list(
+            InputValidationStage().iter_sequential_requests(
+                sequential_parent,
+                SimpleNamespace(
+                    pipeline_config=SimpleNamespace(
+                        supports_sequential_multi_output_inference=lambda: True
+                    )
+                ),
+            )
+        )
+
+        def expansion_signature(req):
+            return (
+                req.request_id,
+                req.seed,
+                req.num_outputs_per_prompt,
+                req.output_file_name,
+                req.extra["parent_request_id"],
+                req.extra["output_index"],
+                req.metrics.request_id,
+            )
+
+        self.assertEqual(
+            [expansion_signature(req) for req in sequential_outputs],
+            [expansion_signature(req) for req in entrypoint_outputs],
+        )
+        self.assertTrue(
+            all(
+                req.trace_ctx is sequential_parent.trace_ctx
+                for req in sequential_outputs
+            )
         )
 
     def test_split_batched_latents_uses_original_batched_tensor(self):

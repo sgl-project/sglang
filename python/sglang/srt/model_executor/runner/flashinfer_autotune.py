@@ -17,6 +17,7 @@ import contextlib
 import datetime
 import functools
 import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -26,13 +27,18 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_model,
+    get_parallel,
+    get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
@@ -142,7 +148,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
-        str(mr.ps.pp_size),
+        str(get_parallel().pp_size),
         str(mr.ps.attn_dp_size),
         str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
@@ -165,18 +171,95 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     return (
         cache_dir
-        / f"rank_tp{mr.ps.tp_rank}_pp{mr.ps.pp_rank}_dp{mr.ps.dp_rank or 0}.json"
+        / f"rank_tp{mr.ps.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.ps.dp_rank or 0}.json"
     )
+
+
+def _autotune_tactic_sync_group(
+    tp_group: GroupCoordinator,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """CPU group over the ranks that must agree on the tuned tactics.
+
+    Per-rank timing noise alone makes each rank's ``argmin`` pick a different
+    tactic for the same shape. FlashInfer all-reduces the timings over this
+    group so every rank minimizes over the same numbers. TP is the scope: those
+    ranks run the same dummy forward, and PP stages are already separate groups.
+    """
+    if tp_group.world_size <= 1:
+        return None
+    # The CPU group keeps the reduction of these scalars off the profiled stream.
+    return tp_group.cpu_group
+
+
+@contextlib.contextmanager
+def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
+    """Set FlashInfer's timing-reduction group, restoring the previous one after."""
+    from flashinfer.autotuner import (
+        get_autotune_process_group,
+        set_autotune_process_group,
+    )
+
+    previous = get_autotune_process_group()
+    set_autotune_process_group(group)
+    try:
+        yield
+    finally:
+        set_autotune_process_group(previous)
+
+
+def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
+    """Hash of what this rank would load from ``cache_path`` ("" for nothing).
+
+    Includes the environment: ``load_configs`` ignores the whole file when its
+    ``_metadata`` stamp disagrees with the environment reading it, so equal
+    tactics alone do not mean two ranks load the same thing.
+    """
+    if not cache_path.is_file():
+        return ""
+    try:
+        configs = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(configs, dict):
+        return ""
+    payload = {"file": configs, "env": env}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _drop_diverged_autotune_cache(
+    cache_path: Path, group: torch.distributed.ProcessGroup, env: dict[str, str]
+) -> None:
+    """Enter tuning with the same cache on every rank, or with none at all.
+
+    A cache hit skips a profile, so caches that disagree desync the reduction.
+    """
+    digests: list[str] = [""] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(
+        digests, _autotune_cache_digest(cache_path, env), group=group
+    )
+    if len(set(digests)) == 1:
+        return
+    log_info_on_rank0(
+        logger,
+        "FlashInfer autotune: per-rank caches disagree, discarding them and "
+        "tuning from scratch so all ranks agree on the tactics.",
+    )
+    cache_path.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer.autotuner import autotune
+    # The gate below decides on the same inputs load_configs does.
+    from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+    sync_group = _autotune_tactic_sync_group(mr.tp_group)
+    reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
+    if reuse_cache:
         autotune_cache = cache_path
+        if sync_group is not None:
+            _drop_diverged_autotune_cache(cache_path, sync_group, _collect_metadata())
         logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -196,12 +279,23 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with autotune(
-            True,
-            cache=str(autotune_cache),
-            skip_ops=skip_ops,
-        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
+        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
+        # the target's tactics when the draft worker loads; load and save them by hand.
+        tuner = AutoTuner.get()
+        if reuse_cache and autotune_cache.is_file():
+            tuner.load_configs(str(autotune_cache))
+        with (
+            _autotune_process_group(sync_group),
+            autotune(
+                True,
+                cache=None if reuse_cache else str(autotune_cache),
+                skip_ops=skip_ops,
+            ),
+            autotune_dummy_run_mode(run_lm_head=run_lm_head),
+        ):
             yield
+        if reuse_cache:
+            tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
@@ -249,7 +343,7 @@ def maybe_flashinfer_autotune_speculative_draft(
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
-    """Also autotune one EXTEND-shaped dummy forward.
+    """Also autotune kernels at the prefill token ceiling.
 
     The decode-shaped autotune only covers token counts up to the decode
     batch size, so larger prefill/extend batches fall outside the tuned
@@ -258,22 +352,38 @@ def maybe_flashinfer_autotune_extend(
     untuned at >=8k tokens on sm100). One extra forward at the largest
     per-rank extend token count tunes all buckets up to it.
     """
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
-        return
     mr = runner.model_runner
-    # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
-    # runs on all dp ranks at once, so the gathered dummy already reaches the
-    # worst-case serving gather. Do not divide by dp_size.
-    num_tokens = mr.server_args.max_prefill_tokens
+    # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
+    # when chunked prefill is disabled.
+    num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    if not mr.is_generation or mr.spec_algorithm.is_speculative():
-        # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
-        # extend-bucket autotune for spec configs is a follow-up.
+    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
+    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
+    wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
+    if wants_prefill_autotune is not None and not wants_prefill_autotune():
+        # Entering the autotune context loads / saves the tactic cache and syncs
+        # ranks, so a model that has nothing to tune must decline before it.
+        prefill_autotune = None
+    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
+        with flashinfer_autotune_context(mr, run_lm_head=False):
+            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
+        if tuned:
+            return
+
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return
-    if mr.model_config.is_multimodal:
-        # The dummy runs mm_inputs=None, which multimodal prefill paths iterate.
+    is_pd_prefill_target = (
+        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
+    )
+    if not mr.is_generation or (
+        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
+    ):
+        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
+        # have no draft-side state and preserve the requested EXTEND mode.
         return
+    # Multimodal generation wrappers can still run this text-only EXTEND dummy;
+    # an incompatible model should fail the explicit opt-in visibly.
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size
@@ -315,6 +425,11 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
+        if _autotune_tactic_sync_group(mr.tp_group) is not None:
+            # Tuning is collective: this rank has stopped reducing while its
+            # peers wait on the next tactic, so skipping the pass would hang
+            # them. Fail instead of degrading alone.
+            raise
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
         log_info_on_rank0(
