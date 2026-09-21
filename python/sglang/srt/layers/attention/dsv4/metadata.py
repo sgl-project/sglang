@@ -277,15 +277,31 @@ class PagedIndexerMetadata:
         if self.use_topk_v2:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-            self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)
-            if self.rows_per_chunk is not None:
-                self.topk_metadata_chunks = [
-                    plan_topk_v2(self.compressed_seq_lens[rows])
-                    for rows in iter_row_chunks(
-                        num_rows=self.compressed_seq_lens.shape[0],
-                        rows_per_chunk=self.rows_per_chunk,
+            if self.row_chunk > 0:
+                plans = [
+                    plan_topk_v2(self.compressed_seq_lens[_s : _s + self.row_chunk])
+                    for _s in range(
+                        0, self.compressed_seq_lens.shape[0], self.row_chunk
                     )
                 ]
+                # Keep one capture-stable tensor so replay can refresh every
+                # chunk plan with a single copy_. The last plan may have fewer
+                # rows; callers slice its valid prefix before launching top-k.
+                self.topk_metadata = self.compressed_seq_lens.new_zeros(
+                    (len(plans), self.row_chunk + 1, 2)
+                )
+                for i, plan in enumerate(plans):
+                    self.topk_metadata[i, : plan.shape[0]].copy_(plan)
+            else:
+                self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)
+                if self.rows_per_chunk is not None:
+                    self.topk_metadata_chunks = [
+                        plan_topk_v2(self.compressed_seq_lens[rows])
+                        for rows in iter_row_chunks(
+                            num_rows=self.compressed_seq_lens.shape[0],
+                            rows_per_chunk=self.rows_per_chunk,
+                        )
+                    ]
         else:
             self.topk_metadata = torch.empty((0,))
 
@@ -348,6 +364,16 @@ class PagedIndexerMetadata:
             f"{len(chunks)=}"
         )
         return chunks
+
+    def topk_plan_for_chunk(self, chunk_index: int, rows: slice) -> torch.Tensor:
+        assert self.use_topk_v2, "top-k v2 plan requested from v1 metadata"
+        if self.row_chunk > 0:
+            start = 0 if rows.start is None else rows.start
+            stop = self.compressed_seq_lens.shape[0] if rows.stop is None else rows.stop
+            return self.topk_metadata[chunk_index, : stop - start + 1]
+        if self.topk_metadata_chunks is not None:
+            return self.topk_metadata_chunks[chunk_index]
+        return self.topk_metadata
 
     def copy_(self, other: PagedIndexerMetadata):
         # A chunked schedule list has no in-place copy; rebind it instead.
