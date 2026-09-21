@@ -4,7 +4,6 @@ import json
 import logging
 import os
 from collections import defaultdict
-from functools import lru_cache
 
 import torch
 
@@ -125,23 +124,25 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
-@lru_cache(maxsize=1)
-def _get_libcudart():
-    import ctypes
-
-    return ctypes.CDLL("libcudart.so")
-
-
 def _clear_sticky_cuda_error() -> int:
     """Read and clear the CUDA last-error slot, returning the error code.
 
-    torch links libcudart dynamically, so a ctypes cudaGetLastError call
-    operates on the same slot as the failing cudart call. Only call this
-    when the pending error is provably the expected one (same thread, no
-    intervening CUDA work); otherwise it would mask an unrelated failure.
+    torch.cuda.cudart() returns the same libcudart handle torch itself uses,
+    so this operates on the same last-error slot as the failing cudart call
+    (e.g. a failed cudaHostRegister). A torch.empty()-style "consume" does
+    not reliably trigger torch's error checking, so read the slot explicitly.
+    Non-zero reads are logged so an unrelated or truly sticky failure is not
+    silently masked.
     """
     try:
-        return int(_get_libcudart().cudaGetLastError())
+        cudart = torch.cuda.cudart()
+        rc = 0
+        for _ in range(8):
+            rc = int(cudart.cudaGetLastError())
+            if rc == 0:
+                return 0
+            logger.warning("clear pending CUDA error: rc=%d", rc)
+        return rc
     except Exception:
         return 0
 
