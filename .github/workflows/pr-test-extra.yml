@@ -204,7 +204,18 @@ jobs:
         simulator-test-cpu,
         extra-test,
       ]
-    if: always()
+    # Same `labeled` guard as check-changes above. Any label starts a run;
+    # for a label that is not gating, check-changes and everything under it
+    # skip, and an unguarded `always()` here would still finish green -- and
+    # that green publishes a passing `pr-test-extra-finish` check over the
+    # real run's failure on the same commit. Skipping it leaves the run
+    # `skipped` as a whole, which is what pr-states.yml's `isReal` expects.
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -234,10 +245,17 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
+    # Carries the same `labeled` guard: on a non-gating label this run has
+    # nothing to report, and a green job here would drag the run conclusion
+    # back to `success`. pr-states.yml subscribes to labeled/unlabeled through
+    # its own pull_request_target trigger, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch pr-states refresh
