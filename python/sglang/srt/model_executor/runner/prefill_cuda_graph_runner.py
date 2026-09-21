@@ -1779,6 +1779,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.global_forward_mode
         )
 
+        # NPU BCG attention runs eagerly and must retain the live MIXED mode.
+        if is_npu() and self.prefill_backend_name == Backend.BREAKABLE:
+            pcg_forward_mode = forward_batch.forward_mode
+            pcg_global_forward_mode = forward_batch.global_forward_mode
+
         # The draft tail concatenates hidden states with padded input embeddings;
         # expose the bucket-sized static view and refresh its live prefix below.
         padded_spec_info = forward_batch.spec_info
