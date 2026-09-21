@@ -588,8 +588,8 @@ class LingBotWorldTransformerBlock(nn.Module):
             dtype=torch.float32,
         )
         self.rotary_emb = RotaryEmbedding(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
+            head_size=self.dim_head,
+            rotary_dim=self.dim_head,
             use_precomputed_cache=False,
             is_neox_style=False,
         )
