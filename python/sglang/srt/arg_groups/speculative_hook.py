@@ -244,16 +244,24 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
+    if cfg.enable_dp_attention and cfg.device == "xpu":
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
+            "attention on XPU devices."
         )
 
     if cfg.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
+        )
+
+    if cfg.enable_dp_attention and not cfg.enable_dp_lm_head:
+        # Draft sampling uses the attention-TP group, so the target lm_head
+        # must be sharded over that group rather than the full target TP group.
+        declare_resolution(server_args, "_handle_dflash", enable_dp_lm_head=True)
+        logger.warning(
+            "DFLASH + dp_attention requires enable_dp_lm_head so draft sampling "
+            "stays within the attention TP group; enabling it automatically."
         )
 
     if cfg.speculative_draft_model_path is None:
