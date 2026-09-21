@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLArchConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
+    QuantoInt8Config,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -16,6 +20,33 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     _vision_cu_seqlens,
     _vision_position_ids,
 )
+from sglang.srt.models.qwen3_vl import (
+    Qwen3VLMoeVisionPatchMerger,
+    Qwen3VLVisionPatchEmbed,
+)
+from sglang.srt.runtime_context import get_parallel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim", [36, 40, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("recompute_on_device_change", [False, True])
+def test_vision_rope_device_transfer(dim, dtype, recompute_on_device_change):
+    with torch.device("cpu"):
+        transferred = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        assert transferred.recompute_on_device_change is False
+        transferred.recompute_on_device_change = recompute_on_device_change
+        expected_cpu = transferred(64).clone()
+    with torch.device("cuda"):
+        resident = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        expected_cuda = resident(64)
+
+    transferred.cuda()
+    expected = expected_cuda if recompute_on_device_change else expected_cpu.cuda()
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
+    transferred.cpu()
+    torch.testing.assert_close(transferred(64), expected_cpu, atol=0, rtol=0)
 
 
 def test_native_vision_layout_matches_qwen3_merge_order():
@@ -53,7 +84,11 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         out_hidden_size=12,
         deepstack_visual_indexes=[],
     )
-    model = Qwen3VLVisionTransformer(config)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(config)
+
+    assert isinstance(model.patch_embed, Qwen3VLVisionPatchEmbed)
+    assert isinstance(model.merger, Qwen3VLMoeVisionPatchMerger)
 
     assert set(model.state_dict()) == {
         "patch_embed.proj.weight",
@@ -66,6 +101,41 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         "merger.linear_fc2.weight",
         "merger.linear_fc2.bias",
     }
+
+
+def test_native_vision_accepts_srt_linear_quantization():
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=1,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=12,
+        deepstack_visual_indexes=[],
+    )
+    prefixes = {
+        "model.visual.blocks.0.attn.qkv_proj",
+        "model.visual.blocks.0.attn.proj",
+        "model.visual.blocks.0.mlp.linear_fc1",
+        "model.visual.blocks.0.mlp.linear_fc2",
+    }
+    quant_config = QuantoInt8Config(prefixes)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(
+            config,
+            quant_config=quant_config,
+            prefix="model.visual",
+        )
+
+    assert quant_config.selected == prefixes
+    for name, parameter in model.blocks[0].named_parameters():
+        if name.endswith("weight") and not name.startswith("norm"):
+            assert parameter.dtype == torch.int8
 
 
 def test_native_vision_keeps_position_math_in_fp32():
@@ -114,10 +184,78 @@ def test_native_vision_keeps_position_math_in_fp32():
     assert block.position_embedding_dtypes == (torch.float32, torch.float32)
 
 
+def test_qwen3vl_ties_lm_head_to_input_embeddings():
+    vision_config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=0,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=16,
+        deepstack_visual_indexes=[],
+    )
+    text_config = SimpleNamespace(
+        hidden_size=16,
+        vocab_size=32,
+        pad_token_id=0,
+        num_hidden_layers=0,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=True,
+    )
+    arch_config = SimpleNamespace(
+        vision_config=vision_config,
+        text_config=text_config,
+        tie_word_embeddings=True,
+        _fsdp_shard_conditions=[],
+        stacked_params_mapping=[],
+    )
+    config = SimpleNamespace(arch_config=arch_config, quant_config=None)
+
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLForConditionalGeneration(config)
+
+    assert model.lm_head.weight is model.model.get_input_embeddings().weight
+    parameters = dict(model.named_parameters())
+    parameters_with_duplicates = dict(model.named_parameters(remove_duplicate=False))
+    assert "model.language_model.embed_tokens.weight" in parameters
+    assert "lm_head.weight" not in parameters
+    assert (
+        parameters_with_duplicates["lm_head.weight"]
+        is parameters["model.language_model.embed_tokens.weight"]
+    )
+
+
 def test_qwen3_multimodal_encoders_layerwise_offload_vision_blocks():
     assert "model.visual.blocks" in Qwen3VLForConditionalGeneration.layer_names
     assert "model.visual.blocks" in MiniMaxH3Qwen3VLEncoder.layer_names
     assert any(
         condition.__name__ == "is_block"
         for condition in Qwen3VLArchConfig()._fsdp_shard_conditions
+    )
+
+
+def test_vision_position_interpolation_preserves_bf16_rounding():
+    model = Qwen3VLVisionTransformer.__new__(Qwen3VLVisionTransformer)
+    nn.Module.__init__(model)
+    model.num_grid_per_side = 2
+    model.spatial_merge_size = 2
+    model.pos_embed = nn.Embedding.from_pretrained(
+        torch.tensor(
+            [[7.21875], [-3.359375], [2.078125], [-1.1171875]], dtype=torch.bfloat16
+        )
+    )
+    model.fp32_position_interpolation = False
+    positions = model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]]))
+    # (1, 1) has corner weights 4/9, 2/9, 2/9, 1/9 in merge order
+    assert positions.dtype == torch.bfloat16
+    assert positions[3, 0].item() == 2.8125
+    model.fp32_position_interpolation = True
+    assert (
+        model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]])).dtype
+        == torch.float32
     )

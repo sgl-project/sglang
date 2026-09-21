@@ -2,6 +2,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -17,8 +18,17 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     initialize_parallel_runtime,
 )
 from sglang.srt.distributed import parallel_state as srt_parallel_state
+from sglang.srt.runtime_context import get_parallel
 
 _UTILS = "sglang.multimodal_gen.test.single_test_file.component_accuracy.utils"
+
+
+def _tp_group(world_size: int = 1, rank_in_group: int = 0) -> SimpleNamespace:
+    """A TP group handle carrying the two members the scope declares to the
+    runtime context (`use_tensor_parallel_group` overrides `tp_size` /
+    `tp_rank` / `tp_group` for its duration); the scope otherwise only stores
+    the handle and compares it by identity."""
+    return SimpleNamespace(world_size=world_size, rank_in_group=rank_in_group)
 
 
 def _server_args(*, ulysses_degree: int, ring_degree: int) -> SimpleNamespace:
@@ -123,7 +133,10 @@ def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
 
 
 def test_srt_attention_tp_group_tracks_diffusion_tp_group():
-    tp_group = object()
+    # `world_size`, because lending the group also states the parallel widths it
+    # implies -- the shared `srt` vision layers ask for `attn_tp_size`, and this
+    # package publishes no `srt` config for that read to resolve against.
+    tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
 
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -134,11 +147,23 @@ def test_srt_attention_tp_group_tracks_diffusion_tp_group():
 
         assert srt_parallel_state._TP is tp_group
         assert srt_parallel_state._ATTN_TP is tp_group
+        assert get_parallel().attn_tp_size == 2
+        # The handle too: assigning the module global does not reach the `srt`
+        # context, which is what the shared layers ask for a group.
+        assert get_parallel().tp_group is tp_group
+        assert get_parallel().attn_tp_group is tp_group
+        # And the ranks the shared layers shard by. Nothing else writes one
+        # here: this package publishes no rank bundle, so a handle without a
+        # rank leaves every `srt` linear unable to say which shard it is.
+        assert get_parallel().tp_rank == 1
+        assert get_parallel().attn_tp_rank == 1
 
         parallel_state._clear_srt_tp_group()
 
         assert srt_parallel_state._TP is None
         assert srt_parallel_state._ATTN_TP is None
+        with pytest.raises(RuntimeError):
+            get_parallel().tp_group
 
 
 def test_srt_owned_groups_are_not_overwritten_or_cleared():
@@ -162,7 +187,7 @@ def test_srt_tp_groups_follow_encoder_folding_context():
     original_diffusion_tp_group = object()
     original_srt_tp_group = object()
     original_srt_attention_tp_group = object()
-    folding_tp_group = object()
+    folding_tp_group = _tp_group(world_size=2, rank_in_group=1)
 
     with (
         patch.object(parallel_state, "_TP", original_diffusion_tp_group),
@@ -177,6 +202,9 @@ def test_srt_tp_groups_follow_encoder_folding_context():
             assert parallel_state._TP is folding_tp_group
             assert srt_parallel_state._TP is folding_tp_group
             assert srt_parallel_state._ATTN_TP is folding_tp_group
+            assert get_parallel().tp_size == 2
+            assert get_parallel().tp_rank == 1
+            assert get_parallel().tp_group is folding_tp_group
 
         assert parallel_state._TP is original_diffusion_tp_group
         assert srt_parallel_state._TP is original_srt_tp_group
@@ -185,8 +213,8 @@ def test_srt_tp_groups_follow_encoder_folding_context():
 
 def test_encoder_folding_context_is_nested_and_restores_each_group():
     original_tp_group = object()
-    outer_tp_group = object()
-    inner_tp_group = object()
+    outer_tp_group = _tp_group(world_size=4, rank_in_group=3)
+    inner_tp_group = _tp_group(world_size=2, rank_in_group=1)
 
     with (
         patch.object(parallel_state, "_TP", original_tp_group),
@@ -194,14 +222,19 @@ def test_encoder_folding_context_is_nested_and_restores_each_group():
         patch.object(srt_parallel_state, "_ATTN_TP", original_tp_group),
     ):
         with parallel_state.use_tensor_parallel_group(outer_tp_group):
+            assert get_parallel().tp_size == 4
             with parallel_state.use_tensor_parallel_group(inner_tp_group):
                 assert parallel_state._TP is inner_tp_group
                 assert srt_parallel_state._TP is inner_tp_group
                 assert srt_parallel_state._ATTN_TP is inner_tp_group
+                assert get_parallel().tp_size == 2
+                assert get_parallel().tp_rank == 1
 
             assert parallel_state._TP is outer_tp_group
             assert srt_parallel_state._TP is outer_tp_group
             assert srt_parallel_state._ATTN_TP is outer_tp_group
+            assert get_parallel().tp_size == 4
+            assert get_parallel().tp_rank == 3
 
         assert parallel_state._TP is original_tp_group
         assert srt_parallel_state._TP is original_tp_group

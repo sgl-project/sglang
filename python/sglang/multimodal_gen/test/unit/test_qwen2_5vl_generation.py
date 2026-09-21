@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     _vision_window_index,
 )
 from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+)
 
 
 class _StubQwen2_5VL(Qwen2_5_VLForConditionalGeneration):
@@ -66,7 +70,33 @@ class _AttentionRecorder(nn.Module):
         return query
 
 
-def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
+def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
+    monkeypatch,
+):
+    monkeypatch.setattr(qwen2_5vl, "Qwen2_5_VLAttention", lambda *_args: nn.Identity())
+    monkeypatch.setattr(qwen2_5vl, "_tp_world_size", lambda: 3)
+    monkeypatch.setattr(qwen2_5vl, "_tp_rank", lambda: 2)
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=25,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        use_sliding_window=False,
+        _attn_implementation="flash_attention_2",
+        layer_types=["full_attention"],
+    )
+
+    layer = qwen2_5vl.Qwen2_5_VLDecoderLayer(config, layer_idx=0)
+
+    assert layer.mlp.tp_size == 1
+    assert layer.mlp.tp_rank == 0
+    assert isinstance(layer.mlp.gate_proj, ColumnParallelLinear)
+    assert isinstance(layer.mlp.up_proj, ColumnParallelLinear)
+    assert layer.mlp.gate_proj.tp_rank == layer.mlp.up_proj.tp_rank == 0
+    assert isinstance(layer.mlp.down_proj, ReplicatedLinear)
+
+
+def test_explicit_attention_mask_is_honored_without_a_cache(monkeypatch):
     attention = Qwen2_5_VLAttention.__new__(Qwen2_5_VLAttention)
     nn.Module.__init__(attention)
     attention.q_proj = nn.Identity()
@@ -76,12 +106,12 @@ def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
     attention.num_heads = 1
     attention.num_key_value_heads = 1
     attention.head_dim = 4
-    attention.rope_scaling = {"mrope_section": [1, 1, 0]}
+    attention.rotary_emb = object()
     attention.attn = _AttentionRecorder()
     monkeypatch.setattr(
         qwen2_5vl,
-        "apply_multimodal_rotary_pos_emb",
-        lambda query, key, *_args: (query, key),
+        "apply_qwen_vl_text_rope",
+        lambda _rotary_emb, _position_ids, query, key: (query, key),
     )
 
     hidden_states = torch.randn(1, 2, 4)
@@ -89,12 +119,22 @@ def test_explicit_attention_mask_is_limited_to_cached_generation(monkeypatch):
     kwargs = {
         "hidden_states": hidden_states,
         "attention_mask": explicit_mask,
-        "position_embeddings": (torch.empty(0), torch.empty(0)),
+        "position_ids": torch.zeros(3, 1, 2, dtype=torch.long),
     }
 
+    # LongCat opts into masking the padded body on the cache-free path.
+    attention.honor_cache_free_padding_mask = True
     attention(**kwargs, use_cache=False)
     attention(**kwargs, use_cache=True)
+    assert attention.attn.masks[0] is explicit_mask
+    assert attention.attn.masks[1] is explicit_mask
 
+    # Every other pipeline keeps the original behavior: mask dropped when
+    # cache-free, honored only under cached generation.
+    attention.attn.masks.clear()
+    attention.honor_cache_free_padding_mask = False
+    attention(**kwargs, use_cache=False)
+    attention(**kwargs, use_cache=True)
     assert attention.attn.masks[0] is None
     assert attention.attn.masks[1] is explicit_mask
 

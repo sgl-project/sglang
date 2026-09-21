@@ -64,6 +64,7 @@ class CanaryManager:
         self._model_forward_bracket_depth: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
+        self._launch_capacities = launch_capacities
 
         self._device_state = CanaryDeviceState.allocate(
             config=config,
@@ -167,11 +168,16 @@ class CanaryManager:
             for _ in range(num_sfms)
         )
 
+    def per_forward_workspace_bytes(self) -> int:
+        return self._launch_capacities.per_forward_workspace_bytes(
+            num_buffer_groups=len(self._buffer_groups)
+        )
+
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
-        assert (
-            self._active_single_forward_manager_index is None
-        ), "kv-canary: nested with_active_single_forward_manager is forbidden"
+        assert self._active_single_forward_manager_index is None, (
+            "kv-canary: nested with_active_single_forward_manager is forbidden"
+        )
         self._active_single_forward_manager_index = index
         try:
             yield
