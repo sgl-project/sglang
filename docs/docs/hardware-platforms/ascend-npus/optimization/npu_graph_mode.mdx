@@ -20,8 +20,8 @@ For general tuning knobs, see [Parameter Tuning](/docs/hardware-platforms/ascend
 | Term | Meaning on Ascend NPU |
 | --- | --- |
 | **NPU Graph** | Graph capture/replay path backed by `torch.npu.NPUGraph` |
-| **CLI flags** | Still named `--cuda-graph-*` / `--disable-cuda-graph` for cross-platform parity |
-| **Capture batch size** | Discrete decode batch sizes listed in `--cuda-graph-bs` |
+| **CLI flags** | Cross-platform CUDA Graph knobs: `--cuda-graph-bs-decode` / `--cuda-graph-backend-{decode,prefill}` |
+| **Capture batch size** | Discrete decode batch sizes listed in `--cuda-graph-bs-decode` |
 | **Graph update stream** | Dedicated stream used when refreshing captured graphs after shape/control-flow changes |
 
 NPU Graph is most effective when decode batch sizes are stable and predictable. It requires fixed control flow and tensor shapes during capture, so some feature combinations are only partially compatible.
@@ -36,7 +36,7 @@ NPU Graph is **enabled by default** on supported decode paths. Typical model tut
 sglang serve \
   --model-path /path/to/model \
   --attention-backend ascend \
-  --cuda-graph-bs 1 4 8 16
+  --cuda-graph-bs-decode 1 4 8 16
 ```
 
 ### Core flags
@@ -47,12 +47,20 @@ sglang serve \
   </thead>
   <tbody>
     <tr>
-      <td><code>--disable-cuda-graph</code></td>
-      <td>Disable graph capture/replay entirely (eager decode).</td>
+      <td><code>--cuda-graph-backend-decode=disabled</code></td>
+      <td>Disable decode-phase graph capture/replay (eager decode).</td>
     </tr>
     <tr>
-      <td><code>--cuda-graph-bs</code></td>
+      <td><code>--cuda-graph-backend-prefill=disabled</code></td>
+      <td>Disable prefill-phase graph capture/replay.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-bs-decode</code></td>
       <td>Explicit list of decode batch sizes to capture, e.g. <code>1 4 8 16</code>.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-bs-prefill</code></td>
+      <td>Explicit list of prefill batch sizes to capture (when prefill graphs are enabled).</td>
     </tr>
     <tr>
       <td><code>--cuda-graph-max-bs-decode</code></td>
@@ -60,11 +68,11 @@ sglang serve \
     </tr>
     <tr>
       <td><code>--disable-decode-cuda-graph</code></td>
-      <td>Disable decode-phase graphs only (PD prefill role).</td>
+      <td>Convenience alias for <code>--cuda-graph-backend-decode=disabled</code> (PD prefill role).</td>
     </tr>
     <tr>
       <td><code>--disable-prefill-cuda-graph</code></td>
-      <td>Disable prefill-phase graphs only (PD decode role).</td>
+      <td>Convenience alias for <code>--cuda-graph-backend-prefill=disabled</code> (PD decode role).</td>
     </tr>
     <tr>
       <td><code>--enable-profile-cuda-graph</code></td>
@@ -72,6 +80,10 @@ sglang serve \
     </tr>
   </tbody>
 </table>
+
+:::note
+`--disable-cuda-graph` and `--cuda-graph-bs` are **deprecated**. Prefer `--cuda-graph-backend-{decode,prefill}=disabled` and `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill`.
+:::
 
 ### Choosing capture batch sizes
 
@@ -87,7 +99,7 @@ sglang serve \
   --model-path /path/to/Qwen3-8B \
   --attention-backend ascend \
   --max-running-requests 32 \
-  --cuda-graph-bs 1 2 4 8 16 32
+  --cuda-graph-bs-decode 1 2 4 8 16 32
 ```
 
 ## Graph Adaptation Workflow
@@ -102,14 +114,15 @@ Run a short functional smoke test with graphs disabled:
 sglang serve \
   --model-path /path/to/model \
   --attention-backend ascend \
-  --disable-cuda-graph
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled
 ```
 
 Confirm correctness first. Graph mode should never be the first debugging surface for a new model.
 
 ### 2. Enable graphs with conservative capture sizes
 
-Re-enable graphs using a minimal `--cuda-graph-bs` list from the model tutorial. Warm up with a few requests before measuring TPOT/throughput.
+Re-enable graphs using a minimal `--cuda-graph-bs-decode` list from the model tutorial. Warm up with a few requests before measuring TPOT/throughput.
 
 ### 3. Expand capture sizes only when needed
 
@@ -119,7 +132,7 @@ Add batch sizes incrementally when benchmarks show replay misses (fallback to ea
 
 Before enabling advanced features together with NPU Graph, check [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features) and the model tutorial notes. Common constraints:
 
-- `--enable-torch-compile` requires `--disable-cuda-graph`.
+- `--enable-torch-compile` requires `--cuda-graph-backend-decode=disabled` (and usually prefill disabled as well).
 - Some PD disaggregation roles disable one graph phase by design.
 - Speculative decoding and dynamic batching may require narrower capture lists.
 
@@ -139,7 +152,7 @@ Typical triggers include:
 
 | Scenario | Recommendation |
 | --- | --- |
-| High capture cardinality | Reduce `--cuda-graph-bs` entries; prefer ≤10 sizes |
+| High capture cardinality | Reduce `--cuda-graph-bs-decode` entries; prefer ≤10 sizes |
 | Stream/resource conflicts | Upgrade CANN/TorchNPU; reduce captured graphs |
 | PD mixed serving | Follow model tutorial PD flags; do not reuse GPU-only capture lists blindly |
 | Debugging update failures | Temporarily disable graphs and compare eager traces |
@@ -186,7 +199,9 @@ Inspect `operator_details.csv`, `kernel_details.csv`, and `trace_view.json` unde
 To map Python call stacks to individual operators, temporarily disable graphs:
 
 ```bash Command
-sglang serve ... --disable-cuda-graph
+sglang serve ... \
+  --cuda-graph-backend-decode=disabled \
+  --cuda-graph-backend-prefill=disabled
 ```
 
 This reduces decode performance and is intended **only** for profiling sessions.
@@ -206,9 +221,9 @@ Traces are written under `SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`.
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| ACL Fill / graph kernel launch failures | Too many captured graphs / stream conflict | Reduce `--cuda-graph-bs`; upgrade CANN/TorchNPU |
+| ACL Fill / graph kernel launch failures | Too many captured graphs / stream conflict | Reduce `--cuda-graph-bs-decode`; upgrade CANN/TorchNPU |
 | TPOT regression after feature toggle | Graph replay miss → eager fallback | Add missing batch size or disable incompatible feature |
-| Missing Python stacks in trace | Graph mode enabled | Re-run with `--disable-cuda-graph` for profiling only |
+| Missing Python stacks in trace | Graph mode enabled | Re-run with `--cuda-graph-backend-decode=disabled` for profiling only |
 | PD role mismatch | Wrong phase graph disabled/enabled | Use PD-specific flags from model tutorial |
 | OOM during startup | Excessive capture sizes | Lower `--cuda-graph-max-bs-decode` and capture list |
 
