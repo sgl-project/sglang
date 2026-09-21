@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::message::detok::DetokMsg;
+use crate::message::detok::{DetokMsg, PromptSource};
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
@@ -131,6 +131,9 @@ impl DetokenizerBackend {
 
 struct DetokState {
     sink: ResponseSink,
+    /// Prompt text requested by the generation request. It is consumed on the
+    /// first normal output frame so it shares the request's RID/lifecycle.
+    prompt_text: Option<String>,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
@@ -193,27 +196,46 @@ impl Runnable for DetokenizerWorker {
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
+                    prompt,
                 } => {
-                    table.insert(
-                        rid.clone(),
-                        DetokState {
-                            sink,
-                            decode_logprob_text,
-                            no_stop_trim,
-                            decoder: self.backend.new_decoder(),
-                            // Registered == handed to the scheduler == Queued.
-                            fsm: RequestState::Queued,
-                        },
-                    );
+                    let prompt_text = match prompt {
+                        None => Ok(None),
+                        Some(PromptSource::Text(text)) => Ok(Some(text)),
+                        Some(PromptSource::TokenIds(token_ids)) => self
+                            .backend
+                            .decode_once(&token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>())
+                            .map(Some),
+                    };
+                    match prompt_text {
+                        Ok(prompt_text) => {
+                            table.insert(
+                                rid.clone(),
+                                DetokState {
+                                    sink,
+                                    prompt_text,
+                                    decode_logprob_text,
+                                    no_stop_trim,
+                                    decoder: self.backend.new_decoder(),
+                                    // Registered == handed to the scheduler == Queued.
+                                    fsm: RequestState::Queued,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            // Abort first, then notify (as in `handle_fail`): the sink
+                            // send releases the handler, which treats the Error as a
+                            // terminal outcome and disarms its guard — after that this
+                            // abort is the request's only cancellation.
+                            let _ = self.abort.send(AbortSource::Detok(rid));
+                            let _ = sink.try_send(ResponseItem::Error(error));
+                        }
+                    }
                 }
                 // One decode step's chunks for this shard, batched by from-scheduler.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
-                }
-                DetokMsg::Decode { rid, token_ids } => {
-                    handle_decode(&mut table, &rid, &token_ids, &self.backend)
                 }
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
@@ -224,27 +246,6 @@ impl Runnable for DetokenizerWorker {
                 }
             }
         }
-    }
-}
-
-/// The `RequestKind::Detokenize` backend stage: to-scheduler queued this rid's
-/// `Register` just before on this same channel, so the entry exists — deliver
-/// the decoded text (or the error) through the registered sink and drop it,
-/// like a one-result control request. No scheduler abort on failure: this kind
-/// never reaches the ring, so there is nothing to stop.
-fn handle_decode(
-    table: &mut HashMap<Rid, DetokState>,
-    rid: &Rid,
-    token_ids: &[u32],
-    backend: &DetokenizerBackend,
-) {
-    if let Some(mut st) = table.remove(rid) {
-        let item = match backend.decode_once(token_ids) {
-            Ok(text) => ResponseItem::Data(text.into()),
-            Err(e) => ResponseItem::Error(e),
-        };
-        let _ = st.sink.try_send(item);
-        st.fsm = RequestState::Completed;
     }
 }
 
@@ -272,8 +273,9 @@ fn handle_fail(
     abort: &flume::Sender<AbortSource>,
 ) {
     if let Some(mut st) = table.remove(rid) {
-        // Abort first: `try_send` on the sink can release the handler, which frees
-        // the rid for reuse (same ordering hazard as the disconnect path).
+        // Abort first: `try_send` on the sink releases the handler, which classifies
+        // the Error as terminal and disarms its guard — after that this abort is the
+        // request's only cancellation, so it must be enqueued before the notification.
         let _ = abort.send(AbortSource::Detok(rid.clone()));
         let _ = st
             .sink
@@ -298,6 +300,7 @@ fn handle_chunk(
     };
     let decode_logprob_text = st.decode_logprob_text;
     let no_stop_trim = st.no_stop_trim;
+    let prompt_text = st.prompt_text.take();
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
     if matches!(st.fsm, RequestState::Queued) {
@@ -364,6 +367,9 @@ fn handle_chunk(
     // token_ids, prompt_tokens, finish_reason) already ride in `ev`. The API handler
     // formats this delta (and accumulates for the cumulative view).
     ev.text = delta_text;
+    if prompt_text.is_some() {
+        ev.extras.get_or_insert_with(Default::default).prompt_text = prompt_text;
+    }
     ev.completion_tokens = n_tok;
 
     if finished {
@@ -396,12 +402,10 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             // Abort ONLY when the sink is full. `Closed` means the handler future is
-            // already gone, so its `AbortGuard` has run: it aborted and released the
-            // rid. A second abort from here is unordered with respect to that
-            // release, so it lands after a resubmit of the same rid has registered
-            // and deregisters the NEW request — the cross-wiring the rid registry
-            // exists to prevent, reached through the one abort producer that
-            // bypasses the guard's ordering.
+            // already gone, so its `AbortGuard` has aborted this rid; a second abort
+            // from here would only duplicate that ring push. `Full` means the client
+            // stopped reading while the handler is still alive (its guard has not
+            // run), so this shard is the only producer that can cancel the work.
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
@@ -453,6 +457,7 @@ mod tests {
             Rid::from("1"),
             DetokState {
                 sink: ResponseSink::Local(tx),
+                prompt_text: None,
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -475,6 +480,43 @@ mod tests {
             tm_rx.try_recv(),
             Ok(AbortSource::Detok(rid)) if rid == Rid::from("1")
         ));
+    }
+
+    /// A non-terminal chunk whose sink is closed drops the request WITHOUT a
+    /// detok abort: a closed sink means the handler future is gone, so its guard
+    /// already owns cancellation, and a second abort from here would only
+    /// duplicate that ring push.
+    #[test]
+    fn closed_sink_drops_request_without_a_second_abort() {
+        let (tx, rx) = mpsc::channel::<ResponseItem>(1);
+        drop(rx);
+
+        let mut table = HashMap::new();
+        table.insert(
+            Rid::from("1"),
+            DetokState {
+                sink: ResponseSink::Local(tx),
+                prompt_text: None,
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        let ev = ChunkEvent {
+            rid: Rid::from("1"),
+            token_ids: vec![5],
+            ..Default::default() // finish_reason None → non-terminal
+        };
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &abort_tx);
+
+        assert!(!table.contains_key(&Rid::from("1")));
+        assert!(
+            abort_rx.try_recv().is_err(),
+            "closed sink: the handler's guard owns cancellation"
+        );
     }
 
     /// `trim_stop_str` reproduces the base's stop-string semantics: `stop: "3"` on
@@ -512,47 +554,6 @@ mod tests {
         assert!(error.to_string().contains("skip_tokenizer_init=True"));
     }
 
-    /// A `Decode` job answers through the REGISTERED sink and consumes the
-    /// entry.
-    #[test]
-    fn decode_answers_via_registered_sink_and_consumes_the_entry() {
-        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
-        let mut table = HashMap::new();
-        table.insert(
-            Rid::from("d1"),
-            DetokState {
-                sink: ResponseSink::Local(tx),
-                decode_logprob_text: false,
-                no_stop_trim: false,
-                decoder: None,
-                fsm: RequestState::Queued,
-            },
-        );
-
-        handle_decode(
-            &mut table,
-            &Rid::from("d1"),
-            &[1],
-            &DetokenizerBackend::Skip,
-        );
-
-        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
-            panic!("the decode error must reach the sink, not vanish");
-        };
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(!table.contains_key(&Rid::from("d1")), "entry consumed");
-
-        // Unregistered rid (raced with an abort's Deregister): nothing to
-        // answer to — must be a no-op, not a panic.
-        handle_decode(
-            &mut table,
-            &Rid::from("d2"),
-            &[1],
-            &DetokenizerBackend::Skip,
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
     /// Two requests on the SAME shard keep separate entries. This is what a
     /// A shard-hash collision now degrades to: the hash partitions, the rid
     /// identifies. Keying the table by the hash made colliding rids one entry, so
@@ -566,6 +567,7 @@ mod tests {
         let mut table = HashMap::new();
         let state = |tx| DetokState {
             sink: ResponseSink::Local(tx),
+            prompt_text: None,
             decode_logprob_text: false,
             no_stop_trim: false,
             decoder: None,
@@ -623,6 +625,7 @@ mod tests {
             Rid::from("1"),
             DetokState {
                 sink: ResponseSink::Local(tx),
+                prompt_text: None,
                 decode_logprob_text: false,
                 no_stop_trim,
                 decoder: None, // skip mode → output_ids passthrough
@@ -683,5 +686,224 @@ mod tests {
         let fr = serde_json::json!({ "type": "length", "length": 3 });
         let out = final_chunk(false, fr, vec![1, 2, 3]);
         assert_eq!(out.token_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn prompt_text_is_attached_to_the_first_generation_frame_only() {
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
+        let rid: Rid = "prompt-once".into();
+        let mut table = HashMap::new();
+        table.insert(
+            rid.clone(),
+            DetokState {
+                sink: ResponseSink::Local(tx),
+                prompt_text: Some("original prompt".into()),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+        let (abort_tx, _abort_rx) = flume::unbounded::<AbortSource>();
+
+        handle_chunk(
+            &mut table,
+            ChunkEvent {
+                rid: rid.clone(),
+                token_ids: vec![1],
+                ..Default::default()
+            },
+            &DetokenizerBackend::Skip,
+            &abort_tx,
+        );
+        handle_chunk(
+            &mut table,
+            ChunkEvent {
+                rid,
+                token_ids: vec![2],
+                finish_reason: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "length",
+                        "length": 1
+                    }))
+                    .expect("finish reason must parse"),
+                ),
+                ..Default::default()
+            },
+            &DetokenizerBackend::Skip,
+            &abort_tx,
+        );
+
+        let Ok(ResponseItem::Frame(first)) = rx.try_recv() else {
+            panic!("first output must be a frame");
+        };
+        assert_eq!(
+            first
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.prompt_text.as_deref()),
+            Some("original prompt")
+        );
+        let Ok(ResponseItem::Done(second)) = rx.try_recv() else {
+            panic!("second output must be terminal");
+        };
+        assert!(
+            second
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.prompt_text.as_deref())
+                .is_none()
+        );
+    }
+    /// Minimal WordLevel tokenizer: `<unk>`, hello(1), world(2), hi(3),
+    /// there(4). Written to a temp file because dynamo's loader is file-based;
+    /// the suffix keeps parallel tests from sharing a path.
+    fn word_tokenizer(suffix: &str) -> dynamo_tokenizers::Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0, "hello": 1, "world": 2, "hi": 3, "there": 4},
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let path = std::env::temp_dir().join(format!(
+            "sglang-server-echo-{}-{suffix}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).expect("fixture writes");
+        dynamo_tokenizers::Tokenizer::from_file(path.to_str().unwrap())
+            .expect("fixture tokenizer loads")
+    }
+
+    /// A token-ID prompt goes through real registration + the detokenizer
+    /// worker, is decoded to prompt text, attaches to the first generation
+    /// frame only, and that frame reaches Completion rendering with the echoed
+    /// prompt prepended exactly once.
+    #[tokio::test]
+    async fn token_id_echo_reaches_completion_rendering() {
+        use crate::api_server::core::generate::RequestTiming;
+        use crate::api_server::core::openai::completions::{
+            CompletionFrameShaper, CompletionRenderingOptions, completion_event_stream,
+            completion_sse_payload,
+        };
+        use crate::api_server::core::test_utils::{plan, senders};
+        use futures::StreamExt;
+
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let (sink_tx, sink_rx) = mpsc::channel::<ResponseItem>(8);
+        let worker = DetokenizerWorker::new(
+            0,
+            detok_rx,
+            DetokenizerBackend::Dynamo(word_tokenizer("echo")),
+            abort_tx,
+        );
+        std::thread::spawn(move || worker.run());
+
+        let rid = Rid::from("echo");
+        detok_tx
+            .send(DetokMsg::Register {
+                rid: rid.clone(),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                // The prompt is token ids, exactly as a token-ID Completion
+                // request with `echo=true` submits it.
+                prompt: Some(PromptSource::TokenIds(vec![1, 2])),
+            })
+            .unwrap();
+
+        let options = CompletionRenderingOptions {
+            response_id: "cmpl-echo".into(),
+            model: "model".into(),
+            created: 1,
+            echo: true,
+            want_logprobs: false,
+            n: 1,
+            enable_cache_report: false,
+            weight_version: None,
+        };
+        let stream = completion_event_stream(
+            plan(
+                vec![(rid.clone(), sink_rx, RequestTiming::new())],
+                senders(),
+            ),
+            CompletionFrameShaper::new(1, options, false, false),
+        );
+        futures::pin_mut!(stream);
+
+        detok_tx
+            .send(DetokMsg::Chunks(vec![ChunkEvent {
+                rid: rid.clone(),
+                token_ids: vec![3], // "hi"
+                ..Default::default()
+            }]))
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&completion_sse_payload(stream.next().await.unwrap())).unwrap();
+        assert_eq!(first["choices"][0]["text"], "hello worldhi");
+
+        detok_tx
+            .send(DetokMsg::Chunks(vec![ChunkEvent {
+                rid: rid.clone(),
+                token_ids: vec![4], // "there"
+                finish_reason: Some(
+                    serde_json::from_value(serde_json::json!({"type": "stop", "matched": "</s>"}))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            }]))
+            .unwrap();
+        let terminal: serde_json::Value =
+            serde_json::from_str(&completion_sse_payload(stream.next().await.unwrap())).unwrap();
+        assert_eq!(
+            terminal["choices"][0]["text"].as_str().unwrap().trim(),
+            "there",
+            "the prompt must not be echoed a second time"
+        );
+        assert!(stream.next().await.is_none());
+        drop(detok_tx);
+    }
+
+    /// A token-ID prompt the backend cannot decode (skip mode) fails at
+    /// registration: the worker aborts the scheduler work before notifying the
+    /// sink, and there is no duplicate abort.
+    #[test]
+    fn token_id_prompt_decode_failure_aborts_before_notifying() {
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ResponseItem>(4);
+        let worker = DetokenizerWorker::new(0, detok_rx, DetokenizerBackend::Skip, abort_tx);
+        std::thread::spawn(move || worker.run());
+
+        detok_tx
+            .send(DetokMsg::Register {
+                rid: Rid::from("1"),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                prompt: Some(PromptSource::TokenIds(vec![1, 2])),
+            })
+            .unwrap();
+
+        let abort = abort_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("registration failure aborts");
+        assert!(matches!(abort, AbortSource::Detok(rid) if rid == Rid::from("1")));
+        let error = sink_rx.blocking_recv().expect("failure notification");
+        assert!(matches!(error, ResponseItem::Error(_)));
+        assert!(
+            abort_rx.try_recv().is_err(),
+            "no duplicate abort after the sink error"
+        );
+        drop(detok_tx);
     }
 }

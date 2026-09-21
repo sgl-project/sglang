@@ -427,6 +427,14 @@ fn push_escaped(dst: &mut String, s: &str) {
 }
 
 impl OutputAccumulator {
+    /// Incremental streams need only the running count, not retained output.
+    pub(crate) fn count_tokens(&mut self, delta: &ChunkEvent) {
+        self.out.completion_tokens = self
+            .out
+            .completion_tokens
+            .saturating_add(delta.completion_tokens);
+    }
+
     /// Fold one delta frame in. Output families concatenate; input families and
     /// hidden states are set-once / last-writer-wins (they ride the prefill/final
     /// chunk), matching the Python `meta_info` assignment.
@@ -459,6 +467,21 @@ impl OutputAccumulator {
         let oe = o
             .extras
             .get_or_insert_with(|| Box::new(ChunkExtras::default()));
+        if oe.prompt_text.is_none() {
+            oe.prompt_text.clone_from(&de.prompt_text);
+        }
+        // Metadata snapshots are cumulative (reasoning) or constant per request
+        // (cached); 0 means "not reported yet". Spans arrive on the final frame
+        // only, so the latest `Some` wins.
+        if de.reasoning_tokens != 0 {
+            oe.reasoning_tokens = de.reasoning_tokens;
+        }
+        if de.cached_tokens != 0 {
+            oe.cached_tokens = de.cached_tokens;
+        }
+        if de.weight_versions.is_some() {
+            oe.weight_versions.clone_from(&de.weight_versions);
+        }
         oe.out_lp_val.extend_from_slice(&de.out_lp_val);
         oe.out_lp_idx.extend_from_slice(&de.out_lp_idx);
         oe.out_top_val.extend_from_slice(&de.out_top_val);
@@ -564,6 +587,7 @@ impl OutputAccumulator {
 mod tests {
     use super::*;
     use crate::message::finish_reason::FinishReason;
+    use crate::message::response::WeightVersionSpan;
 
     fn fr(v: serde_json::Value) -> Option<FinishReason> {
         Some(serde_json::from_value(v).expect("finish reason must parse"))
@@ -713,6 +737,22 @@ mod tests {
                 let slow = typed_frame_string(frame_typed(acc.snapshot(), "rid-x"), index);
                 assert_eq!(fast, slow, "memo diverged on {delta:?}");
             }
+        }
+    }
+
+    #[test]
+    fn incremental_count_retains_no_output_buffers() {
+        let mut acc = OutputAccumulator::default();
+        let mut expected = 0;
+        for delta in frame_corpus() {
+            acc.count_tokens(&delta);
+            expected += delta.completion_tokens;
+            assert_eq!(acc.snapshot().completion_tokens, expected);
+            assert_eq!(acc.snapshot().text.capacity(), 0);
+            assert_eq!(acc.snapshot().token_ids.capacity(), 0);
+            assert!(acc.snapshot().extras.is_none());
+            assert_eq!(acc.text_json.capacity(), 0);
+            assert_eq!(acc.ids_json.capacity(), 0);
         }
     }
 
@@ -1059,5 +1099,37 @@ mod tests {
             cumulative_frame_json(&acc, "1", None).is_none(),
             "a text column out of lockstep must invalidate the memo"
         );
+    }
+    /// Metadata rides the same box as logprobs: the accumulator keeps the
+    /// latest nonzero reasoning/cached snapshots and the latest span list, and
+    /// a later 0 does not erase a known count.
+    #[test]
+    fn accumulator_keeps_the_latest_metadata_snapshot() {
+        let mut acc = OutputAccumulator::default();
+        let meta =
+            |reasoning: u32, cached: u32, spans: Option<Vec<WeightVersionSpan>>| ChunkEvent {
+                extras: Some(Box::new(ChunkExtras {
+                    reasoning_tokens: reasoning,
+                    cached_tokens: cached,
+                    weight_versions: spans,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+        acc.fold(&meta(2, 3, None));
+        acc.fold(&meta(
+            7,
+            0,
+            Some(vec![WeightVersionSpan {
+                version: "v2".into(),
+                start: 0,
+                end: 7,
+            }]),
+        ));
+        let out = acc.snapshot();
+        let extras = out.extras.as_deref().expect("metadata box");
+        assert_eq!(extras.reasoning_tokens, 7);
+        assert_eq!(extras.cached_tokens, 3);
+        assert_eq!(extras.weight_versions.as_deref().unwrap()[0].version, "v2");
     }
 }

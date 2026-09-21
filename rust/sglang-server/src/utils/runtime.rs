@@ -17,7 +17,8 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::message::config::RuntimeConfig;
+use crate::api_server::core::openai::template::ChatFormatter;
+use crate::message::config::{RuntimeConfig, ServerArgs};
 use crate::message::detok::DetokMsg;
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
@@ -34,6 +35,38 @@ use crate::{
 /// loop until its inbox closes.
 pub trait Runnable: Send + 'static {
     fn run(self);
+}
+
+/// Resolve the optional OpenAI chat formatter during runtime bootstrap. This
+/// is startup-time model-artifact discovery; request handling never reaches
+/// into the tokenizer manager and only submits the rendered prompt through the
+/// shared generation plan.
+fn load_chat_formatter(server_args: &ServerArgs) -> Option<ChatFormatter> {
+    if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
+        return None;
+    }
+    let config_file = tokenizer::resolve_model_file(
+        &server_args.tokenizer_path,
+        server_args.revision.as_deref(),
+        "tokenizer_config.json",
+    );
+    match crate::api_server::core::openai::template::load_chat_formatter(
+        config_file.as_deref(),
+        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.chat_template.as_deref(),
+    ) {
+        Ok(formatter) => {
+            tracing::info!(
+                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
+                "loaded OpenAI chat template"
+            );
+            Some(formatter)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "OpenAI chat completions disabled");
+            None
+        }
+    }
 }
 
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
@@ -298,7 +331,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             response_buf: cfg.rust_server_args.channel_cap,
             api_key: cfg.rust_server_args.api_key.clone(),
             server_args: cfg.server_args.clone(),
-            chat_formatter: crate::api_server::core::openai::load_chat_support(&cfg.server_args),
+            chat_formatter: load_chat_formatter(&cfg.server_args),
             // Response heartbeat watched by `/health_generate`.
             response_activity,
         });

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use crate::message::config::ServerArgs;
-use crate::message::detok::DetokMsg;
+use crate::message::detok::{DetokMsg, PromptSource};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{GenerateRequest, MmRequest, Request, RequestKind, SchedulerRequest};
@@ -207,10 +207,10 @@ impl Intake {
                     registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control and detokenize skip normalization (no sampling params)
-                // straight to the pre-send checks; generate goes to Normalizing.
+                // Control skips normalization (it has no sampling params); generate
+                // goes to Normalizing.
                 RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
+                    RequestKind::Control(_) => {
                         let _ = req
                             .state
                             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
@@ -224,7 +224,7 @@ impl Intake {
                 RequestState::Normalizing => {
                     let outcome = {
                         let RequestKind::Generate(g) = &mut req.kind else {
-                            // Unreachable (control/detokenize never reach here);
+                            // Unreachable (control requests never reach here);
                             // reject so a bug can't leak/hang a registered request.
                             self.fail(
                                 &mut req,
@@ -327,15 +327,13 @@ impl Intake {
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Hand the request to the stage that answers it: the scheduler
-                // ring (generate payload or control frame), or — for detokenize
-                // — the detok shard itself.
+                // ring (generate payload or control frame).
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the
                     // discriminant and `req` can be moved into each push.
                     match req.kind {
                         RequestKind::Generate(_) => self.push_to_ring(req),
                         RequestKind::Control(_) => self.push_control_to_ring(req),
-                        RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
                     }
                     return;
                 }
@@ -364,12 +362,24 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, prompt) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.return_prompt_text
+                    .then(|| {
+                        g.text
+                            .as_ref()
+                            .map(|text| PromptSource::Text(text.clone()))
+                            .or_else(|| {
+                                g.input_ids
+                                    .as_ref()
+                                    .map(|ids| PromptSource::TokenIds(ids.clone()))
+                            })
+                    })
+                    .flatten(),
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Control(_) => (false, false, None),
         };
         self.senders
             .detok_for(&req.rid)
@@ -378,36 +388,9 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                prompt,
             })
             .is_ok()
-    }
-
-    /// Hand a `Detokenize` request to its owning detok shard — the stage that
-    /// answers this kind (it never touches the scheduler ring). The shard
-    /// already holds this rid's sink: `register_detok` queued `Register` on the
-    /// same channel from this same thread, so FIFO gives Register → Decode.
-    fn push_detokenize_to_shard(&self, mut req: Request) {
-        let RequestKind::Detokenize { token_ids } = &req.kind else {
-            self.fail(
-                &mut req,
-                Error::Internal("non-detokenize request reached push_detokenize_to_shard".into()),
-                true,
-            );
-            return;
-        };
-        // Infallible: `validate` rejected out-of-range ids at `Received`.
-        let token_ids: Vec<u32> = token_ids.iter().map(|&id| id as u32).collect();
-        if self
-            .senders
-            .detok_for(&req.rid)
-            .send(DetokMsg::Decode {
-                rid: req.rid.clone(),
-                token_ids,
-            })
-            .is_err()
-        {
-            self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
-        }
     }
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The
@@ -593,18 +576,6 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
                          {id}; valid range is [0, {vocab_size})"
                     )));
                 }
-            }
-        }
-    }
-
-    // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab
-    // bound — parity with the retired direct decode service: an unknown id is
-    // the tokenizer's error to report, and nothing here reaches the scheduler's
-    // embedding lookup.
-    if let RequestKind::Detokenize { token_ids } = &req.kind {
-        for &id in token_ids {
-            if u32::try_from(id).is_err() {
-                return Err(Error::Validation(format!("Token ID {id} is out of range")));
             }
         }
     }
@@ -869,6 +840,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prompt_text_option_is_carried_on_normal_registration() {
+        let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
+        let mut request = generate_req(37, SamplingParams::default());
+        let RequestKind::Generate(g) = &mut request.kind else {
+            unreachable!();
+        };
+        g.return_prompt_text = true;
+        intake.drive(request);
+
+        let Ok(DetokMsg::Register { prompt, .. }) = detok_rx.try_recv() else {
+            panic!("generation registration must be emitted");
+        };
+        assert!(matches!(
+            prompt,
+            Some(crate::message::detok::PromptSource::TokenIds(ids)) if ids == vec![1, 2, 3]
+        ));
+    }
+
     /// `input + max_new_tokens` past the context window is an actionable 400, not a
     /// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
     /// The message names both halves so the client can fix the right one.
@@ -1091,71 +1081,6 @@ mod tests {
             consumer.drain(16).headers.is_empty(),
             "must not reach the scheduler"
         );
-    }
-
-    /// A `Detokenize` request terminates at the detok stage, and the shard must
-    /// see its `Register` BEFORE its `Decode` — the shard delivers the result
-    /// through the sink registered under that rid, so a `Decode` that arrives
-    /// unregistered is silently dropped and the caller waits forever. Both
-    /// messages ride one channel from this one thread, which is the FIFO this
-    /// pins. Nothing may reach the scheduler ring.
-    #[test]
-    fn detokenize_flows_register_then_decode_and_skips_the_ring() {
-        let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-        let (tx, mut rx) = mpsc::channel(8);
-        intake.drive(Request {
-            rid: "41".into(),
-            state: RequestState::Received,
-            sink: ResponseSink::Local(tx),
-            kind: RequestKind::Detokenize {
-                token_ids: vec![7, 8, 9],
-            },
-        });
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "41"),
-            "the sink must be registered before the decode job",
-        );
-        assert!(
-            matches!(
-                detok_rx.try_recv(),
-                Ok(DetokMsg::Decode { rid, token_ids })
-                    if rid.as_str() == "41" && token_ids == [7, 8, 9]
-            ),
-            "the decode job follows, ids intact",
-        );
-        assert!(
-            consumer.drain(16).headers.is_empty(),
-            "must never reach the scheduler"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "no response until the shard answers"
-        );
-    }
-
-    /// Negative ids cannot decode (the shard's domain is `&[u32]`): rejected by
-    /// `validate` at `Received` — an `Error` to the sink, and the shard sees
-    /// NOTHING (validation runs before registration, so there is no entry to
-    /// leak and no decode job to drop).
-    #[test]
-    fn detokenize_negative_ids_reject_before_registration() {
-        let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-        let (tx, mut rx) = mpsc::channel(8);
-        intake.drive(Request {
-            rid: "43".into(),
-            state: RequestState::Received,
-            sink: ResponseSink::Local(tx),
-            kind: RequestKind::Detokenize {
-                token_ids: vec![1, -1],
-            },
-        });
-        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
-            panic!("sink must receive the validation error");
-        };
-        assert_eq!(err.http_status(), 400);
-        assert!(err.to_string().contains("out of range"), "{err}");
-        assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
-        assert!(consumer.drain(16).headers.is_empty());
     }
 
     /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,

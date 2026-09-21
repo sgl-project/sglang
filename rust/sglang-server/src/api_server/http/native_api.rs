@@ -15,7 +15,7 @@ use super::response::sse_encode;
 use super::response::{HttpResponse, bytes_response, read_json, status_response};
 use crate::api_server::core::frame::{error_value, frame_typed};
 use crate::api_server::core::generate::{
-    GeneratePlan, UnaryOutcome, add_e2e_latency, drain_unary, generate_start,
+    UnaryDrainPolicy, UnaryOutcome, add_e2e_latency, drain_plan_unary, generate_start,
     generation_event_stream,
 };
 use crate::api_server::core::health::{HealthStatus, health_probe};
@@ -32,7 +32,6 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Htt
 struct NativeUnary {
     code: u16,
     body: String,
-    terminal: bool,
 }
 
 /// The HTTP JSON rendering of a folded [`UnaryOutcome`].
@@ -44,18 +43,15 @@ fn render_unary(outcome: UnaryOutcome, rid: &str) -> NativeUnary {
             NativeUnary {
                 code: 200,
                 body: serde_json::to_string(&frame).expect("a generated frame always serializes"),
-                terminal: true,
             }
         }
         UnaryOutcome::Error { code, message } => NativeUnary {
             code,
             body: error_value(code, &message).to_string(),
-            terminal: true,
         },
         UnaryOutcome::Truncated => NativeUnary {
             code: 500,
             body: error_value(500, "response truncated before completion").to_string(),
-            terminal: false,
         },
     }
 }
@@ -104,66 +100,36 @@ pub(super) async fn generate<B: http_body::Body>(
         // the client asked for.
         Err(e) => return native_error(e.http_status(), &e.message, stream),
     };
-    let GeneratePlan {
-        receivers,
-        mut guard,
-        is_batch,
-        incremental,
-    } = plan;
-
+    let is_batch = plan.is_batch;
     if stream {
         // A single request is a 1-element batch without the `index` field — the
         // same multiplexed stream serves both, so the frame/abort/truncation
         // logic lives in one place. `guard` moves into the stream so a client
         // disconnect aborts what's unfinished.
-        sse_encode(generation_event_stream(
-            receivers,
-            guard,
-            incremental,
-            is_batch,
-        ))
-    } else if !is_batch {
-        // `into_requests` guarantees exactly one payload for a non-batch body.
-        let (rid_str, mut rx, timing) = receivers
-            .into_iter()
-            .next()
-            .expect("into_requests yields >=1 payload");
-        // Unary: fold to the terminal, respond once. Disarm only on a real terminal
-        // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let outcome = drain_unary(&mut rx, timing).await;
-        let unary = render_unary(outcome, rid_str.client_facing());
-        if unary.terminal {
-            guard.disarm(&rid_str);
-        }
-        let status = StatusCode::from_u16(unary.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        bytes_response(status, "application/json", unary.body.into_bytes())
+        sse_encode(generation_event_stream(plan))
     } else {
-        // Unary batch: poll every item concurrently, as Python's gather does.
-        // `join_all` preserves input order for the final JSON array, while each
-        // drain observes its own terminal output promptly (important for
-        // per-item e2e_latency). A failed item is its own `{ "error": … }`
-        // entry; the batch response is 200.
-        let drained = futures::future::join_all(receivers.into_iter().map(
-            |(rid_str, mut rx, request_timing)| async move {
-                let outcome = drain_unary(&mut rx, request_timing).await;
-                let unary = render_unary(outcome, rid_str.client_facing());
-                (rid_str, unary)
-            },
-        ))
-        .await;
-        let mut results = Vec::with_capacity(drained.len());
-        for (rid_str, unary) in drained {
-            if unary.terminal {
-                guard.disarm(&rid_str);
-            }
-            results.push(unary.body);
+        let drained = match drain_plan_unary(plan, UnaryDrainPolicy::PerItem).await {
+            Ok(drained) => drained,
+            Err(e) => return native_error(e.http_status(), &e.message, false),
+        };
+        let mut rendered = drained
+            .into_iter()
+            .map(|(rid, outcome)| render_unary(outcome, rid.client_facing()));
+        if !is_batch {
+            // `into_requests` guarantees exactly one payload for a non-batch body.
+            let unary = rendered.next().expect("into_requests yields one payload");
+            let status =
+                StatusCode::from_u16(unary.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            bytes_response(status, "application/json", unary.body.into_bytes())
+        } else {
+            // The shared per-item drain preserves input order; each item keeps its
+            // own terminal/error shape while the batch itself remains HTTP 200.
+            let results: Vec<_> = rendered.map(|unary| unary.body).collect();
+            bytes_response(
+                StatusCode::OK,
+                "application/json",
+                format!("[{}]", results.join(",")).into_bytes(),
+            )
         }
-        // Comma-joined pre-serialized bodies: the bytes `serde_json` writes for
-        // an array of the same documents.
-        bytes_response(
-            StatusCode::OK,
-            "application/json",
-            format!("[{}]", results.join(",")).into_bytes(),
-        )
     }
 }

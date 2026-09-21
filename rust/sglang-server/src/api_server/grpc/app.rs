@@ -15,9 +15,7 @@ use sglang_api_types::api::v1::sglang_service_server::{SglangService, SglangServ
 use tonic::{Request, Response, Status};
 
 use crate::api_server::core::error::ApiError;
-use crate::api_server::core::generate::{
-    GeneratePlan, PbFrameShaper, generation_event_stream_with,
-};
+use crate::api_server::core::generate::{PbFrameShaper, generation_event_stream_with};
 use crate::api_server::core::health::{HealthStatus, health_probe};
 use crate::api_server::core::state::CoreState;
 use crate::api_server::core::{control, generate};
@@ -73,15 +71,7 @@ impl SglangService for GrpcApi {
         let plan = generate::generate_start(&self.state, body)
             .await
             .map_err(|e| status(&e))?;
-        let GeneratePlan {
-            receivers,
-            guard,
-            is_batch,
-            incremental,
-        } = plan;
-        let stream =
-            generation_event_stream_with(receivers, guard, incremental, is_batch, PbFrameShaper)
-                .map(Ok);
+        let stream = generation_event_stream_with(plan, PbFrameShaper).map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -173,7 +163,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_server::core::openai::test_utils::senders;
+    use crate::api_server::core::test_utils::senders;
     use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
     use crate::tokenizer_manager::wiring::{Senders, TmEvent};
     use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;

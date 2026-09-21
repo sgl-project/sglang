@@ -40,27 +40,7 @@ pub(crate) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrappe
     ReasoningParserType::get_reasoning_parser_from_name(name)
 }
 
-/// Split a completed generation's text into `(reasoning_text, normal_text)`
-/// when `--reasoning-parser` selects a parser; otherwise the text passes
-/// through untouched as normal text. Chat splits before tool-call parsing.
-pub(crate) fn split_reasoning_unary(
-    name: Option<&str>,
-    text: &str,
-    token_ids: &[i32],
-) -> (String, String) {
-    let Some(name) = name else {
-        return (String::new(), text.to_owned());
-    };
-    let mut parser = build_reasoning_parser(name);
-    let token_ids = token_ids
-        .iter()
-        .filter_map(|&id| u32::try_from(id).ok())
-        .collect::<Vec<_>>();
-    let split = parser.detect_and_parse_reasoning(text, &token_ids);
-    (split.reasoning_text, split.normal_text)
-}
-
-/// Stateful reasoning split for one streaming response. Mirrors Python's
+/// Stateful reasoning split for one response. Mirrors Python's
 /// `reasoning_parser_dict` entries: the parser is built lazily on the first
 /// content delta, each frame is split into `(reasoning, normal)` deltas, and
 /// [`finish`](Self::finish) flushes the parser-buffered tail — *both* columns,
@@ -98,6 +78,17 @@ impl ReasoningStreamSplitter {
         (split.reasoning_text, split.normal_text)
     }
 
+    /// Split one complete text: feed it through the incremental parser, then
+    /// flush the parser-buffered tail. Unary rendering uses this so it exposes
+    /// exactly what a streaming run reconstructs.
+    pub(crate) fn split_complete(&mut self, text: &str, token_ids: &[i32]) -> (String, String) {
+        let (mut reasoning_text, mut normal_text) = self.split(text, token_ids);
+        let (reasoning_tail, normal_tail) = self.finish();
+        reasoning_text.push_str(&reasoning_tail);
+        normal_text.push_str(&normal_tail);
+        (reasoning_text, normal_text)
+    }
+
     /// Flush the parser-buffered tail at stream end, releasing both columns.
     pub(crate) fn finish(&mut self) -> (String, String) {
         let Some(parser) = self.parser.as_mut() else {
@@ -110,7 +101,7 @@ impl ReasoningStreamSplitter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReasoningStreamSplitter, build_reasoning_parser, split_reasoning_unary};
+    use super::{ReasoningStreamSplitter, build_reasoning_parser};
     use dynamo_parsers::reasoning::ReasoningParser;
 
     #[test]
@@ -165,10 +156,60 @@ mod tests {
     }
 
     #[test]
-    fn unary_split_passes_text_through_without_a_parser() {
-        let (reasoning, normal) = split_reasoning_unary(None, "<think>kept as text</think>", &[1]);
+    fn split_complete_passes_text_through_without_a_parser() {
+        let (reasoning, normal) =
+            ReasoningStreamSplitter::new(None).split_complete("<think>kept as text</think>", &[1]);
         assert_eq!(reasoning, "");
         assert_eq!(normal, "<think>kept as text</think>");
+    }
+
+    /// The reported Qwen case: the one-shot result must keep the exact
+    /// whitespace the streaming result keeps, instead of trimming both columns.
+    #[test]
+    fn split_complete_preserves_reported_qwen_whitespace() {
+        let input = "<think>\nOkay \n</think> Paris \n";
+        let (reasoning, normal) =
+            ReasoningStreamSplitter::new(Some("qwen3")).split_complete(input, &[]);
+        assert_eq!(reasoning, "\nOkay \n");
+        assert_eq!(normal, " Paris \n");
+
+        let (reasoning, normal) =
+            ReasoningStreamSplitter::new(Some("deepseek-r1")).split_complete(input, &[]);
+        assert_eq!(reasoning, "\nOkay \n");
+        assert_eq!(normal, " Paris \n");
+    }
+
+    /// Away from surrounding whitespace the streaming split agrees with the
+    /// unary parser it replaces, including forced mode and buffered EOF text.
+    #[test]
+    fn split_complete_matches_the_legacy_parser_away_from_whitespace() {
+        for (parser, input) in [
+            ("deepseek-r1", "<think>because</think>Paris"),
+            ("deepseek-r1", "forced reasoning"),
+            ("qwen3", "<think>reason</think>answer"),
+            ("qwen3-thinking", "plain text"),
+            ("kimi_k2", "<think>k</think>out"),
+            ("minimax_m3", "The answer is 42"),
+            ("minimax_m3", "<mm:think>think hard</mm:think>"),
+            ("qwen3", ""),
+        ] {
+            let mut legacy = build_reasoning_parser(parser);
+            let legacy = legacy.detect_and_parse_reasoning(input, &[]);
+            let (reasoning, normal) =
+                ReasoningStreamSplitter::new(Some(parser)).split_complete(input, &[]);
+            assert_eq!(reasoning, legacy.reasoning_text, "{parser}: {input:?}");
+            assert_eq!(normal, legacy.normal_text, "{parser}: {input:?}");
+        }
+    }
+
+    /// A parser with an implicit boundary buffers its whole input until EOF;
+    /// the one-shot path must flush that buffer, not drop it.
+    #[test]
+    fn split_complete_releases_buffered_eof_text() {
+        let (reasoning, normal) = ReasoningStreamSplitter::new(Some("minimax_m3"))
+            .split_complete("The answer is 42", &[]);
+        assert_eq!(reasoning, "");
+        assert_eq!(normal, "The answer is 42");
     }
 
     /// REASONING_P1: MiniMax M3's implicit-tool-start recovery buffers the

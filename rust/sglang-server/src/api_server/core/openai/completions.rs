@@ -1,6 +1,24 @@
 //! Transport-neutral pieces of the OpenAI legacy completions endpoint.
 
-use dynamo_protocols::types::CompletionUsage;
+use std::collections::BTreeMap;
+
+use futures::StreamExt;
+
+use crate::api_server::core::error::ApiError;
+use crate::api_server::core::event::CoreEvent;
+use crate::api_server::core::frame::OutputAccumulator;
+use crate::api_server::core::generate::{
+    FrameShaper, GeneratePlan, RequestTiming, UnaryDrainPolicy, drain_plan_unary,
+    generation_event_stream_with, unary_output,
+};
+use crate::api_server::core::openai::{UsageDetails, usage_value, weight_metadata_value};
+use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::sampling::SamplingParams;
+use crate::message::types::{OneOrMany, TokenIds};
+use dynamo_protocols::types::{
+    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
+    CreateCompletionResponse, Logprobs, Prompt, Stop,
+};
 
 pub(crate) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
     CompletionUsage {
@@ -11,42 +29,24 @@ pub(crate) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> Co
     }
 }
 
-use std::collections::BTreeMap;
-
-use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CreateCompletionRequest, CreateCompletionResponse, Logprobs,
-    Prompt, Stop,
-};
-use futures::StreamExt;
-use tokio::sync::mpsc;
-
-use crate::api_server::core::error::ApiError;
-use crate::api_server::core::event::CoreEvent;
-use crate::api_server::core::guard::AbortGuard;
-use crate::api_server::core::openai::{collect_output, indexed_decode_stream};
-use crate::api_server::core::state::CoreState;
-use crate::api_server::core::submit::submit;
-use crate::message::finish_reason::Matched;
-use crate::message::ids::Rid;
-use crate::message::request::RequestKind;
-use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
-use crate::message::sampling::SamplingParams;
-use crate::message::types::{OneOrMany, TokenIds};
-use crate::utils::error::Error;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PromptSpec {
     Text(String),
     TokenIds(TokenIds),
 }
 
-pub(crate) struct SubmittedChoice {
-    pub(crate) index: usize,
-    pub(crate) prompt_index: usize,
-    pub(crate) rid: Rid,
-    pub(crate) echo: String,
-    pub(crate) rx: mpsc::Receiver<ResponseItem>,
+/// Record one output's prompt count for `prompt_index`, keeping the first
+/// nonzero value: a scheduler's first frame may report 0 before the real count
+/// is known, and sibling choices sharing a prompt must neither double-count nor
+/// overwrite a known count with 0. Returns the recorded count.
+fn record_prompt_tokens(counts: &mut BTreeMap<usize, u32>, prompt_index: usize, count: u32) -> u32 {
+    let entry = counts.entry(prompt_index).or_insert(0);
+    if *entry == 0 {
+        *entry = count;
+    }
+    *entry
 }
+
 #[derive(Debug, Default)]
 pub(crate) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
@@ -55,64 +55,42 @@ pub(crate) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
-/// Decode a token-id prompt back to text for `echo=true`, via a
-/// `RequestKind::Detokenize` request through the regular submit path — the
-/// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
-/// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
-pub(crate) async fn decode_prompt_echo(
-    state: &CoreState,
-    token_ids: TokenIds,
-) -> Result<String, ApiError> {
-    let (_rid, mut rx) = submit(state, RequestKind::Detokenize { token_ids }).await?;
-    match rx.recv().await {
-        Some(ResponseItem::Data(payload)) => String::from_utf8(payload.to_vec())
-            .map_err(|_| ApiError::internal("detokenized prompt is not valid UTF-8")),
-        // A validation failure surfaces the bare diagnostic (Python parity);
-        // other pipeline errors get the echo-decode context prefix.
-        Some(ResponseItem::Error(Error::Validation(message))) => {
-            Err(ApiError::bad_request(message))
-        }
-        Some(ResponseItem::Error(error)) => Err(ApiError::new(
-            error.http_status(),
-            format!("failed to decode prompt for echo: {error}"),
-        )),
-        Some(_) | None => Err(ApiError::internal(
-            "failed to decode prompt for echo: reply channel closed",
-        )),
-    }
-}
-
-pub(crate) fn completion_prompt_specs(prompt: &Prompt) -> Result<Vec<PromptSpec>, String> {
+/// Normalize the endpoint's single-shape prompt into one owned payload per
+/// prompt. Consumes the prompt so text moves instead of cloning.
+pub(crate) fn completion_prompt_specs(prompt: Prompt) -> Result<Vec<PromptSpec>, String> {
     match prompt {
         Prompt::String(text) => {
             if text.is_empty() {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(vec![PromptSpec::Text(text.clone())])
+            Ok(vec![PromptSpec::Text(text)])
         }
         Prompt::StringArray(texts) => {
             if texts.is_empty() || texts.iter().any(String::is_empty) {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(texts.iter().cloned().map(PromptSpec::Text).collect())
+            Ok(texts.into_iter().map(PromptSpec::Text).collect())
         }
         Prompt::IntegerArray(ids) => Ok(vec![token_prompt_spec(ids)?]),
         Prompt::ArrayOfIntegerArray(prompts) => {
             if prompts.is_empty() {
                 return Err("Prompt cannot be empty".into());
             }
-            prompts.iter().map(|ids| token_prompt_spec(ids)).collect()
+            prompts.into_iter().map(token_prompt_spec).collect()
         }
     }
 }
 
-fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
+/// Validate and convert one token-id prompt. The wire type is `Vec<u32>` while
+/// [`TokenIds`] is `Vec<i32>`, so this is one reallocation per prompt — not a
+/// clone that ownership rules could avoid.
+fn token_prompt_spec(ids: Vec<u32>) -> Result<PromptSpec, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
     let input_ids = ids
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
+        .into_iter()
+        .map(|id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(PromptSpec::TokenIds(input_ids))
 }
@@ -160,41 +138,59 @@ pub(crate) fn completion_sampling_params(
     })
 }
 
+pub(crate) struct CompletionRenderingOptions {
+    pub(crate) response_id: String,
+    pub(crate) model: String,
+    pub(crate) created: u32,
+    pub(crate) echo: bool,
+    pub(crate) want_logprobs: bool,
+    pub(crate) n: usize,
+    /// `--enable-cache-report`: OpenAI usage exposes
+    /// `prompt_tokens_details.cached_tokens` only when enabled.
+    pub(crate) enable_cache_report: bool,
+    /// Launch-time `--weight-version`, the scalar fallback when the request has
+    /// no weight-version spans.
+    pub(crate) weight_version: Option<String>,
+}
+
 pub(crate) async fn unary_completion(
-    submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
-    response_id: String,
-    model: String,
-    created: u32,
-    echo: bool,
-    want_logprobs: bool,
+    plan: GeneratePlan,
+    options: CompletionRenderingOptions,
 ) -> Result<serde_json::Value, ApiError> {
-    // Every request is already submitted, so draining in choice order does not
-    // serialize generation. The non-streaming native path sends one terminal
-    // result, and the accumulator also tolerates intermediate frames.
-    let mut choices = Vec::with_capacity(submitted.len());
-    let mut extensions = Vec::with_capacity(submitted.len());
+    // Drain concurrently through the common path; results retain request order.
+    let drained = drain_plan_unary(plan, UnaryDrainPolicy::AggregateFailFast).await?;
+    let mut choices = Vec::with_capacity(drained.len());
+    let mut extensions = Vec::with_capacity(drained.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
+    let mut cached_tokens = 0u32;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u32;
+    let mut weight_spans = None;
 
-    for choice in submitted {
-        let output = collect_output(choice.rx, &mut guard, &choice.rid).await?;
+    for (choice_index, (_, outcome)) in drained.into_iter().enumerate() {
+        let output = unary_output(outcome)?;
+        let prompt_index = choice_index / options.n;
 
-        prompt_tokens
-            .entry(choice.prompt_index)
-            .or_insert(output.prompt_tokens);
+        record_prompt_tokens(&mut prompt_tokens, prompt_index, output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-        let (response_choice, extension) = completion_choice(
-            choice.index,
-            if echo {
-                choice.echo + &output.text
-            } else {
-                output.text.clone()
-            },
-            &output,
-            want_logprobs,
-            echo,
-        );
+        if let Some(extras) = output.extras.as_deref() {
+            reasoning_tokens = reasoning_tokens.saturating_add(extras.reasoning_tokens);
+            // Python selects cached counts from the first choice of each prompt
+            // (`idx % n == 0`) only; a sibling's count never wins, even if the
+            // first choice reported 0. Each choice is visited once, so a scalar
+            // total is enough here.
+            if choice_index.is_multiple_of(options.n) {
+                cached_tokens = cached_tokens.saturating_add(extras.cached_tokens);
+            }
+        }
+        if choice_index == 0 {
+            weight_spans = output
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.weight_versions.clone());
+        }
+        let (response_choice, extension) =
+            completion_choice(choice_index, output, options.echo, options.want_logprobs)?;
         choices.push(response_choice);
         extensions.push(extension);
     }
@@ -207,28 +203,45 @@ pub(crate) async fn unary_completion(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
     );
+    let details = UsageDetails {
+        reasoning_tokens,
+        cached_tokens: options.enable_cache_report.then_some(cached_tokens),
+    };
 
-    Ok(completion_response_value(
+    let mut value = completion_response_value(
         CreateCompletionResponse {
-            id: response_id,
+            id: options.response_id,
             choices,
-            created,
-            model,
+            created: options.created,
+            model: options.model,
             system_fingerprint: None,
             object: "text_completion".into(),
             usage: Some(usage),
         },
         &extensions,
-    ))
+        details,
+    );
+    value["metadata"] =
+        weight_metadata_value(weight_spans.as_deref(), options.weight_version.as_deref());
+    Ok(value)
 }
 
 fn completion_choice(
     index: usize,
-    text: String,
-    output: &ChunkEvent,
+    mut output: ChunkEvent,
+    echoed: bool,
     want_logprobs: bool,
-    include_input_logprobs: bool,
-) -> (Choice, ChoiceExtensions) {
+) -> Result<(Choice, ChoiceExtensions), ApiError> {
+    // Prepend the prompt metadata the generation lifecycle attached for
+    // `echo=true`; its absence is a lifecycle fault, not a client error.
+    if echoed {
+        let prefix = output
+            .extras
+            .as_deref()
+            .and_then(|extras| extras.prompt_text.as_deref())
+            .ok_or_else(|| ApiError::internal("generation output is missing prompt metadata"))?;
+        output.text.insert_str(0, prefix);
+    }
     let reason = output.finish_reason.as_ref();
     let (finish_reason, finish_reason_override) = {
         match reason.and_then(|reason| reason.kind_name()).as_deref() {
@@ -239,38 +252,34 @@ fn completion_choice(
             None => (None, None),
         }
     };
-    let matched_stop = reason
-        .and_then(|reason| reason.matched())
-        .map(|matched| match matched {
-            Matched::Token(id) => serde_json::json!(id),
-            Matched::Str(value) => serde_json::json!(value),
-            // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
-            Matched::Tokens(ids) => serde_json::json!(ids.ids),
-        });
-    (
+    let matched_stop = reason.and_then(super::matched_stop_value);
+    Ok((
         Choice {
-            text,
+            text: output.text,
             index: u32::try_from(index).unwrap_or(u32::MAX),
-            logprobs: want_logprobs
-                .then(|| completion_logprobs(output.extras.as_deref(), include_input_logprobs)),
+            logprobs: want_logprobs.then(|| completion_logprobs(output.extras.as_deref(), echoed)),
             finish_reason,
         },
         ChoiceExtensions {
             matched_stop,
             finish_reason_override,
         },
-    )
+    ))
 }
 
 /// Serialize Dynamo's standard response and add only SGLang/Python fields that
 /// its schema cannot represent. `text_offset` is corrected here because Dynamo
 /// types it as `u32`, while Python deliberately emits `-1`.
 pub(crate) fn completion_response_value(
-    response: CreateCompletionResponse,
+    mut response: CreateCompletionResponse,
     extensions: &[ChoiceExtensions],
+    details: UsageDetails,
 ) -> serde_json::Value {
+    let usage = response.usage.take();
     let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
+    if let Some(usage) = usage {
+        value["usage"] = usage_value(usage, details);
+    }
     let Some(root) = value.as_object_mut() else {
         return value;
     };
@@ -296,6 +305,9 @@ pub(crate) fn completion_response_value(
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
         );
+        // Python's completion choice always carries `logprobs` (null when the
+        // request did not ask for them).
+        choice.entry("logprobs").or_insert(serde_json::Value::Null);
         if let Some(logprobs) = choice
             .get_mut("logprobs")
             .and_then(serde_json::Value::as_object_mut)
@@ -310,10 +322,7 @@ pub(crate) fn completion_response_value(
     value
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn completion_event_stream(
-    submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
+pub(crate) struct CompletionFrameShaper {
     response_id: String,
     model: String,
     created: u32,
@@ -321,112 +330,214 @@ pub(crate) fn completion_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     continuous_usage: bool,
-) -> impl futures::Stream<Item = CoreEvent<serde_json::Value>> {
-    async_stream::stream! {
-        let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
-        let mut prompt_indexes = Vec::with_capacity(count);
-        let mut echoes = Vec::with_capacity(count);
-        let mut first_chunks = vec![true; count];
-        let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
-        let mut completion_tokens_by_choice = vec![0u64; count];
-        let mut streams = Vec::with_capacity(count);
+    enable_cache_report: bool,
+    n: usize,
+    first_chunks: Vec<bool>,
+    prompt_tokens_by_prompt: BTreeMap<usize, u32>,
+    cached_tokens_by_prompt: BTreeMap<usize, u32>,
+    reasoning_tokens_by_choice: Vec<u32>,
+    completion_tokens_by_choice: Vec<u64>,
+}
 
-        for choice in submitted {
-            let index = choice.index;
-            rids.push(choice.rid);
-            prompt_indexes.push(choice.prompt_index);
-            echoes.push(choice.echo);
-            streams.push(indexed_decode_stream(index, choice.rx));
+impl CompletionFrameShaper {
+    pub(crate) fn new(
+        count: usize,
+        options: CompletionRenderingOptions,
+        include_usage: bool,
+        continuous_usage: bool,
+    ) -> Self {
+        let CompletionRenderingOptions {
+            response_id,
+            model,
+            created,
+            echo,
+            want_logprobs,
+            n,
+            enable_cache_report,
+            weight_version: _,
+        } = options;
+        Self {
+            response_id,
+            model,
+            created,
+            echo,
+            want_logprobs,
+            include_usage,
+            continuous_usage,
+            enable_cache_report,
+            n,
+            first_chunks: vec![true; count],
+            prompt_tokens_by_prompt: BTreeMap::new(),
+            cached_tokens_by_prompt: BTreeMap::new(),
+            reasoning_tokens_by_choice: vec![0; count],
+            completion_tokens_by_choice: vec![0; count],
         }
-        let mut events = futures::stream::select_all(streams);
+    }
 
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield CoreEvent::ItemError(ApiError::internal("response truncated before completion"));
-                continue;
-            };
-            let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield CoreEvent::ItemError(ApiError::from_pipeline(&error));
-                    continue;
-                }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
-            };
-
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield CoreEvent::ItemError(ApiError::from_abort(code, message));
-                continue;
+    fn frame(
+        &mut self,
+        choice_index: usize,
+        out: ChunkEvent,
+        completion_tokens: u64,
+        first: bool,
+    ) -> Result<CoreEvent<serde_json::Value>, ApiError> {
+        let prompt_index = choice_index / self.n;
+        let prompt_tokens = record_prompt_tokens(
+            &mut self.prompt_tokens_by_prompt,
+            prompt_index,
+            out.prompt_tokens,
+        );
+        if let Some(extras) = out.extras.as_deref() {
+            if extras.reasoning_tokens != 0 {
+                self.reasoning_tokens_by_choice[choice_index] = extras.reasoning_tokens;
             }
-
-            prompt_tokens_by_prompt
-                .entry(prompt_indexes[index])
-                .or_insert(output.prompt_tokens);
-            completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
-                .saturating_add(output.completion_tokens);
-            let first = std::mem::replace(&mut first_chunks[index], false);
-            let text = if echo && first {
-                echoes[index].clone() + &output.text
-            } else {
-                output.text.clone()
-            };
-            let chunk_usage = continuous_usage.then(|| {
-                completion_usage(
-                    output.prompt_tokens,
-                    u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
-                )
-            });
-            let (choice, extension) = completion_choice(
-                index,
-                text,
-                &output,
-                want_logprobs,
-                echo && first,
-            );
-            let chunk = CreateCompletionResponse {
-                id: response_id.clone(),
+            // First choice of each prompt only (Python `idx % n == 0`).
+            if choice_index.is_multiple_of(self.n) && extras.cached_tokens != 0 {
+                self.cached_tokens_by_prompt
+                    .insert(prompt_index, extras.cached_tokens);
+            }
+        }
+        self.completion_tokens_by_choice[choice_index] = completion_tokens;
+        let chunk_usage = self.continuous_usage.then(|| {
+            completion_usage(
+                prompt_tokens,
+                u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            )
+        });
+        // Python's continuous chunks report the choice's own reasoning count and
+        // no cached details; the final trailer carries both.
+        let details = UsageDetails {
+            reasoning_tokens: self.reasoning_tokens_by_choice[choice_index],
+            cached_tokens: None,
+        };
+        let (choice, extension) =
+            completion_choice(choice_index, out, self.echo && first, self.want_logprobs)?;
+        Ok(CoreEvent::Item(completion_response_value(
+            CreateCompletionResponse {
+                id: self.response_id.clone(),
                 choices: vec![choice],
-                created,
-                model: model.clone(),
+                created: self.created,
+                model: self.model.clone(),
                 system_fingerprint: None,
                 object: "text_completion".into(),
                 usage: chunk_usage,
-            };
-            yield CoreEvent::Item(completion_response_value(chunk, &[extension]));
-        }
+            },
+            &[extension],
+            details,
+        )))
+    }
+}
 
-        if include_usage {
-            let prompt_tokens = prompt_tokens_by_prompt
-                .values()
+impl FrameShaper for CompletionFrameShaper {
+    type Frame = Result<CoreEvent<serde_json::Value>, ApiError>;
+
+    fn delta(
+        &mut self,
+        out: ChunkEvent,
+        acc: &OutputAccumulator,
+        _rid: &str,
+        index: Option<usize>,
+    ) -> Self::Frame {
+        let item_index = index.unwrap_or(0);
+        let completion_tokens = acc.snapshot().completion_tokens;
+        let first = std::mem::replace(&mut self.first_chunks[item_index], false);
+        self.frame(item_index, out, completion_tokens, first)
+    }
+
+    fn coalesced(
+        &mut self,
+        acc: &OutputAccumulator,
+        _rid: &str,
+        index: Option<usize>,
+    ) -> Self::Frame {
+        self.delta(acc.snapshot().clone(), acc, "", index)
+    }
+
+    fn terminal(
+        &mut self,
+        out: ChunkEvent,
+        acc: &OutputAccumulator,
+        _incremental: bool,
+        _rid: &str,
+        index: Option<usize>,
+        _timing: &RequestTiming,
+    ) -> Self::Frame {
+        self.delta(out, acc, _rid, index)
+    }
+
+    fn item_error(&mut self, code: u16, message: &str, _index: Option<usize>) -> Self::Frame {
+        let error = ApiError::new(code, message);
+        Ok(CoreEvent::ItemError(error))
+    }
+
+    fn finish(&mut self) -> Option<Self::Frame> {
+        if !self.include_usage {
+            return None;
+        }
+        let prompt_tokens = self
+            .prompt_tokens_by_prompt
+            .values()
+            .copied()
+            .fold(0u32, u32::saturating_add);
+        let completion_tokens = self
+            .completion_tokens_by_choice
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        let details = UsageDetails {
+            reasoning_tokens: self
+                .reasoning_tokens_by_choice
+                .iter()
                 .copied()
-                .fold(0u32, u32::saturating_add);
-            let completion_tokens = completion_tokens_by_choice
-                .into_iter()
-                .fold(0u64, u64::saturating_add);
-            let final_chunk = CreateCompletionResponse {
-                id: response_id,
+                .fold(0u32, u32::saturating_add),
+            cached_tokens: self.enable_cache_report.then(|| {
+                self.cached_tokens_by_prompt
+                    .values()
+                    .copied()
+                    .fold(0u32, u32::saturating_add)
+            }),
+        };
+        Some(Ok(CoreEvent::Item(completion_response_value(
+            CreateCompletionResponse {
+                id: self.response_id.clone(),
                 choices: vec![],
-                created,
-                model,
+                created: self.created,
+                model: self.model.clone(),
                 system_fingerprint: None,
                 object: "text_completion".into(),
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                 )),
-            };
-            yield CoreEvent::Item(completion_response_value(final_chunk, &[]));
-        }
+            },
+            &[],
+            details,
+        ))))
+    }
+}
+
+/// Rendering failures end the logical Completion response. Scheduler item
+/// errors are successful frame values and retain the shared per-item behavior.
+pub(crate) fn completion_event_stream(
+    plan: GeneratePlan,
+    shaper: CompletionFrameShaper,
+) -> impl futures::Stream<Item = CoreEvent<serde_json::Value>> {
+    async_stream::stream! {
+        let error = {
+            let raw = generation_event_stream_with(
+                GeneratePlan { incremental: true, ..plan },
+                shaper,
+            );
+            futures::pin_mut!(raw);
+            loop {
+                match raw.next().await {
+                    Some(Ok(frame)) => yield frame,
+                    Some(Err(error)) => break error,
+                    None => return,
+                }
+            }
+        }; // Drop the raw stream and abort unfinished work before yielding the error.
+        yield CoreEvent::ItemError(error);
     }
 }
 
@@ -534,52 +645,75 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, senders, submitted};
+    use crate::api_server::core::test_utils::{
+        abort_senders, aborted_guard_rids, chunk, chunk_with_metadata, plan, planned, senders,
+    };
 
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        ChoiceExtensions, CompletionFrameShaper, CompletionRenderingOptions, PromptSpec,
+        completion_event_stream, completion_logprobs, completion_prompt_specs,
+        completion_response_value, completion_sse_payload, unary_completion,
     };
-    use crate::api_server::core::guard::AbortGuard;
-    use crate::message::response::ChunkExtras;
-    use dynamo_protocols::types::{
-        Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
-    };
-    use futures::StreamExt;
+    use crate::api_server::core::event::CoreEvent;
+    use crate::api_server::core::openai::UsageDetails;
+    use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan};
+    use dynamo_protocols::types::{Choice, CreateCompletionResponse, Prompt};
+    use futures::{FutureExt, StreamExt};
 
-    #[test]
-    fn dynamo_completion_request_deserializes_directly() {
-        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "prompt": ["a", "b"],
-            "max_tokens": 8,
-            "n": 2,
-            "stream_options": {
-                "include_usage": true,
-                "continuous_usage_stats": true
+    /// The common rendering options; tests override fields with struct-update
+    /// syntax.
+    fn completion_options() -> CompletionRenderingOptions {
+        CompletionRenderingOptions {
+            response_id: "cmpl-test".into(),
+            model: "model".into(),
+            created: 1,
+            echo: false,
+            want_logprobs: false,
+            n: 1,
+            enable_cache_report: false,
+            weight_version: Some("wv-test".into()),
+        }
+    }
+
+    fn chunk_with_prompt(rid: &str, text: &str, done: bool, prompt_tokens: u32) -> ResponseItem {
+        let mut item = chunk(rid, text, done);
+        match &mut item {
+            ResponseItem::Frame(event) | ResponseItem::Done(event) => {
+                event.prompt_tokens = prompt_tokens;
             }
-        }))
-        .unwrap();
-        assert!(matches!(request.prompt, Prompt::StringArray(_)));
-        assert_eq!(request.n, Some(2));
-        assert!(request.stream_options.unwrap().continuous_usage_stats);
+            _ => unreachable!("chunk builds a frame"),
+        }
+        item
     }
 
     #[test]
-    fn max_tokens_zero_is_rejected_before_submission() {
-        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "prompt": "hello",
-            "max_tokens": 0
-        }))
-        .unwrap();
-        assert_eq!(request.max_tokens, Some(0));
-    }
-
-    #[test]
-    fn token_prompt_is_normalized_without_echo_state() {
-        let specs = completion_prompt_specs(&Prompt::IntegerArray(vec![1, 2])).unwrap();
-        assert_eq!(specs, [PromptSpec::TokenIds(vec![1, 2])]);
+    fn prompt_specs_consume_text_and_convert_token_ids() {
+        assert_eq!(
+            completion_prompt_specs(Prompt::String("hi".into())).unwrap(),
+            [PromptSpec::Text("hi".into())]
+        );
+        assert_eq!(
+            completion_prompt_specs(Prompt::StringArray(vec!["a".into(), "b".into()])).unwrap(),
+            [PromptSpec::Text("a".into()), PromptSpec::Text("b".into())]
+        );
+        assert_eq!(
+            completion_prompt_specs(Prompt::IntegerArray(vec![1, 2])).unwrap(),
+            [PromptSpec::TokenIds(vec![1, 2])]
+        );
+        assert_eq!(
+            completion_prompt_specs(Prompt::ArrayOfIntegerArray(vec![vec![1], vec![2, 3]]))
+                .unwrap(),
+            [
+                PromptSpec::TokenIds(vec![1]),
+                PromptSpec::TokenIds(vec![2, 3])
+            ]
+        );
+        assert_eq!(
+            completion_prompt_specs(Prompt::String(String::new())).unwrap_err(),
+            "Prompt cannot be empty"
+        );
+        assert!(completion_prompt_specs(Prompt::IntegerArray(vec![])).is_err());
+        assert!(completion_prompt_specs(Prompt::IntegerArray(vec![u32::MAX])).is_err());
     }
 
     #[test]
@@ -612,6 +746,7 @@ mod tests {
                 usage: None,
             },
             &[ChoiceExtensions::default()],
+            UsageDetails::default(),
         );
         assert_eq!(
             value["choices"][0]["logprobs"]["text_offset"],
@@ -621,21 +756,19 @@ mod tests {
 
     #[tokio::test]
     async fn unary_fold_orders_choices_and_counts_each_prompt_once() {
-        let (choice0, tx0) = submitted(0, 0, "r0");
-        let (choice1, tx1) = submitted(1, 0, "r1");
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
         tx0.send(chunk("r0", "a", false)).await.unwrap();
         tx0.send(chunk("r0", "b", true)).await.unwrap();
         tx1.send(chunk("r1", "x", false)).await.unwrap();
         tx1.send(chunk("r1", "y", true)).await.unwrap();
 
         let response = unary_completion(
-            vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
-            "cmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            false,
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                ..completion_options()
+            },
         )
         .await
         .expect("unary completion succeeds");
@@ -647,22 +780,271 @@ mod tests {
         assert_eq!(value["usage"]["completion_tokens"], 4);
     }
 
+    /// A zero prompt count on the first sibling must not latch: a later
+    /// sibling's real count recovers it, and the shared prompt is counted once.
+    #[tokio::test]
+    async fn unary_usage_recovers_a_zero_prompt_count_from_a_sibling_choice() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(chunk_with_prompt("r0", "a", true, 0))
+            .await
+            .unwrap();
+        tx1.send(chunk_with_prompt("r1", "b", true, 5))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn echo_uses_prompt_text_from_the_generation_frame() {
+        let (choice, tx) = planned("r0");
+        let mut output = chunk("r0", "completion", true);
+        if let ResponseItem::Done(event) = &mut output {
+            event
+                .extras
+                .get_or_insert_with(Default::default)
+                .prompt_text = Some("decoded token prompt".into());
+        }
+        tx.send(output).await.unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice], senders()),
+            CompletionRenderingOptions {
+                echo: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("echo completion succeeds");
+        assert_eq!(
+            value["choices"][0]["text"],
+            "decoded token promptcompletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_echo_prompt_metadata_is_an_error() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "completion", true)).await.unwrap();
+
+        let error = unary_completion(
+            plan(vec![choice], senders()),
+            CompletionRenderingOptions {
+                echo: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect_err("echo without prompt metadata must fail");
+        assert_eq!(error.http_code, 500);
+        assert!(error.message.contains("missing prompt metadata"));
+    }
+
+    #[tokio::test]
+    async fn rendering_error_aborts_unfinished_choices_before_emitting_error() {
+        for terminal in [false, true] {
+            for failing_index in 0..2 {
+                let (choice0, tx0) = planned("r0");
+                let (choice1, tx1) = planned("r1");
+                let rids = ["r0", "r1"];
+                let txs = [tx0, tx1];
+                txs[failing_index]
+                    .send(chunk(rids[failing_index], "no echo metadata", terminal))
+                    .await
+                    .unwrap();
+                let (senders, abort_rx) = abort_senders();
+                let plan = plan(vec![choice0, choice1], senders);
+                let stream = completion_event_stream(
+                    plan,
+                    CompletionFrameShaper::new(
+                        2,
+                        CompletionRenderingOptions {
+                            echo: true,
+                            n: 2,
+                            ..completion_options()
+                        },
+                        true,
+                        false,
+                    ),
+                );
+                futures::pin_mut!(stream);
+
+                let CoreEvent::ItemError(error) = stream.next().await.unwrap() else {
+                    panic!("missing requested echo metadata must fail rendering");
+                };
+                assert_eq!(error.http_code, 500);
+                assert!(error.message.contains("missing prompt metadata"));
+
+                // Cancellation must already have happened while the adapter is
+                // suspended at its error yield, not only after the client drops it.
+                let expected = if terminal {
+                    vec![rids[1 - failing_index]]
+                } else {
+                    rids.to_vec()
+                };
+                assert_eq!(
+                    aborted_guard_rids(&abort_rx),
+                    expected,
+                    "terminal={terminal}, index={failing_index}"
+                );
+                assert!(
+                    stream
+                        .next()
+                        .now_or_never()
+                        .expect("rendering failure must end immediately")
+                        .is_none(),
+                    "no sibling content or final usage after rendering failure"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_item_error_keeps_sibling_output_and_final_usage() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice".into(),
+        )))
+        .await
+        .unwrap();
+        tx1.send(chunk("r1", "a", false)).await.unwrap();
+        tx1.send(chunk("r1", "b", true)).await.unwrap();
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            CompletionFrameShaper::new(
+                2,
+                CompletionRenderingOptions {
+                    n: 2,
+                    ..completion_options()
+                },
+                true,
+                false,
+            ),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame, CoreEvent::ItemError(_)))
+                .count(),
+            1
+        );
+        let outputs: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                CoreEvent::Item(value) => Some(value),
+                CoreEvent::ItemError(error) => {
+                    assert_eq!(error.http_code, 400);
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(outputs[0]["choices"][0]["text"], "a");
+        assert_eq!(outputs[1]["choices"][0]["text"], "b");
+        assert!(outputs[2]["choices"].as_array().unwrap().is_empty());
+        assert_eq!(outputs[2]["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn single_choice_error_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice".into(),
+        )))
+        .await
+        .unwrap();
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0], senders()),
+            CompletionFrameShaper::new(1, completion_options(), true, false),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 1);
+        let CoreEvent::ItemError(error) = &frames[0] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 400);
+        assert!(error.message.contains("bad choice"));
+    }
+
+    #[tokio::test]
+    async fn all_choice_error_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice 0".into(),
+        )))
+        .await
+        .unwrap();
+        tx1.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice 1".into(),
+        )))
+        .await
+        .unwrap();
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            CompletionFrameShaper::new(
+                2,
+                CompletionRenderingOptions {
+                    n: 2,
+                    ..completion_options()
+                },
+                true,
+                false,
+            ),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| matches!(f, CoreEvent::ItemError(_))));
+    }
+
+    #[tokio::test]
+    async fn truncation_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        drop(tx0);
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0], senders()),
+            CompletionFrameShaper::new(1, completion_options(), true, false),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 1);
+        let CoreEvent::ItemError(error) = &frames[0] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 500);
+        assert!(error.message.contains("truncated"));
+    }
+
     #[tokio::test]
     async fn stream_uses_deltas_then_usage_and_done() {
-        let (choice, tx) = submitted(0, 0, "r0");
+        let (choice, tx) = planned("r0");
         tx.send(chunk("r0", "a", false)).await.unwrap();
         tx.send(chunk("r0", "b", true)).await.unwrap();
 
+        let plan = plan(vec![choice], senders());
         let stream = completion_event_stream(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "cmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            false,
-            true,
-            false,
+            plan,
+            CompletionFrameShaper::new(1, completion_options(), true, false),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.map(super::completion_sse_payload).collect().await;
@@ -676,5 +1058,454 @@ mod tests {
         assert!(usage["choices"].as_array().unwrap().is_empty());
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
+    }
+
+    /// `continuous_usage_stats` puts a running usage object on every chunk
+    /// instead of only on the final usage trailer.
+    #[tokio::test]
+    async fn stream_continuous_usage_reports_monotonic_totals_per_chunk() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "a", false)).await.unwrap();
+        tx.send(chunk("r0", "b", true)).await.unwrap();
+
+        let stream = completion_event_stream(
+            plan(vec![choice], senders()),
+            CompletionFrameShaper::new(
+                1,
+                completion_options(),
+                false, // no separate final usage trailer
+                true,  // continuous per-chunk usage
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::completion_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 2, "usage rides the chunks, not a trailer");
+        assert_eq!(frames[0]["usage"]["prompt_tokens"], 5);
+        assert_eq!(frames[0]["usage"]["completion_tokens"], 1);
+        assert_eq!(frames[1]["usage"]["completion_tokens"], 2);
+    }
+
+    /// The first nonzero prompt count wins per original prompt: an early zero
+    /// is recovered, siblings sharing a prompt count once, and the final
+    /// trailer sums distinct prompts. Continuous chunks report recovered counts.
+    #[tokio::test]
+    async fn stream_usage_recovers_zero_prompt_counts_and_deduplicates_prompts() {
+        let (receivers, txs): (Vec<_>, Vec<_>) =
+            (0..4).map(|index| planned(&format!("r{index}"))).unzip();
+        // Two prompts x two choices. Prompt 0 reports 0 from both choices
+        // before the real count arrives; prompt 1 is known from the start.
+        txs[0]
+            .send(chunk_with_prompt("r0", "a", false, 0))
+            .await
+            .unwrap();
+        txs[0]
+            .send(chunk_with_prompt("r0", "b", true, 5))
+            .await
+            .unwrap();
+        txs[1]
+            .send(chunk_with_prompt("r1", "c", false, 0))
+            .await
+            .unwrap();
+        txs[1]
+            .send(chunk_with_prompt("r1", "d", true, 5))
+            .await
+            .unwrap();
+        txs[2]
+            .send(chunk_with_prompt("r2", "e", false, 7))
+            .await
+            .unwrap();
+        txs[2]
+            .send(chunk_with_prompt("r2", "f", true, 7))
+            .await
+            .unwrap();
+        txs[3]
+            .send(chunk_with_prompt("r3", "g", true, 7))
+            .await
+            .unwrap();
+
+        let stream = completion_event_stream(
+            plan(receivers, senders()),
+            CompletionFrameShaper::new(
+                4,
+                CompletionRenderingOptions {
+                    n: 2,
+                    ..completion_options()
+                },
+                true, // final usage trailer
+                true, // continuous per-chunk usage
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::completion_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 8, "7 chunks + the final usage trailer");
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["prompt_tokens"], 12);
+        assert_eq!(trailer["usage"]["completion_tokens"], 7);
+        assert_eq!(trailer["usage"]["total_tokens"], 19);
+
+        let mut recovered_by_choice = std::collections::BTreeMap::new();
+        for frame in &frames {
+            let prompt = frame["usage"]["prompt_tokens"].as_u64().unwrap();
+            for choice in frame["choices"].as_array().unwrap() {
+                let index = choice["index"].as_u64().unwrap();
+                recovered_by_choice
+                    .entry(index)
+                    .and_modify(|value: &mut u64| *value = (*value).max(prompt))
+                    .or_insert(prompt);
+            }
+        }
+        assert_eq!(
+            recovered_by_choice,
+            std::collections::BTreeMap::from([(0, 5), (1, 5), (2, 7), (3, 7)])
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_echo_uses_prompt_text_on_first_delta() {
+        let (choice, tx) = planned("r0");
+        let mut first = chunk("r0", "a", false);
+        if let ResponseItem::Frame(event) = &mut first {
+            event
+                .extras
+                .get_or_insert_with(Default::default)
+                .prompt_text = Some("decoded prompt".into());
+        }
+        tx.send(first).await.unwrap();
+        tx.send(chunk("r0", "b", true)).await.unwrap();
+
+        let stream = completion_event_stream(
+            plan(vec![choice], senders()),
+            CompletionFrameShaper::new(
+                1,
+                CompletionRenderingOptions {
+                    echo: true,
+                    ..completion_options()
+                },
+                false,
+                false,
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream
+            .filter_map(|event| async move {
+                match event {
+                    CoreEvent::Item(value) => Some(value.to_string()),
+                    CoreEvent::ItemError(_) => None,
+                }
+            })
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&frames[0]).unwrap()["choices"][0]["text"],
+            "decoded prompta"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&frames[1]).unwrap()["choices"][0]["text"],
+            "b"
+        );
+    }
+    /// Python's `UsageInfo`: top-level `reasoning_tokens` and cached prompt
+    /// details (with cache reporting), plus unary weight metadata from the
+    /// request's spans, whose scalar falls back to the launch version.
+    #[tokio::test]
+    async fn unary_usage_exposes_reasoning_cached_and_weight_metadata() {
+        // Two choices of one prompt: reasoning sums over choices, cached is
+        // counted once per prompt representative.
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        let mut first = chunk_with_metadata("r0", "done", true, 7, 3);
+        if let ResponseItem::Done(event) = &mut first {
+            event.extras.as_mut().unwrap().weight_versions = Some(vec![
+                WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 2,
+                },
+                WeightVersionSpan {
+                    version: "v2".into(),
+                    start: 2,
+                    end: 4,
+                },
+            ]);
+        }
+        tx0.send(first).await.unwrap();
+        tx1.send(chunk_with_metadata("r1", "done", true, 5, 4))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                enable_cache_report: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["reasoning_tokens"], 12);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(value["metadata"]["weight_version"], "v2");
+        assert_eq!(value["metadata"]["weight_versions"][0]["version"], "v1");
+        assert_eq!(value["metadata"]["weight_versions"][1]["end"], 4);
+    }
+
+    /// With cache reporting off the details block is absent, and a request with
+    /// no spans reports the launch-time scalar only (metadata is still present,
+    /// matching Python's unconditional unary metadata).
+    #[tokio::test]
+    async fn unary_usage_omits_cached_details_and_falls_back_to_scalar_metadata() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk_with_metadata("r0", "done", true, 7, 3))
+            .await
+            .unwrap();
+
+        let value = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect("unary completion succeeds");
+        assert_eq!(value["usage"]["reasoning_tokens"], 7);
+        assert!(value["usage"].get("prompt_tokens_details").is_none());
+        assert_eq!(value["metadata"]["weight_version"], "wv-test");
+        assert!(value["metadata"].get("weight_versions").is_none());
+    }
+
+    /// The prompt representative's cached count wins even when it is zero:
+    /// a sibling's nonzero count must not leak into the details.
+    #[tokio::test]
+    async fn unary_usage_keeps_the_first_choices_zero_cached_count() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(chunk_with_metadata("r0", "a", true, 0, 0))
+            .await
+            .unwrap();
+        tx1.send(chunk_with_metadata("r1", "b", true, 0, 4))
+            .await
+            .unwrap();
+
+        let value = unary_completion(
+            plan(vec![choice0, choice1], senders()),
+            CompletionRenderingOptions {
+                n: 2,
+                enable_cache_report: true,
+                ..completion_options()
+            },
+        )
+        .await
+        .expect("unary completion succeeds");
+        assert!(
+            value["usage"].get("prompt_tokens_details").is_none(),
+            "the first choice's zero wins over a sibling's count"
+        );
+    }
+
+    /// Streaming also selects cached counts from the prompt representative,
+    /// regardless of the order sibling choices report.
+    #[test]
+    fn stream_usage_takes_cached_from_the_prompt_representative() {
+        let trailer_cached = |representative: u32, sibling: u32, representative_first: bool| {
+            let event = |cached: u32| ChunkEvent {
+                extras: Some(Box::new(ChunkExtras {
+                    cached_tokens: cached,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let mut shaper = CompletionFrameShaper::new(
+                2,
+                CompletionRenderingOptions {
+                    n: 2,
+                    enable_cache_report: true,
+                    ..completion_options()
+                },
+                true,
+                false,
+            );
+            let (first_choice, second_choice, first_count, second_count) = if representative_first {
+                (0, 1, representative, sibling)
+            } else {
+                (1, 0, sibling, representative)
+            };
+            shaper
+                .frame(first_choice, event(first_count), 1, false)
+                .unwrap();
+            shaper
+                .frame(second_choice, event(second_count), 1, true)
+                .unwrap();
+            let trailer = crate::api_server::core::generate::FrameShaper::finish(&mut shaper)
+                .expect("trailer enabled")
+                .expect("trailer frame");
+            let CoreEvent::Item(value) = trailer else {
+                panic!("trailer must be an item")
+            };
+            value["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64()
+        };
+
+        // The representative's 3 wins over a sibling's 4 in either arrival order
+        // (a last-writer implementation passes only the second case).
+        assert_eq!(trailer_cached(3, 4, true), Some(3));
+        assert_eq!(trailer_cached(3, 4, false), Some(3));
+        // A representative 0 stays 0; a sibling's count never leaks in.
+        assert_eq!(trailer_cached(0, 4, true), None);
+        assert_eq!(trailer_cached(0, 4, false), None);
+    }
+
+    /// Streaming: continuous chunks report the choice's own reasoning snapshot
+    /// (Python omits cached there); the final trailer carries the summed
+    /// reasoning and the prompt-representative cached count.
+    #[tokio::test]
+    async fn stream_usage_exposes_reasoning_and_cached_details() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk_with_metadata("r0", "a", false, 2, 3))
+            .await
+            .unwrap();
+        tx.send(chunk_with_metadata("r0", "b", true, 7, 3))
+            .await
+            .unwrap();
+
+        let stream = completion_event_stream(
+            plan(vec![choice], senders()),
+            CompletionFrameShaper::new(
+                1,
+                CompletionRenderingOptions {
+                    enable_cache_report: true,
+                    ..completion_options()
+                },
+                true,
+                true,
+            ),
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<serde_json::Value> = stream
+            .map(super::completion_sse_payload)
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect()
+            .await;
+        assert_eq!(frames[0]["usage"]["reasoning_tokens"], 2);
+        assert!(
+            frames[0]["usage"].get("prompt_tokens_details").is_none(),
+            "Python's completion chunks omit cached details"
+        );
+        let trailer = frames.last().unwrap();
+        assert!(trailer["choices"].as_array().unwrap().is_empty());
+        assert_eq!(trailer["usage"]["reasoning_tokens"], 7);
+        assert_eq!(
+            trailer["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+    }
+    /// Python's completion choice always carries `logprobs` (null when the
+    /// request did not ask for them).
+    #[tokio::test]
+    async fn completion_choice_carries_null_logprobs_when_disabled() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "a", true)).await.unwrap();
+        let value = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect("unary completion succeeds");
+        assert!(value["choices"][0].get("logprobs").is_some());
+        assert!(value["choices"][0]["logprobs"].is_null());
+    }
+    /// Echo prepends the prompt text on each choice's first chunk only.
+    #[test]
+    fn stream_echo_prepends_prompt_once_per_choice() {
+        let mut shaper = CompletionFrameShaper::new(
+            2,
+            CompletionRenderingOptions {
+                echo: true,
+                ..completion_options()
+            },
+            false,
+            false,
+        );
+        let event = |text: &str, prompt: Option<&str>| ChunkEvent {
+            text: text.into(),
+            extras: prompt.map(|prompt| {
+                Box::new(ChunkExtras {
+                    prompt_text: Some(prompt.into()),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        };
+        let item = |frame: CoreEvent<serde_json::Value>| match frame {
+            CoreEvent::Item(value) => value,
+            CoreEvent::ItemError(_) => panic!("unexpected rendering error"),
+        };
+        for (choice, prompt) in [(0usize, "P0"), (1, "P1")] {
+            let first = item(
+                shaper
+                    .frame(choice, event("a", Some(prompt)), 1, true)
+                    .unwrap(),
+            );
+            let second = item(shaper.frame(choice, event("b", None), 2, false).unwrap());
+            assert_eq!(first["choices"][0]["text"], format!("{prompt}a"));
+            assert_eq!(
+                second["choices"][0]["text"], "b",
+                "echo belongs to the first chunk only"
+            );
+        }
+    }
+
+    /// Worker failures carried on a committed SSE stream are in-band errors in
+    /// the nested envelope: validation maps to 400, an actual detokenization
+    /// failure to 500.
+    #[tokio::test]
+    async fn sse_item_errors_use_in_band_envelope_with_mapped_status() {
+        use crate::utils::error::Error;
+
+        for (error, code, error_type) in [
+            (
+                Error::Validation("bad input".into()),
+                400,
+                "BadRequestError",
+            ),
+            (
+                Error::Internal("detokenization failed".into()),
+                500,
+                "InternalServerError",
+            ),
+        ] {
+            let (choice, tx) = planned("r0");
+            tx.send(ResponseItem::Error(error)).await.unwrap();
+            let stream = completion_event_stream(
+                plan(vec![choice], senders()),
+                CompletionFrameShaper::new(1, completion_options(), false, false),
+            );
+            futures::pin_mut!(stream);
+            let frame = completion_sse_payload(stream.next().await.expect("error frame"));
+            let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(value["error"]["object"], "error");
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["type"], error_type);
+            assert!(stream.next().await.is_none(), "the error ends the response");
+        }
+    }
+
+    /// A unary worker failure keeps the error's mapped HTTP status (not every
+    /// failure collapses to 400).
+    #[tokio::test]
+    async fn unary_worker_failure_keeps_mapped_status() {
+        use crate::utils::error::Error;
+
+        let (choice, tx) = planned("r0");
+        tx.send(ResponseItem::Error(Error::Internal(
+            "detokenization failed".into(),
+        )))
+        .await
+        .unwrap();
+        let error = unary_completion(plan(vec![choice], senders()), completion_options())
+            .await
+            .expect_err("worker failure must surface");
+        assert_eq!(error.http_code, 500);
     }
 }

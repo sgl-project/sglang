@@ -14,3 +14,5 @@ pub(crate) mod openai;
 pub(crate) mod prefetch;
 pub(crate) mod state;
 pub(crate) mod submit;
+#[cfg(test)]
+pub(crate) mod test_utils;

@@ -572,7 +572,8 @@ class RustServer:
         bulk numeric columns never go through msgpack:
 
           - ``header``: msgpack ``BatchHeader`` positional array — the per-request
-            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens,
+            reasoning_tokens, cached_tokens, weight_versions``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones).
@@ -612,11 +613,26 @@ class RustServer:
         finish_reasons = payload.finished_reasons
         tok_lens = list(map(len, output_ids))
         flat_ids = array("i", chain.from_iterable(output_ids))
+        # Per-request metadata snapshots ride the base header (msgpack, not the
+        # raw numeric buffer). The spans list is None per request until that
+        # request's final frame (which always carries a span, version change or
+        # not), and all-None until some request in the batch finishes.
+        reasoning_tokens = payload.reasoning_tokens or []
+        cached_tokens = payload.cached_tokens or []
+        weight_versions = payload.weight_versions or [None] * len(rids)
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
-        header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
+        header_cols = [
+            rids,
+            finish_reasons,
+            prompt_tokens,
+            tok_lens,
+            reasoning_tokens,
+            cached_tokens,
+            weight_versions,
+        ]
         data_cols = [flat_ids.tobytes()]
 
         if has_extra:
@@ -776,6 +792,7 @@ class RustServer:
             tool_call_parser=sa.tool_call_parser,
             reasoning_parser=sa.reasoning_parser,
             stream_response_default_include_usage=sa.stream_response_default_include_usage,
+            enable_cache_report=sa.enable_cache_report,
             tokenizer_worker_num=sa.tokenizer_worker_num,
             detokenizer_worker_num=sa.detokenizer_worker_num,
             skip_tokenizer_init=sa.skip_tokenizer_init,

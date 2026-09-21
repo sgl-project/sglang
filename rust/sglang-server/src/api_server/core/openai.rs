@@ -7,24 +7,7 @@ pub(crate) mod completions;
 pub(crate) mod models;
 pub(crate) mod reasoning;
 pub(crate) mod template;
-#[cfg(test)]
-pub(crate) mod test_utils;
 pub(crate) mod tools;
-
-use futures::StreamExt;
-use tokio::sync::mpsc;
-
-use self::template::ChatFormatter;
-use crate::api_server::core::error::ApiError;
-use crate::api_server::core::frame::OutputAccumulator;
-use crate::api_server::core::guard::AbortGuard;
-use crate::api_server::core::state::CoreState;
-use crate::api_server::core::submit::submit;
-use crate::message::config::ServerArgs;
-use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
-use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::tokenizer_manager::tokenizer;
 
 pub(crate) fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -37,125 +20,126 @@ pub(crate) fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
-/// The OpenAI error payload — the body shape every OpenAI-compatible surface
-/// answers errors with, regardless of transport framing.
-pub(crate) fn error_payload_value(code: u16, message: &str) -> serde_json::Value {
-    let error_type = if code == 401 {
+/// The native finish reason's `matched` value as OpenAI wire JSON: a token id
+/// or a string; a multi-token match (native-only) is carried as its id list.
+pub(crate) fn matched_stop_value(
+    reason: &crate::message::finish_reason::FinishReason,
+) -> Option<serde_json::Value> {
+    use crate::message::finish_reason::Matched;
+
+    reason.matched().map(|matched| match matched {
+        Matched::Token(id) => serde_json::json!(id),
+        Matched::Str(value) => serde_json::json!(value),
+        Matched::Tokens(ids) => serde_json::json!(ids.ids),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matched_stop_value;
+    use crate::message::finish_reason::{FinishReason, Matched};
+
+    #[test]
+    fn multi_token_matched_stop_keeps_its_token_list() {
+        let reason = FinishReason::stop(Some(Matched::Tokens(vec![9, 10].into())));
+        assert_eq!(
+            matched_stop_value(&reason),
+            Some(serde_json::json!([9, 10]))
+        );
+    }
+}
+
+/// Usage details Dynamo's `CompletionUsage` cannot express on the wire.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UsageDetails {
+    pub reasoning_tokens: u32,
+    /// Already gated by `--enable-cache-report`; `None` omits the details block.
+    pub cached_tokens: Option<u32>,
+}
+
+/// Serialize one `CompletionUsage` in Python's `UsageInfo` shape:
+/// `reasoning_tokens` is a top-level key (always emitted, 0 allowed) and
+/// `prompt_tokens_details.cached_tokens` is present only when reporting is
+/// enabled and positive. Dynamo's type nests `reasoning_tokens` and its
+/// details block serializes extra null keys, so the keys are injected here.
+pub(crate) fn usage_value(
+    usage: dynamo_protocols::types::CompletionUsage,
+    details: UsageDetails,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(usage).expect("usage always serializes");
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    object.insert(
+        "reasoning_tokens".into(),
+        serde_json::json!(details.reasoning_tokens),
+    );
+    if let Some(cached_tokens) = details.cached_tokens.filter(|&cached| cached > 0) {
+        object.insert(
+            "prompt_tokens_details".into(),
+            serde_json::json!({"cached_tokens": cached_tokens}),
+        );
+    }
+    value
+}
+
+/// The endpoint-visible weight metadata Python builds from `meta_info`
+/// (`utils/weight_versions.build_endpoint_weight_version_metadata`): the last
+/// span's version, falling back to the launch-time scalar. The span list is
+/// present only when the producer sent one.
+pub(crate) fn weight_metadata_value(
+    spans: Option<&[crate::message::response::WeightVersionSpan]>,
+    fallback_version: Option<&str>,
+) -> serde_json::Value {
+    let version = spans
+        .and_then(|spans| spans.last())
+        .map(|span| span.version.clone())
+        .or_else(|| fallback_version.map(str::to_owned));
+    let mut metadata = serde_json::json!({"weight_version": version});
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        metadata["weight_versions"] =
+            serde_json::to_value(spans).expect("weight spans always serialize");
+    }
+    metadata
+}
+
+/// The machine-readable `type` Python's OpenAI errors carry for a status:
+/// serving failures default to `BadRequestError`, 5xx to
+/// `InternalServerError`, 401 to `AuthenticationError`.
+pub(crate) fn error_type(code: u16) -> &'static str {
+    if code == 401 {
         "AuthenticationError"
     } else if (500..600).contains(&code) {
         "InternalServerError"
     } else {
         "BadRequestError"
-    };
+    }
+}
+
+/// Python's unary `ErrorResponse` body: a FLAT object whose `object` field is
+/// `"error"` (`serving_base.create_error_response` dumps the model directly —
+/// only the SSE frame nests under `error`).
+pub(crate) fn unary_error_value(code: u16, message: &str, error_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "object": "error",
+        "message": message,
+        "type": error_type,
+        "param": null,
+        "code": code,
+    })
+}
+
+/// The OpenAI error payload — the in-band SSE frame shape every
+/// OpenAI-compatible surface answers streamed errors with (Python
+/// `create_streaming_error_response` nests under `error`).
+pub(crate) fn error_payload_value(code: u16, message: &str) -> serde_json::Value {
     serde_json::json!({
         "error": {
             "object": "error",
             "message": message,
-            "type": error_type,
+            "type": error_type(code),
             "param": null,
             "code": code,
         }
     })
-}
-
-/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
-/// endpoint. Tokenization is the tokenizer pool's job (the api server never
-/// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
-/// `--chat-template` name or a model-path-inferred legacy template resolve
-/// without it, so its absence must not disable chat.
-pub(crate) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
-    // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
-    // there is none (text cannot be submitted), so chat is disabled.
-    if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
-        return None;
-    }
-    let config_file = tokenizer::resolve_model_file(
-        &server_args.tokenizer_path,
-        server_args.revision.as_deref(),
-        "tokenizer_config.json",
-    );
-
-    match crate::api_server::core::openai::template::load_chat_formatter(
-        config_file.as_deref(),
-        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
-        server_args.chat_template.as_deref(),
-    ) {
-        Ok(formatter) => {
-            tracing::info!(
-                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
-                "loaded OpenAI chat template"
-            );
-            Some(formatter)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            None
-        }
-    }
-}
-
-/// Drain one submitted request to its terminal output: fold frames, disarm
-/// `guard` on a natural terminal, and map errors / validation aborts /
-/// truncation to an [`ApiError`] for the caller's transport shaping.
-pub(crate) async fn collect_output(
-    mut rx: mpsc::Receiver<ResponseItem>,
-    guard: &mut AbortGuard,
-    rid: &Rid,
-) -> Result<ChunkEvent, ApiError> {
-    let mut accumulator = OutputAccumulator::default();
-    let output = loop {
-        match rx.recv().await {
-            Some(ResponseItem::Frame(output)) => accumulator.fold(&output),
-            Some(ResponseItem::Done(output)) => {
-                accumulator.fold(&output);
-                break accumulator.into_output();
-            }
-            Some(ResponseItem::Error(error)) => {
-                guard.disarm(rid);
-                return Err(ApiError::from_pipeline(&error));
-            }
-            Some(ResponseItem::Control(_)) | Some(ResponseItem::Data(_)) => {}
-            None => {
-                return Err(ApiError::internal("response truncated before completion"));
-            }
-        }
-    };
-    guard.disarm(rid);
-    if let Some((code, message)) = output
-        .finish_reason
-        .as_ref()
-        .and_then(|reason| reason.abort_status())
-    {
-        return Err(ApiError::from_abort(code, message));
-    }
-    Ok(output)
-}
-
-pub(crate) async fn submit_generation(
-    state: &CoreState,
-    request: GenerateRequest,
-    guard: &mut AbortGuard,
-) -> Result<mpsc::Receiver<ResponseItem>, ApiError> {
-    let (rid, rx) = submit(state, RequestKind::Generate(Box::new(request))).await?;
-    guard.arm(rid);
-    Ok(rx)
-}
-
-pub(crate) fn indexed_decode_stream(
-    index: usize,
-    rx: mpsc::Receiver<ResponseItem>,
-) -> futures::stream::BoxStream<'static, (usize, Option<ResponseItem>)> {
-    futures::stream::unfold((rx, false), move |(mut rx, finished)| async move {
-        if finished {
-            return None;
-        }
-        match rx.recv().await {
-            Some(item) => {
-                let finished = matches!(item, ResponseItem::Done(_) | ResponseItem::Error(_));
-                Some(((index, Some(item)), (rx, finished)))
-            }
-            None => Some(((index, None), (rx, true))),
-        }
-    })
-    .boxed()
 }
