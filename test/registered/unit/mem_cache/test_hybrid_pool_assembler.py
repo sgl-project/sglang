@@ -433,163 +433,51 @@ def _entry_shape(group, transfer_layer_num):
     ]
 
 
-def _legacy_build_anchor_sidecar_stack(
-    *,
-    params,
-    kv_pool,
-    indexer_decl,
-    full_layer_mapping,
-    load_cache_event,
-    storage_backend,
-    use_mla,
-    override_kv_cache_dim=None,
-    prefetch_threshold=256,
-    model_name=None,
-    storage_backend_extra_config=None,
-    enable_storage_metrics=False,
-):
-    """Pre-declaration DSA assembly (main before 2a), kept here only as the
-    parity oracle for assemble_declared_stack."""
-    transfer_layer_id_max = len(full_layer_mapping)
-    mtp_draft_device_pools = tuple(
-        pool for pool in params.mtp_draft_device_pools if pool.index_k_with_scale_buffer
+def _target_params(drafts=()):
+    return SimpleNamespace(
+        page_size=64,
+        mtp_draft_device_pools=tuple(drafts),
+        token_to_kv_pool_allocator=None,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        pp_cache_group=None,
     )
-    kv_host_pool = hybrid_pool_assembler.build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
-    sidecar_host_pool = pool_host_dsa.DSAIndexerPoolHost(
-        indexer_decl,
-        kv_host_pool,
-        packed_draft_device_pools=mtp_draft_device_pools,
-        allocator_type=hybrid_pool_assembler._get_allocator_type(),
-    )
-    if mtp_draft_device_pools:
-        full_layer_mapping = hybrid_pool_assembler._with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
-    entries = [
-        hybrid_pool_assembler.build_pool_entry(
-            name=PoolName.KV,
-            host_pool=kv_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            is_anchor=True,
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
-        hybrid_pool_assembler.build_pool_entry(
-            name=indexer_decl.name,
-            host_pool=sidecar_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
-    ]
-    host_pool_group = hybrid_pool_assembler.HostPoolGroup(entries)
-    cache_controller = hybrid_pool_assembler.HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=hybrid_pool_assembler.get_memory().hicache_write_policy,
-        io_backend=hybrid_pool_assembler.get_memory().hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=hybrid_pool_assembler.get_memory().hicache_host_memory_mode,
-    )
-    return host_pool_group, cache_controller
 
 
-def _legacy_build_kv_only_stack(
-    *,
-    params,
-    kv_pool,
-    full_layer_mapping,
-    load_cache_event,
-    storage_backend,
-    use_mla,
-    override_kv_cache_dim=None,
-    prefetch_threshold=256,
-    model_name=None,
-    storage_backend_extra_config=None,
-    enable_storage_metrics=False,
-):
-    """Pre-declaration plain KV assembly (_PlainKvStrategy before the
-    consolidation), kept here only as the parity oracle."""
-    transfer_layer_id_max = len(full_layer_mapping)
-    mtp_draft_device_pools = params.mtp_draft_device_pools
-    kv_host_pool = hybrid_pool_assembler.build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=params.page_size,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
-    if mtp_draft_device_pools:
-        full_layer_mapping = hybrid_pool_assembler._with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
-    host_pool_group = hybrid_pool_assembler.HostPoolGroup(
-        [
-            hybrid_pool_assembler.build_pool_entry(
-                name=PoolName.KV,
-                host_pool=kv_host_pool,
-                device_pool=kv_pool,
-                layer_mapping=full_layer_mapping,
-                transfer_layer_id_max=transfer_layer_id_max
-                + len(mtp_draft_device_pools),
-                is_anchor=True,
-                packed_draft_device_pools=mtp_draft_device_pools,
-            )
-        ]
-    )
-    cache_controller = hybrid_pool_assembler.HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=hybrid_pool_assembler.get_memory().hicache_write_policy,
-        io_backend=hybrid_pool_assembler.get_memory().hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=hybrid_pool_assembler.get_memory().hicache_host_memory_mode,
-    )
-    return host_pool_group, cache_controller
+# Mirror geometry for the 4096-token stubs at page 64 and host ratio 2:
+# 8256 host tokens (2 x 4096 plus one reserve page) = 129 pages; the MLA row is
+# kv_cache_dim 576 x bf16 = 1152 B per layer; the DSA index row is 132 B per
+# token, 8448 B per page, per layer.
+_HOST_SIZE, _HOST_PAGES, _KV_ROW, _INDEX_ROW, _INDEX_PAGE = 8256, 129, 1152, 132, 8448
 
 
-class TestDeclaredStackParity(CustomTestCase):
-    """assemble_declared_stack must build the same mirrors (real dummy host
-    pools: size, page_num, layers, byte stride), entries, layer mapping,
-    sidecars and controller arguments as the pre-declaration DSA assembly."""
+def _kv_shape(layers):
+    return {
+        "size": _HOST_SIZE,
+        "page_num": _HOST_PAGES,
+        "layer_num": layers,
+        "size_per_token": _KV_ROW * layers,
+        "layout": "page_first",
+    }
 
-    def _run(self, builder, *, pool, params, full_layer_mapping, **kw):
+
+def _indexer_shape(layers):
+    return {
+        **_kv_shape(layers),
+        "size_per_token": _INDEX_ROW * layers,
+        "indexer_page_stride_size": _INDEX_PAGE,
+        "indexer_layout_dim": _INDEX_PAGE * layers,
+    }
+
+
+class TestDeclaredStackStructure(CustomTestCase):
+    """Everything the controller reads from a declared target stack, pinned
+    against the pre-declaration DSA and plain-KV assembly it replaced: entry
+    order, anchor, device owners, layer mapper over every transfer layer,
+    packed drafts, mirror geometry, controller arguments, sidecars."""
+
+    def _run(self, *, pool, drafts, full_layer_mapping):
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
@@ -637,110 +525,97 @@ class TestDeclaredStackParity(CustomTestCase):
                 ),
             ),
         ):
-            out = builder(
-                params=params,
+            stack = assemble_declared_stack(
+                params=_target_params(drafts),
+                decls=pool.host_pool_decls(),
                 full_layer_mapping=dict(full_layer_mapping),
                 load_cache_event=None,
                 storage_backend=None,
                 use_mla=True,
                 override_kv_cache_dim=pool.kv_cache_dim,
-                **kw,
             )
         (call,) = controller.call_args_list
-        controller_args = (call.args[2], dict(call.kwargs))  # page_size, kwargs
-        return out, controller_args
+        # target transfer layers exclude packed tail layers
+        self.assertEqual(call.args[2], 64)
+        self.assertEqual(call.kwargs["transfer_layer_id_max"], len(full_layer_mapping))
+        return stack
 
-    def test_matches_legacy_assembly(self):
-        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_pool_decl
+    def test_dsa_target(self):
+        pool = _dsa_pool_stub(layer_num=3)
+        stack = self._run(pool=pool, drafts=(), full_layer_mapping={0: 0, 1: 1, 2: 2})
+        mapper = (None, 0, 1, 2, None, None)
+        self.assertEqual(
+            _entry_shape(stack.host_pool_group, 3),
+            [
+                (PoolName.KV, True, id(pool), (), mapper, _kv_shape(3)),
+                (PoolName.INDEXER, False, id(pool), (), mapper, _indexer_shape(3)),
+            ],
+        )
+        self.assertEqual(
+            stack.sidecars, [pool_host_dsa.dsa_indexer_pool_decl(pool).sidecar_spec()]
+        )
 
-        cases = {
-            "identity": dict(shard=None, mapping={0: 0, 1: 1, 2: 2}, drafts=0),
-            "packed_draft": dict(shard=None, mapping={0: 0, 1: 1, 2: 2}, drafts=1),
-            "sharded_permuted": dict(
-                shard=(0, 2), mapping={0: 1, 1: 2, 2: 0}, drafts=0
-            ),
-        }
-        for name, case in cases.items():
-            with self.subTest(case=name):
-                pool = _dsa_pool_stub(layer_num=3, shard=case["shard"])
-                drafts = tuple(
-                    _dsa_pool_stub(layer_num=1) for _ in range(case["drafts"])
-                )
-                params = SimpleNamespace(
-                    page_size=64,
-                    mtp_draft_device_pools=drafts,
-                    token_to_kv_pool_allocator=None,
-                    tp_cache_group=None,
-                    attn_cp_cache_group=None,
-                    attn_tp_cache_group=None,
-                    pp_cache_group=None,
-                )
-                (legacy_group, _), legacy_ctrl = self._run(
-                    _legacy_build_anchor_sidecar_stack,
-                    pool=pool,
-                    params=params,
-                    full_layer_mapping=case["mapping"],
-                    kv_pool=pool,
-                    indexer_decl=dsa_indexer_pool_decl(pool),
-                )
-                stack, new_ctrl = self._run(
-                    assemble_declared_stack,
-                    pool=pool,
-                    params=params,
-                    full_layer_mapping=case["mapping"],
-                    decls=pool.host_pool_decls(),
-                )
-                transfer_layer_num = len(case["mapping"]) + case["drafts"]
-                self.assertEqual(
-                    _entry_shape(stack.host_pool_group, transfer_layer_num),
-                    _entry_shape(legacy_group, transfer_layer_num),
-                )
-                self.assertEqual(new_ctrl, legacy_ctrl)
-                # target transfer layers exclude packed tail layers
-                self.assertEqual(
-                    new_ctrl[1]["transfer_layer_id_max"], len(case["mapping"])
-                )
-                self.assertEqual(
-                    stack.sidecars, [dsa_indexer_pool_decl(pool).sidecar_spec()]
-                )
+    def test_dsa_target_with_packed_draft(self):
+        pool = _dsa_pool_stub(layer_num=3)
+        draft = _dsa_pool_stub(layer_num=1)
+        stack = self._run(
+            pool=pool, drafts=(draft,), full_layer_mapping={0: 0, 1: 1, 2: 2}
+        )
+        # transfer layer 3 is the draft's tail layer, device layer 3 = target_layer_num + depth
+        mapper = (None, 0, 1, 2, 3, None, None)
+        self.assertEqual(
+            _entry_shape(stack.host_pool_group, 4),
+            [
+                (PoolName.KV, True, id(pool), (id(draft),), mapper, _kv_shape(4)),
+                (
+                    PoolName.INDEXER,
+                    False,
+                    id(pool),
+                    (id(draft),),
+                    mapper,
+                    _indexer_shape(4),
+                ),
+            ],
+        )
 
-    def test_matches_legacy_kv_only_assembly(self):
-        # A plain MLA pool declares KV only; the declared assembler must build
-        # the same anchor-only group the removed build_kv_only_stack built.
-        for name, drafts in (("no_draft", 0), ("packed_draft", 1)):
-            with self.subTest(case=name):
+    def test_dsa_target_layer_sharded(self):
+        # rank 0 of 2 owns local layers 0 and 1 of 3; the permuted stage mapping
+        # is passed through untouched and the mirrors hold only the owned layers.
+        pool = _dsa_pool_stub(layer_num=3, shard=(0, 2))
+        stack = self._run(pool=pool, drafts=(), full_layer_mapping={0: 1, 1: 2, 2: 0})
+        mapper = (None, 1, 2, 0, None, None)
+        self.assertEqual(
+            _entry_shape(stack.host_pool_group, 3),
+            [
+                (PoolName.KV, True, id(pool), (), mapper, _kv_shape(2)),
+                (PoolName.INDEXER, False, id(pool), (), mapper, _indexer_shape(2)),
+            ],
+        )
+
+    def test_plain_mla_target(self):
+        # A pool that declares KV only builds the anchor-only group the removed
+        # build_kv_only_stack built, packed draft included.
+        for drafts in (0, 1):
+            with self.subTest(drafts=drafts):
                 pool = _kv_pool_stub(layer_num=3)
-                params = SimpleNamespace(
-                    page_size=64,
-                    mtp_draft_device_pools=tuple(
-                        _kv_pool_stub(layer_num=1) for _ in range(drafts)
-                    ),
-                    token_to_kv_pool_allocator=None,
-                    tp_cache_group=None,
-                    attn_cp_cache_group=None,
-                    attn_tp_cache_group=None,
-                    pp_cache_group=None,
+                ds = tuple(_kv_pool_stub(layer_num=1) for _ in range(drafts))
+                stack = self._run(
+                    pool=pool, drafts=ds, full_layer_mapping={0: 0, 1: 1, 2: 2}
                 )
-                mapping = {0: 0, 1: 1, 2: 2}
-                (legacy_group, _), legacy_ctrl = self._run(
-                    _legacy_build_kv_only_stack,
-                    pool=pool,
-                    params=params,
-                    full_layer_mapping=mapping,
-                    kv_pool=pool,
-                )
-                stack, new_ctrl = self._run(
-                    assemble_declared_stack,
-                    pool=pool,
-                    params=params,
-                    full_layer_mapping=mapping,
-                    decls=pool.host_pool_decls(),
-                )
+                mapper = (None, 0, 1, 2, *([3] if drafts else []), None, None)
                 self.assertEqual(
                     _entry_shape(stack.host_pool_group, 3 + drafts),
-                    _entry_shape(legacy_group, 3 + drafts),
+                    [
+                        (
+                            PoolName.KV,
+                            True,
+                            id(pool),
+                            tuple(id(d) for d in ds),
+                            mapper,
+                            _kv_shape(3 + drafts),
+                        )
+                    ],
                 )
-                self.assertEqual(new_ctrl, legacy_ctrl)
                 self.assertEqual(stack.sidecars, [])
 
 
@@ -799,83 +674,12 @@ class TestPackedDraftPairing(CustomTestCase):
             packable_draft_pools(target.host_pool_decls(), (wide,))
 
 
-def _legacy_build_full_draft_pools(
-    *,
-    draft_kv_pool,
-    tree_cache,
-):
-    """Pre-2b separate-draft assembly (isinstance DSA branch), kept only as the
-    parity oracle for the declaration-driven build_full_draft_pools."""
+class TestSeparateDraftStructure(CustomTestCase):
+    """Separate draft sidecars: DRAFT sized on the target's logical space, its
+    indexer laid out on DRAFT, both taking transfer indices from target KV; a
+    draft without index buffers gets no indexer sidecar."""
 
-    pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
-        # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = pool.full_kv_pool
-    if pool.layer_num == 0:
-        return [], []
-
-    controller = tree_cache.cache_controller
-    host_pool_group = controller.mem_pool_host
-
-    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
-    # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = hybrid_pool_assembler._build_mha_mla_host_pool(
-        pool=pool,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=hybrid_pool_assembler.get_memory().hicache_mem_layout,
-        allocator_type=hybrid_pool_assembler._get_allocator_type(),
-        pool_label="draft",
-    )
-    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
-
-    specs = [
-        SidecarPoolSpec(
-            pool_name=PoolName.DRAFT,
-            indices_from_pool=PoolName.KV,
-        )
-    ]
-    entries = [
-        hybrid_pool_assembler.build_pool_entry(
-            name=PoolName.DRAFT,
-            host_pool=draft_host_pool,
-            device_pool=pool,
-            layer_mapping=draft_layer_mapping,
-            transfer_layer_id_max=draft_host_pool.layer_num,
-        )
-    ]
-
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        # Separate draft indexer: its own host mirror laid out on the draft KV
-        # mirror, but transfer indices still follow the target KV anchor.
-        indexer_decl = pool_host_dsa.dsa_indexer_pool_decl(
-            pool, name=PoolName.DRAFT_INDEXER
-        )
-        indexer_host_pool = pool_host_dsa.DSAIndexerPoolHost(
-            decl=indexer_decl,
-            anchor_host=draft_host_pool,
-            allocator_type=hybrid_pool_assembler._get_allocator_type(),
-        )
-        specs.append(indexer_decl.sidecar_spec())
-        entries.append(
-            hybrid_pool_assembler.build_pool_entry(
-                name=indexer_decl.name,
-                host_pool=indexer_host_pool,
-                device_pool=pool,
-                layer_mapping=draft_layer_mapping,
-                transfer_layer_id_max=indexer_host_pool.layer_num,
-            )
-        )
-
-    return specs, entries
-
-
-class TestSeparateDraftParity(CustomTestCase):
-    """Declaration-driven build_full_draft_pools must match the isinstance-based
-    assembly it replaces, including skipping the indexer for a draft pool that
-    owns no index buffers."""
-
-    def _run(self, builder, pool):
+    def _run(self, pool):
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
@@ -927,27 +731,38 @@ class TestSeparateDraftParity(CustomTestCase):
                 return_value=SimpleNamespace(hicache_mem_layout="page_first"),
             ),
         ):
-            return builder(draft_kv_pool=pool, tree_cache=tree_cache)
+            return build_full_draft_pools(draft_kv_pool=pool, tree_cache=tree_cache)
 
-    def test_matches_legacy_separate_draft_assembly(self):
-        for name, with_index in (
-            ("dsa_with_indexer", True),
-            ("dsa_no_index_buffers", False),
-        ):
-            with self.subTest(case=name):
-                pool = _dsa_pool_stub(layer_num=2, size=4096)
-                if not with_index:
-                    pool.index_key_cache = SimpleNamespace(buffer=[])
-                legacy_specs, legacy_entries = self._run(
-                    _legacy_build_full_draft_pools, pool
-                )
-                specs, entries = self._run(build_full_draft_pools, pool)
-                self.assertEqual(specs, legacy_specs)
-                self.assertEqual(
-                    _entry_shape(SimpleNamespace(entries=entries), 2),
-                    _entry_shape(SimpleNamespace(entries=legacy_entries), 2),
-                )
-                self.assertEqual(len(entries), 2 if with_index else 1)
+    def test_dsa_draft_sidecars(self):
+        pool = _dsa_pool_stub(layer_num=2, size=4096)
+        specs, entries = self._run(pool)
+        self.assertEqual(
+            [(s.pool_name, s.indices_from_pool) for s in specs],
+            [(PoolName.DRAFT, PoolName.KV), (PoolName.DRAFT_INDEXER, PoolName.KV)],
+        )
+        # 8192 logical target tokens / 4096 draft tokens -> ratio 2, same geometry
+        mapper = (None, 0, 1, None, None)
+        self.assertEqual(
+            _entry_shape(SimpleNamespace(entries=entries), 2),
+            [
+                (PoolName.DRAFT, False, id(pool), (), mapper, _kv_shape(2)),
+                (
+                    PoolName.DRAFT_INDEXER,
+                    False,
+                    id(pool),
+                    (),
+                    mapper,
+                    _indexer_shape(2),
+                ),
+            ],
+        )
+
+    def test_draft_without_index_buffers_has_no_indexer_sidecar(self):
+        pool = _dsa_pool_stub(layer_num=2, size=4096)
+        pool.index_key_cache = SimpleNamespace(buffer=[])
+        specs, entries = self._run(pool)
+        self.assertEqual([s.pool_name for s in specs], [PoolName.DRAFT])
+        self.assertEqual([e.name for e in entries], [PoolName.DRAFT])
 
 
 class TestHybridMambaDeclaredIndexer(CustomTestCase):
@@ -1283,7 +1098,7 @@ class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):
         return cache
 
     def test_extra_pools_follow_sidecar_specs(self):
-        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, SidecarPoolSpec
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
 
         specs = [
             SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV),
