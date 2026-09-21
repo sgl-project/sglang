@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import (
     QSAIndexerHostPoolBuilder,
-    qsa_indexer_pool_decl,
+    make_qsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -68,7 +68,7 @@ class TestQSAIndexerHostTransfer(unittest.TestCase):
     def _mirror(self, pool, layout, drafts=()):
         anchor = MHATokenToKVPoolHost(pool.full_kv_pool, 2, 0, PAGE, layout)
         host = QSAIndexerHostPoolBuilder().build(
-            decl=qsa_indexer_pool_decl(pool),
+            decl=make_qsa_indexer_pool_decl(pool),
             anchor_host=anchor,
             allocator_type="default",
             packed_draft_device_pools=drafts,
@@ -86,7 +86,7 @@ class TestQSAIndexerHostTransfer(unittest.TestCase):
     def _roundtrip(self, layout, backend):
         pool = self._device_pool([7, 11], start_layer=4)
         anchor, host = self._mirror(pool, layout)
-        decl = qsa_indexer_pool_decl(pool)
+        decl = make_qsa_indexer_pool_decl(pool)
         src, dst, host_idx = self._indices(host, backend)
         torch.manual_seed(42)
         pool.qsa_compressed_flat.normal_()

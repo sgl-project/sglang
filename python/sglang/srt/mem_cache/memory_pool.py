@@ -1871,12 +1871,15 @@ class KVCache(abc.ABC):
         )
 
     def host_pool_decls(self):
-        """Host pools HiCache must mirror for this pool. Base: the KV pool itself,
-        whose mirror the assembler builds; subclasses append dependent pools."""
+        """Host pools HiCache keeps for the buffers this device pool (and its
+        sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
+        index keys in subclasses. Not a description of the whole model: buffers
+        owned elsewhere (e.g. Mamba state in req_to_token_pool) are declared by
+        their owner or assembled by the existing strategy paths."""
         # pool_host imports this module; resolve the declaration types lazily.
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import kv_pool_decl
+        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
 
-        return (kv_pool_decl(self),)
+        return (make_kv_pool_decl(self),)
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -4000,7 +4003,9 @@ class HybridLinearKVPool(KVCache):
             self.mem_usage = (k_size + v_size) / GB
 
     def host_pool_decls(self):
-        # Mamba state lives in req_to_token_pool and keeps its own host path.
+        # Only the full-attention sub-pool owns HiCache-addressable buffers here.
+        # Mamba state belongs to req_to_token_pool's MambaPool and is assembled
+        # by _MambaStrategy, not declared through this pool.
         return self.full_kv_pool.host_pool_decls()
 
     @property
@@ -4980,14 +4985,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def host_pool_decls(self):
         # pool_host imports this module; resolve the mirror side lazily.
-        from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_pool_decl
+        from sglang.srt.mem_cache.pool_host.dsa import make_dsa_indexer_pool_decl
 
-        decls = super().host_pool_decls()
+        kv_decls = super().host_pool_decls()
         # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
         # is not enough: some layer must actually hold index keys.
-        if self.index_k_with_scale_buffer and not all(self.skip_topk_layers):
-            decls += (dsa_indexer_pool_decl(self),)
-        return decls
+        if not self.index_k_with_scale_buffer or all(self.skip_topk_layers):
+            return kv_decls
+        return (*kv_decls, make_dsa_indexer_pool_decl(self))
 
     @property
     def index_k_with_scale_buffer(self):

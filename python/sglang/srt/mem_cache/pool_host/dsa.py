@@ -77,7 +77,7 @@ class DSAIndexerHostPoolBuilder:
         )
 
 
-def dsa_indexer_pool_decl(
+def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""

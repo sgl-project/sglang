@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    dsa_indexer_pool_decl,
+    make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -84,7 +84,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 override_kv_cache_dim=device_pool.kv_cache_dim,
             )
             indexer_host = DSAIndexerPoolHost(
-                decl=dsa_indexer_pool_decl(device_pool),
+                decl=make_dsa_indexer_pool_decl(device_pool),
                 anchor_host=mla_host,
                 pin_memory=pin_memory,
                 device="cpu",

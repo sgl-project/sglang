@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    dsa_indexer_pool_decl,
+    make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,7 +86,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             skip_topk_layers=[False] * 2,
         )
         indexer_host = DSAIndexerPoolHost(
-            decl=dsa_indexer_pool_decl(dsa_device_pool),
+            decl=make_dsa_indexer_pool_decl(dsa_device_pool),
             anchor_host=mla_host,
             pin_memory=False,
             is_dummy=True,

@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    dsa_indexer_pool_decl,
+    make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -395,7 +395,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
         # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
-        storage_info = dsa_indexer_pool_decl(self._stub()).storage_info
+        storage_info = make_dsa_indexer_pool_decl(self._stub()).storage_info
         self.assertEqual(storage_info.bytes_per_token_per_layer, 132)
         self.assertEqual(storage_info.page_bytes(64), 8448)
         self.assertEqual(
@@ -405,7 +405,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
 
     def test_mirror_consumes_decl(self):
         stub = self._stub()
-        decl = dsa_indexer_pool_decl(stub)
+        decl = make_dsa_indexer_pool_decl(stub)
         storage_info = decl.storage_info
         anchor = MLATokenToKVPoolHost(
             stub,
@@ -441,7 +441,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         relative to that compact count."""
         stub = self._stub()
         stub.skip_topk_layers = [False, True, True, False, True]
-        decl = dsa_indexer_pool_decl(stub)
+        decl = make_dsa_indexer_pool_decl(stub)
         self.assertEqual(decl.owned_device_layers, (0, 3))
         anchor = MLATokenToKVPoolHost(
             stub,

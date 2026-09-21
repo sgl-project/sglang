@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-from sglang.srt.mem_cache.pool_host.host_pool_decl import kv_pool_decl
+from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
 from sglang.srt.mem_cache.pool_host.qsa import qsa_indexer_bytes_per_token_per_layer
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,7 +21,7 @@ def _qsa_pool_stub(*, full_layers, ratio=4, start_layer=0):
     key buffers on the hybrid pool itself."""
     pool = object.__new__(QSATokenToKVPool)
     full = SimpleNamespace(layer_num=len(full_layers), size=256)
-    full.host_pool_decls = lambda: (kv_pool_decl(full),)
+    full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
     pool.full_kv_pool = full
     pool.start_layer = start_layer
     pool.full_attention_layer_id_mapping = {

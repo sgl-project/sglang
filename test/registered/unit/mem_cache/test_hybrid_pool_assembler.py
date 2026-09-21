@@ -23,16 +23,16 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     assemble_host_pools_from_decls,
     build_full_draft_pools,
     build_hybrid_swa_group,
+    prepare_host_pool_configs,
+    validate_packed_draft_pools,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host import qsa as pool_host_qsa
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
-    kv_pool_decl,
     make_draft_sidecar_decls,
-    prepare_host_pool_configs,
-    validate_packed_draft_pools,
+    make_kv_pool_decl,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -208,7 +208,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
         full = SimpleNamespace(layer_num=0)
-        full.host_pool_decls = lambda: (kv_pool_decl(full),)
+        full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
         draft_kv_pool.full_kv_pool = full
 
         specs, entries = build_full_draft_pools(
@@ -221,7 +221,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
         draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
-        draft_kv_pool.host_pool_decls = lambda: (kv_pool_decl(draft_kv_pool),)
+        draft_kv_pool.host_pool_decls = lambda: (make_kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
             cache_controller=SimpleNamespace(
@@ -358,7 +358,7 @@ def _kv_pool_stub(*, layer_num: int, size: int = 4096):
         kv_cache_dim=576,
         layer_shard_enabled=False,
     )
-    pool.host_pool_decls = lambda: (kv_pool_decl(pool),)
+    pool.host_pool_decls = lambda: (make_kv_pool_decl(pool),)
     return pool
 
 
@@ -552,7 +552,8 @@ class TestDeclaredStackStructure(CustomTestCase):
             ],
         )
         self.assertEqual(
-            stack.sidecars, [pool_host_dsa.dsa_indexer_pool_decl(pool).sidecar_spec()]
+            stack.sidecars,
+            [pool_host_dsa.make_dsa_indexer_pool_decl(pool).sidecar_spec()],
         )
 
     def test_dsa_target_with_packed_draft(self):

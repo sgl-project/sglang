@@ -55,7 +55,7 @@ class QSAIndexerHostPoolBuilder:
         )
 
 
-def qsa_indexer_pool_decl(
+def make_qsa_indexer_pool_decl(
     pool: QSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Compressed keys riding on the full-KV pages: indices and layout both follow KV."""
