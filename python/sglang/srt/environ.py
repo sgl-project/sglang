@@ -1460,6 +1460,8 @@ class Envs:
     SGLANG_DSV4_VALIDATE_TOOL_SCHEMA = EnvBool(False)
     # Opt-in literal-marker rejection, not rewriting of quoted code or documents.
     SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS = EnvBool(False)
+    # Opt-in lexical gate, including quoted examples, for tool-parser output.
+    SGLANG_DSV4_REJECT_PROTOCOL_MARKERS = EnvBool(False)
     SGLANG_MODEL_OUTPUT_TRACE_DIR = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.

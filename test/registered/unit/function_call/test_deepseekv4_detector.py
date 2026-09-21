@@ -882,6 +882,110 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                     _weather_call("quoted '</think>'")
                 )
 
+    def test_protocol_gate_rejects_normal_markers_before_content_is_released(self):
+        for text in [
+            "ordinary explanation</think>",
+            "Quoted `</think>` stays a literal, but this policy forbids it.",
+            f"Quoted `<{DSML}tool_calls>` example.",
+            "</parameter>",
+            "Example: |DSML|invoke",
+        ]:
+            for width in [1, 7, len(text)]:
+                with self.subTest(text=text, width=width):
+                    detector = DeepSeekV4Detector(
+                        strict_output=True, reject_protocol_markers=True
+                    )
+                    normal = ""
+                    with self.assertRaisesRegex(ValueError, "Protocol marker"):
+                        for start in range(0, len(text), width):
+                            result = detector.parse_streaming_increment(
+                                text[start : start + width], self.tools
+                            )
+                            normal += result.normal_text
+                        normal += detector.finish(self.tools).normal_text
+                    self.assertEqual(normal, "")
+            with self.assertRaisesRegex(ValueError, "Protocol marker"):
+                DeepSeekV4Detector(
+                    strict_output=True, reject_protocol_markers=True
+                ).detect_and_parse(text, self.tools)
+
+    def test_protocol_gate_rejects_argument_markers_including_quoted_literals(self):
+        for marker in ["</think>", f"<{DSML}tool_calls>", "|DSML|", "</invoke>"]:
+            value = f'print("literal {marker}")'
+            sources = [
+                _weather_call(value),
+                _wrapped(_invoke("get_weather", json.dumps({"city": value}))),
+                _wrapped(
+                    _invoke("get_weather", _param("city", "false", json.dumps([value])))
+                ),
+            ]
+            for source in sources:
+                for width in [1, 7, len(source)]:
+                    with self.subTest(marker=marker, width=width, source=source):
+                        detector = DeepSeekV4Detector(
+                            strict_output=True, reject_protocol_markers=True
+                        )
+                        arguments = ""
+                        with self.assertRaisesRegex(ValueError, "Protocol marker"):
+                            for start in range(0, len(source), width):
+                                result = detector.parse_streaming_increment(
+                                    source[start : start + width], self.tools
+                                )
+                                arguments += "".join(c.parameters for c in result.calls)
+                            detector.finish(self.tools)
+                        self.assertNotIn(marker, arguments)
+
+    def test_protocol_gate_rejects_marker_in_tool_name_or_json_key(self):
+        for source in [
+            _wrapped(_invoke("run</think>", "{}")),
+            _wrapped(_invoke("get_weather", '{"</think>": "SF"}')),
+        ]:
+            with self.subTest(source=source), self.assertRaisesRegex(
+                ValueError, "Protocol marker"
+            ):
+                DeepSeekV4Detector(
+                    strict_output=True, reject_protocol_markers=True
+                ).detect_and_parse(source, self.tools)
+
+    def test_protocol_gate_preserves_clean_content_arguments_and_native_framing(self):
+        source = "Checking.\n" + _weather_call("SF")
+        for width in [1, 7, len(source)]:
+            detector = DeepSeekV4Detector(
+                strict_output=True,
+                validate_tool_schema=True,
+                reject_protocol_markers=True,
+            )
+            normal, arguments = "", ""
+            for start in range(0, len(source), width):
+                parsed = detector.parse_streaming_increment(
+                    source[start : start + width], self.tools
+                )
+                normal += parsed.normal_text
+                arguments += "".join(call.parameters for call in parsed.calls)
+            normal += detector.finish(self.tools).normal_text
+            self.assertEqual(normal.strip(), "Checking.")
+            self.assertEqual(json.loads(arguments), {"city": "SF"})
+
+    def test_protocol_gate_is_optional_and_never_silently_rewrites_literals(self):
+        literal = f'print("<{DSML}tool_calls>")'
+        parsed = DeepSeekV4Detector(
+            strict_output=True, reject_protocol_markers=False
+        ).detect_and_parse(_weather_call(literal), self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": literal})
+        with self.assertRaisesRegex(ValueError, "requires strict"):
+            DeepSeekV4Detector(strict_output=False, reject_protocol_markers=True)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
+                "SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1",
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "Protocol marker"):
+                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
+                    _weather_call(literal)
+                )
+
 
 if __name__ == "__main__":
     import unittest

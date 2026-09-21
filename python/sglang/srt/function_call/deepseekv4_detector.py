@@ -17,6 +17,17 @@ from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
 
+_PROTOCOL_MARKERS = (
+    "<think>",
+    "</think>",
+    "｜DSML｜",
+    "|DSML|",
+    "</parameter>",
+    "</invoke>",
+    "</tool_calls>",
+    "</function_calls>",
+)
+
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result = {}
@@ -153,6 +164,11 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     quoted code and document strings. It requires strict output and defaults
     off so legitimate protocol examples remain usable. It does not inspect
     artifacts produced by executing a command, and never edits argument text.
+    SGLANG_DSV4_REJECT_PROTOCOL_MARKERS=1 adds a lexical gate for think/DSML
+    markers and bare protocol closers in normal tool-parser content and tool
+    names/arguments. This strict-only, default-off policy also rejects quoted
+    protocol examples rather than silently deleting or rewriting their bytes.
+    It does not change the separate reasoning channel.
 
     Reference: DeepSeek V4 format specification
     """
@@ -163,6 +179,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         *,
         validate_tool_schema: bool | None = None,
         reject_reasoning_markers: bool | None = None,
+        reject_protocol_markers: bool | None = None,
     ):
         super().__init__()
         self.bot_token = "<｜DSML｜tool_calls>"
@@ -190,6 +207,15 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         if self.reject_reasoning_markers and not self.strict_output:
             raise ValueError(
                 "DeepSeek V4 argument marker rejection requires strict output"
+            )
+        self.reject_protocol_markers = (
+            envs.SGLANG_DSV4_REJECT_PROTOCOL_MARKERS.get()
+            if reject_protocol_markers is None
+            else reject_protocol_markers
+        )
+        if self.reject_protocol_markers and not self.strict_output:
+            raise ValueError(
+                "DeepSeek V4 protocol marker rejection requires strict output"
             )
         self._schema_validators: dict[str, Draft202012Validator] = {}
         self._quote_history: list[str] = []
@@ -278,7 +304,15 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             raise ValueError(f"Invalid DSML string flag for parameter {name!r}")
         if string_flag == "true":
             _validate_string_parameter(name, value, complete=complete)
-            self._check_argument_markers(name, value)
+            checked_value = value
+            if not complete:
+                # A split native parameter closer is framing, not argument text.
+                closing = "</｜DSML｜parameter>"
+                for width in range(min(len(value), len(closing) - 1), 0, -1):
+                    if closing.startswith(value[-width:]):
+                        checked_value = value[:-width]
+                        break
+            self._check_argument_markers(name, checked_value)
         elif complete:
             try:
                 parsed = _strict_json_loads(value.strip())
@@ -289,13 +323,16 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             self._check_argument_markers(name, parsed)
 
     def _check_argument_markers(self, name: str, value: object) -> None:
-        if not self.reject_reasoning_markers:
+        if not (self.reject_reasoning_markers or self.reject_protocol_markers):
             return
         pending = [value]
         while pending:
             item = pending.pop()
             if isinstance(item, str):
-                if "<think>" in item or "</think>" in item:
+                self._check_protocol_text(item, "tool argument")
+                if self.reject_reasoning_markers and (
+                    "<think>" in item or "</think>" in item
+                ):
                     raise ValueError(
                         f"Reasoning marker in DeepSeek V4 tool argument {name!r}"
                     )
@@ -304,6 +341,12 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 pending.extend(item.values())
             elif isinstance(item, list):
                 pending.extend(item)
+
+    def _check_protocol_text(self, text: str, field: str) -> None:
+        if self.reject_protocol_markers and any(
+            marker in text for marker in _PROTOCOL_MARKERS
+        ):
+            raise ValueError(f"Protocol marker in DeepSeek V4 {field}")
 
     def _validate_arguments(
         self,
@@ -315,6 +358,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     ) -> None:
         if not self.strict_output:
             return
+        self._check_protocol_text(name, "tool name")
         sent = self.streamed_args_for_tool[self.current_tool_id]
         if not arguments.startswith(sent):
             raise ValueError(f"Non-monotonic DSML argument stream for tool {name!r}")
@@ -400,6 +444,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             raise ValueError("Incomplete or malformed DSML tool block at end of stream")
         if self.strict_output:
             normal = "".join(self._normal_chunks) + remaining
+            self._check_protocol_text(normal, "normal content")
             masked = _mask_literals(normal)
             if re.search(
                 r"</(?:parameter|invoke|tool_calls|function_calls)>", masked
@@ -424,6 +469,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             strict_output=self.strict_output,
             validate_tool_schema=self.validate_tool_schema,
             reject_reasoning_markers=self.reject_reasoning_markers,
+            reject_protocol_markers=self.reject_protocol_markers,
         )
         parsed = detector.parse_streaming_increment(text, tools)
         tail = detector.finish(tools)
