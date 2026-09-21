@@ -1690,7 +1690,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    # Allow callers to tune connections for multi-stream CUDA graph replay.
+    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "8")
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
