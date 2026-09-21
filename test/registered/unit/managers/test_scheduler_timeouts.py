@@ -12,11 +12,20 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -24,6 +33,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
         self._finished = is_finished
@@ -57,7 +67,6 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
-    s.ps = SimpleNamespace(pp_size=1)
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     return s
@@ -83,11 +92,13 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
-        s.tree_cache = MagicMock(spec=["release_aborted_request"])
+        s.tree_cache = MagicMock(spec=["finish"])
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
 
-        s.tree_cache.release_aborted_request.assert_called_once_with("candidate")
+        s.tree_cache.finish.assert_called_once_with(
+            candidate.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         self.assertEqual(s.waiting_queue, [])
 
 
@@ -119,6 +130,10 @@ class TestWaitingTimeout(CustomTestCase):
 
 
 class TestRunningTimeout(CustomTestCase):
+    def setUp(self):
+        # The poll asks the context for the pipeline width.
+        enter_scope(self, published_topology())
+
     def test_emits_only_stale_unfinished_reqs_without_marking(self):
         now = time.perf_counter()
         stale = _req("stale", forward_entry=now - 10)

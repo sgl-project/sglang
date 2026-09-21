@@ -114,6 +114,8 @@ Overriding them is the most common cause of a disappointing measurement: it leav
 
 Enable the reasoning parser — `--reasoning-parser auto` resolves to `deepseek-v41` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer. The parser puts the thinking block in `reasoning_content` and the answer in `content`; without it both arrive concatenated in `content`.
 
+The parser can only split a thinking block the model actually produced, and **thinking is off by default** (`SGLANG_DEFAULT_THINKING=false`). Sending `reasoning_effort` turns it on: any value other than `none` also switches `chat_template_kwargs.thinking` on for you. A request that carries neither comes back with an empty `reasoning_content` however the parser is configured.
+
 <Accordion title="Reasoning Example (Python)">
 
 ```python Example
@@ -123,6 +125,7 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 resp = client.chat.completions.create(
     model="deepseek-ai/DeepSeek-V4.1-Flash",
     messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="high",
 )
 msg = resp.choices[0].message
 print("Reasoning:", getattr(msg, "reasoning_content", None))
@@ -131,7 +134,7 @@ print("Answer:", msg.content)
 
 </Accordion>
 
-Reasoning effort is part of the request contract for this model: send `reasoning_effort` on the request, either as a tier or as an integer budget. Tiers with no V4.1 counterpart (`none`, `minimal`, `medium`) log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
+On the request, `reasoning_effort` accepts the tiers `low`, `high`, `xhigh` and `max`, or a float in `[0.0, 0.99]` that maps onto the model's 1–100 budget. An integer budget is reachable only through `chat_template_kwargs.reasoning_effort`, and that route does not switch thinking on by itself — pair it with `chat_template_kwargs.thinking`. `none` turns thinking off. The remaining OpenAI tiers, which have no V4.1 counterpart (`minimal`, `medium`), log a warning and fall back to the server-side default rather than erroring; that default is `high`, and `SGLANG_DSV41_REASONING_EFFORT` overrides it.
 
 ### 3.2 Tool Calling
 
@@ -160,6 +163,7 @@ resp = client.chat.completions.create(
     model="deepseek-ai/DeepSeek-V4.1-Flash",
     messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
     tools=tools,
+    reasoning_effort="high",
 )
 choice = resp.choices[0]
 print("finish_reason:", choice.finish_reason)
@@ -188,3 +192,15 @@ Prefill/decode disaggregation is validated token-identical against a single serv
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
 PD and speculative decoding cannot be combined.
+
+### 3.5 HiCache (Hierarchical KV Caching)
+
+HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
+
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**: the Playground emits `--enable-hierarchical-cache` on top of the recipe's flags, and cold KV pages spill to CPU pinned memory (L2, GPU + CPU) instead of being dropped from the GPU pool. The host pool is sized by ratio (`--hicache-ratio 2`), not by a fixed `--hicache-size`.
+
+The Write policy knob controls the GPU → CPU write and defaults to `write_through` (the upstream default): every page is mirrored to the CPU tier as it is written. `write_through_selective` backs up only hot data and `write_back` defers the copy to eviction, trading cache freshness for host-side I/O.
+
+The card is not offered on MI350X: the ROCm recipes run `--disable-radix-cache`, and the server rejects that alongside `--enable-hierarchical-cache`.
+
+Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).

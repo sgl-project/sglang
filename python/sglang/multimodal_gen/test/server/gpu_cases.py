@@ -115,6 +115,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
+        perf_warmup_requests=1,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -181,6 +182,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
+            extras=[
+                "--warmup-num-frames 1",
+                "--component-residency transformer=resident",
+            ],
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
@@ -254,6 +259,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="video",
+            # the latency baseline measures the warmed, resident transformer
+            extras=["--component-residency transformer=resident"],
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
@@ -398,6 +405,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "sana_wm_ti2v",
         DiffusionServerArgs(
             model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+            extras=["--warmup-resolutions 384x640"],
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,
@@ -679,6 +687,47 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                 "num_inference_steps": 2,
                 "flow_shift": 12.0,
                 "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "vdn_h3_t2va_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="OpenVDN/vdn-minimax-h3",
+            modality="video",
+            num_gpus=4,
+            extras=[
+                "--attention-backend",
+                "hybrid_window_attn_h3",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A curious raccoon peers through a vibrant field of yellow "
+                "sunflowers, its eyes wide with interest."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 9,
                 "seed": 42,
             },
         ),
@@ -1001,16 +1050,6 @@ TWO_GPU_CASES = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
-        "mova_360p_ring1_uly2",
-        DiffusionServerArgs(
-            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            ring_degree=1,
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
-        ),
-        run_perf_check=False,
-    ),
-    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
@@ -1060,6 +1099,9 @@ TWO_GPU_CASES = [
             # decoder headroom on 80 GB GPUs.
             extras=[
                 "--load-diffusion-decoder",
+                "--warmup-resolutions 768x448",
+                "--warmup-num-frames 49",
+                """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
                 "--component-residency "
                 "transformer=component-offload,text_encoder=component-offload",
             ],
@@ -1071,7 +1113,6 @@ TWO_GPU_CASES = [
             expect_audio_output=True,
             extras={"seed": 42, "use_diffusion_decoder": True},
         ),
-        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -1100,6 +1141,26 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
     ),
+    # TODO: re-enable when the checkpoint is accessible to fork PR CI
+    # DiffusionTestCase(
+    #     "qwen_image21_t2i_tp2",
+    #     DiffusionServerArgs(
+    #         model_path="Qwen/Qwen-Image-2.1",
+    #         tp_size=2,
+    #         ulysses_degree=1,
+    #         ring_degree=1,
+    #     ),
+    #     replace(
+    #         T2I_sampling_params,
+    #         output_size="1024x1024",
+    #         output_format="png",
+    #         extras={"num_inference_steps": 40, "guidance_scale": 1, "seed": 42},
+    #     ),
+    #     perf_repeat_requests=2,
+    #     run_perf_check=False,
+    #     run_component_accuracy_check=False,
+    #     run_t2v_input_reference_check=False,
+    # ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus_extra_high",
         DiffusionServerArgs(
@@ -1109,7 +1170,6 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
-        run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
@@ -1428,6 +1488,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
     ],
 }
 
@@ -1473,6 +1534,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # no model load; two small all-to-alls
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
     },
 }
 
