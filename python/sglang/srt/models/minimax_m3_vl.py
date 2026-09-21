@@ -6,9 +6,6 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -86,7 +83,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
