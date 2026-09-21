@@ -10,6 +10,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
@@ -59,55 +60,40 @@ impl ErrorEventScanner {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct StreamTimeouts {
-    pub idle: Duration,
-    pub send_stall: Duration,
-    pub total: Duration,
+/// Bounds on a streaming response beyond what the upstream stream itself provides.
+#[derive(Debug, Clone, Default)]
+pub struct StreamLimits {
+    /// Maximum silence between upstream chunks. `None` waits indefinitely.
+    pub idle_timeout: Option<Duration>,
+    /// Fires when the stale-request janitor expires the request.
+    pub expiration: Option<CancellationToken>,
 }
 
-impl Default for StreamTimeouts {
-    fn default() -> Self {
-        Self {
-            idle: Duration::from_secs(180),
-            send_stall: Duration::from_secs(180),
-            total: Duration::from_secs(3600),
-        }
-    }
-}
-
+/// Bridge a byte stream into an axum Body that streams chunks unchanged.
+///
+/// One tokio task pumps upstream chunks through a bounded 64-slot channel so a
+/// slow client backpressures the upstream read. The pump stops as soon as the
+/// client disconnects, even while upstream is silent, when `limits.idle_timeout`
+/// elapses between chunks, or when `limits.expiration` fires.
+///
+/// The terminal result travels on a separate channel and is chained after the
+/// data, so a full queue cannot block cleanup or turn a failed stream into a
+/// clean EOF. A pump panic is reported the same way.
+///
+/// `guards` is held until the pump finishes; `on_first_byte` runs on the first
+/// `Ok` chunk; `on_complete` runs exactly once with the final [`StreamEnd`].
 pub fn bytes_stream_to_body<S, E>(
-    stream: S,
-    guards: Option<Box<dyn Send + 'static>>,
-    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
-    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
-) -> Body
-where
-    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
-    E: std::fmt::Display + Send + Sync + 'static,
-{
-    bytes_stream_to_body_with_timeouts(
-        stream,
-        guards,
-        on_complete,
-        on_first_byte,
-        StreamTimeouts::default(),
-    )
-}
-
-/// Bounded forwarding with a separate terminal error, so a full queue cannot hide failure.
-pub fn bytes_stream_to_body_with_timeouts<S, E>(
     mut stream: S,
     guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     mut on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
-    timeouts: StreamTimeouts,
+    limits: StreamLimits,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut end = StreamEnd {
@@ -116,28 +102,38 @@ where
             client_disconnect: false,
         };
         let mut scanner = ErrorEventScanner::default();
-        let deadline = tokio::time::Instant::now() + timeouts.total;
+        let idle = limits.idle_timeout.unwrap_or(Duration::MAX);
+        let expired = async {
+            match limits.expiration {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(expired);
         let pump = async {
             loop {
                 let chunk = tokio::select! {
                     biased;
-                    _ = tx.closed() => { end.client_disconnect = true; return Ok(()); }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        end.transport_ok = false;
-                        return Err(std::io::Error::other("SSE total timeout"));
+                    _ = tx.closed() => {
+                        end.client_disconnect = true;
+                        return Ok(());
                     }
-                    chunk = tokio::time::timeout(timeouts.idle, stream.next()) => chunk,
+                    _ = &mut expired => {
+                        end.transport_ok = false;
+                        return Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"));
+                    }
+                    chunk = tokio::time::timeout(idle, stream.next()) => chunk,
                 };
                 let bytes = match chunk {
                     Ok(None) => return Ok(()),
                     Ok(Some(Ok(bytes))) => bytes,
-                    other => {
+                    Ok(Some(Err(e))) => {
                         end.transport_ok = false;
-                        let message = match other {
-                            Ok(Some(Err(e))) => e.to_string(),
-                            _ => "SSE upstream idle timeout".to_owned(),
-                        };
-                        return Err(std::io::Error::other(message));
+                        return Err(std::io::Error::other(e.to_string()));
+                    }
+                    Err(_) => {
+                        end.transport_ok = false;
+                        return Err(std::io::Error::other("SSE upstream idle timeout"));
                     }
                 };
                 if let Some(hook) = on_first_byte.take() {
@@ -146,18 +142,9 @@ where
                 if !end.saw_error_event {
                     end.saw_error_event = scanner.feed(&bytes);
                 }
-                let send_deadline = deadline.min(tokio::time::Instant::now() + timeouts.send_stall);
-                match tokio::time::timeout_at(send_deadline, tx.send(Ok(bytes))).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
-                        end.client_disconnect = true;
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        // A slow consumer is not a worker fault.
-                        end.client_disconnect = true;
-                        return Err(std::io::Error::other("SSE downstream stalled"));
-                    }
+                if tx.send(bytes).await.is_err() {
+                    end.client_disconnect = true;
+                    return Ok(());
                 }
             }
         };
@@ -181,15 +168,14 @@ where
         drop(guards);
         let _ = terminal_tx.send(result);
     });
-    let terminal = futures::stream::once(async {
-        match terminal_rx.await {
+    let terminal = futures::stream::once(terminal_rx).filter_map(|result| {
+        futures::future::ready(match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(Err(error)),
             Err(_) => Some(Err(std::io::Error::other("SSE pump cancelled"))),
-        }
-    })
-    .filter_map(futures::future::ready);
-    Body::from_stream(ReceiverStream::new(rx).chain(terminal))
+        })
+    });
+    Body::from_stream(ReceiverStream::new(rx).map(Ok).chain(terminal))
 }
 
 #[cfg(test)]
@@ -199,22 +185,22 @@ mod tests {
     use futures::stream;
     use http_body_util::BodyExt;
 
-    fn timed_body<S>(
+    fn limited_body<S>(
         stream: S,
-        timeouts: StreamTimeouts,
+        limits: StreamLimits,
     ) -> (Body, tokio::sync::oneshot::Receiver<StreamEnd>)
     where
         S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = bytes_stream_to_body_with_timeouts(
+        let body = bytes_stream_to_body(
             stream,
             None,
             Some(Box::new(move |end| {
                 let _ = tx.send(end);
             })),
             None,
-            timeouts,
+            limits,
         );
         (body, rx)
     }
@@ -233,6 +219,7 @@ mod tests {
             Some(Box::new(Release(Some(tx)))),
             None,
             None,
+            StreamLimits::default(),
         );
         tokio::task::yield_now().await;
         drop(body);
@@ -244,11 +231,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_is_a_visible_upstream_failure() {
-        let (body, end) = timed_body(
+        let (body, end) = limited_body(
             stream::pending(),
-            StreamTimeouts {
-                idle: Duration::from_secs(1),
-                ..Default::default()
+            StreamLimits {
+                idle_timeout: Some(Duration::from_secs(1)),
+                expiration: None,
             },
         );
         assert!(body
@@ -263,54 +250,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn full_queue_does_not_block_cleanup_or_hide_terminal_error() {
-        let chunks = stream::repeat_with(|| Ok(Bytes::from_static(b"chunk")));
-        let (body, end) = timed_body(
-            chunks,
-            StreamTimeouts {
-                send_stall: Duration::from_secs(1),
-                ..Default::default()
+    async fn expiration_stops_a_stream_that_keeps_producing() {
+        let token = CancellationToken::new();
+        let (body, end) = limited_body(
+            stream::repeat_with(|| Ok(Bytes::from_static(b"chunk"))),
+            StreamLimits {
+                idle_timeout: None,
+                expiration: Some(token.clone()),
             },
         );
-        let end = end.await.unwrap();
-        assert!(end.client_disconnect);
-        assert!(end.transport_ok);
+        tokio::task::yield_now().await;
+        token.cancel();
+        // The queue is full, so the failure must ride the terminal channel.
         assert!(body
             .collect()
             .await
             .unwrap_err()
             .to_string()
-            .contains("downstream stalled"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn total_timeout_stops_a_stream_that_keeps_producing() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if tx.send(Ok(Bytes::from_static(b"chunk"))).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let (body, end) = timed_body(
-            ReceiverStream::new(rx),
-            StreamTimeouts {
-                idle: Duration::from_millis(200),
-                total: Duration::from_secs(1),
-                ..Default::default()
-            },
-        );
-        assert!(body
-            .collect()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("total timeout"));
+            .contains("stale_request_timeout"));
         assert!(!end.await.unwrap().transport_ok);
     }
-
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {
         let chunks = vec![
@@ -318,7 +277,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -342,6 +301,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            StreamLimits::default(),
         );
         let _ = body.collect().await.unwrap();
         assert_eq!(
@@ -369,6 +329,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            StreamLimits::default(),
         );
         let _ = body.collect().await;
         assert_eq!(
@@ -385,7 +346,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -447,7 +408,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -470,7 +431,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -529,7 +490,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None, StreamLimits::default());
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -612,6 +573,7 @@ mod tests {
                 let _ = tx.send(end);
             })),
             None,
+            StreamLimits::default(),
         );
         (body, rx)
     }

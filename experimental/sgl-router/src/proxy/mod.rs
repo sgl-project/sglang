@@ -3,10 +3,7 @@
 
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
-mod cancel;
 pub mod sse;
-
-use cancel::AbortOnDrop;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
@@ -19,6 +16,7 @@ use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
@@ -94,9 +92,11 @@ pub struct Proxy {
     /// is used only for workers whose `/server_info` reported `--enable-http2`
     /// on a cleartext URL.
     h2c_client: Client,
-    /// Budget for a full JSON response or a streaming response's headers.
+    /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
+    /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
-    pub stream_timeouts: sse::StreamTimeouts,
+    /// Maximum silence between streamed upstream chunks; `None` waits forever.
+    pub stream_idle_timeout: Option<Duration>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -130,8 +130,13 @@ impl Proxy {
             default_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
-            stream_timeouts: sse::StreamTimeouts::default(),
+            stream_idle_timeout: None,
         })
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
     }
 
     /// The forwarding client for `protocol`, taken from the selected worker's
@@ -184,7 +189,6 @@ impl Proxy {
     /// path concatenation (no double-slash) and pass a typed URL to the
     /// split error variants (`UpstreamUnreachable` / `UpstreamTimeout` /
     /// `UpstreamStatus`).
-    #[allow(clippy::too_many_arguments)]
     pub async fn forward_json_to(
         &self,
         worker_url: &str,
@@ -193,7 +197,6 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
-        request_id: Option<&str>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -201,8 +204,6 @@ impl Proxy {
             });
         }
         let worker_url = parse_worker_url(worker_url, breaker)?;
-        let mut abort =
-            AbortOnDrop::new(self.client_for(protocol), &worker_url, request_id, headers);
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
@@ -244,9 +245,6 @@ impl Proxy {
                 return Err(ApiError::UpstreamStatus { status });
             }
         };
-        if let Some(guard) = &mut abort {
-            guard.disarm();
-        }
         match breaker_outcome(status) {
             BreakerOutcome::Failure => breaker.record_failure(),
             BreakerOutcome::Success => breaker.record_success(),
@@ -293,7 +291,7 @@ impl Proxy {
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
-        request_id: Option<&str>,
+        expiration: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -301,8 +299,6 @@ impl Proxy {
             });
         }
         let worker_url = parse_worker_url(worker_url, breaker)?;
-        let mut abort =
-            AbortOnDrop::new(self.client_for(protocol), &worker_url, request_id, headers);
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
@@ -315,18 +311,10 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        let resp = tokio::time::timeout(self.request_timeout, req.send())
-            .await
-            .map_err(|_| {
-                breaker.record_failure();
-                ApiError::UpstreamTimeout {
-                    worker: worker_url.clone(),
-                }
-            })?
-            .map_err(|e| {
-                breaker.record_failure();
-                Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-            })?;
+        let resp = req.send().await.map_err(|e| {
+            breaker.record_failure();
+            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+        })?;
         let status = resp.status();
         let upstream_ct = resp
             .headers()
@@ -385,27 +373,15 @@ impl Proxy {
         } else {
             None
         };
-        if !status.is_success() {
-            if let Some(guard) = &mut abort {
-                guard.disarm();
-            }
-        }
-        let on_complete = Some(Box::new(move |end: sse::StreamEnd| {
-            if end.transport_ok && !end.client_disconnect {
-                if let Some(guard) = &mut abort {
-                    guard.disarm();
-                }
-            }
-            if let Some(hook) = on_complete {
-                hook(end);
-            }
-        }) as Box<dyn FnOnce(sse::StreamEnd) + Send>);
-        let body = sse::bytes_stream_to_body_with_timeouts(
+        let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
             first_byte_hook,
-            self.stream_timeouts,
+            sse::StreamLimits {
+                idle_timeout: self.stream_idle_timeout,
+                expiration,
+            },
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -524,7 +500,6 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
-                    None,
                 )
                 .await
                 .expect("dispatch should reach the worker (breaker must stay closed)");
@@ -568,7 +543,6 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
-                    None,
                 )
                 .await;
         }
@@ -612,7 +586,6 @@ mod tests {
                 "/v1/chat/completions",
                 &headers,
                 Bytes::from_static(b"{}"),
-                None,
             )
             .await
             .expect("the half-open probe must be admitted and reach the worker");

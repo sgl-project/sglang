@@ -1018,7 +1018,6 @@ async fn forward_json_to_records_failure_on_body_drop() {
             "/v1/chat/completions",
             &headers,
             body,
-            None,
         )
         .await;
     assert!(res.is_err(), "body drop should surface as ApiError");
@@ -1076,7 +1075,6 @@ async fn forward_json_to_records_success_only_after_body_completes() {
             "/v1/chat/completions",
             &headers,
             bytes::Bytes::from_static(b"{}"),
-            None,
         )
         .await;
     assert!(res.is_ok(), "clean OK call must succeed: {res:?}");
@@ -1235,7 +1233,6 @@ async fn forward_json_to_records_failure_on_5xx() {
             "/v1/chat/completions",
             &headers,
             body,
-            None,
         )
         .await;
 
@@ -1270,7 +1267,6 @@ async fn forward_json_to_rejects_when_breaker_open() {
             "/v1/chat/completions",
             &headers,
             body,
-            None,
         )
         .await;
 
@@ -1309,7 +1305,6 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
             "/v1/chat/completions",
             &headers,
             body,
-            None,
         )
         .await;
 

@@ -48,15 +48,10 @@ impl Config {
             validate_bucket_config(bucket_config)?;
         }
         self.model.sampling_overrides.validate()?;
-        if [
-            self.proxy.stream_idle_timeout_secs,
-            self.proxy.stream_send_stall_secs,
-            self.proxy.stream_total_timeout_secs,
-        ]
-        .contains(&0)
-        {
-            return Err(anyhow!("stream timeouts must be greater than zero"));
-        }
+        ensure!(
+            self.proxy.stream_idle_timeout_secs > 0,
+            "stream_idle_timeout_secs must be greater than zero"
+        );
         ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
             "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \

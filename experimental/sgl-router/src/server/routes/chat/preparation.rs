@@ -9,7 +9,6 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::MetricsRegistry;
-use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -30,7 +29,6 @@ pub(super) struct PreparedChatRequest {
     can_forward_input_ids: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
-    rid: Option<EngineRequestId>,
 }
 
 impl PreparedChatRequest {
@@ -74,38 +72,13 @@ impl PreparedChatRequest {
             can_forward_input_ids,
             parsed_body,
             sampling_defaults,
-            rid: fields.rid,
         })
-    }
-
-    pub(super) fn request_id(&self, headers: &HeaderMap, plain_mode: bool) -> Option<String> {
-        // PD prefill must outlive the client to complete its KV transfer.
-        match (plain_mode, self.rid.as_ref()) {
-            (false, _) => None,
-            (true, Some(EngineRequestId::Single(rid))) => Some(rid.clone()),
-            (true, Some(EngineRequestId::Multiple(ids))) => {
-                tracing::debug!(
-                    count = ids.len(),
-                    "leaving batched request cancellation to the engine"
-                );
-                None
-            }
-            (true, None) => Some(
-                headers
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            ),
-        }
     }
 
     pub(super) fn into_outgoing_body(
         self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
-        request_id: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
         let input_ids = match (self.tokens.as_ref(), self.parsed_body.as_ref()) {
@@ -125,36 +98,24 @@ impl PreparedChatRequest {
         ) {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
-        let body = build_outgoing_body(
+        build_outgoing_body(
             &self.body,
             self.parsed_body,
             input_ids,
             bootstrap,
             &self.sampling_defaults,
-        )?;
-        match request_id {
-            Some(rid) if self.rid.is_none() => inject_request_id(&body, rid),
-            _ => Ok(body),
-        }
+        )
     }
 }
 
 /// Routing and sampling fields retained by the lightweight request parser.
 #[derive(Debug, Default)]
 pub(super) struct RoutingFields {
-    rid: Option<EngineRequestId>,
     stream: Option<bool>,
     pub(super) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EngineRequestId {
-    Single(String),
-    Multiple(Vec<String>),
 }
 
 /// Null is absent; unrepresentable values are rejected only under a sampling contract.
@@ -258,7 +219,6 @@ impl<'de> Deserialize<'de> for SamplingValue {
 
 #[derive(Debug, Clone, Copy)]
 enum RoutingKey {
-    Rid,
     Stream,
     Model,
     MaxTokens,
@@ -268,7 +228,6 @@ enum RoutingKey {
 impl RoutingKey {
     const fn bit(self) -> u8 {
         match self {
-            Self::Rid => 1 << 4,
             Self::Stream => 1 << 0,
             Self::Model => 1 << 1,
             Self::MaxTokens => 1 << 2,
@@ -278,7 +237,6 @@ impl RoutingKey {
 
     const fn wire_name(self) -> &'static str {
         match self {
-            Self::Rid => "rid",
             Self::Stream => "stream",
             Self::Model => "model",
             Self::MaxTokens => "max_tokens",
@@ -305,7 +263,6 @@ impl<'de> Deserialize<'de> for RequestKey {
 
             fn visit_str<E>(self, v: &str) -> Result<RequestKey, E> {
                 Ok(match v {
-                    "rid" => RequestKey::Routing(RoutingKey::Rid),
                     "stream" => RequestKey::Routing(RoutingKey::Stream),
                     "model" => RequestKey::Routing(RoutingKey::Model),
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
@@ -350,7 +307,6 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     // Track keys separately so even a repeated null is rejected.
                     seen_routing_keys |= field.bit();
                     match field {
-                        RoutingKey::Rid => fields.rid = map.next_value()?,
                         RoutingKey::Stream => fields.stream = map.next_value()?,
                         RoutingKey::Model => fields.model = map.next_value()?,
                         RoutingKey::MaxTokens => fields.max_tokens = map.next_value()?,
@@ -459,18 +415,6 @@ fn append_sampling_defaults(
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
-}
-
-fn inject_request_id(body: &Bytes, rid: &str) -> Result<Bytes, ApiError> {
-    let close = body
-        .iter()
-        .rposition(|&b| b == b'}')
-        .ok_or_else(|| ApiError::BadRequest("expected a JSON object".into()))?;
-    let mut out = body[..close].to_vec();
-    out.extend_from_slice(b",\"rid\":");
-    serde_json::to_writer(&mut out, rid).map_err(|e| ApiError::Internal(e.into()))?;
-    out.extend_from_slice(&body[close..]);
-    Ok(Bytes::from(out))
 }
 
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
@@ -743,24 +687,6 @@ fn invalid_request() -> ApiError {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    #[test]
-    fn request_id_probe_preserves_single_and_batched_ids() {
-        assert!(serde_json::from_str::<RoutingFields>(r#"{"rid":"a","rid":"b"}"#).is_err());
-        let single = serde_json::from_str::<RoutingFields>(r#"{"rid":"client-id"}"#).unwrap();
-        assert!(matches!(single.rid, Some(EngineRequestId::Single(id)) if id == "client-id"));
-        let batch = serde_json::from_str::<RoutingFields>(r#"{"rid":["a","b"]}"#).unwrap();
-        assert!(matches!(batch.rid, Some(EngineRequestId::Multiple(ids)) if ids == ["a", "b"]));
-    }
-
-    #[test]
-    fn request_id_injection_escapes_and_preserves_existing_bytes() {
-        let raw = Bytes::from_static(br#"{ "model": "tiny", "temperature": 1.00 }  "#);
-        let body = inject_request_id(&raw, "id\"quoted").unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["rid"], "id\"quoted");
-        assert!(std::str::from_utf8(&body).unwrap().contains("1.00"));
-    }
 
     #[test]
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {

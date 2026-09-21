@@ -117,12 +117,6 @@ pub struct ServerArgs {
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
-    /// Maximum wait for a stalled streaming client, in seconds.
-    #[arg(long, default_value_t = ProxyConfig::default().stream_send_stall_secs)]
-    pub stream_send_stall_secs: u64,
-    /// Maximum streaming response lifetime, in seconds.
-    #[arg(long, default_value_t = ProxyConfig::default().stream_total_timeout_secs)]
-    pub stream_total_timeout_secs: u64,
 
     /// Max lifetime of an in-flight request entry before the janitor
     /// reaps it (returns 504 `stale_request_expired`).
@@ -399,8 +393,6 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
-                stream_send_stall_secs: self.server.stream_send_stall_secs,
-                stream_total_timeout_secs: self.server.stream_total_timeout_secs,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

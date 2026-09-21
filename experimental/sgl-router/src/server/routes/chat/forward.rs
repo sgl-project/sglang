@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
@@ -74,7 +75,6 @@ pub(super) async fn forward_chat_request(
         request_started_at,
     );
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
-    let request_id = request.request_id(&headers, decode.is_none());
     let pd = decode.map(|decode| {
         let bootstrap = BootstrapFields {
             host: prefill.bootstrap_host().to_string(),
@@ -83,11 +83,7 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    let body = request.into_outgoing_body(
-        ctx,
-        pd.as_ref().map(|(_, bootstrap)| bootstrap),
-        request_id.as_deref(),
-    )?;
+    let body = request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap))?;
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -117,7 +113,7 @@ pub(super) async fn forward_chat_request(
         body,
         response_load_guards,
         &metrics,
-        request_id.as_deref(),
+        expiration_token.clone(),
     );
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -174,7 +170,6 @@ fn spawn_prefill_request(
                 CHAT_PATH,
                 &headers,
                 body,
-                None,
             )
             .await
         {
@@ -199,7 +194,7 @@ async fn forward_to_response_worker(
     body: Bytes,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
-    request_id: Option<&str>,
+    expiration: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -216,7 +211,7 @@ async fn forward_to_response_worker(
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
-                request_id,
+                Some(expiration),
             )
             .await
     } else {
@@ -230,7 +225,6 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
-                request_id,
             )
             .await
     }

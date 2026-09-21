@@ -17,12 +17,10 @@ pub struct Config {
 /// Outbound request timeout settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
-    /// Timeout for upstream response headers and body (headers only for streaming).
-    /// Counts as a circuit-breaker failure.
+    /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
+    /// Maximum silence between streamed upstream chunks before the stream fails.
     pub stream_idle_timeout_secs: u64,
-    pub stream_send_stall_secs: u64,
-    pub stream_total_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -34,8 +32,6 @@ impl Default for ProxyConfig {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
             stream_idle_timeout_secs: 180,
-            stream_send_stall_secs: 180,
-            stream_total_timeout_secs: 3600,
         }
     }
 }
