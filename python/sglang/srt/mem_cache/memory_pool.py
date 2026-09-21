@@ -1924,6 +1924,15 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    # Optional translation from controller IDs to this pool's buffer indices.
+    # L2TransferEngine resolves it on the transfer stream; move gates prevent
+    # relocation until the transfer is acknowledged.
+    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Token capacity for host sizing; `size` may count rows in per-layer views.
+    host_capacity_tokens: Optional[int] = None
+    # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
+    host_capacity_bytes: Optional[int] = None
+
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 

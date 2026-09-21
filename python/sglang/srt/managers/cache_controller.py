@@ -790,6 +790,15 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
+    def has_inflight_device_transfers(self) -> bool:
+        """Whether queued or unacknowledged L2 transfers still use device rows."""
+        return bool(
+            self.write_queue
+            or self.load_queue
+            or self.ack_write_queue
+            or self.ack_load_queue
+        )
+
     def write(
         self,
         device_indices: torch.Tensor,
