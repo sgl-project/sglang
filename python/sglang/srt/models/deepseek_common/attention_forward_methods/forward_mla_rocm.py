@@ -865,8 +865,10 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
-                if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
+                if dcp_comm_backend in ("a2a", "fi_a2a", "fi_a2a_fused"):
+                    # A2A exchange of head partials + LSE, then the merge:
+                    # locally in Triton for a2a/fi_a2a, inside the same kernel
+                    # for fi_a2a_fused.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),

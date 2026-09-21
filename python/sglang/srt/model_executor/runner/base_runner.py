@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
@@ -254,6 +255,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_fi_a2a_fused_workspace()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -315,6 +317,36 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_fi_a2a_fused_workspace(self):
+        """Allocate the fi_a2a_fused workspaces; must run before CG capture.
+
+        Sized here rather than in layers/dcp because the bound comes from the
+        model geometry and the request pool.
+        """
+        parallel = get_parallel()
+        if not parallel.dcp_enabled or parallel.dcp_comm_backend != "fi_a2a_fused":
+            return
+
+        from sglang.srt.layers.dcp import init_fi_a2a_fused_workspace
+
+        mr = self.model_runner
+        # Speculative decode widens the reduce batch to requests x draft tokens.
+        num_draft_tokens = (
+            get_spec().speculative_num_draft_tokens
+            if mr.spec_algorithm.is_speculative()
+            else 1
+        )
+        head_dim = mr.model_config.kv_lora_rank
+        local_heads = mr.model_config.num_attention_heads // parallel.attn_tp_size
+
+        init_fi_a2a_fused_workspace(
+            parallel.dcp_group,
+            max_tokens=mr.max_running_requests * num_draft_tokens,
+            local_heads=local_heads,
+            head_dim=head_dim,
+            dtype=mr.dtype,
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

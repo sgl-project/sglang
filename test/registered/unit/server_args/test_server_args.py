@@ -4001,6 +4001,43 @@ class TestDcpCommBackendDefault(CustomTestCase):
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
             )
 
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_fused_is_explicit_only(self):
+        """The fused backend needs an unreleased FlashInfer op, so resolution
+        must never pick it on its own -- only an explicit flag selects it."""
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertNotEqual(self._resolved(dcp_size=4), "fi_a2a_fused")
+            self.assertEqual(
+                self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a_fused"),
+                "fi_a2a_fused",
+            )
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_fused_requires_dcp(self):
+        with self.assertRaisesRegex(ValueError, "requires --dcp-size"):
+            self._resolved(dcp_size=1, dcp_comm_backend="fi_a2a_fused")
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_fi_a2a_fused_rejected_off_cuda(self):
+        with self.assertRaisesRegex(ValueError, "fi_a2a_fused"):
+            self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a_fused")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_fused_allows_replicate_q_proj(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(
+                self._resolved(
+                    dcp_size=4,
+                    dcp_comm_backend="fi_a2a_fused",
+                    dcp_replicate_q_proj=True,
+                ),
+                "fi_a2a_fused",
+            )
+
 
 class TestParserChoices(CustomTestCase):
     """The choices come from dependency-free name lists, but `cli/serve.py`
