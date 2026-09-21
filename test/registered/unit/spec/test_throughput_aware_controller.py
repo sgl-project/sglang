@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
-    SpecRuntimeState,
     SpecProfilePoint,
+    SpecRuntimeState,
 )
 from sglang.srt.speculative.throughput_aware_controller import (
     ThroughputAwarePolicy,
@@ -146,7 +146,10 @@ class TestThroughputAwareController(unittest.TestCase):
         processor = SimpleNamespace(
             model_worker=worker, advance_grammar_fsm=lambda *args: None
         )
-        cpu = lambda values: SimpleNamespace(is_cpu=True, tolist=lambda: values)
+
+        def cpu(values):
+            return SimpleNamespace(is_cpu=True, tolist=lambda: values)
+
         result = SimpleNamespace(
             next_token_ids=cpu([10, 11]),
             accept_lens=cpu([2]),
