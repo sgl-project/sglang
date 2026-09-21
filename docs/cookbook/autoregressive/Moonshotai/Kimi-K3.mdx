@@ -57,7 +57,7 @@ For host and platform setup, see the
 
 </Accordion>
 
-Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8, Ascend A3 Series 4×8 — 32 cards / 64 dies, Ascend 950PR/DT Series 4×8 — 32 cards / 32 cores), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8, Ascend A3 Series 4×8 — 32 cards / 64 dies, Ascend 950PR/DT Series 4×8), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
 
 **PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies, both chunked at 16k. On the 8-GPU platforms (B300 1×8, GB300 2×4), `Default` is TP8 and `Long-Context` is `--pp-size 8 --tp-size 1`. On the 16-GPU platforms (B200 2×8, GB200 4×4), both are `--pp-size 16 --tp-size 1` and differ only in `--mem-fraction-static` (0.85 vs 0.90) — deep PP is the throughput shape there, not just the long-context one (see [Deep PP](#deep-pp-for-prefill)).
 
@@ -181,7 +181,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
 | MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
 | Ascend A3 Series 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
-| Ascend 950PR/DT Series 4×8 (32 cards / 32 cores) | TP32/dp1 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; shared experts / dense MLP shard over attention-TP (`--shared-experts-tp-size 4`); radix cache off; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
+| Ascend 950PR/DT Series 4×8 | TP32/dp1 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; shared experts / dense MLP shard over attention-TP (`--shared-experts-tp-size 4`); radix cache off; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
 
 **DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 

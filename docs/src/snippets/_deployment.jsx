@@ -147,12 +147,11 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "mi355x", label: "MI355X", vram: "288GB",
         multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
     ],
-    // Ascend device layout: one /dev/davinciN per die/core, so the docker
-    // `--device` list (and the rank count) follows the product line.
-    //   A3 Series:        1 card = 2 dies -> 16 devices on an 8-card node, and
-    //                     --tp-size is 2× the card count (32 cards -> 64).
-    //   950PR/DT Series:  1 card = 1 die  -> 8 devices on an 8-card node, and
-    //                     --tp-size equals the card count (32 cards -> 32).
+    // Ascend device layout: one /dev/davinciN per core. An A3 Series card is
+    // the exception — 2 dies per card, so an 8-card node exposes 16 devices
+    // and --tp-size is twice the card count. A 950PR/DT Series card is a
+    // single core, so the device count and --tp-size follow the cards. Both
+    // counts feed the docker `--device` list (`npuDevices`).
     npu: [
       { id: "a3", label: "A3 Series",        vram: "64GB/die", npuDevices: 16 },
       { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
@@ -835,9 +834,10 @@ export const Deployment = ({ config, benchmarks }) => {
       };
       const fabricFlagsOf = (hwId) =>
         (catalogEntryOf(hwId) || {}).multiNodeDockerFlags || [];
-      // NPU cards are reached with --device, one node per /dev/davinciN core —
-      // 16 on a dual-die A3 Series card node, 8 on a single-die 950PR/DT Series
-      // node (catalog `npuDevices`), four devices per line as the host docs show.
+      // NPU cards are reached with --device, one per /dev/davinciN core;
+      // `npuDevices` carries the per-product-line count (16 on an A3 Series
+      // node, 8 on a 950PR/DT Series node), four devices per line as the host
+      // docs show.
       const davinciLines = (devices) => {
         const lines = [];
         for (let i = 0; i < devices; i += 4) {

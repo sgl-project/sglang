@@ -1725,9 +1725,9 @@ export const Playground = ({ config }) => {
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
       // Mirrors the vendor branches in _deployment.jsx: ROCm reaches its GPUs
       // through /dev/kfd + /dev/dri and the video group (not --gpus all), and
-      // Ascend NPUs are reached with --device — one /dev/davinciN per die/core,
-      // 16 on a dual-die A3 Series card node and 8 on a single-die 950PR/DT
-      // Series node (the catalog's `npuDevices`).
+      // Ascend NPUs are reached with --device, one per /dev/davinciN core (16
+      // on an A3 Series node, 8 on a 950PR/DT Series node — the catalog's
+      // `npuDevices`).
       const isAmdHw = /^mi\d/.test(sel.hw || "");
       const HW_NPU_DEVICES = { a3: 16, a5: 8 };
       const npuDevices = HW_NPU_DEVICES[sel.hw];

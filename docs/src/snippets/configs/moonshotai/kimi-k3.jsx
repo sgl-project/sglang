@@ -2438,13 +2438,12 @@ export const config = {
       ],
     },
     {
-      // Ascend 950PR/DT Series: 4 nodes × 8 cards, one 128GB core per card, so
-      // one rank per card and TP32 over the 32 cores. Unified PD, Balanced,
-      // DSPARK-only, with the product-line kernels armed per env: FIAS V2 BSND
-      // for the DSpark target-verify/draft attention paths and the fine-grained
-      // dual-stream MoE overlap. DP-attention runs at dp=1 (attn-TP 32), and
-      // the shared experts / dense MLP shard across attention-TP through the
-      // server flags (--shared-experts-tp-size 4).
+      // Ascend 950PR/DT Series: 4 nodes × 8 cards, one rank per card (TP32).
+      // Unified PD, Balanced, DSPARK-only, with the product-line kernels armed
+      // per env: FIAS V2 BSND for the DSpark target-verify/draft attention
+      // paths and the fine-grained dual-stream MoE overlap. DP-attention runs
+      // at dp=1 (attn-TP 32), and the shared experts / dense MLP shard across
+      // attention-TP through the server flags (--shared-experts-tp-size 4).
       // Pool sizing is internal to the Ascend path: the KDA state and MLA KV
       // pools are sized by the runtime, so the recipe sets neither
       // --mamba-full-memory-ratio nor --max-mamba-cache-size, and the radix
