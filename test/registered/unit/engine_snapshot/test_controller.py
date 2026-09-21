@@ -157,6 +157,13 @@ class TestSnapshotController(SnapshotArtifacts, CustomTestCase):
             controller.restore_snapshot(str(artifact), runtime=runtime)
         runtime.stop_restored_tree.assert_called()
 
+    def test_restore_rejects_an_ipv6_host(self):
+        artifact = self.publish()
+        runtime = self.mock_runtime()
+        with self.assertRaisesRegex(SnapshotUsageError, "IPv6"):
+            controller.restore_snapshot(str(artifact), runtime=runtime, host="::1")
+        runtime.restore.assert_not_called()
+
     # ------------------------------------------------------------------ #
     # inspect and CLI
     # ------------------------------------------------------------------ #
