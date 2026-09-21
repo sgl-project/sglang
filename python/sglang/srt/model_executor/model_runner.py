@@ -1163,8 +1163,9 @@ class ModelRunner:
         check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=self.ps.tp_size,
-            moe_ep_size=get_parallel().moe_ep_size,
-            moe_dp_size=get_parallel().moe_dp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_dp_size=self.ps.moe_dp_size,
+            model=self.model,
         )
 
     def init_torch_distributed(self):
