@@ -76,14 +76,14 @@ def _weight_or_none(module: Optional[nn.Module]) -> Optional[torch.Tensor]:
 
 
 def resolve_target_embed_and_head(
-    target_model: nn.Module, *, is_first_pp_rank: bool
+    target_model: nn.Module,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """PP-safe getter: a PPMissingLayer embedding on a non-first stage maps to
-    ``embed=None``; any other AttributeError propagates."""
+    """PP-safe getter: a PPMissingLayer embedding maps to ``embed=None``; any
+    other AttributeError propagates."""
     try:
         return target_model.get_embed_and_head()
     except AttributeError:
-        if is_first_pp_rank or not _target_input_embedding_is_missing(target_model):
+        if not _target_input_embedding_is_missing(target_model):
             raise
         return None, _weight_or_none(target_model.lm_head)
 
@@ -239,17 +239,14 @@ def resolve_draft_embed_and_head(
     *,
     target_model: nn.Module,
     draft_model: nn.Module,
-    is_first_pp_rank: bool,
-    pp_size: int,
     model_path: str,
     revision: Optional[str],
     load_config: LoadConfig,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Embed/head to bind into a draft; loads the draft's own embedding under PP."""
-    embed, head = resolve_target_embed_and_head(
-        target_model, is_first_pp_rank=is_first_pp_rank
-    )
-    if embed is None and pp_size > 1:
+    """Embed/head to bind into a draft; a stage without the target embedding
+    loads the draft's own from the checkpoint."""
+    embed, head = resolve_target_embed_and_head(target_model)
+    if embed is None:
         embed = load_draft_embedding_from_checkpoint(
             draft_model, model_path, revision=revision, load_config=load_config
         )

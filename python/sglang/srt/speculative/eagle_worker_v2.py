@@ -364,12 +364,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
-        pp_group = get_parallel().pp_group
         return resolve_draft_embed_and_head(
             target_model=target_runner.model,
             draft_model=self.draft_runner.model,
-            is_first_pp_rank=pp_group.is_first_rank,
-            pp_size=pp_group.world_size,
             model_path=target_runner.model_config.model_path,
             revision=target_runner.model_config.revision,
             load_config=target_runner.load_config,

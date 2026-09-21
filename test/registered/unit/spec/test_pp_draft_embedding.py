@@ -101,25 +101,20 @@ class TestResolveTargetEmbedAndHead(CustomTestCase):
         """Regression: a PPMissingLayer embed_tokens used to raise AttributeError and
         abort draft init on the last stage; the head must still be returned."""
         target = _Target(owns_embedding=False)
-        embed, head = resolve_target_embed_and_head(target, is_first_pp_rank=False)
+        embed, head = resolve_target_embed_and_head(target)
         self.assertIsNone(embed)
         self.assertIs(head, target.lm_head.weight)
-
-    def test_first_stage_missing_embedding_is_a_real_error(self):
-        target = _Target(owns_embedding=False)
-        with self.assertRaises(AttributeError):
-            resolve_target_embed_and_head(target, is_first_pp_rank=True)
 
     def test_unrelated_attribute_error_is_not_swallowed(self):
         """A getter bug on a stage that owns its embedding must propagate rather
         than silently redirect to checkpoint loading."""
         target = _BuggyGetterTarget(owns_embedding=True)
         with self.assertRaises(AttributeError):
-            resolve_target_embed_and_head(target, is_first_pp_rank=False)
+            resolve_target_embed_and_head(target)
 
     def test_owning_stage_shares_both(self):
         target = _Target(owns_embedding=True)
-        embed, head = resolve_target_embed_and_head(target, is_first_pp_rank=False)
+        embed, head = resolve_target_embed_and_head(target)
         self.assertIs(embed, target.model.embed_tokens.weight)
         self.assertIs(head, target.lm_head.weight)
 

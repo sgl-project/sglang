@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
@@ -368,8 +367,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             embed, head = resolve_draft_embed_and_head(
                 target_model=target_runner.model,
                 draft_model=self.draft_runner_list[i].model,
-                is_first_pp_rank=get_pp_group().is_first_rank,
-                pp_size=get_pp_group().world_size,
                 model_path=target_runner.model_config.model_path,
                 revision=target_runner.model_config.revision,
                 load_config=target_runner.load_config,
