@@ -37,7 +37,7 @@ from sglang.srt.tp_invariant_ops.tp_invariant_ops import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 BLOCK_K = _MATMUL_K_BLOCK  # 128

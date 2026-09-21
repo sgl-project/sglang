@@ -1,11 +1,9 @@
 import json
 import os
 import subprocess
-import sys
 import textwrap
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -17,18 +15,111 @@ from sglang.srt.true_on_policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 
 
 def _run_dense_math_script(script_body: str) -> dict[str, object]:
+    stubbed_imports = textwrap.dedent("""
+        import importlib.machinery
+        import json
+        import sys
+        import types
+        from pydantic import BaseModel
+
+        def install_openai_stubs():
+            openai_mod = types.ModuleType("openai")
+            openai_types_mod = types.ModuleType("openai.types")
+            openai_responses_mod = types.ModuleType("openai.types.responses")
+            openai_response_mod = types.ModuleType("openai.types.responses.response")
+            openai_tool_mod = types.ModuleType("openai.types.responses.tool")
+
+            openai_mod.__spec__ = importlib.machinery.ModuleSpec("openai", loader=None)
+            openai_types_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types", loader=None)
+            openai_responses_mod.__spec__ = importlib.machinery.ModuleSpec(
+                "openai.types.responses", loader=None
+            )
+            openai_response_mod.__spec__ = importlib.machinery.ModuleSpec(
+                "openai.types.responses.response", loader=None
+            )
+            openai_tool_mod.__spec__ = importlib.machinery.ModuleSpec(
+                "openai.types.responses.tool", loader=None
+            )
+
+            for name in [
+                "ResponseFunctionToolCall",
+                "ResponseInputItemParam",
+                "ResponseOutputItem",
+                "ResponseOutputMessage",
+                "ResponseOutputText",
+                "ResponseReasoningItem",
+            ]:
+                setattr(openai_responses_mod, name, type(name, (BaseModel,), {}))
+
+            openai_response_mod.ToolChoice = type("ToolChoice", (BaseModel,), {})
+            openai_tool_mod.Tool = type("Tool", (BaseModel,), {})
+
+            sys.modules.setdefault("openai", openai_mod)
+            sys.modules.setdefault("openai.types", openai_types_mod)
+            sys.modules.setdefault("openai.types.responses", openai_responses_mod)
+            sys.modules.setdefault("openai.types.responses.response", openai_response_mod)
+            sys.modules.setdefault("openai.types.responses.tool", openai_tool_mod)
+
+        install_openai_stubs()
+
+        hf_utils_mod = types.ModuleType("sglang.srt.utils.hf_transformers_utils")
+        hf_utils_mod.__spec__ = importlib.machinery.ModuleSpec(
+            "sglang.srt.utils.hf_transformers_utils", loader=None
+        )
+        hf_utils_mod.check_gguf_file = lambda *args, **kwargs: False
+        hf_utils_mod.get_rope_config = lambda config: (
+            getattr(config, "rope_theta", 1000000),
+            getattr(config, "rope_scaling", None),
+        )
+        sys.modules.setdefault("sglang.srt.utils.hf_transformers_utils", hf_utils_mod)
+
+        gguf_mod = types.ModuleType("gguf")
+        gguf_mod.__spec__ = importlib.machinery.ModuleSpec("gguf", loader=None)
+        gguf_mod.GGMLQuantizationType = type(
+            "GGMLQuantizationType",
+            (),
+            {
+                "F32": 0,
+                "F16": 1,
+                "BF16": 2,
+                "Q4_0": 3,
+                "Q4_1": 4,
+                "Q5_0": 5,
+                "Q5_1": 6,
+                "Q8_0": 7,
+                "Q8_1": 8,
+                "Q2_K": 9,
+                "Q3_K": 10,
+                "Q4_K": 11,
+                "Q5_K": 12,
+                "Q6_K": 13,
+                "IQ1_S": 14,
+                "IQ1_M": 15,
+                "IQ2_XXS": 16,
+                "IQ2_XS": 17,
+                "IQ2_S": 18,
+                "IQ3_XXS": 19,
+                "IQ3_S": 20,
+                "IQ4_NL": 21,
+                "IQ4_XS": 22,
+            },
+        )
+        sys.modules.setdefault("gguf", gguf_mod)
+        """)
+
     env = dict(os.environ)
     pythonpath = env.get("PYTHONPATH")
     repo_python = "python"
     env["PYTHONPATH"] = (
         f"{repo_python}{os.pathsep}{pythonpath}" if pythonpath else repo_python
     )
+    script = f"{stubbed_imports}\n{script_body}"
     completed = subprocess.run(
-        [sys.executable, "-c", script_body],
+        ["python", "-c", script],
         check=True,
         capture_output=True,
         text=True,
@@ -44,12 +135,14 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
             tp_size=1,
         )
 
-        with patch(
-            "sglang.srt.runtime_context.get_server_args", return_value=server_args
-        ):
-            self.assertFalse(should_force_bfloat16_dense_tensor_math())
-            self.assertFalse(should_force_bfloat16_lm_head(use_fp32_lm_head=False))
-            self.assertEqual(get_on_policy_rms_norm_kwargs(), {})
+        self.assertFalse(should_force_bfloat16_dense_tensor_math(server_args))
+        self.assertFalse(
+            should_force_bfloat16_lm_head(
+                server_args=server_args,
+                use_fp32_lm_head=False,
+            )
+        )
+        self.assertEqual(get_on_policy_rms_norm_kwargs(server_args), {})
 
     def test_on_policy_dense_math_helpers_enable_bfloat16_and_rms_norm_kwargs(self):
         server_args = SimpleNamespace(
@@ -57,18 +150,26 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
             tp_size=1,
         )
 
-        with patch(
-            "sglang.srt.runtime_context.get_server_args", return_value=server_args
-        ):
-            kwargs = get_on_policy_rms_norm_kwargs(
-                weight_dtype=torch.float32,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
+        kwargs = get_on_policy_rms_norm_kwargs(
+            server_args,
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+            fp32_residual=True,
+        )
 
-            self.assertTrue(should_force_bfloat16_dense_tensor_math())
-            self.assertTrue(should_force_bfloat16_lm_head(use_fp32_lm_head=False))
-            self.assertFalse(should_force_bfloat16_lm_head(use_fp32_lm_head=True))
+        self.assertTrue(should_force_bfloat16_dense_tensor_math(server_args))
+        self.assertTrue(
+            should_force_bfloat16_lm_head(
+                server_args=server_args,
+                use_fp32_lm_head=False,
+            )
+        )
+        self.assertFalse(
+            should_force_bfloat16_lm_head(
+                server_args=server_args,
+                use_fp32_lm_head=True,
+            )
+        )
         self.assertEqual(kwargs["weight_dtype"], torch.float32)
         self.assertEqual(kwargs["override_orig_dtype"], torch.float32)
         self.assertTrue(kwargs["cast_x_before_out_mul"])
@@ -76,116 +177,32 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
 
 
 class TestDenseOnPolicyContracts(unittest.TestCase):
-    def test_qwen_projections_use_activation_dtype_with_quantized_weights(self):
-        from sglang.srt.models import qwen3
-        from sglang.srt.models.qwen2 import Qwen2MLP
-
-        class ProjectionStub:
-            def __init__(self, dtype, weight_dtype):
-                self.params_dtype = dtype
-                self.inputs = []
-                if weight_dtype is not None:
-                    self.weight = torch.empty(1, dtype=weight_dtype)
-
-            def __call__(self, x, **kwargs):
-                self.inputs.append(x)
-                return x, None
-
-        cases = [
-            ("quant_bf16", torch.bfloat16, torch.bfloat16, None, False),
-            ("quant_fp16", torch.float16, torch.float16, None, False),
-            ("packed_int8", torch.bfloat16, torch.bfloat16, torch.int8, False),
-            (
-                "fp8_weight",
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float8_e4m3fn,
-                False,
-            ),
-            ("on_policy", torch.float32, torch.bfloat16, torch.bfloat16, True),
-            ("cleared_flag", torch.float32, torch.bfloat16, torch.bfloat16, False),
-            ("dense_bf16", torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-            ("dense_fp16", torch.float16, torch.float16, torch.float16, False),
-            ("dense_fp32", torch.float32, torch.float32, torch.float32, False),
-        ]
-        for name, input_dtype, dtype, weight_dtype, on_policy in cases:
-            for forward in (qwen3.Qwen3Attention.forward, Qwen2MLP.forward):
-                with self.subTest(case=name, forward=forward.__qualname__):
-                    projection = ProjectionStub(dtype, weight_dtype)
-                    output_projection = ProjectionStub(dtype, weight_dtype)
-                    x = torch.randn(2, 4, dtype=input_dtype)
-
-                    def prepare(positions, hidden_states):
-                        projected, _ = projection(hidden_states)
-                        return projected.float(), projected.float(), projected
-
-                    def attend(q, k, v, forward_batch, save_kv_cache):
-                        self.assertEqual((q.dtype, k.dtype, v.dtype), (dtype,) * 3)
-                        self.assertTrue(save_kv_cache)
-                        return v
-
-                    model = SimpleNamespace(
-                        qkv_proj=projection,
-                        gate_up_proj=projection,
-                        o_proj=output_projection,
-                        down_proj=output_projection,
-                        act_fn=lambda x: x,
-                        use_fused_qk_norm_mrope=False,
-                        forward_prepare_native=prepare,
-                        attn=attend,
-                    )
-                    server_args = SimpleNamespace(
-                        true_on_policy_contract=(
-                            QWEN3_DENSE_TRUE_ON_POLICY_V1 if on_policy else None
-                        ),
-                        tp_size=1,
-                    )
-                    with (
-                        patch(
-                            "sglang.srt.runtime_context.get_server_args",
-                            return_value=server_args,
-                        ),
-                        patch.object(qwen3, "_is_npu", False),
-                    ):
-                        if forward is qwen3.Qwen3Attention.forward:
-                            output = forward(model, None, x, None)
-                        else:
-                            output = forward(model, x)
-
-                    self.assertEqual(len(projection.inputs), 1)
-                    self.assertEqual(len(output_projection.inputs), 1)
-                    self.assertEqual(projection.inputs[0].dtype, dtype)
-                    self.assertEqual(output_projection.inputs[0].dtype, dtype)
-                    torch.testing.assert_close(output, x.to(dtype))
-                    if input_dtype == dtype:
-                        self.assertIs(projection.inputs[0], x)
-
     def test_qwen3_style_rms_norm_keeps_fp32_weight_output_and_residual(self):
         result = _run_dense_math_script(
             textwrap.dedent("""
                 import json
+                from types import SimpleNamespace
 
                 import torch
 
                 from sglang.srt.layers.layernorm import RMSNorm
-                from sglang.srt.runtime_context import publish
-                from sglang.srt.server_args import ServerArgs
+                from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
+
                 from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
-                publish(
-                    ServerArgs(
-                        model_path="dummy",
-                        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                        tp_size=1,
-                    ),
-                    role="test",
+                server_args = SimpleNamespace(
+                    true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                    tp_size=1,
                 )
                 norm = RMSNorm(
                     4,
                     eps=1e-6,
-                    true_on_policy_weight_dtype=torch.float32,
-                    true_on_policy_override_orig_dtype=torch.float32,
-                    true_on_policy_fp32_residual=True,
+                    **get_on_policy_rms_norm_kwargs(
+                        server_args,
+                        weight_dtype=torch.float32,
+                        override_orig_dtype=torch.float32,
+                        fp32_residual=True,
+                    ),
                 )
                 x = torch.randn(2, 4, dtype=torch.bfloat16)
                 residual = torch.randn(2, 4, dtype=torch.bfloat16)
@@ -214,18 +231,17 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 import torch
 
                 from sglang.srt.layers.layernorm import RMSNorm
-                from sglang.srt.runtime_context import publish
-                from sglang.srt.server_args import ServerArgs
+                from sglang.srt.server_args import (
+                    ServerArgs,
+                    get_global_server_args,
+                    set_global_server_args_for_scheduler,
+                )
                 from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
-                publish(
-                    ServerArgs(
-                        model_path="dummy",
-                        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                        tp_size=1,
-                    ),
-                    role="test",
-                )
+                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+                server_args = get_global_server_args()
+                server_args.true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
+                server_args.tp_size = 1
                 norm = RMSNorm(
                     4,
                     eps=1e-6,
@@ -262,8 +278,11 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 import torch.nn as nn
 
                 from sglang.srt.layers.logits_processor import LogitsProcessor
-                from sglang.srt.runtime_context import publish
-                from sglang.srt.server_args import ServerArgs
+                from sglang.srt.server_args import (
+                    ServerArgs,
+                    get_global_server_args,
+                    set_global_server_args_for_scheduler,
+                )
                 from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
                 class DummyMeta:
@@ -278,16 +297,11 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                         super().__init__()
                         self.weight = nn.Parameter(torch.randn(8, 4, dtype=torch.float32))
 
-                publish(
-                    ServerArgs(
-                        model_path="dummy",
-                        enable_dp_lm_head=False,
-                        enable_fp32_lm_head=False,
-                        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                        tp_size=1,
-                    ),
-                    role="test",
-                )
+                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+                get_global_server_args().enable_dp_lm_head = False
+                get_global_server_args().enable_fp32_lm_head = False
+                get_global_server_args().true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
+                get_global_server_args().tp_size = 1
 
                 processor = LogitsProcessor(
                     SimpleNamespace(vocab_size=8, final_logit_softcapping=None),

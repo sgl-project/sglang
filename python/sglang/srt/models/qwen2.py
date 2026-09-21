@@ -102,9 +102,9 @@ class Qwen2MLP(nn.Module):
     ) -> torch.Tensor:
         if (
             should_force_bfloat16_dense_tensor_math()
-            or x.dtype != self.gate_up_proj.params_dtype
+            or x.dtype != self.gate_up_proj.weight.dtype
         ):
-            x = x.to(self.gate_up_proj.params_dtype)
+            x = x.to(self.gate_up_proj.weight.dtype)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)

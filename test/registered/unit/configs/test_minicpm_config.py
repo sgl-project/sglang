@@ -26,7 +26,7 @@ from sglang.srt.models.minicpm import (
     MiniCPMDecoderLayer,
     MiniCPMLightningMixer,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -217,10 +217,7 @@ def test_minicpm_full_attention_uses_configured_head_dim(monkeypatch):
         attn_use_rope=False,
     )
 
-    with (
-        get_context().override_server_args(),
-        get_parallel().override(tp_size=1, tp_rank=0),
-    ):
+    with get_parallel().override(tp_size=1, tp_rank=0):
         layer = MiniCPMDecoderLayer(config)
 
     assert layer.self_attn.head_dim == 6
