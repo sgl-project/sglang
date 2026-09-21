@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -306,7 +307,8 @@ class PagedIndexerMetadata:
         ):
             return None
         if (
-            torch.cuda.is_current_stream_capturing()
+            get_is_capture_mode()
+            or torch.cuda.is_current_stream_capturing()
             or is_in_breakable_cuda_graph()
             or is_in_tc_piecewise_cuda_graph()
         ):

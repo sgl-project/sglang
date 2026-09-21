@@ -752,6 +752,33 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
     row chunks the indexer loops over; a mismatch would silently score rows
     with another chunk's schedule."""
 
+    def test_capture_warmup_skips_dynamic_budget_but_eager_forward_uses_it(self):
+        metadata = SimpleNamespace(
+            use_prefill_cuda_graph=False,
+            compressed_seq_lens=SimpleNamespace(
+                is_cuda=True, device=SimpleNamespace(index=0)
+            ),
+            max_compressed_seq_len=65536,
+        )
+        for capture_mode in (True, False):
+            with (
+                self.subTest(capture_mode=capture_mode),
+                patch(f"{_METADATA}.get_is_capture_mode", return_value=capture_mode),
+                patch("torch.cuda.is_current_stream_capturing", return_value=False),
+                patch(f"{_METADATA}.is_in_breakable_cuda_graph", return_value=False),
+                patch(f"{_METADATA}.is_in_tc_piecewise_cuda_graph", return_value=False),
+                patch(
+                    f"{_METADATA}.mqa_logits_budget_bytes", return_value=4096
+                ) as budget,
+            ):
+                result = PagedIndexerMetadata._mqa_logits_budget(metadata, num_rows=256)
+                if capture_mode:
+                    self.assertIsNone(result)
+                    budget.assert_not_called()
+                else:
+                    self.assertEqual(result, 4096)
+                    budget.assert_called_once_with(device_index=0, allow_sync=True)
+
     def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
