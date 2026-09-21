@@ -177,6 +177,7 @@ class Spec(msgspec.Struct):
                 "mooncake",
                 "nixl",
                 "mori",
+                "mori-epv2",
                 "ascend_fuseep",
                 "flashinfer",
                 "megamoe",
