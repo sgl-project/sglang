@@ -61,6 +61,8 @@ def get_share_stream():
 def set_share_stream(stream):
     global share_stream
     share_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(share_stream, 8, 16)
 
 
 def get_routed_stream():
@@ -70,6 +72,8 @@ def get_routed_stream():
 def set_routed_stream(stream):
     global routed_stream
     routed_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(routed_stream, 8, 16)
 
 
 def wait_share_stream():
