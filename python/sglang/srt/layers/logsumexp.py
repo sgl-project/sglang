@@ -143,7 +143,9 @@ def _pack_key(vals, idxs):
     -inf lanes.
     """
     sortable = _fpval_to_key(vals.to(tl.uint32, bitcast=True))
-    return ((sortable.to(tl.int64) & 0xFFFFFFFF) << 31) | (2147483647 - idxs).to(tl.int64)
+    return ((sortable.to(tl.int64) & 0xFFFFFFFF) << 31) | (2147483647 - idxs).to(
+        tl.int64
+    )
 
 
 @triton.jit
