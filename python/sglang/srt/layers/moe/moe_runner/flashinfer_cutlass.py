@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -25,6 +24,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -206,7 +206,7 @@ def _run_flashinfer_cutlass(
 
     if output is None:
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             output = torch.empty(
                 x.shape[0],
@@ -435,7 +435,9 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
     flashinfer_cutlass_fused_moe(

@@ -45,7 +45,7 @@ class TestPureSWAChunkCache(CustomTestCase):
     def test_finished_req_skips_already_evicted_swa_range(self):
         cache = self._make_cache()
 
-        cache.cache_finished_req(_FakeReq(), kv_len_to_handle=8)
+        cache.cache_finished_req(_FakeReq(), owned_kv_len=8)
 
         self.assertEqual(len(cache.token_to_kv_pool_allocator.freed), 1)
         freed = cache.token_to_kv_pool_allocator.freed[0]
@@ -56,7 +56,7 @@ class TestPureSWAChunkCache(CustomTestCase):
         req = _FakeReq()
         req.kv.cache_protected_len = 2
 
-        cache.cache_finished_req(req, kv_len_to_handle=8)
+        cache.cache_finished_req(req, owned_kv_len=8)
 
         freed = cache.token_to_kv_pool_allocator.freed[0]
         self.assertTrue(torch.equal(freed, torch.tensor([2, 6, 7])))

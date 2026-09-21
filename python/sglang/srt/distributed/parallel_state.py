@@ -107,7 +107,9 @@ def get_torch_distributed_pg_options(group_name=None):
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.get_device_module().Stream
+    # Evaluating torch.get_device_module() at import marks the process unsafe
+    # to fork, and a child then fails in cuInit; torch.Stream is its base.
+    stream: torch.Stream
 
 
 @dataclass
@@ -3029,7 +3031,14 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     global _PP
     _PP = pp_group
     try:
-        yield
+        # `pp_size` is a configured leaf: unlike the rank and the handle it
+        # does not follow the group being swapped, so the scope has to name it.
+        with get_parallel().override(
+            pp_size=pp_group.world_size,
+            pp_rank=pp_group.rank_in_group,
+            pp_group=pp_group,
+        ):
+            yield
     finally:
         _PP_STATE_PATCHED = False
         _PP = old_pp_group
@@ -3163,7 +3172,7 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    get_parallel().clear_derived_widths()
+    get_parallel().clear_stamp()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

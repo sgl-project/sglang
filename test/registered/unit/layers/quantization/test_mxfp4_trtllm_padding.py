@@ -11,6 +11,7 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe as mxfp4
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -88,7 +89,7 @@ class TestMxfp4TrtllmPadding(CustomTestCase):
             shards.append(prepare(shard))
 
         with (
-            patch.object(mxfp4, "get_tp_group", return_value=None),
+            get_parallel().override(tp_group=None),
             patch.object(mxfp4, "is_allocation_symmetric", return_value=False),
             patch.object(mxfp4, "use_symmetric_memory", return_value=nullcontext()),
         ):
