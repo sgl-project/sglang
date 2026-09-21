@@ -47,6 +47,7 @@ def _model():
     torch.nn.Module.__init__(model)
     model.vision_model = SimpleNamespace(num_patches=2)
     model.max_num_tiles = 2
+    model.num_tokens_per_image = 4
     model.image_size = 2
     return model
 
@@ -123,7 +124,7 @@ def test_multiple_items_contribute_all_encoder_tokens():
     text = array("q", [1, 99, 99, 2])
     padded = model.pad_input_ids(text, mm_input)
     assert mm_input.num_image_tokens == 8
-    assert mm_input.mm_items[0].model_specific_data["mllama_prompt_length"] == len(text)
+    assert mm_input.mm_items[0].mllama_prompt_length == len(text)
     assert padded[8:] == text
     longer = model.pad_input_ids(text + array("q", [3]), mm_input)
     assert longer[0] != padded[0]
@@ -192,9 +193,9 @@ def test_mixed_batch_masks_with_cached_encoder():
         False,
     ]
     indices, indptr = filter_cross_attention_kv_indices(
-        torch.arange(12, dtype=torch.int32),
-        torch.tensor([0, 4, 4, 12], dtype=torch.int32),
-        batch.cross_attention_custom_mask,
+        kv_indices=torch.arange(12, dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 4, 4, 12], dtype=torch.int32),
+        custom_mask=batch.cross_attention_custom_mask,
     )
     # The inactive multi-image row uses finite attention before residual gating.
     assert indices.tolist() == [0, 1, 4, 5, 6, 7, 8, 9, 10, 11]

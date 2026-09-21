@@ -37,7 +37,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs, _compute_pad_value
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    _compute_pad_value,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -832,6 +836,7 @@ class MllamaForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("vision_model", prefix),
         )
+        self.num_tokens_per_image = self.vision_model.num_patches * self.max_num_tiles
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
@@ -849,17 +854,17 @@ class MllamaForConditionalGeneration(nn.Module):
     def pad_input_ids(
         self, input_ids: array[int], mm_inputs: MultimodalInputs
     ) -> array[int]:
-        mm_inputs.mm_items[0].model_specific_data["mllama_prompt_length"] = len(
-            input_ids
-        )
+        prompt_length = len(input_ids)
+        mm_inputs.mm_items[0].mllama_prompt_length = prompt_length
         pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
         image_len = self.vision_model.num_patches * sum(
             item.feature.shape[1] * item.feature.shape[2] for item in mm_inputs.mm_items
         )
         mm_inputs.num_image_tokens = image_len
-        if image_len > self.vision_model.num_patches * self.max_num_tiles:
-            # Multi-image decoder KV depends on the original prompt boundary.
-            pad_values[0] = _compute_pad_value(hash((pad_values[0], len(input_ids))))
+        if image_len > self.num_tokens_per_image:
+            # Generated tokens use a different visual mask. Include the boundary
+            # so a longer prompt gets its own decoder KV entries.
+            pad_values[0] = _compute_pad_value(hash((pad_values[0], prompt_length)))
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
@@ -964,10 +969,8 @@ class MllamaForConditionalGeneration(nn.Module):
             if encoder_len == 0 or q_len == 0:
                 continue
             mm_input = forward_batch.mm_inputs[i]
-            positions, tile_masks = mllama_image_layout(mm_input)
-            prompt_length = mm_input.mm_items[0].model_specific_data[
-                "mllama_prompt_length"
-            ]
+            positions, tile_masks = mllama_image_layout(mm_input.mm_items)
+            prompt_length = mm_input.mm_items[0].mllama_prompt_length
             # Image visibility stays constant beyond the prompt boundary.
             query_start = (
                 prompt_length if is_decode else forward_batch.extend_prefix_lens_cpu[i]
@@ -990,11 +993,12 @@ class MllamaForConditionalGeneration(nn.Module):
             forward_batch.cross_attention_custom_mask = torch.cat(mask_parts)
 
     def get_full_text_row_masked_out_mask(self, forward_batch: ForwardBatch):
-        image_length = self.vision_model.num_patches * self.max_num_tiles
         if forward_batch.forward_mode.is_decode():
             # Meta extends image visibility during generation for single-image
             # prompts. Each image occupies a fixed number of encoder slots.
-            return (forward_batch.encoder_lens == image_length).reshape(-1, 1)
+            return (forward_batch.encoder_lens == self.num_tokens_per_image).reshape(
+                -1, 1
+            )
 
         device = forward_batch.seq_lens.device
         parts = []
@@ -1008,11 +1012,8 @@ class MllamaForConditionalGeneration(nn.Module):
                 query_start, query_start + q_len, device=device
             )
             visible = query_positions >= first_item.offsets[0][0]
-            if forward_batch.encoder_lens_cpu[i] != image_length:
-                visible &= (
-                    query_positions
-                    < first_item.model_specific_data["mllama_prompt_length"]
-                )
+            if forward_batch.encoder_lens_cpu[i] != self.num_tokens_per_image:
+                visible &= query_positions < first_item.mllama_prompt_length
             parts.append(visible)
         return torch.cat(parts).reshape(-1, 1)
 
@@ -1124,7 +1125,9 @@ class MllamaForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-def mllama_image_layout(mm_input) -> Tuple[List[int], List[torch.Tensor]]:
+def mllama_image_layout(
+    mm_items: Sequence[MultimodalDataItem],
+) -> Tuple[List[int], List[torch.Tensor]]:
     """Return image positions and tile masks in encoder KV order.
 
     Offsets are inclusive spans in decoder text coordinates, with one token
@@ -1132,11 +1135,11 @@ def mllama_image_layout(mm_input) -> Tuple[List[int], List[torch.Tensor]]:
     Aspect-ratio metadata survives release of the pixel tensors after prefill.
     """
     positions, tile_masks = [], []
-    for item in mm_input.mm_items:
+    for item in mm_items:
         item_positions = [
             pos for start, end in item.offsets for pos in range(start, end + 1)
         ]
-        masks = torch.as_tensor(item.model_specific_data["aspect_ratio_mask"])
+        masks = torch.as_tensor(item.aspect_ratio_mask)
         masks = masks.reshape(-1, masks.shape[-1])
         positions.extend(item_positions)
         tile_masks.extend(masks.unbind(0))

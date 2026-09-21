@@ -1767,7 +1767,9 @@ class FlashInferIndicesUpdaterDecode:
         cross_attention_indptr_cpu = None
         if cross_attention_custom_mask is not None:
             visible_indices, visible_indptr = filter_cross_attention_kv_indices(
-                kv_indices, kv_indptr, cross_attention_custom_mask
+                kv_indices=kv_indices,
+                kv_indptr=kv_indptr,
+                custom_mask=cross_attention_custom_mask,
             )
             if wrapper.is_cuda_graph_enabled:
                 # Captured kernels retain these buffers across replay steps.
