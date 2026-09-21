@@ -649,7 +649,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
-        if self.host_pool is not None and not kv_manager.supports_host_destination:
+        if (
+            get_disagg().disaggregation_decode_enable_host_receive
+            and not kv_manager.supports_host_destination
+        ):
             raise ValueError(
                 "Transfer backend does not support decode host KV destinations"
             )
