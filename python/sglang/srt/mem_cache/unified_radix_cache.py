@@ -38,7 +38,12 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
@@ -1989,6 +1994,19 @@ class UnifiedRadixCache(BasePrefixCache):
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
         prefetch_length = len(prefetch_key)
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            prefetch_length = min(
+                prefetch_length,
+                self.components[ct].align_storage_prefetch_length(
+                    self.tree_core.node_by_id(last_host_node_id), prefetch_length
+                ),
+            )
+        prefetch_key = prefetch_key[:prefetch_length]
+        assume_stored = (
+            assume_stored and storage_start + prefetch_length == storage_hit_end
+        )
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
@@ -2354,12 +2372,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
         #
-        # Skip KV-derived pools, which do not report hits in operation.pool_storage_result.
-        # Their hit lengths are stored in completed_tokens.
+        # Physical KV includes derived-pool reads in completed_tokens. A logical
+        # anchor has no payload: every physical pool reports through pool_hits.
+        logical_anchor = self.cache_controller.storage_host_pool.kv_buffer is None
         pool_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
-            if transfer.indices_from_pool != PoolName.KV
+            if logical_anchor or transfer.indices_from_pool != PoolName.KV
         ]
         hit_pages = (
             operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
@@ -2650,7 +2669,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 pool_page_size = (
                     entry.host_pool.page_size if entry is not None else self.page_size
                 )
-                num_tokens = min(len(transfer.keys or ()), hit_pages) * pool_page_size
+                hit_objects = hit_pages // transfer.logical_pages_per_object
+                num_tokens = min(len(transfer.keys or ()), hit_objects) * pool_page_size
                 if num_tokens == 0:
                     continue
                 host_indices = self.components[ct].alloc_prefetch_staging(num_tokens)
@@ -2845,8 +2865,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     hit_tokens,
                     available_size - (available_size % self.page_size),
                 )
-                if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
+                # Only KV-derived, page-aligned sidecars can safely use a shorter
+                # prefix. Independent pools describe a specific window or coarse
+                # object boundary and must remain all-or-nothing.
+                clampable = not operation.pool_transfers or all(
+                    transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+                    and transfer.indices_from_pool == PoolName.KV
+                    for transfer in operation.pool_transfers
+                )
+                if clampable:
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     # Parked ops hold no pin: release and re-take at the next

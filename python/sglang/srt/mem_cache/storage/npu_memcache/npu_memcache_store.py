@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -164,6 +165,9 @@ class NpuMemcacheStore(HiCacheStorage):
     ):
         self.store = None
         self.storage_config = storage_config
+        self._store_initialized = False
+        self._store_init_lock = threading.Lock()
+        self._pending_buffers: List[Tuple[int, int]] = []
 
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
@@ -183,23 +187,19 @@ class NpuMemcacheStore(HiCacheStorage):
                     "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
                 )
 
-            self.store = DistributedObjectStore()
-            if self.store.setup(local_cfg) != 0:
-                raise RuntimeError(
-                    "memcache_hybrid.DistributedObjectStore.setup failed"
-                )
-
             ctrl = config.ctrl
             device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
-            if self.store.init(device_id, init_bm) != 0:
-                raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
-            tp_rank = storage_config.tp_rank if storage_config is not None else 0
-            logger.info(
-                "Ascend MemCache store initialized (tp_rank=%s, device_id=%s, init_bm=%s)",
-                tp_rank,
-                device_id,
-                init_bm,
+            self._store_factory = DistributedObjectStore
+            self._local_cfg = local_cfg
+            self._device_id = device_id
+            self._init_bm = init_bm
+            self._protocol = str(getattr(local_cfg, "protocol", "")).lower()
+            self._defer_runtime_init = self._should_lazy_init(
+                mem_pool=mem_pool,
+                protocol=self._protocol,
+                init_bm=init_bm,
+                host_pool_names=getattr(storage_config, "host_pool_names", ()),
             )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
@@ -208,8 +208,19 @@ class NpuMemcacheStore(HiCacheStorage):
             self._check_server_enabled = bool(ctrl.get("check_server", False))
             self.extra_backend_tag = ctrl.get("extra_backend_tag")
 
+            self._init_runtime_fields(storage_config)
+
             if self._check_server_enabled:
                 self.check_server()
+
+            if self._defer_runtime_init:
+                logger.info(
+                    "Delay Ascend memcache BM/HYBM initialization until the first "
+                    "DSV4 L3 write (protocol=%s).",
+                    self._protocol,
+                )
+            else:
+                self._ensure_initialized()
 
             if not init_bm:
                 logger.info(
@@ -221,14 +232,89 @@ class NpuMemcacheStore(HiCacheStorage):
                     f"({envs.SGLANG_NPU_MEMCACHE_ENABLE_WARMUP.name}=0). "
                     "Set it to true to run the register-time warmup probe."
                 )
-            self._init_runtime_fields(storage_config)
-
         except ValueError as e:
             logger.error("Ascend MemCache configuration failed: %s", e)
             raise
         except Exception as exc:
             logger.error("Ascend MemCache store initialization failed: %s", exc)
             raise
+
+    @staticmethod
+    def _should_lazy_init(
+        mem_pool: Any,
+        protocol: Any,
+        init_bm: bool,
+        host_pool_names: Any = (),
+    ) -> bool:
+        """Defer transport setup for DSV4 until after its first model forward."""
+        if not init_bm or str(protocol).lower() not in {
+            "device_sdma",
+            "device_rdma",
+        }:
+            return False
+        dsv4_pool_names = {
+            str(PoolName.DEEPSEEK_V4_C4),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER),
+            str(PoolName.DEEPSEEK_V4_C128),
+            str(PoolName.DEEPSEEK_V4_C4_STATE),
+            str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+            str(PoolName.DEEPSEEK_V4_C128_STATE),
+        }
+        actual_pool_names = {
+            str(getattr(entry, "name", ""))
+            for entry in (getattr(mem_pool, "entries", None) or [])
+        }
+        actual_pool_names.update(str(name) for name in (host_pool_names or ()))
+        return not actual_pool_names.isdisjoint(dsv4_pool_names)
+
+    def _register_buffer_meta(self, ptr: int, size: int) -> None:
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error("Failed to register buffer, error code: %s", ret_code)
+            raise RuntimeError(
+                f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
+            )
+
+    def _ensure_initialized(self) -> None:
+        """Initialize BM/HYBM once and then register every deferred host buffer."""
+        if self._store_initialized:
+            return
+        with self._store_init_lock:
+            if self._store_initialized:
+                return
+            store = self._store_factory()
+            try:
+                if store.setup(self._local_cfg) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.setup failed"
+                    )
+                if store.init(self._device_id, self._init_bm) != 0:
+                    raise RuntimeError(
+                        "memcache_hybrid.DistributedObjectStore.init failed"
+                    )
+                self.store = store
+                for ptr, size in self._pending_buffers:
+                    self._register_buffer_meta(ptr, size)
+                self._store_initialized = True
+                self._pending_buffers.clear()
+            except Exception:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+                self.store = None
+                self._store_initialized = False
+                raise
+
+            tp_rank = self.storage_config.tp_rank if self.storage_config else 0
+            logger.info(
+                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, "
+                "init_bm=%s, deferred=%s)",
+                tp_rank,
+                self._device_id,
+                self._init_bm,
+                getattr(self, "_defer_runtime_init", False),
+            )
 
     def _init_runtime_fields(
         self, storage_config: Optional[HiCacheStorageConfig]
@@ -282,16 +368,14 @@ class NpuMemcacheStore(HiCacheStorage):
         self.backup_bandwidth = []
 
     def register_buffer(self, tensor: torch.Tensor):
-        if self.store is None:
-            raise RuntimeError("Ascend MemCache store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        ret_code = self.store.register_buffer(ptr, size)
-        if ret_code != 0:
-            logger.error("Failed to register buffer, error code: %s", ret_code)
-            raise RuntimeError(
-                f"Failed to register buffer to Ascend MemCache, error code: {ret_code}"
-            )
+        if not self._store_initialized:
+            buffer_meta = (ptr, size)
+            if buffer_meta not in self._pending_buffers:
+                self._pending_buffers.append(buffer_meta)
+            return
+        self._register_buffer_meta(ptr, size)
 
     def check_server(self) -> None:
         url = self._memcache_metrics_url
@@ -339,6 +423,13 @@ class NpuMemcacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # DSV4 FULL is a logical anchor. It owns hashes/slots but no payload.
+        if self.mem_pool_host.kv_buffer is None:
+            self.gb_per_page = 0.0
+            logger.info(
+                "Ascend Memcache registered logical KV anchor without a buffer."
+            )
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -375,6 +466,17 @@ class NpuMemcacheStore(HiCacheStorage):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        layout = getattr(host_pool, "layout", None)
+        if layout not in {
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        }:
+            raise ValueError(
+                "Ascend Memcache hybrid pools require a storage-compatible "
+                f"page-first layout, got {layout!r} for {host_pool_name}."
+            )
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
@@ -384,6 +486,12 @@ class NpuMemcacheStore(HiCacheStorage):
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
             self.register_buffer(buf)
+
+    def prepare_for_backup(self) -> None:
+        # DSV4 is TP-replicated, so non-zero TP ranks do not execute put(). They
+        # still need BM/HYBM ready for later L3 reads; the post-inference backup
+        # boundary initializes every rank without perturbing the first forward.
+        self._ensure_initialized()
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -457,6 +565,16 @@ class NpuMemcacheStore(HiCacheStorage):
             # (k_ptr, v_ptr) order of get_page_buffer_meta.
             base_suffix = f"_{self.mha_suffix}"
             suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
+        elif name in (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        ):
+            suffixes = [f"_{self.mla_suffix}_{name}"]
         else:
             raise ValueError(f"Unsupported hybrid pool for batch v2 I/O: {name}")
         if not suffixes:
@@ -473,41 +591,94 @@ class NpuMemcacheStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(keys, extra_info)
+        logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        if logical_anchor:
+            # Logical anchor: required physical pools decide the usable prefix.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
 
-        for transfer in pool_transfers or []:
+        transfers = pool_transfers or []
+        all_page_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        ]
+        trailing_transfers = [
+            transfer
+            for transfer in transfers
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+        ]
+
+        # Required prefix pools run first. Coarse objects report physical-object
+        # hits and convert them back to anchor/KV logical pages.
+        for transfer in all_page_transfers:
             if final_pages == 0:
                 break
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+            object_anchor_keys = (
+                list(transfer.keys) if transfer.keys else list(keys[:kv_pages])
             )
+            if not object_anchor_keys:
+                final_pages = 0
+                continue
+
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                object_anchor_keys, transfer
+            )
+            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             page_exists = [
                 all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-                for i in range(kv_pages)
+                for i in range(len(object_anchor_keys))
             ]
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
-                hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+
+            coverage = transfer.logical_pages_per_object
+            final_pages = min(final_pages, successful_objects * coverage)
+
+        # The usable prefix must end at every coarse pool's object boundary.
+        for transfer in all_page_transfers:
+            coverage = transfer.logical_pages_per_object
+            final_pages -= final_pages % coverage
+
+        # Window/state pools use the tail of the prefix selected above, not the
+        # tail of the original request, which may already have diverged.
+        for transfer in trailing_transfers:
+            if final_pages == 0:
+                break
+            trailing_n = len(transfer.keys) if transfer.keys else 1
+            if final_pages < trailing_n:
+                final_pages = 0
+                break
+            transfer.keys = list(keys[final_pages - trailing_n : final_pages])
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                transfer.keys, transfer
+            )
+            ex = self._batch_exist(self._tag_keys(component_keys))
+            page_exists = [
+                all(
+                    result == 1
+                    for result in ex[
+                        index * key_multiplier : (index + 1) * key_multiplier
+                    ]
+                )
+                for index in range(len(transfer.keys))
+            ]
+            successful_objects = (
+                page_exists.index(False) if False in page_exists else len(page_exists)
+            )
+            if successful_objects:
+                hit_count[transfer.name] = successful_objects
+            if successful_objects != len(transfer.keys):
+                final_pages = 0
 
         return PoolTransferResult(final_pages, hit_count)
 
@@ -539,11 +710,19 @@ class NpuMemcacheStore(HiCacheStorage):
                     f"len(keys)={len(keys)}, len(host_indices)={len(host_indices)}, page_size={page_size}."
                 )
 
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
+                raise ValueError(
+                    f"PoolTransfer '{transfer.name}' physical object mismatch: "
+                    f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
+                    f"sizes={len(element_size_list)}. Use a storage-compatible "
+                    "page-first host layout."
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
@@ -669,6 +848,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
@@ -694,6 +875,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         # Apply extra_backend_tag prefix if available
         page_keys = self._tag_keys(keys)
 
@@ -863,6 +1046,8 @@ class NpuMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return len(keys)
         page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
@@ -898,7 +1083,44 @@ class NpuMemcacheStore(HiCacheStorage):
         return len(query_keys) // key_multiplier
 
     def clear(self) -> None:
-        self.store.remove_all()
+        """Remove all MemCache objects without breaking deferred NPU init.
+
+        DSV4 deliberately delays BM/HYBM initialization until the first backup.
+        A clear request commonly arrives before that first backup (for example at
+        the beginning of an accuracy test).  Treating the uninitialized state as
+        an already-empty backend is incorrect because the external Holder can
+        still contain objects written by an earlier SGLang process.
+
+        Use a short-lived metadata-only client in that case.  ``init_bm=False``
+        connects to the metadata service but does not create the NPU-side BM/HYBM
+        resources whose early initialization the lazy lifecycle is designed to
+        avoid.
+        """
+        if self._store_initialized:
+            result = self.store.remove_all()
+        else:
+            clear_client = self._store_factory()
+            try:
+                if clear_client.setup(self._local_cfg) != 0:
+                    raise RuntimeError(
+                        "Memcache metadata-only clear client setup failed"
+                    )
+                if clear_client.init(self._device_id, False) != 0:
+                    raise RuntimeError(
+                        "Memcache metadata-only clear client init failed"
+                    )
+                result = clear_client.remove_all()
+            finally:
+                try:
+                    clear_client.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close Memcache metadata-only clear client",
+                        exc_info=True,
+                    )
+
+        if int(result) != 0:
+            raise RuntimeError(f"Memcache remove_all failed with code {result}")
 
     def close(self) -> None:
         if self.store is None:
@@ -912,11 +1134,14 @@ class NpuMemcacheStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
+        self._ensure_initialized()
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
+        if not self._store_initialized:
+            return [-1] * len(key_strs)
         raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
@@ -930,6 +1155,8 @@ class NpuMemcacheStore(HiCacheStorage):
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        if not self._store_initialized:
+            return [0] * len(key_strs)
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):

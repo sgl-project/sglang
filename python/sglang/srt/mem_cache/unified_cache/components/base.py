@@ -677,6 +677,17 @@ class TreeComponent(ABC):
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
         return None
 
+    def align_storage_prefetch_length(
+        self, node: UnifiedTreeNode, prefetch_tokens: int
+    ) -> int:
+        """Return the storage-safe prefix length for this component.
+
+        Most components use the FULL page-aligned candidate unchanged. Components
+        with a coarser correctness boundary may shorten it before storage keys and
+        host allocations are created.
+        """
+        return prefetch_tokens
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
