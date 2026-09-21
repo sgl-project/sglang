@@ -12,6 +12,8 @@ use sgl_router::server::app_context::ChatRouting;
 use sgl_router::state::load_monitor::engine_reported_load::EngineReportedWorkerLoad;
 use std::sync::Mutex;
 
+mod session_aware;
+
 type PickCall = (String, Stage, u64, Option<u64>);
 
 #[derive(Debug)]

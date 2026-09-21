@@ -172,7 +172,7 @@ bucket, both groups share this one request-length decision. Policy fallback on
 a cache/affinity miss stays within that group's candidates. There is no second
 pass with relaxed admission and no post-policy substitution.
 
-SLO ordering, cache lookup, and session/sticky policies are follow-ups. Their
+SLO ordering, cache lookup, global session modes, and sticky policies are follow-ups. Their
 integration must preserve bucket-first selection and the same-bucket PD rule.
 Cross-bucket affinity probing is not part of this interface. Session/routing
 keys still pass through `PickRequest` for policies operating inside the selected
@@ -293,6 +293,18 @@ separate mechanism.
 | `SessionAwarePolicy` | Reuse an admitted session binding; use power-of-two for new or keyless sessions |
 | `StickyPolicy` | Reuse an admitted routing-key binding; use the configured fallback for new or missing keys |
 | `CacheAwarePolicy` | Prefer a usable prefix under cache and pressure rules; use a load-based fallback on a miss |
+
+Session assignments are scoped by model, bucket ID, stage, and session key.
+`SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
+owns the store's idle timeout and eviction task. Missing or empty session keys
+use power-of-two without creating assignments. A new or out-of-group binding
+uses power-of-two with `AllowAll`, then the session policy checks its selected
+engine before binding. A concurrent live assignment wins, but is checked before
+returning it; rejection ends that attempt without rewriting the binding or
+retrying another engine. Existing bindings are reused regardless of pressure
+when admitted. Session policies can be attached independently to each role.
+Programmatic reorg callers configure `model.affinity.session_id_header` for HTTP
+header extraction; this does not enable legacy global modes or backup escape.
 
 Session and sticky policies do not create assignments for missing keys. A
 binding outside the candidates cannot win. A missing binding may invoke policy
@@ -557,8 +569,15 @@ Implemented here:
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
 
-Follow-up order: concrete admission (#40271), then bucket SLO ordering
-in a separate PR, followed by remaining policies and production configuration.
+- `SessionAwarePolicy` reuses admitted model/bucket/role-scoped bindings from a
+  shared `AffinityStore`, falling back to power-of-two for new or keyless sessions.
+  Assignments follow admission; concurrent binding winners are rechecked.
+  Rejection preserves existing bindings and advances to the next bucket.
+  The caller owns expiry and sweeper lifecycle. A binding may remain after a
+  later PD group fails, because it records placement rather than dispatch.
+
+Follow-up order: cache-aware selection (#40366), concrete admission (#40271),
+then bucket SLO ordering, remaining policies, and production configuration.
 
 Not yet implemented in the reorg path:
 
@@ -566,7 +585,8 @@ Not yet implemented in the reorg path:
 - SLO estimates, targets, and bucket preference ordering.
 - CLI/configuration parsing, validation, and model-specific construction.
   The YAML above is illustrative; reorg resolvers are installed in code.
-- Session modes, prefix memoization, and cache-aware selection.
+- Global session modes and sticky routing-key affinity.
+- Prefix memoization and cache-aware selection.
 - Shared load interpretation, dispatch correction, and policy-specific
   dispatch-timestamp requirements.
 - PD compatibility filtering, retry integration, and legacy-route switchover.
