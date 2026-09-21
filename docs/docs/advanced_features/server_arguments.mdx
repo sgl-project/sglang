@@ -1063,6 +1063,16 @@ Please consult the documentation below and [server_args.py](https://github.com/s
   </tbody>
 </table>
 
+## Responses storage
+
+Responses storage is now disabled by default, including on standalone servers. Add `--enable-response-store` to retain responses for retrieval, `previous_response_id` chaining, and background requests. Storage is process-local and in-memory, has no TTL or size limit, and is lost on restart.
+
+Foreground generation and streaming still accept the API's default `store: true` without retaining responses or message history when server storage is disabled. The response's `store` field echoes the client request; the server flag controls persistence. With storage enabled, `store: false` opts out for the current request while allowing it to read a stored predecessor.
+
+Background requests, including streaming requests, require both `--enable-response-store` and `store: true`. Without the flag, chaining, background requests, retrieval, and cancellation return HTTP 400. Cancellation applies to detached background requests; active streams have no stored response until completion.
+
+Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `decode` fails at startup. PD clients must send explicit conversation history in foreground requests. Built-in web search and code interpreter calls are also unsupported under PD.
+
 ## API related
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -1144,13 +1154,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for reasoning models. Use `auto` to detect the parser from the model's chat template.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>deepseek-r1</code>, <code>deepseek-v3</code>, <code>deepseek-v4</code>, <code>dots</code>, <code>glm45</code>, <code>ling3</code>, <code>hunyuan</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>mimo</code>, <code>muse</code>, <code>poolside_v1</code>, <code>qwen3</code>, <code>qwen3-thinking</code>, <code>minimax</code>, <code>minimax-append-think</code>, <code>minimax-m3</code>, <code>step3</code>, <code>step3p5</code>, <code>mistral</code>, <code>nemotron_3</code>, <code>interns1</code>, <code>gemma4</code>, <code>inkling</code>, <code>cohere_command4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>deepseek-r1</code>, <code>deepseek-v3</code>, <code>deepseek-v4</code>, <code>dots</code>, <code>glm45</code>, <code>ling3</code>, <code>hunyuan</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>mimo</code>, <code>muse</code>, <code>poolside_v1</code>, <code>qwen3</code>, <code>qwen3-thinking</code>, <code>minimax</code>, <code>minimax-append-think</code>, <code>minimax-m3</code>, <code>step3</code>, <code>step3p5</code>, <code>mistral</code>, <code>nemotron_3</code>, <code>interns1</code>, <code>gemma4</code>, <code>gigachat35</code>, <code>inkling</code>, <code>cohere_command4</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-call-parser`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for handling tool-call interactions. Use `auto` to detect the parser from the model's chat template.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>cohere_command4</code>, <code>deepseekv3</code>, <code>deepseekv31</code>, <code>deepseekv32</code>, <code>deepseekv4</code>, <code>dots</code>, <code>glm</code>, <code>glm45</code>, <code>glm47</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>lfm2</code>, <code>ling3</code>, <code>llama3</code>, <code>mimo</code>, <code>minicpm5</code>, <code>mistral</code>, <code>muse</code>, <code>poolside_v1</code>, <code>pythonic</code>, <code>qwen</code>, <code>qwen25</code>, <code>qwen3_coder</code>, <code>spark25</code>, <code>step3</code>, <code>step3p5</code>, <code>minimax-m2</code>, <code>minimax-m3</code>, <code>trinity</code>, <code>interns1</code>, <code>hermes</code>, <code>hunyuan</code>, <code>gigachat3</code>, <code>gemma4</code>, <code>inkling</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>apertus2509</code>, <code>cohere_command4</code>, <code>deepseekv3</code>, <code>deepseekv31</code>, <code>deepseekv32</code>, <code>deepseekv4</code>, <code>dots</code>, <code>glm</code>, <code>glm45</code>, <code>glm47</code>, <code>gpt-oss</code>, <code>k2_horizon</code>, <code>kimi_k2</code>, <code>kimi_k3</code>, <code>lfm2</code>, <code>ling3</code>, <code>llama3</code>, <code>mimo</code>, <code>minicpm5</code>, <code>mistral</code>, <code>muse</code>, <code>poolside_v1</code>, <code>pythonic</code>, <code>qwen</code>, <code>qwen25</code>, <code>qwen3_coder</code>, <code>spark25</code>, <code>step3</code>, <code>step3p5</code>, <code>minimax-m2</code>, <code>minimax-m3</code>, <code>trinity</code>, <code>interns1</code>, <code>hermes</code>, <code>hunyuan</code>, <code>gigachat3</code>, <code>gigachat35</code>, <code>gemma4</code>, <code>inkling</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-server`</td>
@@ -1814,7 +1824,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-dispatcher-output-dtype`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select DeepEP dispather output dtype, could be <code>bf16</code>, <code>fp8</code>, <code>int8</code> (only Ascend A2/A3 NPU), <code>nvfp4</code> or <code>auto</code>. Default is <code>auto</code>, which follows a priority order (server argument → deprecated env var → input_global_scale check → dispatcher_output_dtype from quant_config → flashinfer/cutlass backend → NPU BF16 default → GPU FP8 default).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select DeepEP dispatcher output dtype, could be <code>bf16</code>, <code>fp8</code>, <code>int8</code> (only Ascend A2/A3 Series NPUs), <code>nvfp4</code> or <code>auto</code>. Default is <code>auto</code>, which follows a priority order (server argument → deprecated env var → input_global_scale check → dispatcher_output_dtype from quant_config → flashinfer/cutlass backend → NPU BF16 default → GPU FP8 default).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>fp8</code>, <code>int8</code>, <code>nvfp4</code></td>
     </tr>
@@ -2307,6 +2317,24 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`-1`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ple-offload-embedding`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep the Qwen4-Exp PLE n-gram embedding table in host memory instead of device memory; the gather kernel reads it from a host pointer. Enabled by default for BF16 Qwen4-Exp on CUDA; `--no-ple-offload-embedding` disables it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ple-offload-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host storage for the offloaded PLE table: `pinned` (CPU pinned memory) or `file` (a sparse file-backed mmap under `--ple-offload-dir`, read directly by the gather kernel). Use `file` on unified-memory devices such as GB10 / DGX Spark, where pinned host memory comes out of the same pool as the weights; it requires a device that reports `cudaDevAttrPageableMemoryAccessUsesHostPageTables`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pinned`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ple-offload-dir`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Directory for the file-backed PLE table when `--ple-offload-backend` is `file`. The file is sparse and rewritten on every startup; keep it on fast local storage (NVMe). Rewriting an existing table can be much slower than filling a fresh sparse file. Before restarting, stop all servers using that directory and remove its `ple_table_*.bin` files to avoid this startup cost.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`$SGLANG_CACHE_DIR/ple/<model path>`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--offload-num-in-group`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of layers to be offloaded within a group.</td>
@@ -2405,6 +2433,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-max-bs-prefill`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum batch size captured for the prefill CUDA graph.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-max-seq-len-prefill`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Longest sequence a prefill CUDA graph replay admits; longer batches run eager prefill. Folds into `cuda_graph_config[prefill].max_seq_len`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>

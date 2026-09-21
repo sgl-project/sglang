@@ -1012,7 +1012,7 @@ class TestEncoderDelivery(CustomTestCase):
 
             with (
                 patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    "sglang.srt.distributed.parallel_state.get_tp_group",
                     return_value=TPGroup(),
                 ),
                 patch(
@@ -1052,7 +1052,7 @@ class TestEncoderDelivery(CustomTestCase):
 
             with (
                 patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    "sglang.srt.distributed.parallel_state.get_tp_group",
                     return_value=TPGroup(),
                 ),
                 patch(
@@ -1096,7 +1096,7 @@ class TestEncoderDelivery(CustomTestCase):
 
             with (
                 patch(
-                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    "sglang.srt.distributed.parallel_state.get_tp_group",
                     return_value=TPGroup(),
                 ),
                 patch(

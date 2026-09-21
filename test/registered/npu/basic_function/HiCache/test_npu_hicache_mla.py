@@ -40,8 +40,6 @@ class TestAscendMlaHicache(CustomTestCase):
             "--tp-size",
             4,
             "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
         ]
 
     def test_a_gsm8k(self):
