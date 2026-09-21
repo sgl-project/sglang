@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -40,11 +40,13 @@ fn config() -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -54,12 +56,13 @@ fn config() -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
@@ -222,7 +225,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
     let request = tokio::spawn(build_router(Arc::clone(&ctx)).oneshot(chat_request()));
 
     await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    assert_eq!(prefill_worker.active_load(), 1);
+    assert_eq!(prefill_worker.router_inflight_load(), 1);
     assert_eq!(prefill_worker.slots_acquired_since(cutoff), 0);
 
     assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);

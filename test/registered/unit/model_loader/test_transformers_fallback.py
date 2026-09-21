@@ -55,7 +55,7 @@ class TestTransformersFallbackSkipSubstrs(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.transformers.get_pp_group",
+                "sglang.srt.distributed.parallel_state.get_pp_group",
                 return_value=SimpleNamespace(),
             ),
             patch(

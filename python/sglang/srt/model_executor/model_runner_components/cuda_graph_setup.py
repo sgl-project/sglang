@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -95,7 +94,12 @@ def index_attention_layers_by_global_id(
     mha_companion_layers: list[Any],
     layer_model=None,
 ) -> tuple[list[Any], list[Any]]:
-    """Pad PP-local attention metadata so global layer_id remains a valid index."""
+    """Pad PP-local attention metadata so global layer_id remains a valid index.
+
+    Models that re-execute layers pre-expand these lists into position-indexed
+    lookup tables (the same layer at several positions); such tables are
+    returned unchanged.
+    """
     if len(attention_layers) != len(mha_companion_layers):
         raise ValueError("attention and MHA companion metadata must be parallel")
     populated = [layer for layer in attention_layers if layer is not None]
@@ -109,16 +113,27 @@ def index_attention_layers_by_global_id(
     max_layer_id = max(int(layer.layer_id) for layer in populated)
     indexed_attention = [None] * (max_layer_id + 1)
     indexed_companions = [None] * (max_layer_id + 1)
+    has_reused_layers = False
     for attention, companion in zip(attention_layers, mha_companion_layers):
         if attention is None:
             if companion is not None:
                 raise ValueError("MHA companion has no primary attention layer")
             continue
         layer_id = int(attention.layer_id)
-        if layer_id < 0 or indexed_attention[layer_id] is not None:
+        if layer_id < 0:
             raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
+        if indexed_attention[layer_id] is not None:
+            if (
+                indexed_attention[layer_id] is not attention
+                or indexed_companions[layer_id] is not companion
+            ):
+                raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
+            has_reused_layers = True
+            continue
         indexed_attention[layer_id] = attention
         indexed_companions[layer_id] = companion
+    if has_reused_layers:
+        return attention_layers, mha_companion_layers
     return indexed_attention, indexed_companions
 
 
@@ -208,11 +223,11 @@ def refresh_deep_gemm_layout_memory_budget(
         set_masked_standard_layout_memory_budget,
     )
 
-    world_group = get_world_group()
+    world_group = get_parallel().world_group
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=world_group.world_size > 1,
+        distributed=get_parallel().launch_world_size > 1,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
@@ -366,7 +381,7 @@ def capture_prefill_graph(
         logger.warning(
             "Disable prefill CUDA graph because the current LoRA "
             "configuration does not support it (unsupported LoRA backend, "
-            "MoE LoRA, or DP attention)."
+            "MoE LoRA without full or breakable capture, or DP attention)."
         )
         return result(eager_runner)
 
