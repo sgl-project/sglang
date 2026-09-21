@@ -132,11 +132,68 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
+    # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
+    (1, 320, 2560): (64, 8, 4, 11),
+    (1, 512, 2560): (64, 8, 4, 11),
+    (1, 640, 2560): (64, 8, 4, 10),
+    (1, 2560, 1536): (64, 8, 2, 6),
+    (1, 2560, 2560): (64, 8, 2, 6),
+    (1, 3584, 2560): (64, 8, 2, 6),
+    (1, 4096, 2560): (64, 8, 2, 6),
+    (1, 4120, 2560): (64, 8, 2, 6),
+    (2, 320, 2560): (64, 8, 4, 10),
+    (2, 512, 2560): (64, 8, 4, 11),
+    (2, 640, 2560): (64, 8, 4, 11),
+    (2, 2560, 1536): (64, 8, 2, 6),
+    (2, 2560, 2560): (64, 8, 2, 6),
+    (2, 3584, 2560): (64, 8, 2, 6),
+    (2, 4096, 2560): (64, 8, 2, 6),
+    (2, 4120, 2560): (64, 8, 2, 6),
+    (3, 320, 2560): (64, 8, 4, 10),
+    (3, 512, 2560): (64, 8, 4, 10),
+    (3, 640, 2560): (64, 8, 4, 10),
+    (3, 2560, 1536): (64, 8, 2, 6),
+    (3, 2560, 2560): (64, 8, 2, 6),
+    (3, 3584, 2560): (64, 8, 2, 6),
+    (3, 4096, 2560): (64, 8, 2, 6),
+    (3, 4120, 2560): (64, 8, 2, 6),
+    (4, 320, 2560): (64, 8, 4, 12),
+    (4, 512, 2560): (64, 8, 4, 10),
+    (4, 640, 2560): (64, 8, 4, 11),
+    (4, 2560, 1536): (64, 8, 2, 6),
+    (4, 2560, 2560): (64, 8, 2, 6),
+    (4, 3584, 2560): (64, 8, 2, 6),
+    (4, 4096, 2560): (64, 8, 2, 6),
+    (4, 4120, 2560): (64, 8, 2, 6),
+    (8, 320, 2560): (64, 8, 4, 11),
+    (8, 512, 2560): (64, 8, 4, 10),
+    (8, 640, 2560): (64, 8, 4, 11),
+    (8, 2560, 1536): (64, 8, 2, 10),
+    (8, 2560, 2560): (64, 8, 2, 6),
+    (8, 3584, 2560): (64, 8, 2, 6),
+    (8, 4096, 2560): (64, 8, 2, 6),
+    (8, 4120, 2560): (64, 8, 2, 6),
 }
 
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+
+
+def precompile_splitk_tactics() -> bool:
+    """JIT-compile every tuned tactic through the real dispatch,
+    so CUDA graph capture never hits a cold kernel."""
+    if not _enable_bf16_splitk_gemm:
+        return False
+    device = torch.cuda.current_device()
+    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+        x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+        _bf16_splitk_gemm_out(x, weight, None, out)
+    torch.cuda.synchronize()
+    return True
 
 
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
@@ -223,11 +280,12 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
-def _bf16_splitk_gemm(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+def _bf16_splitk_gemm_out(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
     if bias is None and _prefer_direct(m, n, k):
         tactic = _direct_default_tactic(m, n, k)
@@ -242,6 +300,15 @@ def _bf16_splitk_gemm(
             True,
             tactic,
         )
+    return out
+
+
+def _bf16_splitk_gemm(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    x_2d = x.view(-1, x.shape[-1])
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _bf16_splitk_gemm_out(x_2d, weight, bias, out)
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
@@ -459,6 +526,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            _enable_bf16_splitk_gemm
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and use_bf16_splitk_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            return _bf16_splitk_gemm_out(x, layer.weight, None, output)
         if (
             get_bf16_gemm_backend().is_cutedsl()
             and x.is_cuda

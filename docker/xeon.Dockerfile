@@ -8,6 +8,7 @@ RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
     ca-certificates \
+    ffmpeg \
     git \
     curl \
     wget \
@@ -15,6 +16,7 @@ RUN apt-get update && \
     gcc \
     g++ \
     make \
+    libssl-dev \
     libsqlite3-dev \
     libgoogle-perftools-dev \
     libtbb-dev \

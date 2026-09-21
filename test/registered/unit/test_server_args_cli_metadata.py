@@ -3,7 +3,7 @@
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.srt.utils.common import human_readable_int
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -23,7 +23,9 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         }
 
     def test_argparse_shape_is_preserved_for_representative_migrated_options(self):
-        self.assertEqual(self.actions_by_option["--dtype"].default, ServerArgs.dtype)
+        self.assertEqual(
+            self.actions_by_option["--dtype"].default, _declared_default("dtype")
+        )
         self.assertEqual(
             self.actions_by_option["--dtype"].choices,
             ["auto", "half", "float16", "bfloat16", "float", "float32"],
@@ -43,9 +45,24 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             self.actions_by_option["--prefill-delayer-forward-passes-buckets"].nargs,
             "+",
         )
+        self.assertIs(
+            self.actions_by_option["--cuda-graph-prefill-max-context"].type,
+            human_readable_int,
+        )
+        self.assertIsNone(self.actions_by_option["--context-bucket"].nargs)
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "hrrn",
+                "shortest-prefill-first",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,
@@ -64,6 +81,19 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", option, "3"])
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
+
+    def test_prefill_max_context_accepts_human_readable_values(self):
+        for option in (
+            "--cuda-graph-prefill-max-context",
+            "--context-bucket",
+        ):
+            with self.subTest(option=option):
+                args = self.parser.parse_args(["--model", "dummy", option, "200k"])
+
+                self.assertEqual(
+                    ServerArgs.from_cli_args(args).cuda_graph_prefill_max_context,
+                    200_000,
+                )
 
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(
