@@ -328,7 +328,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
 #endif
 
 #ifndef SGL_TOPK_V2_MAX_C16_OCC1
-#define SGL_TOPK_V2_MAX_C16_OCC1 7
+// Non-portable clusters require a positive device probe.
+#define SGL_TOPK_V2_MAX_C16_OCC1 0
 #endif
 
 constexpr uint32_t kNumPersistentClusters = SGL_TOPK_V2_MAX_C8_OCC2;
