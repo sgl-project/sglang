@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -12,6 +12,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
+from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -155,6 +156,34 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
 
+    def test_context_admission_obeys_live_swa_budget(self):
+        allocator = SimpleNamespace(
+            page_size=4,
+            full_available_size=lambda: 128,
+            swa_available_size=lambda: 32,
+        )
+        cache = SimpleNamespace(
+            full_evictable_size=lambda: 0,
+            swa_evictable_size=lambda: 0,
+        )
+        budget = SWAPrefillBudget(allocator, cache)
+        adder = object.__new__(PrefillAdder)
+        adder.memory_budget = budget
+        adder.page_size = 4
+        adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
+        adder.dllm_block_size = 8
+        adder.rem_dllm_tokens = 64
+        adder.is_hybrid_swa = True
+        req = _Req(context_len=40, block_size=8, prefill=True)
+
+        for reserved, expected in ((0, 28), (20, 8), (28, 0), (32, -4)):
+            with self.subTest(reserved=reserved):
+                budget.swa_offset = reserved
+                self.assertEqual(adder._get_dllm_remain_tokens(req), expected)
+        req.dllm_phase_prefill = False
+        budget.swa_offset = 0
+        self.assertEqual(adder._get_dllm_remain_tokens(req), 8)
+
     def test_context_prefill_is_not_capped_to_canvas_length(self):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
@@ -165,8 +194,23 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
 
+        adder.page_size = 1
+        adder.exact_chunk_fill = False
+        adder.rem_chunk_tokens = None
+        adder.rem_input_tokens = 1024
+        adder._check_prefill_budget = Mock(return_value=(True, None))
+        adder._check_prefill_tile_budget = Mock(return_value=None)
         req = _Req(context_len=300, block_size=256, prefill=True)
         req.host_hit_length = req.storage_hit_length = 0
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        admission = adder._select_prefill_admission(
+            req,
+            total_tokens=1024,
+            host_hit_length=0,
+            swa_host_hit_length=0,
+            truncation_align_size=None,
+        )
+        self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
         PrefillAdder._add_dllm_req(adder, req, 0)
         self.assertEqual((req.extend_range.start, req.extend_range.end), (0, 300))
 
@@ -326,6 +370,59 @@ class TestGemma4RequestValidation(unittest.TestCase):
             **req_kwargs,
         )
         return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
+
+    def test_logprob_rejection_never_enters_the_generation_queue(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers.io_struct import AbortReq
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config
+        scheduler._maybe_namespace_elastic_radix_cache = Mock()
+        scheduler._add_request_to_queue = Mock()
+        scheduler.init_req_max_new_tokens = Mock()
+        scheduler.output_streamer = Mock()
+        sender = Mock()
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        recv_req = MagicMock(
+            session_params=None,
+            session_id=None,
+            input_embeds=None,
+            bootstrap_port=1,
+        )
+        req = Req(
+            "unsupported-logprobs",
+            "Hello",
+            array("q", [1]),
+            SamplingParams(),
+            return_logprob=True,
+            top_logprobs_num=1,
+            dllm_config=scheduler.dllm_config,
+        )
+        with (
+            get_context().override_server_args(weight_version="test"),
+            get_parallel().override(tp_rank=0),
+            patch("sglang.srt.managers.scheduler.Req", return_value=req),
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+        ):
+            scheduler.handle_generate_request(recv_req)
+        sender.send_output.assert_called_once()
+        abort, original = sender.send_output.call_args.args
+        self.assertIsInstance(abort, AbortReq)
+        self.assertIs(original, req)
+        self.assertEqual(abort.finished_reason["status_code"], 400)
+        self.assertIn("return_logprob", abort.finished_reason["message"])
+        scheduler._add_request_to_queue.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_not_called()
 
     def test_core_and_posthoc_controls_are_supported(self):
         params = SamplingParams(

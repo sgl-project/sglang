@@ -260,6 +260,7 @@ class BenchArgs:
                 "generated-shared-prefix",
                 "sharegpt",
                 "custom",
+                "longbench_v2",
             ],
             help="Name of the dataset to benchmark on. sharegpt/custom replay "
             "recorded text prompts (custom reads --dataset-path JSONL); their "
@@ -644,6 +645,7 @@ def run_one_case(
             "random-ids",
             "mmmu",
             "generated-shared-prefix",
+            "longbench_v2",
         ) + REPLAY_TEXT_DATASETS
         if dataset_name not in supported_datasets:
             raise ValueError(
@@ -690,6 +692,21 @@ def run_one_case(
         elif dataset_name == "mmmu":
             input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
             image_data = [req.image_data for req in input_requests]
+        elif dataset_name == "longbench_v2":
+            # Real long documents, so the requested ISL is a TRUNCATION rather
+            # than one short message tiled up to length. Truncate to exactly
+            # input_len (instead of averaging, as the replay datasets do) so the
+            # shape under test matches the tiled `random` arm token for token
+            # and the only variable left is how the prompts route.
+            input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
+            input_ids = [ids[:input_len] for ids in input_ids if len(ids) >= input_len]
+            if len(input_ids) < batch_size:
+                raise ValueError(
+                    f"longbench_v2 yielded only {len(input_ids)} prompts of >= "
+                    f"{input_len} tokens for batch size {batch_size}"
+                )
+            input_ids = input_ids[:batch_size]
+            image_data = None
         elif dataset_name in REPLAY_TEXT_DATASETS:
             if len(input_requests) < batch_size:
                 raise ValueError(

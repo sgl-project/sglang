@@ -153,7 +153,11 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--input-lengths", type=int, nargs="+", default=[128, 512])
     parser.add_argument("--output-length", type=int, default=256)
-    parser.add_argument("--denoising-steps", type=int, default=48)
+    parser.add_argument(
+        "--denoising-steps",
+        type=int,
+        help="Verified fixed denoising step count, recorded as metadata only",
+    )
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 4, 8])
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--trials", type=int, default=15)

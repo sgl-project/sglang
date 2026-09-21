@@ -12,13 +12,14 @@
 # limitations under the License.
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models import gemma4_mm
+from sglang.srt.models import gemma4_diffusion, gemma4_mm
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaForBlockDiffusion
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -172,6 +173,42 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
 
         without_signal = model.prepare_dllm_input_embeds(input_ids, None)
         torch.testing.assert_close(without_signal, model.model.embed_tokens(input_ids))
+
+
+class TestGemma4DiffusionExpertActivation(unittest.TestCase):
+    def test_decoder_passes_checkpoint_activation_to_experts(self):
+        for activation, expected in (
+            ("gelu_pytorch_tanh", "gelu_tanh"),
+            ("gelu", "gelu"),
+        ):
+            with self.subTest(activation=activation), ExitStack() as stack:
+                config = SimpleNamespace(
+                    layer_types=["full_attention"],
+                    head_dim=2,
+                    num_key_value_heads=1,
+                    hidden_size=4,
+                    intermediate_size=8,
+                    hidden_activation=activation,
+                    rms_norm_eps=1e-6,
+                )
+                for name in (
+                    "DiffusionGemmaAttention",
+                    "Gemma3MLP",
+                    "Gemma4Router",
+                    "RMSNorm",
+                ):
+                    stack.enter_context(
+                        patch.object(
+                            gemma4_diffusion, name, return_value=torch.nn.Identity()
+                        )
+                    )
+                experts = stack.enter_context(
+                    patch.object(
+                        gemma4_diffusion, "Gemma4MoE", return_value=torch.nn.Identity()
+                    )
+                )
+                gemma4_diffusion.DiffusionGemmaDecoderLayer(0, config)
+                self.assertEqual(experts.call_args.kwargs["activation"], expected)
 
 
 class TestGemma4DiffusionWeightLoading(unittest.TestCase):

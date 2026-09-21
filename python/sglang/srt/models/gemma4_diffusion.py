@@ -22,10 +22,6 @@ from torch import nn
 from transformers import PreTrainedModel
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,6 +56,7 @@ from sglang.srt.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -79,7 +76,7 @@ class DiffusionGemmaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         layer_type = config.layer_types[layer_id]
         # Inclusive (HF) -> exclusive (sglang), matching gemma4_causal.
@@ -285,6 +282,11 @@ class DiffusionGemmaDecoderLayer(nn.Module):
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("moe", prefix),
+            activation=(
+                "gelu_tanh"
+                if config.hidden_activation == "gelu_pytorch_tanh"
+                else config.hidden_activation
+            ),
         )
 
         eps = config.rms_norm_eps
@@ -359,7 +361,7 @@ class DiffusionGemmaModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_conditioning", prefix),
         )
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.layers, self.start_layer, self.end_layer = make_layers(
             text_config.num_hidden_layers,
             lambda idx, prefix: DiffusionGemmaDecoderLayer(
@@ -406,7 +408,7 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.world_size != 1:
             raise NotImplementedError(
                 "DiffusionGemma does not support pipeline parallelism"

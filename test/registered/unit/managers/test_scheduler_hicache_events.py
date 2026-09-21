@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -114,7 +118,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
         s.pp_loop_size = 1
-        s.ps = SimpleNamespace(pp_size=2)
+        enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
