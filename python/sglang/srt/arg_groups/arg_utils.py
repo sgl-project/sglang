@@ -92,6 +92,9 @@ class Arg(msgspec.Struct, frozen=True):
     fallback: Any = None
 
 
+_NO_DEFAULT = object()
+
+
 class Derived(msgspec.Struct, frozen=True):
     """Metadata for a field the configuration implies, not one anyone types.
 
@@ -122,6 +125,12 @@ class Derived(msgspec.Struct, frozen=True):
 
     doc: str = ""
     fn: str = ""
+    # For a declaration with no ``fn`` whose absence is itself an answer:
+    # ``gpu_id`` is ``None`` in a process that runs on no device, and a reader
+    # wants that rather than an error. A rank has no such value -- the wrong
+    # one is a hang in a collective -- so it carries no default and a read
+    # before the write says so.
+    default: Any = _NO_DEFAULT
 
 
 class NS(msgspec.Struct, frozen=True):

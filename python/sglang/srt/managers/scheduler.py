@@ -104,12 +104,10 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -449,12 +447,8 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        gpu_id: int,
         tp_rank: int,
-        moe_ep_rank: int,
         pp_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
         dp_rank: Optional[int],
     ):
         # NOTE: KEEP THE FOLLOWING CODE STYLE for this function:
@@ -515,38 +509,6 @@ class Scheduler(
         self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
-
-        # Distributed rank info
-        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-            compute_dp_attention_world_info(
-                get_parallel().enable_dp_attention,
-                tp_rank,
-                get_parallel().tp_size,
-                get_parallel().dp_size,
-                get_parallel().attn_cp_size,
-            )
-        )
-        self.ps = ParallelState(
-            tp_rank=tp_rank,
-            tp_size=get_parallel().tp_size,
-            pp_rank=pp_rank,
-            pp_size=get_parallel().pp_size,
-            dp_rank=dp_rank,
-            dp_size=get_parallel().dp_size,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=get_parallel().attn_cp_size,
-            attn_dcp_rank=tp_rank % get_parallel().dcp_size,
-            attn_dcp_size=get_parallel().dcp_size,
-            attn_dp_rank=attn_dp_rank,
-            attn_dp_size=attn_dp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=get_parallel().ep_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_dp_size=get_parallel().moe_dp_size,
-            gpu_id=gpu_id,
-        )
 
         # Init model configs
         self.init_model_config()
@@ -779,7 +741,7 @@ class Scheduler(
             if get_parallel().pp_size > 1:
                 logger.error("only zbal mix mode support pp_size > 1!")
             init_zbal(
-                get_parallel().tp_size, self.ps.gpu_id, get_parallel().tp_rank
+                get_parallel().tp_size, get_device().gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
 
     def init_model_config(self):
@@ -1009,8 +971,7 @@ class Scheduler(
     def init_tp_model_worker(self):
         worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=self.ps.gpu_id,
-            ps=self.ps,
+            gpu_id=get_device().gpu_id,
             nccl_port=self.nccl_port,
         )
 
@@ -1047,8 +1008,7 @@ class Scheduler(
         # — is resolved per runner, not on a config copy.
         draft_worker_kwargs = dict(
             server_args=self.server_args,
-            gpu_id=self.ps.gpu_id,
-            ps=self.ps,
+            gpu_id=get_device().gpu_id,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
@@ -1246,7 +1206,7 @@ class Scheduler(
 
         # Print debug info
         self.startup_available_gpu_memory_gb = get_available_gpu_memory(
-            self.device, self.ps.gpu_id, empty_cache=False
+            self.device, get_device().gpu_id, empty_cache=False
         )
         if get_parallel().tp_rank == 0:
             logger.info(
@@ -1582,7 +1542,7 @@ class Scheduler(
                 tp_rank=get_parallel().tp_rank,
                 tp_size=get_parallel().tp_size,
                 dp_size=get_parallel().dp_size,
-                gpu_id=self.ps.gpu_id,
+                gpu_id=get_device().gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 pp_rank=get_parallel().pp_rank,
@@ -1613,7 +1573,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=get_parallel().tp_rank,
                 tp_size=get_parallel().tp_size,
-                gpu_id=self.ps.gpu_id,
+                gpu_id=get_device().gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -2248,7 +2208,6 @@ class Scheduler(
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
-            ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
@@ -2369,7 +2328,6 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             offload_tags=self.weight_updater.offload_tags,
-            ps=self.ps,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
@@ -2457,7 +2415,6 @@ class Scheduler(
         self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
-            ps=self.ps,
             server_args=self.server_args,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
@@ -2500,7 +2457,6 @@ class Scheduler(
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
-            ps=self.ps,
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
@@ -3120,7 +3076,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if self.ps.pp_rank == 0 and getattr(
+        if get_parallel().pp_rank == 0 and getattr(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
@@ -6078,6 +6034,7 @@ def run_scheduler_process(
         ranks=SpawnRanks(
             world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=pp_rank),
             dp_rank=dp_rank,
+            gpu_id=gpu_id,
         ),
     )
     configure_scheduler_process(
@@ -6115,12 +6072,8 @@ def run_scheduler_process(
         scheduler = Scheduler(
             server_args,
             port_args,
-            gpu_id,
             tp_rank,
-            moe_ep_rank,
             pp_rank,
-            attn_cp_rank,
-            moe_dp_rank,
             dp_rank,
         )
 

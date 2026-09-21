@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     derive_parallel_widths,
     get_context,
+    get_device,
     get_exec,
     get_flags,
     get_parallel,
@@ -366,6 +367,35 @@ class TestSpawnIdentities(_IsolatedOverrides):
         self.assertEqual(parallel.pp_rank, 1)
         self.assertEqual(parallel.dp_rank, 2)
 
+    def test_the_spawn_states_the_device_and_the_record_stays_clean(self):
+        """The parent picks the device, so it arrives with the rest of the
+        placement. It is stamped onto the bag: the record is the startup
+        input and stays as the caller handed it over."""
+        server_args = ServerArgs(model_path="dummy")
+        publish(
+            server_args,
+            role="test",
+            ranks=SpawnRanks(world_rank=0, gpu_id=3),
+        )
+        self.assertEqual(get_device().gpu_id, 3)
+        # Not on the record at all. An `Arg` is the operator's input and is
+        # collected into `ServerArgs`; nobody types this one, so it is
+        # declared rather than carried, and the startup input has no field
+        # for the spawn to have to leave alone.
+        self.assertNotIn(
+            "gpu_id", {f.name for f in msgspec.structs.fields(type(server_args))}
+        )
+
+    def test_a_process_on_no_device_is_told_nothing(self):
+        """Most roles run on no device at all, so the bundle leaves it out and
+        the bag keeps the declared default rather than inventing a zero."""
+        publish(
+            ServerArgs(model_path="dummy"),
+            role="test",
+            ranks=SpawnRanks(world_rank=0),
+        )
+        self.assertIsNone(get_device().gpu_id)
+
     def test_no_controller_is_an_answer_not_a_failure(self):
         """`dp_rank=None` means "not under a data parallel controller", which
         is a fact about the deployment, unlike never having been told. The
@@ -394,7 +424,7 @@ class TestSpawnIdentities(_IsolatedOverrides):
 class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
     """With a spawn bundle, a rank read works before any group exists.
 
-    This is what `ParallelState` provided by being a plain frozen record, and
+    This is what the per-runner record provided by being a plain frozen object, and
     what the topology init could not: it needs the groups. Deriving at publish
     is what lets a reader ask the context in a process that never initialises
     distributed -- every unit test that builds a scheduler component, for one.
@@ -3066,6 +3096,58 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().pp_size, 2)
         info = checker._parallelism_info()
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
+
+
+class TestTheRecordIsNeverWrittenTo(CustomTestCase):
+    """`server_args` is the startup record; the bags are the truth afterwards.
+
+    Writing a field onto it after `resolve_once()` has sealed it puts a second
+    answer where there is supposed to be one, and it is invisible to anything
+    reading the bag. The sanctioned writer is `RuntimeContext.override`, which
+    writes the bag and says so in its own contract. `arg_groups/` is exempt: it
+    is the resolution pipeline, so building the record is its job.
+    """
+
+    #: Assignments here are the record being built, not mutated behind a reader.
+    EXEMPT = ("srt/arg_groups/",)
+
+    def test_nothing_assigns_a_field_of_the_record(self):
+        import ast as _ast
+
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.server_args import ServerArgs
+
+        fields = set(namespace_of(ServerArgs))
+        offenders = []
+        for path in _sources():
+            rel = path.as_posix()
+            if "sglang/srt/" not in rel and "sglang/benchmark/" not in rel:
+                continue
+            if any(part in rel for part in self.EXEMPT):
+                continue
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                targets = (
+                    node.targets
+                    if isinstance(node, _ast.Assign)
+                    else [node.target]
+                    if isinstance(node, (_ast.AugAssign, _ast.AnnAssign))
+                    else []
+                )
+                for target in targets:
+                    if not isinstance(target, _ast.Attribute):
+                        continue
+                    base = target.value
+                    name = getattr(base, "id", getattr(base, "attr", None))
+                    if target.attr.startswith("_"):
+                        continue
+                    if name == "server_args" and target.attr in fields:
+                        offenders.append(f"{rel}:{target.lineno} .{target.attr}")
+        self.assertEqual(
+            offenders,
+            [],
+            "write the bag through get_context().override(source, ...) instead "
+            "-- the record is not a channel:\n  " + "\n  ".join(offenders),
+        )
 
 
 class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
