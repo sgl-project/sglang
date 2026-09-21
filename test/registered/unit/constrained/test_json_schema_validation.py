@@ -127,6 +127,7 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
                     },
                 },
                 "required": ["name"],
+                "additionalProperties": False,
             }
         )
 
@@ -155,7 +156,7 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
             {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
-                "additionalProperties": False,
+                "additionalProperties": True,
             },
             {
                 "type": "array",

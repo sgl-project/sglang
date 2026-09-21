@@ -21,6 +21,80 @@ from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
+_NVFP4_PREFILL_BACKEND = {
+    "fp8_e4m3": "flashinfer",
+    "nvfp4": "trtllm_mha",
+}
+_NVFP4_PREFILL_DEQUANT_DTYPE = {
+    backend: dtype for dtype, backend in _NVFP4_PREFILL_BACKEND.items()
+}
+
+
+def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
+    """Resolve the public prefill dequantization dtype to attention backends."""
+
+    cfg = resolving_view(server_args)
+    requested_dtype = cfg.prefill_kv_cache_dequant_dtype
+    if cfg.kv_cache_dtype != "nvfp4":
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dequant-dtype applies only with "
+                "--kv-cache-dtype=nvfp4."
+            )
+        return
+
+    if requested_dtype == "auto":
+        explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
+        if explicit_backend in _NVFP4_PREFILL_DEQUANT_DTYPE:
+            requested_dtype = _NVFP4_PREFILL_DEQUANT_DTYPE[explicit_backend]
+        else:
+            if explicit_backend is not None:
+                raise ValueError(
+                    "NVFP4 prefill supports an FP8 E4M3 workspace or native "
+                    f"NVFP4, but backend {explicit_backend!r} provides neither."
+                )
+            requested_dtype = "nvfp4" if get_platform().is_sm100 else "fp8_e4m3"
+
+    if requested_dtype == "nvfp4" and not get_platform().is_sm100:
+        raise ValueError(
+            "Native NVFP4 prefill currently requires SM100; use "
+            "--prefill-kv-cache-dequant-dtype=fp8_e4m3 on this platform."
+        )
+
+    target_prefill_backend = _NVFP4_PREFILL_BACKEND[requested_dtype]
+    explicit_prefill_backend = cfg.prefill_attention_backend
+    if (
+        explicit_prefill_backend is not None
+        and explicit_prefill_backend != target_prefill_backend
+    ):
+        raise ValueError(
+            f"--prefill-kv-cache-dequant-dtype={requested_dtype} requires prefill "
+            f"backend {target_prefill_backend!r}, but "
+            f"--prefill-attention-backend={explicit_prefill_backend!r} was set. "
+            "Remove the backend option and select the KV dtype only."
+        )
+
+    explicit_decode_backend = cfg.decode_attention_backend
+    if explicit_decode_backend not in (None, "trtllm_mha"):
+        raise ValueError(
+            "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
+            f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
+            "selects the supported decode implementation automatically."
+        )
+
+    updates = {
+        "prefill_attention_backend": target_prefill_backend,
+        "decode_attention_backend": "trtllm_mha",
+    }
+    if cfg.prefill_kv_cache_dequant_dtype == "auto":
+        updates["prefill_kv_cache_dequant_dtype"] = requested_dtype
+    declare_resolution(server_args, "_handle_nvfp4_prefill_kv_dequant_dtype", **updates)
+    logger.info(
+        "NVFP4 prefill dequant dtype: %s; prefill input: %s; decode input: nvfp4.",
+        requested_dtype,
+        requested_dtype,
+    )
+
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
@@ -54,14 +128,149 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
                 "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
             )
-        if (
-            prefill_backend != decode_backend and prefill_backend != "fa4"
-        ):  # Take care of prefill=fa4 later
-            logger.warning(
-                f"Attention: Using KV4 with PREFILL = {prefill_backend} "
-                f"and DECODE = {decode_backend}. "
-                f"Compatibility issues are unlikely, but may occur in rare edge cases."
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "FP4 KV cache does not yet support --enable-unified-memory: "
+                "the unified MHA pool does not allocate FP4 block scales or "
+                "the prefill dequant workspace."
             )
+
+        # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
+        # transfer and host-tier pools do not preserve that layout yet. Keep
+        # these combinations fail-fast while allowing target verification to
+        # reuse the same monolithic cache and GenMHA kernels.
+        uses_sm100_trtllm_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
+            and get_platform().is_sm100
+            and "trtllm_mha" in (prefill_backend, decode_backend)
+        )
+        uses_mixed_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
+            and prefill_backend == "flashinfer"
+            and decode_backend == "trtllm_mha"
+        )
+        uses_sm100_mixed_nvfp4 = uses_sm100_trtllm_nvfp4 and uses_mixed_nvfp4
+        speculative_algorithm = (
+            cfg.speculative_algorithm.upper()
+            if cfg.speculative_algorithm is not None
+            else None
+        )
+        supported_native_spec_algorithms = {
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+            "NGRAM",
+        }
+        if uses_sm100_trtllm_nvfp4 and speculative_algorithm in (
+            "DFLASH",
+            "DSPARK",
+        ):
+            # These workers commit only a prefix of a dense candidate block
+            # through set_kv_buffer_prefix_valid(). That specialized writer
+            # does not produce GenMHA's physical K/V scale layout yet.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding does not yet support "
+                f"{speculative_algorithm}; use EAGLE/NEXTN or NGRAM."
+            )
+        if (
+            uses_sm100_trtllm_nvfp4
+            and speculative_algorithm is not None
+            and speculative_algorithm not in supported_native_spec_algorithms
+        ):
+            # Do not silently treat STANDALONE, FROZEN_KV_MTP, or a custom
+            # plugin algorithm as EAGLE. Their draft/cache-commit contracts may
+            # differ, and none currently has native-layout coverage here.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding supports EAGLE, "
+                "EAGLE3, NEXTN, and breadth-1 NGRAM; got "
+                f"{speculative_algorithm}."
+            )
+        if (
+            uses_sm100_trtllm_nvfp4
+            and speculative_algorithm == "NGRAM"
+            and cfg.speculative_ngram_max_bfs_breadth != 1
+        ):
+            # TRT-LLM MHA's target-verify metadata supports a linear chain
+            # only. NGRAM defaults to a breadth-10 tree, so reject that default
+            # explicitly rather than reaching the later generic paged-backend
+            # assertion with a misleading compatibility message.
+            raise ValueError(
+                "SM100 native NVFP4 NGRAM speculative decoding requires "
+                "--speculative-ngram-max-bfs-breadth=1 because trtllm_mha "
+                "supports linear target verification only; got "
+                f"{cfg.speculative_ngram_max_bfs_breadth}."
+            )
+        uses_draft_model = speculative_algorithm not in (None, "NGRAM")
+        if uses_sm100_trtllm_nvfp4 and uses_draft_model:
+            # A draft worker owns another physical KV pool. It cannot inherit a
+            # target-only hybrid pair: draft-extend would then select the
+            # prefill child even though the draft pool and its block scales use
+            # the native GenMHA layout. Give every draft phase one layout and
+            # one backend, including prefill-graph capture and multi-step
+            # decode. This also covers explicit hybrid target configurations,
+            # for which the model-default hook intentionally does not choose a
+            # draft backend.
+            draft_backend = cfg.speculative_draft_attention_backend
+            if draft_backend is None:
+                logger.warning(
+                    "SM100 native NVFP4 speculative decoding uses trtllm_mha "
+                    "for the draft worker."
+                )
+                declare_resolution(
+                    server_args,
+                    "_handle_kv4_compatibility",
+                    speculative_draft_attention_backend="trtllm_mha",
+                )
+            elif draft_backend != "trtllm_mha":
+                raise ValueError(
+                    "SM100 native NVFP4 speculative decoding requires "
+                    "--speculative-draft-attention-backend=trtllm_mha so the "
+                    "draft worker consumes its physical NVFP4 KV layout; got "
+                    f"{draft_backend!r}."
+                )
+        if (
+            uses_sm100_mixed_nvfp4
+            and cfg.speculative_algorithm is not None
+            and cfg.speculative_attention_mode == "prefill"
+        ):
+            # FlashInfer prefill reads a transient FP8 dequant workspace. Its
+            # host-built page layout cannot be refreshed inside a target-verify
+            # CUDA graph, whereas the decode child consumes the physical NVFP4
+            # cache directly for both eager and graph execution.
+            logger.warning(
+                "SM100 mixed NVFP4 speculative decoding routes target verify "
+                "to trtllm_mha; overriding --speculative-attention-mode=prefill "
+                "to decode."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_kv4_compatibility",
+                speculative_attention_mode="decode",
+            )
+        if uses_sm100_trtllm_nvfp4 and cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support PD "
+                "disaggregation because its physical block-scale layout is not "
+                "implemented by the KV transfer path."
+            )
+        if uses_sm100_trtllm_nvfp4 and (
+            cfg.enable_hierarchical_cache or cfg.enable_lmcache
+        ):
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support "
+                "hierarchical KV cache or LMCache because their host pools do "
+                "not preserve the physical block-scale layout."
+            )
+
+        if prefill_backend != decode_backend and prefill_backend != "fa4":
+            # NVFP4 with FP8 prefill is a supported mixed-storage recipe.
+            if not uses_mixed_nvfp4:
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {prefill_backend} "
+                    f"and DECODE = {decode_backend}. "
+                    "Compatibility issues are unlikely, but may occur in rare "
+                    "edge cases."
+                )
         else:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
@@ -163,6 +372,24 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disable-priority-preemption when priority scheduling is enabled."
         )
 
+    if cfg.radix_eviction_policy == "tlru":
+        tlru_config = cfg.radix_eviction_policy_config or {}
+        threshold = tlru_config.get("threshold", 0)
+        next_prompt_estimate = tlru_config.get("next_prompt_estimate", 0)
+        if threshold < 0 or next_prompt_estimate < 0:
+            raise ValueError(
+                "--radix-eviction-policy tlru requires non-negative 'threshold' and "
+                "'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} and {next_prompt_estimate}."
+            )
+        if threshold <= next_prompt_estimate:
+            raise ValueError(
+                "--radix-eviction-policy tlru needs 'threshold' greater than "
+                f"'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
+                "ever TEL-safe and T-LRU is exactly LRU."
+            )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -185,6 +412,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg._swa_full_tokens_ratio_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
@@ -192,6 +426,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # claimed the field, and the value to range-check is the effective one.
     if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    prefix_tails = resolved_view(server_args).swa_prefix_tails
+    if prefix_tails is not None and prefix_tails < 0:
+        raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
@@ -200,17 +437,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     if not cfg.enable_unified_memory:
         return
     if cfg.disaggregation_mode != "null":
-        # Constraints of the whole-envelope transfer; see
-        # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
-        assert cfg.disaggregation_transfer_backend == "mooncake", (
-            "--enable-unified-memory with PD disaggregation supports only "
-            "the mooncake transfer backend; got "
+        # Constraints of the whole-envelope transfer; see the unified MHA and
+        # MLA pool get_contiguous_buf_infos implementations.
+        supported_backends = server_args._unified_memory_pd_transfer_backends()
+        assert cfg.disaggregation_transfer_backend in supported_backends, (
+            "--enable-unified-memory with PD disaggregation supports only these "
+            f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
+        )
+        assert not (
+            cfg.disaggregation_transfer_backend == "mooncake"
+            and cfg.speculative_algorithm is not None
+        ), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "speculative decoding with the Mooncake transfer backend."
         )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with PD disaggregation requires lazy "
@@ -221,6 +466,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "with --enable-hisparse: the decode-side HiSparse prealloc path "
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
+        )
+        assert cfg.disaggregation_decode_retraction_backup != "host_pool", (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "--disaggregation-decode-retraction-backup=host_pool; use "
+            "cpu_tensor (the automatic default for unified pools)."
+        )
+        assert not cfg.disaggregation_decode_enable_offload_kvcache, (
+            "--enable-unified-memory with PD disaggregation does not yet support "
+            "--disaggregation-decode-enable-offload-kvcache."
         )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "

@@ -7,7 +7,6 @@ across representative configurations. A field that moves without a declaration
 or is projected into the wrong namespace therefore fails on observed state.
 """
 
-import ast
 import copy
 import json
 import os
@@ -133,33 +132,18 @@ def _stash_overlay(server_args):
 
 
 def _live_topology_leaves():
-    """Names `ParallelContext` serves from the live topology, not the config.
+    """Names `ParallelContext` answers from a runtime write, not the config.
 
-    Read out of the class: each shadowed name arrives as `self._v("<name>",
-    <getter>)`. Inferring them from "did the read raise" is wrong -- it only
-    raises while the process groups are missing, so in a process where an
-    earlier test built them the property answers the *live* size and a leaf
-    check reads it as a config mismatch (`parallel.tp_size: bag=1
-    resolution=2`). Whether they are shadowed is a property of the class, not
-    of the process.
+    Read off the declarations that carry no `fn`, which is what those are.
+    Inferring them from "did the read raise" is wrong -- it raises only while
+    nothing has written the name, so in a process where an earlier test stated
+    one the property answers that value and a leaf check reads it as a config
+    mismatch (`parallel.tp_size: bag=1 resolution=2`). Whether a name is
+    shadowed is a property of the declaration, not of the process.
     """
-    tree = ast.parse((_SRT / "runtime_context.py").read_text(encoding="utf-8-sig"))
-    parallel = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == "ParallelContext"
-    )
-    names = set()
-    for node in ast.walk(parallel):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_v"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-        ):
-            names.add(node.args[0].value)
-    return frozenset(names)
+    from sglang.srt.runtime_context import _derived_widths
+
+    return frozenset(n for n, d in _derived_widths().items() if not d.fn)
 
 
 class TestResolutionDeclarations(CustomTestCase):
