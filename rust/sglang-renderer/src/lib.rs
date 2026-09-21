@@ -37,6 +37,7 @@ pub use postprocessing::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
 pub(crate) use preprocessing::ChatFormatter;
+pub use preprocessing::RegexPattern;
 pub(crate) use preprocessing::SamplingParamsOverrides;
 pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
 pub use preprocessing::{

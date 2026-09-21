@@ -9,9 +9,10 @@ use std::fmt;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use sglang_renderer::RegexPattern;
 
 use super::types::OneOrMany;
-use crate::utils::{error::Error, regex::RegexPattern};
+use crate::utils::error::Error;
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;
