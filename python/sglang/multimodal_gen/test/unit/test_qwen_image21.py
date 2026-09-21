@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
 )
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
@@ -34,9 +36,11 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21RMS_norm,
+    QwenImage21Upsample,
     _patchify,
     _unpatchify,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -45,6 +49,28 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21InputValidationStage,
     collapse_image_slots,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["contiguous", "channels_last", "transposed"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nearest_upsample_preserves_every_finite_low_precision_value(
+    dtype, layout, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(dtype)
+    values = values[torch.isfinite(values)].reshape(1, 2, -1, 128).to(device)
+    if layout == "channels_last":
+        values = values.contiguous(memory_format=torch.channels_last)
+    elif layout == "transposed":
+        values = values.transpose(2, 3)
+    upsample = QwenImage21Upsample(scale_factor=2, mode="nearest-exact")
+    expected = torch.nn.functional.interpolate(
+        values.float(), scale_factor=2, mode="nearest-exact"
+    ).to(dtype)
+    actual = upsample(values)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("prompt", ["edit", ""])
@@ -152,6 +178,75 @@ def test_condition_slots_expand_to_actual_latent_grid():
     torch.testing.assert_close(collapsed[slots][0], hidden[2])
 
 
+class _RecordingBlock(torch.nn.Module):
+    def __init__(self, layer_id):
+        super().__init__()
+        self._layer_id = layer_id
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        caches = [cache[self._layer_id] for cache in args[-1]]
+        self.seen = caches[0]
+        return hidden_states
+
+
+class _UnifiedBlocks(torch.nn.Module):
+    def __init__(self, blocks):
+        super().__init__()
+        self.transformer_blocks = torch.nn.ModuleList(blocks)
+
+    def forward(self, hidden_states, *args):
+        x = hidden_states
+        for block in self.transformer_blocks:
+            x = block(x, *args)
+        return x
+
+
+def _run_blocks(blocks, prefix_caches):
+    x = torch.zeros(1)
+    for block in blocks:
+        x = block(x, prefix_caches)
+    return x
+
+
+def test_cache_dit_wrapper_keeps_per_layer_prefix_kv():
+    inner = [_RecordingBlock(0), _RecordingBlock(1), _RecordingBlock(2)]
+    wrapped = torch.nn.ModuleList([_UnifiedBlocks(inner)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}, {"layer": 2}]]
+
+    _run_blocks(wrapped, prefix_caches)
+    assert [block.seen for block in inner] == prefix_caches[0]
+
+
+def test_plain_blocks_still_get_per_layer_prefix_kv():
+    blocks = torch.nn.ModuleList([_RecordingBlock(0), _RecordingBlock(1)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    _run_blocks(blocks, prefix_caches)
+    assert [block.seen for block in blocks] == prefix_caches[0]
+
+
+class _FirstSlotBlock(torch.nn.Module):
+    """Old loop body: take caches[0] and broadcast it to every layer."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        self.seen = args[-1][0]
+        return hidden_states
+
+
+def test_first_slot_only_caches_are_shared_across_layers():
+    inner = [_FirstSlotBlock(), _FirstSlotBlock()]
+    unified = _UnifiedBlocks(inner)
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    unified(torch.zeros(1), [cache[0] for cache in prefix_caches])
+    assert [block.seen for block in inner] == [prefix_caches[0][0], prefix_caches[0][0]]
+
+
 def test_adjacent_image_slots_stay_distinct():
     layout = build_layout(
         [False, True, True, False], [(1, 2, 2), (1, 4, 2), (1, 2, 2)], (4, 6, 6), "cpu"
@@ -182,6 +277,31 @@ def test_latent_pack_decode_contract():
     torch.testing.assert_close(
         (decoded.float() - shift) * scale / scale + shift, decoded.float()
     )
+
+
+@pytest.mark.parametrize("outputs", [1, 2])
+def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
+    scheduler = object.__new__(Scheduler)
+    config = QwenImage21PipelineConfig()
+    scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    scheduler._batch_admission = SimpleNamespace(enabled=True)
+    assert scheduler._dynamic_batching_enabled()
+    requests = []
+    for i, prompt in enumerate(["short", "a longer prompt"]):
+        params = QwenImage21SamplingParams(
+            prompt=prompt, seed=7 + i * 10, num_outputs_per_prompt=outputs
+        )
+        requests.append(Req(request_id=f"request-{i}", sampling_params=params))
+    merged = scheduler._try_merge_generation_reqs(requests)
+    assert merged.prompt == ["short", "a longer prompt"]
+    assert merged.extra["dynamic_batch_seeds"] == [7, 17]
+    result = torch.arange(outputs * 2).reshape(-1, 1)
+    split = scheduler._split_batched_output(OutputBatch(output=result), requests)
+    assert len(split) == 2
+    torch.testing.assert_close(split[0].output, result[:outputs])
+    torch.testing.assert_close(split[1].output, result[outputs:])
+    requests[1].image_path = "reference.png"
+    assert scheduler._try_merge_generation_reqs(requests) is None
 
 
 @pytest.mark.parametrize("channels", [3, 4])

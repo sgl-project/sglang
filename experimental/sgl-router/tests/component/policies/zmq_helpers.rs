@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared ZMQ wire-format helpers for the `policies::kv_events` component
+//! Shared ZMQ wire-format helpers for the `state::kv_events` component
 //! tests. Encodes events in the same msgspec layout SGLang emits, builds
 //! the two-frame `[seq, payload]` ZMQ message a real publisher sends, and
 //! binds a loopback PUB socket on an OS-assigned port.

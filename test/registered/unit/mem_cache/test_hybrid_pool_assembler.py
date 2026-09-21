@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _split_hicache_size,
     _SwaStrategy,
     build_full_draft_pools,
+    build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -153,7 +154,10 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     with patch.object(
                         hybrid_pool_assembler,
                         builder_name,
-                        return_value=(MagicMock(), object()),
+                        return_value=(
+                            MagicMock(),
+                            SimpleNamespace(transfer_layer_id_max=4),
+                        ),
                     ) as build_stack:
                         result = strategy_cls().build(
                             cache=SimpleNamespace(page_size=1),
@@ -169,7 +173,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                             build_stack.call_args.kwargs[f"{name}_layer_mapping"],
                             mapping,
                         )
-                    self.assertEqual(result.transfer_layer_num, 4)
+                    self.assertEqual(result.cache_controller.transfer_layer_id_max, 4)
                     self.assertEqual(
                         kvcache.full_attention_layer_id_mapping, global_maps["full"]
                     )
@@ -227,6 +231,45 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
+
+
+_ASSEMBLER = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+
+
+class TestTransferLayerSpan(CustomTestCase):
+    """``transfer_layer_id_max`` must span global layer ids, not count the mapped ones.
+
+    A hybrid model with an uncached layer type keys its mappings non-contiguously,
+    and the per-layer transfer loop then never reaches the high layer ids.
+    """
+
+    def test_pool_entries_span_the_highest_global_layer_id(self):
+        # Global ids 0/2/4/6 with holes between them, the shape NemotronH's
+        # cache-ineligible MLP layers produce: 4 mapped layers spanning 7 ids.
+        full_layer_mapping = {0: 0, 6: 1}
+        swa_layer_mapping = {2: 0, 4: 1}
+
+        with (
+            patch(_ASSEMBLER + "build_kv_host_pool"),
+            patch(_ASSEMBLER + "HostPoolGroup"),
+            patch(_ASSEMBLER + "build_pool_entry") as build_pool_entry,
+        ):
+            build_hybrid_swa_group(
+                page_size=64,
+                full_kv_pool=MagicMock(),
+                swa_kv_pool=MagicMock(),
+                full_layer_mapping=full_layer_mapping,
+                swa_layer_mapping=swa_layer_mapping,
+                use_mla=False,
+            )
+
+        self.assertEqual(
+            [
+                c.kwargs["transfer_layer_id_max"]
+                for c in build_pool_entry.call_args_list
+            ],
+            [7, 7],
+        )
 
 
 if __name__ == "__main__":
