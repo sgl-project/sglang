@@ -40,7 +40,7 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.dsa_decode_impl = "fa3"
     backend.dsa_prefill_impl = "fa3"
     backend.enable_auto_select_prefill_impl = False
-    backend.token_to_kv_pool = SimpleNamespace(slots_per_page=64)
+    backend.token_to_kv_pool = SimpleNamespace(index_kernel_page_size=64)
     # Only attention-dispatch state is synthetic; every metadata kernel is real.
     backend._is_in_breakable_cuda_graph = lambda: False
     backend._is_in_tc_piecewise_cuda_graph = lambda: False

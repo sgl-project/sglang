@@ -114,6 +114,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_schedule,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -1527,13 +1528,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _full_kv_pages_payload():
+            def _full_kv_pages_payload(
+                transfer_page_size=self.token_to_kv_pool.page_size,
+            ):
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx, :seq_len
                 ]
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                return kv_to_page_indices(kv_indices_full, transfer_page_size)
 
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
@@ -1575,7 +1576,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: lambda: _full_kv_pages_payload(get_schedule().page_size),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,

@@ -40,7 +40,7 @@ def gather_index_k_scale_prefix_into(
     assert page_indices.dtype in (torch.int32, torch.int64)
     assert k_out.dtype == torch.uint8
     assert scale_out.dtype == torch.float32
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.index_kernel_page_size == BLOCK_SIZE_K
     assert k_out.shape[0] >= seq_len
     assert k_out.shape[1] == INDEX_HEAD_DIM
     assert scale_out.shape[0] >= seq_len
@@ -57,10 +57,10 @@ def gather_index_k_scale_prefix_into(
         page_indices,
         k_out,
         scale_out,
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=pool.index_kernel_page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
+        S_OFFSET_NBYTES_IN_PAGE=pool.index_kernel_page_size * INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
     )
 
@@ -664,7 +664,7 @@ def kpool_softmax_rotate_write_cache(
     assert slot_score.dtype in KPOOL_SCORE_DTYPES
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.index_kernel_page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert loc.dtype == torch.int64
     assert write_cache or return_compressed
@@ -723,11 +723,11 @@ def kpool_softmax_rotate_write_cache(
         slot_score.stride(0),
         slot_score.stride(1),
         ape.stride(0),
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=pool.index_kernel_page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * pool.index_head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=pool.index_kernel_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
@@ -767,7 +767,7 @@ def kpool_decode_update_and_maybe_write_cache(
     assert slot_score.dtype == tail_score.dtype
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
+    assert pool.index_kernel_page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert tail_k.is_contiguous()
     assert tail_score.is_contiguous()
@@ -816,16 +816,16 @@ def kpool_decode_update_and_maybe_write_cache(
         block_tables.stride(0),
         block_tables.stride(1),
         REQ_POOL_SIZE=tail_k.shape[0],
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=pool.index_kernel_page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         POOL_SIZE=pool.index_kpool,
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=tail_k.shape[2],
         BLOCK_TABLE_COLS=block_tables.shape[1],
-        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=pool.index_kernel_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
-        SLOTS_PER_PAGE=pool.slots_per_page,
+        SLOTS_PER_PAGE=pool.index_kernel_page_size,
     )
 
 
@@ -1269,7 +1269,7 @@ def kpool_assemble_softmax_rotate_write_cache(
 
     buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
-    slots_per_page = pool.slots_per_page
+    slots_per_page = pool.index_kernel_page_size
 
     _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
         buf_fp8,
@@ -1664,7 +1664,7 @@ def kpool_write_tail_and_maybe_compress(
     if effective_n_per_batch is not None:
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
-    slots_per_page = pool.slots_per_page
+    slots_per_page = pool.index_kernel_page_size
     buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](

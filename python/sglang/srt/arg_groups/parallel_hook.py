@@ -162,6 +162,8 @@ def handle_shared_experts_tp(server_args: Any):
 
 
 def handle_decode_context_parallelism(server_args: Any):
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
@@ -193,6 +195,29 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+    if (
+        cfg.dcp_size == 1
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+    ):
+        return
+
+    model_config = model_config_of(server_args)
+    if is_deepseek_dsa(model_config.hf_config) and (
+        not get_platform().is_cuda
+        or model_config.qk_rope_head_dim != 0
+        or cfg.dsa_prefill_backend != "tilelang"
+        or cfg.dsa_decode_backend != "tilelang"
+        or cfg.dsa_topk_backend == "torch"
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+        or cfg.enable_hisparse
+        or cfg.enable_prefill_cp
+    ):
+        raise ValueError(
+            "DSA decode context parallelism requires CUDA NoPE MLA, "
+            "tilelang prefill/decode, and fused top-k; "
+            "HiSparse and prefill CP cannot be combined with it."
+        )
 
 
 def handle_data_parallelism(server_args: Any):

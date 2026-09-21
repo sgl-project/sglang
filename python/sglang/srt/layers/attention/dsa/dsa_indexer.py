@@ -563,7 +563,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_kernel_page_size
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -1361,7 +1361,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                pool.index_kernel_page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
@@ -1370,7 +1370,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                pool.index_kernel_page_size,
             )
             return
 
@@ -1380,7 +1380,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
+            page_size = pool.index_kernel_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc

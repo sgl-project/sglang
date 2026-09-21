@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
+from sglang.srt.utils.common import (
+    is_fi_a2a_supported,
+    is_mps,
+    is_no_spec_infer_or_topk_one,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +180,28 @@ def attention_backends_of(cfg: Any) -> tuple:
         else cfg.attention_backend
     )
     return prefill, decode
+
+
+def dcp_comm_backend_of(cfg: Any) -> str:
+    """The DCP communication backend the launch resolves to: the explicit
+    ``--dcp-comm-backend`` if set, else the platform default that
+    ``handle_decode_context_parallelism`` declares. A model override runs
+    before that hook, so it reads the answer here rather than the field."""
+    if cfg.dcp_comm_backend is not None:
+        return cfg.dcp_comm_backend
+    if cfg.dcp_size <= 1:
+        return "ag_rs"
+    if is_fi_a2a_supported(
+        dcp_size=cfg.dcp_size,
+        tp_size=cfg.tp_size,
+        pp_size=cfg.pp_size,
+        nnodes=cfg.nnodes,
+    ):
+        return "fi_a2a"
+    platform = get_platform()
+    if platform.is_cuda or platform.is_hip:
+        return "a2a"
+    return "ag_rs"
 
 
 def _register_for(*architectures: str):

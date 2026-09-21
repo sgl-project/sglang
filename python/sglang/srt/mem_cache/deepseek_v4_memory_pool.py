@@ -502,6 +502,7 @@ class DeepSeekV4IndexerPool(KVCache):
             start_layer,
             end_layer,
         )
+        self.index_kernel_page_size = self.page_size
         self.index_head_dim = index_head_dim
         if use_fp4_indexer is None:
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer

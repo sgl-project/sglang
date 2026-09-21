@@ -32,6 +32,7 @@ def test_split_full_attention_applies_model_wrapper_once():
     override.install()
     try:
         runner = SimpleNamespace(
+            is_draft_worker=False,
             server_args=SimpleNamespace(speculative_attention_mode="prefill"),
             model_config=SimpleNamespace(context_len=2048),
             kv_cache_dtype=None,

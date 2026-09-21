@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -84,6 +85,15 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    # NOTE(kpham-sgl): Replicated drafts and backends without DCP use a local span.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+
+    def _init_dcp(self, is_draft_worker: bool) -> None:
+        parallel = get_parallel()
+        self.dcp_size = 1 if is_draft_worker else parallel.attn_dcp_size
+        self.dcp_rank = 0 if is_draft_worker else parallel.attn_dcp_rank
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.

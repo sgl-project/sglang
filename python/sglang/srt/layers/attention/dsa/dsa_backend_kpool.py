@@ -68,7 +68,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return dsa_impl
 
     def _kpool_slots_per_page(self) -> int:
-        return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
+        return self.token_to_kv_pool.index_kernel_page_size
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:

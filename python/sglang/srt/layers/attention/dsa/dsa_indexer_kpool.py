@@ -343,7 +343,7 @@ class IndexerKPool(MultiPlatformOp):
                         max_req = int(active_req.max().item())
                         min_loc = int(active_write_loc.min().item())
                         max_loc = int(active_write_loc.max().item())
-                        max_page = max_loc // int(pool.slots_per_page)
+                        max_page = max_loc // int(pool.index_kernel_page_size)
                         if (
                             min_chunk < 0
                             or max_chunk >= key.shape[0]
@@ -361,7 +361,7 @@ class IndexerKPool(MultiPlatformOp):
                                 f"{key.shape=}, {gate_score.shape=}, {tail_k_buf.shape=}, "
                                 f"{pool.get_index_k_with_scale_buffer(layer_id=layer_id).shape=}, "
                                 f"{min_chunk=}, {max_chunk=}, {min_req=}, {max_req=}, "
-                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}"
+                                f"{min_loc=}, {max_loc=}, {pool.index_kernel_page_size=}"
                             )
                 if not tails.is_empty:
                     tail_chunk_max = tails.chunk_src.to(torch.long) + torch.clamp(
@@ -822,7 +822,7 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.index_kernel_page_size
         # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 

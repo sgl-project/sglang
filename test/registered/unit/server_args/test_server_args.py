@@ -52,9 +52,11 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    _dcp_comm_backend_default,
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
     resolution_result,
+    run_post_process_pass,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -3965,7 +3967,7 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 class TestDcpCommBackendDefault(CustomTestCase):
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)
-        parallel_hook.handle_decode_context_parallelism(args)
+        run_post_process_pass(args, _dcp_comm_backend_default)
         return resolution_result(args, "dcp_comm_backend")
 
     def test_no_dcp_is_ag_rs(self):
@@ -3974,28 +3976,32 @@ class TestDcpCommBackendDefault(CustomTestCase):
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=True,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_a2a_on_cuda_without_mnnvl(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=False,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
     @override_platform(is_cuda=False, is_hip=False)
     def test_ag_rs_off_cuda(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=False,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=True,
         ):
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"

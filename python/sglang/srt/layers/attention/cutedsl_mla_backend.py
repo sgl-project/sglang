@@ -33,7 +33,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
@@ -149,10 +148,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        parallel = get_parallel()
-        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+        if self.dcp_size > 1 and get_in_autotune_dummy_run():
             return self._dummy_dcp_decode_for_autotune(q, layer)
-        if not parallel.dcp_enabled:
+        if self.dcp_size == 1:
             return super().forward_decode(
                 q,
                 k,
@@ -256,8 +254,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
             causal_seqs=global_seq_lens,
-            cp_world=parallel.dcp_size,
-            cp_rank=parallel.dcp_rank,
+            cp_world=self.dcp_size,
+            cp_rank=self.dcp_rank,
             return_lse=True,
         )
 

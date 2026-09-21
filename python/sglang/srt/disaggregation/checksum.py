@@ -71,7 +71,7 @@ def state_indices_for_request(
         )
         return _to_page_indices_gpu(window_swa, page_size)
     if isinstance(pool, DSATokenToKVPool):
-        device_page_size = pool.page_size
+        device_page_size = pool.index_kernel_page_size
         kv_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :seq_len
         ]

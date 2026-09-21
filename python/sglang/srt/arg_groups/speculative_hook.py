@@ -985,6 +985,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=draft_tokens,
         )
 
+    if cfg.dcp_size > 1 and cfg.speculative_eagle_topk > 1:
+        raise ValueError(
+            "DCP with EAGLE-family speculative decoding requires "
+            "--speculative-eagle-topk 1; tree drafting is not supported."
+        )
+
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if cfg.speculative_eagle_topk > 1:
             raise ValueError(

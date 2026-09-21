@@ -1375,11 +1375,11 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _full_kv_pages_payload():
+            def _full_kv_pages_payload(transfer_page_size=page_size):
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return kv_to_page_indices(kv_indices_full, transfer_page_size)
 
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
@@ -1420,7 +1420,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: lambda: _full_kv_pages_payload(get_schedule().page_size),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,

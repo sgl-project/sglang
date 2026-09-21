@@ -132,6 +132,7 @@ class _Runner:
     """HybridAttnBackend takes its translator from the runner, not an inner."""
 
     def __init__(self, translator):
+        self.is_draft_worker = False
         self.kv_index_translator = translator
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
