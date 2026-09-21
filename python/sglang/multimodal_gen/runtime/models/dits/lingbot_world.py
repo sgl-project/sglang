@@ -312,6 +312,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         current_start: int = 0,
         cache_start: int | None = None,
         update_cache_only: bool = False,
+        complex_freqs: torch.Tensor | None = None,
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
@@ -321,6 +322,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             cos=cos,
             sin=sin,
             cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
         )
         roped_query = roped_query.type_as(v)
         roped_key = roped_key.type_as(v)
@@ -1331,6 +1333,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         c2ws_plucker_emb: torch.Tensor | None = None,
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1361,6 +1364,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             current_start,
             cache_start,
             update_cache_only=update_cache_only,
+            complex_freqs=complex_freqs,
         )
         if update_cache_only:
             return hidden_states
@@ -1844,6 +1848,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cam_conditioner_scale_shifts = self._prepare_cam_conditioner_scale_shifts(
             c2ws_plucker_emb, forward_batch
         )
+        # Built once per forward, not per block; forward_cuda ignores it.
+        complex_freqs = torch.complex(freqs_cis[0], freqs_cis[1]).unsqueeze(-2)
 
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(
@@ -1864,6 +1870,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
+                complex_freqs=complex_freqs,
             )
 
         if skip_final_projection:
