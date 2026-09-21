@@ -142,9 +142,22 @@ where
                 if !end.saw_error_event {
                     end.saw_error_event = scanner.feed(&bytes);
                 }
-                if tx.send(bytes).await.is_err() {
-                    end.client_disconnect = true;
-                    return Ok(());
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        end.client_disconnect = true;
+                        return Ok(());
+                    }
+                    _ = &mut expired => {
+                        end.transport_ok = false;
+                        return Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"));
+                    }
+                    result = tx.send(bytes) => {
+                        if result.is_err() {
+                            end.client_disconnect = true;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         };
@@ -250,10 +263,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn expiration_stops_a_stream_that_keeps_producing() {
+    async fn expiration_releases_guards_while_queue_is_full() {
+        struct Release(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
         let token = CancellationToken::new();
-        let (body, end) = limited_body(
-            stream::repeat_with(|| Ok(Bytes::from_static(b"chunk"))),
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::repeat_with(|| Ok::<_, std::io::Error>(Bytes::from_static(b"chunk"))),
+            Some(Box::new(Release(Some(release_tx)))),
+            Some(Box::new(move |end| {
+                let _ = end_tx.send(end);
+            })),
+            None,
             StreamLimits {
                 idle_timeout: None,
                 expiration: Some(token.clone()),
@@ -261,6 +287,12 @@ mod tests {
         );
         tokio::task::yield_now().await;
         token.cancel();
+        // Cleanup must finish before the client frees any channel capacity.
+        tokio::time::timeout(Duration::from_millis(1), release_rx)
+            .await
+            .expect("expiration must release guards while the queue remains full")
+            .unwrap();
+        assert!(!end_rx.await.unwrap().transport_ok);
         // The queue is full, so the failure must ride the terminal channel.
         assert!(body
             .collect()
@@ -268,7 +300,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("stale_request_timeout"));
-        assert!(!end.await.unwrap().transport_ok);
     }
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {

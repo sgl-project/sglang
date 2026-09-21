@@ -65,8 +65,6 @@ pub(super) async fn forward_chat_request(
         request.input_token_count,
         0,
     );
-    // PD requests keep using the prefill expiration token after dispatching decode.
-    let expiration_token = active_request_guard.cancel_token().clone();
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
@@ -106,6 +104,9 @@ pub(super) async fn forward_chat_request(
         (prefill, prefill_load_guards)
     };
 
+    // In PD mode, prefill can finish before decode. Watch the registration
+    // held by the response so expiration remains live for its full lifetime.
+    let expiration_token = response_load_guards.1.cancel_token().clone();
     let response_future = forward_to_response_worker(
         ctx,
         &response_worker,
