@@ -169,7 +169,8 @@ async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
                     worker_ids: Some([WorkerId("w".into())].into()),
                     policy: Arc::new(policy),
                 }),
-            )]),
+            )])
+            .unwrap(),
         )]
         .into(),
     );
