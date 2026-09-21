@@ -2000,6 +2000,8 @@ class BaseMultimodalProcessor(ABC):
                     ("precomputed_embeddings", item.precomputed_embeddings),
                 )
                 for field, tensor in fields:
+                    if field == "feature" and item.keep_feature_on_cpu:
+                        continue
                     if not isinstance(tensor, torch.Tensor):
                         continue
                     wrapped = self._wrap_tensor_for_cuda_ipc(tensor)

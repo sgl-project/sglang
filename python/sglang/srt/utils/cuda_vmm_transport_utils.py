@@ -1077,6 +1077,7 @@ class CudaVmmFeatureTransport:
                 (item, item.feature)
                 for item in mm_items
                 if item.modality in (Modality.IMAGE, Modality.VIDEO)
+                and not item.keep_feature_on_cpu
                 and isinstance(item.feature, torch.Tensor)
                 and item.feature.numel() > 0
                 and not item.model_specific_data.get(
@@ -1100,6 +1101,8 @@ class CudaVmmFeatureTransport:
                     ("precomputed_embeddings", item.precomputed_embeddings),
                 )
                 for field, tensor in fields:
+                    if field == "feature" and item.keep_feature_on_cpu:
+                        continue
                     if _contains_tensor_container(tensor):
                         raise TypeError(
                             "CUDA VMM feature transport requires each feature "
