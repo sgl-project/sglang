@@ -711,10 +711,10 @@ def draft_pp_context():
 
 
 @contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
+def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
         yield
 
 
@@ -816,6 +816,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+    batch.mamba_prefill_track_mask_cpu = None
+    batch.mamba_track_seqlens_cpu = None
 
 
 def _verify_commit_step_indices(

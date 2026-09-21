@@ -89,6 +89,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
+              - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"

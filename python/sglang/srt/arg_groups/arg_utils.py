@@ -92,6 +92,9 @@ class Arg(msgspec.Struct, frozen=True):
     fallback: Any = None
 
 
+_NO_DEFAULT = object()
+
+
 class Derived(msgspec.Struct, frozen=True):
     """Metadata for a field the configuration implies, not one anyone types.
 
@@ -107,16 +110,27 @@ class Derived(msgspec.Struct, frozen=True):
     ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
     which is what a read inside compiled model code needs.
 
-    Every declaration carries ``fn`` today, the parallel quotients included:
+    A declaration with no ``fn`` is one nothing can compute: a rank, or a
+    process group. Those are written into the namespace at runtime -- by
+    ``publish`` from the spawn bundle, or by the build that creates the group --
+    and until then the name has no answer.
+
+    Most declarations carry ``fn``, the parallel quotients included:
     they are a function of the configured leaves, so they are computed at
     publish like the rest. What is special about them is not how they are
-    computed but that a stamp can move one afterwards -- an elastic scale-up
+    computed but that a stamp can move one afterwards -- ``initialize_dp_attention``
     restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
     published leaf.
     """
 
     doc: str = ""
     fn: str = ""
+    # For a declaration with no ``fn`` whose absence is itself an answer:
+    # ``gpu_id`` is ``None`` in a process that runs on no device, and a reader
+    # wants that rather than an error. A rank has no such value -- the wrong
+    # one is a hang in a collective -- so it carries no default and a read
+    # before the write says so.
+    default: Any = _NO_DEFAULT
 
 
 class NS(msgspec.Struct, frozen=True):
