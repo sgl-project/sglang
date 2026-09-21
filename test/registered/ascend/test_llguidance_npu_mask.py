@@ -69,18 +69,43 @@ class _FakeNpuOps:
 
 
 def _install_npu_mock():
-    """Install a fake ``sgl_kernel_npu`` and ``torch.ops.npu`` for testing."""
-    fake_ops = _FakeNpuOps()
+    """Install a fake ``sgl_kernel_npu`` and ``torch.ops.npu`` for testing.
 
-    if not hasattr(torch, "npu"):
+    Returns ``(fake_ops, restore)`` where ``restore()`` undoes global patches.
+    """
+    fake_ops = _FakeNpuOps()
+    created_npu = not hasattr(torch, "npu")
+    prev_is_available = getattr(getattr(torch, "npu", None), "is_available", None)
+    prev_ops_npu = getattr(torch.ops, "npu", None)
+    created_sgl = "sgl_kernel_npu" not in sys.modules
+
+    if created_npu:
         torch.npu = types.ModuleType("torch_npu_mock")
     torch.npu.is_available = lambda: True
     torch.ops.npu = fake_ops  # type: ignore[attr-defined]
 
-    if "sgl_kernel_npu" not in sys.modules:
+    if created_sgl:
         sys.modules["sgl_kernel_npu"] = MagicMock()
 
-    return fake_ops
+    def restore():
+        if created_sgl:
+            sys.modules.pop("sgl_kernel_npu", None)
+        if prev_ops_npu is None:
+            try:
+                delattr(torch.ops, "npu")
+            except Exception:
+                pass
+        else:
+            torch.ops.npu = prev_ops_npu  # type: ignore[attr-defined]
+        if created_npu:
+            try:
+                delattr(torch, "npu")
+            except Exception:
+                pass
+        elif prev_is_available is not None:
+            torch.npu.is_available = prev_is_available
+
+    return fake_ops, restore
 
 
 # ---------------------------------------------------------------------------
@@ -101,23 +126,25 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
 
         def test_npu_branch_dispatches_to_npu_kernel(self):
             """When logits are on npu, the NPU kernel is invoked (mocked)."""
-            fake_ops = _install_npu_mock()
+            fake_ops, restore = _install_npu_mock()
+            try:
+                vocab_size = 64
+                logits = torch.zeros((1, vocab_size), dtype=torch.float32)
+                logits[0, 16] = 22.125
+                logits[0, 5] = 10.0
 
-            vocab_size = 64
-            logits = torch.zeros((1, vocab_size), dtype=torch.float32)
-            logits[0, 16] = 22.125
-            logits[0, 5] = 10.0
+                allowed = [[5, 6, 7, 8]]
+                vocab_mask = _pack_mask(allowed, vocab_size)
 
-            allowed = [[5, 6, 7, 8]]
-            vocab_mask = _pack_mask(allowed, vocab_size)
+                npu_logits = logits.as_subclass(_NpuDeviceTensor)
+                GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask)
 
-            npu_logits = logits.as_subclass(_NpuDeviceTensor)
-            GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask)
-
-            self.assertIsNotNone(fake_ops.last_call)
-            passed_logits, passed_mask = fake_ops.last_call
-            self.assertTrue(torch.equal(passed_logits, npu_logits))
-            self.assertTrue(torch.equal(passed_mask, vocab_mask))
+                self.assertIsNotNone(fake_ops.last_call)
+                passed_logits, passed_mask = fake_ops.last_call
+                self.assertTrue(torch.equal(passed_logits, npu_logits))
+                self.assertTrue(torch.equal(passed_mask, vocab_mask))
+            finally:
+                restore()
 
         def test_cpu_branch_uses_llguidance_kernel(self):
             """When logits are on cpu, the generic llguidance kernel is used."""
@@ -137,26 +164,28 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
 
         def test_npu_branch_matches_reference(self):
             """The mocked NPU kernel matches the CPU reference result."""
-            _install_npu_mock()
+            _, restore = _install_npu_mock()
+            try:
+                vocab_size = 128
+                torch.manual_seed(42)
+                logits = torch.randn((2, vocab_size), dtype=torch.float32)
 
-            vocab_size = 128
-            torch.manual_seed(42)
-            logits = torch.randn((2, vocab_size), dtype=torch.float32)
+                allowed = [
+                    torch.randperm(vocab_size)[: vocab_size // 3].tolist(),
+                    torch.randperm(vocab_size)[: vocab_size // 4].tolist(),
+                ]
+                vocab_mask = _pack_mask(allowed, vocab_size, batch_size=2)
 
-            allowed = [
-                torch.randperm(vocab_size)[: vocab_size // 3].tolist(),
-                torch.randperm(vocab_size)[: vocab_size // 4].tolist(),
-            ]
-            vocab_mask = _pack_mask(allowed, vocab_size, batch_size=2)
+                npu_logits = logits.clone().as_subclass(_NpuDeviceTensor)
+                GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask)
 
-            npu_logits = logits.clone().as_subclass(_NpuDeviceTensor)
-            GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask)
-
-            ref = _apply_ref_cpu(logits, vocab_mask)
-            self.assertTrue(
-                torch.equal(torch.isfinite(npu_logits), torch.isfinite(ref)),
-                "NPU branch finiteness pattern diverges from CPU reference",
-            )
+                ref = _apply_ref_cpu(logits, vocab_mask)
+                self.assertTrue(
+                    torch.equal(torch.isfinite(npu_logits), torch.isfinite(ref)),
+                    "NPU branch finiteness pattern diverges from CPU reference",
+                )
+            finally:
+                restore()
 
     class TestGuidanceGrammarMoveVocabMaskNpu(unittest.TestCase):
         """Verify ``move_vocab_mask`` handles device targets."""
