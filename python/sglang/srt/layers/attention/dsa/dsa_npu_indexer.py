@@ -18,6 +18,11 @@ from sglang.srt.utils import is_npu
 if is_npu():
     import torch_npu
 
+    # Registers the CANN ops-transformer kernels under
+    # torch.ops.cann_ops_transformer; without this import the
+    # torch.ops namespace is empty and op calls raise AttributeError.
+    import cann_ops_transformer  # noqa: F401
+
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -40,17 +45,42 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
 
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+    # Hadamard-rotate x and MX-quantize its 128-dim vectors.
+    # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
+    # and scale holds one E8M0 byte per 32-element block, shaped
+    # x.shape[:-1] + (d/64, 2) == x.shape[:-1] + (2, 2) — the descale layout
+    # quant_lightning_indexer (v2) expects for quant_mode 3 (MXFP8).
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.zeros(
+                x.shape[:-1] + (2, 2), dtype=torch.float8_e8m0fnu, device=x.device
+            ),
         )
     rotated = x @ hadamard
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        rotated.reshape(-1, 128), dst_type=dst_type
+    quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
+        rotated.reshape(-1, 128), dst_type=dst_type, axis=-1
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    # npu_dynamic_mx_quant may return the block scales as [N, 4] or [N, 2, 2];
+    # normalize to the kernel's (d/64, 2) == (2, 2) layout.
+    scale = scale.reshape(x.shape[:-1] + (4,)).view(x.shape[:-1] + (2, 2))
+    if scale.dtype != torch.float8_e8m0fnu:
+        scale = scale.view(torch.float8_e8m0fnu)
+
+    return quantized.reshape(x.shape), scale
+
+
+@lru_cache(maxsize=1)
+def _check_quant_lightning_indexer_constraints(pool) -> None:
+    # quant_lightning_indexer (v2) PA_BBND layout: block_size == pool
+    # page_size must lie in [16, 1024] and be a multiple of 16.
+    page_size = pool.page_size
+    assert 16 <= page_size <= 1024 and page_size % 16 == 0, (
+        "quant_lightning_indexer (v2) PA_BBND layout requires the index-k "
+        f"pool page_size in [16, 1024] and a multiple of 16, got {page_size}. "
+        "Relaunch with page_size=64 (engine kwarg / --page-size 64)."
+    )
 
 
 class DSANPUIndexerMixin:
@@ -215,6 +245,7 @@ class DSANPUIndexerMixin:
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
+            _check_quant_lightning_indexer_constraints(pool)
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
@@ -324,23 +355,66 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                # quant_lightning_indexer (v2) contract, quant_mode 3 (MXFP8):
+                #  - layout_q TND: q (q_t, q_n, d) fp8, cu_seqlens_q (b+1,) int32
+                #    required (first value 0, last value q_t)
+                #  - layout_k PA_BBND: k (block_num, block_size, k_n, d) fp8 with
+                #    block_table (b, max_blocks) and seqused_k (b,) both required
+                #  - descales are E8M0: q (q_t, q_n, d/64, 2),
+                #    k (block_num, block_size, k_n, d/64, 2)
+                #  - w is float32 (q_t, q_n)
+                # The metadata op (task list / load balancing) is pre-planned
+                # once per batch by AscendAttnBackend.init_forward_metadata;
+                # fall back to computing it inline when the backend did not
+                # pre-plan it (cuda-graph capture, other backends, CP, spec
+                # draft model).
+                _fm = get_attn_backend().forward_metadata
+                cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
+                seqused_k = getattr(_fm, "quant_indexer_seqused_k", None)
+                metadata = getattr(_fm, "quant_indexer_metadata", None)
+                if metadata is None:
+                    cum_q = actual_seq_lengths_q.to(torch.int32)  # (b,) cumsum
+                    cu_seqlens_q = torch.cat([cum_q.new_zeros(1), cum_q])
+                    seqused_k = actual_seq_lengths_kv.to(
                         device=k.device, dtype=torch.int32
-                    ),
+                    )
+                    metadata = (
+                        torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
+                            self.n_heads,
+                            1,
+                            self.head_dim,
+                            self.index_topk,
+                            3, # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4
+                            cu_seqlens_q=cu_seqlens_q,
+                            seqused_k=seqused_k,
+                            batch_size=int(cum_q.numel()),
+                            max_seqlen_q=-1,
+                            max_seqlen_k=-1,
+                            layout_q="TND",
+                            layout_k="PA_BBND",
+                            mask_mode=3,
+                            cmp_ratio=1,
+                        )
+                    )
+                block_table = block_table.to(torch.int32)
+                torch.npu.synchronize()
+                topk_indices, _ = torch.ops.cann_ops_transformer.quant_lightning_indexer(
+                    query,
+                    past_key_states,
+                    weights.to(torch.float32),
+                    query_scale,
+                    pool.get_index_k_scale_buffer(layer_id),
+                    self.index_topk,
+                    3, # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=seqused_k,
                     block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
+                    metadata=metadata,
+                    max_seqlen_q=-1,
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                    mask_mode=3,
+                    cmp_ratio=1,
                 )
                 return topk_indices.squeeze(1)
 
