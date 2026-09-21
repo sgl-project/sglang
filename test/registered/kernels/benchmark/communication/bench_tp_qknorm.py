@@ -109,8 +109,6 @@ def _init_cpu_group() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
-    # The context answers a handle from what was stated on it, not from
-    # this module global, so a rank stood up by hand says so itself.
     get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)

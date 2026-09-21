@@ -64,8 +64,6 @@ def load_mlx_scheduler_module():
 class TestSchedulerIdleStepCounters(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # The loop asks the context where this process sits; nothing here
-        # builds a process group, so the placement arrives by publishing one.
         enter_scope(self, published_topology(role="scheduler"))
 
     @parameterized.expand(
@@ -184,11 +182,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         f"{PDMUX_MODULE}.torch.cuda.stream",
                         side_effect=lambda stream: nullcontext(),
                     ),
-                    # The prefill section runs under the duplicate communicator
-                    # `--enable-pdmux` builds, in place of the module flag this
-                    # replaces. The loop has no process groups at all, so stand
-                    # one in: the scope refuses to open without it rather than
-                    # letting prefill quietly share the decode communicator.
+                    # PD multiplexing requires a separate prefill communicator.
                     patch.object(
                         parallel_state,
                         "_PDMUX_PREFILL_TP_GROUP",

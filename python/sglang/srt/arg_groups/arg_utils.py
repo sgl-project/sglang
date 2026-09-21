@@ -96,40 +96,18 @@ _NO_DEFAULT = object()
 
 
 class Derived(msgspec.Struct, frozen=True):
-    """Metadata for a field the configuration implies, not one anyone types.
+    """Metadata for namespace fields that are not CLI inputs or record fields.
 
-    The other half of a namespace. An ``Arg`` field is the operator's input and
-    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
-    so it is not a dataclass field and never reaches the record -- which is
-    right, because it has no input to preserve and the record is what crosses a
-    process boundary.
-
-    ``fn`` names what computes it, as a dotted path resolved lazily so that a
-    declaration module stays free of runtime imports. Such a field is a pure
-    function of the published configuration, so it is computed once at
-    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
-    which is what a read inside compiled model code needs.
-
-    A declaration with no ``fn`` is one nothing can compute: a rank, or a
-    process group. Those are written into the namespace at runtime -- by
-    ``publish`` from the spawn bundle, or by the build that creates the group --
-    and until then the name has no answer.
-
-    Most declarations carry ``fn``, the parallel quotients included:
-    they are a function of the configured leaves, so they are computed at
-    publish like the rest. What is special about them is not how they are
-    computed but that a stamp can move one afterwards -- ``initialize_dp_attention``
-    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
-    published leaf.
+    ``fn`` is a lazily resolved dotted function path. It computes a value from
+    resolved configuration once at publication. Fields without ``fn``, such as
+    ranks and group handles, are set at runtime. Parallel overrides take
+    precedence over published values.
     """
 
     doc: str = ""
     fn: str = ""
-    # For a declaration with no ``fn`` whose absence is itself an answer:
-    # ``gpu_id`` is ``None`` in a process that runs on no device, and a reader
-    # wants that rather than an error. A rank has no such value -- the wrong
-    # one is a hang in a collective -- so it carries no default and a read
-    # before the write says so.
+    # Default for runtime-only fields, e.g. ``gpu_id=None`` without a device.
+    # Fields without a default raise if read before initialization.
     default: Any = _NO_DEFAULT
 
 

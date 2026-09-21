@@ -260,12 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
 
-        # Load draft model weights only.
-        # One decision, used twice: whether the draft runs on an attention-TP
-        # slice of its own. It picks how the runner is built, and then what the
-        # scope may say about attention every time it is entered -- a draft
-        # built outside the scope keeps the target's replica count and still
-        # gathers with it.
+        # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
             get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()

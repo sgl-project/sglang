@@ -1157,11 +1157,7 @@ class ModelRunner:
         self.pre_model_load_memory = bootstrap.measure_pre_model_load_memory(
             device=self.device, is_draft_worker=self.is_draft_worker
         )
-        # Read once, here: a draft runner is constructed inside the scope that
-        # states its topology and used outside it, so what it holds has to be
-        # the placement it was built for rather than whatever the context
-        # answers later. Groups and widths alike -- a runner asked about its own
-        # shape after the scope has closed must still describe itself.
+        # Capture draft placement at construction; the runner outlives the scope.
         parallel = get_parallel()
         self.tp_group = parallel.tp_group
         self.pp_group = parallel.pp_group

@@ -671,12 +671,8 @@ class InklingSharedFusedMoE(FusedMoE):
         quant_config: QuantizationConfig | None,
         inference_moe_w13_interleaved: bool,
     ) -> None:
-        # FusedMoE.__init__ reads get_parallel() once and caches it on self, so
-        # scoping the override to just this call is sufficient for the module's lifetime.
-        # The shared experts are replicated rather than sharded, so there is no
-        # expert-parallel communication here and no group to name: a width of
-        # one with the wider group still installed would describe a layout that
-        # does not exist.
+        # FusedMoE caches this topology at construction. Shared experts are
+        # replicated, so they need no expert-parallel group.
         with get_parallel().override(
             moe_ep_size=1,
             moe_ep_rank=0,

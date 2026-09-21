@@ -23,11 +23,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _published_topology():
-    """The topology these tests run in.
+    """Publish WORLD rank 12 with TP=8 and PP=2.
 
-    World rank 12 of a `tp=8, pp=2` world is `tp_rank=4` on the second stage,
-    which puts this process at `attn_dp_rank=1` with `attn_tp_rank=0`: the
-    context derives all of them from that one number and the widths.
+    This gives TP rank 4, PP rank 1, attention-DP rank 1, and attention-TP rank 0.
     """
     return published_topology(
         role="scheduler",

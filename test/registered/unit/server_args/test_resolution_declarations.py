@@ -132,15 +132,7 @@ def _stash_overlay(server_args):
 
 
 def _live_topology_leaves():
-    """Names `ParallelContext` answers from a runtime write, not the config.
-
-    Read off the declarations that carry no `fn`, which is what those are.
-    Inferring them from "did the read raise" is wrong -- it raises only while
-    nothing has written the name, so in a process where an earlier test stated
-    one the property answers that value and a leaf check reads it as a config
-    mismatch (`parallel.tp_size: bag=1 resolution=2`). Whether a name is
-    shadowed is a property of the declaration, not of the process.
-    """
+    """Return runtime-only parallel fields, identified by declarations without ``fn``."""
     from sglang.srt.runtime_context import _derived_widths
 
     return frozenset(n for n, d in _derived_widths().items() if not d.fn)
