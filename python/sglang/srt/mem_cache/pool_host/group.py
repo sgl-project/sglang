@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 
 @dataclass
@@ -73,8 +74,6 @@ class HostPoolGroup:
 
     def get_contiguous_buf_infos(self):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
         host_by_device_ptr = {}
         device_infos = ([], [], [])
         for entry in self.entries:
