@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
     RuntimeContext,
+    SpawnRanks,
     _FlagGroupBase,
     assert_published,
     derive_parallel_widths,
@@ -198,6 +199,148 @@ class TestTheTwoWorldWidths(_IsolatedOverrides):
             with parallel.override(max_ep_size=6):
                 self.assertEqual(parallel.max_world_size, 6)
                 self.assertEqual(parallel.launch_world_size, 2)
+
+
+class TestSpawnIdentities(_IsolatedOverrides):
+    """`dp_rank` and `gpu_id` come from the spawn, because nothing else has them.
+
+    Both vary per process while the record is identical across them, and
+    neither is a position in any process group -- no group has one member per
+    data-parallel replica. So the process entry states them at publish.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_stamp(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_one_rank_fixes_the_rest(self):
+        """Every other rank is a position in a group laid out from the widths,
+        so `world_rank` is the whole placement: rank 5 of a `tp=4, pp=2` world
+        is the second stage's second device."""
+        publish(
+            ServerArgs(model_path="dummy", tp_size=4, pp_size=2),
+            role="test",
+            ranks=SpawnRanks(world_rank=5, dp_rank=2),
+        )
+        parallel = get_parallel()
+        self.assertEqual(parallel.launch_world_rank, 5)
+        self.assertEqual(parallel.tp_rank, 1)
+        self.assertEqual(parallel.pp_rank, 1)
+        self.assertEqual(parallel.dp_rank, 2)
+
+    def test_no_controller_is_an_answer_not_a_failure(self):
+        """`dp_rank=None` means "not under a data parallel controller", which
+        is a fact about the deployment, unlike never having been told. The
+        replicas are separate WORLD groups, so no rank implies it."""
+        publish(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="test",
+            ranks=SpawnRanks(world_rank=0, dp_rank=None),
+        )
+        self.assertIsNone(get_parallel().dp_rank)
+
+    def test_publishing_without_a_bundle_names_what_is_missing(self):
+        publish(ServerArgs(model_path="dummy", tp_size=2), role="test")
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().dp_rank
+        self.assertIn("rank bundle", str(caught.exception))
+
+    def test_the_attention_rank_keeps_its_own_explanation(self):
+        """Two stamp-only names, two different reasons to be missing."""
+        publish(ServerArgs(model_path="dummy", tp_size=2), role="test")
+        with self.assertRaises(RuntimeError) as caught:
+            get_parallel().attn_dp_rank
+        self.assertIn("initialize_dp_attention", str(caught.exception))
+
+
+class TestAttentionRanksComeFromPublish(_IsolatedOverrides):
+    """With a spawn bundle, a rank read works before any group exists.
+
+    This is what `ParallelState` provided by being a plain frozen record, and
+    what the topology init could not: it needs the groups. Deriving at publish
+    is what lets a reader ask the context in a process that never initialises
+    distributed -- every unit test that builds a scheduler component, for one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        parallel = get_parallel()
+        self._saved_stamp = dict(parallel._stamp)
+        self.addCleanup(
+            lambda: (
+                parallel.clear_stamp(),
+                parallel.override_permanently(**self._saved_stamp),
+            )
+        )
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_it_matches_the_topology_init_for_every_shape(self):
+        """Cross-checked against the function the groups use, not restated.
+
+        Same inputs, two callers: one has them from the configuration and the
+        spawn, the other from the groups it just built.
+        """
+        from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+
+        shapes = [
+            (8, 1, 1, False),
+            (8, 2, 1, True),
+            (8, 4, 1, True),
+            (8, 2, 2, True),
+            (16, 4, 2, True),
+        ]
+        for tp_size, dp_size, attn_cp_size, dp_attn in shapes:
+            for tp_rank in range(tp_size):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        tp_size=tp_size,
+                        dp_size=dp_size,
+                        attn_cp_size=attn_cp_size,
+                        enable_dp_attention=dp_attn,
+                    ),
+                    role="test",
+                    ranks=SpawnRanks(world_rank=tp_rank),
+                )
+                want_tp, _, want_dp, _ = compute_dp_attention_world_info(
+                    dp_attn, tp_rank, tp_size, dp_size, attn_cp_size
+                )
+                msg = f"tp={tp_size} dp={dp_size} cp={attn_cp_size} rank={tp_rank}"
+                self.assertEqual(get_parallel().attn_tp_rank, want_tp, msg)
+                self.assertEqual(get_parallel().attn_dp_rank, want_dp, msg)
+
+    def test_the_rank_reads_without_a_process_group(self):
+        """No distributed init, no patching of any getter."""
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=8, dp_size=2, enable_dp_attention=True
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=5),
+        )
+        with patch(
+            f"{_PS}.get_attn_tensor_model_parallel_rank",
+            side_effect=AssertionError("no group must be consulted"),
+        ):
+            self.assertEqual(get_parallel().attn_tp_rank, 1)
+            self.assertEqual(get_parallel().attn_dp_rank, 1)
+
+    def test_without_a_bundle_it_still_asks_the_group(self):
+        """Unchanged for every process that publishes without a placement."""
+        publish(ServerArgs(model_path="dummy", tp_size=8), role="test")
+        with patch(f"{_PS}.get_attn_tensor_model_parallel_rank", return_value=3):
+            self.assertEqual(get_parallel().attn_tp_rank, 3)
 
 
 class TestStampedRanks(_IsolatedOverrides):
@@ -2105,6 +2248,109 @@ class TestTheDerivedHalfIsDeclared(CustomTestCase):
         for name, value in vars(Parallel).items():
             if isinstance(value, Derived):
                 self.assertNotIn(name, fields)
+
+
+class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
+    """`ModelRunner.__init__` reads a recorded identity, so an entry that
+    publishes without a bundle and then builds one fails at construction.
+
+    Every such entry is an `__main__`-reachable path, so nothing in the unit
+    suite exercises it; the benchmark entry was found this way rather than by
+    a test. This walks the sources instead: a module that publishes and builds
+    a runner has to pass `ranks=`.
+    """
+
+    def test_every_publisher_that_builds_a_runner_passes_a_bundle(self):
+        import ast as _ast
+
+        root = _pathlib.Path(next(iter(_sglang.__path__))).resolve()
+        offenders = []
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8-sig")
+            if "ModelRunner(" not in text or "publish(" not in text:
+                continue
+            tree = _ast.parse(text)
+            builds = any(
+                isinstance(n, _ast.Call)
+                and getattr(n.func, "id", getattr(n.func, "attr", None))
+                == "ModelRunner"
+                for n in _ast.walk(tree)
+            )
+            if not builds:
+                continue
+            for node in _ast.walk(tree):
+                if (
+                    isinstance(node, _ast.Call)
+                    and getattr(node.func, "id", None) == "publish"
+                    and not any(kw.arg == "ranks" for kw in node.keywords)
+                ):
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these publish without a spawn bundle and then build a ModelRunner, "
+            "whose construction reads a recorded identity:\n  "
+            + "\n  ".join(offenders),
+        )
+
+
+class TestWhoAnswersDuringADraftScope(CustomTestCase):
+    """A draft worker runs in one process with the target, under a scope.
+
+    Two things have to hold for that to be workable, and neither is visible
+    from a single read: inside the scope every source agrees on the draft's
+    shape, and a reader that runs *outside* it still gets the draft's answer
+    from whatever it carried out.
+    """
+
+    def _single_member_group(self):
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        group = GroupCoordinator.__new__(GroupCoordinator)
+        group.world_size = 1
+        group.rank_in_group = 0
+        return group
+
+    def _two_stage_pipeline(self):
+        """This process is stage 1 of 2, published the way a spawn states it."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", pp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+
+    def test_the_pipeline_swap_states_every_member_it_installs(self):
+        """`pp_size` is a configured leaf: unlike `pp_rank` it does not follow
+        the group being swapped underneath, so a scope that installs a group
+        without stating its width reports the target's."""
+        from sglang.srt.distributed import parallel_state
+
+        group = self._single_member_group()
+        self._two_stage_pipeline()
+        self.assertEqual(get_parallel().pp_size, 2)
+        with patch.object(parallel_state, "_PP", group):
+            with parallel_state.patch_pipeline_parallel_group(group):
+                self.assertEqual(get_parallel().pp_size, 1)
+                self.assertEqual(get_parallel().pp_rank, 0)
+                self.assertIs(get_parallel().pp_group, group)
+        self.assertEqual(get_parallel().pp_size, 2)
+        self.assertEqual(get_parallel().pp_rank, 1)
+
+    def test_a_report_built_for_a_runner_follows_that_runner(self):
+        """A weight check is an on-demand request served from the scheduler
+        loop, so it runs outside the scope that describes a draft runner. Its
+        report has to name the runner it was built for, which is why it holds
+        a record instead of asking the context."""
+        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from sglang.srt.utils.weight_checker import WeightChecker
+
+        draft = ParallelState.trivial(pp_rank=0, pp_size=1)
+        checker = WeightChecker(get_model=lambda: None, ps=draft)
+        self._two_stage_pipeline()
+        info = checker._parallelism_info()
+        self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
 if __name__ == "__main__":
