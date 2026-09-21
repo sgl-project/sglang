@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
     _CompressedPoolConfig,
+    _num_dsv4_physical_kv_pages,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +24,40 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_physical_kv_pages_cover_reserved_logical_page(self):
+        size = 8192
+        self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
+        self.assertEqual(_num_dsv4_physical_kv_pages(size, 64, 256), 132)
+        self.assertGreaterEqual(
+            _num_dsv4_physical_kv_pages(size, 64, 256) * 64,
+            size + 256,
+        )
+
+    def test_state_buf_item_covers_one_logical_swa_page(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.swa_page_size = 256
+        pool.compress_state_pools = []
+        pool.indexer_compress_state_pools = []
+        for physical_page_size in (256, 64):
+            with self.subTest(physical_page_size=physical_page_size):
+                row_bytes = physical_page_size * 4
+                buf = torch.empty((8, row_bytes), dtype=torch.uint8)
+                pool.swa_kv_pool = SimpleNamespace(
+                    page_size=physical_page_size, kv_buffer=[buf]
+                )
+                data_ptrs, data_lens, item_lens = pool.get_state_buf_infos()
+                self.assertEqual(data_ptrs, [buf.data_ptr()])
+                self.assertEqual(data_lens, [buf.nbytes])
+                self.assertEqual(item_lens, [256 * 4])
+
+    def test_state_buf_infos_without_paged_swa(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.swa_kv_pool = None
+        pool.compress_state_pools = []
+        pool.indexer_compress_state_pools = []
+        self.assertEqual(pool.get_state_buf_infos(), ([], [], []))
+
     def test_pp_mapping_and_pd_buffer_order(self):
         for unified, stage_ratios in product(
             (False, True), ([4, 0, 128, 4], [128], [0])

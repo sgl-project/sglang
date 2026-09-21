@@ -12,7 +12,7 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
-    kimi_linear_config,
+    hybrid_kda_config,
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
@@ -28,7 +28,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -132,6 +131,16 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 
 _is_npu = is_npu()
+
+
+def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
+    """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
+    stays a bf16 ring; MTP/EAGLE NextN follows the env."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
+    )
+
+    return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
 
 
 def _should_enable_lazy_compaction() -> bool:
@@ -276,12 +285,14 @@ class KVCacheConfigurator:
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
+    hybrid_kda_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self.is_hybrid_swa_mtp_draft = (
             self.is_draft_worker
             and self.draft_model_idx is not None
@@ -868,32 +879,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        if get_disagg().disaggregation_mode == "decode":
-            # A decode node hands out request rows to PREALLOCATED transfers on
-            # top of its running set, so it needs the extra-slot pool (and the
-            # `pre_alloc_size` the scheduler's invariant checker reads). Mirrors
-            # `_build_req_to_token_pool`'s decode branch; the mamba composite
-            # already takes `decode_pre_alloc_size` the same way.
-            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
-
-            req_to_token_pool = DecodeReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-                pre_alloc_size=get_disagg().disaggregation_decode_extra_slots,
-            )
-        else:
-            req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + extra_max_context_len,
-                device=self.device,
-                enable_memory_saver=get_exec().features.enable_memory_saver,
-            )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1107,7 +1093,7 @@ class KVCacheConfigurator:
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
+                    or self.hybrid_kda_config is not None
                 )
             ),
         )
@@ -1148,11 +1134,11 @@ class KVCacheConfigurator:
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
+            and self.hybrid_kda_config is None
         ):
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+                "model; got a non-KDA model."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -1188,7 +1174,7 @@ class KVCacheConfigurator:
                 get_exec().mamba.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
+                    or self.hybrid_kda_config is not None
                 )
             ),
         )
@@ -1391,6 +1377,11 @@ class KVCacheConfigurator:
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
 
+        unified_fp8 = unified_fp8_for_dsv4_pool(
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1418,6 +1409,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            unified_fp8=unified_fp8,
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
@@ -2221,8 +2213,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_parallel().launch_world_size > 1,
+            cpu_group=get_parallel().world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2317,7 +2309,7 @@ class KVCacheConfigurator:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_parallel().world_group.cpu_group,
             )
             token_capacity = tensor.item()
 
@@ -2446,7 +2438,9 @@ class KVCacheConfigurator:
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
-                        self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                        self.model_config.num_hidden_layers,
+                        rank,
+                        self.ps.pp_size,
                     )
                     for rank in range(self.ps.pp_size)
                 )
@@ -2466,8 +2460,7 @@ class KVCacheConfigurator:
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
         # request scratch; KDA replay remains attached to each mamba slot.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+            self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
@@ -2479,7 +2472,7 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and kimi_linear_config(self.model_config) is None:
+        if replayssm_active and self.hybrid_kda_config is None:
             replay_req_slots = (
                 get_schedule().max_running_requests // self.ps.attn_dp_size + 1
             )

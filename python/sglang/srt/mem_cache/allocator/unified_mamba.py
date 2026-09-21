@@ -307,6 +307,30 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Retraction backup for the FULL + mamba pair.
+
+        `Req.offload_kv_cache` hands over `req_to_token` rows, which hold
+        VIRTUAL ids here; both unified full pools index their host copy by
+        PHYSICAL ids. The mamba side is already slot-addressed and is
+        translated by the pool.
+        """
+        return self._kvcache.get_cpu_copy(
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu,
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
     def _move_gate_targets(self):
         """Every member a compaction gate must cover. The mamba end is gated
         even where its state is not itself transferred: the gate is about the
