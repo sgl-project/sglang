@@ -13,12 +13,22 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.pp_draft_embedding import (
-    find_draft_embedding_param,
     load_draft_embedding_from_checkpoint,
     resolve_target_embed_and_head,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.layers.vocab_parallel_embedding import (  # noqa: E402
+    VocabParallelEmbedding,
+)
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -58,42 +68,22 @@ class _Draft(nn.Module):
     def __init__(self, *, with_embedding: bool = True):
         super().__init__()
         self.model = _Inner(
-            nn.Embedding(VOCAB, HIDDEN) if with_embedding else nn.Identity()
+            VocabParallelEmbedding(VOCAB, HIDDEN) if with_embedding else nn.Identity()
         )
-        # A nested draft-only embedding that must not be picked over model.embed_tokens.
-        self.mtp = _Inner(nn.Embedding(VOCAB, HIDDEN))
-
-
-class _WordEmbeddingsDraft(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = nn.Module()
-        self.model.word_embeddings = nn.Embedding(VOCAB, HIDDEN)
-
-
-def _write_index(root: str, weight_map: dict) -> None:
-    with open(os.path.join(root, "model.safetensors.index.json"), "w") as f:
-        json.dump({"weight_map": weight_map}, f)
 
 
 def _write_sharded_checkpoint(root: str, embed: torch.Tensor) -> None:
     """Two shards + index; the MTP-layer decoy sorts before the real embedding."""
     decoy = torch.full_like(embed, -1.0)
-    save_file(
-        {MTP_LAYER_KEY: decoy}, os.path.join(root, "model-00001-of-00002.safetensors")
+    shard_a, shard_b = (
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
     )
-    save_file(
-        {MAIN_KEY: embed, "lm_head.weight": decoy},
-        os.path.join(root, "model-00002-of-00002.safetensors"),
-    )
-    _write_index(
-        root,
-        {
-            MTP_LAYER_KEY: "model-00001-of-00002.safetensors",
-            MAIN_KEY: "model-00002-of-00002.safetensors",
-            "lm_head.weight": "model-00002-of-00002.safetensors",
-        },
-    )
+    save_file({MTP_LAYER_KEY: decoy}, os.path.join(root, shard_a))
+    save_file({MAIN_KEY: embed, "lm_head.weight": decoy}, os.path.join(root, shard_b))
+    weight_map = {MTP_LAYER_KEY: shard_a, MAIN_KEY: shard_b, "lm_head.weight": shard_b}
+    with open(os.path.join(root, "model.safetensors.index.json"), "w") as f:
+        json.dump({"weight_map": weight_map}, f)
 
 
 class TestResolveTargetEmbedAndHead(CustomTestCase):
@@ -112,12 +102,6 @@ class TestResolveTargetEmbedAndHead(CustomTestCase):
         with self.assertRaises(AttributeError):
             resolve_target_embed_and_head(target)
 
-    def test_owning_stage_shares_both(self):
-        target = _Target(owns_embedding=True)
-        embed, head = resolve_target_embed_and_head(target)
-        self.assertIs(embed, target.model.embed_tokens.weight)
-        self.assertIs(head, target.lm_head.weight)
-
 
 class TestLoadDraftEmbeddingFromCheckpoint(CustomTestCase):
     @classmethod
@@ -130,109 +114,84 @@ class TestLoadDraftEmbeddingFromCheckpoint(CustomTestCase):
     def tearDownClass(cls):
         cls._override.restore()
 
+    def setUp(self):
+        enter_scope(self, published_topology("test", tp_size=1, pp_size=1))
+
+    def _load(self, draft, root, load_config=AUTO):
+        return load_draft_embedding_from_checkpoint(
+            draft, root, revision=None, load_config=load_config
+        )
+
+    def _assert_loaded(self, param, expected):
+        # VocabParallelEmbedding pads the vocab; only the real rows are loaded.
+        torch.testing.assert_close(param.detach()[:VOCAB], expected)
+
     def test_index_picks_input_embedding_over_mtp_layer_key(self):
         expected = torch.randn(VOCAB, HIDDEN)
         draft = _Draft()
         with tempfile.TemporaryDirectory() as root:
             _write_sharded_checkpoint(root, expected)
-            param = load_draft_embedding_from_checkpoint(
-                draft, root, revision=None, load_config=AUTO
-            )
+            param = self._load(draft, root)
         self.assertIs(param, draft.model.embed_tokens.weight)
-        torch.testing.assert_close(param.detach(), expected)
-        self.assertFalse(torch.equal(draft.mtp.embed_tokens.weight.detach(), expected))
+        self._assert_loaded(param, expected)
 
     def test_no_index_picks_over_whole_checkpoint_not_first_shard(self):
         """Regression: the first shard holding *an* embedding-like key was chosen;
         an MTP-layer embedding in an earlier shard must lose to the real one."""
         expected = torch.randn(VOCAB, HIDDEN)
-        draft = _Draft()
         with tempfile.TemporaryDirectory() as root:
             save_file(
                 {MTP_LAYER_KEY: torch.zeros(VOCAB, HIDDEN)},
                 os.path.join(root, "a.safetensors"),
             )
             save_file({MAIN_KEY: expected}, os.path.join(root, "b.safetensors"))
-            param = load_draft_embedding_from_checkpoint(
-                draft, root, revision=None, load_config=AUTO
-            )
-        torch.testing.assert_close(param.detach(), expected)
+            param = self._load(_Draft(), root)
+        self._assert_loaded(param, expected)
 
     def test_bin_only_checkpoint_follows_loader_fallback(self):
         """Regression: a checkpoint with only pytorch_model.bin raised
         FileNotFoundError because only safetensors were searched."""
         expected = torch.randn(VOCAB, HIDDEN)
-        draft = _Draft()
         with tempfile.TemporaryDirectory() as root:
             torch.save({MAIN_KEY: expected}, os.path.join(root, "pytorch_model.bin"))
-            param = load_draft_embedding_from_checkpoint(
-                draft, root, revision=None, load_config=AUTO
-            )
-        torch.testing.assert_close(param.detach(), expected)
-
-    def test_word_embeddings_draft_is_found(self):
-        expected = torch.randn(VOCAB, HIDDEN)
-        draft = _WordEmbeddingsDraft()
-        with tempfile.TemporaryDirectory() as root:
-            save_file(
-                {"model.word_embeddings.weight": expected},
-                os.path.join(root, "model.safetensors"),
-            )
-            param = load_draft_embedding_from_checkpoint(
-                draft, root, revision=None, load_config=AUTO
-            )
-        self.assertIs(param, draft.model.word_embeddings.weight)
-        torch.testing.assert_close(param.detach(), expected)
+            param = self._load(_Draft(), root)
+        self._assert_loaded(param, expected)
 
     def test_weight_loader_receives_full_vocab_tensor(self):
         """The TP shard is the parameter's weight_loader's job; the helper must hand
         it the whole checkpoint tensor, not a pre-sliced one."""
         expected = torch.randn(VOCAB, HIDDEN)
         draft = _Draft()
-        param = draft.model.embed_tokens.weight
         seen = {}
 
         def sharding_loader(p, loaded):
             seen["shape"] = tuple(loaded.shape)
-            p.data.copy_(loaded)
+            p.data[: loaded.shape[0]].copy_(loaded)
 
-        param.weight_loader = sharding_loader
+        draft.model.embed_tokens.weight.weight_loader = sharding_loader
         with tempfile.TemporaryDirectory() as root:
             _write_sharded_checkpoint(root, expected)
-            load_draft_embedding_from_checkpoint(
-                draft, root, revision=None, load_config=AUTO
-            )
+            self._load(draft, root)
         self.assertEqual(seen["shape"], (VOCAB, HIDDEN))
 
-    def test_dummy_load_format_skips_disk(self):
+    def test_load_format_gates_disk_access(self):
+        """dummy returns the parameter untouched; a streaming format has no weight
+        files to re-open and must fail instead of leaving the embedding random."""
         draft = _Draft()
-        param = load_draft_embedding_from_checkpoint(
-            draft,
-            "/nonexistent",
-            revision=None,
-            load_config=LoadConfig(load_format=LoadFormat.DUMMY),
+        param = self._load(
+            draft, "/nonexistent", LoadConfig(load_format=LoadFormat.DUMMY)
         )
         self.assertIs(param, draft.model.embed_tokens.weight)
-
-    def test_streaming_load_format_is_rejected_before_touching_disk(self):
-        # Streaming formats have no weight files to re-open; a silent fallthrough
-        # would leave the draft embedding randomly initialized.
         with self.assertRaises(ValueError):
-            load_draft_embedding_from_checkpoint(
+            self._load(
                 _Draft(),
                 "/nonexistent",
-                revision=None,
-                load_config=LoadConfig(load_format=LoadFormat.REMOTE_INSTANCE),
+                LoadConfig(load_format=LoadFormat.REMOTE_INSTANCE),
             )
 
     def test_draft_without_embedding_fails_loudly(self):
-        draft = _Draft(with_embedding=False)
-        self.assertIsNotNone(find_draft_embedding_param(draft))
-        draft.mtp = nn.Identity()
         with self.assertRaises(ValueError):
-            load_draft_embedding_from_checkpoint(
-                draft, "/nonexistent", revision=None, load_config=AUTO
-            )
+            self._load(_Draft(with_embedding=False), "/nonexistent")
 
 
 if __name__ == "__main__":

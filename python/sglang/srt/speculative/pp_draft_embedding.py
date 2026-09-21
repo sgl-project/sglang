@@ -91,30 +91,19 @@ def resolve_target_embed_and_head(
 def find_draft_embedding_param(
     draft_model: nn.Module,
 ) -> Optional[Tuple[str, nn.Parameter]]:
-    """The draft's own input-embedding weight: by type first, by name as fallback."""
+    """The draft's own input embedding: its single ``VocabParallelEmbedding``."""
     from sglang.srt.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
     )
 
-    by_type = [
+    found = [
         (f"{name}.weight", module.weight)
         for name, module in draft_model.named_modules()
         if isinstance(module, VocabParallelEmbedding)
         and not isinstance(module, ParallelLMHead)
     ]
-    if len(by_type) == 1:
-        return by_type[0]
-    by_name = [
-        (name, param)
-        for name, param in draft_model.named_parameters(remove_duplicate=False)
-        if name.endswith(_EMBED_KEY_SUFFIXES)
-    ]
-    if not by_name:
-        return None
-    # Prefer the shallowest match (``model.embed_tokens.weight`` over a nested one).
-    by_name.sort(key=lambda kv: kv[0].count("."))
-    return by_name[0]
+    return found[0] if len(found) == 1 else None
 
 
 def _is_input_embedding_key(key: str) -> bool:
@@ -208,10 +197,9 @@ def load_draft_embedding_from_checkpoint(
     found = find_draft_embedding_param(draft_model)
     if found is None:
         raise ValueError(
-            f"Draft model {draft_model.__class__.__name__} has no input embedding "
-            f"(looked for VocabParallelEmbedding or *.<{'|'.join(_EMBED_ATTR_NAMES)}>"
-            ".weight), and the target cannot share its embedding from this pipeline "
-            "stage (https://github.com/sgl-project/sglang/issues/39634)."
+            f"Draft model {draft_model.__class__.__name__} has no single "
+            "VocabParallelEmbedding, and the target cannot share its embedding from "
+            "this pipeline stage (https://github.com/sgl-project/sglang/issues/39634)."
         )
     param_name, param = found
     if load_config.load_format == LoadFormat.DUMMY:
