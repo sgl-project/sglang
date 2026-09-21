@@ -82,22 +82,32 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     if row >= commit_len:
         return
 
-    byte_off = tid * ELEMS_PER_TILE + tl.arange(0, ELEMS_PER_TILE)
-    mask_byte = byte_off < ROW_ELEMS
-    tl.multiple_of(byte_off, 16)
+    elem_off = tid * ELEMS_PER_TILE + tl.arange(0, ELEMS_PER_TILE)
+    mask_elem = elem_off < ROW_ELEMS
+    tl.multiple_of(elem_off, 16)
 
     loc = tl.load(loc_2d_ptr + bid * block_size + row)
     src_row = bid * block_size + row
 
-    src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + byte_off
-    src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + byte_off
-    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + byte_off
-    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + byte_off
+    src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + elem_off
+    src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + elem_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + elem_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + elem_off
 
-    k_val = tl.load(src_k_row_ptr, mask=mask_byte, other=0)
-    v_val = tl.load(src_v_row_ptr, mask=mask_byte, other=0)
-    tl.store(dst_k_row_ptr, k_val, mask=mask_byte)
-    tl.store(dst_v_row_ptr, v_val, mask=mask_byte)
+    k_val = tl.load(src_k_row_ptr, mask=mask_elem, other=0)
+    k_val = k_val.to(tl.float32)
+    k_val = k_val / k_scale
+    k_val = tl.clamp(k_val, -448, 448)
+    k_val = k_val.to(tl.float8e4m3)
+
+    v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0)
+    v_val = v_val.to(tl.float32)
+    v_val = v_val / v_scale
+    v_val = tl.clamp(v_val, -448, 448)
+    v_val = v_val.to(tl.float8e4m3)
+
+    tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
+    tl.store(dst_v_row_ptr, v_val, mask=mask_elem)
 
 
 @triton.jit
