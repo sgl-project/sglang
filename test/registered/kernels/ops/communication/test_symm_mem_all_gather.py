@@ -7,12 +7,12 @@ NCCL all-gather for a sweep of token counts, hidden widths, and the
 Usage::
 
     # Run on the default world sizes (2, 4, 8 GPUs):
-    python test/registered/jit/test_symm_mem_all_gather.py
+    python test/registered/kernels/ops/communication/test_symm_mem_all_gather.py
     # Pick a specific world size (or comma-separated list):
-    python test/registered/jit/test_symm_mem_all_gather.py --num-gpu 4
-    python test/registered/jit/test_symm_mem_all_gather.py --num-gpu 2,4,8
+    python test/registered/kernels/ops/communication/test_symm_mem_all_gather.py --num-gpu 4
+    python test/registered/kernels/ops/communication/test_symm_mem_all_gather.py --num-gpu 2,4,8
     # Extra pytest args (forwarded to each torchrun worker):
-    python test/registered/jit/test_symm_mem_all_gather.py -k 16384
+    python test/registered/kernels/ops/communication/test_symm_mem_all_gather.py -k 16384
 """
 
 from __future__ import annotations
