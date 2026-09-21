@@ -1,12 +1,8 @@
 """Lifetime of the DSA multi-CTAs KV counter across CUDA graph capture.
 
-The decode graphs record this buffer's address, so three regressions must not
-come back: capture growing it, an oversized eager call replacing it, and a
-backend branch leaving the field undefined for the sizing hook to read.
-
-Each case drives the production entry point it guards -- init_cuda_graph_state
-or _multi_ctas_kv_counter_for. The _forward_trtllm call around the latter needs
-a live FlashInfer kernel and is not covered here.
+The decode graphs record this buffer's address, so nothing after capture may
+reallocate it. _forward_trtllm, the production caller, needs a live FlashInfer
+kernel and is not covered here.
 """
 
 import unittest
@@ -36,7 +32,6 @@ _NUM_CAPTURED_ROWS = _CAPTURED_BS * _NUM_DRAFT_TOKENS
 
 
 def _make_backend(*, allocate_counter: bool = True):
-    """Minimal backend carrying only what the counter paths read."""
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = "cuda"
     backend.num_q_heads = _NUM_Q_HEADS
@@ -83,7 +78,6 @@ class TestMultiCtasKvCounterLifetime(CustomTestCase):
         self.assertTrue(_would_grow(_make_backend(), _NUM_CAPTURED_ROWS))
 
     def test_init_cuda_graph_state_sizes_for_query_rows(self):
-        """Capture must not reallocate after graph state is initialized."""
         backend = _make_backend()
         backend.init_cuda_graph_state(
             max_bs=_CAPTURED_BS, max_num_tokens=_NUM_CAPTURED_ROWS
@@ -109,16 +103,12 @@ class TestMultiCtasKvCounterLifetime(CustomTestCase):
         self.assertIsNone(backend._multi_ctas_kv_counter_buffer)
 
     def test_counter_field_defaults_to_none_on_the_class(self):
-        """Only one __init__ branch allocates a counter; the rest must still
-        leave the attribute readable, since the sizing hook is unconditional."""
+        """The sizing hook is unconditional, so every branch must leave it readable."""
         self.assertIsNone(DeepseekSparseAttnBackend._multi_ctas_kv_counter_buffer)
 
     def test_oversized_eager_call_keeps_the_captured_allocation(self):
-        """capture -> oversized eager call -> replay: the buffer must survive.
-
-        Holds only a weakref and an address, so a rebinding implementation drops
-        the last strong reference and the assertions see it.
-        """
+        """Holds only a weakref and an address, so a rebinding implementation
+        drops the last strong reference and the assertions see it."""
         backend = _make_backend()
         backend.init_cuda_graph_state(
             max_bs=_CAPTURED_BS, max_num_tokens=_NUM_CAPTURED_ROWS

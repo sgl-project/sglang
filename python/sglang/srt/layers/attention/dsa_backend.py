@@ -1306,6 +1306,8 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        # Sized by query rows, not requests: target verify captures
+        # speculative_num_draft_tokens rows per request.
         self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
 
     def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
@@ -1317,8 +1319,7 @@ class DeepseekSparseAttnBackend(
             num_q_heads=self.num_q_heads,
             batch_size=num_query_rows,
         )
-        # Capacity is established before capture, so a grow here means that
-        # invariant broke rather than a case needing handling.
+        # Capacity is set before capture, so a grow here is a broken invariant.
         assert (
             counter is self._multi_ctas_kv_counter_buffer
             or not torch.cuda.is_current_stream_capturing()
@@ -1326,12 +1327,9 @@ class DeepseekSparseAttnBackend(
         return counter
 
     def _ensure_multi_ctas_kv_counter_capacity(self, num_query_rows: int) -> None:
-        # Capture indexes by query rows -- speculative_num_draft_tokens per
-        # request under target verify -- which max_running_requests undercounts.
         if self._multi_ctas_kv_counter_buffer is None:
             return
-        # Grow-only, and before any capture: shrinking or growing afterwards
-        # would free the allocation a captured graph replays against.
+        # Must run before any capture: a later rebind frees what a graph replays.
         self._multi_ctas_kv_counter_buffer = (
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 buffer=self._multi_ctas_kv_counter_buffer,

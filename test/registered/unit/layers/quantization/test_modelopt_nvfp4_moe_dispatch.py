@@ -83,6 +83,9 @@ def _trtllm_prepared_layer() -> SimpleNamespace:
         num_local_experts=NUM_EXPERTS,
         moe_ep_rank=0,
         intermediate_size_per_partition=INTERMEDIATE,
+        # FusedMoE.__init__ sets this; apply() reads it to reject the fused
+        # fallback for MegaMoE experts.
+        _mega_moe_nvfp4=False,
     )
 
 
