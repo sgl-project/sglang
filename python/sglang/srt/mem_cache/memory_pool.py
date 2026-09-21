@@ -4003,6 +4003,7 @@ class HybridLinearKVPool(KVCache):
         # Mamba state lives in req_to_token_pool and keeps its own host path.
         return self.full_kv_pool.host_pool_decls()
 
+    @property
     def post_capture_active(self) -> bool:
         return self.full_kv_pool.post_capture_active
 
