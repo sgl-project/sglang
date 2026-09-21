@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod kimi;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -186,7 +187,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            active_load: crate::config::ActiveLoadConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
         }
     }
 
@@ -350,7 +351,11 @@ mod tests {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
         assert!(resolve("inkling_mm_model").is_none());
-        assert!(resolve("kimi_k3").is_none());
+        assert!(resolve("kimi_k3")
+            .unwrap()
+            .render(&request)
+            .unwrap()
+            .contains("<|open|>message"));
         assert_eq!(
             resolve("deepseek_v41").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
