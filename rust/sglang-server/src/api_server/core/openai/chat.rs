@@ -735,8 +735,15 @@ pub(crate) fn chat_event_stream(
     };
     async_stream::stream! {
         let mut kept_tool_call_index: Vec<Option<u32>> = vec![None; count];
+        let mut has_successful_terminal = false;
+        let mut had_failure = false;
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
+            if let Some(error) = item.error.take() {
+                had_failure = true;
+                yield CoreEvent::ItemError(decode_stream_error(error));
+                break;
+            }
             if let Some(mut response) = item.data.take() {
                 if !parallel_tool_calls {
                     for choice in &mut response.choices {
@@ -756,6 +763,11 @@ pub(crate) fn chat_event_stream(
                                 choice.delta.tool_calls = None;
                             }
                         }
+                    }
+                }
+                for choice in &response.choices {
+                    if choice.finish_reason.is_some() {
+                        has_successful_terminal = true;
                     }
                 }
                 // The parser can pack several choices into one event and only
@@ -783,14 +795,12 @@ pub(crate) fn chat_event_stream(
                         ));
                     }
                 }
-            } else if let Some(error) = item.error {
-                yield CoreEvent::ItemError(decode_stream_error(error));
             }
         }
 
         // The final usage trailer follows the parser's EOF flush, so buffered
         // content and terminal choices always precede it.
-        if include_usage {
+        if include_usage && has_successful_terminal && !had_failure {
             let (usage, details) = {
                 let state = state.lock().expect("chat stream state poisoned");
                 (
@@ -1003,7 +1013,7 @@ pub(crate) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatRenderingOptions, SamplingDefaults, chat_event_stream, chat_logprobs,
+        ChatRenderingOptions, CoreEvent, SamplingDefaults, chat_event_stream, chat_logprobs,
         chat_sampling_params, chat_stream_usage_options, unary_chat,
     };
     use crate::api_server::core::test_utils::{
@@ -1431,6 +1441,131 @@ mod tests {
         let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert!(terminal.get("usage").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_single_choice_error_suppresses_usage_trailer() {
+        let (choice, tx) = planned("r0");
+        tx.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "boom".into(),
+        )))
+        .await
+        .unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            chat_options(),
+            true,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "role prelude + item error, no usage trailer"
+        );
+        assert!(matches!(frames[0], CoreEvent::Item(_)));
+        let CoreEvent::ItemError(error) = &frames[1] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 400);
+        assert!(error.message.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_all_choice_error_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "boom 0".into(),
+        )))
+        .await
+        .unwrap();
+        tx1.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "boom 1".into(),
+        )))
+        .await
+        .unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            chat_options(),
+            true,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        assert_eq!(frames.len(), 2);
+        let CoreEvent::ItemError(error) = &frames[1] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 400);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_truncation_suppresses_usage_trailer() {
+        let (choice, tx) = planned("r0");
+        drop(tx);
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            chat_options(),
+            true,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "role prelude + truncation item error, no usage trailer"
+        );
+        let CoreEvent::ItemError(error) = &frames[1] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 500);
+        assert!(error.message.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_terminates_on_error_without_usage() {
+        let (choice, tx) = planned("r0");
+        tx.send(chunk("r0", "hello", false)).await.unwrap();
+        tx.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "parser error mid-stream".into(),
+        )))
+        .await
+        .unwrap();
+        // Sibling/further frames should be dropped after the error breaks the stream
+        tx.send(chunk("r0", "unreachable after error", false))
+            .await
+            .unwrap();
+        tx.send(chunk("r0", "!", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            plan(vec![choice], senders()),
+            chat_options(),
+            true,
+            false,
+            None,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        // role + delta("hello") + item_error; no "unreachable", no "!", no usage trailer
+        assert_eq!(frames.len(), 3);
+        let CoreEvent::ItemError(error) = &frames[2] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 400);
+        assert!(error.message.contains("parser error mid-stream"));
     }
 
     /// Usage must recover the prompt count when an early frame carries 0: the

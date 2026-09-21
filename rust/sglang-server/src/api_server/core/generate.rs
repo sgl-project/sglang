@@ -462,6 +462,8 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
             futs.push(recv_indexed(i, rx));
         }
 
+        let mut has_successful_terminal = false;
+
         while let Some((i, rx, items)) = futs.next().await {
             if items.is_empty() {
                 // Channel closed with no terminal → truncation for this item;
@@ -500,10 +502,12 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                             accs[i].fold(&out);
                         }
                         terminal = Some(out);
+                        break;
                     }
                     ResponseItem::Error(e) => {
                         timings[i].finish();
                         failed = Some(e);
+                        break;
                     }
                     ResponseItem::Control(_) => {} // never on /generate
                 }
@@ -522,14 +526,17 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                         let (code, message) = (code, message.to_owned());
                         shaper.item_error(code, &message, idx(i))
                     }
-                    None => shaper.terminal(
-                        out,
-                        &accs[i],
-                        incremental,
-                        rid_strs[i].client_facing(),
-                        idx(i),
-                        &timings[i],
-                    ),
+                    None => {
+                        has_successful_terminal = true;
+                        shaper.terminal(
+                            out,
+                            &accs[i],
+                            incremental,
+                            rid_strs[i].client_facing(),
+                            idx(i),
+                            &timings[i],
+                        )
+                    }
                 };
             } else {
                 if coalesced {
@@ -538,7 +545,11 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
         }
-        if let Some(frame) = shaper.finish() { yield frame; }
+        if has_successful_terminal
+            && let Some(frame) = shaper.finish()
+        {
+            yield frame;
+        }
     }
 }
 

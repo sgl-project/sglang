@@ -961,6 +961,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_choice_error_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice".into(),
+        )))
+        .await
+        .unwrap();
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0], senders()),
+            CompletionFrameShaper::new(1, completion_options(), true, false),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 1);
+        let CoreEvent::ItemError(error) = &frames[0] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 400);
+        assert!(error.message.contains("bad choice"));
+    }
+
+    #[tokio::test]
+    async fn all_choice_error_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        let (choice1, tx1) = planned("r1");
+        tx0.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice 0".into(),
+        )))
+        .await
+        .unwrap();
+        tx1.send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            "bad choice 1".into(),
+        )))
+        .await
+        .unwrap();
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0, choice1], senders()),
+            CompletionFrameShaper::new(
+                2,
+                CompletionRenderingOptions {
+                    n: 2,
+                    ..completion_options()
+                },
+                true,
+                false,
+            ),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| matches!(f, CoreEvent::ItemError(_))));
+    }
+
+    #[tokio::test]
+    async fn truncation_suppresses_usage_trailer() {
+        let (choice0, tx0) = planned("r0");
+        drop(tx0);
+
+        let frames: Vec<_> = completion_event_stream(
+            plan(vec![choice0], senders()),
+            CompletionFrameShaper::new(1, completion_options(), true, false),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 1);
+        let CoreEvent::ItemError(error) = &frames[0] else {
+            panic!("expected ItemError");
+        };
+        assert_eq!(error.http_code, 500);
+        assert!(error.message.contains("truncated"));
+    }
+
+    #[tokio::test]
     async fn stream_uses_deltas_then_usage_and_done() {
         let (choice, tx) = planned("r0");
         tx.send(chunk("r0", "a", false)).await.unwrap();
