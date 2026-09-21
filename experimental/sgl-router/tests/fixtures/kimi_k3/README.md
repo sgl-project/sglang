@@ -1,5 +1,8 @@
-Tiny synthetic Kimi vocabulary for testing Dynamo's native formatter and
-segmented tokenizer without a model download. The added tokens include Kimi
-protocol markers; ordinary text that spells those markers must not become
-structural tokens. Adapter tests compare directly with the pinned Dynamo crates,
-including null thinking effort, long text, tools, and response formats.
+Synthetic Kimi vocabulary with protocol markers and ordinary BPE merges.
+`prompts.json` records token counts and SHA-256 of little-endian u32 token IDs
+from SGLang's `_encode_messages` and `moonshotai/Kimi-K3` revision
+`f831ab66814297da540d832a5235f8e904f29d06`. Regenerate in a SGLang Python environment:
+
+```sh
+python tests/scripts/generate_kimi_parity.py
+```

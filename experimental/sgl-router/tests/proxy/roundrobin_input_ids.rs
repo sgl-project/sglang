@@ -442,11 +442,13 @@ async fn kimi_native_requests_keep_existing_forwarding_guards() {
             "chat_template_kwargs": {"thinking": true, "thinking_effort": null}}),
         json!({"model": MODEL, "messages": [{"role": "user", "content": "x".repeat(25_001)}]}),
     ] {
-        let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+        let ids = ctx.tokenizers.encode_chat(MODEL, &request);
         assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
         let mut expected = request.clone();
         if request.get("chat_template_kwargs").is_none() {
-            expected["input_ids"] = json!(ids);
+            expected["input_ids"] = json!(ids.unwrap());
+        } else {
+            assert!(ids.is_none());
         }
         assert_eq!(captured(&mock), expected);
     }

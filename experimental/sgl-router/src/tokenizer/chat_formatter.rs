@@ -40,7 +40,6 @@ pub struct ChatFormatter {
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
     is_deepseek_v4: bool,
-    /// Kimi uses Dynamo directly, without the legacy engine-parity adjustments.
     is_kimi_k3: bool,
 }
 
@@ -57,12 +56,12 @@ impl ChatFormatter {
             .unwrap_or(model_id)
             .to_lowercase();
         if let Some(PromptFormatter::OAI(formatter)) =
-            kimi_k3_formatter_for(&model_type.as_ref().map(|t| t.to_lowercase()), &name, true)
+            kimi_k3_formatter_for(&model_type.as_ref().map(|t| t.to_lowercase()), &name, false)
         {
             return Ok(Some(Self {
                 formatter,
                 defaults: HashMap::new(),
-                bos_token: None,
+                bos_token: Some("[BOS]".into()),
                 is_deepseek_v4: false,
                 is_kimi_k3: true,
             }));
@@ -249,7 +248,13 @@ impl ChatFormatter {
             if self.is_deepseek_v4 && !matches!(effort.as_str(), Some("low" | "high" | "max")) {
                 effort = "low".into();
             }
-            kwargs.entry("reasoning_effort".into()).or_insert(effort);
+            if self.is_kimi_k3 {
+                if matches!(effort.as_str(), Some("low" | "high" | "max")) {
+                    kwargs.entry("thinking_effort".into()).or_insert(effort);
+                }
+            } else {
+                kwargs.entry("reasoning_effort".into()).or_insert(effort);
+            }
         }
         for (key, value) in &self.defaults {
             kwargs.entry(key.clone()).or_insert_with(|| value.clone());
@@ -260,20 +265,7 @@ impl ChatFormatter {
     /// Rendered prompt plus the assistant continuation prefix SGLang tokenizes
     /// separately (`_handle_last_assistant_message`).
     fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
-        if self.is_kimi_k3 {
-            let kwargs = match request.get("chat_template_kwargs") {
-                None | Some(JsonValue::Null) => ChatTemplateKwargs::new(),
-                Some(value) => {
-                    serde_json::from_value(value.clone()).context("chat_template_kwargs")?
-                }
-            };
-            let prompt = self
-                .formatter
-                .render_prompt(&KimiRequest { request, kwargs })
-                .context("render Kimi chat")?;
-            return Ok((prompt, String::new()));
-        }
-        let kwargs = self.template_kwargs(request)?;
+        let mut kwargs = self.template_kwargs(request)?;
         let continuing = request["continue_final_message"] == true;
         let mut messages: Vec<JsonValue> = request["messages"]
             .as_array()
@@ -281,13 +273,16 @@ impl ChatFormatter {
             .iter()
             .map(engine_message)
             .collect();
+        if self.is_kimi_k3 {
+            super::kimi::normalize(request, &mut messages, &mut kwargs)?;
+        }
         let mut prefix = String::new();
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
             if let Some(content) = last["content"].as_str() {
                 if continuing {
                     prefix = content.to_owned();
                     messages.pop();
-                } else {
+                } else if !self.is_kimi_k3 {
                     *last = serde_json::json!({"role": "user", "content": content});
                 }
             }
@@ -304,13 +299,14 @@ impl ChatFormatter {
         }
         let prompt = self
             .formatter
-            .render(&ChatRequest {
+            .render_prompt(&ChatRequest {
                 request,
                 messages,
                 kwargs,
+                is_kimi_k3: self.is_kimi_k3,
             })
             .context("render chat template")?;
-        Ok((RenderedPrompt::text(prompt), prefix))
+        Ok((prompt, prefix))
     }
 
     pub fn encode(
@@ -320,12 +316,28 @@ impl ChatFormatter {
     ) -> Result<Vec<u32>> {
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
-            Some(segments) => tokenizer.encode_segments(&segments)?.token_ids().to_vec(),
+            Some(segments) => {
+                let segments = if self.is_kimi_k3 {
+                    super::kimi::split_segments(&segments)
+                } else {
+                    segments
+                };
+                tokenizer.encode_segments(&segments)?.token_ids().to_vec()
+            }
             None => super::adapter::encode(tokenizer, prompt.as_str())?,
         };
         if !prefix.is_empty() {
             // SGLang encodes the assistant prefix separately and removes its leading BOS.
-            let mut suffix = super::adapter::encode(tokenizer, &prefix)?;
+            let mut suffix = if self.is_kimi_k3 {
+                tokenizer
+                    .encode_segments(&super::kimi::split_segments(&[
+                        dynamo_tokenizers::EncodeSegment::control(&prefix),
+                    ]))?
+                    .token_ids()
+                    .to_vec()
+            } else {
+                super::adapter::encode(tokenizer, &prefix)?
+            };
             if let Some(bos) = self.bos_token.as_deref().filter(|s| !s.is_empty()) {
                 let bos = super::adapter::encode(tokenizer, bos)?;
                 if bos.len() == 1 && suffix.first() == bos.first() {
@@ -386,57 +398,12 @@ fn added_token_content(token: &JsonValue) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Kimi request fields are passed directly to Dynamo, which owns message/tool
-/// normalization and thinking defaults. Other model paths retain ChatRequest.
-struct KimiRequest<'a> {
-    request: &'a JsonValue,
-    kwargs: ChatTemplateKwargs,
-}
-
-impl KimiRequest<'_> {
-    fn field(&self, key: &str) -> Option<Value> {
-        self.request
-            .get(key)
-            .filter(|value| !value.is_null())
-            .map(Value::from_serialize)
-    }
-}
-
-impl OAIChatLikeRequest for KimiRequest<'_> {
-    fn model(&self) -> String {
-        self.request["model"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned()
-    }
-    fn messages(&self) -> Value {
-        Value::from_serialize(&self.request["messages"])
-    }
-    fn tools(&self) -> Option<Value> {
-        self.field("tools")
-    }
-    fn tool_choice(&self) -> Option<Value> {
-        self.field("tool_choice")
-    }
-    fn reasoning_effort(&self) -> Option<Value> {
-        self.field("reasoning_effort")
-    }
-    fn response_format(&self) -> Option<Value> {
-        self.field("response_format")
-    }
-    fn should_add_generation_prompt(&self) -> bool {
-        true
-    }
-    fn chat_template_args(&self) -> Option<&ChatTemplateKwargs> {
-        Some(&self.kwargs)
-    }
-}
-
 struct ChatRequest<'a> {
     request: &'a JsonValue,
     /// Normalized copy of `request["messages"]`.
     messages: Vec<JsonValue>,
     kwargs: ChatTemplateKwargs,
+    is_kimi_k3: bool,
 }
 
 impl OAIChatLikeRequest for ChatRequest<'_> {
@@ -457,6 +424,9 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
         if tools.as_array().is_none_or(|t| t.is_empty()) {
             return None;
         }
+        if self.is_kimi_k3 {
+            return Some(Value::from_serialize(tools));
+        }
         let mut tools = tools.clone();
         // SGLang renders only the named tool for a function `tool_choice`.
         if let Some(name) = self.request["tool_choice"]["function"]["name"].as_str() {
@@ -467,18 +437,23 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
         may_be_fix_tool_schema(tools)
     }
     fn tool_choice(&self) -> Option<Value> {
-        self.request.get("tool_choice").map(Value::from_serialize)
+        if self.is_kimi_k3 {
+            self.kwargs.get("tool_choice").map(Value::from_serialize)
+        } else {
+            self.request.get("tool_choice").map(Value::from_serialize)
+        }
     }
     fn reasoning_effort(&self) -> Option<Value> {
         self.kwargs
             .get("reasoning_effort")
             .map(Value::from_serialize)
     }
-    /// Withheld: the engine enforces `response_format` by constrained decoding
-    /// and never renders it, while dynamo-render's DeepSeek formatters would
-    /// append a "## Response Format" schema preamble to the system turn.
+    // Only Kimi renders response_format; other paths use constrained decoding.
     fn response_format(&self) -> Option<Value> {
-        None
+        self.is_kimi_k3
+            .then(|| self.kwargs.get("response_format"))
+            .flatten()
+            .map(Value::from_serialize)
     }
     fn should_add_generation_prompt(&self) -> bool {
         true

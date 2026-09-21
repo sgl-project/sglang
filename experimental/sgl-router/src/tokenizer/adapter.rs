@@ -6,19 +6,8 @@ use dynamo_tokenizers::{traits::DecodeResult, Tokenizer};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Load a tokenizer from `source`, which is either a local tokenizer file
-/// path or a HuggingFace repo id.
-///
-/// An existing local file (or anything with a filesystem-path shape) is
-/// loaded directly via `Tokenizer::from_file`, which dispatches on the
-/// extension: `tokenizer.json`, or a tiktoken `.model` vocabulary whose BPE
-/// pattern and special tokens come from the sibling `config.json` and
-/// `tokenizer_config.json`. Otherwise `source` is treated as a HuggingFace
-/// repo id and its `tokenizer.json` — or, for tiktoken checkpoints such as
-/// Kimi, `tiktoken.model` plus those siblings — is downloaded (once, at
-/// startup) into the HF cache, honoring `HF_TOKEN` / `HF_HOME` /
-/// `HF_HUB_OFFLINE`. `dynamo_tokenizers` itself has no HF-download path, so
-/// the fetch is done here via `hf-hub`.
+/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings.
+/// Tiktoken `.model` files also require sibling config.json and tokenizer_config.json.
 pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
     if Path::new(source).is_file() || looks_like_path(source) {
         return Tokenizer::from_file(source)

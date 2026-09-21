@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod kimi;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;

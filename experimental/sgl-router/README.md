@@ -213,17 +213,16 @@ with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
 ## Kimi-K3
 
-Kimi-K3 uses Dynamo's native formatter and tokenizer as the source of truth.
-Messages, tools, tool choice, response format, reasoning effort, and template
-kwargs go directly to Dynamo, without SGLang-specific normalization or parity
-fallbacks. Segmented encoding keeps literal control spellings in user text
-separate from protocol markers. Existing input-ID forwarding guards still apply.
+Kimi-K3 uses Dynamo's native formatter with SGLang request normalization and
+segmented tokenization, including the checkpoint's long-text chunk boundaries.
+Reasoning controls, tools, response formats, and assistant continuations match
+SGLang. Explicit null `thinking_effort` while thinking is enabled falls back to
+worker rendering because the pinned Dynamo formatter cannot represent it.
 
 `--tokenizer-path` accepts a local `tiktoken.model` or a Hugging Face repo ID.
-The repository loader falls back from `tokenizer.json` to `tiktoken.model` and
-requires its sibling `config.json` and `tokenizer_config.json` files. Tests compare
-Kimi rendering and tokens directly with the pinned Dynamo libraries; the existing
-DeepSeek and Jinja behavior is unchanged.
+The loader falls back from `tokenizer.json` to `tiktoken.model` with sibling
+`config.json` and `tokenizer_config.json`. Token parity fixtures come from
+SGLang's serving code and the pinned Kimi checkpoint tokenizer.
 
 ## HTTP/2
 
