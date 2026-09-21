@@ -705,6 +705,7 @@ class TboForwardBatchPreparer:
 
         for key in [
             "req_pool_indices",
+            "req_pool_indices_cpu",
             "seq_lens",
             "seq_lens_cpu",
             "extend_seq_lens",
@@ -760,6 +761,7 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
+            "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
