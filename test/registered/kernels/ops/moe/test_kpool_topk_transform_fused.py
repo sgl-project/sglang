@@ -22,7 +22,7 @@ from sglang.kernels.ops.moe.kpool_topk_transform import fast_kpool_topk_transfor
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires a GPU")
