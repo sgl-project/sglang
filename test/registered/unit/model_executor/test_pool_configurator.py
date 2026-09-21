@@ -1152,6 +1152,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
         return cfg._compute_dsv4_sizes(max_tokens, page_size)
 
     def test_dsv4_rejects_single_page_pool(self):
@@ -1214,7 +1217,13 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.disaggregation_mode = None
         cfg.disaggregation_decode_extra_slots = 0
         cfg._unified = True
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
+        cfg.request_window_bytes = 0
+        cfg.bytes_per_swa_token = 0.0
         cfg._unified_fp8 = False
+        cfg._dspark_draft_on_bf16 = False
         # object.__new__ skips __init__; bf16 unified row is 2B * latent
         cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
@@ -1231,6 +1240,50 @@ class TestSWAPoolFloor(CustomTestCase):
             + cfg._get_c128_state_fixed_bytes(max_running_requests)
         )
 
+    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(
+            self,
+            enable_encoder_swa_bounded_replay=True,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+            speculative_dspark_block_size=5,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=cfg,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            sliding_window_size=128,
+            page_size=256,
+            spec_algorithm=spec,
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+        )
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
+        budget = 256 * 1024 * 1024
+        sizes = planner.calculate_pool_sizes(budget, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+        self.assertLessEqual(
+            sizes.full_max_total_num_tokens * planner.bytes_per_full_token
+            + planner._get_swa_fixed_bytes(),
+            budget,
+        )
+
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.
@@ -1238,6 +1291,38 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
         self.assertEqual(sizes.c4_state_pool_size, 0)
+
+    def test_dsv4_fp8_dspark_swa_ring_includes_bf16_draft(self):
+        """Target fp8 ring + one-layer bf16 draft ring, not (T+1)/T * fp8."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import dsv4_unified_row_bytes
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = dsv4_unified_row_bytes(448, 64, fp8=True)
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 448, 64
+        cfg._dspark_draft_on_bf16 = True
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        got = cfg._fixed_swa_bytes(mrr)
+        target = (
+            slots * cfg._swa_ring_size * cfg._unified_row_bytes * cfg.num_layers_total
+        )
+        draft = slots * cfg._swa_ring_size * dsv4_unified_row_bytes(448, 64, False)
+        self.assertEqual(got, target + draft)
+        mtp_formula = int(target * cfg._spec_infl)
+        self.assertGreater(got, mtp_formula)
+
+    def test_dsv4_fp8_mtp_swa_ring_keeps_spec_inflation(self):
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = 640
+        cfg._dspark_draft_on_bf16 = False
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
+        self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::policies::active_load::ActiveLoadRegistry;
-use crate::policies::kv_events::KvEventIndex;
+use crate::state::kv_events::KvEventIndex;
+use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
@@ -82,11 +82,11 @@ fn dials_cleartext(worker_url: &str) -> Option<bool> {
 /// that risk.
 ///
 /// [`WireProtocol::Http1`] is the fallback for everything else, and it does
-/// mean HTTP/1.1 on the wire: reqwest is built here without its `http2`
-/// feature, so the forwarding client advertises only `http/1.1` even on TLS.
-/// An `https://` worker running `--enable-http2` therefore stays on HTTP/1.1
-/// — correct, because h2c cannot be sent to a TLS endpoint either way, but
-/// not the ALPN upgrade the flag might suggest. See [`WireProtocol`].
+/// not mean "HTTP/1.1 on the wire". It selects the negotiating client, which
+/// advertises ALPN `h2, http/1.1`, so an `https://` worker running
+/// `--enable-http2` reaches HTTP/2 over TLS on its own — the correct outcome,
+/// arrived at by negotiation rather than by assumption. Only cleartext workers
+/// need prior-knowledge h2c. See [`WireProtocol`].
 fn resolve_protocol(enable_http2: Option<bool>, cleartext: Option<bool>) -> WireProtocol {
     match (enable_http2, cleartext) {
         (Some(true), Some(true)) => WireProtocol::H2c,
@@ -109,7 +109,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// manager does not need a handle to the proxy.
 ///
 /// When `kv_index` is `None`, KV-event and load-subscriber state is disabled; when
-/// `active_load` is `None` the active-load bookkeeping is not pruned
+/// `router_inflight_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
@@ -123,14 +123,14 @@ pub async fn run_with_config(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
 ) {
     run_with_introspector(
         rx,
         registry,
         cfg,
         kv_index,
-        active_load,
+        router_inflight_load,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -146,7 +146,7 @@ pub async fn run_with_introspector(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     run_with_introspector_and_reconcile(
@@ -154,7 +154,7 @@ pub async fn run_with_introspector(
         registry,
         cfg,
         kv_index,
-        active_load,
+        router_inflight_load,
         introspector,
         RECONCILE_INTERVAL,
     )
@@ -186,7 +186,7 @@ pub async fn run_with_introspector_and_reconcile(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: Option<Arc<RouterInflightLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -226,7 +226,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &registry,
                     &cfg,
                     &kv_index,
-                    &active_load,
+                    &router_inflight_load,
                     &introspector,
                     &mut pending,
                 )
@@ -264,7 +264,7 @@ async fn handle_discovery_event(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
-    active_load: &Option<Arc<ActiveLoadRegistry>>,
+    router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -327,7 +327,7 @@ async fn handle_discovery_event(
             // per-worker counters slot will not be re-created
             // (selectors no longer see the worker, so no new
             // requests can register against it).
-            if let Some(al) = active_load {
+            if let Some(al) = router_inflight_load {
                 al.forget_worker(&id);
             }
         }
@@ -449,12 +449,12 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
             worker_url = %worker_url,
             "/server_info reports --enable-http2 on a cleartext worker; forwarding over h2c",
         ),
-        // A TLS worker. h2c is unsendable there and the client does not
-        // negotiate, so this worker stays on HTTP/1.1.
+        // A TLS worker. h2c is unsendable there, but the negotiating client
+        // advertises ALPN h2, so a TLS engine still reaches HTTP/2 on its own.
         (Some(true), Some(false)) => tracing::info!(
             worker_url = %worker_url,
-            "/server_info reports --enable-http2 on a TLS worker; \
-             forwarding over HTTP/1.1",
+            "/server_info reports --enable-http2 on a TLS worker; using the \
+             negotiating client, which reaches HTTP/2 over TLS via ALPN",
         ),
         // `dials_cleartext` could not parse the URL. Reaching this at all means
         // `/server_info` answered over a URL the scheme check then rejected, so
@@ -473,7 +473,8 @@ fn log_protocol_resolution(worker_url: &str, enable_http2: Option<bool>, clearte
         // revisiting it, so this reading is the only one it will ever get.
         (None, _) => tracing::info!(
             worker_url = %worker_url,
-            "no --enable-http2 reading from /server_info; forwarding over HTTP/1.1",
+            "no --enable-http2 reading from /server_info; using the negotiating \
+             client (HTTP/1.1 in cleartext)",
         ),
         // The engine explicitly disabled it. Nothing to explain.
         (Some(false), _) => {}
@@ -569,7 +570,7 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, ModelConfig,
+        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, InflightLoadConfig, ModelConfig,
         PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
@@ -584,11 +585,13 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
+                disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,
@@ -601,12 +604,13 @@ mod tests {
                 affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 
@@ -966,7 +970,7 @@ mod tests {
     }
 
     /// Task B: `DiscoveryEvent::Removed` calls
-    /// `ActiveLoadRegistry::forget_worker` so the per-worker counters
+    /// `RouterInflightLoadRegistry::forget_worker` so the per-worker counters
     /// slot is reaped. Without this, a long-lived cluster with worker
     /// churn would leak one `WorkerCounters` entry per departed worker.
     #[tokio::test]
@@ -980,14 +984,14 @@ mod tests {
             spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
 
         let registry = Arc::new(WorkerRegistry::default());
-        let active_load = ActiveLoadRegistry::with_defaults();
+        let router_inflight_load = RouterInflightLoadRegistry::with_defaults();
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
             None,
             None,
-            Some(Arc::clone(&active_load)),
+            Some(Arc::clone(&router_inflight_load)),
             fast_introspector(),
         ));
 
@@ -1015,8 +1019,8 @@ mod tests {
 
         // Mint a guard to force the active-load registry to create a
         // per-worker counters slot for this id.
-        let _g = active_load.register(id.clone(), "test://", 10, 1);
-        assert!(active_load.is_known(&id));
+        let _g = router_inflight_load.register(id.clone(), "test://", 10, 1);
+        assert!(router_inflight_load.is_known(&id));
 
         // Now drive the Removed event and assert the counters slot is
         // gone.  We tear down the guard last so the request entry is
@@ -1026,7 +1030,7 @@ mod tests {
             .unwrap();
         let removed = timeout(Duration::from_secs(2), async {
             loop {
-                if !active_load.is_known(&id) && registry.get(&id).is_none() {
+                if !router_inflight_load.is_known(&id) && registry.get(&id).is_none() {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1035,7 +1039,7 @@ mod tests {
         .await;
         assert!(
             removed.is_ok(),
-            "manager must call active_load.forget_worker on Removed",
+            "manager must call router_inflight_load.forget_worker on Removed",
         );
 
         drop(tx);
