@@ -50,11 +50,11 @@ export const config = {
     return f ? Number(f.split(/[\s=]/)[1]) || 1 : 1;
   },
   // The two NPU recipes (A3 and A5) each ship exactly one operating point —
-  // Unified PD, the Balanced strategy, Modelslim W4A8, DSPARK, no HiCache,
-  // no tool calling — so every panel gate below keys off this helper instead
-  // of enumerating platforms. Shape differences between the two (TP64/DP4 vs
-  // TP32/dp1, mamba-cache sizing) are handled by the cells and the TP/DP knob
-  // rules, not here.
+  // Unified PD, the Balanced strategy, DSPARK, no HiCache, no tool calling —
+  // so every panel gate below keys off this helper instead of enumerating
+  // platforms. Shape differences between the two (TP64/DP4 vs TP32/dp1,
+  // Modelslim W4A8 vs the MXFP4 checkpoint, mamba-cache sizing) are handled by
+  // the cells, the TP/DP knob rules and the Quantization axis, not here.
   isNpuHw(s) {
     return s.hw === "a3" || s.hw === "a5";
   },
@@ -205,15 +205,19 @@ export const config = {
       default: "mxfp4",
       options: [
         { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint",
-          disabled: (s) => config.isNpuHw(s),
-          disableReason: (s) => (config.isNpuHw(s) ? "Only Modelslim (W4A8) is supported on this recipe." : ""),
+          // The 950PR/DT recipe serves this checkpoint; the A3 Series recipe
+          // serves the W4A8 build under it instead.
+          disabled: (s) => s.hw === "a3",
+          disableReason: (s) => (s.hw === "a3" ? "The A3 Series recipe serves the sgl-npu Modelslim (W4A8) checkpoint." : ""),
         },
         {
-          // NPU recipes only (W4A8 checkpoint); hidden on the GPU recipes.
+          // A3 Series only (ModelSlim W4A8 checkpoint); hidden elsewhere — the
+          // 950PR/DT recipe serves the MXFP4 checkpoint above with no
+          // --quantization flag.
           id: "modelslim",
           label: "Modelslim (W4A8)",
           subtitle: "ModelScope NPU checkpoint",
-          showWhen: (s) => config.isNpuHw(s),
+          showWhen: (s) => s.hw === "a3",
         },
         {
           id: "nvfp4",
@@ -424,7 +428,10 @@ export const config = {
     default: "moonshotai/Kimi-K3",
     nvfp4: "nvidia/Kimi-K3-NVFP4",
     a3: "sgl-npu/Kimi-K3-W4A8",
-    a5: "sgl-npu/Kimi-K3-W4A8",
+    // The 950PR/DT recipe serves the official Moonshot checkpoint (MXFP4) from
+    // ModelScope — the same id the NVIDIA recipes resolve to, fetched through
+    // SGLANG_USE_MODELSCOPE. The A3 Series recipe serves the W4A8 build.
+    a5: "moonshotai/Kimi-K3",
   },
 
   placeholders: {
@@ -2444,6 +2451,14 @@ export const config = {
       // paths and the fine-grained dual-stream MoE overlap. DP-attention runs
       // at dp=1 (attn-TP 32), and the shared experts / dense MLP shard across
       // attention-TP through the server flags (--shared-experts-tp-size 4).
+      // Checkpoint: the official Moonshot MXFP4 build (moonshotai/Kimi-K3,
+      // fetched from ModelScope by SGLANG_USE_MODELSCOPE=1 above). Its routed
+      // experts declare compressed-tensors "mxfp4-pack-quantized", which the
+      // loader detects from the checkpoint itself — the NPU MXFP4 MoE scheme
+      // serves them — so the recipe passes no --quantization flag (attention,
+      // shared experts and the dense MLP are ignored by the checkpoint and stay
+      // BF16). A ModelSlim (W4A8) checkpoint would need --quantization modelslim
+      // and a modelslim-style --model-path instead; the two are not mixable.
       // Pool sizing is internal to the Ascend path: the KDA state and MLA KV
       // pools are sized by the runtime, so the recipe sets neither
       // --mamba-full-memory-ratio nor --max-mamba-cache-size, and the radix
@@ -2489,7 +2504,6 @@ export const config = {
         "--tokenizer-path {{MODEL_NAME}}",
         "--attention-backend ascend",
         "--device npu",
-        "--quantization modelslim",
         "--dtype bfloat16",
         "--tp-size 32",
         "--enable-dp-attention",
