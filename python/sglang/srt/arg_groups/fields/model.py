@@ -297,8 +297,15 @@ class Model(msgspec.Struct):
         int, "Number of threads per rank for checkpoint prefetching (default: 4)."
     ] = 4
     weight_loader_drop_cache_after_load: A[
-        bool, "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it."
-    ] = False
+        Optional[Literal["shard", "model"]],
+        Arg(
+            help="Advise checkpoint page-cache release with posix_fadvise(DONTNEED). "
+            "'shard' (also the bare flag) advises after each safetensors shard is yielded. "
+            "'model' waits for all ranks to finish loading, then advises each file once per node.",
+            nargs="?",
+            const="shard",
+        ),
+    ] = None
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
         "The ip of the seed instance for loading weights from remote instance.",
