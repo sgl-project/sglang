@@ -171,42 +171,22 @@ across engines whose own flags the router operator may not control.
 
 ## Chat rendering
 
-The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
-HF Jinja template from `tokenizer_config.json` or a sibling
-`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
-for template-less models. Cache-aware routing hashes the rendered tokens so its
-prefix queries match the blocks the engine caches. Models the engine encodes in
-code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
-text, as does any model whose template fails to load or render.
+The router renders chat requests with dynamo-render (`dynamo-renderer`), using
+any model's HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or a supported native formatter (DeepSeek, Kimi-K3,
+Inkling). Cache-aware routing hashes the rendered tokens.
 
-Plain text chat requests (string `content`, no tools, no template kwargs or
-reasoning controls or historical `reasoning_content`, no assistant continuation,
-no consecutive users or non-leading system turns) additionally forward the
-rendered tokens to the engine as `input_ids`, retaining the original messages,
-so the engine skips re-tokenizing. Every other request shape is rendered for
-routing only: the router renders with dynamo-render and does not replicate
-SGLang's request normalization, so forwarding is enabled shape by shape as
-parity is verified. Use matching model files on the router and workers; worker
-template overrides and default kwargs are not observable from the request.
+Successfully rendered text requests forward `input_ids` to workers under every
+routing policy, retaining the original messages. This includes tools, reasoning
+controls and history, text content arrays, and assistant continuations. Dynamo's
+rendered tokens are used directly; SGLang rendering parity is not required.
+Media still needs worker preprocessing, and per-request `chat_template` overrides
+are left to workers. Missing or failing formatters fall back to worker rendering
+and raw-text routing. Caller-supplied `input_ids` pass through unchanged.
 
-Set `--disable-input-ids-forwarding` for this router's model when worker-side
-rendering has not been verified to match. This disables router-generated IDs
-for every routing policy; cache-aware routing still renders and tokenizes
-locally, and the original messages reach the workers for engine processing.
-Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
-
-Forwarding logs its assumptions at startup. In particular, disable it for
-`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
-worker parser overrides such as `--tool-call-parser deepseekv32` that select a
-native encoder over a shipped template, or conversation templates with stop
-strings (the engine's `input_ids` path skips those template stops). These worker
-settings are not inferred from the router's environment. Disabling forwarding preserves
-engine behavior but does not establish parity for local routing hashes.
-
-Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
-string content into arrays differently from the worker. The pinned Dynamo renderer does not expose
-its conversion flag, so the router cannot automatically block these templates.
-Detailed content-format parity coverage follows in #39133.
+Set `--disable-input-ids-forwarding` to use worker-side rendering and defaults.
+Cache-aware routing still renders locally when forwarding is disabled. Use the
+same tokenizer vocabulary on the router and workers.
 
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
@@ -224,14 +204,15 @@ The router recognizes the official checkpoint encoder's low-effort default and
 it uses SGLang's preview-profile fallback. A `dsv4_reasoning_effort_profile` value
 of `preview` or `official` in the local `config.json` overrides detection. Keep
 this file and the encoder source consistent with the worker's model and config
-overrides. Worker environment defaults still require the forwarding precautions
-above. V4.1 Flash uses Dynamo 5.2's separate encoder with SGLang's numeric reasoning
+overrides. Disable forwarding to use worker environment defaults.
+
+V4.1 Flash uses Dynamo 5.2's separate encoder with SGLang's numeric reasoning
 budgets, tool payloads, and system markers. Text-only requests are covered;
 media, developer messages, and thinking histories whose last system turn follows
 the last user turn (without tools) fall back to worker rendering because the
 pinned encoder differs from SGLang on those shapes. Such fallbacks also use raw
 text for routing. Non-default `SGLANG_DSV41_REASONING_EFFORT` worker settings
-require the same forwarding precautions as other worker-only defaults.
+also require disabling forwarding to take effect.
 
 ## Kimi-K3
 

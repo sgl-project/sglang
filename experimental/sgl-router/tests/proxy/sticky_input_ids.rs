@@ -11,8 +11,7 @@
 //!
 //! * A plain text chat request forwards `input_ids` AND retains `messages`,
 //!   even though sticky never consults the tokens for routing.
-//! * A request carrying `tools` / multimodal content omits `input_ids` — the
-//!   same safe-to-forward predicate applies regardless of policy.
+//! * Tools and reasoning controls forward IDs; media uses worker preprocessing.
 //! * Same-session-header requests still pin to a single worker (O(1) sticky
 //!   routing is unchanged by the added tokenization).
 //!
@@ -160,7 +159,7 @@ async fn sticky_plain_chat_forwards_input_ids_and_keeps_messages() {
 }
 
 #[tokio::test]
-async fn sticky_tool_request_omits_input_ids() {
+async fn sticky_tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(std::slice::from_ref(&mock.url));
     let status = send(
@@ -177,16 +176,13 @@ async fn sticky_tool_request_omits_input_ids() {
 
     let body = captured(&mock);
     assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids even under sticky; got {body}"
+        body.get("input_ids").is_some(),
+        "tool requests must forward input_ids even under sticky; got {body}"
     );
 }
 
 #[tokio::test]
-async fn sticky_thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode the router's
-    // encoder renders in the default mode only — the safe-to-forward predicate
-    // is policy-independent, so sticky must omit ids here too.
+async fn sticky_thinking_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(std::slice::from_ref(&mock.url));
     let status = send(
@@ -203,8 +199,8 @@ async fn sticky_thinking_request_omits_input_ids() {
 
     let body = captured(&mock);
     assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids under sticky; got {body}"
+        body.get("input_ids").is_some(),
+        "thinking-mode requests must forward input_ids under sticky; got {body}"
     );
 }
 

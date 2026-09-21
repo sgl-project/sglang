@@ -82,13 +82,8 @@ impl TokenizerRegistry {
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
         } else if me.has_chat_formatter(&m.id) {
-            tracing::warn!(model = %m.id,
-                "router-generated input_ids forwarding enabled: requires matching worker model \
-                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
-                 and default SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
-                 (including --tool-call-parser deepseekv32), content-format detection, and \
-                 conversation-template stop strings are not replicated. Use \
-                 --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
+            tracing::info!(model = %m.id,
+                "router-generated input_ids forwarding enabled via dynamo-render");
         }
         Ok(me)
     }
@@ -351,7 +346,11 @@ mod tests {
         for model_type in ["llama", "deepseek_v32"] {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
-        assert!(resolve("inkling_mm_model").is_none());
+        assert!(resolve("inkling_mm_model")
+            .unwrap()
+            .render(&request)
+            .unwrap()
+            .contains("<|message_user|><|content_text|>hi<|end_message|>"));
         assert!(resolve("kimi_k3")
             .unwrap()
             .render(&request)

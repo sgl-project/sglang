@@ -4,16 +4,16 @@
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
 //! Mirrors SGLang reasoning controls, assistant continuations, and DeepSeek-V4
-//! task selection before rendering. Forwarding remains guarded until parity
-//! has been verified for each request shape.
+//! task selection before rendering.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dynamo_renderer::{
-    deepseek_formatter_for, kimi_k3_formatter_for, may_be_fix_tool_schema, ChatTemplate,
-    ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt,
+    deepseek_formatter_for, kimi_k3_formatter_for, may_be_fix_tool_schema, native_formatter_for,
+    ChatTemplate, ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter,
+    RenderedPrompt,
 };
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
@@ -61,8 +61,7 @@ impl ChatFormatter {
             return Ok(Some(kimi));
         }
         match model_type.as_deref() {
-            // These require tokenization paths not yet supported by this adapter.
-            Some("inkling_mm_model") => return Ok(None),
+            Some("inkling_mm_model") => return Ok(Self::native(model_type.as_deref(), model_id)),
             Some(t) if t.starts_with("deepseek_v4") => {
                 let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
                 if let Some(formatter) = &mut formatter {
@@ -77,7 +76,7 @@ impl ChatFormatter {
             .unwrap_or_else(|| serde_json::json!({}));
         let jinja = files.text("chat_template.jinja")?;
         let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
-            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
+            .or_else(|| Self::native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
             formatter.configure_deepseek(&files, &config)?;
         }
@@ -164,6 +163,22 @@ impl ChatFormatter {
             deepseek: None,
             is_kimi_k3: false,
         }))
+    }
+
+    fn native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
+        if let Some(formatter) = Self::deepseek_native(model_type, model_id) {
+            return Some(formatter);
+        }
+        let model_type = model_type.map(str::to_lowercase);
+        let PromptFormatter::OAI(formatter) =
+            native_formatter_for(&model_type, &model_name(model_id))?;
+        Some(Self {
+            formatter,
+            defaults: HashMap::new(),
+            bos_token: None,
+            deepseek: None,
+            is_kimi_k3: false,
+        })
     }
 
     /// dynamo-render's native Kimi-K3 XTML formatter, wrapped in SGLang's request
