@@ -32,7 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_serving
+from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
@@ -205,7 +205,7 @@ class SchedulerOutputStreamer:
 
         # Send to detokenizer
         payload = acc.to_payload(
-            dp_rank=self.ps.dp_rank,
+            dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
@@ -232,7 +232,7 @@ class SchedulerOutputStreamer:
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
             req.finished()
-            and self.ps.attn_tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()

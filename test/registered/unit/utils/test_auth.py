@@ -80,6 +80,17 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_ready_path_always_allowed(self):
+        decision = decide_request_auth(
+            method="GET",
+            path="/ready",
+            authorization_header=None,
+            api_key="secret",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
     def test_metrics_path_always_allowed(self):
         decision = decide_request_auth(
             method="GET",
