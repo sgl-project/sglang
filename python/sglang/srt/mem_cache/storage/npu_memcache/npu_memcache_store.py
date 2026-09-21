@@ -466,17 +466,6 @@ class NpuMemcacheStore(HiCacheStorage):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
-        layout = getattr(host_pool, "layout", None)
-        if layout not in {
-            "page_first",
-            "page_first_direct",
-            "page_head",
-            "page_first_kv_split",
-        }:
-            raise ValueError(
-                "Ascend Memcache hybrid pools require a storage-compatible "
-                f"page-first layout, got {layout!r} for {host_pool_name}."
-            )
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
