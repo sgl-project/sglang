@@ -18,7 +18,6 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -140,7 +139,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
