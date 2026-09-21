@@ -691,6 +691,12 @@ ENV CARGO_BUILD_JOBS=4
 RUN pip uninstall -y sgl_kernel sglang
 
 # Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
+#
+# torch's CUDAExtension hipifies in place, so setup_rocm.py writes generated HIP sources next to
+# their CUDA originals (<name>.cu -> <name>.hip, included headers -> <name>_hip.<ext>). Images
+# built on top of this one move the checkout forward with `git checkout`, which aborts as soon as
+# one of those untracked byproducts sits where the newer revision tracks a real file. Clean them in
+# the same layer so the image ships a checkout that can still be fast-forwarded.
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
          echo "Using local source (BRANCH_TYPE=local)."; \
@@ -712,7 +718,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && cd python/sglang/kernels/aot \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
-    && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install
+    && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
+    && if git -C /sgl-workspace/sglang rev-parse --is-inside-work-tree > /dev/null 2>&1; then \
+         git -C /sgl-workspace/sglang clean -fdx -- \
+             python/sglang/kernels/aot/csrc python/sglang/kernels/aot/include; \
+       fi
 RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
