@@ -103,6 +103,7 @@ pub struct BucketRequest<'a> {
     pub model: &'a ModelId,
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
+    pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
@@ -137,6 +138,25 @@ impl Bucket {
             max_context_tokens: None,
             groups,
         }
+    }
+
+    /// Reject a policy installed on a stage it cannot serve before any request reaches it.
+    pub fn validate(&self) -> Result<(), PickError> {
+        let groups: &[(Stage, &EngineGroup)] = match &self.groups {
+            BucketGroups::Plain(group) => &[(Stage::Plain, group)],
+            BucketGroups::Pd { prefill, decode } => {
+                &[(Stage::Prefill, prefill), (Stage::Decode, decode)]
+            }
+        };
+        for (stage, group) in groups {
+            if !group.policy.supports(*stage) {
+                return Err(PickError::InvalidConfiguration(format!(
+                    "bucket {} installs a policy that cannot serve the {stage:?} stage",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Select this bucket's plain engine or complete P/D pair, without dispatching.
@@ -179,6 +199,7 @@ impl Bucket {
             bucket: &self.id,
             input_tokens: request.input_tokens,
             expected_peak_tokens: request.expected_peak_tokens,
+            prefix: request.prefix,
             token_ids: request.token_ids,
             session_key: request.session_key,
             routing_key: request.routing_key,
@@ -211,8 +232,12 @@ pub struct BucketResolver {
 }
 
 impl BucketResolver {
-    pub fn new(buckets: Vec<Bucket>) -> Self {
-        Self { buckets }
+    /// Fails if any bucket installs a policy on a stage it cannot serve.
+    pub fn new(buckets: Vec<Bucket>) -> Result<Self, PickError> {
+        for bucket in &buckets {
+            bucket.validate()?;
+        }
+        Ok(Self { buckets })
     }
 
     /// Return all length-compatible buckets, ordered by input capacity, rank, and ID.
