@@ -2324,6 +2324,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
+            # Buffered receives and small batches may both complete without
+            # suspending, so explicitly let response waiters and other tasks run.
+            await asyncio.sleep(0)
 
     async def _handle_batch_output(
         self,
@@ -2632,7 +2635,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
-        # handle_loop awaits next recv immediately
+        # handle_loop yields after these remaining notifications.
         for s in pending_notify.values():
             s.event.set()
 
