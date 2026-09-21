@@ -2192,6 +2192,7 @@ class ReasoningParser:
         "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
+        "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "cohere_command4": CohereCommand4Detector,
     }
