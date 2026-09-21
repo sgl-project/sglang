@@ -393,9 +393,7 @@ def _unpack_qwen4_exp_pp_proxy(
     return pp_proxy_tensors["hidden_states"], None
 
 
-def _is_weight_outside_pp_stage(
-    name: str, *, start_layer: int, end_layer: int
-) -> bool:
+def _is_weight_outside_pp_stage(name: str, *, start_layer: int, end_layer: int) -> bool:
     layer_id = get_layer_id(name)
     return layer_id is not None and not (start_layer <= layer_id < end_layer)
 
@@ -1702,9 +1700,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             residual = None
         else:
             assert pp_proxy_tensors is not None
-            hidden_states, residual = _unpack_qwen4_exp_pp_proxy(
-                pp_proxy_tensors
-            )
+            hidden_states, residual = _unpack_qwen4_exp_pp_proxy(pp_proxy_tensors)
 
         ple_batch = (
             _prepare_ple_batch(
