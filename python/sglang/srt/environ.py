@@ -979,9 +979,32 @@ class Envs:
     # DCP extend on NPU: let the sparse operator read the gathered prefix in the
     # rank-major order the all-gather already produced, remapping the top-k
     # instead of permuting ~1 GiB of KV back into position order.
+    #
+    # OFF, and measured rather than merely untried. On a 16k tail over a 958k
+    # cached prefix (GLM-5.2, A3, TP16 DCP16) it came out at 4.843 s against
+    # 4.757 s without it: the index_select it deletes costs ~216 ms and the
+    # top-k remap that replaces it costs about the same, ~0.30 s a chunk spread
+    # over eight elementwise passes on a [tokens, index_topk] tensor, 21 layers
+    # a forward. Correct -- prefill logprobs are bitwise identical at all 44,062
+    # paired positions -- just not worth anything on its own. Its value would
+    # grow with context length, since the gather it avoids permuting scales as
+    # N^2, and the remap could be one table lookup instead of eight passes.
     SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(False)
     # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
     # l computes, into the other of two slots. Requires the packed read above.
+    #
+    # OFF. Measured -1.4% on the same tail (4.690 s) and ~5 s on a 62-chunk 1M
+    # warm-up. It recovers only ~19% of the collective it hides (153 ms of the
+    # ~810 ms of hcom_allGather in a forward) even though there is ~6x more
+    # compute than gather per layer to hide under, so the limit is not compute
+    # headroom and a larger chunk will not lift it.
+    #
+    # The cost is worse than the two-slots arithmetic suggests. Gather buffers
+    # are grow-only and keyed by name, so a process that takes BOTH paths keeps
+    # both sets: the two prefetch slots (~2.25 GiB) on single-request extends
+    # plus the permuting path's four buffers (~1.43 GiB) on multi-request ones,
+    # against ~1.43 GiB without either flag. A mixed workload -- which is the
+    # serving case -- pays ~+2.25 GiB and OOM'd at --mem-fraction-static 0.70.
     SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
