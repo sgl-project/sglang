@@ -88,9 +88,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         slots = torch.arange(batch_size + 1, 1, -1, device="cuda", dtype=torch.int32)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
-            req_pool_indices=torch.arange(
-                batch_size, device="cuda", dtype=torch.int32
-            ),
+            req_pool_indices=torch.arange(batch_size, device="cuda", dtype=torch.int32),
             spec_info=SimpleNamespace(draft_token_num=steps, ragged_verify_layout=None),
         )
         rounds = [
