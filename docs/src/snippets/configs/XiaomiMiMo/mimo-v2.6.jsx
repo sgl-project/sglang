@@ -33,7 +33,7 @@ export const config = {
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","messages":[{"role":"user","content":"What is 15% of 240?"}],"chat_template_kwargs":{"enable_thinking":true}}'`,
   // Built locally using the Dockerfile in the page, not a published image tag.
-  dockerImages: { b300: "mimo-v2.6-sglang:983e643854" },
+  dockerImages: { b300: "lmsysorg/sglang:dev" },
   dockerMounts: ["\"{{MODEL_ROOT}}:/model:ro\""],
   github: { cookbookModel: "MiMo-V2.6 (Flash / Pro)" },
   playgroundFeatures: {
