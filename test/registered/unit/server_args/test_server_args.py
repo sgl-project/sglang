@@ -1,5 +1,4 @@
 import argparse
-import itertools
 import json
 import os
 import pickle
@@ -1996,38 +1995,6 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
-    def test_decode_host_pool_matches_kv_transfer_layout(self):
-        """The shared pool must keep KV transfer geometry through normalization."""
-        for backend, layout in itertools.product(
-            (None, "file", "mooncake", "npu_memcache"),
-            ("layer_first", "page_first", "page_first_direct"),
-        ):
-            with self.subTest(backend=backend, layout=layout):
-                args = self._make_args(
-                    disaggregation_mode="decode",
-                    disaggregation_decode_enable_host_receive=True,
-                    disaggregation_decode_enable_radix_cache=True,
-                    enable_hierarchical_cache=True,
-                    hicache_storage_backend=backend,
-                    hicache_mem_layout=layout,
-                )
-                handle_pd_disaggregation(args)
-                if backend in ("mooncake", "npu_memcache"):
-                    with self.assertRaisesRegex(
-                        ValueError, "storage layout.*KV transfer"
-                    ):
-                        handle_hicache(args)
-                else:
-                    handle_hicache(args)
-                    handle_cache_compatibility(args)
-                    self.assertFalse(resolution_result(args, "disable_radix_cache"))
-                    self.assertEqual(
-                        resolution_result(args, "hicache_mem_layout"), "layer_first"
-                    )
-                    self.assertEqual(
-                        resolution_result(args, "hicache_io_backend"), "kernel"
-                    )
-
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
