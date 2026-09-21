@@ -377,8 +377,9 @@ class Sm100ChunkOKernel:
 
                 parity ^= 1
 
-                # Order this iteration's s_g_cu loads before the next
-                # iteration's loop-top s_g_cu stores (cross-iteration WAR).
+                # s_g_cu feeds the exp-based gating mask above. Order this
+                # iteration's loads before the next iteration's loop-top
+                # stores (cross-iteration WAR).
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
         else:
