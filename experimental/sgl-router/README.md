@@ -171,48 +171,59 @@ across engines whose own flags the router operator may not control.
 
 ## Chat rendering
 
-Dynamo (`dynamo-renderer` and `dynamo-tokenizers`) is the source of truth for
-router-generated prompts and token IDs. The router loads the model's HF Jinja
-template from `tokenizer_config.json` or a sibling `chat_template.jinja`, or
-selects Dynamo's native Kimi-K3 or DeepSeek formatter. Model detection follows
-the pinned Dynamo version; unsupported native families fall back to a shipped
-template or raw prompt-text routing.
+The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
+HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
+for template-less models. Cache-aware routing hashes the rendered tokens so its
+prefix queries match the blocks the engine caches. Models the engine encodes in
+code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
+text, as does any model whose template fails to load or render.
 
-Messages, tools, tool choice, response format, top-level reasoning effort, and
-`chat_template_kwargs` are exposed directly to Dynamo. Dynamo owns their
-interpretation, including thinking defaults, tool handling, and message
-normalization. The router does not reproduce SGLang's Python preprocessing,
-rewrite assistant continuations, or change rendered prompts to match an engine.
-Dynamo's segmented prompts stay segmented through tokenization, so literal
-control-token spellings in ordinary text remain distinct from protocol markers.
+Plain text chat requests (string `content`, no tools, no template kwargs or
+reasoning controls or historical `reasoning_content`, no assistant continuation,
+no consecutive users or non-leading system turns) additionally forward the
+rendered tokens to the engine as `input_ids`, retaining the original messages,
+so the engine skips re-tokenizing. Every other request shape is rendered for
+routing only: the router renders with dynamo-render and does not replicate
+SGLang's request normalization, so forwarding is enabled shape by shape as
+parity is verified. Use matching model files on the router and workers; worker
+template overrides and default kwargs are not observable from the request.
 
-For requests with string content and supported controls, the router forwards
-Dynamo-generated `input_ids` while retaining the original messages. This applies
-to tools, reasoning history, reasoning effort, and template kwargs as well as
-plain chat, independently of the routing policy. Workers consume those IDs
-without rendering the messages again. The same IDs are used for cache routing.
+Set `--disable-input-ids-forwarding` for this router's model when worker-side
+rendering has not been verified to match. This disables router-generated IDs
+for every routing policy; cache-aware routing still renders and tokenizes
+locally, and the original messages reach the workers for engine processing.
+Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
 
-Caller-supplied IDs remain unchanged. Non-string content (including media),
-assistant continuations, legacy `functions`/`function_call`, and top-level
-`chat_template`, `reasoning`, or `task` controls remain on worker-side
-tokenization because this forwarding path does not support them. A Dynamo
-rendering or tokenization error also leaves tokenization to the worker.
+Forwarding logs its assumptions at startup. In particular, disable it for
+`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
+worker parser overrides such as `--tool-call-parser deepseekv32` that select a
+native encoder over a shipped template, or conversation templates with stop
+strings (the engine's `input_ids` path skips those template stops). These worker
+settings are not inferred from the router's environment. Disabling forwarding preserves
+engine behavior but does not establish parity for local routing hashes.
 
-Set `--disable-input-ids-forwarding` when worker-side prompt semantics are
-required. Local routing still uses Dynamo, so its tokens may differ from what
-workers cache in that mode. Router and workers must use matching vocabularies.
+Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
+string content into arrays differently from the worker. Dynamo 5.1.2 does not expose
+its conversion flag, so the router cannot automatically block these templates.
+Detailed content-format parity coverage follows in #39133.
+
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
-with `--locked`. Adapter tests compare rendered text and token IDs directly with
-the pinned Dynamo libraries.
+with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
 ## Kimi-K3
 
-`--tokenizer-path` may name a local `tiktoken.model` or a Hugging Face repository.
-For a tiktoken repository, the loader downloads `tiktoken.model`, `config.json`,
-and `tokenizer_config.json`; missing required siblings fail loading. Kimi uses
-Dynamo's native formatter and segmented tokenizer, including Dynamo's behavior
-for null thinking effort and long text. There are no Python-engine parity guards
-or Kimi-specific request rewrites.
+Kimi-K3 uses Dynamo's native formatter and tokenizer as the source of truth.
+Messages, tools, tool choice, response format, reasoning effort, and template
+kwargs go directly to Dynamo, without SGLang-specific normalization or parity
+fallbacks. Segmented encoding keeps literal control spellings in user text
+separate from protocol markers. Existing input-ID forwarding guards still apply.
+
+`--tokenizer-path` accepts a local `tiktoken.model` or a Hugging Face repo ID.
+The repository loader falls back from `tokenizer.json` to `tiktoken.model` and
+requires its sibling `config.json` and `tokenizer_config.json` files. Tests compare
+Kimi rendering and tokens directly with the pinned Dynamo libraries; the existing
+DeepSeek and Jinja behavior is unchanged.
 
 ## HTTP/2
 

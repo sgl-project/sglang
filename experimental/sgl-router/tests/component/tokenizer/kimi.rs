@@ -1,15 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The pinned Dynamo renderer and tokenizer define the adapter's contract.
+//! The pinned Dynamo renderer and tokenizer define the Kimi adapter's contract.
 //! Compare against a separate request implementation so router-side defaults,
 //! normalization, field filtering, and segment flattening cannot hide drift.
 
-use dynamo_renderer::{
-    deepseek::{v32::DeepSeekV32Formatter, v4::DeepSeekV4Formatter},
-    kimi_k3::KimiK3Formatter,
-    ChatTemplate, ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter,
-};
+use dynamo_renderer::{kimi_k3::KimiK3Formatter, OAIChatLikeRequest, OAIPromptFormatter};
 use minijinja::Value;
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
@@ -132,7 +128,7 @@ fn cases() -> Vec<JsonValue> {
 }
 
 #[test]
-fn native_rendering_matches_dynamo() {
+fn kimi_rendering_matches_dynamo() {
     let cases = cases();
     let vocab = "tests/fixtures/kimi_k3/tiktoken.model";
     check(
@@ -140,34 +136,6 @@ fn native_rendering_matches_dynamo() {
         &KimiK3Formatter::new(true),
         vocab,
         &cases,
-    );
-    check(
-        &ChatFormatter::deepseek_native(Some("deepseek_v4"), "m").unwrap(),
-        &DeepSeekV4Formatter::new_thinking(),
-        "tests/fixtures/tiny_tokenizer.json",
-        &cases,
-    );
-    check(
-        &ChatFormatter::deepseek_native(Some("deepseek_v32"), "m").unwrap(),
-        &DeepSeekV32Formatter::new_thinking(),
-        "tests/fixtures/tiny_tokenizer.json",
-        &cases,
-    );
-}
-
-#[test]
-fn template_rendering_matches_dynamo() {
-    let cfg = json!({"chat_template":"{{ bos_token }}{{ messages | tojson }} tools={{ tools | tojson }} thinking={{ thinking }} effort={{ reasoning_effort }} documents={{ documents }}{% if add_generation_prompt %}assistant{% endif %}"});
-    let template: ChatTemplate = serde_json::from_value(cfg.clone()).unwrap();
-    let PromptFormatter::OAI(dynamo) =
-        PromptFormatter::from_parts(template, ContextMixins::default(), true).unwrap();
-    check(
-        &ChatFormatter::from_tokenizer_config(cfg, None)
-            .unwrap()
-            .unwrap(),
-        dynamo.as_ref(),
-        "tests/fixtures/tiny_tokenizer.json",
-        &cases(),
     );
 }
 

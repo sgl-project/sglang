@@ -25,27 +25,7 @@ pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
             .map(Arc::new)
             .with_context(|| format!("load tokenizer from {source}"));
     }
-    let files = ModelFiles::open(source);
-    let downloaded = match files.path("tokenizer.json") {
-        Some(path) => path,
-        None => {
-            let path = files.path("tiktoken.model").with_context(|| {
-                format!(
-                    "download tokenizer.json or tiktoken.model for HuggingFace repo {source:?} \
-                     (pass --tokenizer-path with a local tokenizer file, or set HF_TOKEN \
-                     for a gated/private repo)"
-                )
-            })?;
-            // The HF cache keeps a snapshot's files together, so the tiktoken
-            // loader finds these next to the vocabulary.
-            for sibling in ["config.json", "tokenizer_config.json"] {
-                files.path(sibling).with_context(|| {
-                    format!("download required {sibling} for tiktoken repo {source:?}")
-                })?;
-            }
-            path
-        }
-    };
+    let downloaded = download_tokenizer(source)?;
     let path = downloaded
         .to_str()
         .context("downloaded tokenizer path is not valid UTF-8")?;
@@ -66,6 +46,25 @@ fn looks_like_path(source: &str) -> bool {
         || source.starts_with('~')
         || source.ends_with(".json")
         || source.ends_with(".model")
+}
+
+/// Keep the tokenizer.json path unchanged; tiktoken models additionally need
+/// their configuration siblings in the same HF snapshot directory.
+fn download_tokenizer(repo_id: &str) -> Result<std::path::PathBuf> {
+    if let Ok(path) = download_repo_file(repo_id, "tokenizer.json") {
+        return Ok(path);
+    }
+    let path = download_repo_file(repo_id, "tiktoken.model").with_context(|| {
+        format!(
+            "download tokenizer.json or tiktoken.model for HuggingFace repo {repo_id:?} \
+             (pass --tokenizer-path with a local tokenizer file, or set HF_TOKEN \
+             for a gated/private repo)"
+        )
+    })?;
+    for sibling in ["config.json", "tokenizer_config.json"] {
+        download_repo_file(repo_id, sibling)?;
+    }
+    Ok(path)
 }
 
 /// Download `file` from a HuggingFace repo id and return the cached local path.

@@ -80,10 +80,13 @@ impl TokenizerRegistry {
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
         } else if me.has_chat_formatter(&m.id) {
-            tracing::info!(model = %m.id,
-                "router-generated input_ids use Dynamo rendering and tokenization; workers \
-                 consume these IDs without rendering messages. Use --disable-input-ids-forwarding \
-                 to retain worker-side rendering");
+            tracing::warn!(model = %m.id,
+                "router-generated input_ids forwarding enabled: requires matching worker model \
+                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
+                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
+                 (including --tool-call-parser deepseekv32), content-format detection, and \
+                 conversation-template stop strings are not replicated. Use \
+                 --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
         }
         Ok(me)
     }
@@ -330,7 +333,7 @@ mod tests {
         assert_eq!(cfg["chat_template"], "X");
     }
 
-    /// Native Kimi and V4 formatters take precedence; other configs keep their template.
+    /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
     #[test]
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,7 +346,7 @@ mod tests {
             ChatFormatter::load("m", tok.to_str().unwrap()).unwrap()
         };
         let request = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        for model_type in ["llama", "deepseek_v32", "deepseek_v41"] {
+        for model_type in ["llama", "deepseek_v32"] {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
         assert!(resolve("inkling_mm_model").is_none());
@@ -352,11 +355,10 @@ mod tests {
             .render(&request)
             .unwrap()
             .contains("<|open|>message"));
-        assert!(resolve("deepseek_v4")
-            .unwrap()
-            .render(&request)
-            .unwrap()
-            .ends_with("<think>"));
+        assert_eq!(
+            resolve("deepseek_v41").unwrap().render(&request).unwrap(),
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
+        );
     }
 
     #[test]
