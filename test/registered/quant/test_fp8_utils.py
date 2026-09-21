@@ -1,18 +1,83 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8MoEMethod,
+    _is_cuda,
+    _is_gfx95_supported,
+    _is_hip,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
+    Fp8GemmRunnerBackend,
+    Mxfp8DenseGemmBackend,
+    block_fp8_scale_to_mxfp8_e8m0,
+    can_serve_block_fp8_as_mxfp8,
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
+    resolve_block_fp8_mxfp8_backend,
     transform_scale_ue8m0,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestMxfp8MoeScaleLayout(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not (
+            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
+        ):
+            raise unittest.SkipTest(
+                "MXFP8 MoE quantization requires SM100 or ROCm gfx95"
+            )
+
+    def test_cutlass_serialized_scales_remain_expert_first(self):
+        class CutlassBackend:
+            def is_cutlass(self):
+                return True
+
+            def is_flashinfer_trtllm(self):
+                return False
+
+            def is_flashinfer_trtllm_routed(self):
+                return False
+
+            def is_deep_gemm(self):
+                return False
+
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.zeros((2, 64, 32), dtype=torch.float8_e4m3fn, device="cuda")
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros((2, 32, 32), dtype=torch.float8_e4m3fn, device="cuda")
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((2, 64, 1), dtype=torch.uint8, device="cuda"),
+                requires_grad=False,
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((2, 32, 1), dtype=torch.uint8, device="cuda"),
+                requires_grad=False,
+            ),
+        )
+        method = object.__new__(Fp8MoEMethod)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8.get_moe_runner_backend",
+            return_value=CutlassBackend(),
+        ):
+            method._process_mxfp8_moe_weights(layer, quantize=False)
+
+        self.assertEqual(tuple(layer.w13_weight_scale_inv.shape), (2, 64, 1))
+        self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 32, 1))
 
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
@@ -37,12 +102,74 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
 
             sf_packed_recreated = transform_scale_ue8m0(sf_fp32_recreated, mn=mn)
 
-            assert torch.all(
-                sf_packed_original == sf_packed_recreated
-            ), f"{sf_packed_original=} {sf_packed_recreated}"
-            assert torch.all(
-                sf_fp32_original == sf_fp32_recreated
-            ), f"{sf_fp32_original=} {sf_fp32_recreated}"
+            assert torch.all(sf_packed_original == sf_packed_recreated), (
+                f"{sf_packed_original=} {sf_packed_recreated}"
+            )
+            assert torch.all(sf_fp32_original == sf_fp32_recreated), (
+                f"{sf_fp32_original=} {sf_fp32_recreated}"
+            )
+
+
+class TestBlockFp8AsMxfp8(CustomTestCase):
+    def test_block_scale_to_e8m0_matches_reference(self):
+        # Sibling classes leave torch's default device on cuda; stay on cpu.
+        gen = torch.Generator().manual_seed(0)
+        n, k, block_n = 100, 256, 32  # 4 scale rows, the last one partial
+        exps = torch.randint(-20, 21, (4, k // 32), generator=gen, device="cpu")
+        got = block_fp8_scale_to_mxfp8_e8m0(
+            torch.exp2(exps.float()), (n, k), [block_n, 32]
+        )
+        ref = (exps + 127).to(torch.uint8).repeat_interleave(block_n, dim=0)[:n]
+        self.assertTrue(torch.equal(got, ref))
+        with self.assertRaises(ValueError):  # 128-wide K block is not MXFP8
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.ones(2, 8, device="cpu"), (64, 1024), [32, 128]
+            )
+        with self.assertRaises(ValueError):  # not a power of two
+            block_fp8_scale_to_mxfp8_e8m0(
+                torch.full((2, 8), 1.5, device="cpu"), (64, 256), [32, 32]
+            )
+
+    def test_serve_gate(self):
+        platform = MagicMock()
+        platform.is_blackwell = True
+        cutedsl = next(b for b in Mxfp8DenseGemmBackend if b.is_flashinfer_cutedsl())
+        with (
+            patch.object(fp8_utils, "_is_cuda", True),
+            patch.object(fp8_utils, "get_platform", return_value=platform),
+            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
+            patch.object(
+                fp8_utils, "resolve_mxfp8_dense_gemm_backend", return_value=cutedsl
+            ),
+        ):
+            for name, expected in (
+                ("flashinfer_cutedsl", True),
+                ("flashinfer_cutlass", True),
+                ("flashinfer_trtllm", False),
+                ("triton", False),
+                ("auto", False),
+            ):
+                with (
+                    self.subTest(backend=name),
+                    patch.object(
+                        fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(name)
+                    ),
+                ):
+                    self.assertEqual(
+                        can_serve_block_fp8_as_mxfp8([32, 32], "ue8m0"), expected
+                    )
+                    self.assertEqual(
+                        resolve_block_fp8_mxfp8_backend().is_unsupported(), not expected
+                    )
+            with patch.object(
+                fp8_utils,
+                "FP8_GEMM_RUNNER_BACKEND",
+                Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            ):
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([128, 128], "ue8m0"))
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([32, 32], None))
+                platform.is_blackwell = False
+                self.assertFalse(can_serve_block_fp8_as_mxfp8([32, 32], "ue8m0"))
 
 
 class TestApplyFp8LinearScaleDispatch(CustomTestCase):
@@ -97,14 +224,16 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                     "is_sm120": False,
                 }
                 capabilities[capability] = True
-                with patch.object(
-                    fp8_utils,
-                    "get_platform",
-                    return_value=SimpleNamespace(**capabilities),
-                ), patch.object(
-                    fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-                ), patch.object(
-                    fp8_utils, "get_exec", return_value=exec_config
+                with (
+                    patch.object(
+                        fp8_utils,
+                        "get_platform",
+                        return_value=SimpleNamespace(**capabilities),
+                    ),
+                    patch.object(
+                        fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+                    ),
+                    patch.object(fp8_utils, "get_exec", return_value=exec_config),
                 ):
                     fp8_utils.apply_fp8_linear(
                         input,
@@ -157,15 +286,18 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
             )
 
-        with patch.object(
-            fp8_utils,
-            "get_platform",
-            return_value=SimpleNamespace(
-                is_sm90=False,
-                is_sm100=False,
-                is_sm120=False,
+        with (
+            patch.object(
+                fp8_utils,
+                "get_platform",
+                return_value=SimpleNamespace(
+                    is_sm90=False,
+                    is_sm100=False,
+                    is_sm120=False,
+                ),
             ),
-        ), patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm):
+            patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm),
+        ):
             fp8_utils.apply_fp8_linear(
                 input,
                 weight,
@@ -204,6 +336,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         native_method = native_fp8.Fp8LinearMethod.__new__(native_fp8.Fp8LinearMethod)
         native_method.use_marlin = False
         native_method.use_mxfp8 = False
+        native_method.block_fp8_as_mxfp8 = False
         native_method.block_quant = False
         native_method.cutlass_fp8_supported = True
         native_method.use_per_token_if_dynamic = False

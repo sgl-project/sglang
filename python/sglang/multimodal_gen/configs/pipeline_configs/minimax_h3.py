@@ -21,13 +21,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionRequirements,
-)
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    get_attn_backend,
-    get_global_forced_attn_backend,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -108,6 +101,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         self, server_args
     ) -> AttentionBackendEnum | None:
         """Resolve the H3 DiT backend using the selector's precedence."""
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_global_forced_attn_backend,
+        )
+
         selected_backend = get_global_forced_attn_backend()
         if selected_backend is None:
             selected_backend, _ = server_args.resolve_component_attention_backend(
@@ -260,6 +257,61 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
         if selected_backend is None:
             return
+        if selected_backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+            attention_config = server_args.attention_backend_config or {}
+            compute_mode = str(attention_config.get("compute_mode", "bf16"))
+            if compute_mode not in ("bf16", "sage_fp8"):
+                raise ValueError(
+                    "SubBlock compute_mode must be 'bf16' or 'sage_fp8', got "
+                    f"{compute_mode!r}."
+                )
+            if compute_mode == "sage_fp8":
+                capability = current_platform.get_device_capability()
+                if capability is None or capability.to_int() not in (90, 120):
+                    found = (
+                        capability.as_version_str()
+                        if capability is not None
+                        else "unknown"
+                    )
+                    raise ValueError(
+                        "MiniMax-H3 SubBlock compute_mode='sage_fp8' currently "
+                        "requires SM90 or SM120 (compute capability 9.0 or 12.0); "
+                        f"found {found}."
+                    )
+                if capability.to_int() == 90:
+                    from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+                        _load_sparge_attention_sm90_ops,
+                    )
+
+                    _load_sparge_attention_sm90_ops()
+                else:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                        _load_sm120_sage_ops,
+                    )
+
+                    _load_sm120_sage_ops()
+        if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+            if server_args.ring_degree > 1:
+                raise ValueError(
+                    "VSA-H3 does not support --ring-degree > 1; use Ulysses "
+                    "sequence parallelism."
+                )
+            if (
+                server_args.enable_torch_compile
+                or server_args.enable_breakable_cuda_graph
+            ):
+                raise ValueError(
+                    "VSA-H3 builds per-step tile metadata eagerly and is not "
+                    "validated under torch.compile or the breakable CUDA "
+                    "graph; disable them or use --attention-backend fa."
+                )
+        from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+            AttentionRequirements,
+        )
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
@@ -279,4 +331,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
-__all__ = ["MiniMaxH3PipelineConfig"]
+@dataclass
+class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
+    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+
+    def __post_init__(self) -> None:
+        self.dit_config.arch_config.has_gate_compress = True
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
+            'audited high-quality deployment. Use quality="lossless".'
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "FastH3 ships one t2va-distilled weight partition; "
+                "--model-variant does not apply. FL2VA and Ref2VA tasks were "
+                "not distilled; use MiniMaxAI/MiniMax-H3 for those."
+            )
+        super().validate_server_args(server_args)
+
+
+__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]

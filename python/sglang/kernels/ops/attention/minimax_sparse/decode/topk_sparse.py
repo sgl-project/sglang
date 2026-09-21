@@ -331,9 +331,9 @@ def flash_decode_with_gqa_share_sparse(
     max_slots, num_kv_heads, _ = k_cache.shape
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     assert topk_idx.shape[0] == num_kv_heads
-    assert (
-        triton.next_power_of_2(block_size) == block_size
-    ), f"block_size must be a power of 2, but got {block_size}"
+    assert triton.next_power_of_2(block_size) == block_size, (
+        f"block_size must be a power of 2, but got {block_size}"
+    )
     # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
     max_kv_len = req_to_token.shape[1]
     # gqa

@@ -26,7 +26,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendMhaHicache(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -39,8 +38,6 @@ class TestAscendMhaHicache(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
         ]
 
     def test_a_gsm8k(self):

@@ -31,7 +31,6 @@ class EPLBManager:
         self,
         *,
         model_config: ModelConfig,
-        ps: Any,
         get_model: Callable[[], nn.Module],
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
         get_expert_backup_client: Callable[[], Any],
@@ -42,7 +41,6 @@ class EPLBManager:
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
         self._model_config = model_config
-        self._ps = ps
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
         self._get_expert_backup_client = get_expert_backup_client
@@ -58,7 +56,9 @@ class EPLBManager:
         assert (
             get_exec().moe.eplb_rebalance_num_iterations
             >= get_exec().moe.expert_distribution_recorder_buffer_size
-        ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        ), (
+            "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        )
 
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
@@ -161,7 +161,7 @@ class EPLBManager:
                 tp_rank=(
                     self._elastic_global_rank()
                     if is_post_scale_rebalance
-                    else self._ps.tp_rank
+                    else get_parallel().tp_rank
                 ),
                 use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
@@ -221,7 +221,7 @@ class EPLBManager:
         )
 
     def _elastic_global_rank(self) -> int:
-        return self._ps.tp_rank + get_parallel().ep_join_rank_offset
+        return get_parallel().tp_rank + get_parallel().ep_join_rank_offset
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:
@@ -246,7 +246,10 @@ class EPLBManager:
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 
     def _should_log_expert_location_metadata(self) -> bool:
-        return self._ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get()
+        return (
+            get_parallel().tp_rank == 0
+            and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get()
+        )
 
     def _log_rebalance_layout_before_update(
         self,

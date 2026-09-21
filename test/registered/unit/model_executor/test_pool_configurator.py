@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -21,7 +20,7 @@ from sglang.srt.runtime_context import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @contextlib.contextmanager
@@ -36,7 +35,16 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size),
+        get_parallel().override(
+            tp_size=tp_size,
+            attn_tp_size=tp_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=1,
+            moe_ep_group=None,
+            moe_dp_size=1,
+            moe_tp_size=tp_size,
+        ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
@@ -83,6 +91,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_unified_memory=False,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -124,9 +133,11 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
+    mc.is_draft_model = False
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
@@ -148,6 +159,7 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_unified_memory=enable_unified_memory,
         enable_hisparse=False,
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
@@ -166,7 +178,8 @@ def _make_model_runner(
     mr.layer_info = SimpleNamespace(
         start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
     )
-    mr.ps = ParallelState.trivial()
+    mr.attn_dp_size = 1
+    mr.pp_size = 1
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
@@ -297,7 +310,14 @@ class TestDefaultConfigurator(CustomTestCase):
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
-    def _make_swa_runner(self, full_layers=16, swa_layers=16, ratio=0.5, page_size=1):
+    def _make_swa_runner(
+        self,
+        full_layers=16,
+        swa_layers=16,
+        ratio=0.5,
+        page_size=1,
+        enable_unified_memory=False,
+    ):
         return _make_model_runner(
             self,
             is_hybrid_swa=True,
@@ -306,6 +326,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             swa_num_kv_heads=4,
             page_size=page_size,
             swa_full_tokens_ratio=ratio,
+            enable_unified_memory=enable_unified_memory,
         )
 
     def _run(self, available_bytes, **kwargs):
@@ -326,6 +347,92 @@ class TestHybridSWAConfigurator(CustomTestCase):
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_draft_does_not_inherit_target_shared_byte_budget(self):
+        """A separate draft pool must not allocate the target's byte envelope again."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr, _, config = self._run(1 << 20, enable_unified_memory=True)
+        self.assertIsNotNone(config.unified_memory_pool_bytes)
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.model_config = mr.model_config
+        configurator.is_hybrid_swa = True
+        configurator.is_draft_worker = False
+        target = configurator._derive_pool_sizes(config=config)
+        configurator.is_draft_worker = True
+        draft = configurator._derive_pool_sizes(config=config)
+        self.assertEqual(
+            target.unified_memory_pool_bytes, config.unified_memory_pool_bytes
+        )
+        self.assertIsNone(draft.unified_memory_pool_bytes)
+        self.assertEqual(
+            draft.full_max_total_num_tokens, config.full_max_total_num_tokens
+        )
+        self.assertEqual(
+            draft.swa_max_total_num_tokens, config.swa_max_total_num_tokens
+        )
+
+    def test_unified_capacity_is_maximal_with_draft_pool(self):
+        page_size = 8
+        full_layers = 2
+        swa_layers = 1
+        draft_layers = 2
+        draft_swa_layers = 1
+        ratio = 0.5
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=ratio,
+            page_size=page_size,
+            enable_unified_memory=True,
+            speculative_algorithm="EAGLE",
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+        mr.spec_aux_config.eagle_draft_swa_num_layers = draft_swa_layers
+
+        full_bytes_per_token = _full_per_token(mr)
+        swa_bytes_per_token = _swa_per_token(mr)
+        target_full_bytes_per_token = full_bytes_per_token * full_layers
+        draft_bytes_per_token = (
+            full_bytes_per_token * (draft_layers - draft_swa_layers)
+            + swa_bytes_per_token * draft_swa_layers
+        )
+
+        def allocation_bytes(full_tokens, *, include_reserved_draft_page=True):
+            swa_tokens = int(full_tokens * ratio) // page_size * page_size
+            target_bytes = (
+                full_tokens * target_full_bytes_per_token
+                + swa_tokens * swa_bytes_per_token * swa_layers
+            )
+            virtual_span = max(target_bytes // target_full_bytes_per_token - 1, 0)
+            draft_tokens = (virtual_span + page_size - 1) // page_size * page_size
+            if include_reserved_draft_page:
+                draft_tokens += page_size
+            return target_bytes + draft_tokens * draft_bytes_per_token
+
+        expected_full_tokens = 10 * page_size
+        available = allocation_bytes(
+            expected_full_tokens + page_size,
+            include_reserved_draft_page=False,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size)
+
+        full_tokens = config.full_max_total_num_tokens
+        self.assertEqual(full_tokens % page_size, 0)
+        self.assertEqual(full_tokens, expected_full_tokens)
+        self.assertLessEqual(allocation_bytes(full_tokens), available)
+        self.assertGreater(allocation_bytes(full_tokens + page_size), available)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
@@ -813,8 +920,9 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         mr.model_config.hf_config.index_topk_freq = 4
         mr.model_config.hf_config.index_skip_topk_offset = 3
 
-        with get_memory().override(enable_hierarchical_cache=True), mock_cpu_env(
-            kv_size=1
+        with (
+            get_memory().override(enable_hierarchical_cache=True),
+            mock_cpu_env(kv_size=1),
         ):
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
@@ -1004,6 +1112,227 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+
+class TestSWAPoolFloor(CustomTestCase):
+    """An SWA pool below the prefill admission floor must fail here, not livelock
+    the scheduler at warmup."""
+
+    def _hybrid_swa_from_max_tokens(self, max_tokens, ratio, page_size, window):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            page_size=page_size,
+            swa_full_tokens_ratio=ratio,
+            sliding_window_size=window,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            return cfg.calculate_pool_sizes_from_max_tokens(max_tokens, page_size)
+
+    def test_hybrid_swa_rejects_single_page_pool(self):
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._hybrid_swa_from_max_tokens(
+                max_tokens=4096, ratio=0.1, page_size=256, window=128
+            )
+
+    def test_hybrid_swa_accepts_pool_above_floor(self):
+        config = self._hybrid_swa_from_max_tokens(
+            max_tokens=32768, ratio=0.1, page_size=256, window=128
+        )
+        self.assertEqual(config.swa_max_total_num_tokens, 3072)
+
+    def _dsv4_sizes(self, max_tokens, page_size, unified=False):
+        """Exercise the DSV4 size arithmetic without a full V4 model fixture:
+        _compute_dsv4_sizes reads only these six attributes."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.swa_ratio = 0.1
+        cfg.sliding_window_size = 128
+        cfg.swa_page_size = 128
+        cfg.c4_ring_size = 8
+        cfg.c4_shrink_factor = 1
+        cfg._unified = unified
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
+        return cfg._compute_dsv4_sizes(max_tokens, page_size)
+
+    def test_dsv4_rejects_single_page_pool(self):
+        # DeepSeek-V4-Flash defaults: page_size=256, swa_full_tokens_ratio=0.1.
+        # int(4096 * 0.1) page-aligns down to 256 -- exactly one page, below the
+        # 128 + 256 floor.
+        with self.assertRaisesRegex(ValueError, "cannot hold even one request"):
+            self._dsv4_sizes(max_tokens=4096, page_size=256)
+
+    def test_dsv4_accepts_pool_above_floor(self):
+        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
+        self.assertEqual(sizes.full_max_total_num_tokens, 32768)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
+        # Non-unified: the c4 state pool scales with the paged SWA pool.
+        self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
+
+    def test_dsv4_token_cap_never_grows_total_footprint(self):
+        """Regression: the token-cap path subtracts no fixed-pool bias, so
+        capping the budget-derived token count must still shrink the total."""
+        cfg = self._dsv4_configurator_for_budget()
+        page_size = 128
+        budget = 256 * (1 << 30)
+        base = cfg.calculate_pool_sizes(budget, page_size)
+        base_bytes = self._dsv4_total_bytes(cfg, base.max_total_num_tokens)
+        self.assertLessEqual(base_bytes, budget)
+        for numerator in (999, 900, 500, 100, 1):
+            capped_tokens = (
+                base.max_total_num_tokens * numerator // 1000 // page_size * page_size
+            )
+            if capped_tokens <= 0:
+                continue
+            capped = cfg.calculate_pool_sizes_from_max_tokens(capped_tokens, page_size)
+            capped_bytes = self._dsv4_total_bytes(cfg, capped.max_total_num_tokens)
+            with self.subTest(numerator=numerator):
+                self.assertLessEqual(capped_bytes, base_bytes)
+
+    # White-box 671B-class shape: the byte arithmetic runs without a model fixture.
+    def _dsv4_configurator_for_budget(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 128, 64
+        cfg.attn_head_dim = 192
+        cfg.indexer_head_dim = 128
+        cfg.num_layers_total = 61
+        cfg.num_layers_ca4 = 61
+        cfg.num_layers_ca128 = 61
+        cfg.c4_ring_size = 8
+        cfg.c128_ring_size = 128
+        cfg._swa_ring_size = 128
+        cfg._spec_infl = 1.0
+        cfg.context_len = 65536
+        cfg.bytes_per_full_token = 576.0
+        cfg.requested_max_running_requests_per_worker = None
+        cfg.swa_ratio = 0.1
+        cfg.sliding_window_size = 4096
+        cfg.swa_page_size = 128
+        cfg.c4_shrink_factor = 1
+        cfg.online_c128_mtp_max_draft_tokens = 0
+        cfg.disaggregation_mode = None
+        cfg.disaggregation_decode_extra_slots = 0
+        cfg._unified = True
+        cfg.operator_swa_ratio = None
+        cfg.swa_cap_tokens = None
+        cfg.swa_prefix_tails = 0
+        cfg.request_window_bytes = 0
+        cfg.bytes_per_swa_token = 0.0
+        cfg._unified_fp8 = False
+        cfg._dspark_draft_on_bf16 = False
+        # object.__new__ skips __init__; bf16 unified row is 2B * latent
+        cfg._unified_row_bytes = cfg.attn_head_dim * 2
+        return cfg
+
+    # Token pool plus the three request-scoped fixed pools, sized from the
+    # concurrency resolve_max_num_reqs derives from this token count.
+    def _dsv4_total_bytes(self, cfg, tokens):
+        estimated = max(min(int(tokens / cfg.context_len * 512), 4096), 2048)
+        max_running_requests = min(estimated, tokens // 2)
+        return int(
+            tokens * cfg.bytes_per_full_token
+            + cfg._fixed_swa_bytes(max_running_requests)
+            + cfg._fixed_c4_state_bytes(max_running_requests)
+            + cfg._get_c128_state_fixed_bytes(max_running_requests)
+        )
+
+    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(
+            self,
+            enable_encoder_swa_bounded_replay=True,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+            speculative_dspark_block_size=5,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=cfg,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            pp_size=1,
+            attn_dp_size=1,
+            sliding_window_size=128,
+            page_size=256,
+            spec_algorithm=spec,
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+        )
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
+        budget = 256 * 1024 * 1024
+        sizes = planner.calculate_pool_sizes(budget, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+        self.assertLessEqual(
+            sizes.full_max_total_num_tokens * planner.bytes_per_full_token
+            + planner._get_swa_fixed_bytes(),
+            budget,
+        )
+
+    def test_dsv4_unified_c4_state_not_token_scaled(self):
+        # Unified-KV sizes the c4 state ring from max_running_requests in
+        # finalize_with_max_running_requests, so it must not scale here.
+        sizes = self._dsv4_sizes(max_tokens=32768, page_size=256, unified=True)
+        self.assertEqual(sizes.full_max_total_num_tokens, 32768)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
+        self.assertEqual(sizes.c4_state_pool_size, 0)
+
+    def test_dsv4_fp8_dspark_swa_ring_includes_bf16_draft(self):
+        """Target fp8 ring + one-layer bf16 draft ring, not (T+1)/T * fp8."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import dsv4_unified_row_bytes
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = dsv4_unified_row_bytes(448, 64, fp8=True)
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 448, 64
+        cfg._dspark_draft_on_bf16 = True
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        got = cfg._fixed_swa_bytes(mrr)
+        target = (
+            slots * cfg._swa_ring_size * cfg._unified_row_bytes * cfg.num_layers_total
+        )
+        draft = slots * cfg._swa_ring_size * dsv4_unified_row_bytes(448, 64, False)
+        self.assertEqual(got, target + draft)
+        mtp_formula = int(target * cfg._spec_infl)
+        self.assertGreater(got, mtp_formula)
+
+    def test_dsv4_fp8_mtp_swa_ring_keeps_spec_inflation(self):
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified_fp8 = True
+        cfg._unified_row_bytes = 640
+        cfg._dspark_draft_on_bf16 = False
+        cfg._spec_infl = (cfg.num_layers_total + 1) / cfg.num_layers_total
+        mrr = 32
+        slots = cfg._get_num_req_slots(mrr)
+        target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
+        self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
 
 
 if __name__ == "__main__":

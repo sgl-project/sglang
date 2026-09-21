@@ -29,7 +29,6 @@ from transformers import PretrainedConfig
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -299,15 +298,15 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         # Align with QKVParallelLinear pattern
         if self.attn_tp_size >= num_heads:
-            assert (
-                self.attn_tp_size % num_heads == 0
-            ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            assert self.attn_tp_size % num_heads == 0, (
+                f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            )
             self.num_heads = 1
             self.num_head_replicas = self.attn_tp_size // num_heads
         else:
-            assert (
-                num_heads % self.attn_tp_size == 0
-            ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            assert num_heads % self.attn_tp_size == 0, (
+                f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            )
             self.num_heads = num_heads // self.attn_tp_size
             self.num_head_replicas = 1
 
@@ -854,9 +853,9 @@ class MiniMaxM2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -873,9 +872,9 @@ class MiniMaxM2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_qk_norm:
@@ -1123,7 +1122,7 @@ class MiniMaxM2Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1252,7 +1251,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -1263,7 +1262,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -1272,7 +1271,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         return self.model.get_input_embeddings(input_ids)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        if not get_pp_group().is_last_rank:
+        if not get_parallel().pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
