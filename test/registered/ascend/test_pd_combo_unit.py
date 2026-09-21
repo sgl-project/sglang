@@ -3,7 +3,7 @@
 Covers server-args validation and config-bag population for PD +
 speculative / prefix-cache / chunked-prefill combinations without
 real 8-GPU e2e.  The tests use the same mock / override pattern as
-the existing unit tests in ``test/registered/unit``.
+other Ascend registered unit tests under ``test/registered/ascend``.
 """
 
 import unittest
