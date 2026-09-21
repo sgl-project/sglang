@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from prometheus_client import Counter
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -42,6 +44,16 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.compression.protocol import (
+    CHUNK_READY as COMPRESSED_CHUNK_READY,
+)
+from sglang.srt.disaggregation.compression.protocol import (
+    BufferDrainError,
+    ChunkDescriptor,
+    RoomTasks,
+    capability,
+    check_peer,
+)
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -56,6 +68,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.kv_compression.types import CompressionCapacityError
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -96,6 +109,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    compression_nonce: str = ""
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -121,6 +135,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            compression_nonce=msg[10].decode("ascii") if len(msg) > 10 else "",
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
@@ -157,6 +172,8 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    compression_capability: str = "off"
+    compression_layout: str = ""
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -203,6 +220,8 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            compression_capability=msg[19].decode("ascii") if len(msg) > 19 else "off",
+            compression_layout=msg[20].decode("ascii") if len(msg) > 20 else "",
         )
 
 
@@ -216,6 +235,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self.compression_mode = envs.SGLANG_PD_KV_COMPRESSION.get()
+        self.compression_runtime = None
+        self.compression_tasks = RoomTasks()
+        self.compression_uncertain_rooms = set()
+        self._compression_active_room = None
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -361,9 +385,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+        if self.compression_mode != "off":
+            from sglang.srt.disaggregation.mooncake.compression import (
+                CompressionRuntime,
+            )
+
+            self.compression_runtime = CompressionRuntime(
+                self, k_buffers, v_buffers, page_size
+            )
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        ret = self.engine.batch_register([ptr], [size])
+        if self.compression_mode != "off" and ret != 0:
+            raise RuntimeError(f"Compression staging registration failed: {ret}")
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -459,6 +493,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             queue.put(kv_chunk)
             return (-1, True)
 
+        if self.compression_mode != "off":
+            try:
+                return self._transfer_compressed_chunk(
+                    staging_strategy.staging_buffer,
+                    kv_chunk,
+                    req,
+                    target_info,
+                    chunk_idx,
+                    c_offset,
+                    prefill_unique_rank,
+                ), False
+            except CompressionCapacityError:
+                # Encoding admission failed before RDMA and drained its source
+                # reads. Keep the chunk's existing lifetime references and let
+                # other work release workspace before retrying on this worker.
+                time.sleep(0.001)
+                queue.put(kv_chunk)
+                return -1, True
+            except Exception as exc:
+                if isinstance(exc, BufferDrainError):
+                    self.compression_runtime.transport_failed = True
+                    self.compression_uncertain_rooms.add(req.room)
+                self.conclude_failure(
+                    bootstrap_room=req.room,
+                    failure_reason=f"KV compression transfer failed: {exc}",
+                )
+                return -1, False
+
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
@@ -479,6 +541,108 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
+    def _transfer_compressed_chunk(
+        self, staging_buffer, kv_chunk, req, target, chunk_idx, offset, writer
+    ):
+        runtime = self.compression_runtime
+        if runtime is None or not req.compression_nonce:
+            raise ValueError("Missing compression runtime or request nonce")
+        if runtime.transport_failed:
+            raise RuntimeError(
+                "Compression transport is quarantined after an RDMA error; restart this worker"
+            )
+        self._compression_active_room = req.room
+        check_peer(capability(self.compression_mode), target.compression_capability)
+        if target.compression_layout != runtime.layout_tag:
+            raise ValueError("P/D compression KV layout or chunk size mismatch")
+        torch.cuda.set_device(runtime.device)
+        stream = staging_buffer.get_gather_stream()
+        wire, pages, compression_ms = runtime.encode_pages(
+            kv_chunk.prefill_kv_indices,
+            kv_chunk.compression_refs,
+            kv_chunk.wait_event,
+            stream,
+        )
+        raw_bytes = len(kv_chunk.prefill_kv_indices) * runtime.bytes_per_token
+        checksum = ""
+        verify_started = time.perf_counter()
+        if runtime.verify:
+            checksum = runtime.source_digest(
+                kv_chunk.prefill_kv_indices, stream, kv_chunk.wait_event
+            )
+        verify_ms = (time.perf_counter() - verify_started) * 1000
+        encoding = "pages"
+        desc = ChunkDescriptor(
+            req.compression_nonce,
+            encoding,
+            raw_bytes,
+            wire.numel(),
+            checksum,
+            pages=pages,
+        )
+        # Validate against this allocation, not the remainder of the whole ring.
+        capacity = req.staging.ends[chunk_idx] - offset
+        desc.validate(
+            nonce=req.compression_nonce,
+            raw_bytes=raw_bytes,
+            capacity=capacity,
+            mode=self.compression_mode,
+            page_bytes=runtime.bytes_per_token,
+        )
+        network_start = time.perf_counter()
+        ret = self._transfer_data(
+            req.mooncake_session_id,
+            [(wire.data_ptr(), target.staging_base_ptr + offset, wire.numel())],
+        )
+        network_ms = (time.perf_counter() - network_start) * 1000
+        if ret != 0:
+            raise RuntimeError(f"Compressed RDMA transfer failed: {ret}")
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                COMPRESSED_CHUNK_READY,
+                str(req.room).encode(),
+                str(chunk_idx).encode(),
+                str(kv_chunk.index_slice.start).encode(),
+                str(len(kv_chunk.prefill_kv_indices)).encode(),
+                req.mooncake_session_id.encode(),
+                str(writer).encode(),
+                desc.to_bytes(),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+        logger.info(
+            "PD_KV_COMPRESSION_SEND %s",
+            json.dumps(
+                {
+                    "room": req.room,
+                    "chunk": chunk_idx,
+                    "mode": self.compression_mode,
+                    "encoding": encoding,
+                    "raw_bytes": raw_bytes,
+                    "wire_bytes": wire.numel(),
+                    "prepare_ms": compression_ms,
+                    "host_send_bytes": getattr(runtime.local, "host_send_bytes", 0),
+                    "objects": len(pages),
+                    "lz4_objects": sum(p[2] == "lz4" for p in pages),
+                    "raw_objects": sum(p[2] == "raw" for p in pages),
+                    "rdma_ms": network_ms,
+                    "verify": runtime.verify,
+                    "verify_ms": verify_ms,
+                    "refs": list(kv_chunk.compression_refs)
+                    if runtime.shared.trace_reuse
+                    and kv_chunk.compression_refs is not None
+                    else None,
+                    "ref_sources": runtime.local.ref_sources
+                    if runtime.shared.trace_reuse
+                    else None,
+                    "descriptor_bytes": len(desc.to_bytes()),
+                }
+            ),
+        )
+        return ret
+
     def _prefetch_staging_reqs(self, room: int):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
@@ -487,8 +651,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
-            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
-            != self.attn_tp_size
+            and (
+                self.compression_mode != "off"
+                or self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
+                != self.attn_tp_size
+            )
             for tinfo in room_infos.values()
         )
         if not needs_staging:
@@ -639,13 +806,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return ret
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        if (
+            self.compression_mode != "off"
+            and self.compression_runtime is not None
+            and self.compression_runtime.transport_failed
+        ):
+            raise RuntimeError(
+                "Compression transport quarantined; restart both workers"
+            )
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
-        )
+        try:
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            )
+        except Exception:
+            self._quarantine_compression_transport()
+            raise
+        if ret != 0:
+            self._quarantine_compression_transport()
+        return ret
+
+    def _quarantine_compression_transport(self):
+        if self.compression_mode != "off" and self.compression_runtime is not None:
+            self.compression_runtime.transport_failed = True
+            if self._compression_active_room is not None:
+                self.compression_uncertain_rooms.add(self._compression_active_room)
+            logger.error(
+                "Compression RDMA failure: retaining registered buffers; restart both P/D workers before reuse"
+            )
 
     def _send_kvcache_generic(
         self,
@@ -1860,6 +2051,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            compression_task_finished = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1891,6 +2084,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.compression_mode != "off":
+                        self.compression_tasks.finish(kv_chunk.room)
+                        compression_task_finished = True
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -1902,6 +2098,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                if self.compression_mode != "off":
+                    self._compression_active_room = kv_chunk.room
+                    if kv_chunk.wait_event is not None:
+                        kv_chunk.wait_event.synchronize()
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -1933,6 +2133,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        try:
+                            check_peer(
+                                capability(self.compression_mode),
+                                target_rank_registration_info.compression_capability,
+                            )
+                        except ValueError as exc:
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room, failure_reason=str(exc)
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2012,8 +2222,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
-                            or self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
+                            or (
+                                self.compression_mode == "off"
+                                and self.attn_tp_size
+                                == target_rank_registration_info.dst_attn_tp_size
+                            )
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
@@ -2048,6 +2261,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
+                        elif self.compression_mode != "off":
+                            raise RuntimeError(
+                                "Compression requires initialized staging on both peers"
+                            )
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -2150,6 +2367,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                if self.compression_mode != "off":
+                    self.compression_tasks.finish(kv_chunk.room)
+                    compression_task_finished = True
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -2180,6 +2400,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                if self.compression_mode != "off" and kv_chunk is not None:
+                    # A recoverable transform error must not kill the only
+                    # worker or leave cancellation waiting on a dead thread.
+                    try:
+                        if staging_buffer is not None:
+                            staging_buffer.get_gather_stream().synchronize()
+                    except Exception as drain_error:
+                        self._quarantine_compression_transport()
+                        # Source reads may still be outstanding. Keep the task
+                        # reference and require worker restart; never free pages.
+                        logger.critical(
+                            "Compression CUDA drain failed: %s", drain_error
+                        )
+                        return
+                    self.conclude_failure(
+                        bootstrap_room=kv_chunk.room, failure_reason=str(e)
+                    )
+                    if not compression_task_finished:
+                        self.compression_tasks.finish(kv_chunk.room)
+                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._maybe_ack_drained_abort(kv_chunk.room)
+                    logger.exception(
+                        "Compression transfer failed for room=%s", kv_chunk.room
+                    )
+                    continue
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -2331,6 +2576,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
+                if msg[0] == COMPRESSED_CHUNK_READY:
+                    try:
+                        if self.compression_mode == "off" or len(msg) != 8:
+                            raise ValueError("Unexpected compressed chunk notification")
+                        self._staging_handler.handle_compressed_chunk(
+                            int(msg[1]),
+                            int(msg[2]),
+                            int(msg[3]),
+                            int(msg[4]),
+                            msg[5].decode(),
+                            msg[7],
+                        )
+                    except Exception as exc:
+                        logger.error("Invalid compression notification: %s", exc)
+                    continue
+
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
@@ -2392,6 +2653,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event=None,
+        compression_refs=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2421,6 +2684,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        if self.compression_mode != "off":
+            self.compression_tasks.add(bootstrap_room)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2431,6 +2696,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                wait_event=wait_event,
+                compression_refs=compression_refs,
             )
         )
 
@@ -2503,6 +2770,12 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    compression_refs = None
+
+    @property
+    def requires_encoded_kv(self):
+        return self.kv_mgr.compression_mode != "off"
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2534,9 +2807,14 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
+        refs, self.compression_refs = self.compression_refs, None
         if should_skip:
             return
 
+        wait_event = None
+        if self.kv_mgr.compression_mode != "off":
+            wait_event = torch.cuda.Event()
+            wait_event.record(torch.cuda.current_stream())
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -2545,6 +2823,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
+                compression_refs=refs,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2556,10 +2836,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
+                compression_refs=refs,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
+        if self.bootstrap_room in getattr(
+            self.kv_mgr, "compression_uncertain_rooms", set()
+        ):
+            return KVPoll.Transferring  # Keep KV and aux slots owned until restart.
+        if (
+            self.kv_mgr.compression_mode != "off"
+            and self.kv_mgr.compression_tasks.pending(self.bootstrap_room)
+        ):
+            return KVPoll.Transferring
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             # Hold Success until all staging chunks transferred: a deferred
@@ -2596,8 +2887,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         self.trace_ctx.trace_req_start()
 
+    def clear(self):
+        if self.bootstrap_room in self.kv_mgr.compression_uncertain_rooms:
+            raise BufferDrainError("Source buffers quarantined; restart both workers")
+        if self.kv_mgr.compression_mode != "off":
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.compression_tasks.drain(self.bootstrap_room)
+            self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+        super().clear()
+
     def abort(self):
+        if self.bootstrap_room in self.kv_mgr.compression_uncertain_rooms:
+            raise BufferDrainError("Source buffers quarantined; restart both workers")
         super().abort()
+        if self.kv_mgr.compression_mode != "off":
+            self.kv_mgr.compression_tasks.drain(self.bootstrap_room)
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -2610,8 +2914,15 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
+        self.compression_nonce = uuid.uuid4().hex
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def failure_exception(self):
+        if self.kv_mgr.compression_mode != "off" and not self.abort_notified:
+            self._send_abort_notification()
+            self.abort_notified = True
+        return super().failure_exception()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2692,6 +3003,14 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
                         ]
+                        + (
+                            [
+                                capability(self.kv_mgr.compression_mode).encode(),
+                                self.kv_mgr.compression_runtime.layout_tag.encode(),
+                            ]
+                            if self.kv_mgr.compression_mode != "off"
+                            else []
+                        )
                     )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
@@ -2754,6 +3073,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 else b""
                             ),
                         ]
+                        + (
+                            [self.compression_nonce.encode()]
+                            if self.kv_mgr.compression_mode != "off"
+                            else []
+                        )
                     )
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()

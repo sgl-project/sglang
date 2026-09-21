@@ -18,7 +18,6 @@ from typing import (
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
@@ -499,6 +498,14 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        from sglang.srt.disaggregation.compression.diagnostics import trace_handoff
+
+        if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+            trace_handoff(
+                "metadata_written",
+                req,
+                self.output_ids[req.metadata_buffer_index][0].item(),
+            )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.

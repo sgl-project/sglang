@@ -16,7 +16,6 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.runtime_context import (
     get_schedule,
 )
@@ -394,6 +393,7 @@ class DecodeStagingHandler:
         num_pages: int,
         decode_req: DecodeRequest,
         receiver,
+        staging_view=None,
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
 
@@ -418,7 +418,8 @@ class DecodeStagingHandler:
 
         scatter_stream = self.staging_allocator._scatter_stream
 
-        staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
+        if staging_view is None:
+            staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
         req_pool_idx = decode_req.req.kv.req_pool_idx
         # page_start is suffix-relative (pages after the decode-side cached
@@ -768,6 +769,7 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
+    min_allocation_bytes: int = 0,
 ):
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
@@ -833,6 +835,7 @@ def handle_staging_req(
             bytes_per_head_per_token,
             num_kv_layers,
         )
+        required = max(required, min_allocation_bytes)
         result = staging_allocator.assign(required)
         if result is None:
             logger.error(
@@ -921,6 +924,9 @@ class StagingManagerMixin:
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            min_allocation_bytes=getattr(
+                getattr(self, "compression_runtime", None), "wire_capacity", 0
+            ),
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
@@ -943,7 +949,6 @@ def prefetch_staging_reqs(
     allocates staging during the GPU forward pass.
     """
     import zmq
-
     from sglang.srt.disaggregation.common.staging_buffer import staging_grid_tokens
     from sglang.srt.utils.network import NetworkAddress
 

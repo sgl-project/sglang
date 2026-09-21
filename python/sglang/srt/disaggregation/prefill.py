@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -96,10 +95,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +328,15 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        context = getattr(
+            self.scheduler.tree_cache,
+            "get_kv_compression_context",
+            lambda: (None, None),
+        )
+        if hasattr(kv_manager, "compression_mode"):
+            kv_manager.shared_compression_runtime, kv_manager.encoded_kv_provider = (
+                context()
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -838,6 +845,11 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                from sglang.srt.disaggregation.compression.diagnostics import (
+                    trace_handoff,
+                )
+
+                trace_handoff("prefill_sampled", req, next_token_id)
                 if req.grammar is not None:
                     try:
                         req.grammar.accept_token(next_token_id)
@@ -1499,6 +1511,13 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            get_refs = getattr(self.tree_cache, "get_kv_transfer_refs", None)
+            if get_refs is not None and getattr(
+                req.disagg_kv_sender, "requires_encoded_kv", False
+            ):
+                req.disagg_kv_sender.compression_refs = get_refs(
+                    req, seg_start, seg_end, page_indices
+                )
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last else None,

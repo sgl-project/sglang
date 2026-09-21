@@ -23,6 +23,24 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
 
+    from sglang.srt.disaggregation.compression.protocol import validate_mode
+
+    compression = validate_mode(envs.SGLANG_PD_KV_COMPRESSION.get())
+    host_compression = validate_mode(envs.SGLANG_HICACHE_KV_COMPRESSION.get())
+    if (
+        compression != "off"
+        or host_compression != "off"
+        or envs.SGLANG_PD_KV_COMPRESSION_FORCE.get()
+    ):
+        _validate_pd_compression(server_args)
+    if compression != "off":
+        envs.SGLANG_DISAGG_STAGING_BUFFER.set(True)
+        envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.set(True)
+        envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.set(1)
+        envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.set(1)
+        if "SGLANG_DISAGG_STAGING_POOL_SIZE_MB" not in os.environ:
+            envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.set(512)
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -263,3 +281,110 @@ def handle_encoder_disaggregation(server_args: Any):
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
             f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
         )
+
+
+def _validate_pd_compression(server_args: ServerArgs) -> None:
+    """Fail closed on combinations outside the prototype's validation scope."""
+    cfg = resolving_view(server_args)
+    errors = []
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        errors.append("P/D mode is required")
+    if (
+        cfg.disaggregation_transfer_backend != "mooncake"
+        or os.getenv("MC_FORCE_TCP") == "1"
+    ):
+        errors.append("Mooncake RDMA is required")
+    if (
+        any(
+            getattr(cfg, key, 1) != 1
+            for key in ("tp_size", "pp_size", "dp_size", "attn_cp_size", "dcp_size")
+        )
+        or cfg.enable_prefill_cp
+    ):
+        errors.append("TP/PP/DP/CP/DCP must all be 1")
+    if cfg.page_size != 1 or cfg.attention_backend != "flashinfer":
+        errors.append("--page-size 1 --attention-backend flashinfer are required")
+    host_compression = envs.SGLANG_HICACHE_KV_COMPRESSION.get()
+    prefill_cache = (
+        cfg.disaggregation_mode == "prefill" and cfg.enable_hierarchical_cache
+    )
+    if prefill_cache and cfg.disable_radix_cache:
+        errors.append("Prefill HiCache requires radix cache enabled")
+    if (
+        (not cfg.disable_radix_cache and not prefill_cache)
+        or (cfg.enable_hierarchical_cache and cfg.disaggregation_mode != "prefill")
+        or cfg.enable_hisparse
+        or cfg.disaggregation_decode_enable_radix_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
+        errors.append(
+            "only Prefill HiCache is supported; Decode radix/HiCache, HiSparse and incremental offload must be disabled"
+        )
+    if host_compression != "off":
+        if (
+            getattr(cfg, "radix_cache_backend", None) is not None
+            or getattr(cfg, "enable_lmcache", False)
+            or getattr(cfg, "enable_flexkv", False)
+            or getattr(cfg, "enable_unified_cache_external_linker", False)
+            or getattr(cfg, "enable_session_radix_cache", False)
+            or getattr(cfg, "enable_streaming_session", False)
+        ):
+            errors.append(
+                "compressed L2 requires the built-in cache without external linker or sessions"
+            )
+        if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            errors.append("compressed L2 cannot use the C++ radix tree")
+        if not prefill_cache or cfg.disable_radix_cache:
+            errors.append(
+                "compressed L2 requires Prefill HiCache with radix cache enabled"
+            )
+        if cfg.hicache_size <= 0 or cfg.hicache_host_memory_mode != "cache":
+            errors.append(
+                "compressed L2 requires an explicit positive --hicache-size and cache mode"
+            )
+        if (
+            cfg.hicache_write_policy != "write_through"
+            or cfg.hicache_storage_backend is not None
+        ):
+            errors.append("compressed L2 requires write_through and no L3 backend")
+        if envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python":
+            errors.append("compressed L2 requires the Python unified TreeCore")
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_retraction_backup != "cpu_tensor"
+    ):
+        errors.append(
+            "Decode requires --disaggregation-decode-retraction-backup cpu_tensor"
+        )
+    if envs.SGLANG_PD_KV_COMPRESSION_FORCE.get():
+        if (
+            envs.SGLANG_PD_KV_COMPRESSION.get() != "lz4"
+            or (
+                cfg.enable_hierarchical_cache
+                and (not prefill_cache or host_compression != "lz4")
+            )
+            or (not cfg.enable_hierarchical_cache and host_compression != "off")
+        ):
+            errors.append(
+                "FORCE is test-only: LZ4 P/D; optional Prefill LZ4 L2; Decode L2 off"
+            )
+        if not envs.SGLANG_PD_KV_COMPRESSION_VERIFY.get():
+            errors.append("FORCE requires VERIFY=1")
+    if envs.SGLANG_KV_COMPRESSION_WORKSPACE_MB.get() <= 0:
+        errors.append("compression workspace budget must be positive")
+    if getattr(cfg, "enable_lora", False):
+        errors.append("LoRA is outside this draft's scope")
+    if not cfg.disable_overlap_schedule or not cfg.disable_cuda_graph:
+        errors.append("--disable-overlap-schedule --disable-cuda-graph are required")
+    if cfg.speculative_algorithm is not None:
+        errors.append("speculative decoding is unsupported")
+    if not cfg.chunked_prefill_size or cfg.chunked_prefill_size <= 0:
+        errors.append("a positive chunked-prefill-size is required")
+    if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get():
+        errors.append("custom Mooncake memory pools are outside the prototype scope")
+    if envs.SGLANG_RUST_SERVER.get():
+        errors.append("the Python worker/bootstrap server is required")
+    if model_config_of(server_args).hf_config.architectures != ["Qwen3ForCausalLM"]:
+        errors.append("only Qwen3ForCausalLM is in the prototype scope")
+    if errors:
+        raise ValueError("P/D compression prototype: " + "; ".join(errors))

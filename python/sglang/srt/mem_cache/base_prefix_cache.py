@@ -17,7 +17,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -543,6 +542,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def has_pending_background_work(self) -> bool:
+        """Whether no-batch polling should yield to background workers."""
+        return False
 
     def check_hicache_events(self) -> Any:
         """

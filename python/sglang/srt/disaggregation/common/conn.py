@@ -15,7 +15,6 @@ import requests
 import torch.distributed as dist
 import zmq
 from aiohttp import web
-
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -108,6 +107,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    pd_kv_compression: str = "off"
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -652,6 +652,8 @@ class CommonKVManager(BaseKVManager):
 
     def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
         """Best-effort ack that this rank's transfer for an aborted room drained."""
+        if room in getattr(self, "compression_uncertain_rooms", set()):
+            return  # A failed synchronous RDMA call is not proof of quiescence.
         try:
             na = NetworkAddress(decode_ip, decode_port)
             self._send_multipart_locked(
@@ -669,6 +671,10 @@ class CommonKVManager(BaseKVManager):
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
+        if getattr(
+            self, "compression_mode", "off"
+        ) != "off" and self.compression_tasks.pending(room):
+            return
         if self._staging_outstanding.get(room, 0) > 0:
             return
         target = self._deferred_ack_targets.pop(room, None)
@@ -878,6 +884,15 @@ class CommonKVManager(BaseKVManager):
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
 
+        from sglang.srt.disaggregation.compression.protocol import (
+            capability,
+            check_peer,
+        )
+
+        check_peer(
+            capability(envs.SGLANG_PD_KV_COMPRESSION.get()), info.pd_kv_compression
+        )
+
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
@@ -1064,6 +1079,13 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
         }
+
+        if envs.SGLANG_PD_KV_COMPRESSION.get() != "off":
+            from sglang.srt.disaggregation.compression.protocol import capability
+
+            payload["pd_kv_compression"] = capability(
+                envs.SGLANG_PD_KV_COMPRESSION.get()
+            )
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_world_group().all_gather_object(payload)
@@ -1570,7 +1592,10 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+        if (
+            hasattr(self.kv_mgr, "_deferred_ack_targets")
+            and getattr(self.kv_mgr, "compression_mode", "off") == "off"
+        ):
             # Drop a held ack target if the room concluded without draining
             # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
             self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
@@ -1634,7 +1659,9 @@ class CommonKVReceiver(BaseKVReceiver):
         )
 
         if self.kv_mgr.enable_staging:
-            self.require_staging = (
+            self.require_staging = getattr(
+                self.kv_mgr, "compression_mode", "off"
+            ) != "off" or (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
@@ -1913,6 +1940,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.pd_kv_compression = "off"
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1980,6 +2008,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        self.pd_kv_compression = data.get("pd_kv_compression", "off")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2078,8 +2107,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                pd_kv_compression=getattr(self, "pd_kv_compression", "off"),
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            response = dataclasses.asdict(info)
+            if info.pd_kv_compression == "off":
+                response.pop(
+                    "pd_kv_compression"
+                )  # Keep disabled wire format unchanged.
+            return web.json_response(response, status=200)
 
         if not self._is_ready():
             return web.Response(

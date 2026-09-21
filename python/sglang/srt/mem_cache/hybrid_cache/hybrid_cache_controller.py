@@ -10,16 +10,13 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
-
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
+    LayerDoneCounter,
+    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
-)
-from sglang.srt.managers.cache_controller import (
-    LayerDoneCounter,
-    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -327,6 +324,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        page_refs=None,
     ) -> Optional[torch.Tensor]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
@@ -347,6 +345,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                page_refs=page_refs,
             )
         )
         self.start_writing()
@@ -361,6 +360,8 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
+        if self.async_l2 is not None:
+            return op.host_indices, op.device_indices, op.pool_transfers
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
         if not getattr(host_group, "supports_per_pool_backup_indices", False):

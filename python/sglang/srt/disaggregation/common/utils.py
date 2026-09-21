@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -29,6 +28,7 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+    compression_refs: Optional[tuple[int, ...]] = None
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False

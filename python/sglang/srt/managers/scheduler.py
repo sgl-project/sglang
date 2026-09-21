@@ -3608,6 +3608,12 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
+            if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+                from sglang.srt.disaggregation.compression.diagnostics import (
+                    trace_native_cache_state,
+                )
+
+                trace_native_cache_state(self.tree_cache)
             if self.enable_hicache_storage:
                 self._process_storage_prefetch_retries()
 
@@ -4861,7 +4867,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
+            if getattr(self.tree_cache, "has_pending_background_work", lambda: False)():
+                # L2 compression submits CUDA work from Python workers. Keep
+                # source pins and the not-fully-idle gate; only yield the CPU.
+                time.sleep(0.001)
+            elif self.enable_hicache_storage:
                 # Storage workers need the GIL between I/O calls. Yield while
                 # there is no GPU batch so polling cannot starve their acks.
                 time.sleep(0)
@@ -4961,16 +4971,34 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
+            compression_manager = None
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                compression_manager = getattr(
+                    self.disagg_prefill_bootstrap_queue, "kv_manager", None
+                )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                compression_manager = getattr(
+                    self.disagg_decode_prealloc_queue, "kv_manager", None
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+
+            if getattr(compression_manager, "compression_mode", "off") != "off":
+                runtime = compression_manager.compression_runtime
+                idle &= not runtime.transport_failed and runtime.shared.idle()
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    transfer = self.disagg_decode_transfer_queue
+                    # Removed requests may still own RDMA destinations or an
+                    # active/quarantined restoration. Never pause/free their
+                    # memory merely because the request queue is empty.
+                    idle &= not transfer.has_pending_deferred_releases()
+                    idle &= transfer.staging_handler.is_idle()
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -4982,6 +5010,7 @@ class Scheduler(
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
+                idle &= getattr(tc, "background_work_is_idle", lambda: True)()
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0

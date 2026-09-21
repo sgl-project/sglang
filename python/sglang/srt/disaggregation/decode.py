@@ -31,8 +31,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -120,6 +118,7 @@ from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -2179,6 +2178,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+        from sglang.srt.disaggregation.compression.diagnostics import trace_handoff
+
+        if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+            trace_handoff(
+                "decode_received",
+                decode_req.req,
+                output_id[0].item(),
+                received_room=int(output_bootstrap_room[0].item()),
+                slot=idx,
+                received_cached_tokens=int(cached_tokens[0].item()),
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -2356,7 +2366,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             DecodeStagingHandler,
         )
 
-        self.staging_handler = DecodeStagingHandler.create(
+        handler_cls = DecodeStagingHandler
+        if getattr(kv_manager, "compression_mode", "off") != "off":
+            from sglang.srt.disaggregation.mooncake.compression import (
+                CompressedDecodeStagingHandler,
+            )
+
+            handler_cls = CompressedDecodeStagingHandler
+        self.staging_handler = handler_cls.create(
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
@@ -2434,6 +2451,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
+                    # Compression restore may still own destination KV pages.
+                    if (
+                        getattr(
+                            decode_req.kv_receiver.kv_mgr, "compression_mode", "off"
+                        )
+                        != "off"
+                    ):
+                        self.staging_handler.unregister_decode_req(
+                            decode_req.req.bootstrap_room
+                        )
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     decode_req.kv_receiver.clear()
@@ -2534,7 +2561,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            compressed = getattr(kv_mgr, "compression_mode", "off") != "off"
+            if not drained and (now < deadline or compressed):
+                if compressed and now >= deadline:
+                    logger.error(
+                        "Quarantining compression buffers for room=%s: remote drain unconfirmed",
+                        room,
+                    )
+                    deadline = float("inf")
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
