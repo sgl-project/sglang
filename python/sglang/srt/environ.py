@@ -980,7 +980,9 @@ class Envs:
     # ON: measured three ~4k tails on a 958k cached prefix (GLM-5.2, A3, TP16
     # DCP16) in one forward at 9.21 -> ~6.5 s, with prefill logprobs bitwise
     # identical to the pre-lift path at all 12,311 tail positions, for the
-    # batch and for the same tails one at a time. Set 0 for the pre-lift path.
+    # batch and for the same tails one at a time. AISBench (990k shared prefix,
+    # 16 x ~10.8k at concurrency 16): measured phase 110.2 -> 79.1 s. Set 0 for
+    # the pre-lift path.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
     # DCP extend on NPU: let the sparse operator read the gathered prefix in the
     # rank-major order the all-gather already produced, remapping the top-k

@@ -146,8 +146,10 @@ def dsa_cp_multi_request_enabled() -> bool:
     matched bitwise. That covers the query-length-0 entries most ranks get here.
     The batch took ~6.5 s against 9.21 s without the lift.
 
-    Estimated, not measured: ~31-40 s of AISBench phase 2 (110.2 s), where
-    84.7% of prefill tokens decline without this. Not composable with the packed read, which refuses
+    AISBench phase 2 (990k shared prefix, 16 x ~10.8k at concurrency 16), where
+    84.7% of prefill tokens declined DSA-CP without this: **110.2 -> 79.1 s**
+    measured on 2026-09-22, with no multi-request batch declining. Phase 1, one
+    request, was unchanged (224.8 -> 224.1 s), as it should be. Not composable with the packed read, which refuses
     multi-request batches for a different reason -- the all-gather is rank-major
     over the whole send, so no request is contiguous in it -- so those batches
     take the permuting gather and this takes the query sharding.
