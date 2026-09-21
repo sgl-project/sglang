@@ -61,15 +61,18 @@ def check_perf(test_case, label: str, *metrics: Metric) -> None:
 def check_batch_scaling(
     test_case,
     label: str,
-    run_one: Callable[[int], dict],
+    run_all: Callable[[Sequence[int]], Sequence[dict]],
     bounds: Sequence[tuple],
 ) -> None:
-    """Run `run_one` once per batch size and bound its latency at each one.
+    """Bound the latency at each batch size of one sweep.
 
+    `run_all` takes every batch size at once so the sweep shares a server.
     Each `bounds` entry is `(batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms)`.
     """
-    for batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms in bounds:
-        res = run_one(batch_size)
+    results = run_all([b[0] for b in bounds])
+    for (batch_size, avg_ms, p95_ms, amd_avg_ms, amd_p95_ms), res in zip(
+        bounds, results
+    ):
         test_case.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             test_case,

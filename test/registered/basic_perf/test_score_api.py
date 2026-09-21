@@ -13,10 +13,11 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     CustomTestCase,
     run_score_benchmark,
+    run_score_benchmark_multi,
 )
 
-register_cuda_ci(est_time=290, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=285, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=215, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=210, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestScoreAPI(CustomTestCase):
@@ -43,10 +44,10 @@ class TestScoreAPI(CustomTestCase):
         check_batch_scaling(
             self,
             "test_score_api_batch_scaling",
-            lambda batch_size: run_score_benchmark(
-                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+            lambda batch_sizes: run_score_benchmark_multi(
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+                batch_sizes,
                 num_requests=500,
-                batch_size=batch_size,
             ),
             # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
             [(10, 45, 50, 60, 65), (25, 50, 60, 70, 80), (50, 60, 65, 80, 90)],

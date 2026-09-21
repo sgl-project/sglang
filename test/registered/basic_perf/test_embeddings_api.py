@@ -13,10 +13,11 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     run_embeddings_benchmark,
+    run_embeddings_benchmark_multi,
 )
 
-register_cuda_ci(est_time=320, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=315, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=245, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=240, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestEmbeddingsAPI(CustomTestCase):
@@ -44,10 +45,10 @@ class TestEmbeddingsAPI(CustomTestCase):
         check_batch_scaling(
             self,
             "test_embeddings_api_batch_scaling",
-            lambda batch_size: run_embeddings_benchmark(
-                model=DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+            lambda batch_sizes: run_embeddings_benchmark_multi(
+                DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
+                batch_sizes,
                 num_requests=500,
-                batch_size=batch_size,
                 input_tokens=500,
             ),
             # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
