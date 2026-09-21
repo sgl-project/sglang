@@ -79,18 +79,23 @@ def silu_and_mul_post_quant_mxfp4(
 
 
 @cache_once
-def _jit_fp8_module(apply_clamp: bool) -> Module:
+def _jit_fp8_module(apply_clamp: bool, apply_gemm1_alpha: bool) -> Module:
     if not is_ppu():
         raise RuntimeError(
             _PPU_ONLY_MSG.format(name="silu_and_mul_post_per_token_quant_fp8")
         )
     clamp_str = "true" if apply_clamp else "false"
+    alpha_str = "true" if apply_gemm1_alpha else "false"
     return load_jit(
         "silu_and_mul_post_per_token_quant_fp8",
         clamp_str,
+        alpha_str,
         cuda_files=["elementwise/silu_and_mul_post_per_token_quant_fp8.cuh"],
         cuda_wrappers=[
-            ("run", f"SiluMulFp8TP<{_FP8_BLOCK_THREADS},{clamp_str}>::run"),
+            (
+                "run",
+                f"SiluMulFp8TP<{_FP8_BLOCK_THREADS},{clamp_str},{alpha_str}>::run",
+            ),
         ],
         extra_cuda_cflags=["-use_fast_math"],
     )
@@ -99,6 +104,8 @@ def _jit_fp8_module(apply_clamp: bool) -> Module:
 def silu_and_mul_post_per_token_quant_fp8(
     gateup: torch.Tensor,
     swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
     eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert gateup.ndim == 2, "input must be 2D (N, 2H)"
@@ -117,10 +124,21 @@ def silu_and_mul_post_per_token_quant_fp8(
         return output, output_scale
 
     apply_clamp = swiglu_limit is not None
-    limit_val = float(swiglu_limit) if apply_clamp else 0.0
+    apply_gemm1_alpha = gemm1_alpha is not None
+    assert not (apply_clamp and apply_gemm1_alpha), (
+        "swiglu_limit (DeepSeek V4) and gemm1_alpha (oai-swiglu) are mutually exclusive"
+    )
+    if apply_gemm1_alpha:
+        assert gemm1_clamp_limit is not None, "gemm1_alpha requires gemm1_clamp_limit"
 
-    module = _jit_fp8_module(apply_clamp)
-    module.run(gateup, output, output_scale, limit_val, float(eps))
+    limit_val = float(swiglu_limit) if apply_clamp else 0.0
+    alpha_val = float(gemm1_alpha) if apply_gemm1_alpha else 0.0
+    clamp_val = float(gemm1_clamp_limit) if apply_gemm1_alpha else 0.0
+
+    module = _jit_fp8_module(apply_clamp, apply_gemm1_alpha)
+    module.run(
+        gateup, output, output_scale, limit_val, alpha_val, clamp_val, float(eps)
+    )
 
     return output, output_scale
 
