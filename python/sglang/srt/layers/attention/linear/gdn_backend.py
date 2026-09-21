@@ -5,8 +5,10 @@ import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    can_use_qwen38_gdn_prefill_prologue,
     causal_conv1d_fn,
     causal_conv1d_update,
+    qwen38_gdn_prefill_prologue,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
@@ -22,10 +24,21 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 _is_hip = is_hip()
+_enable_qwen38_gdn_prefill_prologue = _is_hip and get_bool_env_var(
+    "SGLANG_QWEN38_GDN_PREFILL_PROLOGUE_FUSION",
+    default="false",
+)
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -369,6 +382,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_supports_fused_raw_qk(self) -> bool:
+        return getattr(self.extend_kernel, "supports_fused_raw_qk_prefill", False)
 
     @property
     def extend_uses_state_checkpoints(self) -> bool:
@@ -853,6 +870,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+        query = None
+        key = None
+        value = None
+        prepared_g = None
+        prepared_beta = None
+
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
@@ -912,39 +935,91 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            use_fused_prologue = (
+                _enable_qwen38_gdn_prefill_prologue
+                and is_gfx95_supported()
+                and self.kernel_dispatcher.extend_supports_fused_raw_qk
+                and not get_exec().deterministic.enable_deterministic_inference
+                and not get_memory().enable_page_major_kv_layout
+                and not needs_state_gather
+                and not forward_metadata.has_mamba_track_mask
+            )
+            if use_fused_prologue:
+                use_fused_prologue, _ = can_use_qwen38_gdn_prefill_prologue(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    conv_states_contig,
+                    query_start_loc,
+                    forward_batch.extend_seq_lens_cpu,
+                    state_cache_indices,
+                    has_initial_states,
+                    layer.A_log,
+                    a,
+                    b,
+                    layer.dt_bias,
+                    layer.activation,
+                )
 
-        actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            query, key, value = fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            if use_fused_prologue:
+                query, key, value, prepared_g, prepared_beta = (
+                    qwen38_gdn_prefill_prologue(
+                        mixed_qkv,
+                        layer.conv_weights,
+                        layer.bias,
+                        conv_states_contig,
+                        query_start_loc,
+                        forward_batch.extend_seq_lens_cpu,
+                        state_cache_indices,
+                        has_initial_states,
+                        layer.A_log,
+                        a,
+                        b,
+                        layer.dt_bias,
+                        layer.activation,
+                    )
+                )
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+
+        if query is None:
+            actual_seq_len = mixed_qkv.shape[0]
+            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+            if (
+                is_cuda() or is_hip() or is_xpu()
+            ) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+                query, key, value = fused_qkv_split_gdn_prefill(
+                    mixed_qkv,
+                    layer.num_q_heads,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                    dim=-1,
+                )
+                query = query.view(
+                    1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
+                )
+                key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+                value = value.view(
+                    1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
+                )
 
         if is_target_verify:
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
@@ -1017,7 +1092,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if prepared_g is None or prepared_beta is None:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            else:
+                g, beta = prepared_g, prepared_beta
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,

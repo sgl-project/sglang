@@ -26,6 +26,15 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    A_log_ptr,
+    a_ptr,
+    b_ptr,
+    dt_bias_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
@@ -42,6 +51,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
+    stride_a_token: tl.constexpr,
+    stride_a_head: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_b_head: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -55,6 +68,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FUSE_QWEN38_GDN_PREP: tl.constexpr,
+    NUM_QK_HEADS: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    SOFTPLUS_BETA: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -380,14 +399,85 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token).to(tl.int64)
-            * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        token_idx = (sequence_start_index + token_offset + idx_token).to(tl.int64)
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+        if FUSE_QWEN38_GDN_PREP:
+            # Preserve the legacy Conv1D BF16 rounding point. Q/K remain raw:
+            # the unchanged chunk scan applies its established L2Norm kernel.
+            # BLOCK_N stays 256, matching the legacy Conv kernel specialization.
+            conv_rounded = acc.to(x_ptr.dtype.element_ty)
+            qk_dim: tl.constexpr = NUM_QK_HEADS * HEAD_DIM
+            v_dim: tl.constexpr = NUM_V_HEADS * HEAD_DIM
+            tl.store(
+                q_ptr + token_idx * qk_dim + idx_feats,
+                conv_rounded,
+                mask=mask_1d & (idx_feats < qk_dim),
+            )
+            tl.store(
+                k_ptr + token_idx * qk_dim + (idx_feats - qk_dim),
+                conv_rounded,
+                mask=mask_1d & (idx_feats >= qk_dim) & (idx_feats < 2 * qk_dim),
+            )
+            tl.store(
+                v_ptr + token_idx * v_dim + (idx_feats - 2 * qk_dim),
+                conv_rounded,
+                mask=mask_1d
+                & (idx_feats >= 2 * qk_dim)
+                & (idx_feats < 2 * qk_dim + v_dim),
+            )
+
+            feature_block = tl.program_id(2)
+            feature_start = feature_block * BLOCK_N
+            if feature_start >= 2 * qk_dim:
+                # Raw A/B gating is prepared without another launch. With the
+                # legacy 256-wide Conv tile, each value block owns two
+                # 128-wide value heads.
+                heads_per_block: tl.constexpr = BLOCK_N // HEAD_DIM
+                v_head = (feature_start - 2 * qk_dim) // HEAD_DIM + tl.arange(
+                    0, heads_per_block
+                )
+                gate_mask = (idx_token < segment_len) & (v_head < NUM_V_HEADS)
+                raw_a = tl.load(
+                    a_ptr + token_idx * stride_a_token + v_head * stride_a_head,
+                    mask=gate_mask,
+                    other=0.0,
+                )
+                raw_b = tl.load(
+                    b_ptr + token_idx * stride_b_token + v_head * stride_b_head,
+                    mask=gate_mask,
+                    other=0.0,
+                )
+                A_log = tl.load(
+                    A_log_ptr + v_head,
+                    mask=gate_mask,
+                    other=0.0,
+                )
+                dt_bias = tl.load(
+                    dt_bias_ptr + v_head,
+                    mask=gate_mask,
+                    other=0.0,
+                )
+                gate_x = raw_a.to(tl.float32) + dt_bias.to(tl.float32)
+                beta_x = SOFTPLUS_BETA * gate_x
+                softplus = tl.where(
+                    beta_x <= SOFTPLUS_THRESHOLD,
+                    (1.0 / SOFTPLUS_BETA) * tl.log(1.0 + tl.exp(beta_x)),
+                    gate_x,
+                )
+                gate_g = -tl.exp(A_log.to(tl.float32)) * softplus
+                gate_beta = tl.sigmoid(raw_b.to(tl.float32))
+                gate_offset = token_idx * NUM_V_HEADS + v_head
+                tl.store(g_ptr + gate_offset, gate_g, mask=gate_mask)
+                # Match fused_gdn_gating: sigmoid rounds to the raw B dtype
+                # before it is stored in the FP32 beta tensor.
+                tl.store(
+                    beta_ptr + gate_offset,
+                    gate_beta.to(b_ptr.dtype.element_ty),
+                    mask=gate_mask,
+                )
+        else:
+            o_ptrs = o_ptr + token_idx * stride_o_token + (idx_feats * stride_o_dim)
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
@@ -532,6 +622,15 @@ def causal_conv1d_fn(
         has_initial_state,
         query_start_loc,
         out,
+        out,
+        out,
+        out,
+        out,
+        out,
+        out,
+        out,
+        out,
+        out,
         # Matrix dimensions
         dim,
         cu_seqlen,
@@ -548,6 +647,10 @@ def causal_conv1d_fn(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        0,
+        0,
+        0,
+        0,
         # others
         pad_slot_id,
         # META
@@ -562,9 +665,261 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=8,
         BLOCK_N=256,
+        FUSE_QWEN38_GDN_PREP=False,
+        NUM_QK_HEADS=0,
+        NUM_V_HEADS=0,
+        HEAD_DIM=0,
+        SOFTPLUS_BETA=1.0,
+        SOFTPLUS_THRESHOLD=20.0,
         num_stages=2,
     )
     return out
+
+
+QWEN38_GDN_NUM_QK_HEADS = 16
+QWEN38_GDN_NUM_V_HEADS = 48
+QWEN38_GDN_HEAD_DIM = 128
+QWEN38_GDN_QKV_DIM = (
+    2 * QWEN38_GDN_NUM_QK_HEADS * QWEN38_GDN_HEAD_DIM
+    + QWEN38_GDN_NUM_V_HEADS * QWEN38_GDN_HEAD_DIM
+)
+
+
+def can_use_qwen38_gdn_prefill_prologue(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    activation: Optional[str] = "silu",
+) -> tuple[bool, str]:
+    """Fail-closed contract for the Qwen3.8 TP1 fused prefill producer."""
+    tensors = (
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        A_log,
+        a,
+        b,
+        dt_bias,
+    )
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return False, "all inputs must be torch.Tensor instances"
+    if torch.version.hip is None or not all(tensor.is_cuda for tensor in tensors):
+        return False, "ROCm tensors are required"
+    if len({tensor.device for tensor in tensors}) != 1:
+        return False, "all tensors must be on one device"
+    try:
+        arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":", 1)[0]
+    except Exception as exc:  # noqa: BLE001
+        return False, f"architecture detection failed ({exc})"
+    if arch != "gfx950":
+        return False, f"gfx950 is required, got {arch}"
+    if x.ndim != 2 or x.shape[0] != QWEN38_GDN_QKV_DIM or x.shape[1] <= 0:
+        return False, "x must have shape [10240, T] with T > 0"
+
+    num_tokens = x.shape[1]
+    if weight.shape != (QWEN38_GDN_QKV_DIM, 4):
+        return False, "Conv1D weight must have shape [10240, 4]"
+    if bias.shape != (QWEN38_GDN_QKV_DIM,):
+        return False, "Conv1D bias must have shape [10240]"
+    if (
+        conv_states.ndim != 3
+        or conv_states.shape[1] != QWEN38_GDN_QKV_DIM
+        or conv_states.shape[2] < 3
+        or not conv_states.is_contiguous()
+    ):
+        return False, "Conv1D state must be contiguous [slots, 10240, >=3]"
+    expected_gate_shape = (num_tokens, QWEN38_GDN_NUM_V_HEADS)
+    if a.shape != expected_gate_shape or b.shape != expected_gate_shape:
+        return False, "raw A/B projections must have shape [T, 48]"
+    if A_log.shape != (QWEN38_GDN_NUM_V_HEADS,) or dt_bias.shape != (
+        QWEN38_GDN_NUM_V_HEADS,
+    ):
+        return False, "A_log and dt_bias must have shape [48]"
+
+    if query_start_loc.ndim != 1 or query_start_loc.numel() < 2:
+        return False, "query_start_loc must be rank-1 with at least two entries"
+    num_sequences = query_start_loc.numel() - 1
+    if cache_indices.shape != (num_sequences,) or has_initial_state.shape != (
+        num_sequences,
+    ):
+        return False, "state metadata must have one entry per sequence"
+    if len(seq_lens_cpu) != num_sequences:
+        return False, "seq_lens_cpu must have one entry per sequence"
+    sequence_lengths = [int(length) for length in seq_lens_cpu]
+    if any(length <= 0 for length in sequence_lengths):
+        return False, "zero-length or padded sequences are unsupported"
+    if sum(sequence_lengths) != num_tokens:
+        return False, "sequence lengths must cover exactly T tokens"
+
+    if x.dtype is not torch.bfloat16:
+        return False, "Qwen3.8 fused prefill requires BF16 projections"
+    if any(
+        tensor.dtype is not torch.bfloat16
+        for tensor in (weight, bias, conv_states, a, b)
+    ):
+        return False, "Conv1D, state, and raw gate tensors must be BF16"
+    if A_log.dtype is not torch.float32:
+        return False, "A_log must be FP32"
+    if dt_bias.dtype not in (torch.bfloat16, torch.float32):
+        return False, "dt_bias must be BF16 or FP32"
+    if query_start_loc.dtype not in (torch.int32, torch.int64):
+        return False, "query_start_loc must be int32 or int64"
+    if cache_indices.dtype not in (torch.int32, torch.int64):
+        return False, "cache_indices must be int32 or int64"
+    if has_initial_state.dtype is not torch.bool:
+        return False, "has_initial_state must be bool"
+
+    if x.stride(0) != 1 or x.stride(1) < QWEN38_GDN_QKV_DIM:
+        return False, "x must be non-overlapping with a unit feature stride"
+    if weight.stride(1) != 1 or bias.stride(0) != 1:
+        return False, "Conv1D weight/bias inner dimensions must be contiguous"
+    if a.stride(1) != 1 or b.stride(1) != 1:
+        return False, "raw A/B head dimensions must have unit stride"
+    if A_log.stride(0) != 1 or dt_bias.stride(0) != 1:
+        return False, "gate parameter vectors must be contiguous"
+    if not query_start_loc.is_contiguous() or not cache_indices.is_contiguous():
+        return False, "sequence and cache indices must be contiguous"
+    if not has_initial_state.is_contiguous():
+        return False, "has_initial_state must be contiguous"
+    if activation not in ("silu", "swish"):
+        return False, "activation must be silu or swish"
+    return True, "eligible"
+
+
+def qwen38_gdn_prefill_prologue(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    activation: Optional[str] = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse Conv1D, raw QKV layout emission, and raw gate preparation."""
+    eligible, reason = can_use_qwen38_gdn_prefill_prologue(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices,
+        has_initial_state,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        activation,
+    )
+    if not eligible:
+        raise ValueError(f"Ineligible Qwen3.8 GDN prefill prologue: {reason}")
+
+    num_tokens = x.shape[1]
+    q = torch.empty(
+        (1, num_tokens, QWEN38_GDN_NUM_QK_HEADS, QWEN38_GDN_HEAD_DIM),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    k = torch.empty_like(q)
+    v = torch.empty(
+        (1, num_tokens, QWEN38_GDN_NUM_V_HEADS, QWEN38_GDN_HEAD_DIM),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    g = torch.empty(
+        (1, num_tokens, QWEN38_GDN_NUM_V_HEADS),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    beta = torch.empty_like(g)
+
+    num_cache_lines = conv_states.shape[0]
+    state_len = weight.shape[1] - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    def grid(meta):
+        return (
+            len(seq_lens_cpu),
+            triton.cdiv(max(seq_lens_cpu), meta["BLOCK_M"]),
+            triton.cdiv(QWEN38_GDN_QKV_DIM, meta["BLOCK_N"]),
+        )
+
+    _causal_conv1d_fwd_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        x,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        QWEN38_GDN_QKV_DIM,
+        num_tokens,
+        num_cache_lines,
+        0,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        0,
+        0,
+        0,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        PAD_SLOT_ID,
+        HAS_BIAS=True,
+        KERNEL_WIDTH=weight.shape[1],
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        HAS_INITIAL_STATES=True,
+        HAS_CACHE=True,
+        IS_CONTINUOUS_BATCHING=True,
+        USE_PAD_SLOT=True,
+        NP2_STATELEN=np2_statelen,
+        BLOCK_M=8,
+        BLOCK_N=256,
+        FUSE_QWEN38_GDN_PREP=True,
+        NUM_QK_HEADS=QWEN38_GDN_NUM_QK_HEADS,
+        NUM_V_HEADS=QWEN38_GDN_NUM_V_HEADS,
+        HEAD_DIM=QWEN38_GDN_HEAD_DIM,
+        SOFTPLUS_BETA=1.0,
+        SOFTPLUS_THRESHOLD=20.0,
+        num_warps=4,
+        num_stages=2,
+    )
+    return q, k, v, g, beta
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
