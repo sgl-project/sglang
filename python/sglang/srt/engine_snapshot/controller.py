@@ -33,7 +33,10 @@ from sglang.srt.engine_snapshot.manifest import (
     validate_identity,
 )
 from sglang.srt.engine_snapshot.runtime import SnapshotRuntime
-from sglang.srt.engine_snapshot.startup import validate_server_args
+from sglang.srt.engine_snapshot.startup import (
+    validate_listen_host,
+    validate_server_args,
+)
 from sglang.srt.environ import envs, third_party_cache_defaults
 
 
@@ -223,6 +226,7 @@ def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
             )
         effective_host = manifest.host if host is None else host
         effective_port = manifest.port if port is None else port
+        validate_listen_host(effective_host)
         control.clear_handshake(control_dir)
         runtime.verify_restorable(manifest, effective_host, effective_port)
         root_pid = None

@@ -49,6 +49,21 @@ _REQUIRED_SERVER_ARGS = {
 _RELOADABLE_LOAD_FORMATS = ("auto", "pt", "safetensors")
 
 
+def validate_listen_host(host):
+    """Refuse listen addresses the snapshot path cannot carry.
+
+    The probes and sockets behind a restore speak plain IPv4-or-hostname
+    addresses; an IPv6 literal would have to be bracketed for some of them and
+    unbracketed for others. Refusing it where the address enters turns a later
+    probe timeout into a message that names the value.
+    """
+    if ":" in host:
+        raise SnapshotUsageError(
+            "Initialized snapshots require an IPv4 address or hostname, "
+            f"not an IPv6 literal: {host}"
+        )
+
+
 def validate_startup(args):
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.environ import envs
@@ -82,6 +97,7 @@ def validate_startup(args):
         raise SnapshotUsageError(
             "Initialized snapshots require a fixed listen port (1-65535)"
         )
+    validate_listen_host(args.host)
 
 
 def validate_server_args(argv):
