@@ -1058,6 +1058,81 @@ def test_prepare_for_next_req_repins_residents(monkeypatch):
     assert {0, 1, 2} <= manager._gpu_layers
 
 
+def test_release_after_use_defaults_to_the_old_release_all(monkeypatch):
+    """The rename must not move anything: `release_after_use()` == the previous call.
+
+    `finish_use` used to call `release_all()` unconditionally. It now says
+    `release_after_use()`, and with the default argument that has to clear exactly the
+    same layers, or this refactor is a behaviour change wearing a new name.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_all_still_drops_everything(monkeypatch):
+    """`release_all` keeps its literal contract for the full-reset callers.
+
+    `enable_offload` syncs to CPU and expects nothing left on the device; it
+    must not inherit the resident-set exemption.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_all()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_after_use_can_keep_the_resident_set(monkeypatch):
+    """`keep_resident` is the whole point of naming the two calls apart.
+
+    A component whose use is one forward pass has its resident set prefetched
+    at the start of the use and dropped at the end, so `resident_layers` buys
+    it nothing. Measured on Qwen-Image-2.1 / RTX 5090:
+    `--layerwise-resident-layers text_encoder=0.8` logs `resident=53/66` and
+    moves neither memory nor latency.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_after_use(keep_resident=True)
+    assert set(manager._gpu_layers) == set(manager._retained_set)
+    # Those layers never left the device, so the next use must not re-do the
+    # sequential first pass that exists for evicted pages.
+    assert manager._first_pass is False
+
+
+def test_release_after_use_keeps_nothing_when_no_residents_are_configured(monkeypatch):
+    """`keep_resident` with an empty resident set is still a full release."""
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=0
+    )
+    manager.prefetch_layer(0, non_blocking=False)
+    manager.prefetch_layer(1, non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use(keep_resident=True)
+    assert not manager._gpu_layers
+
+
 def _record_prepare(manager, monkeypatch):
     """Log the order of prefetches and stream waits inside prepare_for_next_req.
 
