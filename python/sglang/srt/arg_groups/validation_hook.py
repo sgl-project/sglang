@@ -465,15 +465,11 @@ def validate_cutlass_mxfp4(server_args: Any):
             f"architecture is built; this GPU reports sm{get_platform().device_sm}. Use "
             "marlin instead."
         )
-    if view.ep_size != 1:
-        raise ValueError(
-            f"{flags} cutlass_mxfp4 serves the standard (non-EP) MoE dispatch only, "
-            f"got ep_size={view.ep_size}."
-        )
     if view.moe_a2a_backend != "none":
         raise ValueError(
             f"{flags} cutlass_mxfp4 has no all-to-all dispatch path, got "
-            f"--moe-a2a-backend {view.moe_a2a_backend}."
+            f"--moe-a2a-backend {view.moe_a2a_backend}. Expert parallelism over the "
+            "standard dispatcher (--ep-size N, --moe-a2a-backend none) is supported."
         )
 
 
