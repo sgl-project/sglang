@@ -50,7 +50,11 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import (
+    assert_int64_array,
+    flatten_nested_list,
+    print_warning_once,
+)
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -233,14 +237,6 @@ class TransportProxyTensor(torch.Tensor):
         return self._metadata.get("transport_mode", "default")
 
 
-def _assert_mm_token_array(input_ids: array, name: str) -> None:
-    assert (
-        isinstance(input_ids, array)
-        and input_ids.typecode == "q"
-        and input_ids.itemsize == 8
-    ), f"{name} must be array('q') with 8-byte items"
-
-
 def duplicate_pad_mm_input_ids(
     input_ids: array,
     mm_inputs: MultimodalInputs,
@@ -248,7 +244,7 @@ def duplicate_pad_mm_input_ids(
 ) -> array:
     """Validate and duplicate model-padded tokens for scheduler ownership."""
     padded_ids = pad_input_ids_func(input_ids, mm_inputs)
-    _assert_mm_token_array(padded_ids, "pad_input_ids result")
+    assert_int64_array(padded_ids, "pad_input_ids result")
     # Preserve scheduler ownership: no-op models return the unpadded input,
     # and other models can retain the result in multimodal metadata.
     return padded_ids[:]
@@ -298,7 +294,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
-        _assert_mm_token_array(input_ids, "input_ids")
+        assert_int64_array(input_ids, "input_ids")
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
@@ -355,7 +351,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        _assert_mm_token_array(input_ids, "input_ids")
+        assert_int64_array(input_ids, "input_ids")
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
