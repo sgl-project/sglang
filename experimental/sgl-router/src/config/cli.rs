@@ -118,8 +118,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
 
-    /// Max lifetime of an in-flight request entry before the janitor
-    /// reaps it (returns 504 `stale_request_expired`).
+    /// Maximum in-flight request lifetime in seconds, including streaming responses.
+    /// Expiry returns 504 `stale_request_expired` before response headers are sent;
+    /// after streaming starts, it aborts the body without changing the HTTP status.
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
 

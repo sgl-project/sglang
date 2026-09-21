@@ -5,7 +5,7 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -284,6 +284,9 @@ impl DispatchMetrics {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
         Box::new(move |end| {
+            if end.reason == StreamEndReason::Expired {
+                metrics.record_stale_request(StaleRequestOutcome::Expired);
+            }
             metrics.record_stream_outcome(&response_worker_url, &model, classify_stream_end(end));
         })
     }

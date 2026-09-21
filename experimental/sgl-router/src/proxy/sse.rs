@@ -12,15 +12,24 @@ use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+/// Why the SSE pump stopped, independently of any SSE error event it observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEndReason {
+    Completed,
+    UpstreamError,
+    IdleTimeout,
+    /// The router's stale-request deadline expired, regardless of worker health.
+    Expired,
+    ClientDisconnect,
+    PumpPanicked,
+}
+
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
-    /// No upstream stream error and no pump panic.
-    pub transport_ok: bool,
+    pub reason: StreamEndReason,
     /// An SSE error event (`data: {"error"...}`) rode the stream.
     pub saw_error_event: bool,
-    /// The client disconnected or stopped consuming the response.
-    pub client_disconnect: bool,
 }
 
 /// A `data:` line whose payload's first JSON key is `error` — tolerant of
@@ -97,9 +106,8 @@ where
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut end = StreamEnd {
-            transport_ok: true,
+            reason: StreamEndReason::Completed,
             saw_error_event: false,
-            client_disconnect: false,
         };
         let mut scanner = ErrorEventScanner::default();
         let idle = limits.idle_timeout.unwrap_or(Duration::MAX);
@@ -115,20 +123,26 @@ where
             tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    end.client_disconnect = true;
+                    end.reason = StreamEndReason::ClientDisconnect;
                     Ok(())
                 }
                 _ = expired => {
-                    end.transport_ok = false;
+                    end.reason = StreamEndReason::Expired;
                     Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
                 }
                 result = async {
                     loop {
                         let bytes = match tokio::time::timeout(idle, stream.next()).await {
-                            Ok(None) => return Ok(()),
+                            Ok(None) => return (StreamEndReason::Completed, Ok(())),
                             Ok(Some(Ok(bytes))) => bytes,
-                            Ok(Some(Err(e))) => return Err(std::io::Error::other(e.to_string())),
-                            Err(_) => return Err(std::io::Error::other("SSE upstream idle timeout")),
+                            Ok(Some(Err(e))) => return (
+                                StreamEndReason::UpstreamError,
+                                Err(std::io::Error::other(e.to_string())),
+                            ),
+                            Err(_) => return (
+                                StreamEndReason::IdleTimeout,
+                                Err(std::io::Error::other("SSE upstream idle timeout")),
+                            ),
                         };
                         if let Some(hook) = on_first_byte.take() {
                             hook();
@@ -142,15 +156,15 @@ where
                         }
                     }
                 } => {
-                    end.transport_ok &= result.is_ok();
-                    result
+                    end.reason = result.0;
+                    result.1
                 }
             }
         };
         let result = match AssertUnwindSafe(pump).catch_unwind().await {
             Ok(result) => result,
             Err(payload) => {
-                end.transport_ok = false;
+                end.reason = StreamEndReason::PumpPanicked;
                 let message = payload
                     .downcast_ref::<&str>()
                     .copied()
@@ -244,8 +258,7 @@ mod tests {
             .to_string()
             .contains("idle timeout"));
         let end = end.await.unwrap();
-        assert!(!end.transport_ok);
-        assert!(!end.client_disconnect);
+        assert_eq!(end.reason, StreamEndReason::IdleTimeout);
     }
 
     #[tokio::test(start_paused = true)]
@@ -278,7 +291,7 @@ mod tests {
             .await
             .expect("expiration must release guards while the queue remains full")
             .unwrap();
-        assert!(!end_rx.await.unwrap().transport_ok);
+        assert_eq!(end_rx.await.unwrap().reason, StreamEndReason::Expired);
         // The queue is full, so the failure must ride the terminal channel.
         assert!(body
             .collect()
@@ -425,8 +438,9 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
+        let (body, end) = limited_body(s, StreamLimits::default());
         let result = body.collect().await;
+        assert_eq!(end.await.unwrap().reason, StreamEndReason::PumpPanicked);
         assert!(
             result.is_err(),
             "expected body collect to surface non-string panic as Err, got Ok"
@@ -608,9 +622,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::Completed);
         assert!(end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -624,7 +637,7 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await;
         let end = stream_end(completion).await;
-        assert!(!end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::UpstreamError);
         assert!(end.saw_error_event);
     }
 
@@ -634,9 +647,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await;
         let end = stream_end(completion).await;
-        assert!(!end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::UpstreamError);
         assert!(!end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -647,9 +659,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::Completed);
         assert!(!end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -664,7 +675,6 @@ mod tests {
         let _ = stream.next().await;
         drop(stream);
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
-        assert!(end.client_disconnect);
+        assert_eq!(end.reason, StreamEndReason::ClientDisconnect);
     }
 }

@@ -39,14 +39,14 @@ enum BreakerOutcome {
     /// The worker was responsive — a 2xx, or a 4xx it answered cleanly (a
     /// client's bad request says nothing about worker health). The non-streaming
     /// arm records success immediately; the streaming arm defers to the pump's
-    /// completion hook, which records success or failure by
-    /// [`sse::StreamEnd::transport_ok`], since a 2xx head can still be followed
+    /// completion hook, which classifies [`sse::StreamEnd::reason`],
+    /// since a 2xx head can still be followed
     /// by a body that never completes.
     Success,
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure (the worker is responsive but at capacity) →
+    /// Backpressure or router-side stream expiry →
     /// `record_backpressure`: never opens the breaker and, while Closed, leaves
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
@@ -79,6 +79,20 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
         StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => BreakerOutcome::Neutral,
         s if s.is_server_error() => BreakerOutcome::Failure,
         _ => BreakerOutcome::Success,
+    }
+}
+
+/// Router-side expiry says nothing about worker health. Preserve the existing
+/// treatment of completed streams and client disconnects; upstream faults,
+/// idle timeouts, and pump panics remain failures.
+fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
+    use sse::StreamEndReason;
+    match end.reason {
+        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => BreakerOutcome::Failure,
     }
 }
 
@@ -355,10 +369,10 @@ impl Proxy {
                 BreakerOutcome::Success => {
                     let breaker_for_hook = Arc::clone(breaker);
                     Some(Box::new(move |end| {
-                        if end.transport_ok {
-                            breaker_for_hook.record_success();
-                        } else {
-                            breaker_for_hook.record_failure();
+                        match stream_breaker_outcome(end) {
+                            BreakerOutcome::Success => breaker_for_hook.record_success(),
+                            BreakerOutcome::Failure => breaker_for_hook.record_failure(),
+                            BreakerOutcome::Neutral => breaker_for_hook.record_backpressure(),
                         }
                         if let Some(hook) = caller_end_hook {
                             hook(end);
@@ -479,6 +493,145 @@ mod tests {
                 .await;
         });
         (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    async fn spawn_pending_stream_worker() -> (String, oneshot::Sender<()>) {
+        use futures::StreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Body::from_stream(
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"data: chunk\n\n",
+                    ))])
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        );
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), tx)
+    }
+
+    async fn pending_stream_body(
+        proxy: &Proxy,
+        url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        expiration: Option<CancellationToken>,
+    ) -> Body {
+        use http_body_util::BodyExt;
+
+        let response = proxy
+            .forward_streaming_to(
+                url,
+                WireProtocol::Http1,
+                breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                None,
+                expiration,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_preserves_breaker_failure_streak() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        breaker.record_failure();
+        breaker.record_failure();
+        for _ in 0..6 {
+            let expiration = CancellationToken::new();
+            let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+            expiration.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("stale_request_timeout"));
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "expiry must not add a failure"
+            );
+        }
+        breaker.record_failure();
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "expiry must not reset prior failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_resolves_half_open_probe() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let expiration = CancellationToken::new();
+        let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+        assert_eq!(breaker.snapshot().state_code, 2);
+        assert!(!breaker.would_allow());
+        expiration.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_request_timeout"));
+        assert_eq!(breaker.snapshot().state_code, 0);
+        assert!(breaker.would_allow());
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_still_trips_breaker() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let mut proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        proxy.stream_idle_timeout = Some(Duration::from_millis(20));
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+        let body = pending_stream_body(&proxy, &url, &breaker, None).await;
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("idle timeout"));
+        assert_eq!(breaker.snapshot().state_code, 1);
+        assert!(!breaker.would_allow());
     }
 
     /// A saturated engine's own queue-full 503s must not trip the router's

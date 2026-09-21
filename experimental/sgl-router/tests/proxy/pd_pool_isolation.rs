@@ -153,7 +153,10 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
             .to_string(),
         ))
         .unwrap();
-    let response = build_router(ctx).oneshot(request).await.unwrap();
+    // Two prior faults make any accidental expiry failure trip the default breaker.
+    decode_worker.breaker.record_failure();
+    decode_worker.breaker.record_failure();
+    let response = build_router(ctx.clone()).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
     tokio::time::timeout(Duration::from_secs(2), body.frame())
@@ -177,6 +180,22 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
         .unwrap_err();
     assert!(error.to_string().contains("stale_request_timeout"));
     assert_eq!(decode_worker.router_inflight_load(), 0);
+    assert_eq!(decode_worker.breaker.snapshot().state_code, 0);
+    let metrics = ctx.metrics.render();
+    assert!(metrics
+        .lines()
+        .any(|line| line == r#"sgl_router_stale_requests_total{outcome="expired"} 1"#));
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="expired"}} 1"#,
+        decode.url,
+    );
+    assert!(metrics.lines().any(|line| line == expected));
+    assert!(!metrics
+        .lines()
+        .any(|line| line.starts_with("sgl_router_stream_outcome_total{")
+            && line.contains(r#"outcome="upstream_error""#)));
+    decode_worker.breaker.record_failure();
+    assert_eq!(decode_worker.breaker.snapshot().state_code, 1);
 }
 
 /// Gap closer #1: PD mode with only decode workers → 503 with
