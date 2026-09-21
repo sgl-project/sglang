@@ -128,6 +128,12 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
         graph.replay()
         torch.npu.synchronize()
         row_lengths = sequence_lengths[ids.long()]
+        # Validate the newly integrated MQA as well as selection of its scores.
+        # Reference work stays outside capture; near ties need not choose the
+        # same IDs as an independently rounded reference score matrix.
+        reference_scores = mqa.torch_qsa_mqa_prefill(q, keys, starts, starts + lengths)
+        torch.testing.assert_close(scores, reference_scores, atol=2e-5, rtol=2e-5)
+        assert torch.equal(torch.isneginf(scores), torch.isneginf(reference_scores))
         _assert_prefix(captured_blocks, positions, row_lengths, 4)
         _assert_topk(scores, starts, lengths, captured_blocks)
         expected = _expected(captured_blocks, positions, row_lengths, 4, block_topk * 4)
@@ -215,6 +221,10 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         graph.replay()
         torch.npu.synchronize()
         blocks, tokens, slots, logits, lengths = outputs
+        paged_cache, page_table, valid_lengths, width = indexer.get_decode_mqa_inputs(0)
+        reference_scores = mqa.torch_qsa_mqa_decode(q, paged_cache, page_table, valid_lengths, width)
+        torch.testing.assert_close(logits, reference_scores, atol=2e-5, rtol=2e-5)
+        assert torch.equal(torch.isneginf(logits), torch.isneginf(reference_scores))
         _assert_topk(logits, torch.zeros_like(lengths), lengths, blocks)
         p, n = indexer.decode_logical_positions, indexer.sequence_lengths
         _assert_prefix(blocks, p, n, 4)

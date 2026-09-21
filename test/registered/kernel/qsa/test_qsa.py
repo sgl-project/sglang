@@ -1157,7 +1157,8 @@ def test_qsa_row_ranges_do_not_cross_sequences():
     assert ends.tolist() == [2, 2, 3, 3]
 
 
-def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
+def test_qsa_weight_free_mqa_logits_matches_explicit_formula(monkeypatch):
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     torch.manual_seed(1)
     q = torch.randn(3, 4, 128, dtype=torch.bfloat16)
     k = torch.randn(5, 1, 128, dtype=torch.bfloat16)
@@ -1177,6 +1178,7 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     # This is a CPU orchestration test, including a non-model token budget.
     monkeypatch.setattr(qsa_kernel_module, "_is_npu", False)
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
     indexer = SimpleNamespace(
@@ -1299,15 +1301,35 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
 
     topk_module.fast_topk = npu_topk
     monkeypatch.setitem(sys.modules, topk_module.__name__, topk_module)
+    mqa_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.mqa")
+    mqa_calls = []
+
+    def npu_packed(*args):
+        mqa_calls.append("packed")
+        return qsa_mqa_module.torch_qsa_mqa_prefill(*args)
+
+    def npu_paged(*args):
+        mqa_calls.append("paged")
+        return qsa_mqa_module.torch_qsa_mqa_decode(*args)
+
+    mqa_module.packed, mqa_module.paged = npu_packed, npu_paged
+    monkeypatch.setitem(sys.modules, mqa_module.__name__, mqa_module)
+    # Module-style imports resolve the parent's attribute when already loaded.
+    package_name = "sgl_kernel_npu.qwen3_8_flash_next"
+    package = sys.modules.get(package_name)
+    if package is None:
+        package = ModuleType(package_name)
+        monkeypatch.setitem(sys.modules, package_name, package)
+    monkeypatch.setattr(package, "mqa", mqa_module, raising=False)
     # The platform guard must short-circuit before inspecting rotary fields.
     assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
     assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(
         SimpleNamespace(req_to_token=torch.zeros(1)), None, torch.ones(1)
     )
-    q = torch.ones(1, 2, 16)
+    q = torch.ones(1, 4, 128, dtype=torch.bfloat16)
     lengths = torch.tensor([4], dtype=torch.int32)
     starts = torch.zeros_like(lengths)
-    logits = qsa_mqa_prefill(q, torch.ones(4, 1, 16), starts, lengths)
+    logits = qsa_mqa_prefill(q, torch.ones(4, 1, 128, dtype=q.dtype), starts, lengths)
     blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
     assert len(topk_calls) == 1
     raw_lengths = lengths * 4
@@ -1316,7 +1338,8 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     # Equal scores do not define a block order; all four complete blocks survive.
     assert sorted(selected[0, :16].tolist()) == list(range(16))
     assert torch.all(selected[0, 16:] == -1)
-    qsa_mqa_decode(q, torch.ones(1, 4, 1, 16), starts[:, None], lengths, 4)
+    qsa_mqa_decode(q, torch.ones(1, 16, 1, 128, dtype=q.dtype), starts[:, None], lengths, 16)
+    assert mqa_calls == ["packed", "paged"]
 
 
 @pytest.mark.parametrize("device,columns,topk", [
@@ -1485,9 +1508,12 @@ def test_qsa_npu_fallback_graph_replay():
         pytest.skip("NPU is not available")
     device = "npu"
     q = torch.ones(2, 2, 16, dtype=torch.bfloat16, device=device)
+    # MQA now follows the model H4/D128/page16 contract; the separate small
+    # attention tensors below still exercise the existing attention fallback.
+    index_q = torch.ones(2, 4, 128, dtype=q.dtype, device=device)
     cache = (
-        torch.arange(8 * 16, device=device, dtype=torch.float32)
-        .reshape(2, 4, 1, 16)
+        torch.arange(32 * 128, device=device, dtype=torch.float32)
+        .reshape(2, 16, 1, 128)
         .to(q.dtype)
         / 128
     )
@@ -1515,7 +1541,7 @@ def test_qsa_npu_fallback_graph_replay():
     )
 
     def forward():
-        logits = qsa_mqa_decode(q, cache, page_table, lengths, 8)
+        logits = qsa_mqa_decode(index_q, cache, page_table, lengths, 32)
         blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
         positions = lengths * 4 - 1
         metadata.sequence_lengths.copy_(lengths * 4)
@@ -1627,7 +1653,9 @@ def test_qsa_triton_block_expansion_matches_torch_reference():
     assert torch.equal(actual, expected)
 
 
-def test_qsa_decode_mqa_reads_paged_cache():
+def test_qsa_decode_mqa_reads_paged_cache(monkeypatch):
+    # Keep the CPU reference's broader page-size behavior covered on NPU hosts.
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     torch.manual_seed(7)
     q = torch.randn(2, 4, 128, dtype=torch.bfloat16)
     cache = torch.randn(8, 64, 1, 128, dtype=torch.bfloat16)

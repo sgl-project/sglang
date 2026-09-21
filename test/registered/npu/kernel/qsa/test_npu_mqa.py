@@ -1,104 +1,151 @@
-"""Paged NPU MQA comparisons with the unchanged Torch scoring reference."""
+"""Model-scoped MQA adapters: canonical package, errors and graph replay.
 
+Legacy generic inputs are now rejection cases, not a reference fallback.
+The kernel package carries independent FP64 and larger-shape regressions.
+"""
 import pytest
 import torch
-from sgl_kernel_npu.qwen3_8_flash_next.mqa import (
-    can_run_mqa_decode,
-    mqa_decode,
-)
+from sgl_kernel_npu.qwen3_8_flash_next import mqa as npu_mqa
 
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
-
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 
 
-def make_inputs(rows, heads, dim, page_size, pages, dtype, strided=False):
+def make_inputs(kind):
     torch.manual_seed(73)
-    q = torch.randn(rows, heads, dim, device="npu", dtype=dtype)
-    cache = torch.randn(23, page_size, 1, dim, device="npu", dtype=dtype)
-    table = torch.randint(0, 23, (rows, pages), device="npu", dtype=torch.int64)
-    lengths = torch.arange(rows, device="npu", dtype=torch.int32)
-    lengths = lengths * (pages * page_size) // max(rows - 1, 1)
-    if rows and pages:
-        table[-1, 0] = -1  # The Torch reference clamps negative page ids to zero.
-    if strided:
-        q = q.transpose(0, 1).contiguous().transpose(0, 1)
-        cache = cache.transpose(0, 1).contiguous().transpose(0, 1)
-        table = table.t().contiguous().t()
-        lengths = torch.stack((lengths, lengths), dim=1)[:, 0]
-    return q, cache, table, lengths
+    q = torch.randn(8, 4, 128, device="npu", dtype=torch.bfloat16)
+    lengths = torch.tensor([0, 1, 15, 16, 17, 31, 128, 144], device="npu", dtype=torch.int32)
+    if kind == "packed":
+        k = torch.randn(160, 1, 128, device="npu", dtype=q.dtype)
+        starts = torch.arange(8, device="npu", dtype=torch.int32)
+        return q, k, starts, starts + lengths
+    k = torch.randn(10, 16, 1, 128, device="npu", dtype=q.dtype)
+    table = torch.arange(9, 0, -1, device="npu", dtype=torch.int32).repeat(8, 1)
+    return q, k, table, lengths, 144
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "rows,heads,dim,page_size,pages,width",
-    [
-        (0, 4, 128, 16, 3, 48),
-        (3, 4, 128, 16, 3, 0),
-        (3, 4, 128, 16, 0, 19),
-        (3, 4, 128, 16, 3, 61),
-        (8, 4, 128, 64, 7, 257),
-        (4, 3, 64, 3, 7, 21),
-        (4, 1, 256, 1, 17, 129),
-        (32, 4, 128, 16, 129, 2065),
-        (128, 8, 128, 16, 9, 65536),
-    ],
-)
-def test_mqa_reference(rows, heads, dim, page_size, pages, width, dtype):
-    args = make_inputs(rows, heads, dim, page_size, pages, dtype)
-    before = [x.clone() for x in args]
-    expected = mqa.torch_qsa_mqa_decode(*args, width)
-    actual = mqa_decode(*args, width)
-    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
-    for original, saved in zip(args, before):
-        torch.testing.assert_close(original, saved)
+def functions(kind):
+    if kind == "packed":
+        return mqa.qsa_mqa_prefill, mqa.torch_qsa_mqa_prefill
+    return mqa.qsa_mqa_decode, mqa.torch_qsa_mqa_decode
 
 
-def test_mqa_strides_scale_and_dispatch(monkeypatch):
-    args = make_inputs(4, 4, 128, 16, 19, torch.bfloat16, strided=True)
-    expected = mqa.torch_qsa_mqa_decode(*args, 333, 3.0)
+@pytest.mark.parametrize("kind", ["packed", "paged"])
+def test_mqa_dispatch_and_graph_updates(kind, monkeypatch):
+    fn, reference = functions(kind)
+    args = make_inputs(kind)
+    calls = []
+    raw = getattr(npu_mqa, kind)
 
-    def unexpected_fallback(*args, **kwargs):
-        raise AssertionError("Supported NPU inputs must execute Triton")
+    def traced(*inputs):
+        calls.append(kind)
+        return raw(*inputs)
 
-    monkeypatch.setattr(mqa, "torch_qsa_mqa_decode", unexpected_fallback)
-    actual = mqa.qsa_mqa_decode(*args, 333, 3.0)
-    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("NPU MQA must not call Torch reference or TileLang")
 
+    monkeypatch.setattr(npu_mqa, kind, traced)
+    for name in ("torch_qsa_mqa_prefill", "torch_qsa_mqa_decode",
+                 "tilelang_qsa_mqa_prefill", "tilelang_qsa_mqa_decode"):
+        monkeypatch.setattr(mqa, name, forbidden)
 
-def test_mqa_padding_and_graph_replay():
-    args = make_inputs(4, 4, 128, 16, 9, torch.bfloat16)
-    q, cache, table, lengths = args
-    width = 161
+    def check(out):
+        expected = reference(*args)
+        assert out.dtype == torch.float32 and out.is_contiguous()
+        assert torch.equal(torch.isneginf(out), torch.isneginf(expected))
+        torch.testing.assert_close(out, expected, atol=2e-5, rtol=2e-5)
+
     for _ in range(2):
-        mqa_decode(*args, width)
+        check(fn(*args))
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        actual = mqa_decode(*args, width)
-    for length in (0, 1, 129, 144):
-        q.normal_()
-        lengths.fill_(length)
-        table.fill_(1)
-        cache[1].normal_()
-        cache[0] = float("nan")
-        table[:, (length + 15) // 16 :] = 0
+        out = fn(*args)
+    call_count = len(calls)
+    originals = [x.clone() for x in args[:4]]
+    addresses = [x.data_ptr() for x in args[:4]]
+    for change in (None, 0, 1, 2, 3, "restore"):
+        for x, saved in zip(args, originals):
+            x.copy_(saved)
+        if change in (0, 1):
+            args[change].neg_()
+        elif change == 2:
+            if kind == "packed":
+                args[2].copy_(args[3])
+            else:
+                args[2].copy_(args[2].roll(1, dims=1))
+        elif change == 3:
+            if kind == "packed":
+                args[3].copy_(args[2])
+            else:
+                args[3].zero_()
+        saved_inputs = [x.clone() for x in args[:4]]
         graph.replay()
         torch.npu.synchronize()
-        expected = mqa.torch_qsa_mqa_decode(*args, width)
-        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        check(out)
+        assert len(calls) == call_count  # Replay does not execute Python routing.
+        assert addresses == [x.data_ptr() for x in args[:4]]
+        for x, saved in zip(args, saved_inputs):
+            torch.testing.assert_close(x, saved, atol=0, rtol=0)
 
 
-def test_mqa_unsupported_layout_keeps_reference():
-    args = make_inputs(3, 4, 128, 16, 3, torch.bfloat16)
-    q, cache, table, lengths = args
-    args = q[..., ::2], cache[..., ::2], table, lengths
-    assert not can_run_mqa_decode(*args, 48)
-    with pytest.raises(ValueError, match="Unsupported NPU"):
-        mqa_decode(*args, 48)
-    expected = mqa.torch_qsa_mqa_decode(*args, 48)
-    torch.testing.assert_close(mqa.qsa_mqa_decode(*args, 48), expected)
+@pytest.mark.parametrize("kind", ["packed", "paged"])
+@pytest.mark.parametrize("case", ["fp16", "fp32", "heads", "dimension", "stride", "int64", "cpu", "shape", "storage"])
+def test_mqa_metadata_errors_do_not_fall_back(kind, case, monkeypatch):
+    fn, _ = functions(kind)
+    args = list(make_inputs(kind))
+    if case in ("fp16", "fp32"):
+        dtype = torch.float16 if case == "fp16" else torch.float32
+        args[0], args[1] = args[0].to(dtype), args[1].to(dtype)
+    elif case == "heads":
+        args[0] = args[0][:, :3].contiguous()
+    elif case == "dimension":
+        args[0], args[1] = args[0][..., :64].contiguous(), args[1][..., :64].contiguous()
+    elif case == "stride":
+        args[0] = args[0].transpose(0, 1).contiguous().transpose(0, 1)
+    elif case == "int64":
+        args[2] = args[2].long()
+    elif case == "cpu":
+        args[2] = args[2].cpu()
+    elif case == "shape":
+        args[3] = args[3][:-1]
+    elif kind == "paged":
+        args[1] = args[1][:, :8].contiguous()
+    else:
+        args[1] = args[1].expand(-1, 2, -1).contiguous()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unsupported metadata must not use the reference")
+
+    monkeypatch.setattr(mqa, "torch_qsa_mqa_prefill", forbidden)
+    monkeypatch.setattr(mqa, "torch_qsa_mqa_decode", forbidden)
+    with pytest.raises(ValueError):
+        fn(*args)
+
+
+@pytest.mark.parametrize("kind", ["packed", "paged"])
+@pytest.mark.parametrize("scale", [0, 3.0, 128**0.5])
+def test_mqa_custom_scale_rejected(kind, scale):
+    with pytest.raises(ValueError, match="Custom MQA scale"):
+        functions(kind)[0](*make_inputs(kind), score_scale=scale)
+
+
+@pytest.mark.parametrize("kind", ["packed", "paged"])
+def test_mqa_kernel_errors_propagate(kind, monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("intentional MQA failure")
+
+    monkeypatch.setattr(npu_mqa, kind, fail)
+    with pytest.raises(RuntimeError, match="intentional MQA failure"):
+        functions(kind)[0](*make_inputs(kind))
+
+
+def test_mqa_independent_output_width_rejected():
+    args = list(make_inputs("paged"))
+    args[-1] -= 1
+    with pytest.raises(ValueError, match="Output width"):
+        mqa.qsa_mqa_decode(*args)
