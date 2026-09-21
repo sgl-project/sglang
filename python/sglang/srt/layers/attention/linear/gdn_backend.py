@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -23,7 +24,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import get_bool_env_var, rank0_log
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -244,6 +247,54 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+
+
+_AITER_GDN_CONV_UNAVAILABLE = False
+
+
+def _aiter_gdn_prefill_conv():
+    """AITER's FlyDSL prefill causal conv, or None if it cannot be used.
+
+    Opt-in: SGLANG_USE_AITER plus SGLANG_AITER_GDN_CONV. It implements the same
+    ``causal_conv1d_fn`` contract (one output, ``conv_states`` updated in place),
+    mapping channels to lanes instead of going through an implicit GEMM.
+    Measured on MI355X at ISL 32768 it is ~1.8x the Triton prefill convolution.
+    """
+    global _AITER_GDN_CONV_UNAVAILABLE
+    if _AITER_GDN_CONV_UNAVAILABLE:
+        return None
+    if not (
+        get_bool_env_var("SGLANG_USE_AITER")
+        and get_bool_env_var("SGLANG_AITER_GDN_CONV")
+    ):
+        _AITER_GDN_CONV_UNAVAILABLE = True
+        return None
+    try:
+        from aiter.ops.flydsl.causal_conv1d_flydsl import (
+            causal_conv1d_prefill_flydsl_fn,
+        )
+    except ImportError:
+        logger.info(
+            "aiter FlyDSL prefill conv unavailable; keeping the Triton convolution"
+        )
+        _AITER_GDN_CONV_UNAVAILABLE = True
+        return None
+    return causal_conv1d_prefill_flydsl_fn
+
+
+def _prefill_causal_conv1d(*args, **kwargs):
+    """Dispatch the GDN prefill convolution, falling back to Triton.
+
+    The AITER kernel raises on shapes or dtypes it does not cover rather than
+    degrading silently, so an unsupported batch simply lands on Triton here.
+    """
+    fn = _aiter_gdn_prefill_conv()
+    if fn is not None:
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as exc:
+            logger.debug("aiter FlyDSL prefill conv declined this batch: %s", exc)
+    return causal_conv1d_fn(*args, **kwargs)
 
 
 class GDNKernelDispatcher:
@@ -913,7 +964,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv = _prefill_causal_conv1d(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
