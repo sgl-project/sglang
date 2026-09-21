@@ -153,12 +153,24 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
 
         self.assertEqual(info.dst_host_kv_ptrs, [])
         msg[16:18] = [b"1", b"0"]
-        msg.extend([b"", pack_int_lists([[0x4000], [1024], [128]], "Q")])
+        msg.extend(
+            [
+                b"",
+                struct.pack("Q", 128),
+                pack_int_lists([[0x4000], [1024], [128]], "Q"),
+            ]
+        )
         info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_kv_item_lens, [128])
         self.assertEqual(info.dst_host_kv_ptrs, [0x4000])
+        self.assertEqual(info.dst_host_kv_data_lens, [1024])
+        self.assertEqual(info.dst_host_kv_item_lens, [128])
         manager = object.__new__(MooncakeKVManager)
         manager.pp_size = manager.dcp_size = manager.attn_cp_size = 1
         manager.attn_tp_size = 1

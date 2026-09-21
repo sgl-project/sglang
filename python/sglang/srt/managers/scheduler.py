@@ -1127,6 +1127,15 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
+        if model_runner.token_to_kv_pool.post_capture_active:
+            kv_cache_builder.prepare_hicache_staging(
+                tp_worker=self.tp_worker,
+                draft_plan=(
+                    self.draft_worker.hicache_draft_plan
+                    if self.draft_worker is not None
+                    else None
+                ),
+            )
         device_module = torch.get_device_module(model_runner.device)
         self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
@@ -2923,6 +2932,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.pp_prefetch_ticketed is True:
+            self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
@@ -3114,6 +3125,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.ps.pp_rank == 0 and getattr(
+            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        ):
+            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3168,7 +3185,7 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                tree_cache.prefetch_from_storage(
+                return tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
@@ -3268,6 +3285,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            self._release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3275,6 +3293,7 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
+                self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)

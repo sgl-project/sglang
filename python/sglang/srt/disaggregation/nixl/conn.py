@@ -1867,6 +1867,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
+            pack_capacity_bytes=rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
 
@@ -3077,7 +3078,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        def bootstrap_thread_guarded():
+            try:
+                bootstrap_thread()
+            except Exception:
+                logger.exception(
+                    "prefill bootstrap_thread died on engine_rank=%s; requests to "
+                    "this rank will time out in KVPoll.Bootstrapping",
+                    self.kv_args.engine_rank,
+                )
+                raise
+
+        threading.Thread(target=bootstrap_thread_guarded).start()
 
 
 class NixlKVSender(CommonKVSender):

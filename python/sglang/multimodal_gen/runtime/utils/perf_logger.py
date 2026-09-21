@@ -58,6 +58,7 @@ class RequestMetrics:
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
+        self.denoising_stages: set[str] = set()
         self.steps: list[float] = []
         self.steps_by_stage: Dict[str, list[float]] = {}
         self.stage_iterations: Dict[str, tuple[int, int]] = {}
@@ -112,6 +113,7 @@ class RequestMetrics:
         return {
             "request_id": self.request_id,
             "stages": self.stages,
+            "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
             "memory_snapshots": {
@@ -461,7 +463,11 @@ class PerformanceLogger:
         Note that this accords to the time spent internally in server, postprocess is not included
         """
         formatted_stages = [
-            {"name": name, "execution_time_ms": duration_ms}
+            {
+                "name": name,
+                "execution_time_ms": duration_ms,
+                "is_denoising": name in metrics.denoising_stages,
+            }
             for name, duration_ms in metrics.stages.items()
         ]
 
