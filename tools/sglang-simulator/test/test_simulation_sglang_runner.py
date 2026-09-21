@@ -87,35 +87,6 @@ def make_sglang_runner(tmp_path: Path):
     return runner
 
 
-def test_meta_host_memory_bypasses_cgroup_budget():
-    from sglang_simulator.simulation.sglang.mem_pool_host import (
-        _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES,
-        _call_with_meta_host_memory,
-    )
-
-    def original_init(self):
-        return available_host_memory_bytes()
-
-    fake_available_host_memory = lambda: 0
-    test_globals = original_init.__globals__
-    original_available_host_memory = test_globals.get("available_host_memory_bytes")
-    test_globals["available_host_memory_bytes"] = fake_available_host_memory
-    try:
-        result = _call_with_meta_host_memory(original_init, object())
-        assert result == _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES
-    finally:
-        if original_available_host_memory is None:
-            del test_globals["available_host_memory_bytes"]
-        else:
-            test_globals["available_host_memory_bytes"] = original_available_host_memory
-
-    assert (
-        test_globals.get("available_host_memory_bytes")
-        is original_available_host_memory
-    )
-    assert fake_available_host_memory() == 0
-
-
 def test_benchmark_sglang_runs_paged_decode(tmp_path):
     runner = make_sglang_runner(tmp_path)
     dataset = make_fixed_dataset(

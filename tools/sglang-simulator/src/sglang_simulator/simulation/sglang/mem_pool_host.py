@@ -104,48 +104,12 @@ def _install_meta_allocators() -> None:
 _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES = 1 << 60
 
 
-class _PsutilProxy:
-    def __init__(self, psutil_module):
-        self._psutil_module = psutil_module
-
-    def virtual_memory(self):
-        snapshot = self._psutil_module.virtual_memory()
-        return snapshot._replace(
-            available=max(
-                snapshot.available,
-                _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES,
-            )
-        )
-
-    def __getattr__(self, name):
-        return getattr(self._psutil_module, name)
-
-
 def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
     """Bypass physical host-payload checks while meta allocation is active."""
-    init_globals = getattr(original_init, "__globals__", None)
-    if init_globals is None:
-        return original_init(self, *args, **kwargs)
+    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 
-    psutil_module = init_globals.get("psutil")
-    available_host_memory = init_globals.get("available_host_memory_bytes")
-    if psutil_module is None and available_host_memory is None:
+    with host_memory_budget_scope(_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES):
         return original_init(self, *args, **kwargs)
-
-    proxy = _PsutilProxy(psutil_module) if psutil_module is not None else None
-    if proxy is not None:
-        init_globals["psutil"] = proxy
-    if available_host_memory is not None:
-        init_globals["available_host_memory_bytes"] = lambda: (
-            _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES
-        )
-    try:
-        return original_init(self, *args, **kwargs)
-    finally:
-        if init_globals.get("psutil") is proxy:
-            init_globals["psutil"] = psutil_module
-        if available_host_memory is not None:
-            init_globals["available_host_memory_bytes"] = available_host_memory
 
 
 @lru_cache(maxsize=256)
