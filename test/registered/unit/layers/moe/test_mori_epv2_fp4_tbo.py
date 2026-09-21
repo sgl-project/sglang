@@ -103,6 +103,8 @@ def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
     if dynamic:
         assert op.prepare_recv_cap.call_args_list == [call(32), call(64)]
     dispatcher.op = op
+    dispatcher._trim_recv = False
+    dispatcher._direct_output = False
     dispatcher._select_recv_cap.return_value = 32
     dispatcher._comm_stream = Mock() if comm_stream else None
     dispatcher._dispatch_intermediate_state = (None,) * 5 + (Mock(),)
