@@ -157,7 +157,9 @@ async def async_request_sglang_generate(
                             elif cur > last_output_len:
                                 num_new_tokens = cur - last_output_len
                                 chunk_gap = timestamp - most_recent_timestamp
-                                output.itl.extend([chunk_gap / num_new_tokens] * num_new_tokens)
+                                output.itl.extend(
+                                    [chunk_gap / num_new_tokens] * num_new_tokens
+                                )
                                 most_recent_timestamp = timestamp
                             if cur > last_output_len:
                                 last_output_len = cur
@@ -170,7 +172,10 @@ async def async_request_sglang_generate(
                         output.success = True
                     else:
                         output.success = False
-                        output.error = output.error or "stream closed with 0 generated tokens (HTTP 200)"
+                        output.error = (
+                            output.error
+                            or "stream closed with 0 generated tokens (HTTP 200)"
+                        )
                     output.latency = latency
                 else:
                     output.error = (
