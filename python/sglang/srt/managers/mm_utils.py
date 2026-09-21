@@ -728,9 +728,11 @@ def general_mm_embed_routine(
                 for mm_input_obj in mm_inputs_list:
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
                         for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
+                            if (
+                                isinstance(mm_item.feature, torch.Tensor)
+                                and mm_item.feature.is_cuda
+                            ):
+                                mm_item.offload_feature()
                             if get_disagg().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None

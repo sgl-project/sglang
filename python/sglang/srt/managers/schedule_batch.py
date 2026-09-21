@@ -458,6 +458,30 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def is_precomputed_embedding(self):
         return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
+    def wait_for_feature(self) -> None:
+        ready = self.model_specific_data.get(CUDA_IPC_FEATURE_COPY_EVENT_KEY)
+        if ready is None:
+            return
+        if self.feature.is_cuda:
+            torch.cuda.current_stream(self.feature.device).wait_event(ready)
+        else:
+            # A stream wait cannot protect CPU dtype conversion or packing.
+            ready.synchronize()
+        self.model_specific_data.pop(CUDA_IPC_FEATURE_COPY_EVENT_KEY)
+
+    def offload_feature(self) -> None:
+        feature = self.feature
+        if not isinstance(feature, torch.Tensor) or feature.is_cpu:
+            return
+        self.wait_for_feature()
+        self.feature = feature.to("cpu", non_blocking=True)
+        if feature.is_cuda:
+            stream = torch.cuda.current_stream(feature.device)
+            feature.record_stream(stream)
+            self.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = (
+                stream.record_event()
+            )
+
     @staticmethod
     def from_dict(obj: dict):
         kwargs = dict(obj)
@@ -785,8 +809,7 @@ class MultimodalInputs:
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:
-                if item.feature is not None:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
+                item.offload_feature()
 
         mm_inputs = MultimodalInputs(
             mm_items=mm_items,
