@@ -28,6 +28,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
     if cfg.disaggregation_transfer_backend == "mooncake_tcp":
         os.environ.setdefault("MC_FORCE_TCP", "1")
+        # Without the connection pool, TcpTransport opens a fresh TCP
+        # connection per transfer; under concurrent load the client side
+        # exhausts ephemeral ports (EADDRNOTAVAIL, default range is only
+        # ~28K ports with TIME_WAIT held for 60s) and prefill/decode each
+        # conclude the peer is dead. Pooling keeps a bounded set of live
+        # connections instead.
+        os.environ.setdefault("MC_TCP_ENABLE_CONNECTION_POOL", "true")
         declare_resolution(
             server_args,
             "handle_pd_disaggregation",
@@ -40,7 +47,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
         logger.info(
             "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
-            "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
+            "with MC_FORCE_TCP=1 (TCP transport, no RDMA), "
+            "MC_TCP_ENABLE_CONNECTION_POOL=true"
         )
 
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
