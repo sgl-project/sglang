@@ -64,6 +64,46 @@ def _ci_layer_fingerprint(module, inputs, output, *, name, weights_logged):
     for index, value in enumerate(inputs):
         _ci_tensor_fingerprint(f"layer0.{name}.input{index}", value)
     _ci_tensor_fingerprint(f"layer0.{name}.output", output)
+    if (
+        name == "self_attn.q_proj"
+        and inputs[0].shape[1] == 30
+        and "q_proj.gemm" not in weights_logged
+    ):
+        weights_logged.add("q_proj.gemm")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profile:
+            replay = torch.nn.functional.linear(inputs[0], module.weight)
+            torch.cuda.synchronize()
+        _ci_tensor_fingerprint("layer0.q_proj.gemm_replay", replay)
+        print(
+            "QWEN21_GEMM "
+            + json.dumps(
+                dict(
+                    rank=get_world_rank(),
+                    kernels=sorted(
+                        {
+                            event.name
+                            for event in profile.events()
+                            if event.device_type == torch.autograd.DeviceType.CUDA
+                        }
+                    ),
+                    workspace={
+                        key: os.environ.get(key)
+                        for key in (
+                            "CUBLAS_WORKSPACE_CONFIG",
+                            "CUBLASLT_WORKSPACE_SIZE",
+                            "TORCH_BLAS_PREFER_CUBLASLT",
+                        )
+                    },
+                    cublas=version("nvidia-cublas"),
+                )
+            ),
+            flush=True,
+        )
 
 
 def collapse_image_slots(hidden, input_ids, image_token_id):
