@@ -53,14 +53,14 @@ const config = {
         },
         {
           id: "offload", label: "CPU offload",
-          flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
+          flags: (s) => ["rtx4090", "rtx5090"].includes(s.hw) && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === platformAttention(s) && s.precision === "native" && s.execution === "eager"
             && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
             ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
             : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
-          description: "RTX 4090 native single-output FlashAttention keeps the DiT and VAE resident and streams encoder layers. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder. Requires sufficient host RAM.",
+          description: "RTX 4090 and RTX 5090 keep the DiT and VAE resident on their platform attention kernel and stream encoder layers, which is faster than streaming the DiT: measured 1024px / 40 steps on one RTX 5090, 14.08s resident-DiT against 19.95s layerwise-DiT, on 17.0GB against 19.3GB steady. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder when it falls back to them. Requires sufficient host RAM.",
         },
         {
           id: "all_offload", label: "All components layerwise",
