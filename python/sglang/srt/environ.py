@@ -972,10 +972,16 @@ class Envs:
     # against a same-session control, with prefill logprobs bitwise identical at
     # all 44,062 paired positions. Set 0 to restore the unsharded attention.
     SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
-    # DSA-CP: also shard batches that carry more than one request. Shards each
-    # request's tokens separately and drops the operator's causal crop, which
-    # the top-k already enforces -- see dsa_cp_layout.plan_dsa_cp_shard_per_req.
-    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(False)
+    # DSA-CP: also shard batches that carry more than one request, by passing
+    # full per-request KV lengths and dropping the operator's causal crop. Only
+    # where every request's prefix reaches index_topk -- below that the crop is
+    # load-bearing and the batch keeps the unsharded path. See
+    # dsa_cp.dsa_cp_multi_request_enabled.
+    # ON: measured three ~4k tails on a 958k cached prefix (GLM-5.2, A3, TP16
+    # DCP16) in one forward at 9.21 -> ~6.5 s, with prefill logprobs bitwise
+    # identical to the pre-lift path at all 12,311 tail positions, for the
+    # batch and for the same tails one at a time. Set 0 for the pre-lift path.
+    SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
     # DCP extend on NPU: let the sparse operator read the gathered prefix in the
     # rank-major order the all-gather already produced, remapping the top-k
     # instead of permuting ~1 GiB of KV back into position order.

@@ -1454,10 +1454,14 @@ class AscendAttnBackend(AttentionBackend):
                     # The lift. Do NOT shorten the per-request KV lengths -- keep
                     # dcp_kv_indptr[1:], the same full lengths the unsharded path
                     # passes, so no request's start moves -- and drop the causal
-                    # crop that the shortening existed to satisfy. The top-k is
-                    # already causal, which is what the DCP decode branch above
-                    # has relied on since the port began. A request this rank's
-                    # slice does not reach simply gets query length 0.
+                    # crop that the shortening existed to satisfy. Dropping it is
+                    # safe only because dcp_crop_free_extend has checked that
+                    # every request's prefix reaches index_topk, so every key the
+                    # top-k names is a past one. It is NOT safe because the top-k
+                    # is causal in general: below that bound it is not, and
+                    # stage A measured the cost. A request this rank's slice does
+                    # not reach simply gets query length 0; p13 measured that the
+                    # operator handles those entries exactly.
                     sparse_mode = 0
                 else:
                     if dsa_cp_plan is not None:

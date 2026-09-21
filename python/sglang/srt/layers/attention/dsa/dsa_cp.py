@@ -139,8 +139,15 @@ def dsa_cp_multi_request_enabled() -> bool:
     carries several. A single-request run is the FIRST test of this flag, not an
     unaffected control.
 
-    Worth ~31-40 s of AISBench phase 2 (110.2 s), where 84.7% of prefill tokens
-    currently decline. Not composable with the packed read, which refuses
+    **Measured, 2026-09-21** (``glm5.2_testing/p13_concurrent_lift.sh``): three
+    ~4k tails on a 958k cached prefix, sent as one batch, came out bitwise
+    identical to the pre-lift path at all 12,311 tail positions -- on a server
+    with the flag on against one with it off, whose single-request control also
+    matched bitwise. That covers the query-length-0 entries most ranks get here.
+    The batch took ~6.5 s against 9.21 s without the lift.
+
+    Estimated, not measured: ~31-40 s of AISBench phase 2 (110.2 s), where
+    84.7% of prefill tokens decline without this. Not composable with the packed read, which refuses
     multi-request batches for a different reason -- the all-gather is rank-major
     over the whole send, so no request is contiguous in it -- so those batches
     take the permuting gather and this takes the query sharding.
