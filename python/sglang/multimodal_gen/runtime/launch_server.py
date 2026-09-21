@@ -14,7 +14,17 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
-from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
+    SchedulerProcessSpec,
+    ServerArgsPayload,
+    bootstrap_http_server_process,
+    bootstrap_scheduler_process,
+)
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    configure_metrics,
+    start_role_metrics_server,
+)
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -24,7 +34,6 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.process import (
-    kill_itself_when_parent_died,
     kill_process_tree,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
@@ -93,11 +102,6 @@ def _kill_alive_processes(processes, timeout_s: float) -> None:
     _join_processes_with_deadline(alive, timeout_s)
 
 
-def _run_http_server_process(server_args: ServerArgs) -> None:
-    kill_itself_when_parent_died()
-    launch_http_server_only(server_args)
-
-
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
     if server_args.disagg_role != RoleType.MONOLITHIC:
         return
@@ -134,18 +138,17 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     Args:
         launch_http_server: False for offline local mode
     """
+    apply_plugin_hooks()
     configure_logger(server_args)
 
-    worker_ctx = mp
     if server_args.weight_cache_mode != "off":
         from sglang.multimodal_gen.runtime.weight_cache.preflight import preflight
 
         preflight(server_args)
-        # Existing package imports may initialize CUDA; never fork that context
-        # into a cached worker. Legacy non-cache launch behavior is unchanged.
-        worker_ctx = mp.get_context("spawn")
 
     # Start a new server with multiple worker processes
+    if server_args.enable_metrics:
+        configure_metrics()
     logger.info("Starting server...")
 
     # num_gpus is the total world size across every node; each node runs
@@ -158,6 +161,11 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
     processes = []
+
+    # A local spawn context makes the worker boundary deterministic even when
+    # an embedding application selected a different global start method.
+    worker_context = mp.get_context("spawn")
+    server_args_payload = ServerArgsPayload.capture(server_args)
 
     # Launch this node's local worker processes.
     scheduler_pipe_readers = []
@@ -172,11 +180,17 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
 
             device_index = local_device_index(server_args, i)
-        reader, writer = worker_ctx.Pipe(duplex=False)
+        reader, writer = worker_context.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        process = worker_ctx.Process(
-            target=run_scheduler_process,
-            args=(device_index, rank, server_args, writer),
+        spec = SchedulerProcessSpec(
+            local_rank=device_index,
+            rank=rank,
+            server_args=server_args_payload,
+            pipe_writer=writer,
+        )
+        process = worker_context.Process(
+            target=bootstrap_scheduler_process,
+            args=(spec,),
             name=f"sglang-diffusionWorker-{rank}",
             daemon=True,
         )
@@ -209,6 +223,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader.close()
 
     logger.debug("All workers are ready")
+    logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
 
     if node_rank != 0:
         # The TokenizerManager / HTTP surface lives on the node that owns
@@ -236,9 +251,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
-            http_server_process = mp.Process(
-                target=_run_http_server_process,
-                args=(server_args,),
+            http_server_process = worker_context.Process(
+                target=bootstrap_http_server_process,
+                args=(server_args_payload,),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
@@ -284,6 +299,8 @@ def launch_pool_disagg_server(
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)
+    if server_args.enable_metrics:
+        configure_metrics()
     num_denoisers = len(denoiser_gpus)
     num_decoders = len(decoder_gpus)
     logger.info(
@@ -378,6 +395,7 @@ def launch_pool_disagg_server(
             base_dict.update(role_overrides)
             base_dict.pop("pipeline_config", None)
             role_args = ServerArgs.from_kwargs(**base_dict)
+            role_args_payload = ServerArgsPayload.capture(role_args)
 
             pool_ctx = mp.get_context("spawn")
             inst_readers = []
@@ -387,9 +405,18 @@ def launch_pool_disagg_server(
                 reader, writer = pool_ctx.Pipe(duplex=False)
                 gpu_id = gpu_ids[rank_idx]
 
+                # Physical GPU index as local_rank: torch.cuda.set_device() must
+                # not depend on CUDA_VISIBLE_DEVICES remapping, which can be
+                # stale if CUDA was already initialized in the parent.
+                spec = SchedulerProcessSpec(
+                    local_rank=gpu_id,
+                    rank=rank_idx,
+                    server_args=role_args_payload,
+                    pipe_writer=writer,
+                )
                 process = pool_ctx.Process(
-                    target=_run_disagg_role_process,
-                    args=(gpu_id, rank_idx, role_args, writer),
+                    target=bootstrap_scheduler_process,
+                    args=(spec,),
                     name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
                     daemon=True,
                 )
@@ -439,6 +466,7 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        server_args=server_args,
     )
     diffusion_server.start()
 
@@ -459,27 +487,6 @@ def launch_pool_disagg_server(
             )
 
     return all_processes
-
-
-def _run_disagg_role_process(
-    gpu_id: int,
-    rank: int,
-    server_args: ServerArgs,
-    pipe_writer: mp.connection.Connection,
-):
-    """Entry point for a disagg role process.
-
-    Uses the physical GPU index (gpu_id) as local_rank so that
-    torch.cuda.set_device(local_rank) selects the correct GPU.
-    This avoids relying on CUDA_VISIBLE_DEVICES remapping, which
-    may not work if CUDA was pre-initialized in the parent process.
-    """
-    run_scheduler_process(
-        local_rank=gpu_id,
-        rank=rank,
-        server_args=server_args,
-        pipe_writer=pipe_writer,
-    )
 
 
 def launch_http_server_only(server_args):
@@ -520,6 +527,9 @@ def launch_disagg_server(server_args: ServerArgs):
     """
     configure_logger(server_args)
     set_global_server_args(server_args)
+
+    if server_args.enable_metrics:
+        configure_metrics()
 
     glm_distributed_mode_enabled = (
         type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
@@ -613,6 +623,8 @@ def launch_disagg_role(server_args: ServerArgs):
     configure_logger(server_args)
 
     role_type = server_args.disagg_role
+    if server_args.enable_metrics:
+        configure_metrics()
     if server_args.disagg_server_addr is None:
         raise ValueError(
             f"--disagg-server-addr is required for --disagg-role {role_type.value}"
@@ -704,6 +716,7 @@ def launch_disagg_role(server_args: ServerArgs):
     base_dict.update(role_overrides)
     base_dict.pop("pipeline_config", None)
     role_args = ServerArgs.from_kwargs(**base_dict)
+    role_args_payload = ServerArgsPayload.capture(role_args)
 
     # Spawn GPU worker processes
     # NOTE: All ranks must be spawned before waiting for ready signals,
@@ -718,9 +731,18 @@ def launch_disagg_role(server_args: ServerArgs):
         reader, writer = pool_ctx.Pipe(duplex=False)
         gpu_id = base_gpu_id + rank_idx
 
+        # Physical GPU index as local_rank: torch.cuda.set_device() must not
+        # depend on CUDA_VISIBLE_DEVICES remapping, which can be stale if CUDA
+        # was already initialized in the parent.
+        spec = SchedulerProcessSpec(
+            local_rank=gpu_id,
+            rank=rank_idx,
+            server_args=role_args_payload,
+            pipe_writer=writer,
+        )
         process = pool_ctx.Process(
-            target=_run_disagg_role_process,
-            args=(gpu_id, rank_idx, role_args, writer),
+            target=bootstrap_scheduler_process,
+            args=(spec,),
             name=f"sglang-{role_type.value}-r{rank_idx}",
             daemon=True,
         )
@@ -754,6 +776,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
     # Block until interrupted
     try:
+        if server_args.enable_metrics:
+            start_role_metrics_server(server_args)
         for p in processes:
             p.join()
     except KeyboardInterrupt:
@@ -764,6 +788,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
+    apply_plugin_hooks()
+
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 
@@ -779,6 +805,7 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    apply_plugin_hooks()
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

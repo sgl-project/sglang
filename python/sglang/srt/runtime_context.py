@@ -68,10 +68,23 @@ logger = logging.getLogger(__name__)
 
 # Imported lazily so this module has no import-time dependencies: any module can
 # import get_parallel at module level without risking an import cycle.
-def _ps():
-    from sglang.srt.distributed import parallel_state
+_PARALLEL_STATE = None
 
-    return parallel_state
+
+def _ps():
+    """The module every rank and group read ends at.
+
+    Cached because the import statement dominated the read: a group read is
+    two attribute lookups plus this, and it runs per row-linear on an eager
+    forward. The getter is still resolved by name on the returned module, so
+    a test that patches `parallel_state.get_tp_group` is still seen.
+    """
+    global _PARALLEL_STATE
+    if _PARALLEL_STATE is None:
+        from sglang.srt.distributed import parallel_state
+
+        _PARALLEL_STATE = parallel_state
+    return _PARALLEL_STATE
 
 
 def _dp():
@@ -97,42 +110,38 @@ def _parallel_config_leaves() -> frozenset:
     )
 
 
-_PARALLEL_FIELDS = frozenset(
-    {
-        "world_size",
-        "world_rank",
-        "tp_size",
-        "tp_rank",
-        "pp_size",
-        "pp_rank",
-        "moe_ep_size",
-        "moe_ep_rank",
-        "moe_dp_size",
-        "moe_dp_rank",
-        "moe_tp_size",
-        "moe_tp_rank",
-        "attn_tp_size",
-        "attn_tp_rank",
-        "attn_cp_size",
-        "attn_cp_rank",
-        "dcp_enabled",
-        "dcp_size",
-        "dcp_rank",
-        "attn_dcp_size",
-        "attn_dcp_rank",
-        "attn_dp_size",
-        "attn_dp_rank",
-        "world_group",
-        "tp_group",
-        "pp_group",
-        "moe_ep_group",
-        "moe_dp_group",
-        "moe_tp_group",
-        "attn_tp_group",
-        "attn_cp_group",
-        "dcp_group",
+# Ranks and group handles: the names no configuration carries. This table is
+# their declaration, the way `arg_groups/fields/parallel.py` is the leaves' and
+# `Derived` is the widths'. A group handle names the getter that owns it,
+# because the module that builds the groups is where it lives; a rank is a
+# position in one of those groups, so it is read off the handle. `None` marks a
+# name only a stamp can answer: no coordinator knows this process's
+# attention-DP rank.
+_MISSING_READ = object()
+
+
+@functools.lru_cache(maxsize=1)
+def _parallel_fields() -> frozenset:
+    """Every name `ParallelContext` answers for, read from the declarations.
+
+    Three sources, because the namespace has three kinds of name and each one
+    declares itself somewhere already:
+
+    * configured leaves -- the `parallel` namespace of the record;
+    * derived widths -- the `Derived` declarations beside those leaves;
+    * ranks and group handles -- declared beside the leaves with no `fn`,
+      because nothing computes them; they are written at runtime.
+
+    The set is the union of those three, so `override()` cannot refuse a name
+    the class answers for.
+    """
+    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.fields.parallel import Parallel
+
+    derived = {
+        name for name, decl in vars(Parallel).items() if isinstance(decl, Derived)
     }
-)
+    return frozenset(_parallel_config_leaves() | derived)
 
 
 def derive_attention_widths(
@@ -146,6 +155,81 @@ def derive_attention_widths(
     """
     attn_dp_size = dp_size if enable_dp_attention else 1
     return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+
+
+def derive_attention_ranks(
+    *, tp_rank: int, attn_tp_size: int, attn_cp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_tp_rank, attn_dp_rank) for a process at `tp_rank`.
+
+    The rank layout is (dp, cp, tp) with tp the fastest-changing dimension::
+
+        tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size
+                  + attn_tp_rank
+
+    Split out beside `derive_attention_widths` because two places need it from
+    different inputs: `publish` has this process's `tp_rank` from the spawn and
+    the widths from the configuration, while `initialize_dp_attention` has them
+    from the groups it just built. They must not carry separate copies of the
+    arithmetic -- the point of computing it at publish is that the two agree.
+    """
+    attn_tp_rank = tp_rank % attn_tp_size
+    if not enable_dp_attention:
+        return attn_tp_rank, 0
+    return attn_tp_rank, tp_rank // (attn_tp_size * attn_cp_size)
+
+
+def spawn_world_rank(server_args, *, tp_rank: int, pp_rank: int) -> int:
+    """This process's place in WORLD, from the ranks its entry was given.
+
+    The inverse of `derive_spawn_ranks`, for the entries that have the pieces
+    but not the whole: the same expression `bootstrap` hands to
+    `init_distributed_environment` when it builds the group.
+
+    Reads a resolving view because it runs before `publish`.
+    """
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    cfg = resolving_view(server_args)
+    return cfg.ep_join_rank_offset + cfg.tp_size * pp_rank + tp_rank
+
+
+def derive_spawn_ranks(
+    *,
+    world_rank: int,
+    tp_size: int,
+    ep_join_rank_offset: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    moe_dp_size: int,
+    moe_ep_size: int,
+) -> dict:
+    """Every rank a process group would answer, from its place in WORLD.
+
+    WORLD is laid out `rank = ep_join_rank_offset + tp_size * pp_rank +
+    tp_rank`: `initialize_model_parallel` builds tensor-parallel groups as
+    contiguous blocks of `tp_size` and pipeline groups strided by it, so the
+    map is a bijection and this is its inverse. The attention and MoE ranks
+    are then positions inside the tensor-parallel block, which is what the
+    launcher computes when it decides what to spawn.
+
+    Pure arithmetic over the published widths: no group is consulted, which is
+    the point -- this runs at publish, before any of them exist.
+    """
+    local = world_rank - ep_join_rank_offset
+    tp_rank = local % tp_size
+    return {
+        "tp_rank": tp_rank,
+        "pp_rank": local // tp_size,
+        "attn_cp_rank": (tp_rank // attn_tp_size) % attn_cp_size,
+        "moe_dp_rank": tp_rank // (tp_size // moe_dp_size),
+        "moe_ep_rank": (
+            tp_rank
+            % (tp_size // moe_dp_size)
+            // (tp_size // moe_dp_size // moe_ep_size)
+        ),
+        "moe_tp_rank": tp_rank % (tp_size // moe_dp_size // moe_ep_size),
+    }
 
 
 def derive_parallel_widths(
@@ -164,9 +248,15 @@ def derive_parallel_widths(
     the arithmetic lives here rather than being read back off the group
     coordinators.
 
-    `world_size` is not among them: it is not a quotient, and `get_world_size()`
-    answers with the live WORLD group, which stays right through an elastic
-    scale-up that a value fixed at group build would not survive.
+    The world widths are not among them: neither is a quotient, and they are
+    not one number. `launch_world_size` is what the WORLD group was built at
+    and is frozen there -- `GroupCoordinator.world_size` is `len(ranks)`, so it
+    does not move when mooncake admits ranks into an expandable WORLD;
+    `max_world_size` is what that group has room for. How much of that room is
+    serving right now is elastic-EP state and is asked of its owner. Deriving
+    either from the leaves would be wrong in a further way: on a scale joiner it
+    would answer with the joining cohort's own `tp * pp`, while that process's
+    WORLD spans `ep_join_rank_offset + tp * pp`.
     """
     return {
         "attn_dp_size": attn_dp_size,
@@ -212,6 +302,24 @@ def parallel_widths_of(cfg: Any) -> dict:
     )
 
 
+def launch_world_size_of(cfg: Any):
+    """`launch_world_size`, computed at publish.
+
+    The width `bootstrap` builds the WORLD at: one rank per pipeline stage of
+    each tensor-parallel group, above the offset a scale joiner comes in at --
+    zero for everyone else, which is the convention `spawn_world_rank` uses for
+    the same arithmetic. A scale-up does not move it, which is the point of the
+    name.
+    """
+    return cfg.ep_join_rank_offset + cfg.tp_size * cfg.pp_size
+
+
+def max_world_size_of(cfg: Any):
+    """`max_world_size`, computed at publish. The ceiling the group is
+    pre-allocated to: `--max-ep-size` when set, otherwise the launch width."""
+    return cfg.max_ep_size or launch_world_size_of(cfg)
+
+
 def attn_tp_size_of(cfg: Any):
     """`attn_tp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_tp_size"]
@@ -242,35 +350,182 @@ def dcp_enabled_of(cfg: Any):
     return parallel_widths_of(cfg)["dcp_enabled"]
 
 
+class SpawnRanks(msgspec.Struct, frozen=True):
+    """Where the launcher put this process, in the two numbers only it knows.
+
+    `world_rank` is this process's place in the WORLD group, which fixes every
+    other rank: the groups are laid out from the published widths, so
+    `tp_rank`, `pp_rank` and the attention / MoE ranks are functions of it (see
+    `derive_spawn_ranks`). Passing them separately would be passing the same
+    fact five more times, with five more ways for an entry to contradict
+    itself.
+
+    `dp_rank` is the exception, because data-parallel replicas are separate
+    WORLD groups: with `--dp-size 2` each replica holds ranks `0 .. n-1`, so
+    the rank cannot say which replica this is. `None` means "no controller",
+    which is an answer rather than an absence, and it is recorded as one.
+
+    `gpu_id` is the device the parent picked for this process. It is not a
+    position in any group -- reindexing narrows the visible devices before the
+    spawn, and Ray allocates from its own pool -- but it is the same kind of
+    fact: something only the entry that spawned the process can state. `None`
+    for a process that runs on no device.
+    """
+
+    world_rank: int
+    dp_rank: Optional[int] = None
+    gpu_id: Optional[int] = None
+
+
+_RANK_AND_WIDTH = (
+    ("tp_rank", "tp_size"),
+    ("pp_rank", "pp_size"),
+    ("attn_tp_rank", "attn_tp_size"),
+    ("attn_dp_rank", "attn_dp_size"),
+    ("attn_cp_rank", "attn_cp_size"),
+    ("moe_ep_rank", "moe_ep_size"),
+)
+
+# `moe_dp` is absent because `initialize_model_parallel` aliases the MoE-DP
+# group to the attention-CP group when the latter is wider: there the group and
+# the name are two facts, which is the same reason `moe_dp_rank` is left off the
+# record at publish.
+_WIDTH_AND_GROUP = (
+    ("tp_size", "tp_group"),
+    ("pp_size", "pp_group"),
+    ("attn_tp_size", "attn_tp_group"),
+    ("attn_cp_size", "attn_cp_group"),
+    ("moe_ep_size", "moe_ep_group"),
+)
+
+_UNREADABLE = object()
+
+
+def _validate_parallel(parallel, source: str) -> None:
+    """Fail on a topology that cannot describe a real process layout.
+
+    Every identity holds unconditionally: a width and a rank are both
+    plausible small integers whichever way they are wrong, so an inconsistent
+    set is not caught by anything downstream -- it surfaces as a hang or a
+    wrong answer in a collective, far from the write. Stating one leaf without
+    the quotients that follow from it leaves the namespace describing no real
+    layout, and the caller that did so is the one that has to say what it meant.
+
+    Names that cannot be read are skipped rather than treated as zero: a
+    process that has published nothing can still stamp a rank, and a group that
+    has not been built answers nothing at all.
+    """
+
+    def read(name):
+        """A width or a rank, or `_UNREADABLE` for anything these identities
+        cannot be stated about -- an absent name, `None`, or a stand-in a test
+        put in a group's place. Booleans are integers in Python and are not
+        widths, so they are out too."""
+        try:
+            value = getattr(parallel, name)
+        except Exception:
+            return _UNREADABLE
+        if isinstance(value, bool) or not isinstance(value, int):
+            return _UNREADABLE
+        return value
+
+    problems = []
+
+    for rank_name, size_name in _RANK_AND_WIDTH:
+        rank, size = read(rank_name), read(size_name)
+        if _UNREADABLE in (rank, size):
+            continue
+        if not 0 <= rank < size:
+            problems.append(
+                f"0 <= {rank_name} < {size_name}\n  {rank} is not a rank of {size}"
+            )
+
+    terms = ("tp_size", "attn_tp_size", "attn_dp_size", "attn_cp_size")
+    tp_size, a_tp, a_dp, a_cp = (read(n) for n in terms)
+    if _UNREADABLE not in (tp_size, a_tp, a_dp, a_cp):
+        if tp_size != a_tp * a_dp * a_cp:
+            problems.append(
+                "tp_size == attn_tp_size * attn_dp_size * attn_cp_size\n"
+                f"  {tp_size} != {a_tp} * {a_dp} * {a_cp} (= {a_tp * a_dp * a_cp})"
+            )
+
+    moe_terms = ("tp_size", "moe_ep_size", "moe_dp_size", "moe_tp_size")
+    tp_size, m_ep, m_dp, m_tp = (read(n) for n in moe_terms)
+    if _UNREADABLE not in (tp_size, m_ep, m_dp, m_tp):
+        if tp_size != m_ep * m_dp * m_tp:
+            problems.append(
+                "tp_size == moe_ep_size * moe_dp_size * moe_tp_size\n"
+                f"  {tp_size} != {m_ep} * {m_dp} * {m_tp} (= {m_ep * m_dp * m_tp})"
+            )
+
+    layout_terms = (
+        "tp_rank",
+        "attn_dp_rank",
+        "attn_cp_rank",
+        "attn_tp_rank",
+        "attn_cp_size",
+        "attn_tp_size",
+    )
+    tp_rank, r_dp, r_cp, r_tp, w_cp, w_tp = (read(n) for n in layout_terms)
+    if _UNREADABLE not in (tp_rank, r_dp, r_cp, r_tp, w_cp, w_tp):
+        laid_out = (r_dp * w_cp + r_cp) * w_tp + r_tp
+        if tp_rank != laid_out:
+            problems.append(
+                "tp_rank == (attn_dp_rank * attn_cp_size + attn_cp_rank)"
+                " * attn_tp_size + attn_tp_rank\n"
+                f"  {tp_rank} != ({r_dp} * {w_cp} + {r_cp})"
+                f" * {w_tp} + {r_tp} (= {laid_out})"
+            )
+
+    for size_name, group_name in _WIDTH_AND_GROUP:
+        size = read(size_name)
+        if size is _UNREADABLE:
+            continue
+        try:
+            group = getattr(parallel, group_name)
+        except Exception:
+            continue
+        built = getattr(group, "world_size", _UNREADABLE)
+        if isinstance(built, int) and not isinstance(built, bool) and built != size:
+            problems.append(
+                f"{group_name}.world_size == {size_name}\n"
+                f"  built {built}, configured {size}"
+            )
+
+    if problems:
+        raise ValueError(
+            f"parallel topology is inconsistent (set by {source}):\n"
+            + "\n".join(problems)
+        )
+
+
 class ParallelContext:
     """Parallel-topology namespace: one spelling per name.
 
-    Ranks and group handles are read-through ``@property`` over the canonical
-    getters, so they answer with the **live** process groups and raise before
-    distributed init. Every other name — ``tp_size`` and its size siblings
-    included, alongside config-only leaves such as ``nccl_port`` — is answered
-    from the published ``parallel`` bag, in any process at any point after
-    publish.
+    Every name is answered by a lookup, never by asking a process group. A
+    configured leaf and a width derived from one come off the published
+    ``parallel`` bag; a rank is written by ``publish`` from the spawn bundle,
+    and a group handle by ``initialize_model_parallel`` as it builds them. A
+    read before the write that answers it says which write is missing rather
+    than deriving a number from whatever is installed -- the two answer
+    different questions, and a plausible wrong rank surfaces as a hang in a
+    collective far from here.
 
-    A size is read from the configuration because the groups are built at
-    exactly the configured widths. Two things do not follow that rule and are
-    asked of the group itself: ``initialize_model_parallel`` aliases ``_MOE_DP``
-    to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, so a reader that means
-    the MoE communicator's width calls ``get_moe_cp_size()``; and
-    ``patch_tensor_parallel_group`` runs a scope under a different TP group,
-    which it declares by overriding ``tp_size``, ``tp_rank`` and ``tp_group``
-    for its duration. Elastic EP is a third case, and it needs no rule here: it
-    scales ``ep_size`` / ``dp_size`` on the published bag while the group
-    coordinators keep the width they were constructed with, so the two are
-    different names rather than two answers to one name.
+    That makes a scope a matter of stating names: ``patch_tensor_parallel_group``
+    runs a draft worker under a different TP group by overriding the members it
+    changes, and PD multiplexing points ``tp_group`` at the prefill
+    communicator the same way. Elastic EP needs no rule at all: it scales
+    ``ep_size`` / ``dp_size`` on the published bag while ``launch_world_size``
+    keeps the width the groups were built at, so the two are different names
+    rather than two answers to one name.
     """
 
-    __slots__ = ("_overrides", "_config", "_derived")
+    __slots__ = ("_overrides", "_stamp", "_config")
 
     def __init__(self):
-        self._overrides = {}
+        self._overrides = {}  # scoped, restored when the `with` block exits
+        self._stamp = {}  # permanent for the process, dropped by clear_stamp
         self._config = None  # parallel config bag, wired at publish
-        self._derived = {}  # widths overridden permanently, as the groups are built
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -278,194 +533,135 @@ class ParallelContext:
             # still unset (pickle/copy protocols probe attributes before
             # __init__ runs).
             raise AttributeError(name)
+        return self._read(name)
+
+    def _read(self, name):
+        """The one read path, for every kind of name in the namespace.
+
+        Scoped override, then the permanent stamp, then the published bag.
+        A rank or a group handle is on no bag, so once those three are out the
+        name has not been written yet and the read says so.
+
+        The two override maps stay separate because they are taken down by
+        different things -- a `with` block and `clear_stamp()` -- and
+        merging them would let a teardown of one drop the other, and would
+        turn "which wins" into whichever was written last.
+        """
         overrides = self._overrides
         if name in overrides:
             return overrides[name]
+        stamp = self._stamp
+        if name in stamp:
+            return stamp[name]
         config = self._config
-        if config is not None:
-            if name in config._fields:
-                return getattr(config, name)
-        elif name in _parallel_config_leaves():
+        if config is not None and name in config._fields:
+            return getattr(config, name)
+        if config is None and name in _parallel_config_leaves():
             raise ValueError("config namespace 'parallel' not published")
+        declared = _derived_widths().get(name)
+        if declared is not None and not declared.fn:
+            raise RuntimeError(
+                f"parallel name {name!r} has not been written in this process. "
+                + declared.doc
+                + f" Write it by publishing a rank bundle or building the groups, "
+                f"or state it with get_parallel().override({name}=...)"
+            )
+        if declared is not None:
+            raise RuntimeError(
+                f"derived parallel width {name!r} is not available: it is computed "
+                "from the configured leaves at publish, and permanently corrected "
+                "when the process groups are built. Nothing is published and "
+                "nothing has been set with override_permanently -- publish a "
+                f"parallel config, or state the width with get_parallel().override({name}=...)"
+            )
         raise AttributeError(f"ParallelContext has no {name!r}")
 
-    def _v(self, name, getter):
-        overrides = self._overrides
-        return overrides[name] if name in overrides else getter()
-
-    def override_permanently(self, **widths) -> None:
-        """Permanently correct a derived width the published bag can't answer
+    def override_permanently(self, **values) -> None:
+        """Permanently record a width or rank the published bag can't answer
         or no longer answers correctly -- not `RuntimeContext.override`,
-        because a derived width is not a resolved config leaf and this must
-        work with no config published at all (`multimodal_gen` lends a TP
-        group to `srt` layers with no `srt` config to publish against).
+        because neither is a resolved config leaf and this must work with no
+        config published at all (`multimodal_gen` lends a TP group to `srt`
+        layers with no `srt` config to publish against).
 
-        Lives beside, not inside, the `@contextmanager` `override` above -- a
+        Widths are quotients of the configured leaves, so the bag can usually
+        answer and this only corrects it; a rank is a per-process fact the
+        configuration never carries, so for those this is the only source.
+
+        Lives beside, not inside, the `@contextmanager` `override` below -- a
         name it cannot also have on this class -- because these are permanent
         for the process, not scoped to a `with` block: none of the real
         callers ever restore the value they set here.
         """
-        self._derived.update(widths)
+        unknown = set(values) - _parallel_fields()
+        if unknown:
+            raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
+        saved = dict(self._stamp)
+        self._stamp.update(values)
+        try:
+            _validate_parallel(self, "override_permanently")
+        except Exception:
+            self._stamp = saved
+            raise
 
-    def clear_derived_widths(self) -> None:
-        self._derived.clear()
-
-    def _derived_width(self, name):
-        """A width the configuration implies: scoped override, else permanent
-        override, else the published leaf.
-
-        The leaf is computed at publish by `parallel_widths_of`; the permanent
-        override sits above it because an elastic scale-up corrects
-        `attn_dp_size` after publish, and a scope that swaps in another TP
-        group states the quotients through the scoped `override` above that.
-
-        Nothing is recomputed on read, so overriding `tp_size` does not move
-        `attn_tp_size`: name the width, or publish a config.
-        """
-        overrides = self._overrides
-        if name in overrides:
-            return overrides[name]
-        derived = self._derived
-        if name in derived:
-            return derived[name]
-        config = self._config
-        if config is not None and name in config._fields:
-            return getattr(config, name)
-        raise RuntimeError(
-            f"derived parallel width {name!r} is not available: it is computed "
-            "from the configured leaves at publish, and permanently corrected "
-            "when the process groups are built. Nothing is published and "
-            "nothing has been set with override_permanently -- publish a "
-            f"parallel config, or state the width with get_parallel().override({name}=...)"
-        )
+    def clear_stamp(self) -> None:
+        """Drop every stamped name, ranks included."""
+        self._stamp.clear()
 
     @contextmanager
     def override(self, **kwargs):
         """Temporarily force parallel values, restoring on exit. Validates keys and
         supports nesting."""
-        unknown = set(kwargs) - _PARALLEL_FIELDS
+        unknown = set(kwargs) - _parallel_fields()
         if unknown:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
         saved = dict(self._overrides)
         self._overrides.update(kwargs)
         try:
+            _validate_parallel(self, "override")
+        except Exception:
+            self._overrides = saved
+            raise
+        try:
             yield self
         finally:
             self._overrides = saved
 
-    @property
-    def world_size(self) -> int:
-        return self._v("world_size", _ps().get_world_size)
 
-    @property
-    def world_rank(self) -> int:
-        return self._v("world_rank", _ps().get_world_rank)
-
-    @property
-    def tp_rank(self) -> int:
-        return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
-
-    @property
-    def pp_rank(self) -> int:
-        return self._v("pp_rank", _ps().get_pipeline_model_parallel_rank)
-
-    @property
-    def moe_ep_rank(self) -> int:
-        return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
-
-    @property
-    def moe_dp_rank(self) -> int:
-        return self._v("moe_dp_rank", _ps().get_moe_data_parallel_rank)
-
-    @property
-    def moe_tp_rank(self) -> int:
-        return self._v("moe_tp_rank", _ps().get_moe_tensor_parallel_rank)
-
-    @property
-    def attn_tp_rank(self) -> int:
-        return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
-
-    @property
-    def attn_cp_rank(self) -> int:
-        return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
-
-    @property
-    def dcp_rank(self) -> int:
-        return self._v("dcp_rank", _ps().get_dcp_rank)
-
-    @property
-    def attn_dcp_rank(self) -> int:
-        return self._v(
-            "attn_dcp_rank", lambda: self.dcp_rank if self.dcp_enabled else 0
-        )
-
-    @property
-    def attn_dp_rank(self) -> int:
-        return self._v("attn_dp_rank", _dp().get_attention_dp_rank)
-
-    @property
-    def world_group(self) -> Any:
-        return self._v("world_group", _ps().get_world_group)
-
-    @property
-    def tp_group(self) -> Any:
-        return self._v("tp_group", _ps().get_tp_group)
-
-    @property
-    def pp_group(self) -> Any:
-        return self._v("pp_group", _ps().get_pp_group)
-
-    @property
-    def moe_ep_group(self) -> Any:
-        return self._v("moe_ep_group", _ps().get_moe_ep_group)
-
-    @property
-    def moe_dp_group(self) -> Any:
-        return self._v("moe_dp_group", _ps().get_moe_dp_group)
-
-    @property
-    def moe_tp_group(self) -> Any:
-        return self._v("moe_tp_group", _ps().get_moe_tp_group)
-
-    @property
-    def attn_tp_group(self) -> Any:
-        return self._v("attn_tp_group", _ps().get_attn_tp_group)
-
-    @property
-    def attn_cp_group(self) -> Any:
-        return self._v("attn_cp_group", _ps().get_attn_cp_group)
-
-    @property
-    def dcp_group(self) -> Any:
-        return self._v("dcp_group", _ps().get_dcp_group)
-
-
-def _install_derived_widths() -> None:
-    """Give `ParallelContext` a property per declared quotient.
-
-    They are declared in `arg_groups/fields/parallel.py`, in the same class as
-    the leaves they are computed from -- unannotated, so `collect_input_fields`
-    leaves them off the record while they still live where the namespace does. Written here as
-    properties rather than answered by `__getattr__` because they are read
-    inside compiled model code, where an attribute load is traceable and a
-    dynamic lookup is not.
-    """
+def _derived_widths() -> dict:
+    """The declared quotients, by name -- `{name: Derived}`."""
     from sglang.srt.arg_groups.arg_utils import Derived
     from sglang.srt.arg_groups.fields.parallel import Parallel
 
-    for name, decl in vars(Parallel).items():
-        if not isinstance(decl, Derived):
-            continue
+    return {
+        name: decl for name, decl in vars(Parallel).items() if isinstance(decl, Derived)
+    }
+
+
+def _install_parallel_properties() -> None:
+    """Give `ParallelContext` a property per name that is not a config leaf.
+
+    Every name the namespace answers that is not a plain leaf: the quotients,
+    and the ranks and group handles declared beside them with no `fn`.
+
+    Properties rather than names left to `__getattr__` because the class
+    surface is what the guards introspect -- `hasattr(ParallelContext,
+    "tp_size")` and `vars(ParallelContext)` are how the tests read the set from
+    the class side -- and because each one carries its `Derived.doc`.
+
+    Every one of them resolves through `_read`, so there is a single priority
+    chain rather than one per kind of name.
+    """
+    for name, decl in _derived_widths().items():
 
         def getter(self, _name=name):
-            return self._derived_width(_name)
+            return self._read(_name)
 
         getter.__name__ = name
         getter.__doc__ = decl.doc
         setattr(ParallelContext, name, property(getter))
 
 
-_install_derived_widths()
+_install_parallel_properties()
 
 
 class _FlagGroupBase(msgspec.Struct):
@@ -560,9 +756,9 @@ class MoeFlags(_FlagGroupBase):
 
 class DpFlags(_FlagGroupBase):
     """DP-attention runtime flags, materialized by ``initialize_dp_attention``
-    (after distributed setup; reads the model config). Topology values
-    (sizes/ranks) stay on ``layers.dp_attention`` until the parallel vertical
-    migrates them."""
+    (after distributed setup; reads the model config). The topology values it
+    also computes -- the attention-DP width and rank -- are stamped on
+    ``get_parallel()``, not kept here."""
 
     enabled: bool = False
     use_world_group_for_gather: bool = False
@@ -923,7 +1119,7 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
     """
     import importlib
 
-    from sglang.srt.arg_groups.arg_utils import Derived
+    from sglang.srt.arg_groups.arg_utils import _NO_DEFAULT, Derived
     from sglang.srt.arg_groups.overrides import resolved_view
 
     namespaces = getattr(type(server_args), "_NAMESPACES", None)
@@ -935,7 +1131,18 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
         if path is None:
             continue
         for name, decl in vars(source).items():
-            if not isinstance(decl, Derived) or not decl.fn:
+            if not isinstance(decl, Derived):
+                continue
+            if not decl.fn:
+                # Nothing computes it. Seed the ones whose absence is itself an
+                # answer, so a process that never states one still reads it;
+                # the rest stay unwritten and say so when read.
+                if decl.default is not _NO_DEFAULT:
+                    bag = tops.get(path.split(".")[0])
+                    for segment in path.split(".")[1:]:
+                        bag = bag and getattr(bag, segment, None)
+                    if bag is not None:
+                        bag._set(name, decl.default)
                 continue
             module, _, attr = decl.fn.rpartition(".")
             bag = tops.get(path.split(".")[0])
@@ -1055,7 +1262,20 @@ class RuntimeContext:
         # Snapshot resolved config into the namespace bags (the single source of
         # truth for config reads). Placed by `namespace_of`; a mock/partial
         # config that declares no namespace yields an empty tree (no bags).
+        # A name the configuration does not carry survives the re-projection.
+        # `gpu_id` is stated by the spawn, not derived, so rebuilding the bags
+        # from the record must not unwrite it -- the record has no field for it
+        # to be rebuilt from.
+        stated = {}
+        if self._config_bags is not None:
+            device = self._config_bags.get("device")
+            fields = object.__getattribute__(device, "_fields") if device else {}
+            if "gpu_id" in fields:
+                stated["gpu_id"] = fields["gpu_id"]
         self._config_bags = _build_config_bags(server_args)
+        device = self._config_bags.get("device")
+        if stated and device is not None:
+            device._set("gpu_id", stated["gpu_id"])
         spec = self._config_bags.get("spec")
         if spec is not None:
             from sglang.srt.arg_groups.overrides import (
@@ -1569,7 +1789,13 @@ def _dump_recorded_namespace_reads() -> None:
         )
 
 
-def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+def publish(
+    server_args,
+    *,
+    role: str,
+    hf_config: Any = None,
+    ranks: SpawnRanks | None = None,
+) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
     Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
@@ -1579,6 +1805,12 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
+
+    ``ranks`` is who this process is, from the entry that spawned it. It is
+    optional because most roles are not placed in the topology at all -- a
+    tokenizer has no ``tp_rank`` -- and those processes raise on a rank read
+    exactly as they do today, with a message naming the missing bundle rather
+    than an absent process group.
 
     A process holds at most one live config: the bags always describe the
     engine running now. Re-publish is allowed and is **last-publish-wins**
@@ -1605,6 +1837,61 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             ),
         )
     _CONTEXT._publish_role = role
+    # Zero for every process when decode context parallelism is off, which is a
+    # fact about the configuration and not about the spawn -- so it answers
+    # without a rank bundle, the way it did when it stood for a group that was
+    # never built. With DCP on it is a position, and the bundle below states it.
+    if not _CONTEXT.parallel.dcp_enabled:
+        _CONTEXT.parallel.override_permanently(attn_dcp_rank=0)
+    # Stated on the bag directly: `gpu_id` is declared but not configured, so
+    # it is not a leaf `override` can route, and the spawn is the only thing
+    # that knows it. Written whatever it is, `None` included -- most roles run
+    # on no device, and that is an answer rather than a name nobody wrote.
+    _CONTEXT.config_bag("device")._set(
+        "gpu_id", ranks.gpu_id if ranks is not None else None
+    )
+    if ranks is not None:
+        # The placement, worked out here rather than carried: the widths are on
+        # the bag a moment ago, and `world_rank` fixes the rest. A read of any
+        # of these then needs no process group, which is the point -- they are
+        # read long before one exists. The scoped overrides that swap a group
+        # for a draft worker sit above the record in the read chain, so a
+        # scope still wins.
+        parallel = _CONTEXT.parallel
+        placement = derive_spawn_ranks(
+            world_rank=ranks.world_rank,
+            tp_size=parallel.tp_size,
+            ep_join_rank_offset=parallel.ep_join_rank_offset,
+            attn_cp_size=parallel.attn_cp_size,
+            attn_tp_size=parallel.attn_tp_size,
+            moe_dp_size=parallel.moe_dp_size,
+            moe_ep_size=parallel.moe_ep_size,
+        )
+        # `initialize_model_parallel` aliases the MoE-DP group to the
+        # attention-CP one when the CP dimension is the wider of the two, so
+        # this process's place in it is its CP index rather than the MoE-DP
+        # index the arithmetic above gives.
+        if parallel.moe_dp_size < parallel.attn_cp_size:
+            placement["moe_dp_rank"] = placement["attn_cp_rank"]
+        # `dp_rank` is recorded whatever it is, None included: replicas are
+        # separate WORLD groups, so no rank implies it and `None` is the answer
+        # "no controller" rather than an absence.
+        placement["dp_rank"] = ranks.dp_rank
+        placement["launch_world_rank"] = ranks.world_rank
+        placement.update(_attention_ranks(parallel, placement["tp_rank"]))
+        # A DCP group is a contiguous slice of a TP group, so this process's
+        # place in one is its TP rank folded by that width. `attn_dcp_rank` is
+        # the same number, and zero where decode context parallelism is off, so
+        # a reader does not have to ask whether it is on first.
+        if parallel.dcp_enabled:
+            placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
+        placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
+        # One stamp, not two: the identities are checked on every write, and a
+        # half-placed process satisfies none of them.
+        parallel.override_permanently(**placement)
+        # Publish established the whole layout, so every identity applies here,
+        # not just the ones the stamp happened to name.
+        _validate_parallel(parallel, "publish")
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
@@ -1617,6 +1904,28 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def _attention_ranks(parallel, tp_rank: int) -> dict:
+    """Place this process in the attention topology, from the configuration.
+
+    The widths are already on the bag -- `publish` computed them a moment ago --
+    and the rank comes from the spawn, so the position is known here, before any
+    process group exists. That is the point: a rank read then works in a process
+    that never initialises distributed, which is what the per-runner record used to provide
+    by being a plain frozen record.
+
+    These are stamped rather than written as bag leaves because they are
+    per-process facts, and nothing about the configuration distinguishes one
+    rank from another.
+    """
+    attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+        tp_rank=tp_rank,
+        attn_tp_size=parallel.attn_tp_size,
+        attn_cp_size=parallel.attn_cp_size,
+        enable_dp_attention=parallel.enable_dp_attention,
+    )
+    return {"attn_tp_rank": attn_tp_rank, "attn_dp_rank": attn_dp_rank}
 
 
 def assert_published(server_args, *, role: str) -> RuntimeContext:
@@ -1761,7 +2070,7 @@ def reset_context() -> None:
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
     ``parallel`` holds the permanently-overridden derived widths, which go
-    with the lifecycle that set them: `_derived_width` prefers them over the
+    with the lifecycle that set them: `_read` prefers them over the
     published leaves, so leaving one behind lets the next test read the
     previous topology.
     """
@@ -1770,7 +2079,7 @@ def reset_context() -> None:
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
-    _CONTEXT.parallel.clear_derived_widths()
+    _CONTEXT.parallel.clear_stamp()
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()

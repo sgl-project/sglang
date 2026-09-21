@@ -51,6 +51,26 @@ def test_cache_pins_resident_and_raw_off_variant_is_independent():
     assert "transformer" in args._required_resident_components
 
 
+def test_cache_variants_apply_platform_defaults_to_raw_inputs():
+    inputs = []
+
+    def apply_defaults(args):
+        inputs.append((args.weight_cache_mode, args.dit_cpu_offload))
+        args.dit_cpu_offload = False
+
+    with patch(
+        "sglang.multimodal_gen.runtime.platforms.current_platform.apply_server_args_defaults",
+        side_effect=apply_defaults,
+    ):
+        args = make_args()
+        off = args.resolve_variant(weight_cache_mode="off")
+
+    assert inputs == [("client", None), ("off", None)]
+    assert not args.dit_cpu_offload
+    assert not off.dit_cpu_offload
+    assert not off.is_arg_explicitly_set("dit_cpu_offload")
+
+
 @pytest.mark.parametrize("stale_prepared", [None, object()])
 def test_cache_off_never_enters_cache_preparation(stale_prepared):
     """Off must preserve automatic attention/device/config selection, even if
@@ -162,7 +182,9 @@ def test_preflight_failure_does_not_start_worker():
 
 
 @pytest.mark.parametrize("gpu_ids,base_gpu_id", [([1], 0), (None, 1)])
-def test_cache_launch_uses_spawn_and_current_scheduler_signature(gpu_ids, base_gpu_id):
+def test_cache_launch_uses_spawn_bootstrap_and_preserves_admission(
+    gpu_ids, base_gpu_id
+):
     from sglang.multimodal_gen.runtime import launch_server
 
     args = make_args()
@@ -172,9 +194,14 @@ def test_cache_launch_uses_spawn_and_current_scheduler_signature(gpu_ids, base_g
     reader.recv.return_value = {"status": "ready"}
     context = Mock()
     context.Pipe.return_value = (reader, writer)
+
+    def admit(server_args):
+        server_args._weight_cache_admission = ("test-plan", "test-generation")
+
     with (
         patch(
-            "sglang.multimodal_gen.runtime.weight_cache.preflight.preflight"
+            "sglang.multimodal_gen.runtime.weight_cache.preflight.preflight",
+            side_effect=admit,
         ) as preflight,
         patch.object(launch_server.mp, "get_context", return_value=context) as spawn,
         patch.object(launch_server.mp, "Process") as default_process,
@@ -187,12 +214,21 @@ def test_cache_launch_uses_spawn_and_current_scheduler_signature(gpu_ids, base_g
     default_process.assert_not_called()
     default_pipe.assert_not_called()
     context.Pipe.assert_called_once_with(duplex=False)
+    (spec,) = context.Process.call_args.kwargs["args"]
     context.Process.assert_called_once_with(
-        target=launch_server.run_scheduler_process,
-        args=(1, 0, args, writer),
+        target=launch_server.bootstrap_scheduler_process,
+        args=(spec,),
         name="sglang-diffusionWorker-0",
         daemon=True,
     )
+    assert spec.local_rank == 1
+    assert spec.rank == 0
+    assert spec.pipe_writer is writer
+    restored = spec.server_args.materialize()
+    assert restored.gpu_ids == gpu_ids
+    assert restored.base_gpu_id == base_gpu_id
+    assert restored.weight_cache_mode == "client"
+    assert restored._weight_cache_admission == ("test-plan", "test-generation")
     context.Process.return_value.start.assert_called_once_with()
     assert processes == [context.Process.return_value]
     writer.close.assert_called_once_with()
