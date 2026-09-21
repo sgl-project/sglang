@@ -204,8 +204,6 @@ class TestRegisterToBootstrap(CustomTestCase):
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
         self, mock_put
     ):
-        # The consumer reads the group through `get_parallel()`, so the
-        # stub is stated there rather than in the module the build writes.
         mock_world_group = MagicMock()
         success_resp = MagicMock()
         success_resp.status_code = 200

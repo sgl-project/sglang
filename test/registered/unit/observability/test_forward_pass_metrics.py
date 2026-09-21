@@ -64,12 +64,7 @@ class _DummyPublisherThread:
 
 
 def _publish_server_args(test, **fields):
-    """Publish a config for the reporter under test and return the instance.
-
-    The collector asks the context where this process sits, so the ranks are
-    stated too: without them a rank read falls through to a process group that
-    a unit test has not built.
-    """
+    """Install reporter configuration and rank overrides, with test cleanup."""
     fields.setdefault("decode_log_interval", 40)
     override = get_context().override_server_args(**fields)
     server_args = override.install()
@@ -297,8 +292,6 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        # The reporter asks the context whether this is the last stage, and
-        # which replica it is reporting for.
         enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1, dp_rank=2))
         scheduler.enable_kv_cache_events = False
 
@@ -336,7 +329,6 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_pass_metrics_ipc_name=None,
             kv_events_config=None,
         )
-        # The reporter asks the context whether this is the last stage.
         enter_scope(self, get_parallel().override(pp_rank=0, pp_size=2))
         scheduler.enable_kv_cache_events = False
 

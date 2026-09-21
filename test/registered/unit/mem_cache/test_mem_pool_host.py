@@ -302,10 +302,6 @@ class TestHostMemoryBudget(CustomTestCase):
         )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):
-        # The launcher slices ranks uniformly across nodes, so the co-located
-        # rank count is world_size // nnodes — no hostname collective.
-        # tp_size=16 states the launch width the count divides -- the
-        # published configuration is where ranks_per_host reads it from.
         with (
             get_context().override_server_args(nnodes=2, tp_size=16),
             unittest.mock.patch.object(

@@ -259,8 +259,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
 class KVCacheConfigurator:
     device: str
     gpu_id: int
-    # Frozen at construction, not asked for later: this configurator is built
-    # inside the scope that describes a draft runner and used outside it.
+    # Capture draft placement at construction; the configurator outlives the scope.
     attn_dp_size: int
     pp_size: int
     pp_group: Any

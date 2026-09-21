@@ -59,9 +59,7 @@ def _resolve_elastic_world_dp_size(
 
     live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
-    # The group's own membership, not the width it was built at: this is the
-    # one number an out-of-process join moves, and it is the upper bound the
-    # served width has to stay under.
+    # Query live membership because elastic joins can expand WORLD.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
