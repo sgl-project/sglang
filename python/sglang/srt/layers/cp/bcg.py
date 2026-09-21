@@ -382,7 +382,11 @@ def execute_prefill_cp_bcg(
         ):
             tail_metadata = runner.model_runner.attn_backend.tail_forward_metadata
             tail = tail_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+            input_ids = tail.global_rows(input_ids)
+            hidden_states = tail.global_rows(hidden_states)
+            if hidden_states_before_norm is not None:
+                hidden_states_before_norm = tail.global_rows(hidden_states_before_norm)
+            aux_hidden_states = [tail.global_rows(aux) for aux in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -399,5 +403,5 @@ def execute_prefill_cp_bcg(
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = tail.global_token_indices
         return output

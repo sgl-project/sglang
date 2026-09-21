@@ -148,6 +148,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
+    suspend_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -791,6 +792,34 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
+
+
+def deepseek_v4_bounded_tail(
+    model,
+    positions,
+    hidden_states,
+    prev_pre,
+    input_ids,
+    input_ids_global,
+    hash_ids,
+):
+    # The captured ForwardBatch belongs to the dummy request. An eager break
+    # must instead resolve the batch and tail metadata for this replay.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    model._check_late_layer_tail_readers(forward_batch)
+    with suspend_breakable_cuda_graph():
+        return model._forward_bounded_tail_eager(
+            positions,
+            hidden_states,
+            prev_pre,
+            input_ids,
+            input_ids_global,
+            hash_ids,
+            forward_batch,
+        )
+
+
+bcg_deepseek_v4_bounded_tail = eager_on_graph(True)(deepseek_v4_bounded_tail)
 
 
 class MqaAttentionBase(nn.Module):
@@ -3802,12 +3831,14 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 def _scatter_tail_rows(
-    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int, *, zero_fill: bool = False
 ) -> torch.Tensor:
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
-    full = rows.new_empty((num_tokens, rows.shape[1]))
+    shape = (num_tokens, *rows.shape[1:])
+    full = rows.new_zeros(shape) if zero_fill else rows.new_empty(shape)
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        start = tail.contiguous_start
+        full[start : start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
@@ -4006,6 +4037,80 @@ class DeepseekV4Model(nn.Module):
                 "set logprob_start_len to the prompt length"
             )
 
+    def _forward_bounded_tail_eager(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        prev_pre: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        hash_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Run the request-shaped late layers outside BCG, then restore bucket rows."""
+        attn_backend = get_attn_backend()
+        tail = attn_backend.tail_forward_metadata.late_layer_tail
+        full_rows = hidden_states.shape[0]
+        saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+        try:
+            state = mhc.HcState(hidden_states, prev_pre).take_rows(tail.rows)
+            input_ids = tail.rows(input_ids)
+            input_ids_global = tail.rows(input_ids_global)
+            positions = tail.positions
+            if hash_ids is not None:
+                hash_ids = tail.rows(hash_ids)
+
+            late_aux = []
+            cp_extend = is_cp_active(forward_batch)
+            for i in range(self.late_layer_start, self.end_layer):
+                engram = self.layers[i].engram
+                if engram is not None:
+                    before_engram = state.residual
+                    residual = engram(
+                        before_engram,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                    )
+                    if (
+                        self.config.model_type == "deepseek_v41"
+                        and self.config.vision_n_layers > 0
+                        and forward_batch.contains_mm_inputs()
+                    ):
+                        residual = torch.where(
+                            (input_ids == self.config.image_token_id)[:, None, None],
+                            before_engram,
+                            residual,
+                        )
+                    state = state.with_residual(residual)
+                if (
+                    self.dspark_layers_to_capture is not None
+                    and i in self.dspark_layers_to_capture
+                ):
+                    late_aux.append(
+                        _scatter_tail_rows(
+                            tail, state.residual.mean(dim=1), full_rows, zero_fill=True
+                        )
+                    )
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    state = self.layers[i].forward_hc_pre_from_prev(
+                        positions=positions,
+                        state=state,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                        seam_open=False,
+                    )
+            state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+            assert state.pre is not None
+            return (
+                _scatter_tail_rows(tail, state.residual, full_rows, zero_fill=True),
+                _scatter_tail_rows(tail, state.pre, full_rows, zero_fill=True),
+                late_aux,
+            )
+        finally:
+            attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+
     def _forward_layers_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -4058,6 +4163,7 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        bounded_bcg = tail is not None and is_in_breakable_cuda_graph()
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4065,6 +4171,21 @@ class DeepseekV4Model(nn.Module):
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
         for i in range(self.start_layer, self.end_layer):
+            if bounded_bcg and i == self.late_layer_start:
+                state = state.materialized(self.layers[i - 1].hc_cfg)
+                assert state.pre is not None
+                hidden_states, prev_pre, late_aux = bcg_deepseek_v4_bounded_tail(
+                    self,
+                    positions,
+                    state.residual,
+                    state.pre,
+                    input_ids,
+                    input_ids_global,
+                    hash_ids,
+                )
+                dspark_aux_hidden_states.extend(late_aux)
+                # The break returned bucket-shaped rows; no post-head scatter.
+                return hidden_states, prev_pre, None
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4101,7 +4222,7 @@ class DeepseekV4Model(nn.Module):
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
-                if tail is not None and i < self.late_layer_start:
+                if tail is not None and i < self.late_layer_start and not bounded_bcg:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
@@ -4734,6 +4855,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
+            if is_in_breakable_cuda_graph():
+                # The bounded eager break returns full bucket rows so BCG and
+                # CP gather have a fixed shape; the draft head reads only tail.
+                hidden_states = tail.rows(hidden_states)
+                pre_hc_head = tail.rows(pre_hc_head)
+                aux_hidden_states = [tail.rows(aux) for aux in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
