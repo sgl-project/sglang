@@ -204,7 +204,7 @@ jobs:
           # Emit a single JSON output `partitions` keyed by suite name with
           # {size, arr, max_parallel} fields per suite. Replaces the prior
           # full/low max-parallel presets; `--full-parallel` keeps the
-          # `high priority` PR / scheduled cron escape hatch.
+          # `max-concurrency` PR / scheduled cron escape hatch.
           # See scripts/ci/utils/compute_partitions.py.
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
