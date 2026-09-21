@@ -123,8 +123,15 @@ class AscendTorchNativeAttnBackend:
                 if is_cross_attention:
                     atten_end_kv = int(encoder_lens[seq_idx].item())
                 else:
+                    # The page-table row is shared between encoder KV slots
+                    # (at the row head) and decoder text KV slots. Extend on
+                    # the text side must read the *entire* text KV (prefix +
+                    # this chunk) — exactly like the decode path below — not
+                    # just the last extend_seq_len_q cells, which fall into
+                    # the oldest prefix text slots once vision occupies the
+                    # row head.
                     atten_start_kv = int(encoder_lens[seq_idx].item())
-                    atten_end_kv = atten_start_kv + extend_seq_len_q
+                    atten_end_kv = atten_start_kv + seq_len_kv
 
             is_swa_self_attn = (
                 sliding_window_size is not None
