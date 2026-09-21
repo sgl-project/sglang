@@ -3936,14 +3936,15 @@ class Scheduler(
         )
 
         # SGLANG_1093_DECODE_PREFER_V2
-        # Prefill-first scheduling: any prefill batch (including chunked_req
-        # continuation) fully preempts decode. Under speculative decoding
-        # without mixed chunk, defer all prefills while decode is running so
-        # multi-turn ITL/TPOT stays stable.
+        # Prefill-first scheduling lets new prefills preempt decode and blow
+        # multi-turn TPOT under speculative decoding without mixed chunk.
+        # Defer *new* prefills while decode is running, but still advance an
+        # in-flight chunked_req so a partial prefill cannot stall forever.
         if (
             not self.spec_algorithm.is_none()
             and not self.is_mixed_chunk
             and not running_batch.is_empty()
+            and self.chunked_req is None
         ):
             return None, running_batch
 

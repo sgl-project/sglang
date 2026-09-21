@@ -931,11 +931,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     # SGLANG_1093_CHUNKED_PREFILL_DEFAULT
-    # Disabled chunked prefill under EAGLE/NEXTN lets one exclusive prefill
-    # starve decode and blows multi-turn TPOT. Default to 1024; an explicit
-    # positive --chunked-prefill-size is left unchanged.
+    # Disabled/unset chunked prefill under EAGLE/NEXTN lets one exclusive
+    # prefill starve decode and blows multi-turn TPOT. Default to 1024 when
+    # unset or legacy negative disable; keep an explicit 0 as intentional off.
     _cps = cfg.chunked_prefill_size
-    if _cps is None or _cps <= 0:
+    if _cps is None or _cps < 0:
         declare_resolution(
             server_args,
             "_handle_eagle_family",
