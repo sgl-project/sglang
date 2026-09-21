@@ -20,9 +20,7 @@ NUM_LOCAL_EXPERTS = 4
 
 class TestMaterializeSwigluParamsForCutlass(CustomTestCase):
     def _materialize(self, activation="silu", **config_kwargs):
-        config = MoeRunnerConfig(
-            activation=activation, is_gated=True, **config_kwargs
-        )
+        config = MoeRunnerConfig(activation=activation, is_gated=True, **config_kwargs)
         return materialize_swiglu_params_for_cutlass(
             config, num_local_experts=NUM_LOCAL_EXPERTS, device=torch.device("cpu")
         )
