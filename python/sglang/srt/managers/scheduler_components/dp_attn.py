@@ -10,7 +10,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -58,7 +58,7 @@ def _resolve_elastic_world_dp_size(
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    live_dp_size = get_parallel().attn_dp_size
+    live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     # The group's own membership, not the width it was built at: this is the
     # one number an out-of-process join moves, and it is the upper bound the

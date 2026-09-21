@@ -112,7 +112,12 @@ class Sampler(nn.Module):
         self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
-            self.cp_sync_group = get_parallel().attn_cp_group.device_group
+            # Only when there is more than one context shard to reconcile. The
+            # sync below already short-circuits on that, and a model running on
+            # one shard -- a speculative draft, under the scope that says so --
+            # has no context-parallel communicator to name.
+            if get_parallel().attn_cp_size > 1:
+                self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.

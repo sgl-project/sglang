@@ -15,11 +15,9 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -49,6 +47,33 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def dp_gather_width() -> int:
+    """How many replicas the DP sync gathers over.
+
+    The attention-DP replicas, except after an elastic-EP scale-up, when the
+    gather spans the expanded WORLD -- whose width is the `dp_size` the
+    scale-up published. Read from the context either way: a scoped width has
+    to reach this, which is the whole reason the name has one home.
+    """
+    parallel = get_parallel()
+    return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
+
+
+def dp_gather_slot() -> int:
+    """This process's index in the list the DP sync just gathered.
+
+    The gather spans the attention-DP replicas, except after an elastic-EP
+    scale-up, when it spans the expanded WORLD and the joining cohort is
+    numbered from its offset. Which list was gathered is what the flag below
+    says, so the index is read from there rather than kept as a second name on
+    the topology.
+    """
+    parallel = get_parallel()
+    if world_dp_gather_enabled():
+        return parallel.tp_rank + parallel.ep_join_rank_offset
+    return parallel.attn_dp_rank
+
+
 def world_dp_gather_enabled() -> bool:
     """Whether DP gathers should use expanded WORLD after joiner admission."""
     dp = get_flags().dp
@@ -60,9 +85,13 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    get_parallel().override_permanently(
-        attn_dp_size=new_dp_size, attn_dp_rank=new_dp_rank
-    )
+    """Point the DP gather at the expanded WORLD.
+
+    The widths themselves are not written here: the caller scales `dp_size` on
+    the published bag, and the gather reads its width and this process's slot
+    from there. The arguments are the values the caller is about to publish,
+    kept so the log says which scale-up this was.
+    """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -92,7 +121,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = get_parallel().attn_dp_size
+        dp_size = dp_gather_width()
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -374,14 +403,13 @@ def initialize_dp_attention(
     dp.enabled = enable_dp_attention
 
     tp_rank = get_parallel().tp_rank
-    tp_size = get_tensor_model_parallel_world_size()
+    tp_size = get_parallel().tp_size
 
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
         # Reads the resolution, not a bag: this runs under
         # `initialize_dp_attention`, which the weight-cache daemon calls from
         # `_init_distributed` -- and other callers reach it from processes
@@ -414,7 +442,10 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    dp_rank = get_parallel().attn_dp_rank
+    # The slot in the list that was gathered. A scale-up widens that list
+    # to WORLD, and this process's index in it is not its index among the
+    # launch replicas.
+    dp_rank = dp_gather_slot()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -438,7 +469,10 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank
+    # The slot in the list that was gathered. A scale-up widens that list
+    # to WORLD, and this process's index in it is not its index among the
+    # launch replicas.
+    dp_rank = dp_gather_slot()
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch
@@ -514,7 +548,7 @@ def _dp_gather_via_all_reduce(
         NUM_GPUS_PER_NODE = 8
         if (
             not local_tokens.dtype.is_floating_point
-            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+            and get_parallel().tp_size <= NUM_GPUS_PER_NODE
         ):
             from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
@@ -534,7 +568,7 @@ def _dp_gather_via_all_gather(
 ):
     use_world = world_dp_gather_enabled()
 
-    if get_attn_tensor_model_parallel_world_size() == 1:
+    if get_parallel().attn_tp_size == 1:
         if use_world:
             torch.distributed.all_gather_into_tensor(
                 global_tokens,
@@ -548,9 +582,9 @@ def _dp_gather_via_all_gather(
     if not is_partial:
         if get_parallel().attn_tp_rank != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(
-        get_attn_tensor_model_parallel_world_size()
-    )[get_parallel().attn_tp_rank]
+    scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
+        get_parallel().attn_tp_rank
+    ]
     get_parallel().attn_tp_group.reduce_scatter_tensor(
         scattered_local_tokens, local_tokens
     )
@@ -721,8 +755,8 @@ def is_dp_gatherv_active() -> bool:
     return (
         _USE_DP_GATHERV
         and not world_dp_gather_enabled()
-        and get_attn_tensor_model_parallel_world_size() == 1
-        and get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size
+        and get_parallel().attn_tp_size == 1
+        and get_parallel().tp_size == get_parallel().attn_dp_size
         and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
@@ -881,12 +915,12 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         if sizes is not None:
             get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
             return
-    if get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size:
+    if get_parallel().tp_size == get_parallel().attn_dp_size:
         get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
-        scattered_local_tokens = input.tensor_split(
-            get_tensor_model_parallel_world_size()
-        )[get_parallel().tp_rank]
+        scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
+            get_parallel().tp_rank
+        ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
         get_parallel().attn_tp_group.all_gather_into_tensor(
             output, scattered_local_tokens
