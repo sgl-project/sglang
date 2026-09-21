@@ -2596,18 +2596,30 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         }
 
     def _callers(self, name):
+        """Every call in business code, including one hiding behind an import
+        alias -- `from ... import get_moe_dp_group as _g` then `_g()` is the
+        same reach past the context, and searching for the original spelling
+        alone reports zero while it is right there."""
         import re
 
         from sglang.srt.distributed import parallel_state as parallel_state_module
 
         root = _pathlib.Path(parallel_state_module.__file__).parents[2]
-        pattern = re.compile(rf"(?<![.\w]){re.escape(name)}\(")
         hits = []
         for path in root.rglob("*.py"):
             rel = path.relative_to(root).as_posix()
             if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
                 continue
-            for number, line in enumerate(path.read_text().splitlines(), 1):
+            text = path.read_text()
+            spellings = (
+                {name}
+                | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
+                | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
+            )
+            pattern = re.compile(
+                r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
+            )
+            for number, line in enumerate(text.splitlines(), 1):
                 if line.lstrip().startswith(("def ", "#")):
                     continue
                 if pattern.search(line):
@@ -3147,6 +3159,72 @@ class TestTheRecordIsNeverWrittenTo(CustomTestCase):
             [],
             "write the bag through get_context().override(source, ...) instead "
             "-- the record is not a channel:\n  " + "\n  ".join(offenders),
+        )
+
+
+class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
+    """The package stopped re-exporting the getters and the build stopped
+    taking widths. Both are import-time or call-time failures in whatever tree
+    they survive in, and the trees beside the package have no suite to notice.
+    """
+
+    def _retired(self):
+        from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
+
+        return set(_CONTEXT_NAME_OF)
+
+    def test_nothing_imports_a_retired_name_from_the_package(self):
+        import ast as _ast
+
+        retired = self._retired()
+        offenders = []
+        for path in _sources():
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.ImportFrom)
+                    and node.module == "sglang.srt.distributed"
+                ):
+                    for alias in node.names:
+                        if alias.name in retired:
+                            offenders.append(f"{path}:{node.lineno} {alias.name}")
+        self.assertEqual(
+            offenders,
+            [],
+            "these import a name the package no longer re-exports; import it "
+            "from parallel_state, or read get_parallel():\n  " + "\n  ".join(offenders),
+        )
+
+    def test_nothing_passes_a_width_to_the_build(self):
+        """`multimodal_gen` is out: it has a function of this name that builds
+        its own parallelism from its own degrees."""
+        import ast as _ast
+        import inspect
+
+        from sglang.srt.distributed.parallel_state import initialize_model_parallel
+
+        takes = set(inspect.signature(initialize_model_parallel).parameters)
+        offenders = []
+        for path in _sources():
+            if "multimodal_gen" in path.parts:
+                continue
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+                if (
+                    isinstance(node, _ast.Call)
+                    and getattr(node.func, "id", getattr(node.func, "attr", None))
+                    == "initialize_model_parallel"
+                ):
+                    stale = [
+                        kw.arg for kw in node.keywords if kw.arg and kw.arg not in takes
+                    ]
+                    if stale or node.args:
+                        offenders.append(
+                            f"{path}:{node.lineno} {stale or 'positional'}"
+                        )
+        self.assertEqual(
+            offenders,
+            [],
+            "the build reads every width from the context; publish the "
+            "topology instead of passing it:\n  " + "\n  ".join(offenders),
         )
 
 
