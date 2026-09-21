@@ -213,16 +213,13 @@ with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
 ## Kimi-K3
 
-Kimi-K3 uses Dynamo's native formatter with SGLang request normalization and
-segmented tokenization, including the checkpoint's long-text chunk boundaries.
-Reasoning controls, tools, response formats, and assistant continuations match
-SGLang. Explicit null `thinking_effort` while thinking is enabled falls back to
-worker rendering because the pinned Dynamo formatter cannot represent it.
-
-`--tokenizer-path` accepts a local `tiktoken.model` or a Hugging Face repo ID.
-The loader falls back from `tokenizer.json` to `tiktoken.model` with sibling
-`config.json` and `tokenizer_config.json`. Token parity fixtures come from
-SGLang's serving code and the pinned Kimi checkpoint tokenizer.
+Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
+request semantics (reasoning controls, tools, `response_format`, continuations)
+and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
+local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
+and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
+An explicit null `thinking_effort` with thinking enabled is not representable
+in the pinned formatter and falls back to engine-side rendering.
 
 ## HTTP/2
 

@@ -1,25 +1,29 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//! Kimi-K3 request semantics from `serving_chat.py` and the checkpoint's
+//! `tokenization_kimi.py`, applied around dynamo-render's native formatter.
+
 use anyhow::{ensure, Result};
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use serde_json::{json, Value};
 
 use super::chat_formatter::ChatTemplateKwargs;
 
-// Match serving_chat.py before invoking Dynamo's native Kimi formatter.
 pub(super) fn normalize(
     request: &Value,
     messages: &mut [Value],
     kwargs: &mut ChatTemplateKwargs,
 ) -> Result<()> {
+    // Dynamo reads `reasoning_effort` and treats a non-bool `thinking` as true;
+    // the checkpoint ignores the former and uses Python truthiness for the latter.
     kwargs.remove("reasoning_effort");
-    let thinking = kwargs.entry("thinking".into()).or_insert(true.into());
-    *thinking = minijinja::Value::from_serialize(&*thinking)
-        .is_true()
-        .into();
+    let thinking = kwargs
+        .get("thinking")
+        .is_none_or(|v| minijinja::Value::from_serialize(v).is_true());
+    kwargs.insert("thinking".into(), thinking.into());
     ensure!(
-        kwargs["thinking"] == false || !kwargs.get("thinking_effort").is_some_and(Value::is_null),
+        !thinking || !kwargs.get("thinking_effort").is_some_and(Value::is_null),
         "Kimi null thinking_effort requires engine-side rendering"
     );
     for message in messages.iter_mut() {
@@ -28,70 +32,59 @@ pub(super) fn normalize(
         }
         if let Some(parts) = message["content"].as_array_mut() {
             parts.retain(|part| matches!(part["type"].as_str(), Some("text" | "image_url")));
-            for part in parts {
-                if part["type"] == "text" {
-                    neutralize(&mut part["text"]);
-                }
-            }
-        } else {
-            neutralize(&mut message["content"]);
         }
-        if message["role"] == "assistant" {
-            if let Some(reasoning) = message.get_mut("reasoning_content") {
-                neutralize(reasoning);
+        for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
+            let args = &mut call["function"]["arguments"];
+            if let Some(parsed) = args
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .filter(Value::is_object)
+            {
+                *args = parsed;
             }
-            for call in message["tool_calls"].as_array_mut().into_iter().flatten() {
-                let args = &mut call["function"]["arguments"];
-                if let Some(parsed) = args
-                    .as_str()
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .filter(Value::is_object)
-                {
-                    *args = parsed;
-                }
-                neutralize(args);
-            }
+            neutralize(args);
+        }
+        neutralize(&mut message["content"]);
+        if let Some(reasoning) = message.get_mut("reasoning_content") {
+            neutralize(reasoning);
         }
     }
-    let has_tools = std::iter::once(&request["tools"])
-        .chain(
-            messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .map(|m| &m["tools"]),
-        )
-        .any(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
+    let has_tools = std::iter::once(request)
+        .chain(messages.iter().filter(|m| m["role"] == "system"))
+        .any(|m| m["tools"].as_array().is_some_and(|t| !t.is_empty()));
     if has_tools && matches!(request["tool_choice"].as_str(), Some("none" | "required")) {
         kwargs
             .entry("tool_choice".into())
             .or_insert_with(|| request["tool_choice"].clone());
     }
-    // The checkpoint only consumes string choices; named choice constrains decoding.
+    // The checkpoint renders only these; a named choice is constrained decoding.
     if !matches!(
         kwargs.get("tool_choice").and_then(Value::as_str),
         Some("none" | "required")
     ) {
         kwargs.remove("tool_choice");
     }
-    if let Some(format) = request.get("response_format").filter(|v| !v.is_null()) {
-        let mut format = format.clone();
+    if let Some(mut format) = request
+        .get("response_format")
+        .filter(|v| !v.is_null())
+        .cloned()
+    {
+        // protocol.py lifts a legacy top-level `schema` into `json_schema`.
         if format["type"] == "json_schema" && format["json_schema"].is_null() {
-            if let Some(mut schema) = format.get("schema").cloned() {
-                if let Some(properties) =
-                    schema.get_mut("properties").and_then(Value::as_object_mut)
-                {
-                    properties.remove("strict");
+            if let Some(mut schema) = format.as_object_mut().and_then(|f| f.remove("schema")) {
+                if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                    props.remove("strict");
                 }
                 format["json_schema"] = json!({"schema": schema});
             }
         }
         kwargs.entry("response_format".into()).or_insert(format);
     }
-    if let (Some(schema), Some(format)) = (
-        kwargs.get("response_schema").cloned(),
-        kwargs.get_mut("response_format"),
-    ) {
-        if format["type"] == "json_schema" {
+    if let Some(schema) = kwargs.get("response_schema").cloned() {
+        if let Some(format) = kwargs
+            .get_mut("response_format")
+            .filter(|f| f["type"] == "json_schema")
+        {
             format["json_schema"] = json!({"schema": schema});
         }
     }
@@ -109,27 +102,24 @@ fn neutralize(value: &mut Value) {
     }
 }
 
-// Python's Kimi tokenizer splits by character count before BPE, including prefixes.
+/// `tokenization_kimi.py` encodes 400k-char windows, each split after 25k
+/// consecutive (non-)whitespace chars, and BPE is not chunk-invariant.
 pub(super) fn encode(tokenizer: &Tokenizer, segments: &[EncodeSegment<'_>]) -> Result<Vec<u32>> {
     let mut chunks = Vec::new();
     for segment in segments {
-        let (mut start, mut count, mut run, mut was_space) = (0, 0, 0, false);
-        for (offset, ch) in segment.text.char_indices() {
+        let (mut start, mut run, mut was_space) = (0, 0, false);
+        for (count, (offset, ch)) in segment.text.char_indices().enumerate() {
+            // Python's `str.isspace` also covers U+001C..U+001F.
             let space = ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch);
-            if count == 400_000 || (space == was_space && run == 25_000) {
+            run = if space == was_space { run + 1 } else { 1 };
+            if (count > 0 && count % 400_000 == 0) || run > 25_000 {
                 chunks.push(EncodeSegment::new(
                     &segment.text[start..offset],
                     segment.allow_special,
                 ));
-                start = offset;
-                if count == 400_000 {
-                    count = 0;
-                }
-                run = 0;
+                (start, run) = (offset, 1);
             }
-            run = if space == was_space { run + 1 } else { 1 };
             was_space = space;
-            count += 1;
         }
         chunks.push(EncodeSegment::new(
             &segment.text[start..],

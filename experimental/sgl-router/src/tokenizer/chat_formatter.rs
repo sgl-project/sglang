@@ -15,6 +15,7 @@ use dynamo_renderer::{
     deepseek_formatter_for, kimi_k3_formatter_for, may_be_fix_tool_schema, ChatTemplate,
     ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt,
 };
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
 
@@ -50,21 +51,8 @@ impl ChatFormatter {
         let model_type = files
             .json("config.json")?
             .and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
-        let name = model_id
-            .rsplit('/')
-            .next()
-            .unwrap_or(model_id)
-            .to_lowercase();
-        if let Some(PromptFormatter::OAI(formatter)) =
-            kimi_k3_formatter_for(&model_type.as_ref().map(|t| t.to_lowercase()), &name, false)
-        {
-            return Ok(Some(Self {
-                formatter,
-                defaults: HashMap::new(),
-                bos_token: Some("[BOS]".into()),
-                is_deepseek_v4: false,
-                is_kimi_k3: true,
-            }));
+        if let Some(kimi) = Self::kimi_native(model_type.as_deref(), model_id) {
+            return Ok(Some(kimi));
         }
         match model_type.as_deref() {
             // These require tokenization paths not yet supported by this adapter.
@@ -153,16 +141,27 @@ impl ChatFormatter {
         }))
     }
 
+    /// dynamo-render's native Kimi-K3 XTML formatter, wrapped in SGLang's request
+    /// semantics (`kimi::normalize`) and the checkpoint's chunked tokenization.
+    pub fn kimi_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
+        let model_type = model_type.map(str::to_lowercase);
+        let PromptFormatter::OAI(formatter) =
+            kimi_k3_formatter_for(&model_type, &model_name(model_id), false)?;
+        Some(Self {
+            formatter,
+            defaults: HashMap::new(),
+            bos_token: Some("[BOS]".into()),
+            is_deepseek_v4: false,
+            is_kimi_k3: true,
+        })
+    }
+
     /// dynamo-render's code-based DeepSeek encoders, for V4 (including variants
     /// such as V4.1) and V3.2 non-Exp: the only built-in formatters verified
     /// against the engine. `model_type` (from `config.json`) is authoritative;
     /// the model id's last path segment is the fallback.
     pub fn deepseek_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
-        let name = model_id
-            .rsplit('/')
-            .next()
-            .unwrap_or(model_id)
-            .to_lowercase();
+        let name = model_name(model_id);
         // The engine treats every `deepseek_v4*` variant (e.g. V4.1) as V4.
         let model_type = model_type.map(str::to_lowercase).map(|t| {
             if t.starts_with("deepseek_v4") {
@@ -309,11 +308,7 @@ impl ChatFormatter {
         Ok((prompt, prefix))
     }
 
-    pub fn encode(
-        &self,
-        tokenizer: &dynamo_tokenizers::Tokenizer,
-        request: &JsonValue,
-    ) -> Result<Vec<u32>> {
+    pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
             Some(segments) if self.is_kimi_k3 => super::kimi::encode(tokenizer, &segments)?,
@@ -323,10 +318,7 @@ impl ChatFormatter {
         if !prefix.is_empty() {
             // SGLang encodes the assistant prefix separately and removes its leading BOS.
             let mut suffix = if self.is_kimi_k3 {
-                super::kimi::encode(
-                    tokenizer,
-                    &[dynamo_tokenizers::EncodeSegment::control(&prefix)],
-                )?
+                super::kimi::encode(tokenizer, &[EncodeSegment::control(&prefix)])?
             } else {
                 super::adapter::encode(tokenizer, &prefix)?
             };
@@ -379,6 +371,15 @@ fn engine_message(message: &JsonValue) -> JsonValue {
     out.insert("role".into(), role.into());
     out.insert("content".into(), content);
     out.into()
+}
+
+/// Lowercased last path segment of a model id, dynamo-render's name fallback.
+fn model_name(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_lowercase()
 }
 
 /// `content` of an HF `AddedToken` object (`{"content": "<s>", "lstrip": ...}`).
@@ -440,7 +441,8 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .get("reasoning_effort")
             .map(Value::from_serialize)
     }
-    // Only Kimi renders response_format; other paths use constrained decoding.
+    /// Only Kimi-K3 renders `response_format`; elsewhere the engine enforces
+    /// it by constrained decoding and never renders it.
     fn response_format(&self) -> Option<Value> {
         self.is_kimi_k3
             .then(|| self.kwargs.get("response_format"))
