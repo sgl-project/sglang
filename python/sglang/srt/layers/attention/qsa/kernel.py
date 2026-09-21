@@ -12,11 +12,6 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
-# FP32 has 24 bits of significand precision, so every integer from zero
-# through this inclusive limit is exactly representable.
-# Used to check sorting-key precision after QSA block expansion.
-_FP32_EXACT_INT_MAX = 2**24
-
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -150,10 +145,6 @@ def torch_expand_qsa_block_indices(
     result = torch.cat([expanded, tail], dim=1)
     # Keep all valid entries contiguous. This is required by the FA2 packing path.
     order = torch.arange(final_topk, device=device).unsqueeze(0).expand(rows, -1)
-    if _is_npu and 2 * final_topk - 1 <= _FP32_EXACT_INT_MAX:
-        # NPU integer argsort falls back to AiCpu. Convert only when the
-        # largest positional key, including padding, is exact in FP32.
-        order = order.float()
     sort_key = torch.where(result >= 0, order, order + final_topk)
     return result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(torch.int32)
 
@@ -283,21 +274,18 @@ def expand_qsa_block_indices(
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
     if _is_npu:
-        from sgl_kernel_npu.qwen3_8_flash_next.expansion import (
-            can_run_block_expansion,
-            expand_blocks,
-        )
+        from sgl_kernel_npu.qwen3_8_flash_next.expansion import expand_blocks
 
-        args = (
+        # The package wrapper owns the model contract and its internal dispatch.
+        # Unsupported metadata must not silently enter the generic reference.
+        return expand_blocks(
             block_indices,
             query_positions,
             sequence_lengths,
             compress_ratio,
             token_topk,
         )
-        if can_run_block_expansion(*args):
-            return expand_blocks(*args)
-    if not _is_npu and block_indices.is_cuda:
+    if block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
         return triton_expand_qsa_block_indices(

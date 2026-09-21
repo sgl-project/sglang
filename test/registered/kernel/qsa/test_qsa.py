@@ -1175,6 +1175,8 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
 
 
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
+    # This is a CPU orchestration test, including a non-model token budget.
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", False)
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
     indexer = SimpleNamespace(
@@ -1275,6 +1277,17 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     monkeypatch.setattr(qsa_mqa_module, "tilelang_qsa_mqa_prefill", cuda_only)
     monkeypatch.setattr(qsa_mqa_module, "tilelang_qsa_mqa_decode", cuda_only)
     monkeypatch.setattr(qsa_kernel_module, "triton_expand_qsa_block_indices", cuda_only)
+    # This CPU routing test also runs in GPU CI, without the NPU package.
+    # Mock only its import boundary; real NPU execution is tested separately.
+    expansion_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.expansion")
+    expansion_calls = []
+
+    def npu_expansion(*args):
+        expansion_calls.append(args)
+        return torch_expand_qsa_block_indices(*args)
+
+    expansion_module.expand_blocks = npu_expansion
+    monkeypatch.setitem(sys.modules, expansion_module.__name__, expansion_module)
     # The platform guard must short-circuit before inspecting rotary fields.
     assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
     assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(
@@ -1285,8 +1298,12 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     starts = torch.zeros_like(lengths)
     logits = qsa_mqa_prefill(q, torch.ones(4, 1, 16), starts, lengths)
     blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
-    selected = expand_qsa_block_indices(blocks, lengths - 1, lengths, 4, 2048)
-    assert selected[0, :4].tolist() == [0, 1, 2, 3]
+    raw_lengths = lengths * 4
+    selected = expand_qsa_block_indices(blocks, raw_lengths - 1, raw_lengths, 4, 2048)
+    assert len(expansion_calls) == 1
+    # Equal scores do not define a block order; all four complete blocks survive.
+    assert sorted(selected[0, :16].tolist()) == list(range(16))
+    assert torch.all(selected[0, 16:] == -1)
     qsa_mqa_decode(q, torch.ones(1, 4, 1, 16), starts[:, None], lengths, 4)
 
 
@@ -1506,7 +1523,7 @@ def test_qsa_npu_fallback_graph_replay():
 
 
 @pytest.mark.parametrize("is_npu", [False, True])
-def test_qsa_npu_block_expansion_uses_exact_float_sort_keys(monkeypatch, is_npu):
+def test_qsa_block_expansion_reference_keeps_integer_sort_keys(monkeypatch, is_npu):
     original_argsort = torch.argsort
     dtypes = []
 
@@ -1523,11 +1540,13 @@ def test_qsa_npu_block_expansion_uses_exact_float_sort_keys(monkeypatch, is_npu)
         4,
         8,
     )
-    assert dtypes == [torch.float32 if is_npu else torch.int64]
+    assert dtypes == [torch.int64]
     assert result.tolist() == [[0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]]
 
 
-def test_qsa_block_expansion_adds_only_incomplete_tail():
+def test_qsa_block_expansion_adds_only_incomplete_tail(monkeypatch):
+    # Keep CPU reference coverage independent of the host's NPU availability.
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", False)
     blocks = torch.full((2, BLOCK_TOPK), -1, dtype=torch.int32)
     blocks[0, 0] = 0
     blocks[1, :2] = torch.tensor([1, 0])
