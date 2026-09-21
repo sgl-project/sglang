@@ -45,7 +45,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -338,7 +337,7 @@ class TestTreeNode(unittest.TestCase):
 
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists."""
-        for node_cls in (TreeNode, MambaTreeNode):
+        for node_cls in (TreeNode,):
             with self.subTest(node_cls=node_cls.__module__):
                 root = node_cls()
                 n1 = node_cls()
@@ -572,7 +571,7 @@ class TestRadixCache(CustomTestCase):
         cache.cache_finished_req(
             req,
             is_insert=True,
-            kv_len_to_handle=len(prompt_ids) + len(output_ids),
+            owned_kv_len=len(prompt_ids) + len(output_ids),
         )
 
         (prompt_node,) = cache.root_node.children.values()

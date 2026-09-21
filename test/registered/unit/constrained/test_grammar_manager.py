@@ -26,13 +26,19 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import enter_override
+from sglang.test.test_utils import enter_override, enter_scope
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
@@ -43,9 +49,10 @@ register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     """Create a mock scheduler with necessary attributes.
 
-    The grammar manager reads its config from the bags, so the settings that
-    used to be hung off the mock are published instead. The caller resets the
-    context; every test here goes through `_GrammarFixture`.
+    The grammar manager reads its config and its place in the pipeline from
+    the context, so the settings that used to be hung off the mock are
+    published instead. The caller resets the context; every test here goes
+    through `_GrammarFixture`.
     """
     reset_context()
     server_args = ServerArgs(
@@ -56,7 +63,11 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
         constrained_json_whitespace_pattern=None,
         constrained_json_disable_any_whitespace=False,
     )
-    publish(server_args, role="scheduler")
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(world_rank=0),
+    )
     scheduler = MagicMock()
     scheduler.server_args = server_args
     scheduler.model_config.request_selectable_think_end_id_sequences = None
@@ -66,8 +77,6 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.dp_tp_group.world_size = 1
     scheduler.dp_tp_group.first_rank = 0
     scheduler.dp_tp_group.is_first_rank = True
-    scheduler.ps.pp_rank = 0
-    scheduler.ps.pp_size = 1
     scheduler.pp_group = None
 
     return scheduler
@@ -87,6 +96,7 @@ def _make_req(
     req.sampling_params.json_schema = json_schema
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf
+    req.sampling_params.ebnf_full_assistant = False
     req.sampling_params.structural_tag = structural_tag
     req.sampling_params.custom_params = custom_params
     req.require_reasoning = False
@@ -201,11 +211,16 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         future = Future()
         mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
 
-        req = _make_req(ebnf="root ::= 'hello'")
-        result = mgr.process_req_with_grammar(req)
-
-        self.assertTrue(result)
-        self.assertEqual(req.grammar_key, ("ebnf", "root ::= 'hello'"))
+        for full_assistant, key_type in (
+            (False, "ebnf"),
+            (True, "full_assistant_ebnf"),
+        ):
+            with self.subTest(full_assistant=full_assistant):
+                req = _make_req(ebnf='root ::= "hello"')
+                req.sampling_params.ebnf_full_assistant = full_assistant
+                result = mgr.process_req_with_grammar(req)
+                self.assertTrue(result)
+                self.assertEqual(req.grammar_key, (key_type, 'root ::= "hello"'))
 
     def test_structural_tag_cache_miss(self):
         mgr = self._make_mgr()
@@ -763,8 +778,10 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        scheduler.ps.pp_rank = pp_rank
-        scheduler.ps.pp_size = pp_size
+        # After that override, not before: installing a server-args override
+        # re-resolves the parallel bag from defaults, which puts `pp_size`
+        # back to 1 whatever was published.
+        enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
         scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)

@@ -1296,6 +1296,25 @@ fn match_prefix_splits_on_a_partial_match() {
 }
 
 #[test]
+fn match_full_device_prefix_is_read_only_and_accounts_the_pinned_node() {
+    let mut tc = core();
+    let (a, _b) = matched_chain(&mut tc);
+
+    let (matched_len, node_id, pinned_len) =
+        tc.match_full_device_prefix(&vec![1, 9], KeyNamespaceRef::new(None, None));
+
+    assert_eq!(matched_len, 1);
+    assert_eq!(node_id, tc.arena.node(a).id);
+    assert_eq!(pinned_len, 2);
+    assert_eq!(tc.arena.node(a).key, vec![1, 2]);
+
+    tc.inc_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 1);
+    tc.dec_full_pin(node_id).unwrap();
+    assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 0);
+}
+
+#[test]
 fn match_prefix_stops_at_a_dead_node() {
     // An evicted, unbackuped child ends the traversal before it.
     let mut tc = core();
@@ -4346,6 +4365,7 @@ fn fallible_node_boundaries_reject_stale_handles() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::NodeAccess(NodeAccessError { node_id }))
@@ -7800,33 +7820,6 @@ fn sanity_check_reports_a_cyclic_child_map_without_hanging() {
     tc.sanity_check(&[], &[]);
 }
 
-#[test]
-#[should_panic(expected = "host LRU mismatch")]
-fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
-    let mut tc = sane_tree();
-    let leaf = tc
-        .match_prefix(&match_params(&vec![1, 2, 9]))
-        .best_match_node_id;
-    let parent = tc
-        .arena
-        .node(tc.arena.resolve(leaf).expect("live test node"))
-        .parent();
-    tc.register_component_(Arc::new(SwaComponentForTest));
-    // The arena was built Full-only; give the root the stub's lock too.
-    tc.arena.node_mut(tc.arena.root()).values[SWA.idx()].lock_ref = 1;
-    tc.arena
-        .node_mut(parent)
-        .state_mut_(ValueSlotIdx::host(FULL))
-        .value = Some(Tensor::from_slice(&[10i64, 11]));
-    let leaf_node = tc
-        .arena
-        .node_mut(tc.arena.resolve(leaf).expect("live test node"));
-    leaf_node.state_mut_(ValueSlotIdx::host(FULL)).value = Some(Tensor::from_slice(&[30i64]));
-    leaf_node.state_mut_(ValueSlotIdx::host(SWA)).value = Some(Tensor::from_slice(&[30i64]));
-    leaf_node.state_mut_(ValueSlotIdx::host(SWA)).lock_ref = 1;
-    tc.sanity_check(&[], &[]);
-}
-
 // A backed-up leaf whose unlocked Swa value is host-only (no device value).
 fn host_only_aux_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let leaf = tc
@@ -7867,6 +7860,17 @@ fn sanity_check_accepts_an_unlocked_host_only_value_in_the_lru() {
 fn sanity_check_detects_a_host_only_value_missing_from_the_lru() {
     let mut tc = sane_tree();
     host_only_aux_leaf(&mut tc);
+    tc.sanity_check(&[], &[]);
+}
+
+// A host lock delists its node: missing from the LRU is the in-flight state.
+#[test]
+fn sanity_check_accepts_a_host_locked_value_missing_from_the_lru() {
+    let mut tc = sane_tree();
+    let leaf = host_only_aux_leaf(&mut tc);
+    tc.arena
+        .node_mut(leaf)
+        .set_lock_ref_(ValueSlotIdx::host(SWA), 1);
     tc.sanity_check(&[], &[]);
 }
 

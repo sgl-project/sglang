@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -41,6 +42,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
+)
+from sglang.srt.utils.common import (
+    add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
 )
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -52,6 +57,7 @@ logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 SERVER_WARMUP_BYPASS_PATHS = (
+    "/metrics",
     "/liveness",
     "/health",
     "/health_generate",
@@ -397,6 +403,10 @@ def create_app(server_args: ServerArgs):
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
+    if server_args.enable_metrics:
+        configure_metrics()
+        add_prometheus_middleware(app)
+        add_prometheus_track_response_middleware(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
