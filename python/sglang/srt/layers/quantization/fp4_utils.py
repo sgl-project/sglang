@@ -95,6 +95,7 @@ class Fp4GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_B12X = "flashinfer_b12x"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
