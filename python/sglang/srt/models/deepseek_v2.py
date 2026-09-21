@@ -608,6 +608,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)
@@ -1185,8 +1186,10 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not all_reduce_done:
-            if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-                is_tp_path=True
+            if (
+                self.is_deepseek_v4
+                and self.tp_size > 1
+                and not should_skip_post_experts_all_reduce(is_tp_path=True)
             ):
                 from sglang.srt.layers.moe.mhc_post_fusion import (
                     current_mhc_post_fusion,
@@ -1341,8 +1344,10 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
+        if (
+            self.is_deepseek_v4
+            and self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
             from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
@@ -2788,6 +2793,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
+    """The first stage embeds inputs; the last supplies the EAGLE draft embedding."""
+    return pp_group.is_first_rank or (
+        pp_group.is_last_rank and speculative_algorithm is not None
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2805,7 +2817,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_parallel().pp_group
 
-        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
+        if pp_stage_needs_embedding(self.pp_group, get_spec().speculative_algorithm):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
