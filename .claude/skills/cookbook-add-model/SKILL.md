@@ -169,6 +169,27 @@ least one real deployment or capability boundary. Put orthogonal runtime feature
    variant/quant/strategy needs its own image), `multiNodeHints` only for fabric-specific hw
    (e.g. gb200).
 
+5. **Diffusion pages: add the ComfyUI section.** Every diffusion cookbook page ends with
+   a `## <n>. Run in ComfyUI` section so a reader never has to guess whether the model is
+   reachable from ComfyUI. It is one component; the per-model facts live in the component,
+   not the page:
+
+   ```mdx
+   ## <n>. Run in ComfyUI
+
+   import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+   <ComfyUISupport model="<key>" />
+   ```
+
+   Pick `model` from the table in
+   `docs/src/snippets/diffusion/comfyui-support.jsx`. Use the model's own key when it has
+   an entry (its executor or dedicated node differs); otherwise use the generic `image` or
+   `video`. A model gets its own key only when the plugin actually treats it specially —
+   an entry in `executor_class_dict`
+   (`python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/core/generator.py`) or a
+   dedicated node. Adding a key without the matching plugin support makes the page lie.
+
 ### Site-wiring (do all three)
 
 - **`docs/docs.json`** — add the page under Cookbook → `<category>` → `<Vendor>`, at
