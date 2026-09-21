@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import math
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -41,6 +42,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.kernels.ops.elementwise import beam_fused
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
@@ -62,6 +64,19 @@ def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     """Scale Q using absolute positions, rounding only after multiplication."""
     scale = torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
+
+
+def use_fused_beam_kernels(x: torch.Tensor) -> bool:
+    """Fused Triton paths run on CUDA half-precision activations.
+
+    `SGLANG_BEAM_DISABLE_FUSED=1` restores the eager reference sequence, for
+    ablation and parity checks.
+    """
+    return (
+        x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and os.environ.get("SGLANG_BEAM_DISABLE_FUSED", "0").lower() not in ("1", "true")
+    )
 
 
 def apply_attention_gate(
@@ -339,11 +354,19 @@ class BeamAttention(nn.Module):
             q = apply_ssmax(q, positions)
         attention_output = self.attn(q, k, v, forward_batch)
         gate, _ = self.gate_proj(hidden_states)
-        attention_output = apply_attention_gate(
-            attention_output.view(-1, self.num_heads, self.head_dim),
-            gate.view(-1, self.num_heads, self.head_dim),
-            self.gate_bias,
-        ).view(-1, self.q_size)
+        if use_fused_beam_kernels(attention_output):
+            attention_output = beam_fused.fused_attention_gate(
+                attention_output.view(-1, self.q_size),
+                gate.view(-1, self.q_size),
+                self.gate_bias,
+                self.head_dim,
+            )
+        else:
+            attention_output = apply_attention_gate(
+                attention_output.view(-1, self.num_heads, self.head_dim),
+                gate.view(-1, self.num_heads, self.head_dim),
+                self.gate_bias,
+            ).view(-1, self.q_size)
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -359,6 +382,8 @@ class BeamDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.residual_scale_in_fp32 = config.residual_scale_in_fp32
+        self.rms_norm_eps = config.rms_norm_eps
         attn_depth = 2 * (layer_id + 1)
         mlp_depth = attn_depth + 1
         attn_denominator = math.sqrt(attn_depth)
@@ -422,6 +447,42 @@ class BeamDecoderLayer(nn.Module):
             self.mlp_residual_scales,
         )
 
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        next_norm_weight: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Same arithmetic as `forward` with the two norm/residual transitions fused.
+
+        `normed` is this layer's `input_layernorm(residual)`, produced by the
+        previous transition. Returns the next layer's normalized input (or None
+        when `next_norm_weight` is None, on the last layer of a pipeline stage
+        that does not own the final norm) and the new residual stream.
+        """
+        attn = self.self_attn(positions, normed, forward_batch)
+        normed, residual = beam_fused.fused_sandwich_residual_rmsnorm(
+            attn,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.rms_norm_eps,
+            self.attn_residual_scales,
+            self.residual_scale_in_fp32,
+        )
+        mlp = self.mlp(normed)
+        return beam_fused.fused_sandwich_residual_rmsnorm(
+            mlp,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            next_norm_weight,
+            self.rms_norm_eps,
+            self.mlp_residual_scales,
+            self.residual_scale_in_fp32,
+        )
+
 
 class BeamModel(nn.Module):
     def __init__(
@@ -480,6 +541,10 @@ class BeamModel(nn.Module):
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
         aux_hidden_states = []
+        if use_fused_beam_kernels(hidden_states):
+            return self._forward_fused(
+                positions, hidden_states, forward_batch, aux_hidden_states
+            )
         for layer_id in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[layer_id](
                 positions, hidden_states, forward_batch
@@ -493,6 +558,36 @@ class BeamModel(nn.Module):
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        aux_hidden_states: list,
+    ):
+        # Each fused transition also produces the next layer's normalized input,
+        # so the first norm of this stage is the only standalone one.
+        residual = hidden_states
+        normed = self.layers[self.start_layer].input_layernorm(residual)
+        for layer_id in range(self.start_layer, self.end_layer):
+            if layer_id + 1 < self.end_layer:
+                next_norm_weight = self.layers[layer_id + 1].input_layernorm.weight
+            elif self.pp_group.is_last_rank:
+                next_norm_weight = self.norm.weight
+            else:
+                next_norm_weight = None
+            normed, residual = self.layers[layer_id].forward_fused(
+                positions, normed, residual, forward_batch, next_norm_weight
+            )
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(residual)
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors({"hidden_states": residual})
+        # `normed` already holds `self.norm(residual)`.
+        if self.layers_to_capture:
+            return normed, aux_hidden_states
+        return normed
 
 
 def is_serialized_w4a4_nvfp4(quant_config: QuantizationConfig) -> bool:
