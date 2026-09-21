@@ -1,16 +1,20 @@
-"""Latency and accept length of EAGLE speculative decoding.
+"""Latency and accept length of EAGLE3 speculative decoding.
 
-Registered for CUDA only: the one test here is skipped on ROCm.
+The point of this one is the latency: it is the only place in the tree that
+asserts speculative decoding actually makes generation faster. Every other
+speculative test bounds accept length, which says how many draft tokens
+survive, not what that buys.
+
+Registered for CUDA only -- AMD bounds for this config have not been measured.
 """
 
 import unittest
 
-from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.perf_bench_kit import at_least, at_most, check_perf
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     CustomTestCase,
     run_bench_serving,
 )
@@ -18,11 +22,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestEagleLatency(CustomTestCase):
-    @unittest.skipIf(is_hip(), "Skip Eagle test for ROCm")
-    def test_online_latency_eagle(self):
+class TestEagle3Latency(CustomTestCase):
+    def test_online_latency_eagle3(self):
         res = run_bench_serving(
-            model=DEFAULT_TARGET_MODEL_EAGLE,
+            model=DEFAULT_TARGET_MODEL_EAGLE3,
             num_prompts=300,
             request_rate=8,
             sharegpt_context_len=3072,
@@ -30,9 +33,9 @@ class TestEagleLatency(CustomTestCase):
             dataset_name="sharegpt",
             other_server_args=[
                 "--speculative-algorithm",
-                "EAGLE",
+                "EAGLE3",
                 "--speculative-draft-model-path",
-                DEFAULT_DRAFT_MODEL_EAGLE,
+                DEFAULT_DRAFT_MODEL_EAGLE3,
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
@@ -46,10 +49,12 @@ class TestEagleLatency(CustomTestCase):
             seed=42,
         )
 
+        # Carried over from the EAGLE/Llama-2 config this replaced, so they are
+        # a starting point, not a measured distribution: recalibrate both from
+        # the first CI run of EAGLE3 on this hardware.
         check_perf(
             self,
-            "test_online_latency_eagle",
-            # No AMD bound: `skipIf(is_hip())` means this never runs on ROCm.
+            "test_online_latency_eagle3",
             at_most(
                 "median_e2e_latency_ms", res["median_e2e_latency_ms"], 900, unit="ms"
             ),
