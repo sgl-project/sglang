@@ -26,22 +26,29 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
         n = text_config.num_hidden_layers
-        # Compose with the target model's mapper rather than replacing it: the
-        # loader applies this one for the draft model, and the quantization
-        # config is keyed on the checkpoint's own names, so the checkpoint
-        # prefixes have to be stripped here too.
+        # `_map_name` rewrites a name at most once: it tries the longest rule
+        # first and stops at the first hit. Rules therefore cannot be chained,
+        # so a draft-layer rule has to carry the checkpoint prefix itself rather
+        # than rely on another rule having stripped it. Spell out both forms a
+        # lookup can arrive in -- the checkpoint's own
+        # `model.language_model.layers.{n}` and the already-normalized
+        # `model.layers.{n}` -- so the result does not depend on which one it is.
+        # The prefixed form is always the longer rule, hence tried first, which
+        # also keeps `model.layers.{n}.eh_proj` from matching the `model.` that
+        # ends `language_model.` and mangling the name.
         #
         # Only the transformer block lives under `decoder`; eh_proj, enorm and
-        # hnorm are its siblings directly under `model`. _map_name tries the
-        # longest substring first and stops at the first hit, so the three
-        # specific rules win over the catch-all.
+        # hnorm are its siblings directly under `model`.
+        draft_rules: dict[str, str] = {}
+        for ckpt_prefix in (f"model.language_model.layers.{n}", f"model.layers.{n}"):
+            draft_rules[f"{ckpt_prefix}.eh_proj"] = "model.eh_proj"
+            draft_rules[f"{ckpt_prefix}.enorm"] = "model.enorm"
+            draft_rules[f"{ckpt_prefix}.hnorm"] = "model.hnorm"
+            draft_rules[ckpt_prefix] = "model.decoder"
+        # The target's rules still normalize everything outside the draft layer
+        # (other layers named in `exclude`, and the vision tower).
         return Glm5NextForConditionalGeneration.hf_to_sglang_mapper | WeightsMapper(
-            orig_to_new_substr={
-                f"model.layers.{n}.eh_proj": "model.eh_proj",
-                f"model.layers.{n}.enorm": "model.enorm",
-                f"model.layers.{n}.hnorm": "model.hnorm",
-                f"model.layers.{n}": "model.decoder",
-            },
+            orig_to_new_substr=draft_rules,
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):

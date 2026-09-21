@@ -824,20 +824,13 @@ class QuarkConfig(QuantizationConfig):
             # half-width packed parameter.
             if layer_name.endswith(".experts"):
                 expert_prefix = layer_name + "."
-                expert_configs = [
-                    cfg
+                expert_entries = {
+                    name[len(expert_prefix) :]: cfg
                     for name, cfg in layer_quant_config.items()
                     if name.startswith(expert_prefix)
-                ]
-                if expert_configs:
-                    first = expert_configs[0]
-                    if not all(deep_compare(cfg, first) for cfg in expert_configs):
-                        raise ValueError(
-                            f"Found different quantization configurations among the "
-                            f"experts of {layer_name}. SGLang builds one fused module "
-                            "for them and requires a single scheme."
-                        )
-                    return first
+                }
+                if expert_entries:
+                    return self._fused_expert_config(layer_name, expert_entries)
 
             layer_type = type(module).__name__
             layer_type_quant_config = cast(
@@ -850,6 +843,60 @@ class QuarkConfig(QuantizationConfig):
                 dict[str, Any], self.quant_config.get("global_quant_config")
             )
             return global_quant_config
+
+    @staticmethod
+    def _fused_expert_config(
+        layer_name: str, entries: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Collapse per-expert checkpoint entries into the fused module's scheme.
+
+        `entries` is keyed by what follows `...experts.` in the checkpoint name,
+        i.e. `<expert index>.<projection>`. One fused module covers the whole
+        expert bank at once, so a scheme is only well defined when every expert
+        it spans is pinned the same way. Partial coverage has no right answer --
+        picking any of the entries would silently apply one expert's scheme to
+        experts the checkpoint never mentioned -- so it is rejected.
+        """
+        projections_by_expert: dict[int, set[str]] = {}
+        for suffix in entries:
+            index, _, projection = suffix.partition(".")
+            if not index.isdigit() or not projection:
+                raise ValueError(
+                    f"{layer_name} has a per-expert entry {suffix!r} that is not "
+                    "<expert index>.<projection>, so SGLang cannot tell which "
+                    "experts the fused module's scheme would come from."
+                )
+            projections_by_expert.setdefault(int(index), set()).add(projection)
+
+        indices = sorted(projections_by_expert)
+        missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+        if missing:
+            raise ValueError(
+                f"{layer_name} pins experts up to {indices[-1]} but leaves "
+                f"{len(missing)} of them unpinned (e.g. {missing[:4]}). SGLang "
+                "builds one fused module for the whole bank and cannot give part "
+                "of it a different scheme."
+            )
+
+        projections = projections_by_expert[indices[0]]
+        for index in indices:
+            if projections_by_expert[index] != projections:
+                raise ValueError(
+                    f"{layer_name} pins {sorted(projections)} for expert "
+                    f"{indices[0]} but {sorted(projections_by_expert[index])} for "
+                    f"expert {index}. A fused module needs one scheme covering "
+                    "the same projections of every expert."
+                )
+
+        configs = list(entries.values())
+        first = configs[0]
+        if not all(deep_compare(cfg, first) for cfg in configs):
+            raise ValueError(
+                f"Found different quantization configurations among the experts "
+                f"of {layer_name}. SGLang builds one fused module for them and "
+                "requires a single scheme."
+            )
+        return first
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):

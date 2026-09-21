@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -185,6 +186,138 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
 
     def test_non_mixed_config_returns_none(self):
         self.assertIsNone(_mixed_precision_layer_map({"quant_algo": "NVFP4"}))
+
+
+class TestFusedExpertConfig(CustomTestCase):
+    """Per-expert checkpoint entries resolved against one fused MoE module.
+
+    amd/GLM-5.3-Flash-Quark-MXFP4 pins the NextN layer's 288 experts one by one
+    (864 entries, block FP8) while the rest of the model is MXFP4. SGLang builds
+    a single FusedMoE named `...mlp.experts`, which matches none of those names,
+    so without resolving them the MoE inherits the global MXFP4 scheme and its
+    unpacked FP8 weights meet a half-width packed parameter.
+
+    A fused module covers the whole bank at once, so only full, uniform coverage
+    has a well-defined answer; anything less is rejected rather than silently
+    applied to experts the checkpoint never mentioned.
+    """
+
+    _FP8 = {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_block",
+            "block_size": [128, 128],
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_group",
+            "group_size": 128,
+        },
+    }
+    _MXFP4 = {
+        "weight": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+        "input_tensors": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+    }
+    _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+    def _entries(self, num_experts, projections=None, config=None):
+        projections = projections or self._PROJECTIONS
+        config = config or self._FP8
+        return {
+            f"{index}.{projection}": copy.deepcopy(config)
+            for index in range(num_experts)
+            for projection in projections
+        }
+
+    def _config_with(self, layer_quant_config):
+        quark_config = _bare_config()
+        quark_config.quant_config = {
+            "layer_quant_config": layer_quant_config,
+            "layer_type_quant_config": {},
+            "global_quant_config": self._MXFP4,
+        }
+        quark_config.packed_modules_mapping = {}
+        return quark_config
+
+    def test_complete_uniform_coverage_resolves(self):
+        resolved = QuarkConfig._fused_expert_config(
+            "model.decoder.mlp.experts", self._entries(4)
+        )
+        self.assertEqual(resolved["weight"]["dtype"], "fp8_e4m3")
+        self.assertEqual(resolved["weight"]["block_size"], [128, 128])
+
+    def test_fused_moe_resolves_from_per_expert_entries(self):
+        # End to end through _find_matched_config: the per-expert names must win
+        # over the global MXFP4 scheme for the coarse `...experts` module.
+        prefix = "model.decoder.mlp.experts"
+        quark_config = self._config_with(
+            {f"{prefix}.{suffix}": cfg for suffix, cfg in self._entries(288).items()}
+        )
+        matched = quark_config._find_matched_config(prefix, torch.nn.Module())
+        self.assertEqual(matched["weight"]["dtype"], "fp8_e4m3")
+
+    def test_conflicting_expert_configs_raise(self):
+        entries = self._entries(4)
+        entries["2.up_proj"] = copy.deepcopy(self._MXFP4)
+        with self.assertRaises(ValueError) as ctx:
+            QuarkConfig._fused_expert_config("model.decoder.mlp.experts", entries)
+        self.assertIn("different quantization configurations", str(ctx.exception))
+
+    def test_missing_expert_raises(self):
+        # Expert 2 absent: the remaining entries agree, but they say nothing
+        # about the expert the fused module would still cover.
+        entries = {
+            suffix: cfg
+            for suffix, cfg in self._entries(4).items()
+            if not suffix.startswith("2.")
+        }
+        with self.assertRaises(ValueError) as ctx:
+            QuarkConfig._fused_expert_config("model.decoder.mlp.experts", entries)
+        self.assertIn("unpinned", str(ctx.exception))
+
+    def test_single_pinned_expert_does_not_claim_the_bank(self):
+        with self.assertRaises(ValueError):
+            QuarkConfig._fused_expert_config(
+                "model.decoder.mlp.experts",
+                self._entries(1) | {"7.gate_proj": self._FP8},
+            )
+
+    def test_partial_projection_coverage_raises(self):
+        entries = self._entries(4)
+        del entries["3.down_proj"]
+        with self.assertRaises(ValueError) as ctx:
+            QuarkConfig._fused_expert_config("model.decoder.mlp.experts", entries)
+        self.assertIn("same projections", str(ctx.exception))
+
+    def test_non_per_expert_entry_raises(self):
+        # A fused parameter name (experts.w13_weight_scale) is not <index>.<proj>.
+        with self.assertRaises(ValueError) as ctx:
+            QuarkConfig._fused_expert_config(
+                "model.decoder.mlp.experts", {"w13_weight_scale": self._FP8}
+            )
+        self.assertIn("expert index", str(ctx.exception))
+
+    # ---- Guardrails: unchanged code paths ---------------------------------
+
+    def test_experts_without_per_expert_entries_fall_through_to_global(self):
+        quark_config = self._config_with({})
+        matched = quark_config._find_matched_config(
+            "model.layers.0.mlp.experts", torch.nn.Module()
+        )
+        self.assertEqual(matched["weight"]["dtype"], "fp4")
+
+    def test_shared_experts_module_is_not_treated_as_a_fused_bank(self):
+        # `...mlp.shared_experts` must not pick up the routed experts' entries.
+        quark_config = self._config_with(
+            {
+                f"model.layers.0.mlp.experts.{suffix}": cfg
+                for suffix, cfg in self._entries(4).items()
+            }
+        )
+        matched = quark_config._find_matched_config(
+            "model.layers.0.mlp.shared_experts", torch.nn.Module()
+        )
+        self.assertEqual(matched["weight"]["dtype"], "fp4")
 
 
 class TestParseNvfp4Excludes(CustomTestCase):
