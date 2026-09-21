@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     deep_gemm_fp4_paged_mqa_logits,
+    topk_transform_paged_from_metadata,
 )
 
 CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
@@ -176,6 +177,10 @@ class DeepGemmCandidateIndexer:
         metadata."""
         metadata = inputs.metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
+        if isinstance(metadata.deep_gemm_metadata, list):
+            return self._publish_decode_chunked(
+                inputs, page_indices, raw_indices, seq_lens
+            )
         logits = deep_gemm_fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
@@ -230,6 +235,83 @@ class DeepGemmCandidateIndexer:
                 valid_lens=row_valid_lens,
                 ready=ready,
             )
+
+    def _publish_decode_chunked(
+        self,
+        inputs: IndexerInputs,
+        page_indices: torch.Tensor,
+        raw_indices: Optional[torch.Tensor],
+        seq_lens: torch.Tensor,
+    ) -> SparseBlockTable:
+        """Publish an eager forward whose dense logits are bounded by row chunks.
+
+        CUDA-graph metadata always carries one tensor schedule and keeps using the
+        asynchronous fast path above.  The exceptional eager path stays on the
+        current stream so each chunk's full logits can be released before the next.
+        """
+        metadata = inputs.metadata
+        block_chunks = []
+        phys_block_chunks = []
+        valid_len_chunks = []
+        topk_plans = metadata.topk_metadata_chunks
+        assert not metadata.use_topk_v2 or topk_plans is not None
+
+        for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (inputs.q_fp4[rows], inputs.q_sf[rows]),
+                inputs.k_cache,
+                inputs.weights[rows],
+                metadata.compressed_seq_lens[rows],
+                metadata.page_table[rows],
+                plan,
+                metadata.max_compressed_seq_len,
+            )
+            topk_transform_paged_from_metadata(
+                logits,
+                metadata,
+                page_indices,
+                raw_indices,
+                rows=rows,
+                topk_metadata=(
+                    topk_plans[chunk_idx] if topk_plans is not None else None
+                ),
+            )
+
+            chunk_seq_lens = seq_lens[rows]
+            nblocks, row_valid_lens = candidate_row_lens(
+                chunk_seq_lens, self.topk_blocks
+            )
+            blocks = amax_topk_blocks(logits, chunk_seq_lens, nblocks, self.topk_blocks)
+            phys_blocks = sort_candidate_blocks(
+                blocks,
+                chunk_seq_lens,
+                metadata.page_table[rows],
+                metadata.compressed_page_size,
+            )
+            block_chunks.append(blocks)
+            phys_block_chunks.append(phys_blocks)
+            valid_len_chunks.append(row_valid_lens)
+
+        blocks = torch.cat(block_chunks)
+        phys_blocks = torch.cat(phys_block_chunks)
+        row_valid_lens = torch.cat(valid_len_chunks)
+        schedule = build_sparse_indexer_schedule(
+            blocks,
+            seq_lens,
+            metadata.page_table,
+            metadata.compressed_page_size,
+            inputs.q_fp4.dtype,
+            self._request_ids(inputs.request_ids, inputs.num_rows, blocks.device),
+        )
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        return SparseBlockTable(
+            blocks=blocks,
+            schedule=schedule,
+            phys_blocks=phys_blocks,
+            valid_lens=row_valid_lens,
+            ready=ready,
+        )
 
     def _scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
         return sparse_logits(

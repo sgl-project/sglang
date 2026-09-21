@@ -325,14 +325,27 @@ class PagedIndexerMetadata:
 
     def row_chunks(self):
         num_rows = self.compressed_seq_lens.shape[0]
-        if self.row_chunk <= 0:
+        if self.row_chunk > 0:
+            rows_per_chunk = self.row_chunk
+        elif isinstance(self.deep_gemm_metadata, list):
+            assert self.rows_per_chunk is not None, (
+                "chunked DeepGEMM metadata requires rows_per_chunk"
+            )
+            rows_per_chunk = self.rows_per_chunk
+        else:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]
-        return [
-            (slice(start, min(start + self.row_chunk, num_rows)), plan)
+
+        chunks = [
+            (slice(start, min(start + rows_per_chunk, num_rows)), plan)
             for start, plan in zip(
-                range(0, num_rows, self.row_chunk), self.deep_gemm_metadata
+                range(0, num_rows, rows_per_chunk), self.deep_gemm_metadata
             )
         ]
+        assert chunks and chunks[-1][0].stop == num_rows, (
+            f"chunk schedules do not cover all rows: {num_rows=} {rows_per_chunk=} "
+            f"{len(chunks)=}"
+        )
+        return chunks
 
     def copy_(self, other: PagedIndexerMetadata):
         # A chunked schedule list has no in-place copy; rebind it instead.
