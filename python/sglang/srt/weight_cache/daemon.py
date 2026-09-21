@@ -232,16 +232,7 @@ class WeightCacheDaemon:
                 moe_a2a_backend=self.moe_a2a_backend,
             )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=self.pp_size,
-            expert_model_parallel_size=self.ep_size,
-            attention_data_parallel_size=(
-                self.dp_size if self.enable_dp_attention else 1
-            ),
-            attention_context_model_parallel_size=self.attn_cp_size,
-            moe_data_model_parallel_size=self.moe_dp_size,
-        )
+        initialize_model_parallel()
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
         from sglang.srt.layers.dp_attention import initialize_dp_attention
@@ -283,15 +274,14 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        # The launcher told this daemon where it sits, and it builds the same
-        # groups a scheduler does, so the same one number places it.
         publish(
             server_args,
             role="weight_cache_daemon",
             ranks=SpawnRanks(
                 world_rank=spawn_world_rank(
                     server_args, tp_rank=self.tp_rank, pp_rank=self.pp_rank
-                )
+                ),
+                gpu_id=self.gpu_id,
             ),
         )
 
