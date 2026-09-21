@@ -69,6 +69,9 @@ class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     layout: Optional[HostPoolLayout]
     mirror: Optional[MirrorAdapter]
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    # Local device layers that own buffers for this pool; None means every
+    # layer. Layers outside it are neither mirrored nor transferred.
+    device_layers: Optional[tuple[int, ...]] = None
 
     @property
     def is_primary(self) -> bool:
@@ -205,16 +208,32 @@ def plan_host_pools(
             raise ValueError(f"{d.name}.layout_source must name another pool")
         if d.layout_source not in names:
             raise ValueError(f"{d.name} references undeclared pool {d.layout_source}")
-    layers = LayerBinding(
-        transfer_to_device=full_layer_mapping,
-        transfer_layer_id_max=transfer_layer_id_max,
-    )
     return tuple(
         HostPoolPlan(
             decl=d,
             device_pool=device_pool,
-            layers=layers,
+            layers=LayerBinding(
+                transfer_to_device=_owned_layer_mapping(
+                    full_layer_mapping, d.device_layers, device_pool.layer_num
+                ),
+                transfer_layer_id_max=transfer_layer_id_max,
+            ),
             packed_draft_device_pools=packed_draft_device_pools,
         )
         for d in decls
     )
+
+
+def _owned_layer_mapping(
+    mapping: dict[int, int],
+    device_layers: Optional[tuple[int, ...]],
+    target_layer_num: int,
+) -> dict[int, int]:
+    """Drop transfer layers whose device layer owns no buffer for this pool.
+    Packed draft tails (device index >= target layer count) are kept."""
+    if device_layers is None:
+        return mapping
+    owned = set(device_layers)
+    return {
+        t: dev for t, dev in mapping.items() if dev >= target_layer_num or dev in owned
+    }

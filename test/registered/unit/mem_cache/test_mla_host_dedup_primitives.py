@@ -83,6 +83,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
             index_head_dim=8,
             quant_block_size=4,
+            skip_topk_layers=[False] * 2,
         )
         indexer_host = DSAIndexerPoolHost(
             decl=dsa_indexer_pool_decl(dsa_device_pool),
