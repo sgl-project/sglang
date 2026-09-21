@@ -10,10 +10,10 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes GLM-5.3-Flash support.
+Use an SGLang build that includes GLM-5.3-Flash support (v0.5.20 or later).
 
 ```bash Command
-docker pull lmsysorg/sglang:glm-5.3-flash
+docker pull lmsysorg/sglang:latest
 ```
 
 The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
@@ -134,13 +134,13 @@ The default multimodal feature transport is automatic, and on a single CUDA node
 
 ### 3.1 Reasoning
 
-Thinking is enabled by the checkpoint's generation configuration, and generated commands enable `--reasoning-parser glm45` by default. The OpenAI-compatible API then places thinking in `message.reasoning_content` and the final answer in `message.content`. You can disable **Reasoning Parser** in the Playground when an integration needs the raw response format.
+Thinking is enabled by the checkpoint's generation configuration, and generated commands enable `--reasoning-parser auto` (which resolves to `glm45` for GLM-5.3-Flash) by default. The OpenAI-compatible API then places thinking in `message.reasoning_content` and the final answer in `message.content`. You can disable **Reasoning Parser** in the Playground when an integration needs the raw response format.
 
 To disable thinking for a request, pass `chat_template_kwargs: {"thinking": false}` in the request body.
 
 ### 3.2 Tool calling
 
-Generated commands enable `--tool-call-parser glm47` by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
+Generated commands enable `--tool-call-parser auto` (which resolves to `glm47` for GLM-5.3-Flash) by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
 
 ### 3.3 Multimodal serving
 
