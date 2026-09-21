@@ -40,20 +40,36 @@ class TestAiterFusedSoftmaxTopkSharedGate(CustomTestCase):
 
         captured = {}
 
-        def fake_topk_softmax(
+        # Positional signature must match the aiter op:
+        # (topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm,
+        #  num_shared_experts, shared_expert_scoring_func, hidden_states, gate_weight,
+        #  shared_expert_scale, shared_expert_base)
+        def fake_fused(
             topk_weights,
             topk_ids,
             token_expert_indices,
             gating_output,
             need_renorm,
-            **kwargs,
+            num_shared_experts,
+            shared_expert_scoring_func,
+            hidden_states_arg,
+            gate_weight_arg,
+            shared_expert_scale,
+            shared_expert_base,
         ):
-            captured["weights_buf"] = topk_weights
-            captured["ids_buf"] = topk_ids
-            captured["tei_buf"] = token_expert_indices
-            captured["gating_output"] = gating_output
-            captured["need_renorm"] = need_renorm
-            captured["kwargs"] = kwargs
+            captured.update(
+                weights_buf=topk_weights,
+                ids_buf=topk_ids,
+                tei_buf=token_expert_indices,
+                gating_output=gating_output,
+                need_renorm=need_renorm,
+                num_shared_experts=num_shared_experts,
+                scoring_func=shared_expert_scoring_func,
+                hidden_states=hidden_states_arg,
+                gate_weight=gate_weight_arg,
+                shared_expert_scale=shared_expert_scale,
+                shared_expert_base=shared_expert_base,
+            )
             # Emulate the kernel writing into the caller-owned buffers so we can
             # confirm the wrapper returns the same buffers it allocated.
             topk_weights.fill_(0.25)
@@ -62,7 +78,10 @@ class TestAiterFusedSoftmaxTopkSharedGate(CustomTestCase):
         with (
             patch.object(topk_module, "_use_aiter", True),
             patch.object(
-                topk_module, "aiter_topk_softmax", fake_topk_softmax, create=True
+                topk_module,
+                "aiter_topk_softmax_fused_shared_gate",
+                fake_fused,
+                create=True,
             ),
         ):
             weights, ids = topk_module.aiter_fused_softmax_topk_with_shared_gate(
@@ -105,15 +124,15 @@ class TestAiterFusedSoftmaxTopkSharedGate(CustomTestCase):
 
         # Routed inputs forwarded verbatim (same tensor objects).
         self.assertIs(captured["gating_output"], router_logits)
-        self.assertIs(captured["kwargs"]["hidden_states"], hidden_states)
-        self.assertIs(captured["kwargs"]["gate_weight"], gate_weight)
+        self.assertIs(captured["hidden_states"], hidden_states)
+        self.assertIs(captured["gate_weight"], gate_weight)
         # renormalize threads through to the kernel's need_renorm flag.
         self.assertFalse(captured["need_renorm"])
         # Shared-gate parameters must match the wrapper's arguments exactly.
-        self.assertEqual(captured["kwargs"]["num_shared_experts"], self.NUM_SHARED)
-        self.assertEqual(captured["kwargs"]["shared_expert_scoring_func"], "sigmoid")
-        self.assertEqual(captured["kwargs"]["shared_expert_base"], base)
-        self.assertEqual(captured["kwargs"]["shared_expert_scale"], self.SCALE)
+        self.assertEqual(captured["num_shared_experts"], self.NUM_SHARED)
+        self.assertEqual(captured["scoring_func"], "sigmoid")
+        self.assertEqual(captured["shared_expert_base"], base)
+        self.assertEqual(captured["shared_expert_scale"], self.SCALE)
 
     def test_requires_use_aiter(self):
         with patch.object(topk_module, "_use_aiter", False):
@@ -125,6 +144,22 @@ class TestAiterFusedSoftmaxTopkSharedGate(CustomTestCase):
                     num_fused_shared_experts=self.NUM_SHARED,
                     shared_expert_base=self.NUM_EXPERTS,
                     gate_weight=torch.randn(self.NUM_SHARED, self.HIDDEN),
+                    renormalize=True,
+                    shared_expert_scale=self.SCALE,
+                )
+
+    def test_gate_width_mismatch_raises(self):
+        # gate_weight must have exactly num_fused_shared_experts rows; the kernel
+        # would otherwise read out-of-bounds gate rows.
+        with patch.object(topk_module, "_use_aiter", True):
+            with self.assertRaises(AssertionError):
+                topk_module.aiter_fused_softmax_topk_with_shared_gate(
+                    torch.randn(self.M, self.HIDDEN),
+                    torch.randn(self.M, self.NUM_EXPERTS),
+                    top_k=self.TOP_K,
+                    num_fused_shared_experts=self.NUM_SHARED,
+                    shared_expert_base=self.NUM_EXPERTS,
+                    gate_weight=torch.randn(1, self.HIDDEN),  # 1 row != NUM_SHARED
                     renormalize=True,
                     shared_expert_scale=self.SCALE,
                 )

@@ -70,6 +70,7 @@ from sglang.srt.layers.moe.topk import (
     TopK,
     TopKOutputChecker,
     aiter_fused_softmax_topk_with_shared_gate,
+    aiter_topk_softmax_fused_shared_gate,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -323,10 +324,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         # Option A: on aiter, fold the shared-expert gate GEMV + append into the routed
         # softmax top-k kernel (single launch), replacing the routed-topk + separate
-        # fused-append pair. Requires a per-token gated shared expert (shared_expert_gate).
+        # fused-append pair. Requires a per-token gated shared expert (shared_expert_gate)
+        # and an aiter build that ships the topk_softmax_fused_shared_gate op.
         self.fuse_shared_experts_in_topk = (
-            self.enable_shared_expert_fusion and _use_aiter
+            self.enable_shared_expert_fusion
+            and _use_aiter
+            and aiter_topk_softmax_fused_shared_gate is not None
         )
+        if (
+            self.enable_shared_expert_fusion
+            and _use_aiter
+            and aiter_topk_softmax_fused_shared_gate is None
+        ):
+            logger.warning_once(
+                "aiter lacks topk_softmax_fused_shared_gate; using the routed-topk + "
+                "separate shared-append path. Rebuild aiter to enable the "
+                "single-launch fused shared-expert gate."
+            )
         self._routed_top_k = config.num_experts_per_tok
         self._norm_topk_prob = config.norm_topk_prob
 
