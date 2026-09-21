@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 
 if TYPE_CHECKING:
@@ -48,7 +49,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -472,8 +473,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("thread_count", str(num_threads))
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
+
+        def create_backend():
+            torch.get_device_module(get_device().device).set_device(self.kv_args.gpu_id)
+            return self.agent.create_backend(backend, backend_params)
+
         run_with_deadline(
-            lambda: self.agent.create_backend(backend, backend_params),
+            create_backend,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"NIXL create_backend({backend!r}, {backend_params})",
         )
@@ -1020,6 +1026,59 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         peer_info.kv_xfer_segments = prepared_segments
 
+    def _build_transfer_dst_indices(
+        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+    ) -> List[int]:
+        """Map source entries to destination entries for this transfer.
+
+        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
+        All other layouts use explicit layer IDs, or positional pairing for non-PP.
+        """
+        use_pp_mla_offsets = (
+            self.pp_size > 1
+            and n_src != n_dst
+            and not self.kv_args.kv_layer_ids
+            and not peer_info.dst_kv_layer_ids
+            and self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.mla_compression_ratios
+        )
+        if not use_pp_mla_offsets:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            return [j for _, j in pairs]
+
+        start, end = self._mla_kv_entry_span_with_pp(n_src)
+        # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
+        # span is a matched-pp stage above 0, whose entries start at its own index 0.
+        if end > n_dst:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=False,
+            )
+            return [j for _, j in pairs]
+
+        indices = list(range(start, end))
+        src_item_lens = list(self.kv_args.kv_item_lens)
+        dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+        if src_item_lens != dst_item_lens:
+            # Disagreeing cell sizes mean the peers did not build the same KV geometry;
+            # writing anyway would silently corrupt the peer's pool.
+            raise RuntimeError(
+                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
+                f"prefill over layers [{start}, {end}): prefill item_lens="
+                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+            )
+        return indices
+
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
@@ -1104,14 +1163,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
 
-            pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
-                allow_positional_fallback=self.pp_size == 1,
+            dst_indices = self._build_transfer_dst_indices(
+                peer_info=peer_info, n_src=n_src, n_dst=n_dst
             )
-            dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
@@ -1574,6 +1628,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+        dst_item_lens: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1635,17 +1692,41 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend or force_flat:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                # The source item length is used as the destination stride, so
+                # the paired entries must have identical layouts.
+                if dst_item_lens is not None:
+                    for i, j in pairs:
+                        if item_lens[i] != dst_item_lens[j]:
+                            raise RuntimeError(
+                                f"{state_type} item length mismatch for paired "
+                                f"entries src[{i}]={item_lens[i]} "
+                                f"dst[{j}]={dst_item_lens[j]}"
+                            )
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -1666,6 +1747,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+
+        if not layers_params:
+            return None
 
         src_addrs = []
         src_lens = []
@@ -1783,6 +1867,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_token_indices=src_token_indices,
             token_item_lens=token_item_lens[:num_target],
             pack_offset_bytes=rank * rank_stride,
+            pack_capacity_bytes=rank_stride,
         )
         return packed_source_by_dcp_rank[rank]
 
@@ -2507,6 +2592,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
+                    if 0 in src_dims:
+                        raise RuntimeError(
+                            "Replicated Mamba PD state transfer currently requires "
+                            "matching prefill/decode attention TP sizes"
+                        )
                     h = self._send_mamba_state_slice(
                         peer_name,
                         src_indices,
@@ -2571,6 +2661,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.QSA_PENDING,
+                StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
@@ -2599,6 +2691,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
@@ -2982,7 +3078,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        def bootstrap_thread_guarded():
+            try:
+                bootstrap_thread()
+            except Exception:
+                logger.exception(
+                    "prefill bootstrap_thread died on engine_rank=%s; requests to "
+                    "this rank will time out in KVPoll.Bootstrapping",
+                    self.kv_args.engine_rank,
+                )
+                raise
+
+        threading.Thread(target=bootstrap_thread_guarded).start()
 
 
 class NixlKVSender(CommonKVSender):

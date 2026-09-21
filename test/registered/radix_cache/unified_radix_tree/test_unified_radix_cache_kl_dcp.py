@@ -4,7 +4,7 @@ Under DCP the radix layer allocates widened logical indices while each rank's
 buffers hold only its 1/dcp_size shard, so a missing translation makes cache
 hits return another rank's KV. The KL cases catch that as a large divergence.
 
-Blackwell-only: the MLA DCP decode path needs ``tokenspeed_mla`` (SM100/12x).
+Blackwell-only: ``cutedsl_mla`` is the DCP-native MLA decode kernel on SM100.
 """
 
 import unittest
@@ -65,9 +65,7 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
                 "--page-size",
                 str(PAGE_SIZE),
                 "--attention-backend",
-                "tokenspeed_mla",
-                "--kv-cache-dtype",
-                "fp8_e4m3",
+                "cutedsl_mla",
                 "--dcp-comm-backend",
                 "a2a",
                 "--dcp-replicate-q-proj",
@@ -92,7 +90,10 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
                 str(MAX_MAMBA_CACHE_SIZE),
                 "--enable-metrics",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18, trust_remote_code=True)
 

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -28,13 +30,14 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
     validate_declarations,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
@@ -78,6 +81,59 @@ def _rocm_fp8_wo_a_supported() -> bool:
         return is_wo_a_fp8_mxscale_supported()
     except Exception:  # pragma: no cover - env-dependent
         return False
+
+
+def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str | None:
+    """Read one indexed wo_a dtype without downloading a weight shard."""
+    try:
+        from huggingface_hub import (
+            parse_local_safetensors_file_metadata,
+            parse_safetensors_file_metadata,
+        )
+        from transformers.utils.hub import cached_file
+
+        model_path = model_config.model_path
+        revision = (
+            getattr(model_config.hf_config, "_commit_hash", None)
+            or model_config.revision
+        )
+        index_path = cached_file(
+            model_path,
+            "model.safetensors.index.json",
+            revision=revision,
+            cache_dir=download_dir,
+        )
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        name = next((key for key in weight_map if key.endswith(".wo_a.weight")), None)
+        if name is None:
+            return None
+
+        shard = weight_map[name]
+        local_shard = os.path.join(os.path.dirname(index_path), shard)
+        metadata = (
+            parse_local_safetensors_file_metadata(local_shard)
+            if os.path.isfile(local_shard)
+            else parse_safetensors_file_metadata(model_path, shard, revision=revision)
+        )
+        return getattr(metadata.tensors.get(name), "dtype", None)
+    except Exception:
+        logger.debug("Unable to inspect the checkpoint wo_a dtype", exc_info=True)
+        return None
+
+
+def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -> None:
+    flag = envs.SGLANG_OPT_FP8_WO_A_GEMM
+    if not _rocm_fp8_wo_a_supported():
+        flag.set(False)
+        return
+    if flag.is_set():
+        return
+
+    dtype = _probe_wo_a_weight_dtype(model_config, download_dir)
+    if dtype is not None and dtype != "F8_E4M3":
+        flag.set(False)
+        logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
 
 
 def handle_model_specific_adjustments(server_args: Any):
@@ -229,9 +285,15 @@ def handle_model_specific_adjustments(server_args: Any):
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     if cfg.dp_size < cfg.tp_size:
+                        _, attn_tp_size = derive_attention_widths(
+                            tp_size=cfg.tp_size,
+                            attn_cp_size=cfg.attn_cp_size,
+                            dp_size=cfg.dp_size,
+                            enable_dp_attention=cfg.enable_dp_attention,
+                        )
                         logger.warning(
                             f"DSA with TP mode is active, dp_size={cfg.dp_size}, tp_size={cfg.tp_size}, "
-                            f"attn_tp_size={cfg.tp_size}, attention weights will be sharded across {cfg.tp_size} ranks."
+                            f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
 
                 # The DSA page-size selection moved to the override registry
@@ -339,24 +401,9 @@ def handle_model_specific_adjustments(server_args: Any):
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
-            if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
-                # CUDA/Hopper-only path: its JIT source includes
-                # <cooperative_groups.h> and uses cg::this_cluster()
-                # (thread-block clusters), neither of which exists on ROCm,
-                # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                # here for the rest of the DSA family (DeepSeek-V3.2 /
-                # GLM-5.x) that shares the same decode top-k path.
+            if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                # Prefer HIP top-k by default while honoring an explicit selection.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if model_arch == "GlmMoeDsaForCausalLM":
-                # Open the fused top-k v2 kernel for the GLM-5.x DSA
-                # family on ROCm: it shares this decode top-k path, and
-                # the kernel's ROCm build compiles the streaming levels
-                # on gfx9xx. Order is load-bearing: the blanket disable
-                # above `set`s the variable unconditionally, so this has
-                # to follow it.
-                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
@@ -374,16 +421,19 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
-            validate_deepseek_v4_mega_moe_token_budget,
+            validate_deepseek_v41_features,
         )
 
+        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
-        validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # SM120 lacks tcgen05/TMEM: disable features that depend on
-            # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
+            # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The default top-k v2 path still requires unsupported resources.
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
@@ -401,11 +451,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
-            # e8m0 block-scale equivalent, but only on gfx950 -- everywhere else
-            # keeps the bf16 absorb GEMM.
-            if not _rocm_fp8_wo_a_supported():
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
@@ -786,7 +832,11 @@ def handle_model_capability_adjustments(server_args: Any):
                 "_handle_model_capability_adjustments",
                 prefill_only_disable_kv_cache=True,
             )
-            validate_prefill_only_disable_kv_cache_args(server_args)
+            # Through the registry, not a bare call: an out-of-tree
+            # replacement registered at this validator's own pipeline
+            # position must also win here, at this later re-validation after
+            # the Hopper/Blackwell no-KV-pool default declares itself.
+            run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",
@@ -880,6 +930,13 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
     if not view.uses_mamba_radix_cache:
+        # auto is arch-gated, so only an explicit strategy reaches a non-mamba
+        # arch here, where it would arm the mamba paths and crash at prefill.
+        if mamba_extra_buffer_of(view):
+            raise ValueError(
+                f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
+                f"needs mamba state, got {model_arch}."
+            )
         return
 
     if mamba_extra_buffer_of(view):

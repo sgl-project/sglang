@@ -121,17 +121,18 @@ class Parallel(msgspec.Struct):
         ),
     ] = 1
     dcp_comm_backend: A[
-        str,
+        Optional[str],
         Arg(
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
+            "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
+            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
-    ] = "ag_rs"
+    ] = None
     dcp_replicate_q_proj: A[
         Optional[bool],
         Arg(
@@ -207,6 +208,12 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard shared expert weights across the attention TP group when using an expert-parallel all-to-all backend.",
     ] = False
+    shared_experts_tp_size: A[
+        Optional[int],
+        "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
+        "backend. Must divide attention TP size. Overrides "
+        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+    ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",

@@ -28,7 +28,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -51,12 +50,15 @@ from sglang.srt.mem_cache.allocator.swa import (
     is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedSWAAllocatorBase,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    select_dsv4_kv_layout,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -129,6 +131,16 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 
 _is_npu = is_npu()
+
+
+def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
+    """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
+    stays a bf16 ring; MTP/EAGLE NextN follows the env."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
+    )
+
+    return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
 
 
 def _should_enable_lazy_compaction() -> bool:
@@ -240,6 +252,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    unified_memory_pool_bytes: Optional[int] = None
     unified_total_bytes: Optional[int] = None
 
 
@@ -289,6 +302,23 @@ class KVCacheConfigurator:
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
 
+    def hybrid_swa_token_capacity(
+        self,
+        *,
+        allocator: BaseTokenToKVPoolAllocator,
+        full_capacity: Optional[int],
+        swa_capacity: Optional[int],
+    ) -> int:
+        if get_memory().enable_unified_memory:
+            capacity = allocator.size_full
+            max_total_tokens = get_schedule().max_total_tokens
+            return (
+                min(capacity, max_total_tokens)
+                if max_total_tokens is not None
+                else capacity
+            )
+        return full_capacity or swa_capacity
+
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
@@ -299,7 +329,9 @@ class KVCacheConfigurator:
             quant_name,
             num_layers=num_layers,
             device=self.device,
+            page_size=self.page_size,
         )
+        quant_method.configure_attention_backends_from_server_args(self.server_args)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
@@ -423,6 +455,10 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            # The target's byte envelope excludes the separate draft allocation.
+            unified_memory_pool_bytes=(
+                None if self.is_draft_worker else config.unified_memory_pool_bytes
+            ),
             c4_max_total_num_tokens=c4_max_total_num_tokens,
             c128_max_total_num_tokens=c128_max_total_num_tokens,
             c4_state_pool_size=c4_state_pool_size,
@@ -446,24 +482,12 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
-            pd_enabled = get_disagg().disaggregation_mode != "null"
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
             # Order matters: an Inkling-class model is BOTH mambaish and
             # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
             # FULL lifetime -- its branch reads the HF config's
             # full_attention_layer_ids, which for Inkling is ALL layers.
             if self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    # Same limitation as the 2-pool SWA branch below: the
-                    # tri-pool carries an SWA sub-pool, and there is no
-                    # whole-envelope transfer scheme for it.
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool); this model "
-                        "routes to the mamba+SWA tri-pool, which has one. Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_mamba_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -471,31 +495,17 @@ class KVCacheConfigurator:
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.mambaish_config is not None:
-                if pd_enabled and not self.use_mla_backend:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation "
-                        "currently supports only MLA hybrid-Mamba models "
-                        "(e.g. kimi-linear); this model uses the MHA full-"
-                        "attention pool. Drop --enable-unified-memory or run "
-                        "without PD disaggregation."
-                    )
                 bundle = self._init_unified_mamba_pools(
                     max_num_reqs=sizes.max_running_requests,
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool). Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_memory_pool_bytes=sizes.unified_memory_pool_bytes,
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
@@ -524,7 +534,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool_allocator,
                 (
                     UnifiedMambaTokenToKVPoolAllocator,
-                    UnifiedSWATokenToKVPoolAllocator,
+                    UnifiedSWAAllocatorBase,
                 ),
             ):
                 draft_virtual_id_space = (
@@ -547,7 +557,7 @@ class KVCacheConfigurator:
                 if (
                     isinstance(
                         token_to_kv_pool_allocator,
-                        UnifiedSWATokenToKVPoolAllocator,
+                        UnifiedSWAAllocatorBase,
                     )
                     and self.is_hybrid_swa
                 ):
@@ -835,14 +845,22 @@ class KVCacheConfigurator:
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor input (context len is already passed).
             sliding_window_size=self.model_config.sliding_window_size,
+            # Decode nodes hand out request rows to PREALLOCATED transfers on
+            # top of the running set; the 2-pool mamba factory takes the same.
+            decode_pre_alloc_size=(
+                get_disagg().disaggregation_decode_extra_slots
+                if get_disagg().disaggregation_mode == "decode"
+                else 0
+            ),
         )
 
     def _init_unified_swa_pools(
         self,
         *,
         max_num_reqs: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
+        full_max_total_num_tokens: Optional[int] = None,
+        swa_max_total_num_tokens: Optional[int] = None,
+        unified_memory_pool_bytes: Optional[int] = None,
         unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
@@ -859,16 +877,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        req_to_token_pool = ReqToTokenPool(
-            size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-        )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -903,6 +912,12 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        total_bytes = unified_memory_pool_bytes
+        # An uncapped, draft-free pool owns the profiled budget, including bytes
+        # left over after rounding the FULL/SWA boot capacities to pages.
+        if unified_total_bytes is not None and self.spec_algorithm.is_none():
+            total_bytes = unified_total_bytes
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -919,6 +934,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
@@ -926,9 +942,6 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
-            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor inputs. `model_context_len` bounds the
             # sliding window term only -- the full-attention side is not
             # charged, see `_check_bs1_feasibility_floor`.
@@ -985,32 +998,34 @@ class KVCacheConfigurator:
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
-        if get_disagg().disaggregation_mode == "decode":
-            # Extra slots for pre-allocated requests
-            pre_alloc_size = get_disagg().disaggregation_decode_extra_slots
+        disagg = get_disagg()
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
+            # A flip-capable prefill needs the decode pool shape, and the extra-slot
+            # default is only computed for a decode launch.
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots
+            if disagg.enable_pd_role_switch:
+                pre_alloc_size = pre_alloc_size or 0
             if self.mambaish_config:
-                req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
+                return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
                     extra_max_context_len=extra_max_context_len,
                     pre_alloc_size=pre_alloc_size,
                 )
-            else:
-                req_to_token_pool = self._build_decode_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                    pre_alloc_size=pre_alloc_size,
-                )
-        elif self.mambaish_config:
-            req_to_token_pool = self._build_hybrid_req_pool(
+            return self._build_decode_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+                pre_alloc_size=pre_alloc_size,
+            )
+
+        if self.mambaish_config:
+            return self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
                 extra_max_context_len=extra_max_context_len,
             )
-        else:
-            req_to_token_pool = self._build_default_req_pool(
-                max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
-            )
-        return req_to_token_pool
+        return self._build_default_req_pool(
+            max_num_reqs=max_num_reqs,
+            extra_max_context_len=extra_max_context_len,
+        )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
         mamba_layer_ids = [
@@ -1023,6 +1038,22 @@ class KVCacheConfigurator:
                 if layer_id not in mamba_layer_ids:
                     mamba_layer_ids.append(layer_id)
         return mamba_layer_ids
+
+    def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            return {}
+        return {
+            "short_conv_layer_ids": [
+                i
+                for i in self.mambaish_config.short_conv_layer_ids
+                if self.layer_info.start_layer <= i < self.layer_info.end_layer
+            ],
+            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
+            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
+        }
 
     def _build_hybrid_mamba_decode_req_pool(
         self,
@@ -1049,6 +1080,7 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
@@ -1106,20 +1138,6 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
-        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
-
-        ple_kwargs = {}
-        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
-            ple_kwargs = dict(
-                short_conv_layer_ids=[
-                    i
-                    for i in self.mambaish_config.short_conv_layer_ids
-                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                ],
-                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
-                ngram_context_len=self.mambaish_config.ngram_context_len,
-                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
-            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1131,13 +1149,13 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-            **ple_kwargs,
+            **self._get_ple_req_pool_kwargs(),
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
             speculative_num_draft_tokens=(
                 None
-                if get_disagg().disaggregation_mode == "prefill"
+                if get_disagg().disaggregation_mode == "prefill" and not _is_npu
                 else max_speculative_num_draft_tokens()
             ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
@@ -1208,6 +1226,7 @@ class KVCacheConfigurator:
         if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
                 c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
@@ -1311,6 +1330,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_running_requests: int,
+        full_max_total_num_tokens: int,
         swa_max_total_num_tokens: Optional[int],
         c4_max_total_num_tokens: int,
         c128_max_total_num_tokens: int,
@@ -1332,8 +1352,10 @@ class KVCacheConfigurator:
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
             ] * self.layer_info.num_effective_layers
+            kv_source_layers = []
         else:
             compression_ratios = self.model_config.compress_ratios
+            kv_source_layers = list(self.model_config.hf_config.kv_source_layer_ids)
 
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
@@ -1345,8 +1367,18 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
+            kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            kv_layout_kwargs = dict(
+                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+            )
+
+        unified_fp8 = unified_fp8_for_dsv4_pool(
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -1375,6 +1407,11 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            unified_fp8=unified_fp8,
+            kv_source_layers=kv_source_layers,
+            full_size=full_max_total_num_tokens,
+            **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            **kv_layout_kwargs,
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only
@@ -1884,25 +1921,16 @@ class KVCacheConfigurator:
             else mha_pool_class
         )
         from sglang.srt.layers.attention.qsa.config import (
-            QSA_VARIANT_TOKENWISE,
             parse_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
-            QwenDSATokenToKVPool,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
-        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
-            pool_class = QwenDSATokenToKVPool
-            extra_args.update(
-                qsa_index_kv_heads=qsa_profile.kv_heads,
-                qsa_index_head_dim=qsa_profile.head_dim,
-                qsa_token_budget=qsa_profile.budget,
-            )
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(
@@ -2051,7 +2079,19 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
+                if (
+                    isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and not token_to_kv_pool.needs_paged_swa_allocator
+                ):
+                    token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        sizes.full_max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,
@@ -2121,7 +2161,10 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa and (
+                not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                or token_to_kv_pool.needs_paged_swa_allocator
+            ):
                 if isinstance(
                     token_to_kv_pool_allocator,
                     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -2130,7 +2173,7 @@ class KVCacheConfigurator:
                 else:
                     swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                    swa_allocator, UnifiedSWAAllocatorBase
                 )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
@@ -2168,8 +2211,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=get_parallel().launch_world_size > 1,
+            cpu_group=get_parallel().world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2264,7 +2307,7 @@ class KVCacheConfigurator:
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
+                group=get_parallel().world_group.cpu_group,
             )
             token_capacity = tensor.item()
 
@@ -2373,9 +2416,8 @@ class KVCacheConfigurator:
             f"{config.max_total_num_tokens}"
         )
         if max_tokens != config.max_total_num_tokens:
-            # Token-capped re-derivation: the profiled budget no longer
-            # applies; the recalced config's unified_total_bytes stays None
-            # and the factories fall back to the token-count byte sum.
+            # Re-derive the capped budget: SWA carries unified_memory_pool_bytes;
+            # Mamba factories fall back to token-count sizing without unified_total_bytes.
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
@@ -2394,7 +2436,9 @@ class KVCacheConfigurator:
                 sum(1 for i in all_mamba_layers if start <= i < end)
                 for start, end in (
                     get_pp_indices(
-                        self.model_config.num_hidden_layers, rank, self.ps.pp_size
+                        self.model_config.num_hidden_layers,
+                        rank,
+                        self.ps.pp_size,
                     )
                     for rank in range(self.ps.pp_size)
                 )
