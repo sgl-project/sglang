@@ -69,9 +69,9 @@ def _import_under_stubs(module_name, stub_cm):
     return module
 
 
-LMCacheMode, LMCRadixCache = (
-    lambda m: (m.LMCacheMode, m.LMCRadixCache)
-)(_import_under_stubs(_LMC_MODULE, _install_lmcache_stubs))
+LMCacheMode, LMCRadixCache = (lambda m: (m.LMCacheMode, m.LMCRadixCache))(
+    _import_under_stubs(_LMC_MODULE, _install_lmcache_stubs)
+)
 
 
 class FakeMPConnector:
