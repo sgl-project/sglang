@@ -36,7 +36,11 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size),
+        # A width is a whole topology: state the TP siblings the identities
+        # relate it to, not the attention share alone.
+        get_parallel().override(
+            tp_size=tp_size, attn_tp_size=tp_size, moe_tp_size=tp_size
+        ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield

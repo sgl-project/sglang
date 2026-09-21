@@ -107,7 +107,12 @@ class Derived(msgspec.Struct, frozen=True):
     ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
     which is what a read inside compiled model code needs.
 
-    Every declaration carries ``fn`` today, the parallel quotients included:
+    A declaration with no ``fn`` is one nothing can compute: a rank, or a
+    process group. Those are written into the namespace at runtime -- by
+    ``publish`` from the spawn bundle, or by the build that creates the group --
+    and until then the name has no answer.
+
+    Most declarations carry ``fn``, the parallel quotients included:
     they are a function of the configured leaves, so they are computed at
     publish like the rest. What is special about them is not how they are
     computed but that a stamp can move one afterwards -- ``initialize_dp_attention``

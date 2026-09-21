@@ -2,6 +2,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -135,7 +136,7 @@ def test_srt_attention_tp_group_tracks_diffusion_tp_group():
     # `world_size`, because lending the group also states the parallel widths it
     # implies -- the shared `srt` vision layers ask for `attn_tp_size`, and this
     # package publishes no `srt` config for that read to resolve against.
-    tp_group = SimpleNamespace(world_size=2)
+    tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
 
     with (
         patch.object(parallel_state, "_TP", tp_group),
@@ -147,11 +148,22 @@ def test_srt_attention_tp_group_tracks_diffusion_tp_group():
         assert srt_parallel_state._TP is tp_group
         assert srt_parallel_state._ATTN_TP is tp_group
         assert get_parallel().attn_tp_size == 2
+        # The handle too: assigning the module global does not reach the `srt`
+        # context, which is what the shared layers ask for a group.
+        assert get_parallel().tp_group is tp_group
+        assert get_parallel().attn_tp_group is tp_group
+        # And the ranks the shared layers shard by. Nothing else writes one
+        # here: this package publishes no rank bundle, so a handle without a
+        # rank leaves every `srt` linear unable to say which shard it is.
+        assert get_parallel().tp_rank == 1
+        assert get_parallel().attn_tp_rank == 1
 
         parallel_state._clear_srt_tp_group()
 
         assert srt_parallel_state._TP is None
         assert srt_parallel_state._ATTN_TP is None
+        with pytest.raises(RuntimeError):
+            get_parallel().tp_group
 
 
 def test_srt_owned_groups_are_not_overwritten_or_cleared():

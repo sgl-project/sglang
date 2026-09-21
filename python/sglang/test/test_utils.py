@@ -2095,7 +2095,13 @@ def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
     build outlive any block, so the configuration describing them has to as
     well. Callers that tear the groups down are already resetting the process.
     """
-    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
     from sglang.srt.server_args import ServerArgs
 
     reset_context()
@@ -2104,6 +2110,13 @@ def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
         role="test",
         ranks=SpawnRanks(world_rank=world_rank),
     )
+    # Callers that go on to build groups have already run
+    # `init_distributed_environment`, which states the WORLD group -- and the
+    # build below places every group it creates by reading that back. The reset
+    # above drops it, so hand it over again: publishing a configuration does not
+    # unbuild a process group.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
 
 
 _GPU_IDLE_TIMEOUT_SECS = 30.0

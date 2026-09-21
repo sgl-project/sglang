@@ -24,10 +24,13 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import functools
 import gc
 import logging
 import os
 import pickle
+import sys
+import warnings
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -50,7 +53,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
-    _validate_parallel,
     derive_parallel_widths,
     get_global_dwdp_manager,
     get_parallel,
@@ -2072,8 +2074,7 @@ _WORLD: Optional[GroupCoordinator] = None
 
 
 def get_world_group() -> GroupCoordinator:
-    assert _WORLD is not None, "world group is not initialized"
-    return _WORLD
+    return get_parallel().world_group
 
 
 def init_world_group(
@@ -2152,43 +2153,37 @@ _DCP: Optional[GroupCoordinator] = None
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
-_ENABLE_PDMUX_P_TP: bool = False
 
+@contextmanager
+def pdmux_prefill_tp_group():
+    """Run on the prefill stream's own tensor-parallel communicator.
 
-def set_pdmux_status(enable_prefill_multiplexing: bool):
-    global _ENABLE_PDMUX_P_TP
-    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
+    PD multiplexing builds a duplicate TP group -- the same ranks, a second
+    communicator -- so prefill and decode can occupy separate streams without
+    serialising on one. Nothing about the topology differs, so the scope states
+    the handle and nothing else.
+    """
+    assert _PDMUX_PREFILL_TP_GROUP is not None, (
+        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+    )
+    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
+        yield
 
 
 def get_tp_group() -> GroupCoordinator:
-    if _ENABLE_PDMUX_P_TP:
-        assert _PDMUX_PREFILL_TP_GROUP is not None, (
-            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-        )
-        return _PDMUX_PREFILL_TP_GROUP
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    return _TP
+    return get_parallel().tp_group
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert _ATTN_TP is not None, (
-        "attention tensor model parallel group is not initialized"
-    )
-    return _ATTN_TP
+    return get_parallel().attn_tp_group
 
 
 def get_shared_experts_tp_group() -> GroupCoordinator:
-    assert _SHARED_EXPERTS_TP is not None, (
-        "shared-expert tensor model parallel group is not initialized"
-    )
-    return _SHARED_EXPERTS_TP
+    return get_parallel().shared_experts_tp_group
 
 
 def get_attn_cp_group() -> GroupCoordinator:
-    assert _ATTN_CP is not None, (
-        "attention context model parallel group is not initialized"
-    )
-    return _ATTN_CP
+    return get_parallel().attn_cp_group
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2196,8 +2191,7 @@ def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
 
 
 def get_dcp_group() -> GroupCoordinator:
-    assert _DCP is not None, "decode context parallel group is not initialized"
-    return _DCP
+    return get_parallel().dcp_group
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -2206,18 +2200,15 @@ _MOE_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
-    assert _MOE_DP is not None, "moe data parallel group is not initialized"
-    return _MOE_DP
+    return get_parallel().moe_dp_group
 
 
 def get_moe_ep_group() -> GroupCoordinator:
-    assert _MOE_EP is not None, "expert model parallel group is not initialized"
-    return _MOE_EP
+    return get_parallel().moe_ep_group
 
 
 def get_moe_tp_group() -> GroupCoordinator:
-    assert _MOE_TP is not None, "expert model parallel group is not initialized"
-    return _MOE_TP
+    return get_parallel().moe_tp_group
 
 
 # kept for backward compatibility
@@ -2233,8 +2224,7 @@ def get_self_pp_group() -> GroupCoordinator:
 
 
 def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
+    return get_parallel().pp_group
 
 
 # kept for backward compatibility
@@ -2513,6 +2503,10 @@ def init_distributed_environment(
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size"
         )
+    # Stated here rather than with the groups below it: WORLD is built in this
+    # function, and every group `initialize_model_parallel` builds is placed by
+    # reading it back.
+    get_parallel().override_permanently(world_group=_WORLD)
 
 
 def initialize_model_parallel(
@@ -2692,7 +2686,7 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
-        if get_tensor_model_parallel_rank() == 0:
+        if _TP.rank_in_group == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
@@ -2942,10 +2936,32 @@ def initialize_model_parallel(
         )
 
     # The groups just built and the configuration they were built from are two
-    # accounts of one layout. Check them against each other here, where the
-    # disagreement is still attributable, rather than letting a collective run
-    # on the wrong peers.
-    _validate_parallel(get_parallel(), "group build")
+    # accounts of one layout, and this is where they meet: stating a group
+    # checks the identities, so a group built on the wrong peers is refused
+    # here rather than hanging in a collective later.
+    #
+    # A dimension this configuration does not have is left unstated -- `_DCP`
+    # is None without decode context parallelism -- so reading it says the
+    # group was never built, which is what these getters have always said,
+    # rather than handing back a None to fail on at the collective.
+    #
+    # WORLD is not here: it is built and stated by
+    # `init_distributed_environment`, which is what lets every build above
+    # place its group by reading `get_world_group().local_rank`.
+    built = {
+        "tp_group": _TP,
+        "pp_group": _PP,
+        "moe_ep_group": _MOE_EP,
+        "moe_dp_group": _MOE_DP,
+        "moe_tp_group": _MOE_TP,
+        "attn_tp_group": _ATTN_TP,
+        "attn_cp_group": _ATTN_CP,
+        "shared_experts_tp_group": _SHARED_EXPERTS_TP,
+        "dcp_group": _DCP,
+    }
+    get_parallel().override_permanently(
+        **{name: group for name, group in built.items() if group is not None}
+    )
 
 
 def create_custom_parallel_group(
@@ -3041,8 +3057,8 @@ def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
     assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
 
     _PP_STATE_PATCHED = True
-    old_pp_group = get_pp_group()
     global _PP
+    old_pp_group = _PP
     _PP = pp_group
     try:
         # `pp_size` is a configured leaf: unlike the rank and the handle it
@@ -3096,8 +3112,8 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
     _TP_STATE_PATCHED = True
-    old_tp_group = get_tp_group()
     global _TP
+    old_tp_group = _TP
     _TP = tp_group
     narrowed = dict(
         tp_size=tp_group.world_size,
@@ -3437,3 +3453,84 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
+
+
+# --- deprecation ---------------------------------------------------------
+#
+# These getters are the definition of a name, not a second spelling of it.
+# Business code asks `get_parallel()`, which answers by calling them and which
+# a scope can redirect; a call that arrives here directly cannot be redirected,
+# so a draft worker's scope does not reach it. The package that defines them
+# keeps calling them -- a read there would go through the context back into
+# itself -- so the warning fires only for callers outside it, and once per
+# name, because the point is to name the replacement rather than to fill a log.
+_EXEMPT_CALLERS = ("sglang.srt.distributed.",)
+
+# Which context name each getter here answers. The shim's own bookkeeping --
+# what a getter was replaced by is of no interest to whoever declares the field
+# -- so it is written next to the warning that uses it.
+_CONTEXT_NAME_OF = {
+    "get_world_group": "world_group",
+    "get_tp_group": "tp_group",
+    "get_pp_group": "pp_group",
+    "get_moe_ep_group": "moe_ep_group",
+    "get_moe_dp_group": "moe_dp_group",
+    "get_moe_tp_group": "moe_tp_group",
+    "get_attn_tp_group": "attn_tp_group",
+    "get_attn_cp_group": "attn_cp_group",
+    "get_shared_experts_tp_group": "shared_experts_tp_group",
+    "get_dcp_group": "dcp_group",
+    "get_world_size": "launch_world_size",
+    "get_world_rank": "launch_world_rank",
+    "get_tensor_model_parallel_rank": "tp_rank",
+    "get_pipeline_model_parallel_rank": "pp_rank",
+    "get_moe_expert_parallel_rank": "moe_ep_rank",
+    "get_moe_data_parallel_rank": "moe_dp_rank",
+    "get_moe_tensor_parallel_rank": "moe_tp_rank",
+    "get_attn_tensor_model_parallel_rank": "attn_tp_rank",
+    "get_attn_context_model_parallel_rank": "attn_cp_rank",
+    "get_dcp_rank": "dcp_rank",
+}
+# The width getters read a built group; the context answers the same names from
+# the configuration. Those are one answer rather than two only for the groups
+# the build checks against the configuration -- `_WIDTH_AND_GROUP` in
+# `runtime_context` -- so only those are listed here. `moe_dp`, `moe_tp` and
+# `dcp` are not on that list and are deliberately absent: the MoE-DP group is
+# the attention-CP group when the latter is wider, and the other two are simply
+# not pinned yet.
+_CONTEXT_NAME_OF["get_tensor_model_parallel_world_size"] = "tp_size"
+_CONTEXT_NAME_OF["get_attn_tensor_model_parallel_world_size"] = "attn_tp_size"
+_CONTEXT_NAME_OF["get_attn_context_model_parallel_world_size"] = "attn_cp_size"
+_CONTEXT_NAME_OF["get_pipeline_model_parallel_world_size"] = "pp_size"
+_CONTEXT_NAME_OF["get_moe_expert_parallel_world_size"] = "moe_ep_size"
+
+_ALREADY_WARNED: set = set()
+
+
+def _warn_if_called_from_outside(name: str, replacement: str):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if name not in _ALREADY_WARNED:
+                caller = sys._getframe(1).f_globals.get("__name__", "")
+                if not caller.startswith(_EXEMPT_CALLERS):
+                    _ALREADY_WARNED.add(name)
+                    warnings.warn(
+                        f"{name}() is deprecated; read "
+                        f"get_parallel().{replacement} instead, which answers the "
+                        "same thing and can be redirected by a scope",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
+for _name, _replacement in _CONTEXT_NAME_OF.items():
+    _fn = globals().get(_name)
+    if _fn is not None:
+        globals()[_name] = _warn_if_called_from_outside(_name, _replacement)(_fn)
+del _name, _replacement, _fn

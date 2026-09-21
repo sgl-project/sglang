@@ -97,9 +97,14 @@ def init_world_group(
 
 def _sync_srt_world_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._WORLD is None:
         srt_parallel_state._WORLD = _WORLD
+    if srt_parallel_state._WORLD is _WORLD:
+        # On the context too: that is where a handle is read from, and
+        # assigning the module global above does not reach it.
+        get_parallel().override_permanently(world_group=_WORLD)
 
 
 def _clear_srt_world_group() -> None:
@@ -132,6 +137,27 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._ATTN_TP = _TP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
+            # The group itself, because that is what the `srt` context answers
+            # a handle with -- assigning the module global above does not reach
+            # it. `tp_size` comes with them: the group is as wide as the world
+            # while the dummy carries this package's, and the widths below are
+            # quotients of one number, so stating a subset would describe a
+            # layout that does not exist.
+            tp_group=_TP,
+            attn_tp_group=_TP,
+            tp_size=_TP.world_size,
+            # The ranks too. The shared layers shard by them -- `vision.py`
+            # reads `attn_tp_rank`, every `srt` linear built without an
+            # explicit rank reads `tp_rank` -- and this package publishes no
+            # rank bundle, so nothing else writes one. The draft has no
+            # pipeline, context or expert dimension of its own, so those
+            # positions are zero.
+            tp_rank=_TP.rank_in_group,
+            attn_tp_rank=_TP.rank_in_group,
+            moe_tp_rank=_TP.rank_in_group,
+            attn_cp_rank=0,
+            pp_rank=0,
+            moe_ep_rank=0,
             **derive_parallel_widths(
                 tp_size=_TP.world_size,
                 attn_cp_size=1,
@@ -151,6 +177,10 @@ def _clear_srt_tp_group() -> None:
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
         get_parallel().clear_stamp()
+        if srt_parallel_state._WORLD is not None:
+            # `clear_stamp` drops every stamped name; the WORLD group this
+            # package lent is still built, so hand it back.
+            get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 

@@ -652,10 +652,7 @@ class TestStructuralSignature(unittest.TestCase):
         # must see the same gathered list and thus the same aggregate.
         fake_group.all_gather_object.side_effect = lambda local: ["sig-pp0", "sig-pp1"]
 
-        with mock.patch(
-            "sglang.srt.distributed.parallel_state.get_world_group",
-            return_value=fake_group,
-        ):
+        with get_parallel().override(world_group=fake_group):
             agg_from_rank0 = (
                 PreshardedModelLoader._make_rank_invariant_structural_signature(
                     "sig-pp0"
@@ -673,10 +670,7 @@ class TestStructuralSignature(unittest.TestCase):
             "sig-pp0",
             "sig-pp1-changed",
         ]
-        with mock.patch(
-            "sglang.srt.distributed.parallel_state.get_world_group",
-            return_value=fake_group,
-        ):
+        with get_parallel().override(world_group=fake_group):
             agg_changed = (
                 PreshardedModelLoader._make_rank_invariant_structural_signature(
                     "sig-pp0"

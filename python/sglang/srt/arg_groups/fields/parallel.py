@@ -320,3 +320,73 @@ class Parallel(msgspec.Struct):
         doc="Whether decode context parallelism is in play: `dcp_size` is "
         "wider than one rank, which is exactly when the group gets built.",
     )
+
+    # -- written at runtime, not carried by any configuration --------------
+    #
+    # No `fn`: nothing here is a function of the leaves above. A rank is
+    # written by `publish` from the spawn bundle; a group by the build that
+    # creates it. Until one of them has run there is no answer, and a read
+    # says so rather than deriving something that would answer a different
+    # question.
+    tp_rank = Derived(doc="This process's place in the tensor-parallel group.")
+    pp_rank = Derived(doc="This process's place in the pipeline group.")
+    moe_ep_rank = Derived(doc="This process's place in the expert-parallel group.")
+    moe_dp_rank = Derived(doc=("This process's place in the MoE data-parallel group."))
+    moe_tp_rank = Derived(
+        doc=("This process's place in the MoE tensor-parallel group.")
+    )
+    attn_tp_rank = Derived(
+        doc=("This process's place in the attention tensor-parallel group.")
+    )
+    attn_cp_rank = Derived(
+        doc=("This process's place in the attention context-parallel group.")
+    )
+    dcp_rank = Derived(
+        doc=("This process's place in the decode context-parallel group.")
+    )
+    attn_dcp_rank = Derived(
+        doc=(
+            "Decode context-parallel rank inside the attention TP group, "
+            "zero where decode context parallelism is off."
+        )
+    )
+    attn_dp_rank = Derived(
+        doc=(
+            "This process's index in the attention-DP group, computed from "
+            "`tp_rank` when `initialize_dp_attention` runs."
+        )
+    )
+    dp_rank = Derived(
+        doc=(
+            "Which data-parallel replica this process serves, as the data "
+            "parallel controller numbered them at spawn. `None` when there "
+            "is no controller: unlike the other ranks it is a position in "
+            "no group, which is why the spawn states it."
+        )
+    )
+    launch_world_rank = Derived(
+        doc=(
+            "This process's rank in the WORLD group as built. A scale-up "
+            "does not renumber it."
+        )
+    )
+    launch_world_size = Derived(
+        fn="sglang.srt.runtime_context.launch_world_size_of",
+        doc="Width the WORLD group was built at -- what a scale-up leaves "
+        "behind rather than updates.",
+    )
+    max_world_size = Derived(
+        fn="sglang.srt.runtime_context.max_world_size_of",
+        doc="Ranks the WORLD group has room for: `--max-ep-size` when set, "
+        "otherwise the launch width.",
+    )
+    world_group = Derived(doc="The WORLD group.")
+    tp_group = Derived(doc="The tensor-parallel group.")
+    pp_group = Derived(doc="The pipeline group.")
+    moe_ep_group = Derived(doc="The expert-parallel group.")
+    moe_dp_group = Derived(doc="The MoE data-parallel group.")
+    moe_tp_group = Derived(doc="The MoE tensor-parallel group.")
+    attn_tp_group = Derived(doc="The attention tensor-parallel group.")
+    attn_cp_group = Derived(doc="The attention context-parallel group.")
+    shared_experts_tp_group = Derived(doc=("The shared-expert tensor-parallel group."))
+    dcp_group = Derived(doc="The decode context-parallel group.")
