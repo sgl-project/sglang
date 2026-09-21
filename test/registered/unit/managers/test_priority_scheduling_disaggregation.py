@@ -304,6 +304,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 "sglang.srt.disaggregation.prefill.release_kv_cache"
             ) as release_kv_cache,
             patch("sglang.srt.disaggregation.prefill.prepare_abort"),
+            patch(
+                "sglang.srt.disaggregation.prefill.get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
         ):
             cache.advance_unpublished_req(req, chunked=True)
             SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
