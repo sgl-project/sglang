@@ -183,7 +183,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.end_layer = 4
         kvcache.swa_page_size = 2
         kvcache.swa_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
+            page_size=2,
+            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
         )
         kvcache.c4_kv_pool = SimpleNamespace(
             kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],
@@ -503,7 +504,7 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
         storage.config_prefix = "model_pp0_tag"
         storage.is_mla_backend = True
 
-        def exists(keys):
+        def exists(keys, extra_info=None):
             self.queried.extend(keys)
             return [int(key in self.existing) for key in keys]
 
