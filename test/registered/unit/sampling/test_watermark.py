@@ -229,7 +229,13 @@ def test_disabled_speculative_batch_skips_watermark_state():
 
     with (
         patch.object(eagle_utils, "get_spec", return_value=spec_config),
-        patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+        patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(
+                tp_group=tp_group,
+                attn_tp_group=tp_group,
+            ),
+        ),
         patch(
             "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
         ),

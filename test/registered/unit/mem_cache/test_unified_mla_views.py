@@ -26,9 +26,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.allocator.unified_mamba import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.layout.page_major import build_mla_views
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -37,6 +41,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMLATokenToKVPool,
 )
+from sglang.srt.runtime_context import get_parallel
 
 _DEV = "cpu"
 
@@ -219,6 +224,48 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         k[7] = 2.5
         self.assertTrue(torch.all(v[7] == 2.5))
 
+    def test_cpu_copy_round_trips_through_physical_ids(self):
+        """REGRESSION: the host copy for decode retraction is addressed by
+        PHYSICAL token ids, but this pool's `kv_buffer` views are indexed by
+        kernel-facing ids. Without the rewrite the parent read a different row
+        and the restore silently returned other tokens' KV."""
+        for ps in (1, 4):
+            with self.subTest(page_size=ps):
+                pool, kv_pool = self._make(ps=ps)
+                phys = torch.tensor([0, 1, ps, ps + 1], dtype=torch.int64)
+                self.assertTrue(
+                    torch.equal(
+                        kv_pool._physical_to_kernel_indices(phys),
+                        torch.tensor(
+                            [_kernel_id(int(t), ps, _L) for t in phys],
+                            dtype=torch.int64,
+                        ),
+                    )
+                )
+                for layer in range(_L):
+                    kv_pool.get_key_buffer(layer)[
+                        kv_pool._physical_to_kernel_indices(phys)
+                    ] = float(layer + 1)
+
+                with (
+                    get_parallel().override(dcp_enabled=False),
+                    mock.patch(
+                        "sglang.srt.mem_cache.memory_pool.current_platform.synchronize"
+                    ),
+                ):
+                    saved = kv_pool.get_cpu_copy(phys)
+                    pool._raw.zero_()
+                    kv_pool.load_cpu_copy(saved, phys)
+
+                for layer in range(_L):
+                    restored = kv_pool.get_key_buffer(layer)[
+                        kv_pool._physical_to_kernel_indices(phys)
+                    ]
+                    self.assertTrue(
+                        torch.all(restored == float(layer + 1)),
+                        f"layer {layer} did not round-trip at page_size {ps}",
+                    )
+
     def test_move_kv_cache_moves_page_envelopes(self):
         """Whole page envelopes relocate, in raw bytes and (at ps=4) as read
         back through the per-layer views at the destination kernel ids."""
@@ -332,6 +379,59 @@ class TestTranslateKvLocForKernel(unittest.TestCase):
             x = v.clone()
             alloc.translate_kv_loc_for_kernel(x, out=x)
             self.assertTrue(torch.all(x == no_out))
+
+
+class _RecordingHybridPool:
+    """Stands in for `UnifiedHybridLinearKVPool`, recording the ids it is handed."""
+
+    def __init__(self, full_kv_pool, mamba_pool):
+        self.full_kv_pool = full_kv_pool
+        self.mamba_pool = mamba_pool
+        self.seen = None
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        self.seen = indices.clone()
+        return {"full": None}
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        self.seen = indices.clone()
+
+
+class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
+    """REGRESSION: decode retraction calls the allocator's `get_cpu_copy` with
+    `req_to_token` rows, which hold VIRTUAL ids. This composite inherited the
+    raising base, and a plain delegate would have been just as wrong -- the
+    unified pools read those ids as PHYSICAL."""
+
+    def _build(self, ps=1):
+        pool, _, _ = _make_unified(page_size=ps)
+        kvcache = _RecordingHybridPool(
+            _FakeKVCache(pool.max_slots("full")),
+            _FakeKVCache(pool.max_slots("mamba")),
+        )
+        with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
+            allocator = UnifiedMambaTokenToKVPoolAllocator(
+                unified_buffer=pool, kvcache=kvcache, device=_DEV, page_size=ps
+            )
+        return allocator, kvcache
+
+    def test_pool_is_handed_physical_token_ids(self):
+        alloc, kvcache = self._build()
+        virtual = alloc.alloc(4)
+        self.assertIsNotNone(virtual)
+        virtual = virtual.to(torch.int64)
+        physical = alloc.full_attn_allocator.translate_kv_loc(virtual)
+        # Not identity here, so a delegate that passed the virtual ids straight
+        # through would read and restore other tokens' rows.
+        self.assertFalse(torch.equal(physical, virtual))
+
+        alloc.get_cpu_copy(virtual, req_pool_index=0)
+        self.assertTrue(torch.equal(kvcache.seen, physical))
+
+        alloc.load_cpu_copy({"full": None}, virtual, req_pool_index=0)
+        self.assertTrue(torch.equal(kvcache.seen, physical))
 
 
 if __name__ == "__main__":

@@ -848,6 +848,7 @@ async def server_info():
                 "startup_time": _global_state.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
+                "frontend": "python",
                 # Structured KV-event publisher descriptor for KV-aware routers.
                 # `None` when publishing is disabled or misconfigured; see
                 # `runtime_context.describe_kv_events_publisher` for the contract.
@@ -2272,6 +2273,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         bool(model_info.get("has_image_understanding", False))
         and not get_disagg().language_only
         and not get_disagg().language_model_only
+        and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
     )
     if model_info["is_generation"]:
