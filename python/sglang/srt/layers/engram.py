@@ -42,11 +42,11 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -875,6 +875,67 @@ def engram_gate(
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
+def build_engram_projection(
+    input_size,
+    output_size,
+    *,
+    quant_config,
+    prefix,
+    enabled=False,
+    role=None,
+    tp_rank=0,
+    tp_size=1,
+    dp_attention=False,
+    cp_size=1,
+    prefill_cp=False,
+    sequence_parallel=False,
+):
+    """Shard prefill WKV columns, gathering full outputs before the Engram gate."""
+    if not enabled:
+        return ReplicatedLinear(
+            input_size,
+            output_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if (
+        role != "prefill"
+        or tp_size != 8
+        or dp_attention
+        or cp_size != 1
+        or prefill_cp
+        or sequence_parallel
+    ):
+        raise ValueError(
+            "Engram projection TP requires Prefill, TP8, replicated tokens "
+            "(no DP attention, CP, or sequence parallel)"
+        )
+    block = getattr(quant_config, "weight_block_size", None)
+    if output_size % tp_size or (block and (output_size // tp_size) % block[0]):
+        raise ValueError(
+            "Engram projection partition must align with weight quantization blocks"
+        )
+    layer = ColumnParallelLinear(
+        input_size,
+        output_size,
+        bias=False,
+        gather_output=True,
+        quant_config=quant_config,
+        prefix=prefix,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    logger.info(
+        "Engram projection TP enabled: %s rank=%d/%d local_weight=%s gather_output=True",
+        prefix,
+        tp_rank,
+        tp_size,
+        tuple(layer.weight.shape),
+    )
+    return layer
+
+
 class Engram(nn.Module):
     def __init__(
         self,
@@ -893,12 +954,28 @@ class Engram(nn.Module):
             layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = ReplicatedLinear(
+        projection_options = {}
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_PROJECTION_TP.get():
+            parallel = get_parallel()
+            projection_options = dict(
+                enabled=True,
+                role=get_disagg().disaggregation_mode,
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
+                dp_attention=parallel.enable_dp_attention,
+                cp_size=parallel.attn_cp_size,
+                prefill_cp=parallel.enable_prefill_cp,
+                sequence_parallel=(
+                    parallel.enable_layernorm_sp
+                    or parallel.enable_attn_tp_input_scattered
+                ),
+            )
+        self.wkv = build_engram_projection(
             n_hash_cols * layout.head_dim,
             dim * (hc_mult + 1),
-            bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wkv", prefix),
+            **projection_options,
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
