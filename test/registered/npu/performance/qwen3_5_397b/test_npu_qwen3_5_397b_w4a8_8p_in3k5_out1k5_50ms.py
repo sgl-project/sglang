@@ -9,6 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-16-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-16-npu-a3", nightly=True)
 
 QWEN3_5_397B_A17B_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -16,6 +17,7 @@ QWEN3_5_397B_A17B_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "ASCEND_USE_FIA": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_BUFFSIZE": "0",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "6",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -52,7 +54,7 @@ QWEN3_5_397B_A17B_3K5_1K5_OTHER_ARGS = [
     432,
     "--mem-fraction-static",
     0.8,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     4,
     6,
@@ -123,8 +125,9 @@ class TestNPUQwen3_5_397B_A17B_3K5_1K5_50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     output_token_throughput = 5415
     request_rate = float("inf")
-    temperature = 0.6
-    top_p = 0.95
+    # Disabled to work around DTS2026091033366; re-enable after the fix.
+    # temperature = 0.6
+    # top_p = 0.95
 
     def test_npu_qwen3_5_397b_a17b_3k5_1k5(self):
         """Run NPU performance test for Qwen3.5-397B-A17B in3k5 out1k5"""

@@ -14,6 +14,8 @@ from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
+from sglang.multimodal_gen.runtime.entrypoints.action import openpi
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
@@ -30,8 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.entrypoints.vla import api as vla_api
-from sglang.multimodal_gen.runtime.entrypoints.vla import openpi
+from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -41,6 +42,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
+)
+from sglang.srt.utils.common import (
+    add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
 )
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -52,6 +57,7 @@ logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 SERVER_WARMUP_BYPASS_PATHS = (
+    "/metrics",
     "/liveness",
     "/health",
     "/health_generate",
@@ -205,7 +211,7 @@ async def server_info_endpoint(request: Request):
 
     return {
         "model_path": server_args.model_path,
-        "served_model_name": server_args.model_id or server_args.model_path,
+        "served_model_name": server_args.served_model_name,
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
@@ -264,7 +270,9 @@ async def stats_endpoint(request: Request):
     Returns queue depth, request counts, latency, throughput, etc.
     Sends a GetDisaggStatsReq to the scheduler via ZMQ and returns the result.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        GetDisaggStatsReq,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
     response: dict = {
@@ -395,6 +403,10 @@ def create_app(server_args: ServerArgs):
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
+    if server_args.enable_metrics:
+        configure_metrics()
+        add_prometheus_middleware(app)
+        add_prometheus_track_response_middleware(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -423,8 +435,9 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.task_type.is_action_gen():
-        app.include_router(vla_api.router)
+    if server_args.pipeline_config.supports_action_endpoint():
+        app.include_router(action_api.router)
+    if server_args.pipeline_config.supports_openpi_endpoint():
         app.include_router(openpi.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)

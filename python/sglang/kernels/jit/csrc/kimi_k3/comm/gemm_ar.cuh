@@ -17,7 +17,6 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/cuda_host_adapter.hpp>
 
-#include "ptx_sys.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +33,7 @@
 
 namespace sglang {
 
-namespace ptx {
+namespace device::ptx {
 
 // ---- generic → shared address conversion (PTX ISA §10.4) --------------------
 
@@ -343,7 +342,7 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast_cg1(
       : "memory");
 }
 
-}  // namespace ptx
+}  // namespace device::ptx
 
 namespace swz {
 
@@ -464,11 +463,6 @@ __device__ __forceinline__ int2 group_n_swizzle(int linear, int crank, int clust
 }  // namespace dense_gemm_mainloop
 
 namespace oproj_ar {
-
-using device::distributed::atomic_add_acq_rel_gpu;
-using device::distributed::fence_release_sys;
-using device::distributed::load_acquire_sys;
-using device::distributed::red_add_relaxed_sys;
 
 // ---------------------------------------------------------------- constants
 #ifndef OPROJ_N       // output dim (columns of W / of out). The
@@ -639,19 +633,19 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
   uint64_t* fullb = reinterpret_cast<uint64_t*>(a_st + size_t(S) * kStA);
   uint64_t* emptyb = fullb + S;
 
-  const uint32_t crank = C > 1 ? ptx::cluster_cta_rank() : 0;
+  const uint32_t crank = C > 1 ? device::ptx::cluster_cta_rank() : 0;
   {
     if (tid == 0) {
-      ptx::prefetch_tensormap(&w_map);
-      ptx::prefetch_tensormap(&x_map);
+      device::ptx::prefetch_tensormap(&w_map);
+      device::ptx::prefetch_tensormap(&x_map);
 #pragma unroll
       for (int s = 0; s < S; ++s) {
-        ptx::mbar_init(fullb + s, 1);
-        ptx::mbar_init(emptyb + s, crank == 0 ? kCWarps * C : kCWarps);
+        device::ptx::mbar_init(fullb + s, 1);
+        device::ptx::mbar_init(emptyb + s, crank == 0 ? kCWarps * C : kCWarps);
       }
     }
     __syncthreads();
-    if constexpr (C > 1) ptx::cluster_sync_rel_acq();
+    if constexpr (C > 1) device::ptx::cluster_sync_rel_acq();
 
     if (warp == kCWarps) {
       // ---- producer: the whole K stream, one thread -----------------
@@ -663,28 +657,28 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
         for (int j = 0; j < KSTEPS; ++j) {
           const int slot = j % S;
           const int jj = (j + phase) % KSTEPS;
-          if (j >= S) ptx::mbar_wait_parity(emptyb + slot, ((j - S) / S) & 1);
-          ptx::mbar_arrive_expect_tx(fullb + slot, kStB + kStA);
+          if (j >= S) device::ptx::mbar_wait_parity(emptyb + slot, ((j - S) / S) & 1);
+          device::ptx::mbar_arrive_expect_tx(fullb + slot, kStB + kStA);
 #pragma unroll
           for (int c = 0; c < CH; ++c) {
-            ptx::cp_async_bulk_tensor_2d_load(
-                ptx::to_shared(b_st + size_t(slot) * kStB + c * kBBytes),
+            device::ptx::cp_async_bulk_tensor_2d_load(
+                device::ptx::to_shared(b_st + size_t(slot) * kStB + c * kBBytes),
                 &w_map,
                 (jj * CH + c) * kBK,
                 strip.t0 * 8,
                 fullb + slot);
             if constexpr (C > 1) {
               if (crank == 0)
-                ptx::cp_async_bulk_tensor_2d_load_multicast_cg1(
-                    ptx::to_shared(a_st + size_t(slot) * kStA + c * kABytes),
+                device::ptx::cp_async_bulk_tensor_2d_load_multicast_cg1(
+                    device::ptx::to_shared(a_st + size_t(slot) * kStA + c * kABytes),
                     &x_map,
                     (jj * CH + c) * kBK,
                     0,
                     fullb + slot,
                     uint16_t((1u << C) - 1));
             } else {
-              ptx::cp_async_bulk_tensor_2d_load(
-                  ptx::to_shared(a_st + size_t(slot) * kStA + c * kABytes),
+              device::ptx::cp_async_bulk_tensor_2d_load(
+                  device::ptx::to_shared(a_st + size_t(slot) * kStA + c * kABytes),
                   &x_map,
                   (jj * CH + c) * kBK,
                   0,
@@ -702,36 +696,36 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
       const int a_row = lane & 15, a_ka = lane >> 4;
       for (int s = 0; s < KSTEPS; ++s) {
         const int slot = s % S;
-        ptx::mbar_wait_parity(fullb + slot, (s / S) & 1);
+        device::ptx::mbar_wait_parity(fullb + slot, (s / S) & 1);
 #pragma unroll
         for (int c = 0; c < CH; ++c) {
-          const uint32_t b_base = ptx::to_shared(b_st + size_t(slot) * kStB + c * kBBytes);
+          const uint32_t b_base = device::ptx::to_shared(b_st + size_t(slot) * kStB + c * kBBytes);
 #pragma unroll
           for (int k16 = 0; k16 < kBK / 16; ++k16) {
             uint32_t b0, b1;
-            ptx::ldmatrix_x2_b16(
+            device::ptx::ldmatrix_x2_b16(
                 b_base + uint32_t(b_row) * (kBK * 2) + swz::smem_col_128b_bf16(b_row, (k16 * 2 + b_ka) * 8) * 2,
                 b0,
                 b1);
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
               uint32_t a0, a1, a2, a3;
-              ptx::ldmatrix_x4_b16(
-                  ptx::to_shared(
+              device::ptx::ldmatrix_x4_b16(
+                  device::ptx::to_shared(
                       a_st + size_t(slot) * kStA + c * kABytes + uint32_t(mt * 16 + a_row) * (kBK * 2) +
                       swz::smem_col_128b_bf16(a_row, (k16 * 2 + a_ka) * 8) * 2),
                   a0,
                   a1,
                   a2,
                   a3);
-              ptx::mma_m16n8k16_bf16f32(acc[mt], a0, a1, a2, a3, b0, b1);
+              device::ptx::mma_m16n8k16_bf16f32(acc[mt], a0, a1, a2, a3, b0, b1);
             }
           }
         }
         if (lane == 0) {
-          ptx::mbar_arrive(emptyb + slot);
+          device::ptx::mbar_arrive(emptyb + slot);
           if constexpr (C > 1)
-            if (crank != 0) ptx::mbar_arrive_cluster_release(emptyb + slot, 0);
+            if (crank != 0) device::ptx::mbar_arrive_cluster_release(emptyb + slot, 0);
         }
       }
     }
@@ -751,7 +745,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
     if (tid == 0 && epoch >= 2) {
       const uint32_t e2 = epoch - 2;
       const uint32_t tgt = (e2 / kRing + 1) * R;
-      while (load_acquire_sys(done_local + size_t(e2 % kRing) * kMaxCTA) < tgt) {
+      while (device::ptx::load_acquire_sys(done_local + size_t(e2 % kRing) * kMaxCTA) < tgt) {
       }
     }
     __syncthreads();
@@ -792,19 +786,19 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
   // ---- boundary (gather + flag + per-CTA local-replica spin) -------------
   __syncthreads();
   if (tid == 0) {
-    const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
+    const uint32_t old = device::ptx::atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {
       // ONE completing-CTA fence: publishes every CTA's pushes via the
       // acq_rel gather chain. Measured 0.9 us better than per-CTA
       // fences at bs1 (11.04 vs 11.97) — the parallel-drain theory lost.
-      fence_release_sys();
+      device::ptx::fence_release_sys();
       {
 #pragma unroll
         for (int r = 0; r < R; ++r)
-          red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff) + ring, 1);
+          device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff) + ring, 1);
       }
     }
-    while (load_acquire_sys(flag_local) < flag_target) {
+    while (device::ptx::load_acquire_sys(flag_local) < flag_target) {
     }
   }
   __syncthreads();
@@ -844,7 +838,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
     {
 #pragma unroll
       for (int r = 0; r < R; ++r)
-        red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
+        device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
     }
   }
 }
@@ -913,7 +907,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
                             : 2 * kD3BN <= 256 ? 256
                                                : 512;
   extern __shared__ __align__(1024) uint8_t smem_buf[];
-  const uint32_t smem_base = ptx::to_shared(smem_buf);
+  const uint32_t smem_base = device::ptx::to_shared(smem_buf);
   constexpr uint32_t kSmemAOff = 0, kSmemBOff = kD3NS * kD3ABytes;
 
   __shared__ __align__(8) uint64_t tma_mbars[12];
@@ -940,23 +934,29 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
   const uint32_t gath_target = wrap * gridDim.x;
   const size_t sb = slot_off(parity, prm.my_rank, R);
 
-  if (warp_id == 0 && ptx::elect_one()) {
+  if (warp_id == 0 && device::ptx::elect_one()) {
     for (int i = 0; i < kD3NS; ++i) {
-      ptx::mbar_init(&tma_mbars[i], 1);
-      ptx::mbar_init(&mma_mbars[i], 1);
+      device::ptx::mbar_init(&tma_mbars[i], 1);
+      device::ptx::mbar_init(&mma_mbars[i], 1);
     }
     for (int i = 0; i < 2; ++i) {
-      ptx::mbar_init(&mainloop_mbars[i], 1);
-      ptx::mbar_init(&epi_mbars[i], 4 * 32);
+      device::ptx::mbar_init(&mainloop_mbars[i], 1);
+      device::ptx::mbar_init(&epi_mbars[i], 4 * 32);
     }
   } else if (warp_id == 1) {
-    ptx::tcgen05_alloc(ptx::to_shared(s_taddr), kTmemCols);
+    device::ptx::tcgen05_alloc(device::ptx::to_shared(s_taddr), kTmemCols);
   }
   __syncthreads();
   const uint32_t taddr = s_taddr[0];
 
-  constexpr uint32_t i_desc = ptx::mma_inst_desc_f16(
-      kD3BM, kD3BN, ptx::F16Type::BF16, ptx::F16Type::BF16, ptx::DType::F32, ptx::Major::K, ptx::Major::K);
+  constexpr uint32_t i_desc = device::ptx::mma_inst_desc_f16(
+      kD3BM,
+      kD3BN,
+      device::ptx::F16Type::BF16,
+      device::ptx::F16Type::BF16,
+      device::ptx::DType::F32,
+      device::ptx::Major::K,
+      device::ptx::Major::K);
   auto tile_mn = [&](int linear) -> int2 {
     return dense_gemm_mainloop::group_n_swizzle<1, kD3GroupN>(linear, 0, kGridM, kGridN);
   };
@@ -964,13 +964,13 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
   // Prefetch the first ring of input-independent weight stages before the
   // PDL dependency. SWAP changes which operand slot contains W, but never
   // changes which tensor map is safe to touch here.
-  if (warp_id == 0 && ptx::elect_one()) {
+  if (warp_id == 0 && device::ptx::elect_one()) {
     constexpr int kPrefetch = kIters < kD3NS ? kIters : kD3NS;
     const int2 mn = tile_mn(bid);
 #pragma unroll
     for (int k = 0; k < kPrefetch; ++k) {
-      ptx::mbar_arrive_expect_tx(&tma_mbars[k], kD3ABytes + kD3BBytes);
-      ptx::cp_async_bulk_tensor_2d_load(
+      device::ptx::mbar_arrive_expect_tx(&tma_mbars[k], kD3ABytes + kD3BBytes);
+      device::ptx::cp_async_bulk_tensor_2d_load(
           smem_base + (SWAP ? kSmemAOff + k * kD3ABytes : kSmemBOff + k * kD3BBytes),
           &w_tmap,
           k * kD3BK,
@@ -987,26 +987,26 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     if (tid == 0 && epoch >= 2) {
       const uint32_t e2 = epoch - 2;
       const uint32_t tgt = (e2 / kRing + 1) * R;
-      while (load_acquire_sys(done_local + size_t(e2 % kRing) * kMaxCTA) < tgt) {
+      while (device::ptx::load_acquire_sys(done_local + size_t(e2 % kRing) * kMaxCTA) < tgt) {
       }
     }
     __syncthreads();
   }
 
-  if (warp_id == 0 && ptx::elect_one()) {
+  if (warp_id == 0 && device::ptx::elect_one()) {
     // TMA issuer (simple persistent) — verbatim dense_1cta fp8out shape
     int stage = 0, mma_phase = 1;
     for (int t = bid; t < kTiles; t += num_bids) {
       const int2 mn = tile_mn(t);
       for (int k = 0; k < kIters; ++k) {
-        ptx::mbar_wait_parity(&mma_mbars[stage], mma_phase);
+        device::ptx::mbar_wait_parity(&mma_mbars[stage], mma_phase);
         constexpr bool kDropA = false;
         const bool prefetched = (t == bid && k < kD3NS);
-        if (!prefetched) ptx::mbar_arrive_expect_tx(&tma_mbars[stage], (kDropA ? 0 : kD3ABytes) + kD3BBytes);
+        if (!prefetched) device::ptx::mbar_arrive_expect_tx(&tma_mbars[stage], (kDropA ? 0 : kD3ABytes) + kD3BBytes);
         if constexpr (!kDropA) {
           // In SWAP, A is the prefetched weight; otherwise A is x.
           if (!prefetched || !SWAP)
-            ptx::cp_async_bulk_tensor_2d_load(
+            device::ptx::cp_async_bulk_tensor_2d_load(
                 smem_base + kSmemAOff + stage * kD3ABytes,
                 SWAP ? &w_tmap : &x_tmap,
                 k * kD3BK,
@@ -1015,7 +1015,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
         }
         // In SWAP, B is x; otherwise B is the prefetched weight.
         if (!prefetched || SWAP)
-          ptx::cp_async_bulk_tensor_2d_load(
+          device::ptx::cp_async_bulk_tensor_2d_load(
               smem_base + kSmemBOff + stage * kD3BBytes,
               SWAP ? &x_tmap : &w_tmap,
               k * kD3BK,
@@ -1027,30 +1027,30 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
         }
       }
     }
-  } else if (warp_id == 1 && ptx::elect_one()) {
+  } else if (warp_id == 1 && device::ptx::elect_one()) {
     // MMA issuer with 2-stage TMEM ping-pong
     int stage = 0, tma_phase = 0, ml_stage = 0, epi_phase = 1;
     for (int t = bid; t < kTiles; t += num_bids) {
-      ptx::mbar_wait_parity(&epi_mbars[ml_stage], epi_phase);
+      device::ptx::mbar_wait_parity(&epi_mbars[ml_stage], epi_phase);
       const uint32_t tmem_d = taddr + uint32_t(ml_stage) * kD3BN;
       for (int k = 0; k < kIters; ++k) {
-        ptx::mbar_wait_parity(&tma_mbars[stage], tma_phase);
-        ptx::tcgen05_fence_after_thread_sync();
+        device::ptx::mbar_wait_parity(&tma_mbars[stage], tma_phase);
+        device::ptx::tcgen05_fence_after_thread_sync();
         const uint32_t a_smem = smem_base + kSmemAOff + stage * kD3ABytes;
         const uint32_t b_smem = smem_base + kSmemBOff + stage * kD3BBytes;
 #pragma unroll
         for (int k2 = 0; k2 < kD3KPer; ++k2) {
-          const uint64_t da = ptx::mma_smem_desc_k_major<uint16_t, kD3BK, 128>(a_smem + uint32_t(k2) * 32);
-          const uint64_t db = ptx::mma_smem_desc_k_major<uint16_t, kD3BK, 128>(b_smem + uint32_t(k2) * 32);
-          ptx::tcgen05_mma_f16(tmem_d, da, db, i_desc, (k == 0 && k2 == 0) ? 0u : 1u);
+          const uint64_t da = device::ptx::mma_smem_desc_k_major<uint16_t, kD3BK, 128>(a_smem + uint32_t(k2) * 32);
+          const uint64_t db = device::ptx::mma_smem_desc_k_major<uint16_t, kD3BK, 128>(b_smem + uint32_t(k2) * 32);
+          device::ptx::tcgen05_mma_f16(tmem_d, da, db, i_desc, (k == 0 && k2 == 0) ? 0u : 1u);
         }
-        ptx::tcgen05_commit_arrive(&mma_mbars[stage]);
+        device::ptx::tcgen05_commit_arrive(&mma_mbars[stage]);
         if (++stage == kD3NS) {
           stage = 0;
           tma_phase ^= 1;
         }
       }
-      ptx::tcgen05_commit_arrive(&mainloop_mbars[ml_stage]);
+      device::ptx::tcgen05_commit_arrive(&mainloop_mbars[ml_stage]);
       ml_stage ^= 1;
       if (ml_stage == 0) epi_phase ^= 1;
     }
@@ -1061,21 +1061,21 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     int ml_stage = 0, ml_phase = 0;
     for (int t = bid; t < kTiles; t += num_bids) {
       const int2 mn = tile_mn(t);
-      ptx::mbar_wait_parity(&mainloop_mbars[ml_stage], ml_phase);
-      ptx::tcgen05_fence_after_thread_sync();
+      device::ptx::mbar_wait_parity(&mainloop_mbars[ml_stage], ml_phase);
+      device::ptx::tcgen05_fence_after_thread_sync();
       const uint32_t tmem_d_base = taddr + uint32_t(ml_stage) * kD3BN;
       const int row = mn.x * kD3BM + epi_warp * 32 + lane_id;  // SWAP: n
 #pragma unroll 4
       for (int nb = 0; nb < kNBlk; ++nb) {
         const uint32_t taddr_n = tmem_d_base + uint32_t(nb) * 8 + taddr_lane;
         uint32_t r0, r1, r2, r3, r4, r5, r6, r7;
-        ptx::tcgen05_ld_32x32b_x8(taddr_n, r0, r1, r2, r3, r4, r5, r6, r7);
-        ptx::tcgen05_wait_ld();
+        device::ptx::tcgen05_ld_32x32b_x8(taddr_n, r0, r1, r2, r3, r4, r5, r6, r7);
+        device::ptx::tcgen05_wait_ld();
         uint4 v;
-        v.x = ptx::cvt_pack_f32x2_to<ptx::bf16>(__int_as_float(r1), __int_as_float(r0));
-        v.y = ptx::cvt_pack_f32x2_to<ptx::bf16>(__int_as_float(r3), __int_as_float(r2));
-        v.z = ptx::cvt_pack_f32x2_to<ptx::bf16>(__int_as_float(r5), __int_as_float(r4));
-        v.w = ptx::cvt_pack_f32x2_to<ptx::bf16>(__int_as_float(r7), __int_as_float(r6));
+        v.x = device::ptx::cvt_pack_f32x2_to<device::ptx::bf16>(__int_as_float(r1), __int_as_float(r0));
+        v.y = device::ptx::cvt_pack_f32x2_to<device::ptx::bf16>(__int_as_float(r3), __int_as_float(r2));
+        v.z = device::ptx::cvt_pack_f32x2_to<device::ptx::bf16>(__int_as_float(r5), __int_as_float(r4));
+        v.w = device::ptx::cvt_pack_f32x2_to<device::ptx::bf16>(__int_as_float(r7), __int_as_float(r6));
         if (SWAP || row < M) {  // SWAP masks pad m-cols below
           {
             const size_t off = sb + d3_slot_off(t, nb, epi_warp, lane_id, kNBlk);
@@ -1093,7 +1093,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
           }
         }
       }
-      (void)ptx::mbar_arrive(&epi_mbars[ml_stage]);
+      (void)device::ptx::mbar_arrive(&epi_mbars[ml_stage]);
       ml_stage ^= 1;
       if (ml_stage == 0) ml_phase ^= 1;
     }
@@ -1101,22 +1101,22 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
   __syncthreads();
   device::PDLTriggerSecondary<true>();
   if (warp_id == 1) {
-    ptx::tcgen05_dealloc(taddr, kTmemCols);
-    ptx::tcgen05_relinquish();
+    device::ptx::tcgen05_dealloc(taddr, kTmemCols);
+    device::ptx::tcgen05_relinquish();
   }
 
   // ---- boundary (fam rings) — verbatim member-1 contract ----------------
   if (tid == 0) {
-    const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
+    const uint32_t old = device::ptx::atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {
-      fence_release_sys();
+      device::ptx::fence_release_sys();
       {
 #pragma unroll
         for (int r = 0; r < R; ++r)
-          red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff) + ring, 1);
+          device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff) + ring, 1);
       }
     }
-    while (load_acquire_sys(flag_local) < flag_target) {
+    while (device::ptx::load_acquire_sys(flag_local) < flag_target) {
     }
   }
   __syncthreads();
@@ -1156,16 +1156,16 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     __syncthreads();
     if (tid == 0) {
       uint32_t* const g2 = gather_fam + kRing;  // AG gather ring
-      const uint32_t old = atomic_add_acq_rel_gpu(g2 + ring, 1);
+      const uint32_t old = device::ptx::atomic_add_acq_rel_gpu(g2 + ring, 1);
       if (old + 1 == gath_target) {
-        fence_release_sys();
+        device::ptx::fence_release_sys();
         {
 #pragma unroll
           for (int r = 0; r < R; ++r)
-            red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff + 256) + ring, 1);
+            device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + foff + 256) + ring, 1);
         }
       }
-      while (load_acquire_sys(reinterpret_cast<uint32_t*>(prm.uc_base[prm.my_rank] + foff + 256) + ring) <
+      while (device::ptx::load_acquire_sys(reinterpret_cast<uint32_t*>(prm.uc_base[prm.my_rank] + foff + 256) + ring) <
              flag_target) {
       }
     }
@@ -1200,7 +1200,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
       {
 #pragma unroll
         for (int r = 0; r < R; ++r)
-          red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
+          device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
       }
     }
     return;
@@ -1254,7 +1254,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     {
 #pragma unroll
       for (int r = 0; r < R; ++r)
-        red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
+        device::ptx::red_add_relaxed_sys(reinterpret_cast<uint32_t*>(prm.uc_base[r] + doff2) + off, 1);
     }
   }
 }

@@ -9,23 +9,25 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 def build_eagle_disagg_draft_input(
     batch: ScheduleBatch,
-    server_args: ServerArgs,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> EagleDraftInput:
-    num_states = server_args.speculative_eagle_topk
-    if server_args.enable_multi_layer_eagle:
-        num_states *= server_args.speculative_num_steps
+    # Adaptive spec moves the step count after publish, and this runs once per
+    # prebuilt batch.
+    spec = get_spec()
+    num_states = spec.speculative_eagle_topk
+    if spec.enable_multi_layer_eagle:
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [
@@ -58,7 +60,7 @@ def build_eagle_disagg_draft_input(
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
         dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
-        if should_remap_pd_dsa_seed_to_local_slots(server_args):
+        if should_remap_pd_dsa_seed_to_local_slots():
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token

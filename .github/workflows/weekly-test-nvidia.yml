@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       runner_filter:
-        description: 'Select which runner_config to run (leave empty or "all" to run all)'
+        # A free-text field rather than a choice: `on:` blocks take no
+        # expressions, so an options list would be a second copy of the matrix
+        # below to keep in sync. Matched in _pr-test-stage.yml.
+        description: 'runner_config to run alone (empty or "all" runs every one)'
         required: false
-        type: choice
+        type: string
         default: 'all'
-        options:
-          - 'all'
-          - '8-gpu-h200'
       full_parallel:
         description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
         required: false
@@ -43,17 +43,33 @@ jobs:
       force_continue_on_error: true
     secrets: inherit
 
-  weekly-test-8-gpu-h200:
+  # One row per machine type; timeouts mirror the same runner's nightly job.
+  # Adding a machine is one row here, and adding a test to an existing machine
+  # is none -- `stage="weekly"` + `runner_config=` on the test is enough.
+  weekly-test:
+    # Without this, the matrix default names the job after every value in the
+    # row -- "weekly-test (1-gpu-large, 120, 180)".
+    name: weekly-test-${{ matrix.runner_config }}
     needs: check-changes
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner_config: 1-gpu-large, run_timeout: '120', job_timeout: '180' }
+          - { runner_config: 2-gpu-large, run_timeout: '240', job_timeout: '300' }
+          - { runner_config: 4-gpu-h100, run_timeout: '120', job_timeout: '180' }
+          - { runner_config: 4-gpu-b200, run_timeout: '150', job_timeout: '210' }
+          - { runner_config: 8-gpu-h200, run_timeout: '240', job_timeout: '300' }
+          - { runner_config: 8-gpu-b200, run_timeout: '360', job_timeout: '420' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: weekly-test-8-gpu-h200
-      runner_config: 8-gpu-h200
+      self_name: weekly-test-${{ matrix.runner_config }}
+      runner_config: ${{ matrix.runner_config }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '240'
-      job_timeout_minutes: '300'
+      run_timeout_minutes: ${{ matrix.run_timeout }}
+      job_timeout_minutes: ${{ matrix.job_timeout }}
       scheduled: true
     secrets: inherit

@@ -128,9 +128,14 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        if num_kv_heads is not None and num_kv_heads != num_heads:
-            raise NotImplementedError(
-                "AITer backend does not support Grouped Query Attention yet."
+        # aiter's mha entry points take GQA/MQA K/V directly (they broadcast
+        # each KV head across its group of query heads), so the only
+        # requirement is an even split. The FP8 ASM path is MHA-only and
+        # already routes grouped shapes back to BF16 below.
+        if num_kv_heads is not None and num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"AITer backend requires num_heads ({num_heads}) to be a "
+                f"multiple of num_kv_heads ({num_kv_heads})."
             )
         self.causal = causal
         self.dropout_p = dropout_p
@@ -199,14 +204,14 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output = aiter.flash_attn_func(
             query,
             key,
             value,
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=True,
+            return_lse=False,
         )
         return output
 

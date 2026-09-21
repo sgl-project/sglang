@@ -6,16 +6,25 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
@@ -51,6 +60,25 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
 
+    def test_forwards_prealloc_reclaim_to_logical_allocator(self):
+        """PD decode preallocation must not crash on the HiSparse composite."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        logical_allocator = MagicMock(spec=["reclaim_for_prealloc"])
+        allocator.logical_attn_allocator = logical_allocator
+        logical_allocator.reclaim_for_prealloc.return_value = None
+
+        tree_cache = object()
+        self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, 512, 256))
+        logical_allocator.reclaim_for_prealloc.assert_called_once_with(
+            tree_cache, 512, 256
+        )
+
+        logical_allocator.reclaim_for_prealloc.return_value = "SWA eviction short"
+        self.assertEqual(
+            allocator.reclaim_for_prealloc(tree_cache, 512, 256),
+            "SWA eviction short",
+        )
+
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
@@ -79,7 +107,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
         fill_len = 512
-        swa_tail_len = 128
+        sliding_window_size = 200
+        # _swa_tail_len floors the window start to a page boundary:
+        # floor_align(512 - 200, 256) = 256, so the tail is one whole page.
+        swa_tail_len = 256
         kv_loc = torch.arange(512, 512 + fill_len, dtype=torch.int64)
         host_indices = torch.arange(1000, 1128, dtype=torch.int64)
 
@@ -87,7 +118,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             rid="req-0",
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
-            kv=None,
+            kv=ReqKvInfo(),
         )
 
         def set_extend_range(start, end):
@@ -101,7 +132,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
             def alloc(self, reqs):
                 for item in reqs:
-                    item.req_pool_idx = 0
+                    item.kv.req_pool_idx = 0
                 return torch.tensor([0], dtype=torch.int64)
 
             def write(self, indices, values):
@@ -112,6 +143,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
+            swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )
@@ -133,9 +165,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             enable_hisparse=True,
             hisparse_coordinator=coordinator,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+            sliding_window_size=sliding_window_size,
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue._swa_tail_len = MagicMock(return_value=swa_tail_len)
 
         result = queue._pre_alloc(req)
 
@@ -147,14 +179,14 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
         self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
-        self.assertEqual(req.kv_committed_len, fill_len)
+        self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             len(host_indices),
         )
@@ -174,6 +206,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
         manager._transfer_data = MagicMock(return_value=0)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -214,14 +247,18 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager._send_kvcache_generic = MagicMock(return_value=0)
         executor = MagicMock()
 
-        manager.send_kvcache(
-            "session",
-            np.array([1], dtype=np.int32),
-            [10000, 20000, 30000],
-            np.array([7], dtype=np.int32),
-            executor,
-            dst_device_kv_indices=np.array([21], dtype=np.int32),
-        )
+        # send_kvcache reads the memory bag (the unified-memory envelope-layout
+        # check), so the context has to be published. This is the non-unified
+        # path -- pin that explicitly rather than leaning on the default.
+        with get_context().override_server_args(enable_unified_memory=False):
+            manager.send_kvcache(
+                "session",
+                np.array([1], dtype=np.int32),
+                [10000, 20000, 30000],
+                np.array([7], dtype=np.int32),
+                executor,
+                dst_device_kv_indices=np.array([21], dtype=np.int32),
+            )
 
         kwargs = manager._send_kvcache_generic.call_args.kwargs
         self.assertEqual(kwargs["dst_device_data_ptrs"], {20000, 30000})

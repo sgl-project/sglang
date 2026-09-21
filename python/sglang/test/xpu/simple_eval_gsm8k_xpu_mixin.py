@@ -84,6 +84,9 @@ class SimpleEvalGSM8KXPUMixin(ABC):
             "client": "simple_eval_gsm8k",
             "accuracy_threshold": getattr(self, "accuracy", "N/A"),
             "output_throughput_threshold": getattr(self, "output_throughput", "N/A"),
+            "num_prompts": self.num_examples,
+            "num_threads": self.num_threads,
+            "max_tokens": self.max_tokens,
         }
 
         try:
@@ -102,7 +105,7 @@ class SimpleEvalGSM8KXPUMixin(ABC):
             self.assertGreaterEqual(
                 metrics["score"],
                 accuracy_threshold,
-                f'Accuracy of {self.model} is {metrics["score"]}, '
+                f"Accuracy of {self.model} is {metrics['score']}, "
                 f"is lower than {accuracy_threshold}",
             )
             if "output_throughput" in metrics:
@@ -110,7 +113,7 @@ class SimpleEvalGSM8KXPUMixin(ABC):
                     metrics["output_throughput"],
                     output_throughput_threshold,
                     f"Output throughput of {self.model} is "
-                    f'{metrics["output_throughput"]}, is lower than '
+                    f"{metrics['output_throughput']}, is lower than "
                     f"{output_throughput_threshold}",
                 )
         except Exception as e:
