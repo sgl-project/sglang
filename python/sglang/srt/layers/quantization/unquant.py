@@ -625,86 +625,6 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
-def _bf16_moe_mxfp4_eligible(layer: torch.nn.Module) -> bool:
-    """Whether this layer's dense bf16 experts can be served as MXFP4.
-
-    A model served as MXFP4 can still carry one layer whose experts are dense
-    bf16 -- a draft/MTP layer is the usual case -- and that layer then moves
-    four times the weight bytes per step of its neighbours.
-
-    The gate is deliberately narrow, and reads only the weights: a gate-up
-    fused pair (``w13`` is ``[E, 2I, K]`` against ``w2``'s ``[E, K, I]``), both
-    bf16, Silu, no scales or biases, and K tiling both the 32-wide microscale
-    group and the (16, 16) shuffle. A model with no such layer is untouched.
-    """
-    if not envs.SGLANG_AITER_BF16_MOE_MXFP4.get():
-        return False
-    if getattr(layer, "w13_weight_bias", None) is not None:
-        return False
-    if getattr(layer, "w2_weight_bias", None) is not None:
-        return False
-    if getattr(getattr(layer, "moe_runner_config", None), "activation", None) != "silu":
-        return False
-
-    w13, w2 = layer.w13_weight, layer.w2_weight
-    if w13.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
-        return False
-    if w13.ndim != 3 or w2.ndim != 3 or w13.shape[0] != w2.shape[0]:
-        return False
-    if w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
-        return False
-    return not (
-        w13.shape[2] % 64 or w2.shape[2] % 64 or w13.shape[1] % 32 or w2.shape[1] % 32
-    )
-
-
-def _quant_moe_weight_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP4-quantise one dense bf16 expert weight into the preshuffled layout.
-
-    The same three steps ``Mxfp4MoEMethod`` prepares its weights with: per-1x32
-    e8m0 quant, a (16, 16) weight shuffle, and the matching scale shuffle --
-    which takes the flat ``(E*N, K//32)`` scale the quant step emits.
-
-    Operates on the weight as loaded, before the bf16 path's own shuffle, so
-    there is no layout to undo and no need to infer whether one was applied.
-    """
-    from aiter.ops.quant import per_1x32_mx_quant_hip
-    from aiter.utility import dtypes, fp4_utils
-
-    experts, n, k = w.shape
-    w_qt, w_scale = per_1x32_mx_quant_hip(
-        w.contiguous().view(experts * n, k), quant_dtype=dtypes.fp4x2, shuffle=False
-    )
-    w_qt = shuffle_weight(w_qt.view(experts, n, k // 2), layout=(16, 16))
-    return w_qt, fp4_utils.e8m0_shuffle(w_scale)
-
-
-def _quantize_bf16_moe_to_mxfp4(layer: torch.nn.Module) -> None:
-    """Replace a layer's dense bf16 experts with MXFP4 ones, in place.
-
-    Called from ``process_weights_after_loading``, which precedes CUDA graph
-    capture: the one-shot cost stays out of the graph and off the dispatch
-    path, so no cache or capture-time guard is needed.
-
-    Quantising changes both shape (K -> K//2) and dtype, so the weights are
-    rebound rather than copied into, which keeps the Parameter identity that
-    graph capture holds. Each conversion frees its transient unquantised copy
-    before the next one allocates.
-    """
-    loaded_shapes = (tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape))
-    for weight_name, scale_name in (
-        ("w13_weight", "w13_weight_scale"),
-        ("w2_weight", "w2_weight_scale"),
-    ):
-        qt, scale = _quant_moe_weight_mxfp4(getattr(layer, weight_name).data)
-        copy_or_rebind_param(layer, weight_name, qt)
-        layer.register_parameter(scale_name, Parameter(scale, requires_grad=False))
-        getattr(layer, weight_name).is_shuffled = True
-        torch.cuda.empty_cache()
-
-    logger.info("[aiter] dense bf16 experts %s/%s converted to MXFP4", *loaded_shapes)
-
-
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
@@ -724,8 +644,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
         self.w13_swiglu_interleaved = False
-        # Set by process_weights_after_loading; changes what forward hands aiter.
-        self.aiter_moe_mxfp4 = False
 
     def create_weights(
         self,
@@ -810,21 +728,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and self._aiter_ck_moe_supported(layer)
             and not layer._skip_aiter_moe_shuffle
         )
-        # Also guards re-entry: this hook runs again on hot reload, where the
-        # weights are no longer the bf16 that either branch below expects.
-        if _should_use_aiter_moe and not self.aiter_moe_mxfp4:
-            if _bf16_moe_mxfp4_eligible(layer):
-                _quantize_bf16_moe_to_mxfp4(layer)
-                self.aiter_moe_mxfp4 = True
-            else:
-                copy_or_rebind_param(
-                    layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
-                )
-                torch.cuda.empty_cache()
-                copy_or_rebind_param(
-                    layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
-                )
-                torch.cuda.empty_cache()
+        if _should_use_aiter_moe:
+            copy_or_rebind_param(
+                layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
+            )
+            torch.cuda.empty_cache()
+            copy_or_rebind_param(
+                layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
+            )
+            torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
@@ -1179,23 +1091,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
-                    AiterQuantType,
                 )
 
-                mxfp4 = (
-                    dict(
-                        quant_type=AiterQuantType.PER_1X32,
-                        w13_scale=layer.w13_weight_scale,
-                        w2_scale=layer.w2_weight_scale,
-                    )
-                    if self.aiter_moe_mxfp4
-                    else {}
-                )
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     expert_mask=layer.dispatcher.expert_mask_gpu,
-                    **mxfp4,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 
