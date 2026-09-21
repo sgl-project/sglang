@@ -4,7 +4,7 @@
 //! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras, WeightVersionInfo};
 
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.
@@ -159,6 +159,33 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     serde_json::Value::Array(rows)
 }
 
+/// Match Python's `add_weight_versions_to_meta_info`: clamp terminal spans to
+/// the visible completion count, retaining the first span even for zero output.
+fn weight_version_metadata(
+    info: &WeightVersionInfo,
+    completion_tokens: u64,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    let mut version = info.current.as_ref();
+    if let Some(spans) = &info.spans {
+        let visible: Vec<_> = spans
+            .iter()
+            .filter(|span| span.start < completion_tokens || span.start == 0)
+            .map(|span| {
+                version = &span.version;
+                serde_json::json!({
+                    "version": span.version,
+                    "start": span.start,
+                    "end": span.end.min(completion_tokens),
+                })
+            })
+            .collect();
+        fields.insert("weight_versions".into(), visible.into());
+    }
+    fields.insert("weight_version".into(), version.into());
+    fields
+}
+
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key. Content comes from `out`; request-wide counts
@@ -191,6 +218,12 @@ pub(super) fn frame_value(
             .as_object_mut()
             .expect("meta_info is an object")
             .extend(fields);
+    }
+    if let Some(info) = &cumulative.weight_version {
+        v["meta_info"]
+            .as_object_mut()
+            .expect("meta_info is an object")
+            .extend(weight_version_metadata(info, cumulative.completion_tokens));
     }
     // Logprobs + hidden states ride behind the boxed extras (absent for a plain
     // token/text frame). `[logprob, token_id, text|null]` tuples; text
@@ -277,6 +310,12 @@ pub(super) fn cumulative_frame_json(
         // The typed snapshot serializes as an object. Append only its members;
         // both frame builders use this same schema, including explicit nulls.
         let fields = serde_json::to_string(stats).ok()?;
+        m.push_str(&fields[1..fields.len() - 1]);
+        m.push(',');
+    }
+    if let Some(info) = &o.weight_version {
+        let fields =
+            serde_json::to_string(&weight_version_metadata(info, o.completion_tokens)).ok()?;
         m.push_str(&fields[1..fields.len() - 1]);
         m.push(',');
     }
@@ -459,6 +498,9 @@ impl OutputAccumulator {
         if d.stats.is_some() {
             o.stats.clone_from(&d.stats);
         }
+        if d.weight_version.is_some() {
+            o.weight_version.clone_from(&d.weight_version);
+        }
         // Logprobs/hidden ride behind the boxed extras — most frames have none, so
         // only allocate the accumulator's box once a delta actually carries some.
         let Some(de) = d.extras.as_deref() else {
@@ -569,6 +611,112 @@ impl OutputAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weight_versions_use_visible_spans_in_all_frame_paths() {
+        use crate::message::response::WeightVersionSpan;
+        use serde_json::json;
+
+        let spans = vec![
+            WeightVersionSpan {
+                version: "v1".into(),
+                start: 0,
+                end: 3,
+            },
+            WeightVersionSpan {
+                version: "v2".into(),
+                start: 3,
+                end: 5,
+            },
+            WeightVersionSpan {
+                version: "unused".into(),
+                start: 5,
+                end: 5,
+            },
+        ];
+        // Expected objects captured from Python's add_weight_versions_to_meta_info,
+        // including a current version with no visible tokens and zero output.
+        for (count, expected) in [
+            (
+                0,
+                json!({"weight_version":"v1", "weight_versions":[{"version":"v1","start":0,"end":0}]}),
+            ),
+            (
+                2,
+                json!({"weight_version":"v1", "weight_versions":[{"version":"v1","start":0,"end":2}]}),
+            ),
+            (
+                3,
+                json!({"weight_version":"v1", "weight_versions":[{"version":"v1","start":0,"end":3}]}),
+            ),
+            (
+                4,
+                json!({"weight_version":"v2", "weight_versions":[{"version":"v1","start":0,"end":3},{"version":"v2","start":3,"end":4}]}),
+            ),
+            (
+                5,
+                json!({"weight_version":"v2", "weight_versions":[{"version":"v1","start":0,"end":3},{"version":"v2","start":3,"end":5}]}),
+            ),
+        ] {
+            let mut acc = OutputAccumulator::default();
+            for current in ["default", "parity-v1"] {
+                acc.fold(&ChunkEvent {
+                    weight_version: Some(WeightVersionInfo {
+                        current: current.into(),
+                        spans: None,
+                    }),
+                    ..Default::default()
+                });
+                let value = frame_value(acc.snapshot(), acc.snapshot(), "r");
+                assert_eq!(value["meta_info"]["weight_version"], current);
+                assert!(value["meta_info"].get("weight_versions").is_none());
+            }
+            let terminal = ChunkEvent {
+                completion_tokens: count,
+                weight_version: Some(WeightVersionInfo {
+                    current: "unused".into(),
+                    spans: Some(spans.clone().into()),
+                }),
+                ..Default::default()
+            };
+            acc.fold(&terminal);
+            acc.fold(&ChunkEvent::default()); // Metadata-only end must retain it.
+            assert!(std::sync::Arc::ptr_eq(
+                terminal
+                    .weight_version
+                    .as_ref()
+                    .unwrap()
+                    .spans
+                    .as_ref()
+                    .unwrap(),
+                acc.snapshot()
+                    .weight_version
+                    .as_ref()
+                    .unwrap()
+                    .spans
+                    .as_ref()
+                    .unwrap(),
+            ));
+            for incremental in [false, true] {
+                let value = stream_frame_value(ChunkEvent::default(), &acc, incremental, "r");
+                for (key, expected) in expected.as_object().unwrap() {
+                    assert_eq!(&value["meta_info"][key], expected);
+                }
+            }
+            let plain = frame_value(acc.snapshot(), acc.snapshot(), "r");
+            let cached: serde_json::Value =
+                serde_json::from_str(&cumulative_frame_json(&acc, "r", None).unwrap()).unwrap();
+            assert_eq!(cached, plain);
+            acc.extras_memo_broken = true;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&cumulative_frame_string(
+                    &acc, "r", None
+                ))
+                .unwrap(),
+                plain
+            );
+        }
+    }
 
     #[test]
     fn statistics_are_latest_snapshots_in_both_frame_paths() {
@@ -894,6 +1042,7 @@ mod tests {
                 ChunkEvent {
                     rid: "9".into(),
                     stats: None,
+                    weight_version: None,
                     text: " 世界".into(),
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,

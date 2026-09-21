@@ -675,6 +675,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weight_versions_survive_unary_and_interleaved_streams() {
+        use crate::message::response::{GenerationStats, WeightVersionInfo, WeightVersionSpan};
+
+        for incremental in [false, true] {
+            let (tx0, rx0) = mpsc::channel(4);
+            let (tx1, rx1) = mpsc::channel(4);
+            let stream = generation_event_stream(
+                vec![timed_receiver(10, rx0), timed_receiver(11, rx1)],
+                AbortGuard::new_empty(senders()),
+                incremental,
+                true,
+            );
+            futures::pin_mut!(stream);
+            for (index, tx) in [&tx0, &tx1].into_iter().enumerate() {
+                let version = format!("v{index}");
+                let event = ChunkEvent {
+                    text: "a".into(),
+                    completion_tokens: 1,
+                    token_ids: vec![7],
+                    stats: Some(GenerationStats {
+                        cached_tokens: index as u64,
+                        ..Default::default()
+                    }),
+                    weight_version: Some(WeightVersionInfo {
+                        current: version.into(),
+                        spans: None,
+                    }),
+                    ..Default::default()
+                };
+                tx.send(ResponseItem::Frame(event)).await.unwrap();
+                let value = parse(&stream.next().await.unwrap());
+                assert_eq!(value["index"], index);
+                assert_eq!(value["meta_info"]["weight_version"], format!("v{index}"));
+                assert!(value["meta_info"].get("weight_versions").is_none());
+            }
+            for (index, tx) in [&tx0, &tx1].into_iter().enumerate() {
+                let ResponseItem::Done(mut terminal) = done(10 + index as u64, "") else {
+                    unreachable!()
+                };
+                let version = format!("v{index}");
+                terminal.completion_tokens = 0;
+                terminal.weight_version = Some(WeightVersionInfo {
+                    current: "new-unused".into(),
+                    spans: Some(
+                        vec![WeightVersionSpan {
+                            version: version.clone(),
+                            start: 0,
+                            end: 1,
+                        }]
+                        .into(),
+                    ),
+                });
+                tx.send(ResponseItem::Done(terminal.clone())).await.unwrap();
+                let value = parse(&stream.next().await.unwrap());
+                assert_eq!(value["index"], index);
+                assert_eq!(value["meta_info"]["cached_tokens"], index);
+                assert_eq!(value["meta_info"]["weight_version"], version);
+                assert_eq!(value["meta_info"]["weight_versions"][0]["end"], 1);
+
+                let (unary_tx, mut unary_rx) = mpsc::channel(1);
+                terminal.completion_tokens = 1;
+                unary_tx.send(ResponseItem::Done(terminal)).await.unwrap();
+                let (status, unary, _) =
+                    drain_unary(&mut unary_rx, "r", RequestTiming::new()).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    unary["meta_info"]["weight_versions"],
+                    value["meta_info"]["weight_versions"]
+                );
+                assert_eq!(unary["meta_info"]["weight_version"], version);
+            }
+            assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        }
+    }
+
+    #[tokio::test]
     async fn health_is_unavailable_before_startup_warmup_finishes() {
         let state = Arc::new(AppState {
             senders: senders(),

@@ -4,6 +4,7 @@
 //! per-request [`ChunkEvent`]s.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -121,9 +122,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; trailing extras default empty and omitted statistics default absent
-/// for older producers. New producers include the scheduler statistics even
-/// without logprob/hidden columns.
+/// required; trailing extras default empty and omitted scheduler metadata stays
+/// absent for older producers. New producers include statistics and weight
+/// versions even without logprob/hidden columns.
 /// Field order is the wire ABI and must match `RustServer.push_generation` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
@@ -177,6 +178,10 @@ pub struct BatchHeader {
     pub retraction_counts: Option<Vec<u64>>,
     #[serde(default, deserialize_with = "present_column")]
     pub dp_ranks: Option<Vec<Option<u32>>>,
+    #[serde(default)]
+    pub weight_version: Option<String>,
+    #[serde(default)]
+    pub weight_versions: Option<Vec<Option<Vec<WeightVersionSpan>>>>,
 }
 
 /// Only an omitted tail column is absent. A supplied column must be an array,
@@ -301,6 +306,25 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     if has_stats && stats_lengths.iter().any(|&len| len != Some(n)) {
         reject!()
     }
+    if let Some(columns) = &h.weight_versions {
+        if h.weight_version.is_none() || columns.len() != n {
+            reject!()
+        }
+        for (i, spans) in columns.iter().enumerate() {
+            if let Some(spans) = spans
+                && (h.finish_reasons[i].is_none()
+                    || spans.is_empty()
+                    || spans[0].start != 0
+                    || spans.iter().any(|span| span.start > span.end)
+                    || spans.windows(2).any(|pair| pair[0].end != pair[1].start))
+            {
+                reject!()
+            }
+        }
+    }
+    // One shared version per batch; terminal histories move into shared slices
+    // so folding an event never deep-copies the scheduler's span list.
+    let weight_version = h.weight_version.take().map(Arc::<str>::from);
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
     let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
@@ -493,6 +517,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 num_retractions: h.retraction_counts.as_ref().unwrap()[i],
                 dp_rank: h.dp_ranks.as_ref().unwrap()[i],
             }),
+            weight_version: weight_version.as_ref().map(|current| WeightVersionInfo {
+                current: Arc::clone(current),
+                spans: h
+                    .weight_versions
+                    .as_mut()
+                    .and_then(|v| v[i].take())
+                    .map(Arc::from),
+            }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
             // until it is actually decoded. With the struct-update syntax it
@@ -603,10 +635,28 @@ pub struct ChunkEvent {
     /// Latest scheduler snapshot, independent of per-step token/logprob deltas.
     /// None for older producers or synthetic events without updated statistics.
     pub stats: Option<GenerationStats>,
+    /// Current scheduler version and, on terminal events, the complete history.
+    pub weight_version: Option<WeightVersionInfo>,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
     pub extras: Option<Box<ChunkExtras>>,
+}
+
+/// One scheduler-owned half-open token range. Python's array-like
+/// `WeightVersionSpan` has this field order; native JSON uses named members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightVersionSpan {
+    pub version: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Latest version snapshot, separate from cumulative generation statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightVersionInfo {
+    pub current: Arc<str>,
+    pub spans: Option<Arc<[WeightVersionSpan]>>,
 }
 
 /// Scheduler-owned cumulative counts and cache/routing state. Replaced as one
@@ -820,6 +870,106 @@ mod tests {
                     !requests && count == 21
                 );
             }
+        }
+    }
+
+    /// Captured from the Python test helper: payload(rust=True, version="v2",
+    /// finished=(1,)), sent through RustServer.push_generation with version v2.
+    #[test]
+    fn decodes_python_weight_version_spans() {
+        let header =
+            b"\xdc\x00\x17\x92\xa1\x30\xa1\x31\x92\xc0\x82\xa4\x74\x79\x70\x65\xa6\x6c\x65\x6e\
+\x67\x74\x68\xa6\x6c\x65\x6e\x67\x74\x68\x01\x92\x02\x02\x92\x01\x01\x90\x90\x90\
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x92\x00\x07\x92\xc0\x82\xa6\x64\x65\x76\x69\
+\x63\x65\x07\xa4\x68\x6f\x73\x74\x00\x92\x00\x04\x92\x00\x02\x92\xc0\xc0\xa2\x76\
+\x32\x92\xc0\x92\x93\xa2\x76\x30\x00\x00\x93\xa2\x76\x32\x00\x01";
+        let frame = frame_decode_batch_cols(header, &[&3i32.to_le_bytes(), &3i32.to_le_bytes()]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |e| events.push(e)).ok);
+        assert!(events[0].weight_version.as_ref().unwrap().spans.is_none());
+        let info = events[1].weight_version.as_ref().unwrap();
+        assert_eq!(info.current.as_ref(), "v2");
+        assert_eq!(
+            serde_json::to_value(info.spans.as_deref().unwrap()).unwrap(),
+            serde_json::json!([
+                {"version":"v0", "start":0, "end":0},
+                {"version":"v2", "start":0, "end":1},
+            ])
+        );
+        assert_eq!(events[1].token_ids, vec![3]);
+        assert_eq!(events[1].stats.as_ref().unwrap().cached_tokens, 7);
+    }
+
+    #[test]
+    fn weight_versions_are_validated_before_routing() {
+        use serde_json::json;
+
+        let mut columns = vec![json!([]); 23];
+        columns[..4].clone_from_slice(&[
+            json!(["a", "b"]),
+            json!([null, {"type":"length", "length":2}]),
+            json!([3, 3]),
+            json!([0, 0]),
+        ]);
+        columns[16..21].clone_from_slice(&[
+            json!([0, 0]),
+            json!([null, null]),
+            json!([0, 0]),
+            json!([0, 0]),
+            json!([null, null]),
+        ]);
+        columns[21] = json!("v2");
+        columns[22] = json!([null, [["v1", 0, 1], ["v2", 1, 2]]]);
+        let frame_for = |columns: &[serde_json::Value]| {
+            frame_decode_batch_cols(&rmp_serde::to_vec(columns).unwrap(), &[])
+        };
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame_for(&columns)[1..], |e| events.push(e)).ok);
+        let a = events[0].weight_version.as_ref().unwrap();
+        let b = events[1].weight_version.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&a.current, &b.current));
+        assert!(a.spans.is_none());
+        assert_eq!(b.spans.as_ref().unwrap()[1].start, 1);
+        for count in [4, 16, 21] {
+            assert!(
+                for_each_chunk(&frame_for(&columns[..count])[1..], |e| assert!(
+                    e.weight_version.is_none()
+                ))
+                .ok
+            );
+        }
+        for (column, invalid) in [
+            (21, json!(null)),
+            (21, json!(42)),
+            (22, json!([])),
+            (22, json!([null])),
+            (22, json!([[["v2", 0, 1]], null])), // Nonterminal request.
+            (22, json!([null, []])),
+            (22, json!([null, [["v1", 1, 2]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 3, 4]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 1, 4]]])),
+            (22, json!([null, [["v1", 0, 2], ["v2", 2, 1]]])),
+            (22, json!([null, [["v1", 0, -1]]])),
+            (22, json!([null, [[true, 0, 1]]])),
+        ] {
+            let mut bad = columns.clone();
+            bad[column] = invalid;
+            let decoded = for_each_chunk(&frame_for(&bad)[1..], |_| {
+                panic!("invalid version data routed")
+            });
+            assert!(!decoded.ok, "{bad:?}");
+            assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
+        }
+        for spans in [json!(null), json!([null, [["v1", 0, 0]]])] {
+            columns[22] = spans;
+            assert!(for_each_chunk(&frame_for(&columns)[1..], |_| {}).ok);
+        }
+        let mut idle = vec![json!([]); 21];
+        idle.push(json!("default"));
+        for spans in [json!(null), json!([])] {
+            let mut idle = idle.clone();
+            idle.push(spans);
+            assert!(for_each_chunk(&frame_for(&idle)[1..], |_| panic!("idle batch")).ok);
         }
     }
 
@@ -1357,13 +1507,13 @@ mod tests {
         assert_ne!(events[0].rid, events[1].rid);
     }
 
-    /// Common statistics stay inline (56 bytes); rare logprob/hidden columns
-    /// remain boxed. Avoid an allocation for every ordinary scheduler snapshot.
+    /// Statistics (56 bytes) and shared version references (32 bytes) stay inline;
+    /// rare logprob/hidden columns remain boxed. No box per scheduler snapshot.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 200,
+            sz <= 232,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
