@@ -67,6 +67,7 @@
                 "49": 415.12
             },
             "expected_e2e_ms": 20864.25,
+            "expected_load_ms": 97012.4,
             "expected_avg_denoise_ms": 400.64,
             "expected_median_denoise_ms": 414.97
         },
@@ -133,6 +134,7 @@
                 "49": 723.94
             },
             "expected_e2e_ms": 38031.14,
+            "expected_load_ms": 289464.12,
             "expected_avg_denoise_ms": 707.34,
             "expected_median_denoise_ms": 730.65,
             "estimated_full_test_time_s": 488.4
@@ -200,6 +202,7 @@
                 "49": 514.61
             },
             "expected_e2e_ms": 28194.51,
+            "expected_load_ms": 64374.74,
             "expected_avg_denoise_ms": 503.81,
             "expected_median_denoise_ms": 519.54,
             "estimated_full_test_time_s": 157.8
@@ -257,6 +260,7 @@
                 "39": 4663.42
             },
             "expected_e2e_ms": 191226.03,
+            "expected_load_ms": 191706.92,
             "expected_avg_denoise_ms": 4610.43,
             "expected_median_denoise_ms": 4675.92,
             "estimated_full_test_time_s": 987.8
@@ -323,6 +327,7 @@
                 "49": 627.63
             },
             "expected_e2e_ms": 32007.87,
+            "expected_load_ms": 189815.01,
             "expected_avg_denoise_ms": 622.38,
             "expected_median_denoise_ms": 616.41,
             "estimated_full_test_time_s": 275.2
@@ -390,6 +395,7 @@
                 "49": 762.87
             },
             "expected_e2e_ms": 50170.28,
+            "expected_load_ms": 99622.75,
             "expected_avg_denoise_ms": 732.61,
             "expected_median_denoise_ms": 762.9
         },
@@ -433,6 +439,7 @@
                 "29": 608.5
             },
             "expected_e2e_ms": 87668.19,
+            "expected_load_ms": 142742.95,
             "expected_avg_denoise_ms": 612.91,
             "expected_median_denoise_ms": 616.66
         },
@@ -498,6 +505,7 @@
                 "49": 601.63
             },
             "expected_e2e_ms": 30601.77,
+            "expected_load_ms": 71182.61,
             "expected_avg_denoise_ms": 602.23,
             "expected_median_denoise_ms": 602.13
         },
@@ -518,6 +526,7 @@
                 "3": 38.14
             },
             "expected_e2e_ms": 1262.89,
+            "expected_load_ms": 71785.95,
             "expected_avg_denoise_ms": 40.02,
             "expected_median_denoise_ms": 39.31
         },
@@ -574,6 +583,7 @@
                 "39": 2023.11
             },
             "expected_e2e_ms": 82380.9,
+            "expected_load_ms": 129721.11,
             "expected_avg_denoise_ms": 1965.41,
             "expected_median_denoise_ms": 2021.99,
             "estimated_full_test_time_s": 239.7
@@ -641,6 +651,7 @@
                 "49": 1399.95
             },
             "expected_e2e_ms": 74704.75,
+            "expected_load_ms": 153981.82,
             "expected_avg_denoise_ms": 1439.74,
             "expected_median_denoise_ms": 1388.87,
             "estimated_full_test_time_s": 175.6
@@ -700,6 +711,7 @@
                 "39": 653.36
             },
             "expected_e2e_ms": 30063.69,
+            "expected_load_ms": 124944.99,
             "expected_avg_denoise_ms": 663.7,
             "expected_median_denoise_ms": 665.18,
             "estimated_full_test_time_s": 255.2
@@ -768,6 +780,7 @@
                 "48": 97.59
             },
             "expected_e2e_ms": 155106.21,
+            "expected_load_ms": 394184.69,
             "expected_avg_denoise_ms": 2749.56,
             "expected_median_denoise_ms": 613.17,
             "estimated_full_test_time_s": 320.0
