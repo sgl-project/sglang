@@ -148,26 +148,38 @@ def draft_sidecar_decls(
     return tuple(out)
 
 
-def packable_draft_pools(
+def packed_draft_pools(
     target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
 ) -> tuple[Any, ...]:
-    """Draft pools whose declarations cover every target pool with the same
-    per-layer layout, so their layers can be appended to the target mirrors.
-    A draft that declares fewer pools is skipped; a layout mismatch is an error."""
+    """Validate that every draft can be appended as tail layers of the target
+    mirrors: it declares the same pools with the same per-layer layout and
+    every packed layer owns its buffer. The draft plan already chose packing,
+    so a draft that cannot be packed is an error, not a silent skip."""
     targets = {d.name: d for d in target_decls}
-    packable = []
     for pool in draft_pools:
         drafts = {d.name: d for d in pool.host_pool_decls()}
         if set(drafts) != set(targets):
-            continue
+            raise ValueError(
+                f"packed draft {type(pool).__name__} declares "
+                f"{sorted(d.value for d in drafts)} but the target declares "
+                f"{sorted(d.value for d in targets)}; every target pool needs a "
+                "draft counterpart or the draft state is not restored"
+            )
         for name, target in targets.items():
-            if drafts[name].layout != target.layout:
+            draft = drafts[name]
+            if draft.layout != target.layout:
                 raise ValueError(
-                    f"packed draft {name} layout {drafts[name].layout} differs from "
+                    f"packed draft {name.value} layout {draft.layout} differs from "
                     f"target {target.layout}"
                 )
-        packable.append(pool)
-    return tuple(packable)
+            owned = draft.device_layers
+            if owned is not None and len(owned) != draft.device_pool.layer_num:
+                raise ValueError(
+                    f"packed draft {name.value} owns buffers on {len(owned)} of "
+                    f"{draft.device_pool.layer_num} layers; every packed layer "
+                    "must own its buffer"
+                )
+    return tuple(draft_pools)
 
 
 def layout_root(decls: tuple[HostPoolDecl, ...]) -> HostPoolDecl:
@@ -197,7 +209,7 @@ def plan_host_pools(
     way exactly one layout root anchors the others' capacity, and sidecar
     indices come from one real source (HostPoolGroup resolves no chains).
 
-    ``packed_draft_pools`` are drafts accepted by packable_draft_pools; each
+    ``packed_draft_pools`` are drafts accepted by packed_draft_pools; each
     plan carries the draft objects that own its same-named state."""
     names = [d.name for d in decls]
     if len(set(names)) != len(names):

@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolPlan,
     draft_sidecar_decls,
     layout_root,
-    packable_draft_pools,
+    packed_draft_pools,
     plan_host_pools,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -147,6 +147,24 @@ def _resolve_deepseek_v4_layer_mappings(
     )
 
 
+def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
+    if use_mla:
+        return (pool.kv_cache_dim, pool.store_dtype)
+    return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
+
+
+def _check_packed_kv_rows(kv_pool: Any, drafts: tuple[Any, ...], *, use_mla: bool):
+    """Packed draft KV layers share the target's host row, so their device
+    rows must have the same shape and dtype."""
+    target = _kv_row_signature(kv_pool, use_mla=use_mla)
+    for draft in drafts:
+        row = _kv_row_signature(draft, use_mla=use_mla)
+        if row != target:
+            raise ValueError(
+                f"packed draft KV row {row} differs from target KV row {target}"
+            )
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -160,6 +178,11 @@ def build_kv_host_pool(
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
+    if use_mla and override_kv_cache_dim is None:
+        # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim; the
+        # device pool already resolved the row width.
+        override_kv_cache_dim = kv_pool.kv_cache_dim
+    _check_packed_kv_rows(kv_pool, mtp_draft_device_pools, use_mla=use_mla)
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -986,7 +1009,7 @@ def build_hybrid_mamba_stack(
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    packed_drafts = packable_draft_pools(decls, params.mtp_draft_device_pools)
+    packed_drafts = packed_draft_pools(decls, params.mtp_draft_device_pools)
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -1261,7 +1284,7 @@ def assemble_declared_stack(
     """
     kv_pool = layout_root(decls).device_pool
     transfer_layer_id_max = len(full_layer_mapping)
-    packed_drafts = packable_draft_pools(decls, params.mtp_draft_device_pools)
+    packed_drafts = packed_draft_pools(decls, params.mtp_draft_device_pools)
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if packed_drafts:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -1928,9 +1951,6 @@ class _PlainKvStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=use_mla,
-            # MLA pools carry their host row width; an fp8 DSA store differs
-            # from kv_lora_rank + qk_rope_head_dim.
-            override_kv_cache_dim=kvcache.kv_cache_dim if use_mla else None,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
@@ -2275,7 +2295,6 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             load_cache_event=load_cache_event,
             storage_backend=get_memory().hicache_storage_backend,
             use_mla=True,
-            override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             model_name=get_serving().served_model_name,
             storage_backend_extra_config=extra_config,

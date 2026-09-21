@@ -4983,9 +4983,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         from sglang.srt.mem_cache.pool_host.dsa import dsa_indexer_pool_decl
 
         decls = super().host_pool_decls()
-        # Layers that skip top-k own no index buffer; such a pool has no indexer
-        # state to mirror (this is what packed-draft eligibility used to test).
-        if self.index_k_with_scale_buffer:
+        # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
+        # is not enough: some layer must actually hold index keys.
+        if self.index_k_with_scale_buffer and not all(self.skip_topk_layers):
             decls += (dsa_indexer_pool_decl(self),)
         return decls
 

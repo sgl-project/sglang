@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     draft_sidecar_decls,
     kv_pool_decl,
-    packable_draft_pools,
+    packed_draft_pools,
     plan_host_pools,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -656,22 +656,91 @@ class TestPackedDraftPairing(CustomTestCase):
     """Packing appends draft layers to the target mirrors, so a draft must
     declare every target pool with an identical per-layer layout."""
 
-    def test_draft_without_indexer_is_not_packed(self):
-        # Pre-declaration code filtered on ``pool.index_k_with_scale_buffer``.
+    def test_draft_without_indexer_is_rejected(self):
+        # The pre-declaration filter on ``index_k_with_scale_buffer`` dropped
+        # such a draft silently, leaving its state without any host mirror.
         target = _dsa_pool_stub(layer_num=2)
         no_index = _dsa_pool_stub(layer_num=1)
         no_index.index_key_cache = SimpleNamespace(buffer=[])
-        full = _dsa_pool_stub(layer_num=1)
-        self.assertEqual(
-            packable_draft_pools(target.host_pool_decls(), (no_index, full)), (full,)
-        )
+        with self.assertRaisesRegex(ValueError, "draft counterpart"):
+            packed_draft_pools(target.host_pool_decls(), (no_index,))
+
+    def test_draft_with_empty_index_layers_is_rejected(self):
+        # A 0-row placeholder layer would be packed as a null device pointer.
+        target = _dsa_pool_stub(layer_num=2)
+        shared = _dsa_pool_stub(layer_num=1)
+        shared.skip_topk_layers = [True]
+        shared.index_key_cache = SimpleNamespace(buffer=[object()])
+        with self.assertRaisesRegex(ValueError, "draft counterpart"):
+            packed_draft_pools(target.host_pool_decls(), (shared,))
+        partial = _dsa_pool_stub(layer_num=2)
+        partial.skip_topk_layers = [False, True]
+        with self.assertRaisesRegex(ValueError, "owns buffers on 1 of 2"):
+            packed_draft_pools(target.host_pool_decls(), (partial,))
 
     def test_layout_mismatch_is_rejected(self):
         target = _dsa_pool_stub(layer_num=2)
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
         with self.assertRaisesRegex(ValueError, "layout"):
-            packable_draft_pools(target.host_pool_decls(), (wide,))
+            packed_draft_pools(target.host_pool_decls(), (wide,))
+
+    def test_pool_with_only_shared_topk_layers_declares_kv_only(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        pool.skip_topk_layers = [True, True]
+        self.assertEqual([d.name for d in pool.host_pool_decls()], [PoolName.KV])
+
+
+class TestKvHostPoolRow(CustomTestCase):
+    """The KV mirror takes its row width from the MLA device pool (an fp8 DSA
+    store is wider than kv_lora_rank + qk_rope_head_dim) and refuses packed
+    drafts whose KV rows differ from the target's."""
+
+    def _build(self, pool, drafts=()):
+        seen = {}
+
+        def fake_host(kv_pool, ratio, size, page_size, layout, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(layer_num=kv_pool.layer_num)
+
+        with (
+            patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_ratio=2, hicache_size=0, hicache_mem_layout="page_first"
+                ),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            hybrid_pool_assembler.build_kv_host_pool(
+                kv_pool=pool,
+                page_size=64,
+                use_mla=True,
+                mtp_draft_device_pools=drafts,
+            )
+        return seen
+
+    def test_mla_row_width_comes_from_the_device_pool(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        pool.kv_cache_dim = 656  # fp8 DSA store: 576 + fp32 scales
+        self.assertEqual(self._build(pool)["override_kv_cache_dim"], 656)
+
+    def test_packed_draft_with_a_different_kv_row_is_rejected(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        draft = _dsa_pool_stub(layer_num=1)
+        draft.store_dtype = torch.float8_e4m3fn
+        with self.assertRaisesRegex(ValueError, "KV row"):
+            self._build(pool, (draft,))
+        self._build(pool, (_dsa_pool_stub(layer_num=1),))
 
 
 class TestSeparateDraftStructure(CustomTestCase):
