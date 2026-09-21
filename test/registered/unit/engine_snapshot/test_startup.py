@@ -130,7 +130,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
         self.write_manifest()
         observed = {}
 
-        def note_park(control_dir, name, timeout_seconds=None):
+        def note_park(control_dir, name, type_, timeout_seconds=None):
             observed["scheduler_json"] = json.loads(
                 (self.control / control.SCHEDULER).read_text()
             )
@@ -140,9 +140,10 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
                 scheduler.weight_updater.resume_memory_occupation.call_count,
                 scheduler.weight_updater.update_weights_from_disk.call_count,
             )
+            return control.ReleaseInfo()
 
         with (
-            patch.object(startup.control, "wait_for", side_effect=note_park),
+            patch.object(startup.control, "wait_and_read", side_effect=note_park),
             patch.object(startup, "_run_canary", return_value=self.canary()),
         ):
             startup.scheduler_barrier(scheduler, str(self.artifact_path))
@@ -162,6 +163,22 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
         )
         request = scheduler.weight_updater.update_weights_from_disk.call_args.args[0]
         self.assertEqual((request.model_path, request.load_format), ("/model", "auto"))
+
+    def test_scheduler_barrier_applies_the_release_address(self):
+        scheduler = self.barrier_scheduler()
+        self.write_manifest()
+        release = control.ReleaseInfo(host="0.0.0.0", port=31111)
+
+        with (
+            patch.object(startup, "_run_canary", return_value=self.canary()),
+            patch.object(startup.control, "wait_and_read", return_value=release),
+            patch("sglang.srt.runtime_context.get_context") as context,
+        ):
+            startup.scheduler_barrier(scheduler, str(self.artifact_path))
+
+        context.return_value.override.assert_called_once_with(
+            "snapshot-restore", host="0.0.0.0", port=31111
+        )
 
     def test_scheduler_barrier_reports_failures(self):
         canary = self.canary()

@@ -275,6 +275,25 @@ def active_artifact_path():
     return artifact_path
 
 
+def _apply_release_address(release):
+    """Apply a restore's listen-address override in this process.
+
+    The engine tree is captured once and every process keeps its own resolved
+    config, so each process that wakes on the release applies the override
+    itself: patching only the HTTP process would leave the scheduler on the
+    captured address (disaggregation endpoints, metrics, registration).
+    """
+    overrides = {
+        name: value
+        for name, value in (("host", release.host), ("port", release.port))
+        if value is not None
+    }
+    if overrides:
+        from sglang.srt.runtime_context import get_context
+
+        get_context().override("snapshot-restore", **overrides)
+
+
 def scheduler_barrier(scheduler, artifact_path):
     """Rehearse the reload, park released, then resume and re-verify on restore.
 
@@ -304,7 +323,10 @@ def scheduler_barrier(scheduler, artifact_path):
             control_dir / control.SCHEDULER,
             msgspec.to_builtins(control.SchedulerInfo(gpu_uuid=uuid, canary=canary)),
         )
-        control.wait_for(control_dir, control.RELEASE)
+        release = control.wait_and_read(
+            control_dir, control.RELEASE, control.ReleaseInfo
+        )
+        _apply_release_address(release)
         expected = load_manifest(Path(artifact_path)).canary
         observed = _reload_and_verify(scheduler, server_args_view, expected)
         # This run's evidence, so replacing a leftover marker is intended.
@@ -327,10 +349,9 @@ def server_barrier(server_args, artifact_path):
 
     The HTTP listener is opened after this barrier, so the release marker is
     where a restore may redirect it: the captured address stays the default, and
-    an explicit override changes only this process's resolved serving config.
+    an explicit override replaces it wherever this engine resolves it.
     """
     from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang.srt.runtime_context import get_context
 
     server_args_view = resolving_view(server_args)
     control_dir = Path(artifact_path) / control.CONTROL_DIRNAME
@@ -349,13 +370,7 @@ def server_barrier(server_args, artifact_path):
         ),
     )
     release = control.wait_and_read(control_dir, control.RELEASE, control.ReleaseInfo)
-    overrides = {
-        name: value
-        for name, value in (("host", release.host), ("port", release.port))
-        if value is not None
-    }
-    if overrides:
-        get_context().override("snapshot-restore", **overrides)
+    _apply_release_address(release)
 
 
 if __name__ == "__main__":
