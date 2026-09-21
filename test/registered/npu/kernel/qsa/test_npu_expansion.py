@@ -148,15 +148,21 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
 @pytest.mark.parametrize("batch_size", [2, 32])
 def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
     # Real backend methods/persistent buffers; synthetic pool and Q/K.
-    # Does not execute projection, compression, scheduler, attention or service.
+    # Includes sparse attention; not projection, compression, scheduler or service.
     raw_width = 4096
     rows = batch_size if mode.is_decode() else batch_size * 4
     requests = batch_size + 1
     cache = torch.randn(requests * 1024, 1, 128, device="npu", dtype=torch.bfloat16)
+    attention_q = torch.randn(rows, 3, 256, device="npu", dtype=torch.bfloat16)
+    attention_k = torch.randn(requests * raw_width, 1, 256, device="npu", dtype=torch.bfloat16)
+    attention_v = torch.randn_like(attention_k)
     pool = SimpleNamespace(
         qsa_compress_ratio=4, qsa_block_topk=512,
         qsa_index_kv_heads=1, qsa_index_head_dim=128, qsa_compressed_page_size=16,
-        get_qsa_compressed_k_buffer=lambda layer_id: cache)
+        get_qsa_compressed_k_buffer=lambda layer_id: cache,
+        get_key_buffer=lambda layer_id: attention_k.reshape(-1, 64, 1, 256),
+        get_value_buffer=lambda layer_id: attention_v.reshape(-1, 64, 1, 256))
+    layer = SimpleNamespace(layer_id=0, scaling=1 / 16)
     req_to_token = torch.arange(requests * raw_width, device="npu", dtype=torch.int32).reshape(requests, raw_width)
     backend = QwenSparseAttnBackend()
     backend.device = torch.device("npu")
@@ -192,7 +198,8 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         tokens = kernel.expand_qsa_block_indices(
             blocks, indexer.decode_logical_positions, indexer.sequence_lengths, 4, 2048)
         slots = backend._logical_to_physical(tokens, metadata)
-        return blocks, tokens, slots, logits, lengths
+        output = backend._forward_paged_attention(attention_q, layer, batch, tokens)
+        return blocks, tokens, slots, logits, lengths, output
 
     for _ in range(2): forward()
     graph = torch.npu.NPUGraph()
@@ -201,9 +208,11 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
     for step in range(4):
         if step == 1:
             q.zero_()
+            attention_q.neg_()
             batch.seq_lens_cpu.fill_(5)
         elif step == 2:
             cache.normal_()
+            attention_k.neg_()
             batch.seq_lens_cpu.fill_(2411)
             batch.req_pool_indices.copy_(request_ids.flip(0))
             if not mode.is_decode():
@@ -212,6 +221,7 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         elif step == 3:
             # Permute physical pages without breaking token-group/page alignment.
             req_to_token.copy_(req_to_token.roll(64, dims=1))
+            attention_v.neg_()
             q.normal_()
             batch.seq_lens_cpu.fill_(2307)
             batch.num_padding = 0
@@ -220,7 +230,10 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         assert pointers() == addresses
         graph.replay()
         torch.npu.synchronize()
-        blocks, tokens, slots, logits, lengths = outputs
+        blocks, tokens, slots, logits, lengths, output = outputs
+        reference_output = kernel.qsa_sparse_attention_reference(
+            attention_q.cpu(), attention_k.cpu(), attention_v.cpu(), slots.cpu(), 1 / 16)
+        torch.testing.assert_close(output.cpu(), reference_output.flatten(1), atol=0.02, rtol=0.02)
         paged_cache, page_table, valid_lengths, width = indexer.get_decode_mqa_inputs(0)
         reference_scores = mqa.torch_qsa_mqa_decode(q, paged_cache, page_table, valid_lengths, width)
         torch.testing.assert_close(logits, reference_scores, atol=2e-5, rtol=2e-5)

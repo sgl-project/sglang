@@ -316,21 +316,19 @@ def qsa_sparse_attention(
         raise ValueError("query heads must be divisible by KV heads")
     if _is_npu:
         from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import (
-            can_run_sparse_attention,
             sparse_attention,
         )
 
-        if can_run_sparse_attention(q, k_cache, v_cache, token_slots):
-            return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
+        return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
-    """Adapt NPU KV cache layouts for the Torch reference.
+    """Adapt NPU KV cache layouts to rank-3 physical-token pools.
 
-    The original reference path receives rank-3 [slots, heads, dim] caches.
+    Sparse attention receives rank-3 [slots, heads, dim] caches.
     NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
     """
     if cache.ndim == 3:
@@ -351,33 +349,6 @@ def qsa_sparse_attention_reference(
     """Device-agnostic sparse GQA reference."""
 
     scale = softmax_scale or q.shape[-1] ** -0.5
-    if _is_npu:
-        if q.shape[0] == 0 or token_slots.shape[1] == 0:
-            return torch.zeros_like(q)
-        outputs = []
-        repeats = q.shape[1] // k_cache.shape[1]
-        for row in range(q.shape[0]):
-            valid = token_slots[row] >= 0
-            # Preserve the fixed width; boolean indexing creates dynamic shapes
-            # and requires a device-to-host synchronization on NPU.
-            slots = token_slots[row].clamp_min(0).long()
-            keys = k_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
-            values = v_cache.index_select(0, slots)
-            # Zero invalid values so NaN/Inf padding cannot contaminate the sum.
-            values = values.masked_fill(~valid[:, None, None], 0.0)
-            values = values.repeat_interleave(repeats, dim=1)
-            scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
-            valid = valid.unsqueeze(0)
-            probabilities = torch.softmax(
-                scores.masked_fill(~valid, -float("inf")), dim=-1
-            )
-            # softmax of an all-padding row is NaN; its output must instead be zero.
-            probabilities = torch.where(valid, probabilities, 0.0)
-            outputs.append(
-                torch.einsum("hk,khd->hd", probabilities, values.float()).to(q.dtype)
-            )
-        return torch.stack(outputs)
-
     outputs = []
     repeats = q.shape[1] // k_cache.shape[1]
     for row in range(q.shape[0]):

@@ -1419,6 +1419,11 @@ def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
     elif layout == "fia":
         k, v = k.unsqueeze(1), v.unsqueeze(1)
     q, k, v, slots = q.to(device), k.to(device), v.to(device), slots.to(device)
+    if device == "npu":
+        # The legacy generic shape is intentionally outside the model wrapper.
+        with pytest.raises(ValueError, match="Unsupported NPU"):
+            qsa_sparse_attention(q, k, v, slots)
+        return
     if device == "cpu" and layout != "flat":
         with pytest.raises(ValueError, match="must be rank-3 tensors"):
             qsa_sparse_attention(q, k, v, slots)
@@ -1432,11 +1437,8 @@ def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
 
     monkeypatch.setattr(torch.Tensor, "index_select", record_index_select)
     actual = qsa_sparse_attention(q, k, v, slots)
-    # CPU gathers only valid slots; NPU retains every row's fixed width.
-    assert selected_widths == ([4] * 6 if device == "npu" else [2, 2, 3, 3])
+    assert selected_widths == [2, 2, 3, 3]
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-2, atol=2e-2)
-    if device == "npu":
-        assert qsa_sparse_attention(q[:0], k, v, slots[:0]).shape == q[:0].shape
 
 
 @pytest.mark.parametrize("device", ["cpu", "npu"])
@@ -1444,14 +1446,14 @@ def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
 def test_qsa_npu_sparse_attention_nonfinite_padding(monkeypatch, device, padding_value):
     if device == "npu" and not qsa_kernel_module._is_npu:
         pytest.skip("NPU is not available")
-    # Exercise the fixed-width NPU branch on CPU as well.
-    monkeypatch.setattr(qsa_kernel_module, "_is_npu", True)
-    q = torch.ones(2, 4, 16, device=device)
-    k = torch.ones(3, 2, 16, device=device)
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", device == "npu")
+    q = torch.ones(2, 3, 256, device=device, dtype=torch.bfloat16)
+    k = torch.ones(3, 1, 256, device=device, dtype=q.dtype)
     v = torch.ones_like(k)
     k[0] = padding_value
     v[0] = padding_value
-    slots = torch.tensor([[1, 2, -1], [-1, -1, -1]], device=device)
+    slots = torch.full((2, 2051), -1, device=device, dtype=torch.int32)
+    slots[0, :2] = torch.tensor([1, 2], device=device, dtype=torch.int32)
     expected = torch.zeros_like(q)
     expected[0] = 1
 
@@ -1503,13 +1505,12 @@ def test_qsa_npu_graph_mapping_requires_live_metadata(missing):
         QwenSparseAttnBackend._logical_to_physical(torch.tensor([[0]]), metadata)
 
 
-def test_qsa_npu_fallback_graph_replay():
+def test_qsa_npu_operator_chain_graph_replay():
     if not qsa_kernel_module._is_npu:
         pytest.skip("NPU is not available")
     device = "npu"
-    q = torch.ones(2, 2, 16, dtype=torch.bfloat16, device=device)
-    # MQA now follows the model H4/D128/page16 contract; the separate small
-    # attention tensors below still exercise the existing attention fallback.
+    q = torch.ones(2, 3, 256, dtype=torch.bfloat16, device=device)
+    # Indexer MQA and sparse attention have distinct model head/dim contracts.
     index_q = torch.ones(2, 4, 128, dtype=q.dtype, device=device)
     cache = (
         torch.arange(32 * 128, device=device, dtype=torch.float32)
@@ -1520,10 +1521,10 @@ def test_qsa_npu_fallback_graph_replay():
     page_table = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
     lengths = torch.tensor([8, 0], dtype=torch.int32, device=device)
     starts = torch.zeros_like(lengths)
-    k = torch.ones(32, 1, 16, device=device, dtype=q.dtype)
+    k = torch.ones(32, 1, 256, device=device, dtype=q.dtype)
     v = (
         torch.arange(32, device=device, dtype=torch.float32)[:, None, None]
-        .expand(32, 1, 16)
+        .expand(32, 1, 256)
         .contiguous()
         .to(q.dtype)
     )
