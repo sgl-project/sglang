@@ -51,18 +51,17 @@ class TestDecodeRetractionBackup(CustomTestCase):
     dtype = torch.bfloat16
     device = "cuda"
 
-    def _make_pool(self, layer_num: int, *, page_size=1, use_mla=False):
-        kwargs = dict(
+    def _make_pool(self, layer_num: int, *, page_size=1) -> MHATokenToKVPool:
+        return MHATokenToKVPool(
             size=self.pool_size,
             page_size=page_size,
+            head_num=2,
+            head_dim=64,
             dtype=self.dtype,
             layer_num=layer_num,
             device=self.device,
             enable_memory_saver=False,
         )
-        if use_mla:
-            return MLATokenToKVPool(**kwargs, kv_lora_rank=96, qk_rope_head_dim=32)
-        return MHATokenToKVPool(**kwargs, head_num=2, head_dim=64)
 
     def _seed_pool(
         self, pool: MHATokenToKVPool, indices: torch.Tensor, base: int
@@ -102,7 +101,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
         hicache_ratio: float,
         *,
         shared_receive=False,
-        use_mla=False,
         page_size=1,
         io_backend="kernel",
         draft_mode=None,
@@ -133,13 +131,13 @@ class TestDecodeRetractionBackup(CustomTestCase):
             device=self.device,
             enable_memory_saver=False,
         )
-        target_pool = self._make_pool(layer_num=2, page_size=page_size, use_mla=use_mla)
+        target_pool = self._make_pool(layer_num=2, page_size=page_size)
         if draft_mode is None:
             draft_mode = (
                 HiCacheDraftMode.NONE if shared_receive else HiCacheDraftMode.SIDECAR
             )
         draft_pool = (
-            self._make_pool(layer_num=1, page_size=page_size, use_mla=use_mla)
+            self._make_pool(layer_num=1, page_size=page_size)
             if draft_mode != HiCacheDraftMode.NONE
             else None
         )
@@ -308,21 +306,16 @@ class TestDecodeRetractionBackup(CustomTestCase):
         Sidecar KV must follow the primary host indices through restore and
         release without allocating or freeing those indices a second time.
         """
-        for use_mla, draft_mode, io_backend in product(
-            (False, True),
+        for draft_mode, io_backend in product(
             (HiCacheDraftMode.SIDECAR, HiCacheDraftMode.PACKED),
             ("kernel", "direct"),
         ):
-            with self.subTest(
-                use_mla=use_mla, draft_mode=draft_mode, io_backend=io_backend
-            ):
-                page_size = 1 if use_mla else 16
-                num_slots = max(self.num_tokens, page_size)
-                num_tokens = num_slots - int(page_size > 1)
+            with self.subTest(draft_mode=draft_mode, io_backend=io_backend):
+                page_size = num_slots = 16
+                num_tokens = num_slots - 1
                 env = self._build_cache(
                     hicache_ratio=2.0,
                     shared_receive=True,
-                    use_mla=use_mla,
                     page_size=page_size,
                     io_backend=io_backend,
                     draft_mode=draft_mode,
@@ -357,9 +350,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 device_buffers = [
                     buffer
                     for pool in (env.target_pool, env.draft_pool)
-                    for buffer in (
-                        pool.kv_buffer if use_mla else pool.k_buffer + pool.v_buffer
-                    )
+                    for buffer in pool.k_buffer + pool.v_buffer
                 ]
                 expected = []
                 for index, (buffer, host_ptr, host_len, item_len) in enumerate(

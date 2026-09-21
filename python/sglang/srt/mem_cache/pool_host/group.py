@@ -73,7 +73,7 @@ class HostPoolGroup:
 
     def get_contiguous_buf_infos(self):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         host_by_device_ptr = {}
         device_infos = ([], [], [])
@@ -86,14 +86,13 @@ class HostPoolGroup:
                     and pool.kv_cache_layout == "nhd"
                     and pool.v_head_dim == pool.head_dim
                 )
-                plain_mla = type(pool) is MLATokenToKVPool and not pool.use_dsa
                 if (
-                    not (dense_mha or plain_mla)
+                    not dense_mha
                     or pool.layer_shard_enabled
                     or pool.page_size != self.page_size
                 ):
                     raise ValueError(
-                        "Host receive requires dense NHD MHA or plain MLA target and "
+                        "Host receive requires dense NHD MHA target and "
                         "draft KV with matching page sizes"
                     )
                 for combined, values in zip(
@@ -104,16 +103,11 @@ class HostPoolGroup:
             # Packed MHA stores target/draft K followed by target/draft V,
             # while the wire lists target K/V followed by draft K/V. Associate
             # each host view with its device buffer before applying wire order.
-            if type(entry.device_pool) is MHATokenToKVPool:
-                device_buffers = [b for p in pools for b in p.k_buffer] + [
-                    b for p in pools for b in p.v_buffer
-                ]
-                host_buffers = host.host_kv_data_refs
-            else:
-                device_buffers = [b for p in pools for b in p.kv_buffer]
-                host_buffers = host.data_refs
+            device_buffers = [b for p in pools for b in p.k_buffer] + [
+                b for p in pools for b in p.v_buffer
+            ]
             for device_buffer, host_buffer in zip(
-                device_buffers, host_buffers, strict=True
+                device_buffers, host.host_kv_data_refs, strict=True
             ):
                 if (
                     not host_buffer.is_contiguous()

@@ -92,7 +92,7 @@ class Disagg(msgspec.Struct):
     ] = False
     disaggregation_decode_enable_host_receive: A[
         bool,
-        "Receive KV in the decode retraction host pool when device admission is blocked. Size with --hicache-size or --hicache-ratio; requires Mooncake and dense MHA/MLA with matching TP layouts.",
+        "Receive KV in the decode retraction host pool when device admission is blocked. Size with --hicache-size or --hicache-ratio; requires Mooncake and dense MHA with matching TP layouts.",
     ] = False
     disaggregation_decode_retraction_backup: A[
         Optional[str],
