@@ -50,8 +50,8 @@ def add_cli_args(parser):
     )
     create.add_argument(
         "server_args",
-        nargs=argparse.REMAINDER,
-        help="Server arguments after --.",
+        nargs="*",
+        help="Server arguments, passed after a literal --.",
     )
 
     restore = commands.add_parser(
@@ -97,6 +97,22 @@ def add_cli_args(parser):
     )
 
 
+def require_separator(argv):
+    """Reject `create` pass-through arguments that did not follow ``--``.
+
+    ``argparse`` cannot report this mistake itself: without the separator an
+    unrecognized option either lands inside ``server_args`` (the old REMAINDER
+    behavior) or surfaces as a bare "unrecognized arguments", and neither
+    points at the missing ``--`` as the problem.
+    """
+    if argv[:1] != ["create"] or "--" in argv or "-h" in argv or "--help" in argv:
+        return
+    raise SnapshotUsageError(
+        "create takes the server arguments after a literal --, e.g. "
+        "`sglang snapshot create --artifact DIR -- --model-path ...`"
+    )
+
+
 def execute(options):
     """Run the selected snapshot action and return the process exit code."""
     from sglang.srt.engine_snapshot.controller import (
@@ -107,8 +123,6 @@ def execute(options):
 
     if options.action == "create":
         argv = list(options.server_args)
-        if argv[:1] == ["--"]:
-            argv = argv[1:]
         if not argv:
             raise SnapshotUsageError("create requires server arguments after --")
         create_snapshot(options.artifact, argv, options.timeout)
