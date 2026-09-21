@@ -298,9 +298,9 @@ def run_mega_routed_experts(
             experts,
             hidden_states,
             topk_ids=(
-                topk_ids.to(torch.int64)
+                topk_ids
                 if topk_ids is not None
-                else hidden_states.new_empty((0, top_k), dtype=torch.int64)
+                else hidden_states.new_empty((0, top_k), dtype=torch.int32)
             ),
             topk_weights=(
                 topk_weights.to(torch.float32)
