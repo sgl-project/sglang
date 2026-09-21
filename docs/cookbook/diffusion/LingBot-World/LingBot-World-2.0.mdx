@@ -32,7 +32,7 @@ sglang serve \
   --enable-torch-compile false
 ```
 
-Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only parallel and offload flags.
+Intel Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu`; omit GPU-only parallel and offload flags.
 
 ```bash Command
 SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path robbyant/lingbot-world-v2-14b-causal-fast-diffusers --pipeline-class-name LingBotWorldCausalDMDPipeline

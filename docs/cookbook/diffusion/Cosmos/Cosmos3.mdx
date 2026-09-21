@@ -54,7 +54,7 @@ sed -i 's/weights_only=True/weights_only=False/g' "$COSMOS_GUARDRAIL_DIR/cosmos_
 ```
 ## 3. Serve Cosmos3
 
-For CPU deployment, use `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` with the selected Cosmos3 checkpoint.
+For Intel Xeon CPU deployment, use `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` with the selected Cosmos3 checkpoint.
 
 ```bash Command
 SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path nvidia/Cosmos3-Nano
