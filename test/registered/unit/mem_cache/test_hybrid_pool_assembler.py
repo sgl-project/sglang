@@ -166,13 +166,19 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         tp_cache_group=None,
                         pp_cache_group=None,
                     )
+                    controller = SimpleNamespace(transfer_layer_id_max=4)
+                    built = (
+                        SimpleNamespace(
+                            host_pool_group=MagicMock(),
+                            cache_controller=controller,
+                            plans=(),
+                            sidecars=[],
+                        )
+                        if strategy_cls is _MambaStrategy
+                        else (MagicMock(), controller)
+                    )
                     with patch.object(
-                        hybrid_pool_assembler,
-                        builder_name,
-                        return_value=(
-                            MagicMock(),
-                            SimpleNamespace(transfer_layer_id_max=4),
-                        ),
+                        hybrid_pool_assembler, builder_name, return_value=built
                     ) as build_stack:
                         result = strategy_cls().build(
                             cache=SimpleNamespace(page_size=1),
@@ -257,6 +263,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         draft_kv_pool.layer_num = 1
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
+        draft_kv_pool.skip_topk_layers = [False]
         draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
@@ -318,6 +325,7 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
     pool.index_head_dim = 128
+    pool.skip_topk_layers = [False] * layer_num
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
     pool.layer_shard_enabled = shard is not None
     if shard is not None:
@@ -769,6 +777,109 @@ class TestSeparateDraftParity(CustomTestCase):
                 self.assertEqual(len(entries), 2 if with_index else 1)
 
 
+class TestHybridMambaDeclaredIndexer(CustomTestCase):
+    """hybrid Mamba + DSA reuses the target's indexer declaration: the KV/Mamba
+    stack gains an INDEXER entry whose mirror and layer mapping cover only the
+    DSA layers that own index buffers."""
+
+    def test_stack_declares_indexer_and_skips_empty_layers(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
+        mamba_pool = SimpleNamespace(layer_num=2, size=8)
+        # transfer layers 0,2,4 are DSA (device 0,1,2); 1,3 are Mamba
+        full_mapping = {0: 0, 2: 1, 4: 2}
+        mamba_mapping = {1: 0, 3: 1}
+        params = SimpleNamespace(
+            page_size=64,
+            mtp_draft_device_pools=(),
+            token_to_kv_pool_allocator=None,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    alloc=lambda n: None, free=lambda x: None
+                )
+            ),
+        )
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+
+        def dummy_kv_host(**kwargs):
+            return MLATokenToKVPoolHost(
+                kwargs["kv_pool"],
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=kwargs["page_size"],
+                layout="page_first",
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=None,
+                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
+            )
+
+        def dummy_indexer_host(decl, device_pool, anchor_host, *, allocator_type):
+            return real_indexer_host(
+                decl=decl,
+                device_pool=device_pool,
+                anchor_host=anchor_host,
+                allocator_type=allocator_type,
+                pin_memory=False,
+                is_dummy=True,
+            )
+
+        with (
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(
+                hybrid_pool_assembler,
+                "MambaPoolHost",
+                return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
+            ),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_size=0,
+                    hicache_ratio=2,
+                    hicache_mem_layout="page_first",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            stack = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=params,
+                kv_pool=kv_pool,
+                mamba_pool=mamba_pool,
+                full_layer_mapping=full_mapping,
+                mamba_layer_mapping=mamba_mapping,
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=True,
+            )
+
+        names = [e.name for e in stack.host_pool_group.entries]
+        self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
+        indexer = stack.host_pool_group.entry_map[PoolName.INDEXER]
+        kv = stack.host_pool_group.entry_map[PoolName.KV]
+        # KV still maps every DSA transfer layer; the indexer drops device layer 1.
+        self.assertEqual([kv.layer_mapper(t) for t in range(5)], [0, None, 1, None, 2])
+        self.assertEqual(
+            [indexer.layer_mapper(t) for t in range(5)], [0, None, None, None, 2]
+        )
+        self.assertEqual(indexer.host_pool.layer_num, 2)
+        self.assertEqual(indexer.host_pool._host_layer_index(2), 1)
+        self.assertEqual(stack.sidecars, [kv_pool.host_pool_decls()[1].sidecar_spec()])
+
+
 class TestDeclaredPoolPlanning(CustomTestCase):
     """Sidecar indices resolve from one primary source in HostPoolGroup, so the
     planner must reject self-references and sidecar chains up front."""
@@ -776,7 +887,7 @@ class TestDeclaredPoolPlanning(CustomTestCase):
     def _plan(self, decls):
         return plan_host_pools(
             decls=decls,
-            device_pool=object(),
+            device_pool=SimpleNamespace(layer_num=1),
             full_layer_mapping={0: 0},
             transfer_layer_id_max=1,
             packed_draft_device_pools=(),
@@ -862,9 +973,7 @@ class TestDeclaredPoolVerification(CustomTestCase):
     def test_unmigrated_strategy_logs_missing_indexer(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
-            _verify_declared_pools(
-                pool, self._result_with(PoolName.KV), _MambaStrategy()
-            )
+            _verify_declared_pools(pool, self._result_with(PoolName.KV), _SwaStrategy())
         self.assertIn("indexer", logs.output[0])
 
     def test_migrated_strategy_raises_on_missing_indexer(self):
