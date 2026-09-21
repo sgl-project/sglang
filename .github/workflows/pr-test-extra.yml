@@ -50,7 +50,7 @@ on:
         type: boolean
         default: false
       skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        description: "Skip PR test health check fail-fast (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false

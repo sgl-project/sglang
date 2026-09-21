@@ -79,6 +79,9 @@ jobs:
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
+      - name: Test CI label resolution
+        run: node --test .github/scripts/ci-labels.test.cjs
+
       - name: Cache mint
         uses: actions/cache@v4
         with:

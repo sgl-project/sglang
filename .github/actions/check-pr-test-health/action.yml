@@ -1,5 +1,5 @@
 name: Check PR Test Health
-description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fastfail` label.
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fail-fast` label (or `highest-priority`, which implies it).
 
 inputs:
   github-token:
@@ -23,7 +23,7 @@ runs:
             return;
           }
 
-          // Skip for scheduled runs — they should collect all failures, not fast-fail
+          // Skip for scheduled runs — they should collect all failures, not fail-fast
           if (context.eventName === 'schedule') {
             core.info('Skipping health check for scheduled run');
             return;
@@ -43,33 +43,18 @@ runs:
             cr => cr.app?.slug === 'github-actions'
           );
           if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
-            core.setFailed('Fast-fail: lint check failed');
+            core.setFailed('Fail-fast: lint check failed');
             return;
           }
 
-          // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
+          // Skip the jobs-failed check when the PR opts out of fail-fast.
           // Lint check above still runs.
-          let labels = [];
-          if (context.payload.pull_request?.number) {
-            // reruns retain the original event payload, including stale labels
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
-            });
-            labels = pr.labels.map(l => l.name);
-          } else {
-            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              commit_sha: ref,
-            });
-            if (prs.length > 0) {
-              labels = prs[0].labels.map(l => l.name);
-            }
-          }
-          if (labels.includes('bypass-fastfail')) {
-            core.info('Skipping jobs-failed check (bypass-fastfail label present)');
+          const { resolveCiLabels } = require(
+            `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+          );
+          const { bypassFailFast } = await resolveCiLabels(github, context);
+          if (bypassFailFast) {
+            core.info('Skipping jobs-failed check (bypass-fail-fast label present)');
             return;
           }
 
@@ -79,11 +64,11 @@ runs:
             run_id: context.runId,
             per_page: 100,
           });
-          // Find jobs that failed from a real error, not from fast-fail cascade
+          // Find jobs that failed from a real error, not from fail-fast cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
             // h20 runners are flaky (dirty GPU state from prior runs); their failures
-            // should not cascade fast-fail to other stages. j.name shape from
+            // should not cascade fail-fast to other stages. j.name shape from
             // listJobsForWorkflowRun: "<job-key>" + optional " / <reusable-job>"
             // + optional " (<matrix>)". Split off the base job key before exact
             // match so we cover both inline + reusable forms without confusing
@@ -100,5 +85,5 @@ runs:
             return true;
           });
           if (rootCauseFailures.length > 0) {
-            core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
+            core.setFailed(`Fail-fast: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
           }

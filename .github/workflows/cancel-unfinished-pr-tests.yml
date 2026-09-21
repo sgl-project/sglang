@@ -9,7 +9,7 @@ on:
         type: string
         default: 'pr-test.yml pr-test-extra.yml'
       include_high_priority:
-        description: 'Also cancel runs from high-priority PRs'
+        description: 'Also cancel runs from PRs labelled highest-priority'
         required: false
         type: boolean
         default: false
@@ -99,12 +99,12 @@ jobs:
               return
             fi
 
-            if echo "$labels" | grep -Fxq "high priority"; then
+            if echo "$labels" | grep -Fxq "highest-priority"; then
               if [ "$INCLUDE_HIGH_PRIORITY" != "true" ]; then
-                echo "  🛑 Skipping (high priority label)"
+                echo "  🛑 Skipping (highest-priority label)"
                 return
               fi
-              echo "  ⚠️  High priority PR, but include_high_priority is enabled"
+              echo "  ⚠️  highest-priority PR, but include_high_priority is enabled"
             fi
 
             echo "  🚫 Cancelling..."

@@ -39,7 +39,7 @@ on:
         type: string
         default: ''
       skip_pr_test_health_check:
-        description: 'Set to true to skip the PR test health check (fast-fail gate).'
+        description: 'Set to true to skip the PR test health check (fail-fast gate).'
         type: string
         default: 'false'
       is_nightly_pipeline_job:
@@ -105,7 +105,7 @@ jobs:
               return;
             }
 
-            // Skip for scheduled runs — they should collect all failures, not fast-fail
+            // Skip for scheduled runs — they should collect all failures, not fail-fast
             if (context.eventName === 'schedule') {
               core.notice('[health-check] SKIP: scheduled run');
               return;
@@ -127,28 +127,19 @@ jobs:
             );
             core.info(`[health-check] Lint check: status=${lintRun?.status}, conclusion=${lintRun?.conclusion}`);
             if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
-              core.setFailed('Fast-fail: lint check failed');
+              core.setFailed('Fail-fast: lint check failed');
               return;
             }
 
-            // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
+            // Skip the jobs-failed check when the PR opts out of fail-fast.
             // Lint check above still runs.
-            let labels = [];
-            if (context.payload.pull_request?.labels) {
-              labels = context.payload.pull_request.labels.map(l => l.name);
-            } else {
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: ref,
-              });
-              if (prs.length > 0) {
-                labels = prs[0].labels.map(l => l.name);
-              }
-            }
-            core.info(`[health-check] PR labels: [${labels.join(', ')}]`);
-            if (labels.includes('bypass-fastfail')) {
-              core.notice('[health-check] SKIP jobs-failed check: bypass-fastfail label present');
+            const { resolveCiLabels } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+            );
+            const axes = await resolveCiLabels(github, context);
+            core.info(`[health-check] PR labels: [${axes.labels.join(', ')}]`);
+            if (axes.bypassFailFast) {
+              core.notice('[health-check] SKIP jobs-failed check: bypass-fail-fast label present');
               return;
             }
 
@@ -162,11 +153,11 @@ jobs:
             const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
             core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
 
-            // Find jobs that failed from a real error, not from fast-fail cascade
+            // Find jobs that failed from a real error, not from fail-fast cascade
             const rootCauseFailures = jobs.filter(j => {
               if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
               // h20 runners are flaky (dirty GPU state from prior runs); their failures
-              // should not cascade fast-fail to other stages. j.name shape from
+              // should not cascade fail-fast to other stages. j.name shape from
               // listJobsForWorkflowRun: "<job-key>" + optional " / <reusable-job>"
               // + optional " (<matrix>)". Split off the base job key before exact
               // match so we cover both inline + reusable forms without confusing
@@ -176,7 +167,7 @@ jobs:
                 core.info(`[health-check] Filtered out h20 job: ${j.name}`);
                 return false;
               }
-              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
+              // multimodal-gen NPU tests should not cascade fail-fast to perf/accuracy stages.
               if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
                 core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
                 return false;
@@ -192,7 +183,7 @@ jobs:
             core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
 
             if (rootCauseFailures.length > 0) {
-              core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
+              core.setFailed(`Fail-fast: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
             } else {
               core.notice('[health-check] PASS: no root cause failures detected');
             }
