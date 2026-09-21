@@ -73,6 +73,11 @@ from sglang.srt.utils import is_npu, logger
 
 _is_npu = is_npu()
 
+if _is_npu:
+    from sgl_kernel_npu.qwen3_8_flash_next.short_conv import (
+        short_conv as ple_short_conv,
+    )
+
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
@@ -1027,15 +1032,14 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=x.dtype
                 )
                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
-            # On NPU, F.conv1d dispatches to aclop Conv2D, which cannot be
-            # captured inside torch.npu.graph. The strided slice + mul +
-            # sum below computes the same convolution (with possible rounding
-            # differences) and uses only basic aclnn ops that are capturable.
+            # The NPU kernel is graph-capturable and returns [B, C] directly.
             if _is_npu:
-                conv_weight = self.conv1d.weight.to(dtype=x.dtype).squeeze(1)  # [C, k]
-                conv_output = (
-                    conv_input[:, :, :: self.short_conv_dilation] * conv_weight
-                ).sum(dim=-1)
+                conv_output = ple_short_conv(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    self.short_conv_dilation,
+                    single_token=True,
+                )
             else:
                 conv_output = F.conv1d(
                     conv_input,
@@ -1060,26 +1064,13 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        # F.conv1d dispatches to aclop Conv2D, which cannot be captured inside
-        # torch.npu.graph (same reason as the decode fast path above). Target
-        # verify / decode rows are narrow, so decompose the depthwise dilated
-        # conv into per-tap strided slices + mul + sum (basic aclnn ops,
-        # capturable).
+        # Decode/verify use the graph-capturable NPU kernel. Its output is
+        # already [B, W, C]; ordinary prefill retains native convolution.
         if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
-            conv_weight = self.conv1d.weight.to(dtype=x.dtype).squeeze(1)  # [C, k]
-            dilation = self.short_conv_dilation
-            out_len = conv_input.shape[-1] - (self.conv_kernel_size - 1) * dilation
-            conv_output = (
-                torch.stack(
-                    [
-                        conv_input[:, :, i * dilation : i * dilation + out_len]
-                        * conv_weight[:, i].unsqueeze(-1)
-                        for i in range(self.conv_kernel_size)
-                    ],
-                    dim=0,
-                )
-                .sum(dim=0)
-                .transpose(1, 2)
+            conv_output = ple_short_conv(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                self.short_conv_dilation,
             )
         else:
             conv_output = F.conv1d(

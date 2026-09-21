@@ -12,7 +12,9 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=20, suite="base-b-test-1-npu-a3")
 
 
-def _make_case(device, dtype, mode, kernel_size, dilation, *, reference=False):
+def _make_case(
+    device, dtype, mode, kernel_size, dilation, *, width, channels, reference=False
+):
     generator = torch.Generator().manual_seed(123)
 
     def random_tensor(*shape):
@@ -23,8 +25,6 @@ def _make_case(device, dtype, mode, kernel_size, dilation, *, reference=False):
             .to(device=device, dtype=torch.float32 if reference else dtype)
         )
 
-    channels = 16
-    width = 4 if mode in ("verify", "prefill") else 1
     state_len = (kernel_size - 1) * dilation
     layer = model.Qwen4ExpPLELayer.__new__(model.Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
@@ -37,7 +37,7 @@ def _make_case(device, dtype, mode, kernel_size, dilation, *, reference=False):
     layer.conv1d.weight = nn.Parameter(
         random_tensor(channels, 1, kernel_size), requires_grad=False
     )
-    state = random_tensor(3, channels, state_len)
+    state = random_tensor(5, channels, state_len)
     initial_state = state.clone()
     intermediate = state.new_zeros(2, width, channels, state_len)
     pool = SimpleNamespace(
@@ -70,7 +70,11 @@ def _make_case(device, dtype, mode, kernel_size, dilation, *, reference=False):
         ngram_context=None,
         ngram_eos_token_id=None,
     )
-    forward_batch = SimpleNamespace(mamba_track_indices=None, mamba_track_mask=None)
+    forward_batch = SimpleNamespace(
+        mamba_track_indices=torch.tensor([3, 4], device=device),
+        mamba_track_mask=torch.tensor([True, False], device=device),
+        mamba_track_aligned_lens=lambda: torch.tensor([max(0, width - 1), 0], device=device),
+    )
     return SimpleNamespace(
         layer=layer,
         x=x,
@@ -89,11 +93,19 @@ def _run(case, monkeypatch, *, npu):
     return case.layer._short_conv(case.x, case.forward_batch, case.batch)
 
 
-@pytest.mark.parametrize("execution", ["cpu", "npu", "npu_graph"])
+@pytest.mark.parametrize(
+    "execution,kernel_size,dilation,channels",
+    [("cpu", 1, 1, 16), ("cpu", 4, 3, 16),
+     ("npu", 4, 3, 10240), ("npu_graph", 4, 3, 10240)],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("kernel_size,dilation", [(1, 1), (4, 3)])
-@pytest.mark.parametrize("mode", ["decode_fast", "decode", "verify", "prefill"])
-def test_ple_short_conv_npu(monkeypatch, execution, dtype, kernel_size, dilation, mode):
+@pytest.mark.parametrize(
+    "mode,width", [("decode_fast", 1), ("decode", 1), ("verify", 2),
+                   ("verify", 3), ("verify", 4), ("prefill", 4)],
+)
+def test_ple_short_conv_npu(
+    monkeypatch, execution, dtype, kernel_size, dilation, channels, mode, width
+):
     if execution != "cpu" and not model._is_npu:
         pytest.skip("NPU is not available")
     if execution == "npu_graph" and mode == "prefill":
@@ -103,8 +115,12 @@ def test_ple_short_conv_npu(monkeypatch, execution, dtype, kernel_size, dilation
         qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
     )
     device = "cpu" if execution == "cpu" else "npu"
-    case = _make_case(device, dtype, mode, kernel_size, dilation)
-    reference = _make_case("cpu", dtype, mode, kernel_size, dilation, reference=True)
+    case = _make_case(device, dtype, mode, kernel_size, dilation,
+                      width=width, channels=channels)
+    # On NPU compare the whole model operation against actual native F.conv1d,
+    # including its output rounding before SiLU. CPU keeps generic coverage.
+    reference = _make_case(device, dtype, mode, kernel_size, dilation,
+                           width=width, channels=channels, reference=execution == "cpu")
     graph = None
     if execution == "npu_graph":
         for _ in range(2):
@@ -119,13 +135,16 @@ def test_ple_short_conv_npu(monkeypatch, execution, dtype, kernel_size, dilation
             actual = case.layer._short_conv(case.x, case.forward_batch, case.batch)
 
     original_conv1d = torch.nn.functional.conv1d
-    for step in range(2):
+    for step in range(3):
         if step:
             # Replay must consume changed inputs and persistent state contents.
             case.x.mul_(-0.5)
             reference.x.mul_(-0.5)
             case.initial_state.mul_(0.5)
             reference.initial_state.mul_(0.5)
+        if step == 2:
+            case.layer.conv1d.weight.mul_(-0.5)
+            reference.layer.conv1d.weight.mul_(-0.5)
         case.state.copy_(case.initial_state)
         reference.state.copy_(reference.initial_state)
         monkeypatch.setattr(torch.nn.functional, "conv1d", original_conv1d)
@@ -138,20 +157,89 @@ def test_ple_short_conv_npu(monkeypatch, execution, dtype, kernel_size, dilation
 
         monkeypatch.setattr(torch.nn.functional, "conv1d", record_conv1d)
         if graph is None:
-            actual = _run(case, monkeypatch, npu=True)
-            assert len(calls) == (1 if mode == "prefill" else 0)
+            actual = _run(case, monkeypatch, npu=execution != "cpu")
+            assert len(calls) == (1 if execution == "cpu" or mode == "prefill" else 0)
         else:
             graph.replay()
             torch.npu.synchronize()
-        # The decomposition rounds individual products in the input dtype;
-        # FP32 native convolution is a numerical reference, not bitwise identical.
+        # Keep the original dtype tolerances; graph must see updated state,
+        # inputs and weights without running native convolution inside capture.
         tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
         torch.testing.assert_close(
-            actual.float().cpu(), expected, rtol=tolerance, atol=tolerance
+            actual.float().cpu(), expected.float().cpu(), rtol=tolerance, atol=tolerance
         )
         torch.testing.assert_close(
-            case.state.float().cpu(), reference.state, rtol=0, atol=0
+            case.state.float().cpu(), reference.state.float().cpu(), rtol=0, atol=0
         )
         torch.testing.assert_close(
-            case.intermediate.float().cpu(), reference.intermediate, rtol=0, atol=0
+            case.intermediate.float().cpu(), reference.intermediate.float().cpu(), rtol=0, atol=0
         )
+
+
+def test_ple_short_conv_empty(monkeypatch):
+    layer = model.Qwen4ExpPLELayer.__new__(model.Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+
+    def unexpected_pool():
+        raise AssertionError("Empty input must not access state or launch convolution")
+
+    monkeypatch.setattr(model, "get_req_to_token_pool", unexpected_pool)
+    x = torch.empty(0, 10240)
+    assert layer._short_conv(x, None, None) is x
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("capture", [False, True])
+def test_ple_short_conv_state_preparation(monkeypatch, record_property, dtype, capture):
+    """Exercise the real state-helper predicate and the caller's weight cast.
+
+    Service NPU initialization may redirect Tensor.is_cuda. Unlike the isolated
+    convolution tests, keep the production state-preparation choice here.
+    """
+    if not model._is_npu:
+        pytest.skip("NPU is not available")
+    case = _make_case("npu", dtype, "decode_fast", 4, 3, width=1, channels=10240)
+    reference = _make_case("npu", dtype, "decode_fast", 4, 3, width=1, channels=10240)
+    record_property(
+        "fused_state",
+        qwen4_ple.can_fuse_qwen4_short_conv_state(
+            case.state, case.batch.state_indices, case.x
+        ),
+    )
+    # Model parameters can have a different storage dtype. The framework must
+    # convert them before calling the same-dtype kernel, preserving rank three.
+    for item in (case, reference):
+        item.layer.conv1d.weight = nn.Parameter(
+            item.layer.conv1d.weight.float(), requires_grad=False
+        )
+    for _ in range(2):
+        case.state.copy_(case.initial_state)
+        _run(case, monkeypatch, npu=True)
+    graph = None
+    if capture:
+        case.state.copy_(case.initial_state)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual = _run(case, monkeypatch, npu=True)
+    for step in range(3):
+        if step:
+            for item in (case, reference):
+                item.x.mul_(-0.5)
+                item.initial_state.mul_(0.5)
+                item.layer.conv1d.weight.mul_(-0.5)
+        for item in (case, reference):
+            item.state.copy_(item.initial_state)
+        with monkeypatch.context() as reference_patch:
+            reference_patch.setattr(
+                qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
+            )
+            expected = _run(reference, reference_patch, npu=False)
+        if graph is None:
+            actual = _run(case, monkeypatch, npu=True)
+        else:
+            graph.replay()
+            torch.npu.synchronize()
+        tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(case.state, reference.state, atol=0, rtol=0)
