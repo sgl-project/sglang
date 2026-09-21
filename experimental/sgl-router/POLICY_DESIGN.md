@@ -303,7 +303,7 @@ Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
 use power-of-two without creating assignments. A new or out-of-group binding
-uses power-of-two with `AllowAll`, then the session policy checks its selected
+uses power-of-two with default limits, then the session policy checks its selected
 engine before binding. A concurrent live assignment wins, but is checked before
 returning it; rejection ends that attempt without rewriting the binding or
 retrying another engine. Existing bindings are reused regardless of pressure
@@ -316,8 +316,9 @@ binding outside the candidates cannot win. A missing binding may invoke policy
 fallback within the group; hard admission rejection remains an error.
 
 Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
-with round-robin as the default. Nested fallbacks use `AllowAll`; the owning
-policy explicitly checks the engine returned by its fallback.
+with round-robin as the default. Nested fallbacks use
+`AdmissionLimits::default()`; the owning policy explicitly checks the engine
+returned by its fallback.
 
 ### Cache-aware behavior
 
@@ -502,8 +503,8 @@ do not accept and ignore them.
 - Preserve configured capacity, pending-prefill, and in-flight checks, including
   their missing-report behavior. Power-of-two applies admission to its selected
   engine; other policies explicitly place checks in their selection logic.
-  Other paths use `AllowAll` unless a check is configured. Never silently discard
-  a configured budget.
+  Other paths use `AdmissionLimits::default()` unless limits are configured.
+  Never silently discard a configured budget.
 
 Listener and shutdown configuration, discovery, worker health and circuit
 breakers, tokenizer loading, request timeouts, sampling overrides, and logging

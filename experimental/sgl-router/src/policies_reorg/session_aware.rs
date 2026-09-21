@@ -87,7 +87,7 @@ impl Policy for SessionAwarePolicy {
                 });
             }
 
-            // The nested power-of-two policy uses AllowAll. The session owner
+            // The nested power-of-two policy uses default limits. The session owner
             // checks its chosen engine before creating or replacing a binding.
             let mut pick = self.pick_fallback(engines, request).await?;
             let load = self.engine_load.capture_snapshot(Instant::now());
