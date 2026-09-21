@@ -463,51 +463,32 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Forward generated IDs only for request shapes verified against the engine.
-/// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
-///
-/// Preserve caller-provided IDs. Exclude requests that may render differently
-/// with dynamo-render:
-/// - Non-leading system turns or consecutive users, which strict templates rewrite.
-/// - Historical `reasoning_content`, which may be injected into message content.
-/// - Tools and tool-call history, which the engine merges and normalizes
-///   before rendering.
-/// - Non-string or missing content, which the engine flattens or blanks.
-/// - Template overrides, kwargs, reasoning controls, or task selection.
-/// - Assistant continuations, whose final turn the engine handles separately.
-///
-/// Matching model files and engine defaults are still required. Worker template
-/// overrides and default kwargs cannot be inferred from the request.
-/// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
+/// Forward Dynamo-rendered IDs for supported text requests. Worker-side prompt
+/// normalization is intentionally bypassed. Preserve caller IDs and leave media
+/// and request controls outside Dynamo's rendering interface to the worker.
 fn can_forward_chat_tokens(value: &Value) -> bool {
-    if has_caller_input_ids(value)
-        || request_has_tools(value)
-        || request_has_non_text_content(value)
-        || request_has_reasoning_content(value)
-        || request_has_role_rewrites(value)
-    {
+    if has_caller_input_ids(value) || request_has_non_text_content(value) {
         return false;
     }
-    // Request controls whose rendering has not been verified against the engine.
     for key in [
         "chat_template",
-        "chat_template_kwargs",
         "reasoning",
-        "reasoning_effort",
         "task",
+        "functions",
+        "function_call",
     ] {
         if value.get(key).is_some_and(|v| !v.is_null()) {
             return false;
         }
     }
-    if value
-        .get("continue_final_message")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
+    if value["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message.get("function_call").is_some_and(|v| !v.is_null()))
+    }) {
         return false;
     }
-    !last_message_is_assistant(value)
+    value.get("continue_final_message").and_then(Value::as_bool) != Some(true)
 }
 
 /// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
@@ -532,73 +513,8 @@ fn chat_tokenization_failed(
     !request_tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
-/// Whether the final chat message has `role: "assistant"` (a prefix /
-/// continuation turn the engine's template path special-cases).
-fn last_message_is_assistant(value: &Value) -> bool {
-    value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|msgs| msgs.last())
-        .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
-        == Some("assistant")
-}
-
-/// Tool schemas and tool-call history require engine normalization before
-/// rendering: the engine merges message-level `tools` into the template's tools
-/// and parses `tool_calls` arguments; dynamo-render does neither the same way.
-fn request_has_tools(value: &Value) -> bool {
-    let nonempty = |v: &Value| match v {
-        Value::Array(a) => !a.is_empty(),
-        Value::Null => false,
-        _ => true,
-    };
-    if ["tools", "functions"]
-        .iter()
-        .any(|key| value.get(key).is_some_and(nonempty))
-    {
-        return true;
-    }
-    value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message["role"] == "tool"
-                    || ["tools", "tool_calls", "function_call"]
-                        .iter()
-                        .any(|key| message.get(key).is_some_and(nonempty))
-            })
-        })
-}
-
-/// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
-fn request_has_reasoning_content(value: &Value) -> bool {
-    value
-        .get("messages")
-        .and_then(|messages| messages.as_array())
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("reasoning_content")
-                    .is_some_and(|v| !v.is_null())
-            })
-        })
-}
-
-/// Message orders dynamo-render may rewrite for strict templates.
-fn request_has_role_rewrites(value: &Value) -> bool {
-    let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    messages.iter().skip(1).any(|m| m["role"] == "system")
-        || messages
-            .windows(2)
-            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user")
-}
-
-/// Detect non-string or missing content, which requires engine tokenization:
-/// the engine normalizes arrays and nulls differently from dynamo-render.
+/// The current forwarding transport supports string content only; media and
+/// content arrays remain on the worker path.
 fn request_has_non_text_content(value: &Value) -> bool {
     value
         .get("messages")
@@ -758,20 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn request_has_tools_detects_tools_and_functions() {
-        assert!(request_has_tools(&json!({"tools":[{"type":"function"}]})));
-        assert!(request_has_tools(&json!({"functions":[{"name":"f"}]})));
-        assert!(!request_has_tools(&json!({"tools":[]})));
-        assert!(!request_has_tools(&json!({"messages":[]})));
-        for message in [
-            json!({"role":"system","content":"s","tools":[{"type":"function"}]}),
-            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}),
-        ] {
-            assert!(request_has_tools(&json!({"messages":[message]})));
-        }
-    }
-
-    #[test]
     fn request_has_non_text_content_detects_non_string_content() {
         for content in [
             json!([{"type":"image_url","image_url":"x"}]),
@@ -794,14 +696,14 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_history_is_an_expected_forwarding_omission() {
+    fn reasoning_history_can_forward_dynamo_tokens() {
         let mut value = json!({"messages": [
             {"role":"user", "content":"hi"},
             {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
             {"role":"user", "content":"next"}
         ]});
-        assert!(!can_forward_chat_tokens(&value));
-        assert!(!chat_tokenization_failed(true, Some(&value), None));
+        assert!(can_forward_chat_tokens(&value));
+        assert!(chat_tokenization_failed(true, Some(&value), None));
         value["messages"][1]["reasoning_content"] = Value::Null;
         assert!(can_forward_chat_tokens(&value));
         value["messages"][1]
@@ -812,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn role_rewrites_are_expected_forwarding_omissions() {
+    fn dynamo_role_rewrites_can_forward() {
         for roles in [
             vec!["user", "user"],
             vec!["system", "system", "user"],
@@ -823,8 +725,8 @@ mod tests {
                 .map(|role| json!({"role": role, "content": "text"}))
                 .collect();
             let value = json!({"messages": messages});
-            assert!(!can_forward_chat_tokens(&value), "{roles:?}");
-            assert!(!chat_tokenization_failed(true, Some(&value), None));
+            assert!(can_forward_chat_tokens(&value), "{roles:?}");
+            assert!(chat_tokenization_failed(true, Some(&value), None));
         }
         assert!(can_forward_chat_tokens(&json!({"messages": [
             {"role": "system", "content": "instructions"},
@@ -842,25 +744,42 @@ mod tests {
     }
 
     #[test]
-    fn can_forward_chat_tokens_blocks_unreplicated_signals() {
+    fn can_forward_chat_tokens_blocks_unsupported_controls() {
         let blockers = [
             json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
             json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
-            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
             json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
-            json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
-            json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
             json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
             json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"function_call":"auto"}),
+            json!({"messages":[{"role":"assistant","content":"","function_call":{"name":"f","arguments":"{}"}}]}),
             json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
-            json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
         ];
         for b in blockers {
             assert!(
                 !can_forward_chat_tokens(&b),
                 "must NOT forward input_ids for: {b}"
             );
+        }
+    }
+
+    #[test]
+    fn can_forward_chat_tokens_allows_dynamo_controls() {
+        for controls in [
+            json!({"tools":[{"type":"function","function":{"name":"f"}}]}),
+            json!({"chat_template_kwargs":{"enable_thinking":false}}),
+            json!({"reasoning_effort":"high"}),
+            json!({"response_format":{"type":"json_object"}}),
+            json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"answer"}]}),
+        ] {
+            let mut request = json!({"messages":[{"role":"user","content":"hi"}]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            assert!(can_forward_chat_tokens(&request), "{request}");
         }
     }
 
@@ -886,7 +805,7 @@ mod tests {
             (true, Some(&chat), Some(false), true),
             (true, Some(&chat), None, true),
             (false, Some(&chat), None, false),
-            (true, Some(&tools), None, false),
+            (true, Some(&tools), None, true),
             (true, Some(&prompt), None, false),
             (true, None, None, false),
         ] {

@@ -29,7 +29,7 @@ use tower::ServiceExt;
 use crate::common::mock_worker::MockWorker;
 
 // deepseek-v4 id → the tokenizer registry auto-attaches the built-in V4 chat
-// encoder, so the model has an engine-equivalent encode path.
+// encoder, so the model has an Dynamo-rendered encode path.
 const MODEL: &str = "deepseek-v4-tiny";
 
 fn config() -> Config {
@@ -113,6 +113,14 @@ async fn assert_forwarded_unchanged(ctx: &Arc<AppContext>, mock: &MockWorker, re
         .metrics
         .render()
         .contains("sgl_router_ingress_tokenize_errors_total{"));
+}
+
+async fn assert_forwarded_dynamo_ids(ctx: &Arc<AppContext>, mock: &MockWorker, request: &Value) {
+    let ids = ctx.tokenizers.encode_chat(MODEL, request).unwrap();
+    assert_eq!(send(Arc::clone(ctx), request.clone()).await, StatusCode::OK);
+    let mut expected = request.clone();
+    expected["input_ids"] = json!(ids);
+    assert_eq!(captured(mock), expected);
 }
 
 async fn send(ctx: Arc<AppContext>, body: Value) -> StatusCode {
@@ -257,10 +265,9 @@ async fn disabled_forwarding_does_not_count_routing_render_failures_as_offload_e
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Even under round-robin, a tool request omits `input_ids` (the safe predicate
-/// is policy-independent too).
+/// Tool prompts use Dynamo tokens under round-robin too.
 #[tokio::test]
-async fn round_robin_tool_request_omits_input_ids() {
+async fn round_robin_tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
     let status = send(
@@ -276,17 +283,12 @@ async fn round_robin_tool_request_omits_input_ids() {
 
     let body = captured(&mock);
     assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids under any policy; got {body}"
+        body.get("input_ids").is_some(),
+        "tool requests must forward input_ids under any policy; got {body}"
     );
 }
 
-/// A successful plain-chat forward on a chat-formatter model must NOT emit
-/// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
-/// offload was expected but the encoder failed. A tool request on the same model
-/// is an *expected* omission (its ids are still engine-equivalent; the
-/// safe-predicate withholds forwarding for other reasons), so it must not emit
-/// the error counter either.
+/// Successful rendering of both plain and tool requests avoids the error counter.
 #[tokio::test]
 async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     let mock = MockWorker::start(vec![]).await;
@@ -324,9 +326,9 @@ async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     );
 }
 
-/// History that dynamo-render rewrites stays intact for engine-side tokenization.
+/// Dynamo owns historical reasoning rendering; original messages are retained.
 #[tokio::test]
-async fn reasoning_history_preserves_messages_without_forwarding_ids() {
+async fn reasoning_history_forwards_dynamo_ids_and_preserves_messages() {
     let (_dir, cfg) = template_config(json!({
         "chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"
     }));
@@ -342,7 +344,7 @@ async fn reasoning_history_preserves_messages_without_forwarding_ids() {
         .encode_chat(MODEL, &request)
         .unwrap()
         .is_empty());
-    assert_forwarded_unchanged(&ctx, &mock, &request).await;
+    assert_forwarded_dynamo_ids(&ctx, &mock, &request).await;
 
     request["messages"][1]
         .as_object_mut()
@@ -352,9 +354,9 @@ async fn reasoning_history_preserves_messages_without_forwarding_ids() {
     assert!(captured(&mock).get("input_ids").is_some());
 }
 
-/// Strict-template rewrites are used for routing only; the engine gets the original turns.
+/// Dynamo owns strict-template rewrites for both routing and forwarding.
 #[tokio::test]
-async fn role_rewrites_preserve_messages_without_forwarding_ids() {
+async fn role_rewrites_forward_dynamo_ids_and_preserve_messages() {
     let template = concat!(
         "{%- set ns = namespace(prev='') -%}",
         "{%- for m in messages -%}",
@@ -388,7 +390,7 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
             .encode_chat(MODEL, &request)
             .unwrap()
             .is_empty());
-        assert_forwarded_unchanged(&ctx, &mock, &request).await;
+        assert_forwarded_dynamo_ids(&ctx, &mock, &request).await;
     }
     let request = json!({"model": MODEL, "messages": [
         {"role": "system", "content": "instructions"},
@@ -432,7 +434,7 @@ async fn kimi_native_ids_preserve_control_boundaries() {
 }
 
 #[tokio::test]
-async fn kimi_native_parity_gaps_keep_engine_tokenization() {
+async fn kimi_native_null_effort_and_long_text_forward_dynamo_ids() {
     let mock = MockWorker::start(vec![]).await;
     let mut cfg = config();
     cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
@@ -442,8 +444,49 @@ async fn kimi_native_parity_gaps_keep_engine_tokenization() {
             "chat_template_kwargs": {"thinking": true, "thinking_effort": null}}),
         json!({"model": MODEL, "messages": [{"role": "user", "content": "x".repeat(25_001)}]}),
     ] {
-        assert!(ctx.tokenizers.encode_chat(MODEL, &request).is_none());
-        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
-        assert_eq!(captured(&mock), request);
+        assert_forwarded_dynamo_ids(&ctx, &mock, &request).await;
     }
+}
+
+/// Field mapping and encoding are checked against Dynamo in component tests;
+/// this verifies the HTTP path forwards those exact IDs and retains the request.
+#[tokio::test]
+async fn native_controls_forward_exact_dynamo_ids() {
+    for vocab in [
+        "tests/fixtures/tiny_tokenizer.json",
+        "tests/fixtures/kimi_k3/tiktoken.model",
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let mut cfg = config();
+        cfg.model.tokenizer_path = vocab.into();
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        for controls in [
+            json!({"reasoning_effort":"none"}),
+            json!({"reasoning_effort":"high", "chat_template_kwargs":{"reasoning_effort":"low"}}),
+            json!({"chat_template_kwargs":{"enable_thinking":false}}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}}),
+            json!({"tool_choice":"required"}),
+            json!({"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"f"}}}),
+        ] {
+            let mut request = json!({"model": MODEL,"messages":[{"role":"user","content":"hi"}]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            assert_forwarded_dynamo_ids(&ctx, &mock, &request).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn dynamo_render_error_keeps_worker_tokenization() {
+    let mock = MockWorker::start(vec![]).await;
+    let mut cfg = config();
+    cfg.model.tokenizer_path = "tests/fixtures/kimi_k3/tiktoken.model".into();
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let request = json!({"model": MODEL,"messages":[{"role":"user","content":"hi"}],
+        "chat_template_kwargs":{"thinking_effort":"unsupported"}});
+    assert!(ctx.tokenizers.encode_chat(MODEL, &request).is_none());
+    assert_eq!(send(ctx, request.clone()).await, StatusCode::OK);
+    assert_eq!(captured(&mock), request);
 }

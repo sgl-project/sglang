@@ -39,7 +39,9 @@ pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
             // The HF cache keeps a snapshot's files together, so the tiktoken
             // loader finds these next to the vocabulary.
             for sibling in ["config.json", "tokenizer_config.json"] {
-                files.path(sibling);
+                files.path(sibling).with_context(|| {
+                    format!("download required {sibling} for tiktoken repo {source:?}")
+                })?;
             }
             path
         }

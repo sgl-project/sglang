@@ -1,5 +1,5 @@
-Tiny synthetic Kimi vocabulary and golden token IDs from the Python reference
-`moonshotai/Kimi-K3` revision `a590ce09`. These exercise native rendering and
-segmented BPE without a model download. The `no_effort` case records a known
-dynamo-renderer mismatch: the router must fall back to engine-side tokenization
-instead of rewriting the native prompt.
+Tiny synthetic Kimi vocabulary for testing Dynamo's native formatter and
+segmented tokenizer without a model download. The added tokens include Kimi
+protocol markers; ordinary text that spells those markers must not become
+structural tokens. Adapter tests compare directly with the pinned Dynamo crates,
+including null thinking effort, long text, tools, and response formats.
