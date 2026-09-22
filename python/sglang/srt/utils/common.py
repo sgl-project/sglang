@@ -420,6 +420,58 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
     return True
 
 
+@lru_cache(maxsize=None)
+def _xpu_device_memory_query(gpu_id: int):
+    """Bind the Level Zero memory query for one device, or None if unusable: an
+    old loader or missing sysman telemetry degrades instead of failing a launch."""
+    try:
+        from sglang.srt.utils.xpu_vmm_utils import get_device_memory_in_use
+
+        get_device_memory_in_use(gpu_id)
+    except (ImportError, RuntimeError, OSError) as error:
+        logger.warning(
+            "Level Zero memory query unavailable for XPU %s (%s); falling back to "
+            "torch.xpu.memory_allocated, which sees only torch's own allocator.",
+            gpu_id,
+            error,
+        )
+        return None
+    return get_device_memory_in_use
+
+
+def _xpu_memory_in_use(gpu_id: int) -> int:
+    """Device memory in use on an XPU, counting allocations torch cannot see.
+
+    torch.xpu.memory_allocated knows only its own allocator, so memory mapped
+    straight from the driver and memory held by another tenant both read as free;
+    torch.xpu.mem_get_info is no help, it forwards a free == total stub. Level Zero
+    sysman is the only source that reports the whole device.
+    """
+    torch_in_use = torch.xpu.memory_allocated(gpu_id)
+    query = _xpu_device_memory_query(gpu_id)
+    if query is None:
+        return torch_in_use
+
+    # Telemetry can start failing after the one-time probe succeeded: the sysman
+    # process query counts then fills, so a process starting up between the two
+    # calls fails this query but not the next one. Retry before degrading, since
+    # the fallback sizes memory pools as if the untracked memory were free.
+    for retries_left in (1, 0):
+        try:
+            return max(torch_in_use, query(gpu_id))
+        except (RuntimeError, OSError) as error:
+            if retries_left:
+                continue
+            logger.warning(
+                "Level Zero memory query failed twice for XPU %s (%s); falling back "
+                "to torch.xpu.memory_allocated, which sees only torch's own "
+                "allocator, so memory pools may be sized too high.",
+                gpu_id,
+                error,
+            )
+    return torch_in_use
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -465,9 +517,8 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory = total_gpu_memory - _xpu_memory_in_use(gpu_id)
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
