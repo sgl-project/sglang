@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=97, stage="base-b", runner_config="1-gpu-large")
@@ -113,13 +114,8 @@ class TestDSparkUserCheckpointCandidates(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.target = os.environ.get(
-            "SGLANG_TEST_DSPARK_TARGET_PATH", "/personal/model/Qwen3-4B"
-        )
-        cls.draft = os.environ.get(
-            "SGLANG_TEST_DSPARK_DRAFT_PATH",
-            "/personal/checkpoints/speculators/dspark_qwen3_4b_redhat/checkpoints/0",
-        )
+        cls.target = os.environ["SGLANG_TEST_DSPARK_TARGET_PATH"]
+        cls.draft = os.environ["SGLANG_TEST_DSPARK_DRAFT_PATH"]
         for path in (cls.target, cls.draft):
             if not Path(path).is_absolute() or not Path(path).is_dir():
                 raise RuntimeError(
@@ -220,7 +216,7 @@ class TestDSparkUserCheckpointCandidates(CustomTestCase):
                 )
             finally:
                 if process is not None:
-                    kill_process_tree(process.pid)
+                    terminate_and_kill_process_tree(process)
                 log.flush()
                 log.seek(0)
                 logs = log.read()

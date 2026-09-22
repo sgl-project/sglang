@@ -26,6 +26,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     build_markov_embed_stack,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -45,7 +46,7 @@ def _config(**updates):
     return SimpleNamespace(**config)
 
 
-class TestDSparkConfiguration(unittest.TestCase):
+class TestDSparkConfiguration(CustomTestCase):
     def test_cli_generated_from_optional_fields(self):
         parser = argparse.ArgumentParser()
         fields = [
@@ -85,41 +86,24 @@ class TestDSparkConfiguration(unittest.TestCase):
 
     def test_optional_budgets_and_explicit_zero(self):
         config = _config(markov_topk=3, dspark_draft_topk=4, markov_bias_topk=2)
-        self.assertEqual(resolve_markov_candidate_config(config).effective_topk, 3)
-        disabled = resolve_markov_candidate_config(config, markov_topk=0)
-        self.assertEqual(
-            (disabled.effective_topk, disabled.effective_bias_topk), (0, 0)
-        )
-        self.assertEqual(
-            resolve_markov_candidate_config(
-                config, markov_bias_topk=0
-            ).effective_bias_topk,
-            0,
-        )
-        self.assertEqual(
-            resolve_markov_candidate_config(
-                _config(dspark_draft_topk=4), markov_bias_topk=1
-            ).effective_topk,
-            4,
-        )
-        self.assertEqual(resolve_markov_candidate_config(_config()).effective_topk, 0)
-        self.assertEqual(
-            resolve_markov_candidate_config(
-                _config(vocab_size=32), markov_topk=1
-            ).effective_bias_topk,
-            16,
-        )
-        union = resolve_markov_candidate_config(
-            config, markov_topk=7, markov_bias_topk=7
-        )
-        self.assertEqual(union.effective_topk + union.effective_bias_topk, 14)
         parsed = parse_dspark_draft_config(
             draft_hf_config=_config(markov_topk=None, dspark_draft_topk=3)
         )
-        self.assertEqual(
-            resolve_markov_candidate_config(parsed, markov_bias_topk=0).effective_topk,
-            3,
-        )
+        for cfg, overrides, expected in (
+            (config, {}, (3, 2)),
+            (config, dict(markov_topk=0), (0, 0)),
+            (config, dict(markov_bias_topk=0), (3, 0)),
+            (_config(dspark_draft_topk=4), dict(markov_bias_topk=1), (4, 1)),
+            (_config(), {}, (0, 0)),
+            (_config(vocab_size=32), dict(markov_topk=1), (1, 16)),
+            (config, dict(markov_topk=7, markov_bias_topk=7), (7, 7)),
+            (parsed, dict(markov_bias_topk=0), (3, 0)),
+        ):
+            with self.subTest(config=cfg, overrides=overrides):
+                result = resolve_markov_candidate_config(cfg, **overrides)
+                self.assertEqual(
+                    (result.effective_topk, result.effective_bias_topk), expected
+                )
 
     def test_budget_errors(self):
         for invalid in (-1, True, 1.5, "2"):
@@ -180,7 +164,7 @@ class TestDSparkConfiguration(unittest.TestCase):
             )
 
 
-class TestDSparkVocabulary(unittest.TestCase):
+class TestDSparkVocabulary(CustomTestCase):
     def test_confidence_uses_target_predecessor_ids(self):
         head = VanillaMarkov(vocab_size=6, draft_vocab_size=3, markov_rank=1)
         head.configure_target_vocab(6, torch.tensor([3, 0, 2]))
@@ -261,64 +245,52 @@ class _Vocab(nn.Module):
         self.embedding_dim = hidden
 
 
-class TestDSparkCheckpointWeights(unittest.TestCase):
-    def _weights(self, *, input_vocab=9, draft_vocab=3):
+class TestDSparkCheckpointWeights(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        for name in ("ParallelLMHead", "VocabParallelEmbedding"):
+            self.enterContext(patch(f"sglang.srt.models.dspark.{name}", _Vocab))
+
+    def _weights(self, *, input_vocab=8, draft_vocab=8):
         return [
             ("model.markov_head.markov_w1.weight", torch.ones(input_vocab, 2)),
             ("model.markov_head.markov_w2.weight", torch.ones(draft_vocab, 2)),
         ]
 
-    def test_own_head_embedding_and_mapping_survive_attach(self):
-        model = _Draft(_config(vocab_size=9, draft_vocab_size=3, mask_token_id=8))
-        weights = self._weights() + [
-            ("embed_tokens.weight", torch.ones(9, 4)),
-            ("lm_head.weight", torch.ones(3, 4)),
-            ("d2t", torch.tensor([3, 0, 2])),
-        ]
-        # The input-only mask row need not appear in the predecessor domain.
-        weights[0] = ("markov_head.markov_w1.weight", torch.ones(8, 2))
-        with (
-            patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab),
-            patch("sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab),
-        ):
-            model.load_weights(weights)
-        own_embed, own_head = model.embed_tokens, model.lm_head
-        model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
-        self.assertIs(model.embed_tokens, own_embed)
-        self.assertIs(model.lm_head, own_head)
-        self.assertEqual(model.markov_head.markov_w1.num_embeddings, 8)
-        self.assertEqual(model.map_draft_to_target(torch.arange(3)).tolist(), [3, 1, 4])
-
-    def test_w1_must_cover_all_target_predecessors(self):
-        model = _Draft(_config())
-        model.load_weights(self._weights(input_vocab=7, draft_vocab=8))
-        with self.assertRaisesRegex(ValueError, "cover every target predecessor"):
-            model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
-
-    def test_output_vocab_inferred_from_w2_when_input_has_mask_row(self):
-        model = _Draft(_config(vocab_size=9, mask_token_id=8))
-        with (
-            patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab),
-            patch("sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab),
-        ):
-            model.load_weights(
-                self._weights(input_vocab=8, draft_vocab=3)
-                + [
-                    ("embed_tokens.weight", torch.ones(9, 4)),
-                    ("lm_head.weight", torch.ones(3, 4)),
-                    ("d2t", torch.tensor([3, 0, 2])),
-                ]
-            )
-        model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
-        self.assertEqual(
-            (model.input_vocab_size, model.target_vocab_size, model.draft_vocab_size),
-            (9, 8, 3),
-        )
-        self.assertEqual(model.markov_head.markov_w2.out_features, 3)
+    def test_own_vocab_and_mapping_survive_attach(self):
+        for vocab_config in ({}, {"draft_vocab_size": 3}):
+            with self.subTest(vocab_config=vocab_config):
+                model = _Draft(_config(vocab_size=9, mask_token_id=8, **vocab_config))
+                # Infer Vd from W2 when absent; the input-only mask is outside Vt.
+                model.load_weights(
+                    self._weights(draft_vocab=3)
+                    + [
+                        ("embed_tokens.weight", torch.ones(9, 4)),
+                        ("lm_head.weight", torch.ones(3, 4)),
+                        ("d2t", torch.tensor([3, 0, 2])),
+                    ]
+                )
+                own_embed, own_head = model.embed_tokens, model.lm_head
+                model.attach_shared_modules(
+                    embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4)
+                )
+                self.assertIs(model.embed_tokens, own_embed)
+                self.assertIs(model.lm_head, own_head)
+                self.assertEqual(
+                    (
+                        model.input_vocab_size,
+                        model.target_vocab_size,
+                        model.draft_vocab_size,
+                    ),
+                    (9, 8, 3),
+                )
+                self.assertEqual(
+                    model.map_draft_to_target(torch.arange(3)).tolist(), [3, 1, 4]
+                )
 
     def test_weight_reload_refreshes_candidate_table(self):
         model = _Draft(_config())
-        model.load_weights(self._weights(input_vocab=8, draft_vocab=8))
+        model.load_weights(self._weights())
         model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
         refreshed = []
         model.markov_candidate_sampler = SimpleNamespace(
@@ -339,22 +311,21 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
 
     def test_predecessor_shape_reload_requires_recapture(self):
         model = _Draft(_config())
-        model.load_weights(self._weights(input_vocab=8, draft_vocab=8))
+        model.load_weights(self._weights())
         model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
         with self.assertRaisesRegex(ValueError, "restart/recapture"):
-            model.load_weights(self._weights(input_vocab=9, draft_vocab=8))
+            model.load_weights(self._weights(input_vocab=9))
 
     def test_reload_cannot_overwrite_shared_target_embedding(self):
         model = _Draft(_config())
-        model.load_weights(self._weights(input_vocab=8, draft_vocab=8))
+        model.load_weights(self._weights())
         target_embed = _Vocab(8, 4)
         with torch.no_grad():
             target_embed.weight.fill_(7.0)
         model.attach_shared_modules(embed_tokens=target_embed, lm_head=_Vocab(8, 4))
         with self.assertRaisesRegex(ValueError, "shared to checkpoint-owned"):
             model.load_weights(
-                self._weights(input_vocab=8, draft_vocab=8)
-                + [("embed_tokens.weight", torch.zeros(8, 4))]
+                self._weights() + [("embed_tokens.weight", torch.zeros(8, 4))]
             )
         torch.testing.assert_close(target_embed.weight, torch.full((8, 4), 7.0))
 
@@ -368,12 +339,12 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
         model = _Draft(_config(_sglang_speculators_dspark_normalized=True))
         model.fc = nn.Linear(4, 4, bias=False)
         with self.assertRaisesRegex(ValueError, "missing required backbone.*fc.weight"):
-            model.load_weights(self._weights(input_vocab=8, draft_vocab=8))
+            model.load_weights(self._weights())
 
     def test_training_backbone_aliases_are_normalized_before_loading(self):
         model = _Draft(_config())
         model.load_weights(
-            self._weights(input_vocab=8, draft_vocab=8)
+            self._weights()
             + [
                 ("model.midlayer.self_attn.q_proj.weight", torch.ones(4, 4)),
                 ("model.encoder.fc.weight", torch.ones(4, 4)),
@@ -384,19 +355,28 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
             ["layers.0.self_attn.q_proj.weight", "encoder.fc.weight"],
         )
 
-    def test_reduced_vocab_cannot_use_shared_full_head(self):
-        model = _Draft(_config(vocab_size=8, draft_vocab_size=3))
-        model.load_weights(self._weights(input_vocab=8))
-        with self.assertRaisesRegex(ValueError, "checkpoint lm_head"):
-            model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4))
+    def test_incompatible_vocab_cannot_attach_target_modules(self):
+        for config, weights, error in (
+            (_config(), self._weights(input_vocab=7), "cover every target predecessor"),
+            (
+                _config(draft_vocab_size=3),
+                self._weights(draft_vocab=3),
+                "checkpoint lm_head",
+            ),
+        ):
+            with self.subTest(error=error):
+                model = _Draft(config)
+                model.load_weights(weights)
+                with self.assertRaisesRegex(ValueError, error):
+                    model.attach_shared_modules(
+                        embed_tokens=_Vocab(8, 4), lm_head=_Vocab(8, 4)
+                    )
 
     def test_own_embedding_only_keeps_target_head(self):
         model = _Draft(_config())
-        with patch("sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab):
-            model.load_weights(
-                self._weights(input_vocab=8, draft_vocab=8)
-                + [("embed_tokens.weight", torch.ones(8, 4))]
-            )
+        model.load_weights(
+            self._weights() + [("embed_tokens.weight", torch.ones(8, 4))]
+        )
         own_embed, target_head = model.embed_tokens, _Vocab(8, 4)
         model.attach_shared_modules(embed_tokens=_Vocab(8, 4), lm_head=target_head)
         self.assertIs(model.embed_tokens, own_embed)
@@ -404,11 +384,7 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
 
     def test_base_and_bias_each_receive_logit_scale_once(self):
         model = _Draft(_config(logit_scale=-2.0))
-        with patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab):
-            model.load_weights(
-                self._weights(input_vocab=8, draft_vocab=8)
-                + [("lm_head.weight", torch.ones(8, 4))]
-            )
+        model.load_weights(self._weights() + [("lm_head.weight", torch.ones(8, 4))])
         own_head = model.lm_head
         target_embed = _Vocab(8, 4)
         model.attach_shared_modules(embed_tokens=target_embed, lm_head=_Vocab(8, 4))

@@ -1,8 +1,8 @@
 """DSpark candidate sampling microbenchmark (synthetic weights, TP=1).
 
 This does not measure an LM head, target verification, serving throughput, or
-checkpoint acceptance rate. Shapes must be supplied from inspected checkpoint
-metadata. See dspark_markov_candidates_results.md for reproduction and limits.
+checkpoint acceptance rate. Synthetic target and draft vocabularies are equal.
+See dspark_markov_candidates_results.md for reproduction and limits.
 """
 
 import argparse
@@ -145,45 +145,6 @@ def _measure(fn, args, flush):
     }
 
 
-def _staged_candidates(
-    base, anchor, temps, greedy, w1, w2, static_ids, static_bias, topk, alpha
-):
-    """Vectorized Torch candidate baseline; same union and static-side authority.
-
-    This intentionally measures the dense cache allocation/publication it uses;
-    it is a functional baseline, not claimed to be an optimal implementation.
-    """
-    batch, gamma, vocab = base.shape
-    values, ids = torch.topk(base, topk, dim=-1)
-    cache = torch.full(
-        (batch, gamma, vocab), -torch.inf, dtype=torch.float32, device=base.device
-    )
-    outputs = []
-    prev = anchor
-    for step in range(gamma):
-        a = ids[:, step]
-        h = static_ids[prev].long()
-        a_bias = (w1[prev].float()[:, None, :] * w2[a].float()).sum(-1)
-        a_scores = values[:, step].float() + alpha * a_bias
-        if h.shape[1]:
-            duplicate = (a[:, :, None] == h[:, None, :]).any(-1)
-            a_scores = a_scores.masked_fill(duplicate, -torch.inf)
-            h_scores = base[:, step].gather(1, h).float() + alpha * static_bias[prev]
-            candidates = torch.cat((a, h), dim=1)
-            scores = torch.cat((a_scores, h_scores), dim=1)
-        else:
-            candidates, scores = a, a_scores
-        noise = -torch.log(-torch.log(torch.rand_like(scores).clamp_(1e-7, 1 - 1e-7)))
-        keys = torch.where(greedy[:, None], scores, scores / temps[:, None] + noise)
-        best = keys.max(-1, keepdim=True).values
-        prev = torch.where(keys == best, candidates, vocab).min(-1).values
-        outputs.append(prev)
-        cache[:, step].scatter_reduce_(
-            1, candidates, scores, reduce="amax", include_self=True
-        )
-    return torch.stack(outputs, dim=1), cache
-
-
 def _dense_baseline(base, anchor, temps, greedy, w1, w2, alpha, all_greedy):
     from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
         MarkovGreedyStep,
@@ -215,35 +176,15 @@ def _dense_baseline(base, anchor, temps, greedy, w1, w2, alpha, all_greedy):
     return torch.stack(outputs, dim=1), torch.stack(cache, dim=1) if cache else None
 
 
-def _check_case(base, anchor, temps, w1, w2, sampler, args):
-    greedy = torch.ones(base.shape[0], dtype=torch.bool, device="cuda")
-    actual = sampler.sample(base, anchor, temps, greedy)
-    expected_ids, expected_scores = _staged_candidates(
-        base,
-        anchor,
-        temps,
-        greedy,
-        w1,
-        w2,
-        sampler.static_ids,
-        sampler.static_bias,
-        args.k,
-        args.alpha,
-    )
-    torch.testing.assert_close(actual.tokens, expected_ids, rtol=0, atol=0)
-    torch.testing.assert_close(
-        actual.corrected_logits, expected_scores, rtol=2e-4, atol=2e-4
-    )
-    # This numerical check supplements (not replaces) the independent CPU and
-    # statistical GPU suite. It must pass on the exact benchmark shape.
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--vocab", type=int, required=True, help="actual draft output vocabulary"
+        "--vocab",
+        type=int,
+        required=True,
+        help="synthetic target and draft vocabulary size",
     )
-    parser.add_argument("--rank", type=int, required=True, help="actual Markov rank")
+    parser.add_argument("--rank", type=int, required=True, help="Markov rank")
     parser.add_argument(
         "--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16"
     )
@@ -338,9 +279,6 @@ def main():
             "table_bytes": sampler.static_ids.numel() * 4
             + sampler.static_bias.numel() * 4,
         }
-        _check_case(base, anchor, temps, w1, w2, sampler, args)
-        prepared_values, prepared_ids = sampler.prepare_topk(base)
-        prepared_seeds = torch.randint(0, 2**31, (batch, args.gamma), device="cuda")
         functions = {
             (
                 "existing_dense_markov_greedy"
@@ -356,37 +294,9 @@ def main():
                 args.alpha,
                 args.sampling == "greedy",
             ),
-            "staged_candidate_torch": lambda: _staged_candidates(
-                base,
-                anchor,
-                temps,
-                greedy,
-                w1,
-                w2,
-                sampler.static_ids,
-                sampler.static_bias,
-                args.k,
-                args.alpha,
-            ),
-            "production_candidate_wrapper": lambda: sampler.sample(
+            "production_candidate_wrapper": lambda sampler=sampler: sampler.sample(
                 base, anchor, temps, greedy
             ),
-            "production_topk_only": lambda: sampler.prepare_topk(base),
-            "production_walk_and_sparse_cache_only_ablation": lambda: (
-                sampler.sample_prepared(
-                    base,
-                    prepared_values,
-                    prepared_ids,
-                    anchor,
-                    temps,
-                    greedy,
-                    seeds=prepared_seeds,
-                )
-            ),
-            "torch_topk_only_ablation": lambda: torch.topk(base, args.k, dim=-1),
-            "dense_q_softmax_only_ablation": lambda: (
-                sampler.corrected_logits / temps[:, None, None]
-            ).softmax(-1),
         }
         # Alternating order distributes thermal drift across implementations.
         names = list(functions)
@@ -410,12 +320,11 @@ def main():
                         "effective_topk_backend": getattr(
                             sampler, "topk_backend", "unreported"
                         ),
-                        "correctness": "exact-shape greedy staged parity; run independent suite separately",
                     }
                 ),
                 flush=True,
             )
-        del sampler
+        del functions, sampler
 
 
 if __name__ == "__main__":

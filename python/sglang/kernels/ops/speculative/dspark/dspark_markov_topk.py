@@ -23,13 +23,12 @@ try:
     import triton
     import triton.language as tl
 except ImportError:
-    # The staged implementation and smoke checks need only CPU Torch.
+    # Static table validation can run with CPU Torch.
     triton = None
     tl = None
 
 from sglang.kernels.ops.speculative.dspark.dspark_markov_topk_reference import (
     MarkovCandidateResult,
-    candidate_uniform,
     validate_mapping,
 )
 
@@ -382,10 +381,9 @@ class MarkovCandidateSampler:
             raise ValueError("DSpark candidate weights must be FP16/BF16/FP32")
         if w1.device != w2.device:
             raise ValueError("DSpark candidate weights must be on the same device")
-        if w1.is_cuda:
-            reason = candidate_support_reason(w1, w2, topk=topk, bias_topk=bias_topk)
-            if reason:
-                raise ValueError(reason)
+        reason = candidate_support_reason(w1, w2, topk=topk, bias_topk=bias_topk)
+        if reason:
+            raise ValueError(reason)
         validate_mapping(d2t_offset, w2.shape[0], target_vocab_size)
         self.w1, self.w2 = w1, w2
         self.alpha, self.topk, self.bias_topk = float(alpha), topk, bias_topk
@@ -401,14 +399,14 @@ class MarkovCandidateSampler:
             None if self.d2t_offset is None else self.d2t_offset.detach().cpu().clone()
         )
         self._weight_layouts = tuple(self._weight_layout(weight) for weight in (w1, w2))
-        self.path = "triton" if w1.is_cuda else "torch-reference"
+        self.path = "triton"
         self.logits_dtype = w1.dtype if logits_dtype is None else logits_dtype
         if self.logits_dtype not in _FLOAT_DTYPES:
             raise ValueError("DSpark base logits must be FP16/BF16/FP32")
         self._flashinfer_top_k = None
         if topk_backend not in ("auto", "torch", "flashinfer"):
             raise ValueError("topk_backend must be auto, torch, or flashinfer")
-        if topk_backend != "torch" and w1.is_cuda:
+        if topk_backend != "torch":
             try:
                 from flashinfer import top_k
             except ImportError:
@@ -536,7 +534,7 @@ class MarkovCandidateSampler:
         graph recapture. An omitted mapping retains the configured mapping;
         explicit None requests identity and is checked like any other change.
         """
-        if self.w1.is_cuda and torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             raise ValueError("DSpark Markov weights cannot be refreshed during capture")
         layouts = tuple(self._weight_layout(weight) for weight in (w1, w2))
         current_layouts = tuple(
@@ -571,8 +569,7 @@ class MarkovCandidateSampler:
                 "DSpark draft-to-target mapping changed; restart the worker "
                 "and recapture CUDA graphs"
             )
-        if self.w1.is_cuda:
-            torch.cuda.synchronize(self.w1.device)
+        torch.cuda.synchronize(self.w1.device)
         # Build first, so a workspace failure never publishes a partial table.
         # Existing table storage remains allocated and is included in the free
         # memory observation used to budget the temporary replacement table.
@@ -583,8 +580,7 @@ class MarkovCandidateSampler:
             self.w2.copy_(w2)
         self.static_ids.copy_(ids)
         self.static_bias.copy_(bias)
-        if self.w1.is_cuda:
-            torch.cuda.synchronize(self.w1.device)
+        torch.cuda.synchronize(self.w1.device)
         if self._buffer_addresses() != self._storage_addresses:
             raise RuntimeError("DSpark refresh unexpectedly replaced captured storage")
         self.refresh_count += 1
@@ -725,112 +721,49 @@ class MarkovCandidateSampler:
             return MarkovCandidateResult(
                 self.tokens[:0], self.corrected_logits[:0], self.prev_tokens[:0]
             )
-        if base_logits.is_cuda:
-            _clear_candidate_cache[(bs * self.gamma,)](
-                self.corrected_logits,
-                self.cached_ids,
-                self.target_vocab_size,
-                self.topk + self.bias_topk,
-                triton.next_power_of_2(self.topk + self.bias_topk),
-                num_warps=4,
-            )
-            _candidate_walk[(bs,)](
-                base_logits,
-                values,
-                ids,
-                self.w1,
-                self.w2,
-                self.static_ids,
-                self.static_bias,
-                self.d2t_offset if self.d2t_offset is not None else ids,
-                anchor,
-                temperatures,
-                greedy_mask,
-                seeds,
-                num_valid,
-                self.tokens,
-                self.prev_tokens,
-                self.corrected_logits,
-                self.cached_ids,
-                BASE_STRIDE_B=base_logits.stride(0),
-                BASE_STRIDE_N=base_logits.stride(1),
-                W1_STRIDE=self.w1.stride(0),
-                W2_STRIDE=self.w2.stride(0),
-                V=self.target_vocab_size,
-                N=self.gamma,
-                R=self.w1.shape[1],
-                K=self.topk,
-                M=self.bias_topk,
-                ALPHA=self.alpha,
-                HAS_D2T=self.d2t_offset is not None,
-                BLOCK_BASE_K=triton.next_power_of_2(self.topk),
-                BLOCK_M=triton.next_power_of_2(max(1, self.bias_topk)),
-                BLOCK_R=32,
-                num_warps=4,
-                enable_fp_fusion=False,
-            )
-        else:
-            self._sample_torch(
-                base_logits,
-                values,
-                ids,
-                anchor,
-                temperatures,
-                greedy_mask,
-                seeds,
-                int(num_valid),
-            )
+        _clear_candidate_cache[(bs * self.gamma,)](
+            self.corrected_logits,
+            self.cached_ids,
+            self.target_vocab_size,
+            self.topk + self.bias_topk,
+            triton.next_power_of_2(self.topk + self.bias_topk),
+            num_warps=4,
+        )
+        _candidate_walk[(bs,)](
+            base_logits,
+            values,
+            ids,
+            self.w1,
+            self.w2,
+            self.static_ids,
+            self.static_bias,
+            self.d2t_offset if self.d2t_offset is not None else ids,
+            anchor,
+            temperatures,
+            greedy_mask,
+            seeds,
+            num_valid,
+            self.tokens,
+            self.prev_tokens,
+            self.corrected_logits,
+            self.cached_ids,
+            BASE_STRIDE_B=base_logits.stride(0),
+            BASE_STRIDE_N=base_logits.stride(1),
+            W1_STRIDE=self.w1.stride(0),
+            W2_STRIDE=self.w2.stride(0),
+            V=self.target_vocab_size,
+            N=self.gamma,
+            R=self.w1.shape[1],
+            K=self.topk,
+            M=self.bias_topk,
+            ALPHA=self.alpha,
+            HAS_D2T=self.d2t_offset is not None,
+            BLOCK_BASE_K=triton.next_power_of_2(self.topk),
+            BLOCK_M=triton.next_power_of_2(max(1, self.bias_topk)),
+            BLOCK_R=32,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
         return MarkovCandidateResult(
             self.tokens[:bs], self.corrected_logits[:bs], self.prev_tokens[:bs]
         )
-
-    def _sample_torch(
-        self, base, values, ids, anchor, temperatures, greedy, seeds, num_valid
-    ):
-        """Staged functional fallback for CPU tests; uses the actual static table."""
-        for row in range(base.shape[0]):
-            prev = int(anchor[row]) if row < num_valid else 0
-            for step in range(self.gamma):
-                out = self.corrected_logits[row, step]
-                cached = self.cached_ids[row, step]
-                out[cached[cached >= 0].long()] = float("-inf")
-                cached.fill_(-1)
-                self.prev_tokens[row, step] = prev
-                if row >= num_valid:
-                    self.tokens[row, step] = 0
-                    out[0] = 0
-                    cached[0] = 0
-                    continue
-                bid = ids[row, step].long()
-                sid = self.static_ids[prev].long()
-                keep = ~torch.isin(bid, sid)
-                bid = bid[keep]
-                bias = (self.w2[bid].float() * self.w1[prev].float()).sum(-1)
-                bscore = values[row, step][keep].float() + self.alpha * bias
-                sscore = (
-                    base[row, step, sid].float() + self.alpha * self.static_bias[prev]
-                )
-                chosen = torch.cat((bid, sid))
-                score = torch.cat((bscore, sscore))
-                target = (
-                    chosen
-                    if self.d2t_offset is None
-                    else chosen + self.d2t_offset[chosen]
-                )
-                if not bool(torch.isfinite(score).any()):
-                    winner = target.min()
-                    out[winner] = 0
-                    cached[0] = winner
-                else:
-                    out[target] = score
-                    cached[: target.numel()] = target
-                    if bool(greedy[row]):
-                        keys = score
-                    else:
-                        u = candidate_uniform(seeds[row, step], target)
-                        keys = score / temperatures.reshape(-1)[row] - torch.log(
-                            -torch.log(u)
-                        )
-                    winner = target[keys == keys.max()].min()
-                self.tokens[row, step] = winner
-                prev = int(winner)

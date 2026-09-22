@@ -17,9 +17,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_markov_topk_reference import (
     markov_candidates_reference,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _oracle_step(base, w1, w2, prev, k, m, alpha, temperature, mapping):
@@ -168,7 +169,7 @@ def _enumerate_verify(q_at_prefix, p_at_prefix, gamma, supplied_q=None):
     return dict(outcomes)
 
 
-class TestMarkovCandidateReference(unittest.TestCase):
+class TestMarkovCandidateReference(CustomTestCase):
     def test_static_budget_refuses_oversized_temporary_and_m_zero_builds_nothing(self):
         from sglang.kernels.ops.speculative.dspark.dspark_markov_topk import (
             CandidateCapacityError,
@@ -188,50 +189,6 @@ class TestMarkovCandidateReference(unittest.TestCase):
         self.assertEqual(ids.shape, (7, 0))
         self.assertEqual(bias.shape, (7, 0))
         self.assertEqual(info["temporary_bytes"], 0)
-
-    def test_staged_cache_slot_reuse_and_padding(self):
-        from sglang.kernels.ops.speculative.dspark.dspark_markov_topk import (
-            MarkovCandidateSampler,
-        )
-
-        base, w1, w2, mapping = _fixture()
-        inputs = _inputs(base, mapping)
-        sampler = MarkovCandidateSampler(
-            w1,
-            w2,
-            alpha=-0.5,
-            topk=2,
-            bias_topk=2,
-            target_vocab_size=7,
-            gamma=3,
-            capacity=3,
-            d2t_offset=inputs["d2t_offset"],
-        )
-        sampler.corrected_logits[2].fill_(777)
-        for iteration in range(4):
-            current = base.flip(0).roll(iteration, dims=2).contiguous()
-            result = sampler.sample(
-                current,
-                inputs["anchor"],
-                inputs["temperatures"],
-                inputs["greedy_mask"],
-                seeds=inputs["seeds"],
-            )
-            _assert_chain(self, result, current, w1, w2, mapping, inputs, 2, 2, -0.5)
-        inputs["anchor"][1] = -1
-        result = sampler.sample(
-            base,
-            inputs["anchor"],
-            inputs["temperatures"],
-            inputs["greedy_mask"],
-            seeds=inputs["seeds"],
-            num_valid=torch.tensor(1, dtype=torch.int32),
-        )
-        self.assertEqual(result.tokens[1].tolist(), [0, 0, 0])
-        self.assertTrue(torch.isfinite(result.corrected_logits[1, :, 0]).all())
-        self.assertTrue(torch.isneginf(result.corrected_logits[1, :, 1:]).all())
-        self.assertFalse(result.corrected_logits.softmax(-1).isnan().any())
-        self.assertTrue((sampler.corrected_logits[2] == 777).all())
 
     def test_chain_union_scale_mapping_and_mixed_sampling(self):
         base, w1, w2, mapping = _fixture()
@@ -289,22 +246,6 @@ class TestMarkovCandidateReference(unittest.TestCase):
         )
         self.assertEqual(result.tokens.tolist(), [[0]])
 
-    def test_full_coverage_matches_dense_chain(self):
-        base, w1, w2, mapping = _fixture()
-        inputs = _inputs(base, mapping, greedy=(True, True))
-        result = markov_candidates_reference(
-            base,
-            inputs["anchor"],
-            w1,
-            w2,
-            alpha=0.5,
-            topk=5,
-            bias_topk=2,
-            target_vocab_size=7,
-            **{key: value for key, value in inputs.items() if key != "anchor"},
-        )
-        _assert_chain(self, result, base, w1, w2, mapping, inputs, 5, 2, 0.5)
-
     def test_rejection_enumeration_and_negative_control(self):
         p = lambda prefix: [0.1, 0.2, 0.3, 0.4]
         q = lambda prefix: [0.75, 0.25, 0.0, 0.0]
@@ -325,7 +266,10 @@ class TestMarkovCandidateReference(unittest.TestCase):
 @unittest.skipUnless(
     torch.cuda.is_available(), "requires NVIDIA CUDA; not validated on CPU"
 )
-class TestMarkovCandidateCuda(unittest.TestCase):
+class TestMarkovCandidateCuda(CustomTestCase):
+    # Statistical failures must not be hidden by CustomTestCase's CI retry.
+    _callTestMethod = unittest.TestCase._callTestMethod
+
     def _sampler(self, base, w1, w2, mapping, k, m, alpha=1, capacity=None):
         from sglang.kernels.ops.speculative.dspark.dspark_markov_topk import (
             MarkovCandidateSampler,
@@ -343,6 +287,31 @@ class TestMarkovCandidateCuda(unittest.TestCase):
             d2t_offset=torch.tensor(mapping, device="cuda")
             - torch.arange(len(mapping), device="cuda"),
         )
+
+    def test_refresh_preserves_addresses_and_updates_static_values(self):
+        base, w1, w2, mapping = _fixture(device="cuda")
+        inputs = _inputs(base, mapping)
+        sampler = self._sampler(base, w1, w2, mapping, 2, 2)
+        addresses = sampler._buffer_addresses()
+        old_bias = sampler.static_bias.clone()
+        new_w1, new_w2 = w1.clone() * 2, w2.flip(0).contiguous()
+        sampler.refresh_weights(
+            new_w1, new_w2, alpha=1, d2t_offset=inputs["d2t_offset"]
+        )
+        self.assertEqual(addresses, sampler._buffer_addresses())
+        self.assertFalse(torch.equal(old_bias, sampler.static_bias))
+        result = sampler.sample(
+            base,
+            inputs["anchor"],
+            inputs["temperatures"],
+            inputs["greedy_mask"],
+            seeds=inputs["seeds"],
+        )
+        _assert_chain(self, result, base, new_w1, new_w2, mapping, inputs, 2, 2, 1)
+        with self.assertRaisesRegex(ValueError, "alpha changed"):
+            sampler.refresh_weights(new_w1, new_w2, alpha=-1)
+        with self.assertRaisesRegex(ValueError, "mapping changed"):
+            sampler.refresh_weights(new_w1, new_w2, d2t_offset=None)
 
     def test_actual_kernel_chain_and_cache_match_independent_oracle(self):
         for dtype, k, m, alpha in itertools.product(

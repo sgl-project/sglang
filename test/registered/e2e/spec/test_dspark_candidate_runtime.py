@@ -1,25 +1,26 @@
-"""Exercise the real DSpark eager/graph sampling wrappers with a tiny model.
-
-Only the backbone/LM-head forward is replaced with known input logits. Markov
-heads, capability selection, parameter staging, graph sampling and eager
-sampling are production implementations. No checkpoint or server claim follows
-from these integration tests.
-"""
+"""Exercise production DSpark sampling wrappers with a known-logit backbone."""
 
 import unittest
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.models.dspark import GatedMarkovHead, VanillaMarkov
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.dspark_components.dspark_draft import sample_draft_block
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    DsparkDraftSampler,
+    initialize_markov_candidate_sampler,
+)
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 
 
 def _model(device, sample_from_anchor=True, gated=False):
-    from sglang.srt.models.dspark import GatedMarkovHead, VanillaMarkov
-
     args = dict(vocab_size=7, draft_vocab_size=5, markov_rank=3, logit_scale=1)
     head = GatedMarkovHead(**args, hidden_size=5) if gated else VanillaMarkov(**args)
     head = head.to(device)
@@ -55,8 +56,7 @@ def _model(device, sample_from_anchor=True, gated=False):
             head.gate_proj.weight.zero_()
             head.gate_proj.bias.zero_()
     head.configure_target_vocab(7, offsets)
-    for parameter in head.parameters():
-        parameter.requires_grad_(False)
+    head.requires_grad_(False)
     config = SimpleNamespace(
         vocab_size=7,
         draft_vocab_size=5,
@@ -65,7 +65,7 @@ def _model(device, sample_from_anchor=True, gated=False):
         logit_scale=1,
         sample_from_anchor=sample_from_anchor,
     )
-    model = SimpleNamespace(
+    return SimpleNamespace(
         markov_head=head,
         config=config,
         sample_from_anchor=sample_from_anchor,
@@ -79,7 +79,6 @@ def _model(device, sample_from_anchor=True, gated=False):
         ),
         compute_base_logits=lambda hidden: (hidden, None),
     )
-    return model
 
 
 def _base(device):
@@ -97,8 +96,6 @@ def _base(device):
 
 
 def _sync():
-    from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-
     return SpecTpSync(SimpleNamespace(world_size=1, rank_in_group=0))
 
 
@@ -135,68 +132,57 @@ def _assert_scores(tc, tokens, logits, base, anchor, model, k, m, greedy):
             prev = chosen
 
 
-class TestDsparkCandidateFallback(unittest.TestCase):
+class TestDsparkCandidateFallback(CustomTestCase):
     def test_disabled_cpu_tp_and_gated_use_functional_dense_path(self):
-        from sglang.srt.speculative.dspark_components.dspark_draft import (
-            sample_draft_block,
-        )
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            initialize_markov_candidate_sampler,
-        )
-
-        base = _base("cpu")
-        anchor = torch.tensor([0, 4])
-        for k, tp, gated in ((0, 1, False), (3, 1, False), (3, 2, False), (3, 1, True)):
-            with self.subTest(k=k, tp=tp, gated=gated):
-                model = _model("cpu", gated=gated)
-                candidate = initialize_markov_candidate_sampler(
-                    model=model,
-                    draft_hf_config=model.config,
-                    gamma=3,
-                    capacity=2,
-                    tp_size=tp,
-                    markov_topk=k,
-                    markov_bias_topk=2,
-                )
-                self.assertIsNone(candidate)
-                self.assertIsNone(model.markov_candidate_sampler)
-                result = sample_draft_block(
-                    base_logits=base,
-                    anchor_tokens=anchor,
-                    draft_hidden=base,
-                    sampling_info=None,
-                    markov_head=model.markov_head,
-                    device=torch.device("cpu"),
-                    tp_sync=_sync(),
-                    candidate_sampler=candidate,
-                )
-                _assert_scores(
-                    self,
-                    result.draft_tokens,
-                    result.corrected_logits,
-                    base,
-                    anchor,
-                    model,
-                    5,
-                    0,
-                    torch.ones(2, dtype=torch.bool),
-                )
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            base = _base(device)
+            anchor = torch.tensor([0, 4], device=device)
+            cases = [(0, 1, False), (3, 2, False), (3, 1, True)]
+            if device == "cpu":
+                cases.append((3, 1, False))
+            for k, tp, gated in cases:
+                with self.subTest(device=device, k=k, tp=tp, gated=gated):
+                    model = _model(device, gated=gated)
+                    candidate = initialize_markov_candidate_sampler(
+                        model=model,
+                        draft_hf_config=model.config,
+                        gamma=3,
+                        capacity=2,
+                        tp_size=tp,
+                        markov_topk=k,
+                        markov_bias_topk=2,
+                    )
+                    self.assertIsNone(candidate)
+                    result = sample_draft_block(
+                        base_logits=base,
+                        anchor_tokens=anchor,
+                        draft_hidden=base,
+                        sampling_info=None,
+                        markov_head=model.markov_head,
+                        device=torch.device(device),
+                        tp_sync=_sync(),
+                        candidate_sampler=candidate,
+                    )
+                    _assert_scores(
+                        self,
+                        result.draft_tokens,
+                        result.corrected_logits,
+                        base,
+                        anchor,
+                        model,
+                        5,
+                        0,
+                        torch.ones(2, dtype=torch.bool),
+                    )
+        # TP=2 checks dispatch; this is not a multi-process collective test.
 
 
 @unittest.skipUnless(
     torch.cuda.is_available(), "requires NVIDIA CUDA runtime graph validation"
 )
-class TestDsparkCandidateRuntimeCuda(unittest.TestCase):
+class TestDsparkCandidateRuntimeCuda(CustomTestCase):
     def test_real_wrapper_graph_stages_inputs_and_eager_cache_contract(self):
-        from sglang.srt.sampling.sampling_params import SamplingParams
-        from sglang.srt.speculative.dspark_components.dspark_draft import (
-            sample_draft_block,
-        )
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            DsparkDraftSampler,
-            initialize_markov_candidate_sampler,
-        )
-
         for from_anchor in (True, False):
             for folded in (True, False):
                 with self.subTest(sample_from_anchor=from_anchor, folded=folded):
@@ -210,12 +196,9 @@ class TestDsparkCandidateRuntimeCuda(unittest.TestCase):
                         markov_topk=3,
                         markov_bias_topk=2,
                     )
-                    self.assertIsNotNone(candidate)
                     self.assertEqual(candidate.path, "triton")
 
-                    # The callback encodes the actual predecessor chain, making
-                    # an incorrect confidence input visible without claiming
-                    # confidence calibration has been evaluated.
+                    # Expose the predecessor chain passed to confidence computation.
                     def confidence_fn(
                         *, draft_hidden, anchor_tokens, draft_tokens, confidence_tap
                     ):
@@ -266,9 +249,7 @@ class TestDsparkCandidateRuntimeCuda(unittest.TestCase):
                         temperatures = torch.tensor(
                             [r.temperature for r in requests[:valid]], device="cuda"
                         )
-                        # Request top_k=-1 is normalized by SamplingParams to
-                        # TOP_K_ALL before the real runtime sees top_ks. Passing
-                        # raw -1 here would accidentally exercise greedy rows.
+                        # SamplingParams normalizes request top_k=-1 to TOP_K_ALL.
                         topks = torch.tensor(
                             [r.top_k for r in requests[:valid]], device="cuda"
                         )
@@ -357,52 +338,6 @@ class TestDsparkCandidateRuntimeCuda(unittest.TestCase):
                             1,
                             "sampling row stayed frozen or became greedy",
                         )
-
-    def test_cuda_unsupported_dispatch_keeps_dense_sampling_working(self):
-        from sglang.srt.speculative.dspark_components.dspark_draft import (
-            sample_draft_block,
-        )
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            initialize_markov_candidate_sampler,
-        )
-
-        base = _base("cuda")
-        anchor = torch.tensor([0, 4], device="cuda")
-        for k, tp, gated in ((0, 1, False), (3, 2, False), (3, 1, True)):
-            model = _model("cuda", gated=gated)
-            candidate = initialize_markov_candidate_sampler(
-                model=model,
-                draft_hf_config=model.config,
-                gamma=3,
-                capacity=2,
-                tp_size=tp,
-                markov_topk=k,
-                markov_bias_topk=2,
-            )
-            self.assertIsNone(candidate)
-            result = sample_draft_block(
-                base_logits=base,
-                anchor_tokens=anchor,
-                draft_hidden=base,
-                sampling_info=None,
-                markov_head=model.markov_head,
-                device=torch.device("cuda"),
-                tp_sync=_sync(),
-                candidate_sampler=candidate,
-            )
-            _assert_scores(
-                self,
-                result.draft_tokens,
-                result.corrected_logits,
-                base,
-                anchor,
-                model,
-                5,
-                0,
-                torch.ones(2, dtype=torch.bool),
-            )
-        # TP=2 here tests dispatch only. It does not claim a multi-process
-        # collective or TP model execution test.
 
 
 if __name__ == "__main__":

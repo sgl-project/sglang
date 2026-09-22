@@ -24,34 +24,6 @@ logger = logging.getLogger(__name__)
 _CAPTURE_HEADROOM_GB = 1.0
 
 
-def dspark_effective_graph_capacity(
-    *,
-    max_running_requests: Optional[int],
-    attn_dp_size: int,
-    decode_graph_max_bs: Optional[int],
-) -> Optional[int]:
-    """Tight upper bound on the batch size a DSpark graph can reach.
-
-    ``get_batch_sizes_to_capture`` filters the decode-bs list by
-    ``req_to_token_pool.size``, which derives from ``max_running_requests``.
-    No graph replay can exceed that bound, so buffers sized by the
-    unclamped decode-bs maximum waste memory. This function computes the
-    capped value: the graph's max-bs ceiling limited by the request bound.
-
-    Returns None when neither bound is available (both are None).
-    """
-    if max_running_requests is not None:
-        per_rank = max(1, max_running_requests // attn_dp_size)
-    else:
-        per_rank = None
-    if decode_graph_max_bs is None:
-        return per_rank
-    if per_rank is None:
-        return decode_graph_max_bs
-    capped_graph = min(decode_graph_max_bs, max_running_requests)
-    return max(per_rank, capped_graph)
-
-
 def _target_vocab_size(model) -> int:
     return int(getattr(model, "target_vocab_size", model.lm_head.org_vocab_size))
 
@@ -368,7 +340,7 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
-      
+
     # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
     if getattr(model.markov_head, "supports_sharded_greedy", False):
         return False
@@ -385,7 +357,7 @@ def _resolve_folded_sampling(
     else:
         noise_bytes = max_bs * vocab * 4
         logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
-          
+
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
