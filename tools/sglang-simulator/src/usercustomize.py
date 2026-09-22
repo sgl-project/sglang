@@ -1,6 +1,7 @@
 """Early CPU-simulation compatibility for spawned SGLang workers."""
 
 import os
+import sys
 
 
 def apply_cpu_simulation_compat() -> None:
@@ -29,6 +30,13 @@ def apply_cpu_simulation_compat() -> None:
 
     sgl_kernel_hook.install_load_utils_stub()
     sgl_kernel_hook.install_quantization_stub()
+
+    # Some development images expose an editable Megatron checkout whose
+    # TransformerEngine extension does not match the image runtime.  SGLang's
+    # debug dumper probes Megatron opportunistically during server startup,
+    # even though the simulator does not use it.  Treat that optional package
+    # as unavailable in the explicitly opted-in CPU simulator process.
+    sys.modules.setdefault("megatron", None)
 
 
 apply_cpu_simulation_compat()

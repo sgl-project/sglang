@@ -71,6 +71,8 @@ def test_cpu_bootstrap_masks_rocm_runtime(monkeypatch):
     assert torch.version.hip is None
     assert "sgl_kernel.load_utils" in sys.modules
     assert "sglang.srt.layers.quantization" in sys.modules
+    assert "megatron" in sys.modules
+    assert sys.modules["megatron"] is None
 
 
 def test_cpu_bootstrap_stubs_quantization_registry():
