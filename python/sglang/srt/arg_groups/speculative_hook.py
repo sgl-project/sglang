@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
@@ -35,6 +36,7 @@ def _should_auto_enable_hip_rejection_sampling(
     accept_threshold_single: float,
     accept_threshold_acc: float,
     enable_deterministic_inference: bool,
+    simulate_acc_len: float = -1.0,
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
@@ -43,6 +45,10 @@ def _should_auto_enable_hip_rejection_sampling(
     would crash configs that previously ran greedy on HIP, including EAGLE3
     stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
     EAGLE3 and any EAGLE run that already has a token map.
+
+    Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
+    runs the real EAGLE verify then overwrites accept length, so the Triton
+    chain sampler is paid for and thrown away.
     """
     return (
         is_hip
@@ -53,6 +59,7 @@ def _should_auto_enable_hip_rejection_sampling(
         and accept_threshold_single == 1.0
         and accept_threshold_acc == 1.0
         and not enable_deterministic_inference
+        and simulate_acc_len <= 0
     )
 
 
@@ -161,8 +168,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
-    # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
+    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
+    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
+    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
+    # recent window).
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:
@@ -174,12 +184,29 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
+                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
                 cfg.speculative_algorithm,
             )
+
+    if cfg.speculative_draft_sink_size is not None:
+        sink_size = int(cfg.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_sink_size=sink_size,
+        )
 
     algo = None
     if cfg.speculative_algorithm is not None:
@@ -1005,6 +1032,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         accept_threshold_single=cfg.speculative_accept_threshold_single,
         accept_threshold_acc=cfg.speculative_accept_threshold_acc,
         enable_deterministic_inference=cfg.enable_deterministic_inference,
+        simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
     ):
         declare_resolution(
             server_args,

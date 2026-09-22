@@ -382,7 +382,9 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
-    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+    def _init_dcp_pack_buffers_once(
+        self, dcp_size: int, *, include_draft: bool = False
+    ) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
@@ -397,6 +399,7 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens
 
