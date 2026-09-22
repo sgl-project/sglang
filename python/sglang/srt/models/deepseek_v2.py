@@ -52,7 +52,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_glm_moe_dsa,
 )
-from sglang.srt.distributed import divide, get_pp_group
+from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -552,9 +552,9 @@ class MoEGate(nn.Module):
         return logits
 
 
-# 96 rows of 5120 bf16 fit the 1 MiB CustomAllReduceV2 push slot the whole
-# [T, hidden] view is staged through.
-_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 96
+# The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
+# The dispatch gate also checks slot capacity and available counters.
+_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
 class DeepseekV2MoE(nn.Module):
@@ -608,6 +608,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)
@@ -1129,7 +1130,17 @@ class DeepseekV2MoE(nn.Module):
                         mhc.post,
                         mhc.comb,
                     )
-                    if mhc.norm_weight is not None:
+                    if mhc.combine_only:
+                        from sglang.kernels.ops.communication.all_reduce_mhc_combine import (
+                            moe_finalize_all_reduce_mhc_combine,
+                        )
+
+                        final_hidden_states, mhc.output, mhc.combined = (
+                            moe_finalize_all_reduce_mhc_combine(
+                                *args, mhc.pre, world_size=self.tp_size
+                            )
+                        )
+                    elif mhc.norm_weight is not None:
                         from sglang.kernels.ops.communication.all_reduce_mhc import (
                             moe_finalize_all_reduce_mhc_quant,
                         )
@@ -1175,6 +1186,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not all_reduce_done:
+            if (
+                self.is_deepseek_v4
+                and self.tp_size > 1
+                and not should_skip_post_experts_all_reduce(is_tp_path=True)
+            ):
+                from sglang.srt.layers.moe.mhc_post_fusion import (
+                    current_mhc_post_fusion,
+                )
+
+                mhc = current_mhc_post_fusion()
+                if mhc is not None:
+                    mhc.start_stats_before_all_reduce()
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
@@ -1321,6 +1344,16 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
+        if (
+            self.is_deepseek_v4
+            and self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(is_tp_path=True)
+        ):
+            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
+
+            mhc = current_mhc_post_fusion()
+            if mhc is not None:
+                mhc.start_stats_before_all_reduce()
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
@@ -2760,6 +2793,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
+    """The first stage embeds inputs; the last supplies the EAGLE draft embedding."""
+    return pp_group.is_first_rank or (
+        pp_group.is_last_rank and speculative_algorithm is not None
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2775,9 +2815,9 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
-        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
+        if pp_stage_needs_embedding(self.pp_group, get_spec().speculative_algorithm):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -3097,7 +3137,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config

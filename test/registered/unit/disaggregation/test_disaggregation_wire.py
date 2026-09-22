@@ -2,12 +2,13 @@ import struct
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -29,6 +30,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -36,6 +38,9 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_qsa_pending_state_indices,
+    poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_with_staging,
     setup_state_kv_args,
     should_send_replicated_state,
 )
@@ -64,6 +69,25 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
+        manager = object.__new__(MooncakeKVManager)
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 42
+        for outstanding in (0, 1):
+            with self.subTest(outstanding=outstanding):
+                manager.request_status = {42: KVPoll.Failed}
+                manager._staging_outstanding = {42: outstanding}
+                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
+                with patch.object(manager, "_send_abort_ack") as ack:
+                    sender.clear()
+                    if outstanding:
+                        ack.assert_not_called()
+                        manager._staging_outstanding[42] = 0
+                        manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
+                    manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once()
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -92,6 +116,9 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -158,6 +185,117 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
+class TestPollCollectives(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        failure_prob = patch.object(
+            envs.SGLANG_TEST_DISAGG_FAILURE_PROB, "get", return_value=0
+        )
+        failure_prob.start()
+        self.addCleanup(failure_prob.stop)
+
+    def test_tp_cp_consensus_skips_only_singleton_groups(self):
+        """Poll states retain TP/CP consensus without singleton collectives."""
+        local = [KVPoll.Success, KVPoll.Success, KVPoll.Success]
+        tp_peers = [KVPoll.Success, KVPoll.Transferring, KVPoll.Success]
+        cp_peers = [KVPoll.Bootstrapping, KVPoll.Success, KVPoll.Failed]
+        for tp_size, cp_size in [(4, 1), (2, 2), (1, 4), (1, 1)]:
+            with self.subTest(tp_size=tp_size, cp_size=cp_size):
+                tp, cp = object(), object()
+                sizes = {tp: tp_size, cp: cp_size}
+                peers = {tp: tp_peers, cp: cp_peers}
+                pollers = [Mock(poll=Mock(return_value=state)) for state in local]
+
+                def reduce(tensor, op, group):
+                    self.assertEqual(op, dist.ReduceOp.MIN)
+                    if sizes[group] > 1:
+                        tensor.copy_(
+                            torch.minimum(
+                                tensor, torch.tensor(peers[group], dtype=tensor.dtype)
+                            )
+                        )
+
+                expected = local.copy()
+                expected_calls = []
+                for group in [tp, cp]:
+                    if sizes[group] > 1:
+                        expected = [min(a, b) for a, b in zip(expected, peers[group])]
+                        expected_calls.append(
+                            call(ANY, op=dist.ReduceOp.MIN, group=group)
+                        )
+                with (
+                    patch.object(dist, "get_world_size", side_effect=sizes.__getitem__),
+                    patch.object(dist, "all_reduce", side_effect=reduce) as all_reduce,
+                ):
+                    result = poll_and_all_reduce_attn_cp_tp_group(pollers, cp, tp)
+
+                self.assertEqual(result, expected)
+                self.assertEqual(all_reduce.call_args_list, expected_calls)
+                for poller in pollers:
+                    poller.poll.assert_called_once_with()
+
+    def test_singleton_polling_needs_no_tensor_or_collective(self):
+        """A single rank can poll transfers without allocating a reduction tensor."""
+        states = [KVPoll.Failed, KVPoll.Transferring, KVPoll.Success]
+        pollers = [Mock(poll=Mock(return_value=state)) for state in states]
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+            patch.object(
+                torch, "tensor", side_effect=AssertionError("No tensor needed")
+            ),
+        ):
+            self.assertEqual(poll_and_all_reduce(pollers, object()), states)
+        all_reduce.assert_not_called()
+
+    def test_singleton_still_waits_for_decode_metadata(self):
+        pollers = [Mock(poll=Mock(return_value=KVPoll.Success)) for _ in range(2)]
+        requests = [
+            SimpleNamespace(
+                req=SimpleNamespace(bootstrap_host="127.0.0.1"),
+                metadata_buffer_index=index,
+            )
+            for index in range(2)
+        ]
+        metadata = SimpleNamespace(bootstrap_room=torch.tensor([[0], [42]]))
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce(pollers, object(), requests, metadata)
+        self.assertEqual(result, [KVPoll.Transferring, KVPoll.Success])
+        all_reduce.assert_not_called()
+
+    def test_singleton_still_advances_and_waits_for_staging(self):
+        request = SimpleNamespace(
+            kv_receiver=Mock(
+                require_staging=True, poll=Mock(return_value=KVPoll.Success)
+            )
+        )
+        staging = Mock(
+            is_done=Mock(return_value=False), is_failed=Mock(return_value=False)
+        )
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce_with_staging([request], staging, object())
+        self.assertEqual(result, [KVPoll.Transferring])
+        staging.advance_scatter.assert_called_once_with(request)
+        all_reduce.assert_not_called()
+
+    def test_singleton_preserves_failure_injection(self):
+        poller = Mock(poll=Mock(return_value=KVPoll.Success))
+        with (
+            patch.object(envs.SGLANG_TEST_DISAGG_FAILURE_PROB, "get", return_value=1),
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce([poller], object())
+        self.assertEqual(result, [KVPoll.Failed])
+        all_reduce.assert_not_called()
+
+
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         cases = [
@@ -201,15 +339,8 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
-    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
-
-        np.testing.assert_array_equal(
-            get_qsa_pending_state_indices(req),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_qsa_registers_request_ring_and_page_state_separately(self):
+    @staticmethod
+    def _qsa_pool(layer_id: int):
         pool = object.__new__(QSATokenToKVPool)
         pool.full_kv_pool = object()
         pool.get_state_buf_infos = lambda: ([10], [100], [20])
@@ -220,12 +351,24 @@ class TestQwen4StateWire(unittest.TestCase):
         pool.page_size = 4
         pool.qsa_compress_ratio = 2
         pool.qsa_compressed_page_size = 2
-        pool.full_attention_layer_id_mapping = {24: 0}
+        pool.full_attention_layer_id_mapping = {layer_id: 0}
         pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
         pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
         pool.qsa_compressed_k_buffer_pool = [
             torch.zeros((6, 1, 8), dtype=torch.bfloat16)
         ]
+        return pool
+
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_qsa_registers_request_ring_and_page_state_separately(self):
+        pool = self._qsa_pool(24)
 
         kv_args = SimpleNamespace()
         setup_state_kv_args(kv_args, pool)
@@ -240,6 +383,34 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(
             kv_args.state_layer_ids[1:],
             [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
+        )
+
+    def test_qsa_draft_state_uses_reserved_layer_id_band(self):
+        target_pool = self._qsa_pool(24)
+        draft_pool = self._qsa_pool(0)
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(
+            kv_args,
+            target_pool,
+            draft_token_to_kv_pool=draft_pool,
+            total_kv_layers=48,
+        )
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(
+            kv_args.state_layer_ids[1:],
+            [
+                [24, QSA_ROPE_STATE_LAYER_ID, 48, 49],
+                [24, 48],
+            ],
+        )
+        self.assertEqual(
+            [len(entries) for entries in kv_args.state_data_ptrs[1:]],
+            [4, 2],
         )
 
     def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
@@ -927,6 +1098,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
     pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256
+    pool.swa_page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
     pool.unified_swa_window = 128
@@ -941,7 +1113,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
         )
     else:
         pool.swa_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
+            page_size=256, kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
         )
     return pool
 

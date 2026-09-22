@@ -56,7 +56,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     if not _init():
         return
     from sglang.kernels.ops.kimi_k3 import gemm_ar as mod
-    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
     world_size = parallel.tp_size
@@ -73,7 +73,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     mod.init(
         world_size=world_size,
         rank=parallel.tp_rank,
-        group=get_tp_group().cpu_group,
+        group=get_parallel().tp_group.cpu_group,
         k=weight.shape[1],
     )
     # per-K compile + base-address stash, pre-capture
