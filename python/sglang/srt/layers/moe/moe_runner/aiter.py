@@ -346,12 +346,16 @@ def _install_fused_sorting_override() -> bool:
         signature = inspect.signature(original)
     except (TypeError, ValueError):
         return False
-    if tuple(signature.parameters) != _AITER_MOE_SORTING_PARAMS:
+    # aiter may append trailing parameters; the fused path needs the leading ones and
+    # defers to aiter whenever a caller sets one it does not understand
+    params = tuple(signature.parameters)
+    if params[: len(_AITER_MOE_SORTING_PARAMS)] != _AITER_MOE_SORTING_PARAMS:
         logger.warning(
             "aiter.fused_moe.moe_sorting has an unexpected signature; keeping "
             "aiter's sorting kernel"
         )
         return False
+    extra_params = params[len(_AITER_MOE_SORTING_PARAMS) :]
 
     from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
         AITER_FUSED_SORT_MAX_TOKENS,
@@ -375,6 +379,8 @@ def _install_fused_sorting_override() -> bool:
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         arg = bound.arguments
+        if any(arg.get(name) not in (None, False) for name in extra_params):
+            return original(*args, **kwargs)
         topk_ids, topk_weights = arg["topk_ids"], arg["topk_weights"]
         expert_mask = arg["expert_mask"]
         num_experts = int(arg["num_experts"])
