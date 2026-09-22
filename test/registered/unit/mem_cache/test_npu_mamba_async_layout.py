@@ -156,6 +156,7 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
             MambaPoolHost.__dict__["_copy_tensor_all_layers_lf_pf"], staticmethod
         )
 
+    @patch.object(mamba_pool_host, "transfer_mamba_state", None)
     def test_conv_only_load_skips_empty_temporal_component(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)
         pool.layout = "page_first_direct"

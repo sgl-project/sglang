@@ -7,11 +7,12 @@ import sglang.kernels.ops.attention.dsa.transform_index as transform_index_modul
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
+    transform_index_page_table_prefill_ref,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 TOPK = 2048
 
@@ -234,6 +235,43 @@ class TestDSATransformIndex(CustomTestCase):
             page_table_is_expanded=False,
             output_padding=8,
         )
+
+    def test_prefill_kpool_tail_width(self):
+        extend_lens_cpu = [0, 3, 1, 0, 4]
+        real_num_tokens = sum(extend_lens_cpu)
+        topk_num_tokens = real_num_tokens + 5
+        output_num_tokens = topk_num_tokens + 7
+        context_length = 8192
+
+        # KPool can append three tail positions after the 2048 history indices.
+        tail_indices = torch.tensor(
+            [context_length - 3, context_length - 2, context_length - 1],
+            dtype=torch.int64,
+            device=self.device,
+        ).repeat(topk_num_tokens, 1)
+        topk_indices = torch.cat(
+            [self._make_topk(topk_num_tokens, context_length), tail_indices], dim=1
+        )
+        topk_indices[0, -1] = -1
+        self.assertEqual(topk_indices.shape[1], 2051)
+
+        for page_table_is_expanded in (False, True):
+            with self.subTest(page_table_is_expanded=page_table_is_expanded):
+                page_table_rows = (
+                    real_num_tokens if page_table_is_expanded else len(extend_lens_cpu)
+                )
+                page_table = self._make_page_table(page_table_rows, context_length)
+                kwargs = dict(
+                    page_table=page_table,
+                    topk_indices=topk_indices,
+                    extend_lens_cpu=extend_lens_cpu,
+                    output_num_tokens=output_num_tokens,
+                    page_table_is_expanded=page_table_is_expanded,
+                )
+                expected = transform_index_page_table_prefill_ref(**kwargs)
+                actual = transform_index_page_table_prefill_fast(**kwargs)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_large_batch_size(self):
         self._check_case(
