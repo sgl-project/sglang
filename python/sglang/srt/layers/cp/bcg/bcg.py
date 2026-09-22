@@ -27,15 +27,18 @@ from sglang.srt.layers.cp.base import (
     get_cp_strategy,
     get_cp_strategy_kind,
 )
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
     cp_shard_hidden_states,
     cp_shard_position_ids,
     cp_split_before_forward,
     prepare_cp_forward,
 )
 from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
 
@@ -87,6 +90,7 @@ class PrefillCPBCGInput:
     input_embeds: torch.Tensor
     positions: torch.Tensor
     input_ids: Optional[torch.Tensor] = None
+    global_input_ids: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
@@ -99,6 +103,18 @@ class PrefillCPBCGInput:
             from sglang.srt.layers.cp.bcg import get_cp_bcg_input_type
 
             return get_cp_bcg_input_type(get_cp_strategy_kind()).create(runner)
+        strategy = get_cp_strategy()
+        global_id_capacity = 0
+        if (
+            isinstance(strategy, InterleaveCPStrategy)
+            and get_moe_a2a_backend().is_none()
+        ):
+            align = get_cp_padding_align_size()
+            local_capacity = (
+                runner.max_num_tokens + strategy.cp_size - 1
+            ) // strategy.cp_size
+            local_capacity = (local_capacity + align - 1) // align * align
+            global_id_capacity = strategy.cp_size * local_capacity
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -113,6 +129,11 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
                 input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                global_input_ids=(
+                    torch.zeros((global_id_capacity,), dtype=torch.int64)
+                    if global_id_capacity
+                    else None
+                ),
                 num_token_non_padded=torch.zeros((), dtype=torch.int32),
             )
 
