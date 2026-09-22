@@ -597,6 +597,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if not self.use_compact_draft_cache:
+            # Full draft KV shares the target's logical token ids but has
+            # independent tensors, so CPU retraction must save it too.
+            token_to_kv_pool_allocator.cpu_retraction_draft_pool = (
+                self.draft_model_runner.token_to_kv_pool
+            )
 
     def init_attention_backends(self):
         with (
