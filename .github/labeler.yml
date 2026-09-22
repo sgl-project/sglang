@@ -114,7 +114,6 @@ unified-radix-cache:
   - changed-files:
     - any-glob-to-any-file:
       - 'python/sglang/srt/mem_cache/unified_cache/**/*'
-      - 'python/sglang/srt/mem_cache/cpp_radix_tree/**/*'
       - 'python/sglang/srt/mem_cache/**/*radix*'
       - 'python/sglang/srt/mem_cache/chunk_cache.py'
       - 'python/sglang/srt/mem_cache/evict_policy.py'

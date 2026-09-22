@@ -25,11 +25,12 @@ from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommu
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
-    get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
     set_mscclpp_all_reduce,
 )
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.test_utils import publish_build_topology
 
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
@@ -173,11 +174,12 @@ if __name__ == "__main__":
         rank=rank,
         local_rank=rank % 8,
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
-    group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
-    pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
+    publish_build_topology(world_rank=rank, tp_size=world_size)
+    initialize_model_parallel()
+    group = get_parallel().tp_group.device_group
+    cpu_group = get_parallel().tp_group.cpu_group
+    pynccl_comm = get_parallel().tp_group.pynccl_comm
+    pymscclpp_comm = get_parallel().tp_group.pymscclpp_comm
     dist.barrier()
     profile = False
     dtype = torch.bfloat16

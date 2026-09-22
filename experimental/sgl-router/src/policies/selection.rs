@@ -35,11 +35,11 @@ use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
-use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
 /// Everything one prefill selection reads. Collaborators first, then the
@@ -61,7 +61,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     /// per-domain rung panics without it. `Policy::needs_load_snapshot`
     /// defaults to `uses_shared_prefill_admission`, which is what keeps the
     /// two in step for the ingress caller.
-    pub load_snapshot: Option<&'a EngineLoadSnapshot>,
+    pub load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     pub workers: &'a [Arc<Worker>],
     pub ttft_slo_ms: Option<u64>,
     pub tps_slo: Option<f64>,
@@ -607,7 +607,7 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     /// Required: every rung resolves its proposal against the snapshot, so
     /// without one the ladder reports no peer at all rather than picking one
     /// blind.
-    pub load_snapshot: Option<&'a EngineLoadSnapshot>,
+    pub load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
 }
 
 /// Runs the decode selection ladder.
@@ -699,11 +699,13 @@ mod tests {
     use crate::policies::admission::{resolve_prefill_admitted, CandidateRange, DecisionReason};
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
+    };
+    use crate::state::load_monitor::engine_reported_load::{
+        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
     };
     use crate::workers::Worker;
     use std::sync::Arc;
@@ -720,15 +722,15 @@ mod tests {
     }
 
     /// `(worker, tokens already held, published KV capacity)`.
-    fn snapshot(entries: &[(&Arc<Worker>, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             7,
             entries
                 .iter()
                 .map(|(worker, used, capacity)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: 0,
                             num_waiting_reqs: 0,
                             num_waiting_uncached_tokens: 0,
@@ -749,15 +751,15 @@ mod tests {
     /// `(worker, waiting requests, tokens already held, published KV
     /// capacity)`. The queue gate reads `num_waiting_reqs`, which the plain
     /// [`snapshot`] fixture pins at zero.
-    fn queued_snapshot(entries: &[(&Arc<Worker>, u64, u64, u64)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_native_cache_workers(
+    fn queued_snapshot(entries: &[(&Arc<Worker>, u64, u64, u64)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
             7,
             entries
                 .iter()
                 .map(|(worker, waiting, used, capacity)| {
                     (
                         worker.url.clone(),
-                        NativeCacheWorkerLoad {
+                        EngineReportedSchedulingLoad {
                             num_running_reqs: 1,
                             num_waiting_reqs: *waiting,
                             num_waiting_uncached_tokens: *waiting,
@@ -811,7 +813,7 @@ mod tests {
         metrics: &'a MetricsRegistry,
         model_id: &'a ModelId,
         workers: &'a [Arc<Worker>],
-        load_snapshot: Option<&'a EngineLoadSnapshot>,
+        load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
         request_input_tokens: u64,
     ) -> PrefillSelectionInputs<'a> {
         PrefillSelectionInputs {
@@ -841,7 +843,7 @@ mod tests {
         bucket_selector: &'a BucketSelector,
         model_id: &'a ModelId,
         decode_workers: &'a [Arc<Worker>],
-        load_snapshot: Option<&'a EngineLoadSnapshot>,
+        load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
         request_input_tokens: u64,
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
