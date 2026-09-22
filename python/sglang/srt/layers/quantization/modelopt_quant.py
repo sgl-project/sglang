@@ -1497,6 +1497,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def get_min_capability(cls) -> int:
         return 80
 
+    def can_fuse_shared_expert(self) -> bool:
+        # A shared-expert body kept BF16 via exclude_modules cannot share the packed
+        # FP4 FusedMoE buffers. The shared_expert_gate is a separate linear (kept
+        # BF16 by e.g. Qwen3-Next NVFP4 checkpoints) and must not veto fusion.
+        return not any(
+            "shared_expert" in name and "shared_expert_gate" not in name
+            for name in self.exclude_modules
+        )
+
     @staticmethod
     def common_group_size(cfg: dict) -> int:
         """Return the unique group_size across the config; raise if missing/mismatched."""
@@ -3053,7 +3062,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert activation in _SUPPORTED_ACT_STRS or (
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
-        moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
@@ -3179,9 +3187,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,

@@ -671,7 +671,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             elastic_ep_backend=None,
             is_ep_joiner=False,
         )
-        runner.ps = SimpleNamespace(tp_rank=0)
+        runner.tp_rank = 0
         return runner
 
     def test_start_delegates_to_the_manager(self):
@@ -761,6 +761,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
             SimpleNamespace(
+                hicache_draft_plan=None,
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
                 _draft_model_runners=lambda: (worker.model_runner,),
             )
