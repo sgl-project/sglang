@@ -23,10 +23,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_time_shift_sigmas,
 )
 from sglang.multimodal_gen.tools import build_minimax_h3_pdd_weights as build
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 def _make_heads() -> dict[str, torch.Tensor]:
