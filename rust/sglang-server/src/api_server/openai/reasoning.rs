@@ -71,13 +71,15 @@ pub(super) fn split_reasoning_unary(
 #[derive(Default)]
 pub(super) struct ReasoningStreamSplitter {
     name: Option<String>,
+    starts_in_reasoning: bool,
     parser: Option<ReasoningParserWrapper>,
 }
 
 impl ReasoningStreamSplitter {
-    pub(super) fn new(name: Option<&str>) -> Self {
+    pub(super) fn new(name: Option<&str>, starts_in_reasoning: bool) -> Self {
         Self {
             name: name.map(str::to_owned),
+            starts_in_reasoning,
             parser: None,
         }
     }
@@ -87,9 +89,13 @@ impl ReasoningStreamSplitter {
         let Some(name) = self.name.as_deref() else {
             return (String::new(), text.to_owned());
         };
-        let parser = self
-            .parser
-            .get_or_insert_with(|| build_reasoning_parser(name));
+        let parser = self.parser.get_or_insert_with(|| {
+            let mut parser = build_reasoning_parser(name);
+            if self.starts_in_reasoning {
+                parser.set_in_reasoning(true);
+            }
+            parser
+        });
         let token_ids = token_ids
             .iter()
             .filter_map(|&id| u32::try_from(id).ok())
@@ -171,13 +177,23 @@ mod tests {
         assert_eq!(normal, "<think>kept as text</think>");
     }
 
+    #[test]
+    fn v4_streaming_separates_prefilled_reasoning() {
+        let mut splitter = ReasoningStreamSplitter::new(Some("deepseek-v4"), true);
+        assert_eq!(splitter.split("reason", &[]), ("reason".into(), "".into()));
+        assert_eq!(
+            splitter.split("</think>answer", &[]),
+            ("".into(), "answer".into())
+        );
+    }
+
     /// REASONING_P1: MiniMax M3's implicit-tool-start recovery buffers the
     /// answer text until a boundary establishes the mode; with no opener the
     /// whole buffer is released as normal text only at `finish`. The chat
     /// terminal flush must emit the normal half of the tail.
     #[test]
     fn streaming_tail_releases_normal_text_only_at_finish() {
-        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"));
+        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"), false);
         let (reasoning, normal) = splitter.split("The answer is", &[]);
         assert_eq!(reasoning, "");
         assert_eq!(normal, "", "M3 holds the ambiguous prefix until a boundary");
@@ -191,7 +207,7 @@ mod tests {
 
     #[test]
     fn streaming_tail_releases_reasoning_after_marker_boundary() {
-        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"));
+        let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"), false);
         let (reasoning, normal) = splitter.split("<mm:think>think", &[]);
         assert_eq!(reasoning, "think");
         assert_eq!(normal, "");
@@ -205,7 +221,7 @@ mod tests {
 
     #[test]
     fn finish_without_a_parser_is_empty() {
-        let mut splitter = ReasoningStreamSplitter::new(None);
+        let mut splitter = ReasoningStreamSplitter::new(None, false);
         let (reasoning, normal) = splitter.split("plain", &[]);
         assert_eq!(reasoning, "");
         assert_eq!(normal, "plain");

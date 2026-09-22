@@ -25,7 +25,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     """Compressed QSA must own ``page_size`` here,
     so the qwen3_5 hybrid attention-shape policy is restated rather than shared.
     page_size=64 needs page-aligned full-KV allocation (slots are full_slot // ratio),
-    which MambaRadixCache allows only with mamba extra-buffer or --disable-radix-cache.
+    which in turn needs the mamba extra-buffer strategy or --disable-radix-cache.
     """
     cfg = resolving_view(server_args)
     if (
@@ -74,12 +74,11 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["page_size"] = 64 if sm100_default_attn_backend == "trtllm_mha" else 1
 
     from sglang.srt.layers.attention.qsa.config import (
-        QSA_VARIANT_COMPRESSED,
         parse_qsa_profile,
     )
 
     profile = parse_qsa_profile(hf_config)
-    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+    if profile is not None:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64
