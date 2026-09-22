@@ -76,13 +76,18 @@ def _fp8_method(**overrides):
     return method
 
 
-def test_deepep_v2_quant_contract_accepts_blockwise_fp8(_moe_flags):
+@pytest.mark.parametrize("use_mxfp8,block_size", [(False, [128, 128]), (True, [1, 32])])
+def test_deepep_v2_quant_contract_accepts_blockwise_fp8(
+    _moe_flags, use_mxfp8, block_size
+):
     from sglang.srt.layers.moe.fused_moe_triton.layer import (
         _validate_deepep_v2_quant_method,
     )
 
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
-    _validate_deepep_v2_quant_method(_fp8_method(weight_block_size=[128, 128]))
+    _validate_deepep_v2_quant_method(
+        _fp8_method(weight_block_size=block_size, use_mxfp8=use_mxfp8)
+    )
 
 
 @pytest.mark.parametrize(
@@ -90,7 +95,7 @@ def test_deepep_v2_quant_contract_accepts_blockwise_fp8(_moe_flags):
     [
         ({"activation_scheme": "static"}, "activation_scheme"),
         ({"weight_block_size": None}, "weight_block_size"),
-        ({"weight_block_size": (1, 32), "use_mxfp8": True}, "MXFP8"),
+        ({"weight_block_size": (128, 128), "use_mxfp8": True}, "MXFP8"),
         ({"is_fp4_expert": True}, "FP4 experts"),
     ],
 )
@@ -106,17 +111,30 @@ def test_deepep_v2_quant_contract_rejects_incompatible_fp8(
         _validate_deepep_v2_quant_method(_fp8_method(**overrides))
 
 
+def test_deepep_v2_quant_contract_accepts_unquantized_bf16(_moe_flags):
+    """BF16 experts take the BF16 wire format instead of the FP8 one."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        _deepep_v2_experts_are_fp8,
+        _validate_deepep_v2_quant_method,
+    )
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    _validate_deepep_v2_quant_method(method)
+    assert _deepep_v2_experts_are_fp8(method) is False
+    assert _deepep_v2_experts_are_fp8(_fp8_method()) is True
+
+
 def test_deepep_v2_quant_contract_rejects_incompatible_methods(_moe_flags):
     from sglang.srt.layers.moe.fused_moe_triton.layer import (
         _validate_deepep_v2_quant_method,
     )
-    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8MoEMethod
 
     _moe_flags.a2a_backend = MoeA2ABackend.DEEPEP_V2
-    for method_type in (UnquantizedFusedMoEMethod, W4AFp8MoEMethod):
-        with pytest.raises(ValueError, match=method_type.__name__):
-            _validate_deepep_v2_quant_method(object.__new__(method_type))
+    with pytest.raises(ValueError, match=W4AFp8MoEMethod.__name__):
+        _validate_deepep_v2_quant_method(object.__new__(W4AFp8MoEMethod))
 
 
 def test_deepep_v2_quant_contract_does_not_affect_other_backends(_moe_flags):
@@ -134,6 +152,47 @@ def test_deepep_v2_runner_backstop(_moe_flags):
     with pytest.raises(ValueError, match="deep_gemm"):
         MoeRunner(MoeRunnerBackend.TRITON, MoeRunnerConfig())
     assert MoeRunner(MoeRunnerBackend.DEEP_GEMM, MoeRunnerConfig()).runner_core
+
+
+def test_deepep_v2_registration_uses_primary_architecture_and_rejects_conflicts():
+    from sglang.srt.configs.moe_model_registry import (
+        model_requires_fp32_silu_mul,
+        model_supports_deepep_v2,
+        register_deepep_v2_model,
+    )
+
+    register_deepep_v2_model("TestRoutewiseMoe", silu_mul_keep_fp32=True)
+    config = SimpleNamespace(architectures=["TestRoutewiseMoe"])
+    assert model_supports_deepep_v2(config)
+    assert model_requires_fp32_silu_mul(config)
+    config.architectures = ["UnsupportedMoe", "TestRoutewiseMoe"]
+    assert not model_supports_deepep_v2(config)
+    assert not model_requires_fp32_silu_mul(config)
+    with pytest.raises(ValueError, match="Conflicting"):
+        register_deepep_v2_model("TestRoutewiseMoe", silu_mul_keep_fp32=False)
+
+
+@pytest.mark.parametrize("block_size,width", [(32, 16), (128, 4)])
+def test_mxfp8_recipes_keep_activation_and_weight_groups_separate(block_size, width):
+    # The packed format is a layout contract, independent of the host GPU.
+    from unittest.mock import patch
+
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+    with patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True):
+        quant = DeepGemmMoeQuantInfo(
+            None, None, True, block_shape=[1, 32], use_mxfp8=True
+        )
+    assert quant.scale_recipes(
+        activation_block_size=block_size, hidden_size=2048, activation_scale_width=width
+    ) == ((1, block_size), (1, 32))
+    with pytest.raises(AssertionError, match="activation scale mismatch"):
+        quant.scale_recipes(
+            activation_block_size=block_size,
+            hidden_size=2048,
+            activation_scale_width=width + 1,
+        )
 
 
 if __name__ == "__main__":
