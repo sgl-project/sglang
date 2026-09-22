@@ -2029,7 +2029,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
