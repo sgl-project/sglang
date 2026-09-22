@@ -206,11 +206,13 @@ def test_component_offload_keeps_preferred_component_after_warmup(monkeypatch):
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
     strategy.finish_use = Mock()
+    empty_cache = Mock()
     monkeypatch.setattr(
         torch,
         "get_device_module",
         lambda: SimpleNamespace(
             is_available=lambda: True,
+            empty_cache=empty_cache,
             mem_get_info=lambda: (8 * 1024**3, 16 * 1024**3),
         ),
     )
@@ -227,6 +229,7 @@ def test_component_offload_keeps_preferred_component_after_warmup(monkeypatch):
     strategy.prepare_for_use.assert_called_once_with(module, use, state)
     strategy.wait_for_use.assert_called_once_with(module, use, state)
     strategy.finish_use.assert_not_called()
+    empty_cache.assert_called_once_with()
 
 
 def test_component_offload_warmup_preload_oom_leaves_component_offloaded(
@@ -263,7 +266,8 @@ def test_component_offload_warmup_preload_oom_leaves_component_offloaded(
     strategy.prepare_for_use.assert_called_once_with(module, use, state)
     strategy.wait_for_use.assert_not_called()
     strategy.finish_use.assert_called_once_with(module, use, state)
-    empty_cache.assert_called_once_with()
+    # Once before the budget check, once after OOM recovery.
+    assert empty_cache.call_count == 2
 
 
 def test_component_offload_warmup_skips_preload_when_weights_do_not_fit(
@@ -296,7 +300,8 @@ def test_component_offload_warmup_skips_preload_when_weights_do_not_fit(
     strategy.prepare_for_use.assert_not_called()
     strategy.wait_for_use.assert_not_called()
     strategy.finish_use.assert_called_once_with(module, use, state)
-    empty_cache.assert_called_once_with()
+    # Once before the budget check, once after the skip path.
+    assert empty_cache.call_count == 2
 
 
 def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
