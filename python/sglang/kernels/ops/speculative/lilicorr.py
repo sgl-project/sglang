@@ -1,13 +1,12 @@
 """Triton kernels for the LiLiCorr candidate-lattice reranker.
 
-lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits and
-the full-vocab log-partition from one pass over [n, V].
+lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits and the
+full-vocab log-partition from one pass over [n, V].
 
 lilicorr_sample_path commits one path through the candidate lattice and emits the
 per-slot proposal verify needs to accept it by rejection sampling; lilicorr_greedy_path
-is that walk with every row greedy. Both adapt the head's factors to
-selector_walk_triton, DFlash2's candidate selector, and dispatch to a value-identical
-torch implementation off CUDA.
+is that walk with every row greedy. Both adapt the head's factors to DFlash2's
+selector_walk_triton, and dispatch to a value-identical torch implementation off CUDA.
 """
 
 from __future__ import annotations
@@ -21,17 +20,14 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 
-# Tile width for the scan, and tiles per program (TILE * TPP is the load block).
-# TILE is the contiguous dimension, so a wide TILE is what turns the scan into
-# long coalesced loads; 1024 x 8 = 8192 elements per program. These are launch
-# geometry for an H100-class vocabulary head, not a property of the method.
+# Tile width for the scan, and tiles per program (TILE * TPP is the load block). Launch
+# geometry tuned for an H100-class vocabulary head, not a property of the method.
 _TILE = 1024
 _TILES_PER_PROGRAM = 8
 _NUM_WARPS = 4
 
 # Widest candidate pool the selector walk holds in one lane group. Exported because the
-# config refuses a head wider than this rather than serving it on the torch path; the
-# two must not drift.
+# config refuses a wider head rather than serving it; the two must not drift.
 MAX_FUSED_CANDIDATE_TOPK = 16
 
 _NEG = -3.0e38
@@ -53,8 +49,7 @@ def _tiled_scan(
 ):
     """One pass over [N, V]: per-tile maxima plus one (m, s) partial per program.
 
-    grid = (N, cdiv(T, TPP)). Each program covers TPP contiguous tiles, so the block is
-    [TPP, TILE] and the tile maxima are a single axis-1 reduction.
+    grid = (N, cdiv(T, TPP)); each program covers TPP contiguous tiles, block [TPP, TILE].
     """
     neg = -3.0e38
     row = tl.program_id(0)
@@ -142,14 +137,12 @@ def lilicorr_topk_lse(
     Returns (vals [N, k] fp32 descending, tokens [N, k] int64, lse [N] fp32). The
     candidate log-prob the head consumes is val - lse.
 
-    The tile pre-selection is exact, not approximate. Let e be a member of the row's true
-    top-k, lying in tile T; then max(T) >= e. If T were not among the k tiles with the
-    largest max, k other tiles would each hold an element >= max(T) >= e, so e has rank
-    > k, a contradiction.
+    The tile pre-selection is exact, not approximate: a true top-k element in tile T has
+    max(T) >= it, so T cannot be outside the k largest-max tiles.
 
-    Exactness is about the returned values. Which of an exactly-tied set is returned is
-    unspecified here and in CUDA torch.topk alike, so the two can select different token
-    ids for the same row; the tied candidates carry equal log-probs.
+    Exactness is about the values. Which of an exactly-tied set is returned is
+    unspecified here and in CUDA torch.topk alike, so the two can pick different token
+    ids for a row; the tied candidates carry equal log-probs.
 
     k must be a power of two to take the tiled path, enforced at config parse on
     lilicorr_candidate_topk.
@@ -214,10 +207,9 @@ def lilicorr_topk_lse(
 def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
     """Pack the head's factors into the selector's [bs, slots, K, K] layout.
 
-    log_start [bs, K] is slot 0 and log_pair [bs, slots-1, K, K] is every slot after it.
-    Slot 0 has no predecessor, so the walk only reads scores[:, 0, 0, :] there and the
-    broadcast over the "from" axis is sound. fp32 because the commit's argmax runs on
-    these values.
+    log_start [bs, K] is slot 0, log_pair [bs, slots-1, K, K] every slot after it. The
+    walk only reads scores[:, 0, 0, :] at slot 0, so the broadcast over the "from" axis
+    is sound. fp32 because the commit's argmax runs on these values.
     """
     topk = int(log_start.shape[-1])
     start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
@@ -282,17 +274,13 @@ def lilicorr_sample_path(
     q_rows[b, s] is the distribution slot s was drawn from, over that slot's k candidates
     and zero elsewhere; the caller scatters it into the dense q the verify kernel reads.
 
-    The proposal is softmax(psi_s / T), psi_s being the head's own log-factor row: the
-    start factor at slot 0 and the transition row out of the committed predecessor after
-    it. No other term, because the head was trained with no unary factor and no log-prob
-    prior.
+    The proposal is softmax(psi_s / T), psi_s being the head's own log-factor row and no
+    other term, because the head was trained with no unary factor and no log-prob prior.
+    A greedy_mask row takes the argmax and reports a point mass, so min(1, p/q) stays the
+    right acceptance test for a deterministic pick.
 
-    Rows with greedy_mask set take the argmax and report a point mass, so a mixed batch
-    is one launch and the greedy rows are unchanged.
-
-    The walk itself is DFlash2's candidate selector: same recurrence, same lower-index
-    tie break, same inverse-CDF draw. Fixed trip count and no host syncs, so the draft
-    CUDA graph can capture it.
+    The walk is DFlash2's candidate selector. Fixed trip count and no host syncs, so the
+    draft CUDA graph can capture it.
     """
     scores = _lattice_scores(log_start, log_pair)
     walk = selector_walk_triton if scores.is_cuda else _selector_walk_torch
@@ -310,10 +298,9 @@ def lilicorr_greedy_path(
     log_pair: torch.Tensor,
     candidate_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """lilicorr_sample_path with every row greedy, for a batch carrying no sampling state.
+    """lilicorr_sample_path with every row greedy, for a batch with no sampling state.
 
-    Commits the argmax candidate at each slot conditioned on the previously committed
-    pick, and returns the selected tokens [bs, slots]. Shares the walk, so the commit is
+    Returns the selected tokens [bs, slots]. Shares the walk, so the commit is
     bit-identical to the greedy rows of a mixed sampled batch.
     """
     bsz, num_slots, _ = candidate_tokens.shape
