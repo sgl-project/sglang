@@ -139,11 +139,9 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
 
         runner = SimpleNamespace(
             tp_rank=0,
-            begin_weight_update=lambda: None,
-            end_weight_update=lambda run_post_load: None,
+            model=SimpleNamespace(load_weights=load_weights),
             weight_updater=SimpleNamespace(
                 receive_weights_from_distributed=lambda *args: [],
-                load_weights=load_weights,
                 update_weights_from_tensor=lambda **kwargs: target_result,
             ),
         )

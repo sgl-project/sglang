@@ -34,6 +34,9 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _merge_checksum_payloads,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
@@ -213,13 +216,9 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         # WeightChecker returns a single-role ChecksumInfo.model_dump(),
         # _merge_checksum_payloads folds the roles into one per-role payload, and
         # that is what msgspec.convert has to accept.
-        from sglang.srt.managers.scheduler_components.weight_updater import (
-            _merge_checksum_payloads,
-        )
-
-        def _dump(role_tag):
+        def _dump():
             return PydanticChecksumInfo(
-                checksums={f"model.layers.0{role_tag}": "deadbeef"},
+                checksums={"model.layers.0": "deadbeef"},
                 per_gpu_checksum="cafef00d",
                 parallelism_info=PydanticParallelismInfo(
                     tp_rank=0,
@@ -233,7 +232,7 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
                 ),
             ).model_dump()
 
-        merged = _merge_checksum_payloads([("target", _dump("")), ("draft", _dump(""))])
+        merged = _merge_checksum_payloads([("target", _dump()), ("draft", _dump())])
         converted = msgspec.convert(merged, ChecksumInfo)
         # Draft keys are role-prefixed so they never collide with the target's.
         self.assertEqual(

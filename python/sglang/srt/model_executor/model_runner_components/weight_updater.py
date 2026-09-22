@@ -241,10 +241,6 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
-    def load_weights(self: WeightUpdater, weights) -> None:
-        """Load an in-memory list of (name, tensor) weights into this runner's model."""
-        self.get_model().load_weights(weights)
-
     def receive_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -345,7 +341,7 @@ class WeightUpdater:
             weights = self.receive_weights_from_distributed(
                 names, dtypes, shapes, group_name, load_format
             )
-            self.load_weights(weights)
+            self.get_model().load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:

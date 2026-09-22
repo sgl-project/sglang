@@ -154,26 +154,14 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
-    def iter_weight_update_workers(
-        self, selector: str = "all"
-    ) -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
-        first. This is the worker-level inclusion decision; each worker then
-        contributes its own runners via weight_update_runners()."""
-        parsed = _parse_runner_selector(selector)
-        workers: List[Tuple[str, Any]] = []
-        if "target" in parsed:
-            workers.append(("target", self.tp_worker))
-        if "draft" in parsed and self.draft_worker is not None:
-            workers.append(("draft", self.draft_worker))
-        return workers
-
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
-        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs,
-        target first. Draft roles come from the draft worker's weight_update_runners()."""
+        """(role, ModelRunner) pairs a {target, draft, all} selector covers, target first."""
+        roles = _parse_runner_selector(selector)
         runners: List[Tuple[str, Any]] = []
-        for _, worker in self.iter_weight_update_workers(selector):
-            runners += worker.weight_update_runners()
+        if "target" in roles:
+            runners += self.tp_worker.weight_update_runners()
+        if "draft" in roles and self.draft_worker is not None:
+            runners += self.draft_worker.weight_update_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -197,7 +185,7 @@ class SchedulerWeightUpdaterManager:
                     recv_req.load_format,
                 )
                 for _, runner in self._select_runners(recv_req.selector):
-                    runner.weight_updater.load_weights(weights)
+                    runner.model.load_weights(weights)
                 success, message = True, "Succeeded to update parameter online."
             except Exception as e:
                 success = False

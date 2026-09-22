@@ -73,8 +73,8 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
         None,
     )
     # The single received weights object is loaded into every selected runner.
-    target_runner.weight_updater.load_weights.assert_called_once_with(weights)
-    draft_runner.weight_updater.load_weights.assert_called_once_with(weights)
+    target_runner.model.load_weights.assert_called_once_with(weights)
+    draft_runner.model.load_weights.assert_called_once_with(weights)
 
 
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
@@ -98,7 +98,7 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
 
     assert output.success is True
     target_runner.weight_updater.receive_weights_from_distributed.assert_called_once()
-    target_runner.weight_updater.load_weights.assert_called_once_with(weights)
+    target_runner.model.load_weights.assert_called_once_with(weights)
     draft_worker.weight_update_runners.assert_not_called()
 
 
