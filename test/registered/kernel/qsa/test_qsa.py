@@ -1307,7 +1307,7 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     monkeypatch.setattr(qsa_kernel_module, "triton_expand_qsa_block_indices", cuda_only)
     # This CPU routing test also runs in GPU CI, without the NPU package.
     # Mock only its import boundary; real NPU execution is tested separately.
-    expansion_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.expansion")
+    expansion_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion")
     expansion_calls = []
 
     def npu_expansion(*args):
@@ -1327,7 +1327,7 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
 
     topk_module.fast_topk = npu_topk
     monkeypatch.setitem(sys.modules, topk_module.__name__, topk_module)
-    mqa_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.mqa")
+    mqa_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_mqa")
     mqa_calls = []
 
     def npu_packed(*args):
@@ -1346,7 +1346,7 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     if package is None:
         package = ModuleType(package_name)
         monkeypatch.setitem(sys.modules, package_name, package)
-    monkeypatch.setattr(package, "mqa", mqa_module, raising=False)
+    monkeypatch.setattr(package, "qsa_mqa", mqa_module, raising=False)
     # The platform guard must short-circuit before inspecting rotary fields.
     assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
     assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(

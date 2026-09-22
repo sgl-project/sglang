@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
-impl = importlib.import_module("sgl_kernel_npu.qwen3_8_flash_next.sparse_attention")
+impl = importlib.import_module("sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention")
 
 
 def inputs(heads=3, kv_heads=1):

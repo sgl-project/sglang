@@ -265,7 +265,7 @@ def expand_qsa_block_indices(
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
     if _is_npu:
-        from sgl_kernel_npu.qwen3_8_flash_next.expansion import expand_blocks
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion import expand_blocks
 
         # The package wrapper owns the model contract and its internal dispatch.
         # Unsupported metadata must not silently enter the generic reference.

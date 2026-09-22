@@ -389,7 +389,7 @@ def qsa_mqa_prefill(
     if _is_npu:
         if score_scale is not None:
             raise ValueError("Custom MQA scale is outside the model contract")
-        from sgl_kernel_npu.qwen3_8_flash_next import mqa as npu_mqa
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
 
         return npu_mqa.packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
@@ -408,7 +408,7 @@ def qsa_mqa_decode(
     if _is_npu:
         if score_scale is not None:
             raise ValueError("Custom MQA scale is outside the model contract")
-        from sgl_kernel_npu.qwen3_8_flash_next import mqa as npu_mqa
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
 
         return npu_mqa.paged(q, k_cache, page_table, context_lens, max_model_len)
     if q.is_cuda and HAS_TILELANG:

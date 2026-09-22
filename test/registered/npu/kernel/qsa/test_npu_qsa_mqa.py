@@ -6,7 +6,7 @@ The kernel package carries independent FP64 and larger-shape regressions.
 
 import pytest
 import torch
-from sgl_kernel_npu.qwen3_8_flash_next import mqa as npu_mqa
+from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
 
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.utils import is_npu

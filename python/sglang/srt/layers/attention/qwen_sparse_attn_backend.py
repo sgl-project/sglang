@@ -73,7 +73,7 @@ def _npu_sparse_attention(
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Adapt NPU KV pools and call the model-contract sparse attention kernel."""
-    from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import sparse_attention
+    from sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention import sparse_attention
 
     k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
     v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
