@@ -1,4 +1,4 @@
-"""Explicit original-coordinate GLM DSpark loading on NPU.
+"""Opt-in GLM DSpark correction for unrotated draft weights on NPU.
 
 The configuration lives only around one draft construction. FC conversion is a
 load-time candidate, not an exact inverse for a non-orthogonal stored Q.
@@ -16,6 +16,10 @@ import torch
 from safetensors import safe_open
 
 logger = logging.getLogger(__name__)
+
+_DRAFT_LOAD_FORMATS_CALLING_LOAD_WEIGHTS = frozenset(
+    {"auto", "fastsafetensors", "mistral", "npcache", "pt", "safetensors"}
+)
 
 
 @dataclass(frozen=True)
@@ -43,15 +47,67 @@ def glm_dspark_quarot_scope(config: Optional[GlmDSparkQuaRotConfig]):
         _config.reset(token)
 
 
-def build_glm_dspark_quarot_config(
-    *, device, mode, target_model_config, target_model
-) -> Optional[GlmDSparkQuaRotConfig]:
-    """Read metadata only after matching the explicit target-specific path.
+def validate_glm_dspark_quarot_draft_loader(
+    *, load_format, weight_cache_mode: str = "off"
+) -> None:
+    """Reject draft loaders that can bypass the required FC conversion.
 
-    ``original`` is the caller's declaration about the draft checkpoint. Target
-    QuaRot metadata alone cannot establish the draft's coordinate convention.
+    The allowed formats all use ``DefaultModelLoader`` and call the draft
+    model's ``load_weights`` method. Direct state-copy loaders would otherwise
+    leave the FC in the original coordinate system while the runtime consumes
+    rotated target hidden states.
     """
-    if not mode or str(device).split(":", 1)[0] != "npu":
+    if weight_cache_mode != "off":
+        raise ValueError(
+            "GLM DSpark QuaRot correction does not support --weight-cache-mode="
+            f"{weight_cache_mode!r}: the IPC draft loader bypasses "
+            "DSparkDraftMixin.load_weights()."
+        )
+
+    normalized = getattr(load_format, "value", load_format)
+    normalized = "auto" if normalized is None else str(normalized).lower()
+    if normalized not in _DRAFT_LOAD_FORMATS_CALLING_LOAD_WEIGHTS:
+        supported = ", ".join(sorted(_DRAFT_LOAD_FORMATS_CALLING_LOAD_WEIGHTS))
+        raise ValueError(
+            "GLM DSpark QuaRot correction requires a draft load format that "
+            "calls DSparkDraftMixin.load_weights() so the FC can be folded; "
+            f"got {normalized!r}. Supported formats: {supported}."
+        )
+
+
+def log_glm_dspark_quarot_runtime_status(*, requested: bool, draft_model) -> None:
+    config = getattr(draft_model, "_glm_dspark_quarot_config", None)
+    enabled = config is not None
+    owns_vocab = bool(getattr(draft_model, "uses_own_vocab_modules", False))
+    local_embedding = (
+        enabled
+        and owns_vocab
+        and getattr(draft_model, "embed_tokens", None) is not None
+    )
+    local_lm_head = (
+        enabled and owns_vocab and getattr(draft_model, "lm_head", None) is not None
+    )
+    logger.info(
+        "GLM DSpark QuaRot runtime: requested=%s enabled=%s q_path=%s "
+        "draft_local_embedding=%s draft_local_lm_head=%s",
+        requested,
+        enabled,
+        config.rotation_path if enabled else None,
+        local_embedding,
+        local_lm_head,
+    )
+
+
+def build_glm_dspark_quarot_config(
+    *, device, enabled, target_model_config, target_model
+) -> Optional[GlmDSparkQuaRotConfig]:
+    """Read metadata only after matching the enabled target-specific path.
+
+    ``enabled`` declares that the dense draft checkpoint is unrotated and needs
+    correction for this target. Target metadata alone cannot establish the
+    draft's coordinate convention.
+    """
+    if not enabled or str(device).split(":", 1)[0] != "npu":
         return None
     hf_config = getattr(target_model_config, "hf_text_config", None)
     architectures = getattr(hf_config, "architectures", None)
@@ -64,12 +120,11 @@ def build_glm_dspark_quarot_config(
     get_name = getattr(quant_config, "get_name", None)
     if not callable(get_name) or get_name() != "modelslim":
         return None
-    if mode != "original":
-        raise ValueError("SGLANG_NPU_GLM_DSPARK_QUAROT must be 'original' when enabled")
-
     description = getattr(quant_config, "quant_description", None)
     if not isinstance(description, dict) or description.get("is_rot_used") is not True:
-        raise ValueError("GLM DSpark original mode requires a ModelSlim QuaRot target")
+        raise ValueError(
+            "GLM DSpark QuaRot correction requires a ModelSlim QuaRot target"
+        )
     try:
         relative_path = description["optional"]["quarot"]["rotation_map"][
             "global_rotation"
@@ -126,7 +181,8 @@ def fold_glm_dspark_fc(
 
     started = time.monotonic()
     logger.info(
-        "GLM DSpark original mode: folding FC %s with Q=%s from target=%s "
+        "GLM DSpark QuaRot correction: folding original-coordinate FC %s "
+        "with Q=%s from target=%s "
         "on CPU in FP32, storing %s; no inverse or scale correction",
         tuple(weight.shape),
         config.rotation_path,

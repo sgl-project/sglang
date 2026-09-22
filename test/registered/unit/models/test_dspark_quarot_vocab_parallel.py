@@ -77,7 +77,7 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
     with (
         context,
         envs.SGLANG_ENABLE_EMBED_REPLICATION.override(replicate),
-        envs.SGLANG_NPU_GLM_DSPARK_QUAROT.override("original"),
+        envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.override(True),
         glm_dspark_quarot_scope(plan),
         patch("sglang.srt.models.dspark.is_npu", return_value=True),
         torch.device("cpu"),

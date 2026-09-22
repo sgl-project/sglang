@@ -506,7 +506,7 @@ class DSparkDraftMixin:
         if (
             is_npu()
             and not self.is_nemotron_35_draft
-            and envs.SGLANG_NPU_GLM_DSPARK_QUAROT.get()
+            and envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.get()
         ):
             from sglang.srt.hardware_backend.npu.dspark_quarot import (
                 get_glm_dspark_quarot_config,
@@ -516,7 +516,7 @@ class DSparkDraftMixin:
         if self._glm_dspark_quarot_config is not None:
             if quant_config is not None:
                 raise ValueError(
-                    "GLM DSpark QuaRot original mode requires an unquantized draft."
+                    "GLM DSpark QuaRot correction requires an unquantized draft."
                 )
             if int(config.hidden_size) != self._glm_dspark_quarot_config.hidden_size:
                 raise ValueError("GLM DSpark QuaRot target/draft hidden sizes differ.")
@@ -640,7 +640,7 @@ class DSparkDraftMixin:
             } - quarot_loaded
             if missing:
                 raise ValueError(
-                    "GLM DSpark QuaRot original mode is missing checkpoint weights: "
+                    "GLM DSpark QuaRot correction is missing checkpoint weights: "
                     + ", ".join(sorted(missing))
                 )
 

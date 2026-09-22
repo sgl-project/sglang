@@ -54,7 +54,7 @@ class TestGlmDSparkQuaRot(unittest.TestCase):
     def build(self, **overrides):
         arguments = {
             "device": "npu:0",
-            "mode": "original",
+            "enabled": True,
             "target_model_config": self.model_config,
             "target_model": self.model,
         }
@@ -70,8 +70,8 @@ class TestGlmDSparkQuaRot(unittest.TestCase):
 
     def test_inactive_or_unrelated_targets_do_not_open_q(self):
         cases = (
-            {"mode": None},
-            {"mode": ""},
+            {"enabled": None},
+            {"enabled": False},
             {"device": "cuda:0"},
             {"device": "cpu"},
             {"target_model_config": SimpleNamespace()},
@@ -96,9 +96,62 @@ class TestGlmDSparkQuaRot(unittest.TestCase):
                 with self.subTest(arguments=arguments):
                     self.assertIsNone(self.build(**arguments))
 
-    def test_enabled_target_rejects_unknown_mode_and_missing_quarot(self):
-        with self.assertRaisesRegex(ValueError, "must be 'original'"):
-            self.build(mode="auto")
+    def test_draft_loader_validation_allows_only_load_weights_formats(self):
+        for load_format in (
+            None,
+            "auto",
+            "fastsafetensors",
+            "mistral",
+            "npcache",
+            "pt",
+            "safetensors",
+            SimpleNamespace(value="safetensors"),
+        ):
+            with self.subTest(load_format=load_format):
+                qr.validate_glm_dspark_quarot_draft_loader(load_format=load_format)
+
+        for load_format in (
+            "dummy",
+            "remote_instance",
+            "remote",
+            "sharded_state",
+            "presharded",
+        ):
+            with self.subTest(load_format=load_format):
+                with self.assertRaisesRegex(
+                    ValueError, "DSparkDraftMixin.load_weights"
+                ):
+                    qr.validate_glm_dspark_quarot_draft_loader(load_format=load_format)
+
+        with self.assertRaisesRegex(ValueError, "IPC draft loader"):
+            qr.validate_glm_dspark_quarot_draft_loader(
+                load_format="auto", weight_cache_mode="daemon"
+            )
+
+    def test_runtime_status_logs_effective_modules_and_q_path(self):
+        active = SimpleNamespace(
+            _glm_dspark_quarot_config=self.config,
+            uses_own_vocab_modules=True,
+            embed_tokens=object(),
+            lm_head=object(),
+        )
+        inactive = SimpleNamespace(
+            _glm_dspark_quarot_config=None,
+            embed_tokens=None,
+            lm_head=None,
+        )
+        with patch.object(qr.logger, "info") as log:
+            qr.log_glm_dspark_quarot_runtime_status(requested=True, draft_model=active)
+            args = log.call_args.args
+            self.assertEqual(args[1:], (True, True, str(self.q_path), True, True))
+
+            qr.log_glm_dspark_quarot_runtime_status(
+                requested=False, draft_model=inactive
+            )
+            args = log.call_args.args
+            self.assertEqual(args[1:], (False, False, None, False, False))
+
+    def test_enabled_target_rejects_missing_quarot(self):
         self.description["is_rot_used"] = False
         with self.assertRaisesRegex(ValueError, "QuaRot target"):
             self.build()

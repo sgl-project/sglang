@@ -106,7 +106,7 @@ class TestDSparkNpuQuaRotLoading(CustomTestCase):
             target_model_path=str(self.root / "target"),
         )
 
-    def _load(self, *, mode="original", npu=True, scope=True, weights=None):
+    def _load(self, *, enabled=True, npu=True, scope=True, weights=None):
         (self.model_dir / "config.json").write_text(json.dumps(self.config))
         save_file(
             self.weights if weights is None else weights,
@@ -121,7 +121,9 @@ class TestDSparkNpuQuaRotLoading(CustomTestCase):
         self.assertIsNone(config.quantization)
         loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
         with ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_NPU_GLM_DSPARK_QUAROT.override(mode))
+            stack.enter_context(
+                envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.override(enabled)
+            )
             stack.enter_context(
                 patch("sglang.srt.models.dspark.is_npu", return_value=npu)
             )
@@ -213,7 +215,7 @@ class TestDSparkNpuQuaRotLoading(CustomTestCase):
         self.assertEqual(model.hidden_norm.variance_epsilon, 1e-5)
 
     def test_active_loading_does_not_replace_or_modify_shared_target_modules(self):
-        shared_model = self._load(mode="", scope=False)
+        shared_model = self._load(enabled=False, scope=False)
         with set_default_torch_dtype(torch.bfloat16), torch.device("cpu"):
             target_embedding = VocabParallelEmbedding(32, 16)
             target_head = ParallelLMHead(32, 16)
@@ -292,7 +294,7 @@ class TestDSparkNpuQuaRotLoading(CustomTestCase):
     def test_inactive_paths_keep_the_shared_vocab_contract_without_reading_q(self):
         self.q_path.unlink()
         for options in (
-            {"mode": ""},
+            {"enabled": False},
             {"npu": False},
             {"scope": False},
         ):

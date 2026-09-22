@@ -921,11 +921,10 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
-    # "original" opts a GLM DSA QuaRot target + dense DSpark draft into
-    # checkpoint-local vocab and load-time FC rotation. The draft checkpoint
-    # must contain original (not already converted) weights. Empty keeps the
-    # existing loading behavior.
-    SGLANG_NPU_GLM_DSPARK_QUAROT = EnvStr("")
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)

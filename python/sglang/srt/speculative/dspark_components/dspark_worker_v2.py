@@ -166,22 +166,45 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         quarot_scope = nullcontext()
-        if (
-            _is_npu
-            and not self._draft_is_moe
-            and envs.SGLANG_NPU_GLM_DSPARK_QUAROT.get()
-        ):
+        quarot_config = None
+        apply_quarot_to_draft = envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.get()
+        if apply_quarot_to_draft and not _is_npu:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because this is not an NPU runtime."
+            )
+        elif apply_quarot_to_draft and self._draft_is_moe:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because the QuaRot adapter supports dense drafts only."
+            )
+        elif apply_quarot_to_draft:
             from sglang.srt.hardware_backend.npu.dspark_quarot import (
                 build_glm_dspark_quarot_config,
                 glm_dspark_quarot_scope,
+                validate_glm_dspark_quarot_draft_loader,
             )
 
             quarot_config = build_glm_dspark_quarot_config(
                 device=self.device,
-                mode=envs.SGLANG_NPU_GLM_DSPARK_QUAROT.get(),
+                enabled=apply_quarot_to_draft,
                 target_model_config=target_worker.model_runner.model_config,
                 target_model=target_worker.model_runner.model,
             )
+            if quarot_config is None:
+                logger.warning_once(
+                    "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                    "applied because the target is not a supported GLM DSA "
+                    "ModelSlim model."
+                )
+            else:
+                validate_glm_dspark_quarot_draft_loader(
+                    load_format=(
+                        server_args.speculative_draft_load_format
+                        or server_args.load_format
+                    ),
+                    weight_cache_mode=server_args.weight_cache_mode,
+                )
             quarot_scope = glm_dspark_quarot_scope(quarot_config)
 
         with self._draft_context(), quarot_scope:
@@ -201,6 +224,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                log_glm_dspark_quarot_runtime_status,
+            )
+
+            log_glm_dspark_quarot_runtime_status(
+                requested=apply_quarot_to_draft,
+                draft_model=self.draft_model,
+            )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
