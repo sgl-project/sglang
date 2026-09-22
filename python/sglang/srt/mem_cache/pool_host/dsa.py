@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 def dsa_indexer_bytes_per_token_per_layer(
-    index_head_dim: int, quant_block_size: int
+    *, index_head_dim: int, quant_block_size: int
 ) -> int:
     # packed index keys plus one fp32 scale per quant block, stored as uint8
     elems = index_head_dim + index_head_dim // quant_block_size * 4
@@ -105,7 +105,8 @@ def make_dsa_indexer_pool_decl(
         layout_source=PoolName.KV,
         storage_info=HostPoolStorageInfo(
             bytes_per_token_per_layer=dsa_indexer_bytes_per_token_per_layer(
-                pool.index_head_dim, pool.quant_block_size
+                index_head_dim=pool.index_head_dim,
+                quant_block_size=pool.quant_block_size,
             ),
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
         ),
