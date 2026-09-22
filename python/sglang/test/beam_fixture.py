@@ -45,8 +45,7 @@ def make_beam_fixture(path):
             "sliding_attention",
             "full_attention",
         ],
-        no_rope_layers=[1, 0, 1, 0],
-        mlp_only_layers=[0],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
         moe_intermediate_size=128,
         num_experts=16,
         num_experts_per_tok=8,
@@ -77,8 +76,8 @@ def make_beam_fixture(path):
         for name in (
             "input_layernorm",
             "post_attention_layernorm",
-            "attn_output_layernorm",
-            "mlp_output_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
         ):
             norm(f"{prefix}.{name}.weight", 128)
         for name, width in (
@@ -94,7 +93,7 @@ def make_beam_fixture(path):
         state[f"{prefix}.self_attn.gate_bias"] = torch.tensor(
             [-1.125, -0.375, 0.625, 1.375], dtype=torch.bfloat16
         ).repeat(config.num_attention_heads // 4)
-        if layer == 0:
+        if config.mlp_layer_types[layer] == "dense":
             mlps = [(f"{prefix}.mlp", 256)]
         else:
             matrix(f"{prefix}.mlp.gate.weight", 16, 128, dtype=torch.float32)
@@ -182,8 +181,9 @@ def eager_beam_logits(config, state, token_ids):
         )
 
     causal_mask = positions[:, None] >= positions[None, :]
+    rope_theta = config.rope_parameters["sliding_attention"]["rope_theta"]
     inverse_frequencies = 1.0 / (
-        config.rope_theta
+        rope_theta
         ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
     )
     frequencies = positions.float()[:, None] * inverse_frequencies
@@ -208,7 +208,7 @@ def eager_beam_logits(config, state, token_ids):
         )
         q = norm(q, f"{attn}.q_norm.weight")
         k = norm(k, f"{attn}.k_norm.weight")
-        if config.no_rope_layers[layer]:
+        if config.layer_types[layer] == "sliding_attention":
             q, k = q.float(), k.float()
             q1, q2 = q.chunk(2, dim=-1)
             k1, k2 = k.chunk(2, dim=-1)
@@ -237,11 +237,11 @@ def eager_beam_logits(config, state, token_ids):
         output = F.linear(
             output.reshape(-1, num_heads * head_dim), state[f"{attn}.o_proj.weight"]
         )
-        output = norm(output, f"{prefix}.attn_output_layernorm.weight")
+        output = norm(output, f"{prefix}.post_attention_layernorm.weight")
         hidden = residual_add(output, residual, 2 * (layer + 1))
         residual = hidden
-        hidden = norm(hidden, f"{prefix}.post_attention_layernorm.weight")
-        if layer in config.mlp_only_layers:
+        hidden = norm(hidden, f"{prefix}.pre_feedforward_layernorm.weight")
+        if config.mlp_layer_types[layer] == "dense":
             output = mlp(hidden, f"{prefix}.mlp")
         else:
             router = f"{prefix}.mlp.gate"
@@ -270,7 +270,7 @@ def eager_beam_logits(config, state, token_ids):
             output = (
                 contributions.float().sum(dim=1) * config.routed_scaling_factor
             ).to(hidden.dtype)
-        output = norm(output, f"{prefix}.mlp_output_layernorm.weight")
+        output = norm(output, f"{prefix}.post_feedforward_layernorm.weight")
         hidden = residual_add(output, residual, 2 * (layer + 1) + 1)
     hidden = norm(hidden, "model.norm.weight")
     logits = F.linear(hidden, state["lm_head.weight"]).float()

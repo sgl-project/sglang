@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Inference-only Beam with native paged attention and tensor-parallel MoE."""
 
 import math
 from typing import Iterable, Optional, Tuple
@@ -90,7 +89,7 @@ class BeamRotaryEmbedding(RotaryEmbedding):
             head_size=config.head_dim,
             rotary_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=config.rope_parameters["sliding_attention"]["rope_theta"],
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
@@ -170,7 +169,7 @@ class BeamMoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             renormalize=True,
-            scoring_func=config.scoring_func,
+            scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             output_format=TopKOutputFormat.STANDARD,
         )
@@ -232,12 +231,9 @@ class BeamAttention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.apply_rope = bool(config.no_rope_layers[layer_id])
-        self.sliding_window = (
-            config.sliding_window - 1
-            if config.layer_types[layer_id] == "sliding_attention"
-            else -1
-        )
+        # Sliding layers use RoPE; full-attention layers use NoPE with SSMax.
+        self.apply_rope = config.layer_types[layer_id] == "sliding_attention"
+        self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -347,7 +343,7 @@ class BeamDecoderLayer(nn.Module):
         )
         self.mlp = (
             BeamMLP(config, prefix=add_prefix("mlp", prefix))
-            if layer_id in config.mlp_only_layers
+            if config.mlp_layer_types[layer_id] == "dense"
             else BeamMoE(config, layer_id, prefix=add_prefix("mlp", prefix))
         )
         # Round once, after FP32 normalization and learned-weight multiplication.
@@ -355,10 +351,12 @@ class BeamDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_output_layernorm = RMSNorm(
+        self.pre_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp_output_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -370,14 +368,14 @@ class BeamDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)
         hidden_states = depth_scaled_residual(
-            self.attn_output_layernorm(hidden_states),
+            self.post_attention_layernorm(hidden_states),
             residual,
             self.attn_residual_scales,
         )
         residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
         return depth_scaled_residual(
-            self.mlp_output_layernorm(hidden_states),
+            self.post_feedforward_layernorm(hidden_states),
             residual,
             self.mlp_residual_scales,
         )
@@ -403,7 +401,11 @@ class BeamModel(nn.Module):
             else PPMissingLayer()
         )
         # Reuse the FP32 position cache across this model's rotary layers.
-        rotary_emb = BeamRotaryEmbedding(config) if any(config.no_rope_layers) else None
+        rotary_emb = (
+            BeamRotaryEmbedding(config)
+            if "sliding_attention" in config.layer_types
+            else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BeamDecoderLayer(
@@ -602,8 +604,6 @@ class BeamForCausalLM(nn.Module):
                             )
                         loaded.add(target_name)
                     else:
-                        if name == "lm_head.weight":
-                            weight = weight[:, : self.config.hidden_size]
                         param = params[name]
                         loader = getattr(param, "weight_loader", default_weight_loader)
                         loader(param, weight)

@@ -17,19 +17,29 @@ from typing import List, Optional, Union
 
 from transformers import PretrainedConfig
 
+_DEFAULT_ROPE_THETA = 10000.0
+
+
+def _normalize_rope_parameters(raw: Optional[dict]) -> dict:
+    """Return the per-layer-type RoPE dict: default RoPE on sliding layers, NoPE on full."""
+    raw = raw or {}
+    if raw.keys() - {"sliding_attention", "full_attention"}:
+        raise ValueError("rope_parameters must use per-layer-type keys")
+    if raw.get("full_attention") is not None:
+        raise ValueError("full_attention must run without rotary embeddings")
+    sliding = raw.get("sliding_attention") or {}
+    if sliding.get("rope_type", "default") != "default":
+        raise ValueError("Beam supports only default RoPE")
+    return {
+        "sliding_attention": {
+            "rope_type": "default",
+            "rope_theta": float(sliding.get("rope_theta", _DEFAULT_ROPE_THETA)),
+        },
+        "full_attention": None,
+    }
+
 
 class BeamConfig(PretrainedConfig):
-    """Beam configuration with explicit attention and dense/MoE layer schedules.
-
-    ``no_rope_layers`` retains the checkpoint convention: 1 applies RoPE and
-    0 disables it. Attention width is ``num_attention_heads * head_dim`` and
-    need not equal ``hidden_size``. The default schedule includes a final
-    full-attention layer; explicitly supplied layer arrays are preserved.
-    Native BF16 serving uses BF16 residual arithmetic and, by default, BF16
-    LM-head projection output followed by FP32 softcap and logprobs. Legacy
-    ``lm_head_dtype`` and ``residual_in_fp32`` metadata is ignored.
-    """
-
     model_type = "beam"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -48,38 +58,19 @@ class BeamConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-6,
         use_cache: bool = True,
         tie_word_embeddings: bool = False,
-        rope_theta: Optional[float] = None,
         rope_parameters: Optional[dict] = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         sliding_window: Optional[int] = 512,
         layer_types: Optional[List[str]] = None,
-        no_rope_layers: Optional[List[int]] = None,
-        no_rope_layer_interval: int = 6,
-        decoder_sparse_step: int = 1,
+        mlp_layer_types: Optional[List[str]] = None,
         moe_intermediate_size: int = 2560,
         num_experts: int = 256,
         num_experts_per_tok: int = 8,
         norm_topk_prob: bool = True,
-        mlp_only_layers: Optional[List[int]] = None,
-        scoring_func: str = "sigmoid",
         n_group: int = 8,
         topk_group: int = 4,
         routed_scaling_factor: float = 2.5,
-        topk_method: str = "noaux_tc",
-        ssmax: bool = True,
-        ssmax_offset: int = 1,
-        ssmax_divide_by_log_offset: bool = False,
-        ssmax_scale_mode: str = "root10",
-        enable_sandwich_norm: bool = True,
-        self_attn_depth_scaled_residual: bool = True,
-        mlp_depth_scaled_residual: bool = True,
-        use_paramfree_qk_norm: bool = False,
-        attention_output_gate: bool = True,
-        attention_output_gate_bias: bool = True,
-        attention_output_gate_floor: float = 0.0,
-        attention_output_gate_temperature: float = 1.0,
-        router_dtype: str = "fp32",
         final_logit_softcapping: Optional[float] = 30.0,
         pad_token_id: Optional[int] = None,
         bos_token_id: Optional[int] = None,
@@ -102,68 +93,34 @@ class BeamConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.sliding_window = sliding_window
-        self.no_rope_layer_interval = no_rope_layer_interval
-        self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
-        self.scoring_func = scoring_func
         self.n_group = n_group
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
-        self.topk_method = topk_method
-        self.ssmax = ssmax
-        self.ssmax_offset = ssmax_offset
-        self.ssmax_divide_by_log_offset = ssmax_divide_by_log_offset
-        self.ssmax_scale_mode = ssmax_scale_mode
-        self.enable_sandwich_norm = enable_sandwich_norm
-        self.self_attn_depth_scaled_residual = self_attn_depth_scaled_residual
-        self.mlp_depth_scaled_residual = mlp_depth_scaled_residual
-        self.use_paramfree_qk_norm = use_paramfree_qk_norm
-        self.attention_output_gate = attention_output_gate
-        self.attention_output_gate_bias = attention_output_gate_bias
-        self.attention_output_gate_floor = attention_output_gate_floor
-        self.attention_output_gate_temperature = attention_output_gate_temperature
-        self.router_dtype = "fp32" if router_dtype == "float32" else router_dtype
         self.final_logit_softcapping = final_logit_softcapping
 
-        if num_hidden_layers <= 0 or no_rope_layer_interval <= 0:
-            raise ValueError(
-                "num_hidden_layers and no_rope_layer_interval must be positive"
-            )
-        if no_rope_layers is None:
-            if layer_types is not None:
-                no_rope_layers = [int(t == "sliding_attention") for t in layer_types]
-            else:
-                no_rope_layers = [
-                    int((i + 1) % no_rope_layer_interval != 0)
-                    for i in range(num_hidden_layers)
-                ]
-                no_rope_layers[-1] = 0
-        self.no_rope_layers = list(no_rope_layers)
-        self.layer_types = (
-            list(layer_types)
-            if layer_types is not None
-            else [
-                "sliding_attention" if flag else "full_attention"
-                for flag in self.no_rope_layers
+        if num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be positive")
+        if layer_types is None:
+            layer_types = [
+                "sliding_attention" if (i + 1) % 6 else "full_attention"
+                for i in range(num_hidden_layers)
             ]
-        )
-        self.mlp_only_layers = (
-            list(mlp_only_layers)
-            if mlp_only_layers is not None
-            else list(range(min(3, num_hidden_layers)))
-        )
+            layer_types[-1] = "full_attention"
+        self.layer_types = list(layer_types)
+        if mlp_layer_types is None:
+            num_dense_layers = min(3, num_hidden_layers)
+            mlp_layer_types = ["dense"] * num_dense_layers + ["sparse"] * (
+                num_hidden_layers - num_dense_layers
+            )
+        self.mlp_layer_types = list(mlp_layer_types)
+        # Validate the schedules before the Transformers constructor, whose own
+        # layer-type check raises a non-ValueError with a generic message.
+        self._validate_layer_schedules()
 
-        # Older checkpoints use rope_scaling. Consume that alias before the
-        # Transformers constructor can override explicit rope_parameters.
-        legacy_rope_scaling = kwargs.pop("rope_scaling", None)
-        if rope_parameters is None:
-            rope_parameters = legacy_rope_scaling
-        # Ignore obsolete precision pins without retaining them as HF extras.
-        kwargs.pop("lm_head_dtype", None)
-        kwargs.pop("residual_in_fp32", None)
         kwargs.setdefault("architectures", ["BeamForCausalLM"])
         if kwargs.get("dtype") is None and kwargs.get("torch_dtype") is None:
             kwargs["dtype"] = "bfloat16"
@@ -175,27 +132,37 @@ class BeamConfig(PretrainedConfig):
             **kwargs,
         )
 
-        # Normalize and validate the effective configuration after Transformers
-        # has processed its compatibility fields.
-        self.rope_parameters = dict(rope_parameters or {})
-        legacy_rope_type = self.rope_parameters.pop("type", "default")
-        self.rope_parameters.setdefault("rope_type", legacy_rope_type)
-        nested_theta = self.rope_parameters.get("rope_theta", rope_theta)
-        if rope_theta is not None and nested_theta != rope_theta:
-            raise ValueError("rope_theta disagrees with rope_parameters.rope_theta")
-        self.rope_theta = nested_theta if nested_theta is not None else 10000.0
-        self.rope_parameters["rope_theta"] = self.rope_theta
-        rope_type = self.rope_parameters["rope_type"]
-        if rope_type != "default":
-            raise ValueError("Beam supports only default RoPE")
-        # Default RoPE has no scaling factor; keep context derivation unscaled.
-        self.rope_parameters = {
-            "rope_type": "default",
-            "rope_theta": self.rope_theta,
-        }
-        self.rope_scaling = dict(self.rope_parameters)
+        # Assign after the Transformers constructor: its RoPE compatibility
+        # pass would flatten a per-layer-type dictionary it finds early.
+        self.rope_parameters = _normalize_rope_parameters(rope_parameters)
 
         self._validate_beam_config()
+
+    def validate(self):
+        # Workaround for transformers < 5.16: its save-time validate_rope() cannot
+        # handle the None full_attention entry; drop once the pin moves past it.
+        rope_parameters = self.rope_parameters
+        self.rope_parameters = {
+            "sliding_attention": dict(rope_parameters["sliding_attention"])
+        }
+        try:
+            super().validate()
+        finally:
+            self.rope_parameters = rope_parameters
+
+    def _validate_layer_schedules(self):
+        for name in ("layer_types", "mlp_layer_types"):
+            if len(getattr(self, name)) != self.num_hidden_layers:
+                raise ValueError(f"{name} length must equal num_hidden_layers")
+        if any(
+            kind not in ("sliding_attention", "full_attention")
+            for kind in self.layer_types
+        ):
+            raise ValueError(
+                "layer_types must contain sliding_attention or full_attention"
+            )
+        if any(kind not in ("dense", "sparse") for kind in self.mlp_layer_types):
+            raise ValueError("mlp_layer_types must contain dense or sparse")
 
     def _validate_beam_config(self):
         for name in (
@@ -210,18 +177,6 @@ class BeamConfig(PretrainedConfig):
                 raise ValueError(f"{name} must be positive")
         if self.head_dim % 2:
             raise ValueError("head_dim must be even for split-half RoPE")
-        for name in ("no_rope_layers", "layer_types"):
-            if len(getattr(self, name)) != self.num_hidden_layers:
-                raise ValueError(f"{name} length must equal num_hidden_layers")
-        if any(flag not in (0, 1) for flag in self.no_rope_layers):
-            raise ValueError("no_rope_layers must contain only 0 (NoPE) or 1 (RoPE)")
-        if any(
-            kind not in ("sliding_attention", "full_attention")
-            for kind in self.layer_types
-        ):
-            raise ValueError(
-                "layer_types must contain sliding_attention or full_attention"
-            )
         if "sliding_attention" in self.layer_types and (
             self.sliding_window is None or self.sliding_window < 2
         ):
@@ -236,11 +191,7 @@ class BeamConfig(PretrainedConfig):
             raise ValueError(
                 "num_attention_heads must be divisible by num_key_value_heads"
             )
-        if len(set(self.mlp_only_layers)) != len(self.mlp_only_layers) or any(
-            i < 0 or i >= self.num_hidden_layers for i in self.mlp_only_layers
-        ):
-            raise ValueError("mlp_only_layers must contain unique valid layer indices")
-        if len(self.mlp_only_layers) < self.num_hidden_layers:
+        if "sparse" in self.mlp_layer_types:
             if (
                 self.n_group <= 0
                 or self.num_experts % self.n_group
@@ -266,23 +217,7 @@ class BeamConfig(PretrainedConfig):
             "hidden_act": "silu",
             "tie_word_embeddings": False,
             "attention_bias": False,
-            "decoder_sparse_step": 1,
             "norm_topk_prob": True,
-            "scoring_func": "sigmoid",
-            "topk_method": "noaux_tc",
-            "ssmax": True,
-            "ssmax_offset": 1,
-            "ssmax_divide_by_log_offset": False,
-            "ssmax_scale_mode": "root10",
-            "enable_sandwich_norm": True,
-            "self_attn_depth_scaled_residual": True,
-            "mlp_depth_scaled_residual": True,
-            "use_paramfree_qk_norm": False,
-            "attention_output_gate": True,
-            "attention_output_gate_bias": True,
-            "attention_output_gate_floor": 0.0,
-            "attention_output_gate_temperature": 1.0,
-            "router_dtype": "fp32",
         }
         for name, expected in required.items():
             if getattr(self, name) != expected:

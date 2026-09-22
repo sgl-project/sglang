@@ -1,6 +1,7 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
 import math
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -35,8 +36,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def tiny_config():
-    return BeamConfig(
+def tiny_config(**overrides):
+    kwargs = dict(
         vocab_size=32,
         hidden_size=24,
         intermediate_size=32,
@@ -51,11 +52,12 @@ def tiny_config():
             "sliding_attention",
             "full_attention",
         ],
-        no_rope_layers=[1, 0, 1, 0],
-        mlp_only_layers=[0],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
         moe_intermediate_size=32,
         num_experts=16,
     )
+    kwargs.update(overrides)
+    return BeamConfig(**kwargs)
 
 
 def loader_model(params):
@@ -170,19 +172,20 @@ class TestBeamConfig(CustomTestCase):
             (sliding_ids, full_ids),
         )
         self.assertEqual(
-            release.no_rope_layers, [int(layer not in full_ids) for layer in range(52)]
+            release.layer_types,
+            [
+                "full_attention" if layer in full_ids else "sliding_attention"
+                for layer in range(52)
+            ],
         )
+        self.assertEqual(release.mlp_layer_types, ["dense"] * 3 + ["sparse"] * 49)
         self.assertEqual(release.max_position_embeddings, 1_048_576)
         self.assertTrue(is_hybrid_swa_model(release.architectures, release))
 
-        # Positional transforms and cache layout are independent checkpoint
-        # arrays: a full-attention layer may explicitly retain RoPE.
         explicit = BeamConfig(
             num_hidden_layers=3,
             layer_types=["full_attention", "sliding_attention", "full_attention"],
-            no_rope_layers=[1, 0, 0],
         )
-        self.assertEqual(explicit.no_rope_layers, [1, 0, 0])
         self.assertEqual(
             get_hybrid_layer_ids(explicit.architectures, explicit), ([1], [0, 2])
         )
@@ -221,50 +224,44 @@ class TestBeamConfig(CustomTestCase):
             1,
         )
 
-    def test_rope_parameters_override_legacy_alias_and_survive_roundtrip(self):
-        for parameters in (
-            {"rope_type": "default", "rope_theta": 10000.0},
-            {"rope_type": "default", "rope_theta": 20000.0},
-        ):
-            with self.subTest(parameters=parameters):
-                config = BeamConfig(
-                    rope_parameters={**parameters, "factor": 8},
-                    rope_scaling={"rope_type": "dynamic", "factor": 4.0},
-                )
-                restored = BeamConfig.from_dict(config.to_dict())
-                for candidate in (config, restored):
-                    self.assertEqual(candidate.rope_parameters, parameters)
-                    self.assertEqual(candidate.rope_scaling, parameters)
-                    self.assertEqual(candidate.rope_theta, parameters["rope_theta"])
-                    self.assertEqual(
-                        get_context_length(candidate), candidate.max_position_embeddings
-                    )
-
-        legacy = BeamConfig(
-            rope_scaling={"type": "default", "rope_theta": 20000.0, "factor": 2}
-        )
-        self.assertEqual(
-            legacy.rope_parameters,
-            {"rope_type": "default", "rope_theta": 20000.0},
-        )
-        self.assertEqual(get_context_length(legacy), legacy.max_position_embeddings)
-        self.assertEqual(
-            BeamConfig(rope_theta=20000.0).rope_parameters, legacy.rope_parameters
-        )
-        with self.assertRaisesRegex(ValueError, "rope_theta disagrees"):
-            BeamConfig(
-                rope_theta=10000.0,
-                rope_parameters={"rope_type": "default", "rope_theta": 20000.0},
+    def test_rope_parameters_are_nested_per_layer_type_and_survive_roundtrip(self):
+        parameters = {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 20000.0},
+            "full_attention": None,
+        }
+        config = BeamConfig(rope_parameters=parameters)
+        # save_pretrained runs the Transformers validators; see BeamConfig.validate.
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            saved = BeamConfig.from_pretrained(directory)
+        for candidate in (config, saved):
+            self.assertEqual(candidate.rope_parameters, parameters)
+            self.assertFalse(hasattr(candidate, "rope_theta"))
+            self.assertEqual(
+                get_context_length(candidate), candidate.max_position_embeddings
             )
 
     def test_unsupported_rope_and_single_token_window_fail_early(self):
-        for field in ("rope_parameters", "rope_scaling"):
-            for rope_type in ("linear", "dynamic"):
-                with (
-                    self.subTest(field=field, rope_type=rope_type),
-                    self.assertRaisesRegex(ValueError, "only default RoPE"),
-                ):
-                    BeamConfig(**{field: {"rope_type": rope_type, "factor": 2}})
+        with self.assertRaisesRegex(ValueError, "per-layer-type"):
+            BeamConfig(rope_parameters={"rope_type": "default", "rope_theta": 500000.0})
+        with self.assertRaisesRegex(ValueError, "only default RoPE"):
+            BeamConfig(
+                rope_parameters={
+                    "sliding_attention": {"rope_type": "linear", "factor": 2},
+                    "full_attention": None,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "without rotary embeddings"):
+            BeamConfig(
+                rope_parameters={
+                    "sliding_attention": {"rope_type": "default"},
+                    "full_attention": {"rope_type": "default"},
+                }
+            )
+
+        # Checked before the Transformers constructor, which raises a non-ValueError.
+        with self.assertRaisesRegex(ValueError, "mlp_layer_types length"):
+            BeamConfig(num_hidden_layers=2, mlp_layer_types=["dense"])
 
         for window in (None, 0, 1):
             with (
@@ -287,29 +284,6 @@ class TestBeamConfig(CustomTestCase):
             with self.subTest(field=field):
                 config = BeamConfig(**{field: "float16"})
                 self.assertEqual(_get_and_verify_dtype(config, "auto"), torch.float16)
-
-    def test_obsolete_precision_metadata_is_discarded(self):
-        metadata_cases = [{}]
-        for head_dtype in (None, "bf16", "bfloat16", "fp32", "float32", "float16"):
-            for residual_in_fp32 in (None, False, True):
-                metadata_cases.append(
-                    dict(
-                        lm_head_dtype=head_dtype,
-                        residual_in_fp32=residual_in_fp32,
-                    )
-                )
-        for metadata in metadata_cases:
-            with self.subTest(metadata=metadata):
-                for config in (BeamConfig(**metadata), BeamConfig.from_dict(metadata)):
-                    restored = BeamConfig.from_dict(config.to_dict())
-                    for candidate in (config, restored):
-                        for name in ("lm_head_dtype", "residual_in_fp32"):
-                            self.assertFalse(hasattr(candidate, name))
-                            self.assertNotIn(name, candidate.to_dict())
-                        self.assertEqual(candidate.router_dtype, "fp32")
-                        self.assertEqual(
-                            _get_and_verify_dtype(candidate, "auto"), torch.bfloat16
-                        )
 
 
 class TestBeamNumerics(CustomTestCase):
@@ -406,7 +380,12 @@ class TestBeamNumerics(CustomTestCase):
         generator = torch.Generator().manual_seed(44)
         branch = torch.randn(5, 32, generator=generator).bfloat16()
         residual = torch.randn(5, 32, generator=generator).bfloat16()
+        # Layer 51 is the release depth; the default schedules cover 52 layers.
+        deep_config = tiny_config(
+            num_hidden_layers=52, layer_types=None, mlp_layer_types=None
+        )
         for layer_id in (0, 1, 51):
+            config = deep_config if layer_id == 51 else tiny_config()
             with (
                 patch(
                     "sglang.srt.models.beam.BeamAttention",
@@ -419,7 +398,7 @@ class TestBeamNumerics(CustomTestCase):
                     "sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()
                 ),
             ):
-                layer = BeamDecoderLayer(tiny_config(), layer_id)
+                layer = BeamDecoderLayer(config, layer_id)
             for is_ffn in (False, True):
                 depth = 2 * (layer_id + 1) + int(is_ffn)
                 with self.subTest(layer_id=layer_id, is_ffn=is_ffn):
@@ -806,8 +785,8 @@ class TestBeamLoading(CustomTestCase):
         stub_model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         stub_model.start_layer, stub_model.end_layer = 0, 4
         generator = torch.Generator().manual_seed(45)
-        stored = torch.randn(32, 28, generator=generator)
-        loaded = stored[:, :24].bfloat16()
+        stored = torch.randn(32, 24, generator=generator)
+        loaded = stored.bfloat16()
         hidden = torch.randn(3, 24, generator=generator).bfloat16()
         bf16_projection = hidden @ loaded.T
         fp32_projection = hidden.float() @ loaded.float().T
