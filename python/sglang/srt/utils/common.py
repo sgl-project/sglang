@@ -38,6 +38,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -88,12 +90,11 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -104,6 +105,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -263,8 +265,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -315,6 +319,12 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
@@ -549,6 +559,16 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
+    if not tensor.is_cuda:
+        return tensor.to("cpu", non_blocking=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return host
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
@@ -563,6 +583,16 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
+    # Resolve from the platform checks: torch.get_device_module() with no
+    # argument initializes the CUDA runtime, which poisons fork() startup.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
     return torch.get_device_module()
 
 
@@ -576,6 +606,17 @@ def create_device_stream(device):
 def device_stream_context(stream):
     """Return the appropriate stream context manager for ``stream``."""
     return torch.get_device_module(stream.device).stream(stream)
+
+
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
 
 
 def get_amdgpu_memory_capacity():
@@ -611,8 +652,55 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    # Compute capability of torch device 0, read while torch.cuda stays
+    # uninitialized; None when NVML cannot answer and the caller falls back.
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("get_device_sm: pynvml is not installed, using torch.cuda")
+        return None
+    # Private torch API, read defensively: it maps the torch ordinal to the NVML
+    # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if getter is None:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index is missing, "
+            "using torch.cuda"
+        )
+        return None
+    try:
+        idx = getter(0)
+    except Exception:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index(0) failed, "
+            "using torch.cuda",
+            exc_info=True,
+        )
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        logger.debug(
+            "get_device_sm: NVML query failed, using torch.cuda", exc_info=True
+        )
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Called at import time (e.g. by the DeepGEMM configurer): initializing
+        # torch.cuda here would create a context and poison fork() startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -865,6 +953,17 @@ def is_mnnvl_fabric_device() -> bool:
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
+
+
+def is_fi_a2a_supported(
+    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
+) -> bool:
+    if not get_platform().is_sm100:
+        return False
+    if is_mnnvl_fabric_device():
+        return True
+    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+    return tp_size_per_node % dcp_size == 0
 
 
 @lru_cache(maxsize=1)
@@ -1123,29 +1222,6 @@ def get_cuda_driver_bindings():
         from cuda import cuda as cuda_driver
 
     return cuda_driver
-
-
-def get_physical_device_id(pytorch_device_id: int) -> int:
-    """
-    Convert PyTorch logical device ID to physical device ID.
-
-    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
-    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
-    the device ID unchanged.
-
-    Args:
-        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-
-    Returns:
-        The physical device ID
-    """
-    device_idx = int(pytorch_device_id)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_list = cuda_visible_devices.split(",")
-        return int(device_list[device_idx])
-    else:
-        return device_idx
 
 
 def get_device_sm_nvidia_smi():
@@ -1411,27 +1487,7 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-def calculate_time(show=False, min_cost_ms=0.0):
-    def wrapper(func):
-        def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
-            if show:
-                start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            torch.cuda.synchronize()
-            if show:
-                cost_time = (time.perf_counter() - start_time) * 1000
-                if cost_time > min_cost_ms:
-                    print(f"Function {func.__name__} took {cost_time} ms to run.")
-            return result
-
-        return inner_func
-
-    return wrapper
-
-
 class LayerFn(Protocol):
-
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -1477,24 +1533,6 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
-
-
-def make_layers_non_pp(
-    num_hidden_layers: int,
-    layer_fn: LayerFn,
-    prefix: str = "",
-) -> torch.nn.ModuleList:
-    from sglang.srt.utils.offloader import get_offloader
-
-    layers = torch.nn.ModuleList(
-        get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(num_hidden_layers)
-            )
-        )
-    )
-    return layers
 
 
 def set_random_seed(seed: int) -> None:
@@ -1788,6 +1826,14 @@ class ImageData:
     content_hash: Optional[str] = None
 
 
+GLM_MEDIA_CONFIG_KEYS = (
+    "fps",
+    "max_frames",
+    "max_tokens_per_frame",
+    "max_image_tokens",
+)
+
+
 @dataclass
 class VideoData:
     url: str
@@ -1796,6 +1842,45 @@ class VideoData:
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
+
+
+def smart_to_rgb(
+    image: Union[torch.Tensor, Image.Image],
+) -> Union[torch.Tensor, Image.Image]:
+    if not isinstance(image, Image.Image):
+        return image
+
+    image = ImageOps.exif_transpose(image)
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        image = image.convert("RGBA")
+        width, height = image.size
+        edge_pixels = []
+
+        for x in range(0, width, max(1, width // 20)):
+            for y in (0, height - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        for y in range(0, height, max(1, height // 20)):
+            for x in (0, width - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        if edge_pixels:
+            avg_brightness = sum(sum(pixel) for pixel in edge_pixels) / (
+                len(edge_pixels) * 3
+            )
+            background_color = (32, 32, 32) if avg_brightness > 128 else (240, 240, 240)
+        else:
+            background_color = (255, 255, 255)
+
+        background = Image.new("RGB", image.size, background_color)
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+
+    return image.convert("RGB")
 
 
 def is_jpeg_with_cuda(
@@ -1843,6 +1928,8 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -1907,6 +1994,8 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if image_size is not None and isinstance(image, Image.Image):
+        image_size = (image.width, image.height)
     return image, image_size
 
 
@@ -2042,8 +2131,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2357,11 +2463,21 @@ def configure_logger(server_args, prefix: str = ""):
         force=True,
     )
 
+    configure_hf_hub_logger()
+
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
@@ -2414,7 +2530,9 @@ def broadcast_pyobj(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device
-        else "musa" if is_musa() and not force_cpu_device else "cpu"
+        else "musa"
+        if is_musa() and not force_cpu_device
+        else "cpu"
     )
 
     if rank == src:
@@ -2689,9 +2807,9 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (
-        init_method is None
-    ), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -2738,11 +2856,6 @@ def init_custom_process_group(
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
     return pg
-
-
-def crash_on_warnings():
-    # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
 @functools.lru_cache(None)
@@ -2878,26 +2991,6 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
-def permute_weight(x: torch.Tensor) -> torch.Tensor:
-    b_ = x.shape[0]
-    n_ = x.shape[1]
-    k_ = x.shape[2]
-
-    x_ = x
-    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
-    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
-    else:
-        # return x_
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
-
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    return x_
-
-
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj, output_str: bool = False):
@@ -2973,78 +3066,239 @@ def normalize_serialized_named_tensor_payloads(
     return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
-class SafeUnpickler(pickle.Unpickler):
-    ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
-        # --- PyTorch types ---
-        "torch.",
-        "torch._tensor.",
-        "torch.storage.",
-        "torch.nn.parameter.",
-        "torch.autograd.function.",
-        # --- torch distributed ---
-        "torch.distributed.",
-        "torch.distributed._shard.",
-        "torch.distributed._composable.",
-        "torch._C._distributed_c10d.",
-        "torch._C._distributed_fsdp.",
-        "torch.distributed.optim.",
-        # --- multiprocessing ---
-        "multiprocessing.resource_sharer.",
-        "multiprocessing.reduction.",
-        "pickletools.",
-        # --- PEFT / LoRA ---
-        "peft.",
-        "transformers.",
-        "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.model_executor.model_runner_components.weight_updater.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
-        "torch_npu.",
-    }
+def _safe_load_torch_storage(data: bytes):
+    storage = torch.load(io.BytesIO(data), weights_only=True)
+    if not isinstance(storage, (torch.storage.TypedStorage, torch.UntypedStorage)):
+        raise pickle.UnpicklingError(
+            f"Expected a Torch storage, got {type(storage).__name__}"
+        )
+    return storage
 
-    DENY_CLASSES = {
-        ("builtins", "eval"),
-        ("builtins", "exec"),
-        ("builtins", "compile"),
-        ("os", "system"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("codecs", "decode"),
-        ("types", "CodeType"),
-        ("types", "FunctionType"),
+
+class SafeUnpickler(pickle.Unpickler):
+    # Standard-library modules expose powerful callables alongside harmless data
+    # types. Keep these globals exact so a newly added callable is denied by
+    # default instead of silently expanding the unpickling attack surface.
+    ALLOWED_GLOBALS = {
+        # --- Python types ---
+        ("builtins", "bool"),
+        ("builtins", "bytearray"),
+        ("builtins", "bytes"),
+        ("builtins", "complex"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "range"),
+        ("builtins", "set"),
+        ("builtins", "slice"),
+        ("builtins", "str"),
+        ("builtins", "tuple"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("collections", "Counter"),
+        ("copyreg", "__newobj__"),
+        ("copyreg", "__newobj_ex__"),
+        ("functools", "partial"),
+        ("itertools", "chain"),
+        ("itertools", "repeat"),
+        ("multiprocessing.reduction", "_rebuild_partial"),
+        ("multiprocessing.reduction", "_rebuild_socket"),
+        ("multiprocessing.resource_sharer", "DupFd"),
+        ("types", "SimpleNamespace"),
+        ("_codecs", "encode"),
+        # --- PyTorch data containers & rebuild functions ---
+        # Code-module prefixes (torch.*, sglang.srt.*) are NOT allowed: they
+        # contain gadgets like sglang.srt.utils.common.dynamic_import
+        ("torch", "Tensor"),
+        ("torch", "BFloat16Tensor"),
+        ("torch", "BoolTensor"),
+        ("torch", "ByteTensor"),
+        ("torch", "CharTensor"),
+        ("torch", "DoubleTensor"),
+        ("torch", "FloatTensor"),
+        ("torch", "HalfTensor"),
+        ("torch", "IntTensor"),
+        ("torch", "LongTensor"),
+        ("torch", "ShortTensor"),
+        ("torch.cuda", "BFloat16Tensor"),
+        ("torch.cuda", "BoolTensor"),
+        ("torch.cuda", "ByteTensor"),
+        ("torch.cuda", "CharTensor"),
+        ("torch.cuda", "DoubleTensor"),
+        ("torch.cuda", "FloatTensor"),
+        ("torch.cuda", "HalfTensor"),
+        ("torch.cuda", "IntTensor"),
+        ("torch.cuda", "LongTensor"),
+        ("torch.cuda", "ShortTensor"),
+        ("torch.cuda.sparse", "BFloat16Tensor"),
+        ("torch.cuda.sparse", "ByteTensor"),
+        ("torch.cuda.sparse", "CharTensor"),
+        ("torch.cuda.sparse", "DoubleTensor"),
+        ("torch.cuda.sparse", "FloatTensor"),
+        ("torch.cuda.sparse", "HalfTensor"),
+        ("torch.cuda.sparse", "IntTensor"),
+        ("torch.cuda.sparse", "LongTensor"),
+        ("torch.cuda.sparse", "ShortTensor"),
+        ("torch.sparse", "BFloat16Tensor"),
+        ("torch.sparse", "ByteTensor"),
+        ("torch.sparse", "CharTensor"),
+        ("torch.sparse", "DoubleTensor"),
+        ("torch.sparse", "FloatTensor"),
+        ("torch.sparse", "HalfTensor"),
+        ("torch.sparse", "IntTensor"),
+        ("torch.sparse", "LongTensor"),
+        ("torch.sparse", "ShortTensor"),
+        ("torch", "Size"),
+        ("torch", "device"),
+        ("torch", "dtype"),
+        ("torch", "bfloat16"),
+        ("torch", "bit"),
+        ("torch", "bits16"),
+        ("torch", "bits1x8"),
+        ("torch", "bits2x4"),
+        ("torch", "bits4x2"),
+        ("torch", "bits8"),
+        ("torch", "bool"),
+        ("torch", "cdouble"),
+        ("torch", "cfloat"),
+        ("torch", "chalf"),
+        ("torch", "complex128"),
+        ("torch", "complex32"),
+        ("torch", "complex64"),
+        ("torch", "double"),
+        ("torch", "float"),
+        ("torch", "float16"),
+        ("torch", "float32"),
+        ("torch", "float4_e2m1fn_x2"),
+        ("torch", "float64"),
+        ("torch", "float8_e4m3fn"),
+        ("torch", "float8_e4m3fnuz"),
+        ("torch", "float8_e5m2"),
+        ("torch", "float8_e5m2fnuz"),
+        ("torch", "float8_e8m0fnu"),
+        ("torch", "half"),
+        ("torch", "int"),
+        ("torch", "int1"),
+        ("torch", "int16"),
+        ("torch", "int2"),
+        ("torch", "int3"),
+        ("torch", "int32"),
+        ("torch", "int4"),
+        ("torch", "int5"),
+        ("torch", "int6"),
+        ("torch", "int64"),
+        ("torch", "int7"),
+        ("torch", "int8"),
+        ("torch", "long"),
+        ("torch", "qint32"),
+        ("torch", "qint8"),
+        ("torch", "quint2x4"),
+        ("torch", "quint4x2"),
+        ("torch", "quint8"),
+        ("torch", "short"),
+        ("torch", "uint1"),
+        ("torch", "uint16"),
+        ("torch", "uint2"),
+        ("torch", "uint3"),
+        ("torch", "uint32"),
+        ("torch", "uint4"),
+        ("torch", "uint5"),
+        ("torch", "uint6"),
+        ("torch", "uint64"),
+        ("torch", "uint7"),
+        ("torch", "uint8"),
+        ("torch.nn.parameter", "Parameter"),
+        ("torch.serialization", "_get_layout"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_device_tensor_from_cpu_tensor"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch.storage", "UntypedStorage"),
+        ("torch.storage", "_UntypedStorage"),
+        ("torch.storage", "TypedStorage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch.cuda", "BFloat16Storage"),
+        ("torch.cuda", "BoolStorage"),
+        ("torch.cuda", "ByteStorage"),
+        ("torch.cuda", "CharStorage"),
+        ("torch.cuda", "ComplexDoubleStorage"),
+        ("torch.cuda", "ComplexFloatStorage"),
+        ("torch.cuda", "DoubleStorage"),
+        ("torch.cuda", "FloatStorage"),
+        ("torch.cuda", "HalfStorage"),
+        ("torch.cuda", "IntStorage"),
+        ("torch.cuda", "LongStorage"),
+        ("torch.cuda", "ShortStorage"),
+        ("torch.multiprocessing.reductions", "rebuild_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_meta_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_cuda_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_cuda_tensor_modified"),
+        ("torch_npu.multiprocessing.reductions", "rebuild_npu_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified"),
+        ("torch.multiprocessing.reductions", "rebuild_nested_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_coo_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_compressed_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_fd"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_filename"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_empty"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage_child"),
+        ("torch", "per_tensor_affine"),
+        ("torch", "per_tensor_symmetric"),
+        ("torch", "per_channel_affine"),
+        ("torch", "per_channel_symmetric"),
+        ("torch", "per_channel_affine_float_qparams"),
+        # --- SGLang data containers only (no code modules) ---
+        ("sglang.srt.managers.io_struct", "GenerateReqInput"),
+        ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
+        ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater",
+            "LocalSerializedTensor",
+        ),
+        ("sglang.srt.model_executor.model_runner", "LocalSerializedTensor"),
     }
 
     def find_class(self, module, name):
-        # Block deterministic attacks
-        if (module, name) in self.DENY_CLASSES:
-            raise RuntimeError(
-                f"Blocked unsafe class loading ({module}.{name}), "
-                f"to prevent exploitation of CVE-2025-10164"
-            )
-        # Allowlist of safe-to-load modules.
-        if any(
-            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
-        ):
+        if (module, name) == ("torch.storage", "_load_from_bytes"):
+            # Torch's helper calls an unrestricted nested torch.load.
+            return _safe_load_torch_storage
+        if (module, name) in self.ALLOWED_GLOBALS:
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(
-            f"Blocked unsafe class loading ({module}.{name}), "
-            f"to prevent exploitation of CVE-2025-10164"
+            f"Blocked unsafe global ({module}.{name}) during pickle deserialization"
         )
 
 
@@ -3061,30 +3315,6 @@ def safe_pickle_loads(data):
         # zmq.Frame and other buffer-protocol objects
         buf = bytes(memoryview(data))
     return SafeUnpickler(io.BytesIO(buf)).load()
-
-
-def debug_timing(func):
-    # todo: replace with a more organized instrumentation
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 def nullable_str(val: str):
@@ -3211,13 +3441,13 @@ class UvicornAccessLogFilter(logging.Filter):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
@@ -3413,6 +3643,29 @@ def parse_connector_type(url: str) -> str:
     return m.group(1)
 
 
+def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
+    result: list = []
+    error: list = []
+
+    def _target():
+        try:
+            result.append(fn())
+        except BaseException as e:
+            error.append(e)
+
+    # An overrunning fn cannot be cancelled; only process exit reaps the daemon thread.
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"{what} did not return within {timeout_s}s on {socket.gethostname()}"
+        )
+    if error:
+        raise error[0]
+    return result[0]
+
+
 def retry(
     fn,
     max_retry: int,
@@ -3602,35 +3855,6 @@ def is_no_spec_infer_or_topk_one(cfg):
         cfg.speculative_eagle_topk == 1
         and (cfg.page_size == 1 or cfg.page_size is None)
     )
-
-
-def is_fa3_default_architecture(hf_config):
-    architectures = getattr(hf_config, "architectures", None)
-    if not isinstance(architectures, list) or not architectures:
-        return False
-    default_archs = {
-        "Llama4ForConditionalGeneration",
-        "LlamaForCausalLM",
-        "Olmo2ForCausalLM",
-        "Gemma2ForCausalLM",
-        "Gemma3ForConditionalGeneration",
-        "MixtralForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Glm4MoeForCausalLM",
-        "Glm4vForConditionalGeneration",
-        "Glm4vMoeForConditionalGeneration",
-        "GlmOcrForConditionalGeneration",
-        "Step3VLForConditionalGeneration",
-        "StepVLForConditionalGeneration",
-        "Step3p7ForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    }
-    return architectures[0] in default_archs
 
 
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
@@ -3918,9 +4142,9 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), (
+            "len(weight_names) should be equal to len(transpose_dims)"
+        )
 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
@@ -4035,7 +4259,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
+    logger.debug(
         f"Freezing GC in {context} process. "
         f"gen0: {g0_before}->{g0_after}, "
         f"gen1: {g1_before}->{g1_after}, "
@@ -4060,7 +4284,7 @@ def configure_gc_logger():
             logger.info(
                 f"GC end: Time {time.time()} | Generation {gen} | "
                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f'{"(LONG GC)" if duration > 0.1 else ""}'
+                f"{'(LONG GC)' if duration > 0.1 else ''}"
             )
 
     gc.callbacks.append(gc_callback)
@@ -4140,9 +4364,9 @@ def get_physical_cpus_by_numa():
     for cpu, core, socket, node in cpu_info:
         key = (core, socket)
         if key not in physical_by_node[node]:
-            physical_by_node[node][
-                key
-            ] = cpu  # pick first CPU seen for that physical core
+            physical_by_node[node][key] = (
+                cpu  # pick first CPU seen for that physical core
+            )
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
@@ -4477,7 +4701,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's cache_unfinished_req(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,
@@ -4531,9 +4755,9 @@ class CachedKernel:
 
         # Check that no parameters have default values
         for name, param in self.signature.parameters.items():
-            assert (
-                param.default is inspect.Parameter.empty
-            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            assert param.default is inspect.Parameter.empty, (
+                f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            )
 
         functools.update_wrapper(self, original_fn)
         self.kernel_cache = {}
@@ -4546,9 +4770,9 @@ class CachedKernel:
         Index with grid to get a launcher function.
         Returns a launcher that will handle caching based on the key function.
         """
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Grid must be a tuple with at most 3 dimensions."
+        assert isinstance(grid, tuple) and len(grid) <= 3, (
+            "Grid must be a tuple with at most 3 dimensions."
+        )
 
         # Normalize grid once
         if len(grid) < 3:

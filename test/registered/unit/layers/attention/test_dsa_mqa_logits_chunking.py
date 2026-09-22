@@ -1,4 +1,5 @@
-"""Contract tests for the DSA indexer's MQA-logits chunk budget.
+"""Contract tests for the MQA-logits chunk decision shared by the DSA and DSV4
+indexers.
 
 On ROCm the `[num_q x num_k]` fp32 logits tensor goes to aiter's
 `fp8_mqa_logits`, which only compiles below 2 GiB, so the budget that decides
@@ -8,31 +9,30 @@ The measured memory budget is stubbed: it is the only input the limit has to
 beat, and stubbing it keeps these tests on CPU.
 """
 
-from unittest import mock
-
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.attention.dsa import dsa_indexer  # noqa: E402
+from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
+    MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_should_chunk,
+)
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
-CEILING = dsa_indexer.Indexer._MQA_LOGITS_MAX_BYTES_ROCM
+CEILING = MQA_LOGITS_MAX_BYTES_ROCM
 # More than any single logits tensor here needs, so it never decides a case.
 HUGE_MEM_BUDGET = 64 * 2**30
 
 
 def _decide(num_q, num_k, mem_budget=HUGE_MEM_BUDGET, is_hip=True):
-    # __new__ skips an __init__ that needs a model config and a device.
-    indexer = dsa_indexer.Indexer.__new__(dsa_indexer.Indexer)
-    with mock.patch.object(dsa_indexer, "_is_hip", is_hip), mock.patch.object(
-        dsa_indexer.Indexer,
-        "_get_mqa_logits_budget_bytes",
-        return_value=mem_budget,
-    ):
-        return indexer._should_chunk_mqa_logits(num_q, num_k, 0)
+    return mqa_logits_should_chunk(
+        num_rows=num_q,
+        num_cols=num_k,
+        get_budget_bytes=lambda: mem_budget,
+        rocm=is_hip,
+    )
 
 
 def test_the_ceiling_is_the_largest_logits_aiter_still_takes():

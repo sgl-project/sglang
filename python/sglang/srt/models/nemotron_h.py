@@ -26,8 +26,6 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
-    get_moe_ep_group,
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import ReLU2
@@ -57,6 +55,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -163,6 +162,17 @@ def _get_or_create_alt_stream(device_module):
     return _alt_stream
 
 
+def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
+    return (
+        # LoRA swaps a wrapper module over this attribute after init,
+        # and a subclass may override forward; exact type excludes both.
+        type(projection) is ReplicatedLinear
+        # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
+        and projection.bias is None
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+    )
+
+
 class NemotronHMoE(nn.Module):
     def __init__(
         self,
@@ -177,7 +187,7 @@ class NemotronHMoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
-        self.ep_group = get_moe_ep_group().device_group
+        self.ep_group = get_parallel().moe_ep_group.device_group
         self.ep_rank = self.ep_group.rank()
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.n_routed_experts
@@ -235,6 +245,7 @@ class NemotronHMoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     else {}
                 ),
                 prefix=f"{prefix}.shared_experts",
@@ -331,6 +342,22 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        projection = self.fc2_latent_proj
+        if shared_output is not None and _latent_proj_fuses_shared_add(projection):
+            return projection.quant_method.apply_with_addend(
+                projection, final_hidden_states, addend=shared_output
+            )
+
+        final_hidden_states, _ = projection(final_hidden_states)
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,9 +368,10 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
-
-        if shared_output is not None:
+            final_hidden_states = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
+        elif shared_output is not None:
             final_hidden_states += shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
@@ -806,7 +834,7 @@ class NemotronHModel(nn.Module):
         )
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -943,7 +971,7 @@ class NemotronHForCausalLM(nn.Module):
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:

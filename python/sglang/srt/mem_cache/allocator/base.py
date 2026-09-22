@@ -16,12 +16,26 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+class MambaFullCacheDonor(Protocol):
+    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
+
+    def flush_deferred_full_frees(self) -> None: ...
+
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        """Lower bound on new Full tokens before preparation can help."""
+        ...
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose layout-specific reclaim so Mamba capacity is queryable."""
+        ...
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -52,37 +66,112 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self.size
 
     # -- scheduler-facing capacity hooks --
-    # The scheduler calls these UNCONDITIONALLY (zero feature branches on its
-    # side); the defaults reproduce the historical token behavior exactly, and
-    # unified composites override them with byte-denominated logic.
+    # The scheduler calls these unconditionally, with no allocator-type branches
+    # on its side; byte-accounted composites override the token-count defaults.
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        """Ask the prefix cache to evict unlocked entries until this allocator
-        can serve ``num_tokens`` (or nothing evictable remains). Default = the
-        shared token-count eviction; joint-byte composites override (evicting
-        one multi-lifetime tree node frees bytes on several sides at once).
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        return PrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        """Clip generation to the empty-pool budget; None means prompt cannot fit.
+
+        token_capacity is the scheduler's configured capacity, including its
+        distributed token scaling. Shared pools use their physical byte layout.
         """
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
+        paged_input = -(-input_tokens // self.page_size) * self.page_size
+        return max(
+            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
+        )
 
-        evict_from_tree_cache(tree_cache, num_tokens)
-
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
-        """Whether the NEXT decode step's ``num_tokens`` allocation fits,
-        evicting reclaimable cache first. The retract loop converges on this
-        same check, so allocator-side shortfalls retract gracefully instead of
-        tripping fail-loud alloc errors. Default reproduces the historical
-        ``ScheduleBatch.check_decode_mem`` body; unified composites override
-        with byte gates + per-step reservations of their own.
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        """Whether `prealloc_fits` answers about the state reachable AFTER
+        reclaiming the evictable pages, so admitting on it still owes the
+        reclaim. False when the answer describes the pool as it stands.
         """
+        return False
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        """Whether a demand this size could EVER be preallocated, or None when
+        this pool has no ceiling of its own and the caller's token capacity is
+        the only bound.
+        """
+        return None
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation of this size fits.
+
+        The budgets are the scheduler's policy: what each side has left once
+        decode headroom and retraction are reserved. Separate buffers make the
+        two sides independent, so each is checked against its own budget and
+        ``tree_cache`` is never read -- what it could reclaim is already
+        inside that budget. A pool that cuts both sides from one buffer
+        overrides this to price them together, since a per-side token budget
+        cannot express a shared byte envelope.
+        """
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
+        """Evict unlocked prefix-cache entries until this allocator can serve
+        ``num_tokens`` or nothing evictable remains.
+
+        Return whether capacity was realized, or None if it still needs checking.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
+
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        shortfall = num_tokens - self.available_size()
+        if shortfall > 0:
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            _evict_until_allocatable(tree_cache, self, num_tokens)
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        """Whether the next decode step's ``num_tokens`` allocation fits after
+        evicting reclaimable cache. The retract loop converges on this same
+        check, so a shortfall here retracts instead of failing in alloc.
+        ``requests`` and ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
     def verify_byte_accounting(self) -> list:
-        """Idle-time conservation diagnostic: recompute this allocator's
-        byte/slot accounting and return human-readable violation strings
-        (empty == healthy). Default: static pools have no byte model.
-        """
+        """Idle-time diagnostic: recompute byte/slot accounting and return
+        violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
+        """Return the shared-pool donor capability, if this allocator has one."""
+        return None
 
     def debug_print(self) -> str:
         return ""
@@ -92,6 +181,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def get_all_free_pages(self):
+        # Debug / invariant census; None when the pool has no page free list.
+        if self.free_pages is None:
+            return None
+        if self.release_pages is None or len(self.release_pages) == 0:
+            return self.free_pages
+        return torch.cat((self.free_pages, self.release_pages))
 
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
@@ -118,19 +215,17 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Token ids as the PD-disaggregation transfer engine addresses them.
-
-        Identity here: a static pool's token ids index its registered buffers
-        directly. Virtual-id pools must override.
-        """
+        """Token ids as the PD transfer engine addresses them. Identity here
+        because a static pool's ids index its registered buffers directly;
+        virtual-id pools must override."""
         return kv_indices
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        # FIXME: reuse the get_cpu_copy after paged allocator is implemented
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        # FIXME: reuse the load_cpu_copy after paged allocator is implemented
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def alloc_extend(self, *args, **kwargs):
@@ -158,33 +253,51 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     def free_full(self, free_index: torch.Tensor):
-        """Free slots whose SWA peers the caller already released.
-
-        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
-        that can die first; this releases the full side alone. A single pool has
-        no peer, so it is a plain free()."""
+        """Free full-attention slots whose paired SWA slots the caller already
+        released. A single pool has no SWA peer, so this is a plain free()."""
         self.free(free_index)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
-        page-aligned copy); subclasses may use ``start_pos`` to skip the
-        data-dependent dedup. Default: plain free()."""
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
+
+        In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
+        ``start_pos`` sits on a page boundary, the end may fall mid-page, and
+        the whole last page is released."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
         self.free(free_index)
 
     def free_segments(self, segments):
-        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
-        request's kv row; a boundary page shared by consecutive segments is
-        emitted once (the later segment's head is trimmed)."""
+        """Free several ``(free_index, start_pos)`` segments of one request's
+        kv row. Each covers pages ``[start_pos // ps, ceil(end / ps))``; starts
+        are page-aligned and consecutive page ranges do not overlap, so every
+        page is released exactly once."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_segment(free_index, start_pos=start_pos)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """free_full() for a kv-row segment; same start-alignment contract as
+        free_segment()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
+        self.free_full(free_index)
+
+    def free_full_segments(self, segments):
+        """free_segments() for the full side alone; see free_full()."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_full_segment(free_index, start_pos=start_pos)
+
+    def _page_disjoint(self, segments):
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
             n = free_index.numel()
             if n == 0:
                 continue
-            seg_end = start_pos + n
-            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
-                boundary = (start_pos // ps + 1) * ps
-                free_index = free_index[boundary - start_pos :]
-                start_pos = boundary
-            prev_end = seg_end
-            self.free_segment(free_index, start_pos=start_pos)
+            assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
+                f"segment at {start_pos} shares a page with the one ending at {prev_end}"
+            )
+            prev_end = start_pos + n
+            yield free_index, start_pos

@@ -43,7 +43,7 @@ on:
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
       skip_pr_test_health_check:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Set to true to skip the PR test health check (fail-fast gate).'
         type: string
         default: 'false'
       is_nightly_pipeline_job:
@@ -54,6 +54,10 @@ on:
         description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
         default: '{"size":1,"arr":[0]}'
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event SHA.'
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -63,6 +67,14 @@ on:
         type: string
         default: '300'
         description: 'timeout-minutes for the Run test step'
+      use_coverage_runner:
+        description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
+      upload_test_logs:
+        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -84,113 +96,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Check PR test health
-        uses: actions/github-script@v8
-        env:
-          SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
         with:
-          github-token: ${{ inputs.github-token || github.token }}
-          script: |
-            core.notice(`[health-check] START — event=${context.eventName}, runId=${context.runId}`);
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
-            // Skip when explicitly requested via env var (e.g. release branch cut)
-            if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
-              core.notice('[health-check] SKIP: SKIP_PR_TEST_HEALTH_CHECK=true');
-              return;
-            }
-
-            // Skip for scheduled runs — they should collect all failures, not fast-fail
-            if (context.eventName === 'schedule') {
-              core.notice('[health-check] SKIP: scheduled run');
-              return;
-            }
-
-            // Check lint status from the separate Lint workflow (lint.yml).
-            // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
-            // checks.listForRef which queries by commit SHA across ALL workflows.
-            const ref = context.payload.pull_request?.head?.sha || context.sha;
-            core.info(`[health-check] Checking lint for ref=${ref}`);
-            const { data } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: ref,
-              check_name: 'lint',
-            });
-            const lintRun = data.check_runs.find(
-              cr => cr.app?.slug === 'github-actions'
-            );
-            core.info(`[health-check] Lint check: status=${lintRun?.status}, conclusion=${lintRun?.conclusion}`);
-            if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
-              core.setFailed('Fast-fail: lint check failed');
-              return;
-            }
-
-            // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
-            // Lint check above still runs.
-            let labels = [];
-            if (context.payload.pull_request?.labels) {
-              labels = context.payload.pull_request.labels.map(l => l.name);
-            } else {
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: ref,
-              });
-              if (prs.length > 0) {
-                labels = prs[0].labels.map(l => l.name);
-              }
-            }
-            core.info(`[health-check] PR labels: [${labels.join(', ')}]`);
-            if (labels.includes('bypass-fastfail')) {
-              core.notice('[health-check] SKIP jobs-failed check: bypass-fastfail label present');
-              return;
-            }
-
-            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId,
-              per_page: 100,
-            });
-            core.info(`[health-check] Total jobs in run: ${jobs.length}`);
-            const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
-            core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
-
-            // Find jobs that failed from a real error, not from fast-fail cascade
-            const rootCauseFailures = jobs.filter(j => {
-              if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
-              // h20 runners are flaky (dirty GPU state from prior runs); their failures
-              // should not cascade fast-fail to other stages. j.name shape from
-              // listJobsForWorkflowRun: "<job-key>" + optional " / <reusable-job>"
-              // + optional " (<matrix>)". Split off the base job key before exact
-              // match so we cover both inline + reusable forms without confusing
-              // 'h20' with the 'h200' prefix.
-              const baseName = j.name.split(/[ /]/)[0];
-              if (baseName === 'base-c-test-8-gpu-h20') {
-                core.info(`[health-check] Filtered out h20 job: ${j.name}`);
-                return false;
-              }
-              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
-              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
-                core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
-                return false;
-              }
-              // If the failing step is the health check, it's a cascade — skip it
-              const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
-              if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
-                core.info(`[health-check] Filtered out cascade failure: ${j.name} (failed step: ${failedStep.name})`);
-                return false;
-              }
-              return true;
-            });
-            core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
-
-            if (rootCauseFailures.length > 0) {
-              core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
-            } else {
-              core.notice('[health-check] PASS: no root cause failures detected');
-            }
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Check npu info
         run: |
@@ -227,6 +138,9 @@ jobs:
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
 
+          TEST_LOG_DIR="/tmp/test-logs"
+          mkdir -p "${TEST_LOG_DIR}"
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -258,6 +172,11 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+          # Append the image tag to the workflow-name segment so that runs with
+          # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
+          # image-tagged output/log directories.
+          image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
+          workflow_name="${workflow_name}--${image_label}"
 
           # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
@@ -345,6 +264,7 @@ jobs:
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+          source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh || true
           set -u
 
           # Nightly log path mirrors the output layout; PR keeps the original {date}/{testcase}.
@@ -384,12 +304,27 @@ jobs:
           fi
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
-          # under the structured path; PR runs only tee to /tmp/test_output.log.
+          # under the structured path; PR runs tee to ${TEST_LOG_DIR}/${tc_name}.log.
           # Use an array so the extra target is omitted when empty: passing an empty
           # string arg makes GNU tee fail (exit code 1) and flips the pipeline exit code.
-          LOG_TEE_TARGETS=("/tmp/test_output.log")
+          LOG_TEE_TARGETS=("${TEST_LOG_DIR}/${tc_name}.log")
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             LOG_TEE_TARGETS+=("${log_path}/${tc_name}.log")
+          fi
+
+          # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
+          # selected test files; the original run_suite.py execution below is preserved
+          # unchanged for the default (false) path.
+          if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            ${PYTHON_FOR_SGLANG} -u ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${test_suite} ${PARTITION_ARGS} -o /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
           fi
 
           # Run NPU test suite with run_suite.py.
@@ -411,18 +346,28 @@ jobs:
           export test_status tc_name
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          metric_count=$(grep -c '\[METRIC\]' /tmp/test_output.log 2>/dev/null || echo 0)
-          if [ "${metric_count}" -gt 0 ]; then
-            echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
-            echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
-            grep '\[METRIC\]' /tmp/test_output.log | while IFS= read -r line; do
-              metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
-              metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
-              echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
-            done
-          else
-            echo "No metrics collected (test may have failed before producing results)." >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]; then
+            metric_count=$(grep -c '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" 2>/dev/null || echo 0)
+            if [ "${metric_count}" -gt 0 ]; then
+              echo "| Metric | Value | Pass |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|------|" >> $GITHUB_STEP_SUMMARY
+              grep '\[METRIC\]' "${TEST_LOG_DIR}/${tc_name}.log" | while IFS= read -r line; do
+                metric_name=$(echo "$line" | sed -E 's/.*\[METRIC\] ([^=]+)=.*/\1/')
+                metric_value=$(echo "$line" | sed -E 's/.*\[METRIC\] [^=]+=([^ ]+).*/\1/')
+                echo "| ${metric_name} | ${metric_value} | ${status_icon} |" >> $GITHUB_STEP_SUMMARY
+              done
+            else
+              echo "No metrics collected (test may have failed before producing results)." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
           exit ${test_exit_code}
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

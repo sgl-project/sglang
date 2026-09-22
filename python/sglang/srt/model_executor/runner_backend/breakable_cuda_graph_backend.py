@@ -68,6 +68,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -130,12 +131,22 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         )
         size = shape_key.size
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            barrier_fn=self._tp_group.barrier,
+            capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
+                warmup_out
+            )
+            if capacity_rows is None:
+                capacity_rows = size
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, capacity_rows
+            )
+        with (
+            graph_pool_capture_scope(),
+            BreakableCUDAGraphCapture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                barrier_fn=self._tp_group.barrier,
+            ),
         ):
             self._precarve.mint()
             out = captured_fn()
@@ -154,6 +165,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         A body that shards or prunes its output along dim 0 returns fewer than
         ``cap`` rows; everything else returns exactly ``cap``.
         """
+        runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
+        if runner_rows is not None:
+            return runner_rows
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):

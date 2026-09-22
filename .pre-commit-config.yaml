@@ -48,10 +48,7 @@ repos:
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
           )$
-  - repo: https://github.com/psf/black
-    rev: 26.1.0
-    hooks:
-      - id: black-jupyter
+      - id: ruff-format
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
@@ -114,12 +111,6 @@ repos:
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
         language: system
         files: ^(python|test)/.*\.py$
-      - id: check-lint-script-tests
-        name: unit tests for lint checkers
-        entry: python3 -m unittest discover -s scripts/lint -p 'test_check_*.py'
-        language: system
-        files: ^scripts/lint/(check_|test_check_).*\.py$
-        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py

@@ -33,7 +33,6 @@ from sglang.kernels.ops.elementwise.elementwise import (
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
@@ -48,7 +47,6 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -61,6 +59,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
@@ -77,12 +76,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_prefill_context_parallel_enabled,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -383,6 +376,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or get_moe_a2a_backend().is_flashinfer_megamoe()
+                        or get_moe_a2a_backend().is_megamoe()
                     )
                     else {}
                 ),
@@ -412,6 +407,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
+        self._mega_intermediate_size = config.moe_intermediate_size
+        self._mega_hidden_size = config.hidden_size
 
     def get_moe_weights(self):
         return [
@@ -631,6 +630,69 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
+    def _forward_mega_moe(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        # Same contract as _forward_deepep: combined rows, no TP all-reduce.
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "moe_a2a_backend=megamoe needs MegaMoE expert weights on this "
+                "model: on SM100 load a checkpoint with MXFP4 or NVFP4 routed "
+                "experts; on SM90 load a block-FP8 checkpoint with a DeepGEMM "
+                "that ships fp8_mega_moe."
+            )
+
+        num_tokens = hidden_states.shape[0]
+        shared_output = None
+        topk_ids = None
+        topk_weights = None
+        if num_tokens > 0:
+            router_logits, _ = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                    if not self.is_nextn
+                    else None
+                ),
+            )
+            if self.enable_shared_expert_fusion:
+                topk_output = self._append_shared_to_topk_output(
+                    topk_output, hidden_states
+                )
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "MegaMoE pre-dispatch consumes raw topk ids/weights; "
+                "pick a MoE runner backend that emits standard TopK output"
+            )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+
+        final_hidden_states = run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self._mega_hidden_size,
+            intermediate_size=self._mega_intermediate_size,
+            top_k=self._mega_top_k,
+            num_tokens=num_tokens,
+        )
+        if shared_output is not None:
+            final_hidden_states.add_(shared_output)
+        return final_hidden_states
+
     @property
     def supports_deferred_finalize(self) -> bool:
         return bool(
@@ -748,6 +810,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+        if self._use_mega_moe:
+            return self._forward_mega_moe(hidden_states, forward_batch)
 
         if (
             get_moe_a2a_backend().is_deepep()
@@ -1061,10 +1126,9 @@ class Qwen2MoeModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.moe_dp_size = get_parallel().moe_dp_size
-        self.attn_cp_size = get_parallel().attn_cp_size
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1130,16 +1194,6 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if (
-            is_prefill_context_parallel_enabled()
-            and not is_cp_v2_active(forward_batch)
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1178,10 +1232,20 @@ class Qwen2MoeModel(nn.Module):
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if get_parallel().moe_ep_size > 1:
-                    hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                if get_parallel().moe_tp_size > 1:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                # The deferred reduction the next layer would have fused; no
+                # layer follows on this rank, so run it here. Unconditional --
+                # the skip flags that deferred it are what got us into this
+                # branch -- so it bypasses post_experts_all_reduce()'s guards
+                # while reusing its merge rule.
+                if can_merge_post_experts_all_reduce():
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                else:
+                    if get_parallel().moe_ep_size > 1:
+                        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+                    if get_parallel().moe_tp_size > 1:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                 hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
@@ -1195,20 +1259,6 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-
-        if (
-            self.pp_group.is_last_rank
-            and not is_cp_v2_active(forward_batch)
-            and is_prefill_context_parallel_enabled()
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.attn_cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1226,7 +1276,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None

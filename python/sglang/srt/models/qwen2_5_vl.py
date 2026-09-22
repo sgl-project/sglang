@@ -38,7 +38,6 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import (
@@ -228,7 +227,6 @@ class Qwen2_5_VLMLP(nn.Module):
 
 
 class Qwen2_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -306,7 +304,6 @@ class Qwen2_5_VisionBlock(nn.Module):
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -366,7 +363,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
 
 class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen2_5_VLVisionConfig,
@@ -724,7 +720,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -797,7 +793,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if current_dim == expected_dim:
                 return pixel_values
             if current_dim != raw_patch_dim:
-
                 return pixel_values
 
         assert pixel_values.dim() == 2, pixel_values.dim()

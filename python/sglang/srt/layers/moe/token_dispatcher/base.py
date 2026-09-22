@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 
 
 class _RemovableDispatcherHandle:
-
     next_id = 0  # Global counter for unique IDs
 
     def __init__(self, hooks_dict: OrderedDict):
@@ -56,7 +55,6 @@ class _RemovableDispatcherHandle:
 
 
 class DispatcherBaseHooks:
-
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
 
@@ -70,7 +68,6 @@ class DispatcherBaseHooks:
 
 
 class _PreDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self,
         dispatcher: BaseDispatcher,
@@ -85,7 +82,6 @@ class _PreDispatchHooks(DispatcherBaseHooks):
 
 
 class _PostDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
     ) -> Optional[DispatchOutput]:
@@ -97,7 +93,6 @@ class _PostDispatchHooks(DispatcherBaseHooks):
 
 
 class _PreCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
     ) -> Optional[CombineInput]:
@@ -109,7 +104,6 @@ class _PreCombineHooks(DispatcherBaseHooks):
 
 
 class _PostCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -124,7 +118,6 @@ class _PostCombineHooks(DispatcherBaseHooks):
 
 
 class DispatchOutputChecker:
-
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
@@ -175,7 +168,6 @@ class DispatchOutputChecker:
 
 
 class DispatchOutputFormat(Enum):
-
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
@@ -222,6 +214,16 @@ class DispatchOutput(Protocol):
 
 
 class CombineInputChecker:
+    @staticmethod
+    def needs_model_route_finalization(
+        combine_input: CombineInput,
+    ) -> TypeGuard[RoutewiseCombineInput]:
+        """Whether expert output still needs routewise model finalization."""
+        return (
+            isinstance(combine_input, RoutewiseCombineInput)
+            and combine_input.routewise_layout is not None
+        )
+
     @staticmethod
     def format_is_standard(
         combine_input: CombineInput,
@@ -277,6 +279,23 @@ class CombineInputFormat(Enum):
     ASCEND_TP = "ascend_tp"
 
 
+class RoutewiseLayout(Enum):
+    """Layout of unweighted routes awaiting model finalization; H is hidden size.
+
+    TOKEN_TOPK: outputs [T, K, H], router weights [T, K]. T counts received
+    token rows on this EP rank; K is router top-k. Model finalization reduces
+    K to produce [T, H] before dispatcher combine.
+
+    EXPANDED: outputs [R, H], router weights [R]. Each valid row is one
+    token-expert route; R includes alignment padding and unused capacity.
+    Model finalization preserves row positions; dispatcher combine maps and
+    sums valid routes back to the original sender's tokens.
+    """
+
+    TOKEN_TOPK = "token_topk"
+    EXPANDED = "expanded"
+
+
 @runtime_checkable
 class CombineInput(Protocol):
     """Protocol for combine inputs in different formats."""
@@ -285,6 +304,15 @@ class CombineInput(Protocol):
 
     @property
     def format(self) -> CombineInputFormat: ...
+
+
+@runtime_checkable
+class RoutewiseCombineInput(CombineInput, Protocol):
+    """Combine input whose router weighting is deferred to the model layer."""
+
+    hidden_states: torch.Tensor
+    topk_weights: torch.Tensor
+    routewise_layout: RoutewiseLayout
 
 
 # ------------------------------ Base Dispatcher -------------------------------------

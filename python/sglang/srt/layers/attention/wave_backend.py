@@ -42,7 +42,6 @@ class ForwardMetadata:
 
 
 class WaveAttnBackend(AttentionBackend):
-
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -67,7 +66,7 @@ class WaveAttnBackend(AttentionBackend):
         import wave_lang.kernel.wave.cache as cache
 
         base_cache_dir = cache.CACHE_BASE_DIR
-        new_dir = base_cache_dir / f"worker_{model_runner.ps.tp_rank}"
+        new_dir = base_cache_dir / f"worker_{model_runner.tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
         cache.CACHE_BASE_DIR = new_dir
 
@@ -131,9 +130,9 @@ class WaveAttnBackend(AttentionBackend):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         num_group = num_token // num_seq
 
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        assert num_group * num_seq == num_token, (
+            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        )
 
         if self.static_kv_splits or self.device_core_count <= 0:
             num_kv_splits.fill_(self.max_kv_splits)
