@@ -105,51 +105,6 @@ Set with `--load-format`:
   </tbody>
 </table>
 
-## Load with InstantTensor
-
-InstantTensor provides high-performance loading for Safetensors checkpoints through distributed loading and pipelined prefetching. Install the optional dependency:
-
-```bash
-pip install "sglang[instanttensor]"
-```
-
-Enable it explicitly when you launch the server:
-
-```bash
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.6-35B-A3B \
-  --load-format instanttensor
-```
-
-For tensor-parallel and multi-node deployments, InstantTensor uses SGLang's initialized distributed process group. The standard `auto` and `safetensors` paths remain unchanged.
-
-On NVIDIA CUDA, use `--model-loader-extra-config` to pass tuning options to
-`instanttensor.safe_open` (requires InstantTensor 0.1.9 or later):
-
-```bash
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-4B \
-  --load-format instanttensor \
-  --model-loader-extra-config '{"backend": "MMAP", "chunk_size": 4194304, "concurrency": 2, "io_depth": 2, "max_free_mem_usage": 0.25}'
-```
-
-| Option | Description |
-| --- | --- |
-| `buffer_size` | GPU tensor buffer size in bytes. |
-| `chunk_size` | File I/O operation size in bytes. |
-| `concurrency` | Worker threads for the `MMAP` and `CUFILE` backends. |
-| `io_depth` | Maximum number of rank-local I/O operations in flight. |
-| `max_free_mem_usage` | Maximum fraction of free GPU memory available to the tensor buffer. |
-| `backend` | A backend name or an ordered list of candidates: `AIO`, `AIO_BUFFERED`, `URING`, `URING_BUFFERED`, `CUFILE`, `MMAP`, or the `BUFFERED` policy. |
-
-Explicit non-null values override the corresponding `INSTANTTENSOR_*` environment
-variables. Omitted or `null` options retain InstantTensor's environment-variable
-and automatic defaults. Backend names are case-sensitive; for example,
-`{"backend": ["URING", "AIO"]}` selects the first available candidate.
-SGLang manages `framework`, `device`, and `process_group`, and keeps InstantTensor's
-default tensor-copy behavior. The generic `enable_multithread_load` and
-`num_threads` options do not control InstantTensor; use `concurrency` instead.
-
 ## Model loader extra config
 
 `--model-loader-extra-config` takes a JSON string passed to the loader selected by `--load-format`.
@@ -199,6 +154,30 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>enable_gds</code> (bool)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use GPU Direct Storage. Set to <code>false</code> when the host does not provide the NVIDIA GPUDirect Storage kernel driver, such as in a gVisor sandbox.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>instanttensor</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>buffer_size</code> (int)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GPU tensor buffer size in bytes. See the <a href="https://github.com/scitix/InstantTensor">InstantTensor GitHub homepage</a> for the latest optional parameters.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>null</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>instanttensor</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>chunk_size</code> (int)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>File I/O operation size in bytes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>null</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>instanttensor</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>io_depth</code> (int)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum number of rank-local I/O operations in flight.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>null</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>instanttensor</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>backend</code> (str / list)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A backend name or an ordered list of candidates: <code>AIO</code>, <code>AIO_BUFFERED</code>, <code>URING</code>, <code>URING_BUFFERED</code>, <code>CUFILE</code>, <code>MMAP</code>, or the <code>BUFFERED</code> policy.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>null</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>bitsandbytes</code></td>
