@@ -73,7 +73,7 @@ your dispatch prompt, or ask for it.
    change in a migration PR. Model-specific features are config DATA consumed
    by generic axis handlers (MegaMoE precedent), so they need NO engine change.
    A **titled single-select that strips a flag family** — KV Cache DType
-   (`--kv-cache-dtype`), mamba (`--mamba-scheduler-strategy`), … — is already
+   (`--kv-cache-dtype`), mamba (`--mamba-radix-cache-strategy`), … — is already
    covered by the merged generic **`flagSelects`** axis: declare it in the
    config (a list of `{ id, title, stripPrefixes, options }`; see the Qwen3.5
    mamba example), **no engine PR**. Only a genuinely new control *shape* that
@@ -129,7 +129,7 @@ mention — and a model-specific control is **config data, not engine code**
 (MegaMoE W4A4 is all DSv4 config on the existing `moe` axis). It's pure
 config whenever it fits an existing axis's data schema. A **titled
 single-select that strips a flag family** (Nemotron3's "KV Cache DType",
-mamba `--mamba-scheduler-strategy`, …) fits the merged generic **`flagSelects`**
+mamba `--mamba-radix-cache-strategy`, …) fits the merged generic **`flagSelects`**
 axis — so it too is config-only (declare a `flagSelects` list). Only a control
 whose *shape* `flagSelects` still can't express would need a ONE-TIME generic
 primitive (never a model-named handler) on a separate PRIOR engine PR, keeping

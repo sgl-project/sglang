@@ -19,25 +19,25 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 DEFAULT_REPO = "sgl-project/sglang"
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 GITHUB_API = "https://api.github.com"
+UTILIZATION_WORKFLOW = "runner-utilization.yml"
 
 # Primary pool labels only; aliases (1-gpu-runner, 8-gpu-h200-deepep, ...) are
-# excluded so every runner is counted under exactly one label.
-CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300|a10)$")
-
-# Workflows whose jobs run on the CUDA pools; used for queue-digest.
-CUDA_WORKFLOW_FILES = [
-    "pr-test.yml",
-    "pr-test-extra.yml",
-    "nightly-test-nvidia.yml",
-    "weekly-test-nvidia.yml",
-]
+# excluded so every runner is counted under exactly one label. a10 is left out
+# as well: it serves no per-commit test, so its transitions are noise.
+CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300)$")
 
 FAILED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 # Aggregator jobs fail whenever any other job fails; listing them is noise.
-AGGREGATOR_JOB_RE = re.compile(r"^(check-all-jobs|pr-test-finish)$")
+# Jobs from a called workflow arrive prefixed ("call-pr-test-extra / <name>"),
+# so the aggregator name is matched on the last segment.
+AGGREGATOR_JOB_RE = re.compile(
+    r"^(?:.+ / )?(check-all-jobs|pr-test-finish|pr-test-extra-finish)$"
+)
 MAX_LISTED_JOBS = 15
 
 
@@ -117,41 +117,82 @@ class GitHub:
             max_pages=max_pages,
         )
 
+    def latest_run_url(self, workflow_file: str) -> str:
+        runs = self.workflow_runs(
+            workflow_file, {"status": "success", "per_page": 1}, max_pages=1
+        )
+        if runs:
+            return runs[0]["html_url"]
+        return f"https://github.com/{self.repo}/actions/workflows/{workflow_file}"
+
     def runners(self) -> list:
         return self.paginate(f"repos/{self.repo}/actions/runners", "runners")
 
 
 # --------------------------------------------------------------------------
-# Lark
+# Lark card (schema 2.0)
 # --------------------------------------------------------------------------
 
 
-def build_card(title: str, color: str, body_md: str, buttons: list) -> dict:
-    elements: list = [{"tag": "div", "text": {"tag": "lark_md", "content": body_md}}]
-    if buttons:
-        elements.append(
+def md(text: str) -> dict:
+    return {"tag": "markdown", "content": text}
+
+
+def grey(text: str) -> str:
+    return f"<font color='grey'>{text}</font>"
+
+
+def kv_columns(pairs: list) -> dict:
+    return {
+        "tag": "column_set",
+        "flex_mode": "flow",
+        "horizontal_spacing": "default",
+        "columns": [
             {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": text},
-                        "url": url,
-                        "type": "default",
-                    }
-                    for text, url in buttons
-                ],
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [md(f"{grey(k)}\n**{v}**")],
             }
-        )
+            for k, v in pairs
+        ],
+    }
+
+
+def button(text: str, url: str) -> dict:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": "default",
+        "behaviors": [{"type": "open_url", "default_url": url}],
+    }
+
+
+def chart(spec: dict, aspect_ratio: str = "16:9") -> dict:
+    # The spec is VChart JSON rendered by the Lark client, so no image upload
+    # (hence no Lark app credentials) is involved. Needs Lark client 7.1+.
+    return {
+        "tag": "chart",
+        "aspect_ratio": aspect_ratio,
+        "color_theme": "brand",
+        "chart_spec": spec,
+    }
+
+
+HR = {"tag": "hr"}
+
+
+def build_card(title: str, color: str, elements: list, buttons: list) -> dict:
     return {
         "msg_type": "interactive",
         "card": {
+            "schema": "2.0",
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": title},
-                "template": color,
+                "template": color,  # red | orange | green | blue | grey
             },
-            "elements": elements,
+            "body": {"elements": elements + [button(t, u) for t, u in buttons]},
         },
     }
 
@@ -183,6 +224,23 @@ def parse_time(s: Optional[str]) -> Optional[datetime]:
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
+def fmt_local(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "-"
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def fmt_local_hour(dt: Optional[datetime]) -> str:
+    """Timeline bucket label: the local hour alone, e.g. "9am"."""
+    if dt is None:
+        return "-"
+    return dt.astimezone(LOCAL_TZ).strftime("%I%p").lstrip("0").lower()
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
 def fmt_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "-"
@@ -194,25 +252,17 @@ def fmt_duration(seconds: Optional[float]) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-def percentile(values: list, p: float) -> Optional[float]:
-    if not values:
-        return None
-    ordered = sorted(values)
-    idx = int(round((len(ordered) - 1) * p))
-    return ordered[idx]
-
-
 def primary_cuda_label(labels: list) -> Optional[str]:
-    for label in labels:
-        if CUDA_LABEL_RE.match(label):
-            return label
+    for name in labels:
+        if CUDA_LABEL_RE.match(name):
+            return name
     return None
 
 
 def list_jobs_md(jobs: list, limit: int = MAX_LISTED_JOBS) -> str:
-    lines = [f"  - [{j['name']}]({j['html_url']})" for j in jobs[:limit]]
+    lines = [f"- [{j['name']}]({j['html_url']})" for j in jobs[:limit]]
     if len(jobs) > limit:
-        lines.append(f"  - ... and {len(jobs) - limit} more")
+        lines.append(f"- ... and {len(jobs) - limit} more")
     return "\n".join(lines)
 
 
@@ -278,47 +328,67 @@ def render_ci_status(run: dict, jobs: list, prev_failed: Optional[dict]) -> dict
         else "-"
     )
 
-    sha = run["head_sha"][:9]
-    commit_msg = (run.get("head_commit") or {}).get("message", "").splitlines()
-    commit_line = f"`{sha}` {commit_msg[0] if commit_msg else ''}".strip()
+    repo_url = run["html_url"].split("/actions/")[0]
+    sha = run["head_sha"]
+    subject = ((run.get("head_commit") or {}).get("message") or "").splitlines()
+    commit_md = (
+        f"[`{sha[:9]}`]({repo_url}/commit/{sha}) {subject[0] if subject else ''}"
+    )
     rerun_prefix = f"Rerun #{attempt} - " if attempt > 1 else ""
 
     if conclusion == "cancelled":
-        title = f"{rerun_prefix}{name}: CANCELLED ({duration})"
+        title = f"{rerun_prefix}{name}: CANCELLED"
         color = "grey"
     elif failed:
-        title = f"{rerun_prefix}{name}: FAILED ({len(failed)} failed / {len(counted)} jobs, {duration})"
+        title = f"{rerun_prefix}{name}: FAILED ({len(failed)} of {plural(len(counted), 'job')})"
         color = "red"
     else:
-        title = f"{rerun_prefix}{name}: PASSED ({len(counted)} jobs, {duration})"
+        title = f"{rerun_prefix}{name}: PASSED ({plural(len(counted), 'job')})"
         color = "green"
 
-    lines = [commit_line]
+    jobs_summary = f"{len(counted)} total, {len(failed)} failed"
+    if cancelled:
+        jobs_summary += f", {len(cancelled)} cancelled"
+    elements = [
+        md(f"{grey('Commit')}  {commit_md}"),
+        kv_columns(
+            [
+                ("Started", fmt_local(started)),
+                ("Finished", fmt_local(updated)),
+                ("Duration", duration),
+                ("Jobs", jobs_summary),
+            ]
+        ),
+    ]
+
+    sections = []
     # None: first attempt, nothing to compare against
     if prev_failed is None:
         if failed:
-            lines.append(f"**Failed jobs ({len(failed)})**")
-            lines.append(list_jobs_md(list(failed.values())))
+            sections.append(
+                f"**Failed jobs ({len(failed)})**\n{list_jobs_md(list(failed.values()))}"
+            )
     else:
         diff = diff_attempts(failed, prev_failed)
-        if diff["fixed"]:
-            lines.append(f"**Fixed by rerun ({len(diff['fixed'])})**")
-            lines.append(list_jobs_md(diff["fixed"]))
-        if diff["still"]:
-            lines.append(f"**Still failing ({len(diff['still'])})**")
-            lines.append(list_jobs_md(diff["still"]))
-        if diff["new"]:
-            lines.append(f"**New failures ({len(diff['new'])})**")
-            lines.append(list_jobs_md(diff["new"]))
-    if cancelled:
-        lines.append(f"Cancelled jobs: {len(cancelled)}")
+        for key, heading in (
+            ("fixed", "Fixed by rerun"),
+            ("still", "Still failing"),
+            ("new", "New failures"),
+        ):
+            if diff[key]:
+                sections.append(
+                    f"**{heading} ({len(diff[key])})**\n{list_jobs_md(diff[key])}"
+                )
+    if sections:
+        elements.append(HR)
+        elements.append(md("\n\n".join(sections)))
 
-    buttons = [("Run", run["html_url"])]
+    buttons = [("View run on GitHub", run["html_url"])]
     if attempt > 1:
         buttons.append(
-            (f"Attempt {attempt - 1}", f"{run['html_url']}/attempts/{attempt - 1}")
+            (f"View attempt {attempt - 1}", f"{run['html_url']}/attempts/{attempt - 1}")
         )
-    return build_card(title, color, "\n".join(lines), buttons)
+    return build_card(title, color, elements, buttons)
 
 
 def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
@@ -349,11 +419,11 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
 def summarize_pools(runners: list) -> dict:
     pools: dict = {}
     for r in runners:
-        label = primary_cuda_label([l["name"] for l in r.get("labels", [])])
-        if label is None:
+        pool_label = primary_cuda_label([lb["name"] for lb in r.get("labels", [])])
+        if pool_label is None:
             continue
         pool = pools.setdefault(
-            label,
+            pool_label,
             {"total": 0, "online": 0, "offline": 0, "busy": 0, "offline_names": []},
         )
         pool["total"] += 1
@@ -378,60 +448,66 @@ def plan_health_events(
 ) -> tuple:
     events = []  # (kind, label, pool, since)
     new_state: dict = {}
-    for label, pool in sorted(pools.items()):
-        prev = state.get(label)
+    for pool_label, pool in sorted(pools.items()):
+        prev = state.get(pool_label)
         degraded = is_degraded(pool, threshold)
         if degraded:
             since = parse_time(prev["degraded_since"]) if prev else now
             last = parse_time(prev["last_notified"]) if prev else None
             if prev is None:
-                events.append(("degraded", label, pool, since))
+                events.append(("degraded", pool_label, pool, since))
                 last = now
             elif last is None or (now - last) >= timedelta(hours=remind_hours):
-                events.append(("still_degraded", label, pool, since))
+                events.append(("still_degraded", pool_label, pool, since))
                 last = now
-            new_state[label] = {
+            new_state[pool_label] = {
                 "degraded_since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "last_notified": last.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "offline": pool["offline"],
             }
         elif prev is not None:
             events.append(
-                ("recovered", label, pool, parse_time(prev["degraded_since"]))
+                ("recovered", pool_label, pool, parse_time(prev["degraded_since"]))
             )
     return events, new_state
 
 
 def render_health_event(
-    kind: str, label: str, pool: dict, since: datetime, now: datetime, repo: str
+    kind: str, pool_label: str, pool: dict, since: datetime, now: datetime, repo: str
 ) -> dict:
-    counts = (
-        f"online {pool['online']} / offline {pool['offline']} / total {pool['total']}, "
-        f"busy {pool['busy']}"
-    )
     runners_url = f"https://github.com/{repo}/settings/actions/runners"
-    since_s = since.strftime("%Y-%m-%d %H:%M UTC")
     elapsed = fmt_duration((now - since).total_seconds())
-    if kind == "recovered":
-        title = f"Runner pool recovered: {label}"
-        body = f"{counts}\nDegraded for {elapsed} (since {since_s})."
-        return build_card(title, "green", body, [("Runners", runners_url)])
+    status = f"{pool['online']} online / {pool['offline']} offline of {pool['total']}"
     all_down = pool["offline"] == pool["total"]
-    state_word = "DOWN" if all_down else "degraded"
-    if kind == "degraded":
-        title = f"Runner pool {state_word}: {label}"
+    if kind == "recovered":
+        title = f"Runner pool recovered: {pool_label}"
+        color = "green"
+        elapsed_key = "Was degraded for"
     else:
-        title = f"Runner pool still {state_word}: {label} ({elapsed})"
-    body = "\n".join(
-        [
-            counts,
-            f"Offline: {compress_runner_names(pool['offline_names'])}",
-            f"Since {since_s}",
+        state_word = "DOWN" if all_down else "degraded"
+        if kind == "degraded":
+            title = f"Runner pool {state_word}: {pool_label}"
+        else:
+            title = f"Runner pool still {state_word}: {pool_label} ({elapsed})"
+        color = "red" if all_down else "orange"
+        elapsed_key = "Degraded for"
+    elements = [
+        kv_columns(
+            [
+                ("Pool", pool_label),
+                ("Status", status),
+                ("Busy", str(pool["busy"])),
+                (elapsed_key, elapsed),
+            ]
+        ),
+        md(f"{grey('Degraded since')}  {fmt_local(since)}"),
+    ]
+    if kind != "recovered":
+        elements += [
+            HR,
+            md(f"**Offline runners**\n{compress_runner_names(pool['offline_names'])}"),
         ]
-    )
-    return build_card(
-        title, "red" if all_down else "orange", body, [("Runners", runners_url)]
-    )
+    return build_card(title, color, elements, [("View runners on GitHub", runners_url)])
 
 
 def cmd_runner_health(args: argparse.Namespace, gh: GitHub) -> None:
@@ -441,16 +517,16 @@ def cmd_runner_health(args: argparse.Namespace, gh: GitHub) -> None:
         with open(args.state_file) as f:
             state = json.load(f)
     pools = summarize_pools(gh.runners())
-    for label, pool in sorted(pools.items()):
+    for pool_label, pool in sorted(pools.items()):
         print(
-            f"{label}: online {pool['online']} offline {pool['offline']} busy {pool['busy']}"
+            f"{pool_label}: online {pool['online']} offline {pool['offline']} busy {pool['busy']}"
         )
     events, new_state = plan_health_events(
         pools, state, now, args.threshold, args.remind_hours
     )
-    for kind, label, pool, since in events:
+    for kind, pool_label, pool, since in events:
         post_card(
-            render_health_event(kind, label, pool, since, now, gh.repo),
+            render_health_event(kind, pool_label, pool, since, now, gh.repo),
             args.webhook,
             args.dry_run,
         )
@@ -462,113 +538,135 @@ def cmd_runner_health(args: argparse.Namespace, gh: GitHub) -> None:
 
 
 # --------------------------------------------------------------------------
-# queue-digest
+# queue-timeline
 # --------------------------------------------------------------------------
 
 
-def job_queue_seconds(job: dict, now: datetime) -> Optional[float]:
-    created = parse_time(job.get("created_at"))
-    if created is None:
-        return None
-    if job.get("status") == "queued":
-        return (now - created).total_seconds()
-    started = parse_time(job.get("started_at"))
-    if started is None or started < created:
-        return None
-    return (started - created).total_seconds()
+def merge_timeline(series: dict) -> list:
+    """Fold the per-label series into one CUDA-wide series, bucket by bucket.
 
-
-def summarize_queue(jobs: list, now: datetime) -> dict:
-    per_label: dict = {}
-    for job in jobs:
-        label = primary_cuda_label(job.get("labels") or [])
-        if label is None:
+    Backlog sums across pools; the wait takes the max of the per-pool p90s,
+    since averaging would let idle pools mask the one pool that is stuck. The
+    merge costs the answer to "which pool?", so each bucket keeps the label
+    behind the deepest backlog and the longest wait -- routinely not the same.
+    """
+    buckets: dict = {}
+    for label, rows in series.get("labels", {}).items():
+        if not CUDA_LABEL_RE.match(label):
             continue
-        q = job_queue_seconds(job, now)
-        if q is None:
-            continue
-        entry = per_label.setdefault(
-            label, {"waits": [], "queued_now": [], "started": 0}
-        )
-        if job.get("status") == "queued":
-            entry["queued_now"].append(q)
-        else:
-            entry["waits"].append(q)
-            entry["started"] += 1
-    result = {}
-    for label, e in per_label.items():
-        result[label] = {
-            "n": e["started"],
-            "p50": percentile(e["waits"], 0.5),
-            "p90": percentile(e["waits"], 0.9),
-            "max": max(e["waits"]) if e["waits"] else None,
-            "queued_now": len(e["queued_now"]),
-            "oldest_queued": max(e["queued_now"]) if e["queued_now"] else None,
-        }
-    return result
-
-
-def render_queue_digest(
-    stats: dict, hours: float, slow_minutes: float, repo: str
-) -> dict:
-    slow = slow_minutes * 60
-    ordered = sorted(stats.items(), key=lambda kv: -(kv[1]["p90"] or 0))
-    lines = []
-    for label, s in ordered:
-        flag = " (!)" if (s["p90"] or 0) >= slow else ""
-        queued = (
-            f", queued now {s['queued_now']} (oldest {fmt_duration(s['oldest_queued'])})"
-            if s["queued_now"]
-            else ""
-        )
-        lines.append(
-            f"**{label}**{flag}: {s['n']} jobs, p50 {fmt_duration(s['p50'])}, "
-            f"p90 {fmt_duration(s['p90'])}, max {fmt_duration(s['max'])}{queued}"
-        )
-    if not lines:
-        lines.append("_No CUDA jobs in this window._")
-    any_slow = any((s["p90"] or 0) >= slow for s in stats.values())
-    title = f"CUDA queue time, last {int(hours)}h"
-    if any_slow:
-        title += f" - p90 over {int(slow_minutes)}m on some pools"
-    return build_card(
-        title,
-        "orange" if any_slow else "blue",
-        "\n".join(lines),
-        [("Actions", f"https://github.com/{repo}/actions")],
-    )
-
-
-def fetch_window_jobs(
-    gh: GitHub, hours: float, workflow_files: list, workers: int
-) -> list:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    runs: list = []
-    for wf in workflow_files:
-        runs.extend(
-            gh.workflow_runs(
-                wf,
-                {"created": ">=" + since.strftime("%Y-%m-%dT%H:%M:%SZ")},
-                max_pages=10,
+        for row in rows:
+            b = buckets.setdefault(
+                row["start"],
+                {
+                    "backlog": 0,
+                    "started": 0,
+                    "p90": 0.0,
+                    "p90_pool": "-",
+                    "top_pool": "-",
+                    "top_backlog": 0,
+                },
             )
-        )
-    print(f"{len(runs)} runs in window across {len(workflow_files)} workflows")
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        job_lists = list(pool.map(lambda r: gh.run_jobs(r["id"]), runs))
-    jobs = [j for jl in job_lists for j in jl]
-    print(f"{len(jobs)} jobs fetched")
-    return jobs
+            b["backlog"] += row["backlog"]
+            b["started"] += row["started"]
+            if row["p90_wait_min"] > b["p90"]:
+                b["p90"], b["p90_pool"] = row["p90_wait_min"], label
+            if row["backlog"] > b["top_backlog"]:
+                b["top_backlog"], b["top_pool"] = row["backlog"], label
+    return [dict(start=k, **v) for k, v in sorted(buckets.items())]
 
 
-def cmd_queue_digest(args: argparse.Namespace, gh: GitHub) -> None:
-    now = datetime.now(timezone.utc)
-    jobs = fetch_window_jobs(gh, args.hours, args.workflows.split(","), args.workers)
-    stats = summarize_queue(jobs, now)
-    post_card(
-        render_queue_digest(stats, args.hours, args.slow_minutes, gh.repo),
-        args.webhook,
-        args.dry_run,
+def timeline_chart_spec(rows: list) -> dict:
+    hours = [fmt_local_hour(parse_time(r["start"])) for r in rows]
+    return {
+        "type": "common",
+        "data": [
+            {
+                "id": "backlog",
+                "values": [
+                    {"hour": h, "value": r["backlog"]} for h, r in zip(hours, rows)
+                ],
+            },
+            {
+                "id": "wait",
+                "values": [
+                    {"hour": h, "value": round(r["p90"], 1)}
+                    for h, r in zip(hours, rows)
+                ],
+            },
+        ],
+        "series": [
+            {
+                "type": "bar",
+                "id": "backlog",
+                "dataIndex": 0,
+                "xField": "hour",
+                "yField": "value",
+                "name": "Jobs waiting (peak)",
+            },
+            {
+                "type": "line",
+                "id": "wait",
+                "dataIndex": 1,
+                "xField": "hour",
+                "yField": "value",
+                "name": "p90 wait (min)",
+            },
+        ],
+        "axes": [
+            {"orient": "left", "seriesIndex": [0], "title": {"visible": False}},
+            {"orient": "right", "seriesId": ["wait"], "grid": {"visible": False}},
+            {"orient": "bottom", "type": "band", "label": {"visible": True}},
+        ],
+        "legends": {"visible": True, "orient": "bottom"},
+    }
+
+
+def render_queue_timeline(rows: list, report_url: str) -> dict:
+    peak = max(rows, key=lambda r: r["backlog"])
+    slowest = max(rows, key=lambda r: r["p90"])
+    span = f"{fmt_local(parse_time(rows[0]['start']))} to {fmt_local(parse_time(rows[-1]['start']))}"
+    peak_hour = fmt_local_hour(parse_time(peak["start"]))
+    slowest_hour = fmt_local_hour(parse_time(slowest["start"]))
+    elements = [
+        md(f"{grey('Window')}  {span}  {grey('(bucket: 1h)')}"),
+        kv_columns(
+            [
+                ("Jobs started", str(sum(r["started"] for r in rows))),
+                ("Peak backlog", f"{peak['backlog']} jobs"),
+                ("Worst p90 wait", fmt_duration(slowest["p90"] * 60)),
+            ]
+        ),
+        chart(timeline_chart_spec(rows)),
+        md(
+            f"{grey('Peak backlog')}  {peak_hour}, mostly "
+            f"**{peak['top_pool']}** ({peak['top_backlog']})\n"
+            f"{grey('Worst wait')}  {slowest_hour}, **{slowest['p90_pool']}**"
+        ),
+    ]
+    return build_card(
+        "CUDA queue over the day",
+        "blue",
+        elements,
+        [("View utilization report", report_url)],
     )
+
+
+def cmd_queue_timeline(args: argparse.Namespace, gh: GitHub) -> None:
+    with open(args.series_file) as f:
+        series = json.load(f)
+    rows = merge_timeline(series)
+    if not rows:
+        print("no CUDA buckets in the series; skipping")
+        return
+    # The card is built from THIS run's scan, so link to it rather than to the
+    # last successful one, which would be yesterday's report.
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    report_url = (
+        f"https://github.com/{gh.repo}/actions/runs/{run_id}"
+        if run_id
+        else gh.latest_run_url(UTILIZATION_WORKFLOW)
+    )
+    post_card(render_queue_timeline(rows, report_url), args.webhook, args.dry_run)
 
 
 # --------------------------------------------------------------------------
@@ -604,13 +702,12 @@ def main() -> int:
     )
     p.add_argument("--remind-hours", type=float, default=1.0)
 
-    p = sub.add_parser("queue-digest", help="per-label queue time percentiles")
-    p.add_argument("--hours", type=float, default=6.0)
+    p = sub.add_parser("queue-timeline", help="daily queue backlog / wait chart")
     p.add_argument(
-        "--slow-minutes", type=float, default=30.0, help="p90 above this is flagged"
+        "--series-file",
+        required=True,
+        help="JSON written by runner_utilization_report.py --queue-series-out",
     )
-    p.add_argument("--workflows", default=",".join(CUDA_WORKFLOW_FILES))
-    p.add_argument("--workers", type=int, default=8)
 
     args = parser.parse_args()
     if not args.token:
@@ -626,7 +723,7 @@ def main() -> int:
     {
         "ci-status": cmd_ci_status,
         "runner-health": cmd_runner_health,
-        "queue-digest": cmd_queue_digest,
+        "queue-timeline": cmd_queue_timeline,
     }[args.command](args, gh)
     return 0
 

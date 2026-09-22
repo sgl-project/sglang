@@ -146,14 +146,40 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
         self.task = task
         self.conditions = conditions
-        self.target = {
-            "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 5.0,
-        }
+        self.target = self._synthetic_warmup_target(req, server_args)
         selected_seed = req.seed if isinstance(req.seed, int) else int(req.seed[0])
         req.extra.update(self.build_request_extra(_seed_override=int(selected_seed)))
         self._video_hooks().prepare_for_queue_sync(req)
+
+    @staticmethod
+    def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
+        """Warmup canvas from ``--warmup-num-frames`` / ``--warmup-resolutions``."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+            MINIMAX_H3_SUPPORTED_FPS,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            MINIMAX_H3_FINITE_ASPECT_RATIOS,
+        )
+
+        target: dict[str, Any] = {
+            "short_edge": MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+            "aspect_ratio": "16:9",
+            "duration_seconds": 5.0,
+        }
+        if server_args.warmup_num_frames is not None:
+            target["duration_seconds"] = (
+                server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
+            )
+        if server_args.warmup_resolutions is not None:
+            ratio = req.width / req.height
+
+            def distance(name: str) -> float:
+                w, h = map(int, name.split(":"))
+                return abs(w / h - ratio)
+
+            target["aspect_ratio"] = min(MINIMAX_H3_FINITE_ASPECT_RATIOS, key=distance)
+        return target
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         return self._video_hooks().project_queued_job_fields(req)
