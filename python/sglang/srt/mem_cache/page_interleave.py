@@ -32,17 +32,24 @@ therefore can be striped without extra compute-time communication:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
 import torch
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
+
+# Keep enough assembled prefix KV for eight long-context requests. The
+# new-token compute budget is independent: eight 1K extensions can fill an
+# 8K prefill chunk even when each request has a nearly full-context prefix.
+_KV_SHARD_SCRATCH_PREFIX_CONTEXTS = 8
 
 
 class PageShardSpec(msgspec.Struct, frozen=True):
@@ -52,7 +59,12 @@ class PageShardSpec(msgspec.Struct, frozen=True):
     shard_size: int
     page_size: int  # physical page size (kernel-visible)
     max_prefix_tokens: int  # scratch prefix-region capacity, granule-aligned
-    chunk_tokens: int  # scratch chunk-region capacity, granule-aligned
+    chunk_tokens: int  # scratch chunk-region capacity, physical-page-aligned
+
+    @property
+    def scratch_rows(self) -> int:
+        """Rows in each slot: assembled prefix, current batch chunk, trash page."""
+        return self.max_prefix_tokens + self.chunk_tokens + self.page_size
 
     @property
     def logical_page_size(self) -> int:
@@ -111,3 +123,67 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
     if use_mla_backend:
         return get_parallel().attn_tp_group
     return cp_group
+
+
+def get_kv_shard_group_info(
+    kvc: KVCacheConfigurator,
+) -> Tuple[Optional[int], int]:
+    """``(shard_rank, shard_size)`` for the KV pool; ``(None, 1)`` disables."""
+    if kvc.is_draft_worker or not get_parallel().enable_kv_cache_sharding:
+        return None, 1
+    group = get_kv_shard_group(kvc.use_mla_backend)
+    if group.world_size <= 1:
+        return None, 1
+    return group.rank_in_group, group.world_size
+
+
+def _page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
+    model_config = kvc.model_config
+    kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
+    if kvc.use_mla_backend:
+        return (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * kv_size
+    return (
+        model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        * (model_config.head_dim + model_config.v_head_dim)
+        * kv_size
+    )
+
+
+def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
+    """Provision eight full-context prefixes plus the batch's new-token budget.
+
+    Prefix capacity must not shrink with the number of new tokens: eight
+    long cached prefixes can accompany just 1K new tokens each. Round each
+    context to a shard-group gather span before multiplying, so per-request
+    padding cannot overflow the region even for an unaligned context length.
+
+    This is a fixed eight-context prefix budget, independent of request limits
+    or chunk size. Both scratch slots are charged against HBM before sizing
+    persistent KV; large model contexts therefore reduce persistent capacity.
+    Admission still checks the actual batch's padded prefix and chunk spans.
+    """
+    shard_rank, shard_size = get_kv_shard_group_info(kvc)
+    if shard_rank is None:
+        return None
+
+    page_size = kvc.page_size
+    granule = shard_size * page_size
+    return PageShardSpec(
+        shard_rank=shard_rank,
+        shard_size=shard_size,
+        page_size=page_size,
+        max_prefix_tokens=_KV_SHARD_SCRATCH_PREFIX_CONTEXTS
+        * ceil_align(kvc.model_config.context_len, granule),
+        # chunked_prefill_size is the TOTAL new-token budget for the batch.
+        chunk_tokens=ceil_align(get_schedule().chunked_prefill_size, page_size),
+    )
+
+
+def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
+    """Fixed HBM cost of the double-buffered assembly scratch, charged against
+    the KV budget before pool sizing. Use the same spec as the pool builders:
+    two slots, each holding ONE layer's ``[prefix | chunk | trash page]``."""
+    spec = make_page_shard_spec(kvc)
+    if spec is None:
+        return 0
+    return 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)

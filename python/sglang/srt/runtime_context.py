@@ -63,27 +63,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Imported lazily so this module has no import-time dependencies: any module can
-# import get_parallel at module level without risking an import cycle.
-_PARALLEL_STATE = None
-
-
-def _ps():
-    """Lazily import and cache the parallel-state module."""
-    global _PARALLEL_STATE
-    if _PARALLEL_STATE is None:
-        from sglang.srt.distributed import parallel_state
-
-        _PARALLEL_STATE = parallel_state
-    return _PARALLEL_STATE
-
-
-def _dp():
-    from sglang.srt.layers import dp_attention
-
-    return dp_attention
-
-
 @functools.lru_cache(maxsize=1)
 def _parallel_config_leaves() -> frozenset:
     """Return configured parallel field names, including before publication."""
@@ -95,9 +74,6 @@ def _parallel_config_leaves() -> frozenset:
         for field, path in namespace_of(ServerArgs).items()
         if path.split(".")[0] == "parallel"
     )
-
-
-_MISSING_READ = object()
 
 
 @functools.lru_cache(maxsize=1)
