@@ -519,10 +519,10 @@ class Scheduler(
 
         bootstrap.init_parallel_runtime(
             server_args=server_args,
-            model_config=self.model_config,
             device=get_device().device,
             dist_port=self.nccl_port,
         )
+        bootstrap.init_layer_runtime(model_config=self.model_config)
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
@@ -595,6 +595,12 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                if self.enable_unified_memory:
+                    # Keep device rows stable until host transfers are acknowledged.
+                    # Queue reads and relocation both run on the scheduler thread.
+                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
+                        lambda c=cache_controller: not c.has_inflight_device_transfers()
+                    )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 

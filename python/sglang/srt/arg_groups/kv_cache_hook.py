@@ -507,12 +507,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "write loc, so a captured decode replay raises. "
         "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
     )
-    assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
-        "--enable-unified-memory is not yet compatible with hierarchical / "
-        "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-        "the unified-memory-pool init wires up no host pools, and its device mamba / "
-        "full-attention slots are VIRTUAL — the host-offload path does not "
-        "translate them to physical."
+    assert not cfg.enable_lmcache, (
+        "--enable-unified-memory is not yet compatible with --enable-lmcache: "
+        "the LMCache offload path indexes the device buffers with the ids it "
+        "is handed, and under the unified pool those are VIRTUAL."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
