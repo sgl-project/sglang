@@ -8,8 +8,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
-from sglang.test.kits.hellaswag_kit import HellaswagMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=200, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=167, stage="base-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-a-test-1-gpu-small-amd")
 
 
@@ -29,15 +29,20 @@ class TestBasicSanityEagle3(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
-    HellaswagMixin,
+    MMLUSanityMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
-    # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI. AMD EAGLE3
-    # currently sustains lower single-batch occupancy and needs a longer
-    # measurement window to avoid too few non-NaN samples.
-    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
+    # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI with async-assert
+    # probes off in base-a. AMD EAGLE3 currently sustains lower single-batch
+    # occupancy and needs a longer measurement window to avoid too few
+    # non-NaN samples.
+    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 98.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
+    fwd_occupancy_acc_length_threshold: float = 1.6
+
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    mmlu_accept_length_thres = 1.5
 
     @classmethod
     def setUpClass(cls):
@@ -59,16 +64,17 @@ class TestBasicSanityEagle3(
                 "--speculative-draft-model-path",
                 DEFAULT_DRAFT_MODEL_EAGLE3,
                 "--speculative-num-steps",
-                "3",
+                "1",
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "4",
-                "--cuda-graph-max-bs",
+                "2",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
                 "--enable-metrics",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
         )

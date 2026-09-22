@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-large")
 
 NUM_TURNS = 150
 INPUT_LEN = 16
@@ -271,7 +271,7 @@ class TestSessionLatency(CustomTestCase):
                 "--enable-streaming-session",
                 "--mem-fraction-static",
                 "0.70",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--page-size",
                 "4",
             ],

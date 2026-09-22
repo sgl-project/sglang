@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.layers.attention.dsa.index_buf_accessor import (
+from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
     _get_k_and_s_triton_kernel,
 )
 
@@ -175,7 +175,7 @@ def get_k_and_s_triton():
 
     end_time = time.perf_counter()
     print(
-        f"_get_k_and_s_triton_kernel triton kernel infer time is {((end_time-start_time)*1000):.4f} ms\n"
+        f"_get_k_and_s_triton_kernel triton kernel infer time is {((end_time - start_time) * 1000):.4f} ms\n"
     )
 
 

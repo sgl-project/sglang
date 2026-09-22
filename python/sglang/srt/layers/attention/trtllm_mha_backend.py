@@ -2,7 +2,14 @@ from __future__ import annotations
 
 """
 Support attention backend for TRTLLM MHA kernels from flashinfer.
-The kernel supports sm100 only, with sliding window and attention sink features.
+
+Prefill dispatch:
+  - SM90 / SM120: trtllm_fmha_v2_prefill (Q_PAGED_KV_NHD layout)
+  - SM100:        trtllm_batch_context_with_kv_cache (HND layout)
+
+Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
+
+Sliding window and attention sink features are supported.
 """
 
 import logging
@@ -11,19 +18,48 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.utils import canonicalize_stride
+from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+    Q_MODE_NONE,
+    Q_MODE_STRIDED,
+    update_trtllm_mha_graph_metadata,
+)
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+    build_trtllm_mha_page_table,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
-    fused_fp8_set_kv_buffer,
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    make_persistent_multi_ctas_kv_counter_buffer,
 )
-from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KVCacheAttentionAccessKind,
+)
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_spec,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
+)
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +69,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
@@ -41,7 +78,56 @@ if TYPE_CHECKING:
 DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
-global_zero_init_workspace_buffer = None
+
+
+def _native_fp4_decode_output_capacity(
+    max_running_requests: int,
+    max_draft_tokens: Optional[int],
+    max_cuda_graph_bs: Optional[int] = None,
+) -> int:
+    """Maximum FP8 output rows for eager/graph decode and target verify."""
+    request_capacity = max(max_running_requests, max_cuda_graph_bs or 0)
+    return request_capacity * max(1, max_draft_tokens or 1)
+
+
+def _native_fp4_prefill_output_capacity(
+    max_context_len: int,
+    max_prefill_tokens: int,
+    chunked_prefill_limit: int,
+) -> int:
+    """Maximum FP8 output rows for one admitted prefill batch."""
+    if chunked_prefill_limit > 0:
+        return chunked_prefill_limit
+    return max(max_context_len, max_prefill_tokens)
+
+
+def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
+    """Return the pool-owned buffers in TRT-LLM GenMHA's native layout."""
+    pool = token_to_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        pool._wait_for_layer(layer_id)
+        layer_id = pool._transfer_full_attention_id(layer_id)
+        pool = pool.full_kv_pool
+    elif pool.layer_transfer_counter is not None:
+        pool.layer_transfer_counter.wait_until(layer_id - pool.start_layer)
+
+    local_layer_id = layer_id - pool.start_layer
+    if pool.native_k_scale_buffer is None or pool.native_v_scale_buffer is None:
+        raise RuntimeError(
+            "TRT-LLM native FP4 KV cache requested from a pool without native scales."
+        )
+    k_scale = pool.native_k_scale_buffer[local_layer_id]
+    v_scale = pool.native_v_scale_buffer[local_layer_id]
+    scale_view_dtype = pool.quant_method.scale_buffer_view_dtype()
+    if scale_view_dtype is not None:
+        k_scale = k_scale.view(scale_view_dtype)
+        v_scale = v_scale.view(scale_view_dtype)
+    return (
+        pool.k_buffer[local_layer_id],
+        pool.v_buffer[local_layer_id],
+        k_scale,
+        v_scale,
+    )
 
 
 @dataclass
@@ -50,8 +136,6 @@ class TRTLLMMHAMetadata:
     cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
     max_seq_len_q: int = 1
-    # Maximum sequence length for key
-    max_seq_len_k: int = 0
     # Cumulative sequence lengths for `query
     cu_seqlens_q: torch.Tensor = None
     # Cumulative sequence lengths for key
@@ -60,10 +144,35 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # CP zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
+    zigzag_page_table: torch.Tensor = None
+    zigzag_swa_page_table: torch.Tensor = None
+    # full->SWA translated out_cache_loc (SWA KV-store write target)
+    swa_out_cache_loc: torch.Tensor = None
+    is_ragged_verify: bool = False
+    # ENCODER_ONLY target-verify (bidirectional attention over the window):
+    # bs*L single-token decode rows whose kv length spans the whole window,
+    # so each token attends the full window despite the causal decode kernel.
+    encoder_cache_seqlens: torch.Tensor = None
+    encoder_page_table: torch.Tensor = None
+    encoder_row_map: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
+
+    # Build the page table on-device from seq_lens (incl. the SWA-translated table
+    # via the full->SWA lookup; see _fill_page_table_device), so we never need the
+    # seq_lens_cpu D2H sync; opt out of it, matching trtllm_mla / triton.
+    needs_cpu_seq_lens: bool = False
+
+    supports_ragged_verify_graph: bool = True
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
+        if fm == ForwardMode.EXTEND:
+            return SharedReadEnds.PRE_REPLAY
+        return super().shared_read_ends(fm)
 
     def __init__(
         self,
@@ -85,6 +194,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
+        self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "prefill", "trtllm_mha"
+        )
+        self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+            "decode", "trtllm_mha"
+        )
+        prefill_is_trtllm_mha = (
+            model_runner.prefill_attention_backend_str == "trtllm_mha"
+        )
+        decode_is_trtllm_mha = model_runner.decode_attention_backend_str == "trtllm_mha"
+        if prefill_is_trtllm_mha:
+            self._check_prefill_kv_access()
+        if decode_is_trtllm_mha:
+            self._check_decode_kv_access()
+        self.prefill_uses_native_fp4 = (
+            prefill_is_trtllm_mha
+            and self.prefill_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+        )
+        self.decode_uses_native_fp4 = (
+            decode_is_trtllm_mha
+            and self.decode_kv_access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
+        )
+        self.is_nvfp4_kvcache = (
+            self.prefill_uses_native_fp4
+            and self.prefill_kv_access.scale_recipe == "nvfp4"
+        ) or (
+            self.decode_uses_native_fp4
+            and self.decode_kv_access.scale_recipe == "nvfp4"
+        )
 
         config = model_runner.model_config
 
@@ -99,40 +237,103 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
+        # XQA (SM90/SM120) consumes the legacy linear NVFP4 scale layout and
+        # BF16 Q/O. TRT-LLM GenMHA (SM100) consumes physical HND scales and
+        # requires FP8 Q/O.
+        self.is_xqa_impl = get_platform().is_sm90 or get_platform().is_sm120
+        if self.prefill_uses_native_fp4 and self.is_xqa_impl:
+            raise ValueError(
+                "Native NVFP4 prefill with trtllm_mha requires SM100 "
+                "TRT-LLM GenMHA. Use --prefill-attention-backend flashinfer "
+                "with XQA on SM90/SM120."
+            )
+        self.uses_trtllm_gen_native_fp4 = self.is_nvfp4_kvcache and not self.is_xqa_impl
+
+        # Speculative decoding
+        # Only support topk <= 1 for now.
+        self.topk = get_spec().speculative_eagle_topk or 0
+        self.speculative_step_id = speculative_step_id
+        self.target_verify_metadata = {}
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+
+        self._nvfp4_fp8_output = None
+        if self.uses_trtllm_gen_native_fp4:
+            prefill_limit = 0
+            if self.prefill_uses_native_fp4 and not skip_prefill:
+                # Includes PP dynamic-chunk growth and piecewise capture bounds.
+                prefill_limit = _native_fp4_prefill_output_capacity(
+                    self.max_context_len,
+                    get_schedule().max_prefill_tokens or 0,
+                    max_prefill_buffer_tokens(),
+                )
+            decode_limit = 0
+            if self.decode_uses_native_fp4:
+                # TARGET_VERIFY submits one query row per draft token. Use the
+                # widest adaptive-spec candidate too: the output buffer is
+                # shared by eager execution and every captured CUDA graph.
+                decode_limit = _native_fp4_decode_output_capacity(
+                    model_runner.max_running_requests,
+                    max_speculative_num_draft_tokens(),
+                    get_exec().graph.cuda_graph_config.decode.max_bs,
+                )
+            max_native_tokens = max(prefill_limit, decode_limit)
+            num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
+            self._nvfp4_fp8_output = get_buffer(
+                f"trtllm_mha_nvfp4_output_{max_native_tokens}_"
+                f"{num_q_heads}_{config.head_dim}",
+                lambda: torch.empty(
+                    (max_native_tokens, num_q_heads, config.head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=self.device,
+                ),
+            )
+
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
         # Allocate buffers
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
+        self.workspace_buffer = get_buffer(
+            "trtllm_mha_zero_workspace",
+            lambda: torch.zeros(
                 self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+            ),
+        )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
 
-        # Speculative decoding
-        # Only support topk <= 1 for now.
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
-        self.speculative_step_id = speculative_step_id
-        self.target_verify_metadata = {}
-
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+        # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
+        # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
+        self.expand_encoder_only_verify = any(
+            getattr(module, "attn_type", None) == AttentionType.ENCODER_ONLY
+            for module in model_runner.model.modules()
         )
 
-        # Sliding Window Attention(SWA) hybrid model support.
-        # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
-        # with separate index spaces. We maintain a translated page_table for SWA
-        # layers so the trtllm kernel reads from the correct pool.
-        kv_pool = model_runner.token_to_kv_pool
-        self.use_sliding_window_kv_pool = isinstance(kv_pool, SWAKVPool)
-        self._swa_kv_pool: Optional[SWAKVPool] = (
-            kv_pool if self.use_sliding_window_kv_pool else None
-        )
+        # SWA hybrid models split the KV cache into full and SWA pools with
+        # separate index spaces; SWA layers need a translated page_table.
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        # Raw full->swa index mapping tensor for the fused cuda-graph
+        # metadata kernel (gather + // page_size happen on device). The unified
+        # pool has no token-level mapping, so this is a static-pool mechanism.
+        if (
+            self._swa_kv_pool is not None
+            and not self.kv_index_translator.is_translating
+        ):
+            self._swa_full_to_swa_mapping = self._swa_kv_pool.full_to_swa_index_mapping
+            assert self._swa_full_to_swa_mapping is not None, (
+                "SWA pool must register full_to_swa_index_mapping before "
+                "TRTLLMHAAttnBackend is constructed"
+            )
+        else:
+            self._swa_full_to_swa_mapping = None
+
+        # Static page-table width (upper bound). The CUDA-graph path builds the
+        # page table on-device sized to this constant, so it never reads a runtime
+        # max. See _fill_page_table_device.
+        self.max_num_pages = (
+            self.max_context_len + self.page_size - 1
+        ) // self.page_size
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -145,38 +346,191 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # TRTLLM-GEN:
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
-        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        # fmha_v2 prefill kernel supports SM90 and SM120
+        self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
+        # trtllm-gen serves page_size >= 128 only through its dynamic
+        # tokens-per-page kernels, which exist solely for GQA with equal QK/V
+        # head dims (power-of-2 pages). Mirror that precondition here so an
+        # unsupported combo fails at construction instead of as a
+        # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
+        # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
+        if self.page_size >= 128 and not self.is_xqa_impl:
+            attn_tp_size = get_parallel().attn_tp_size
+            num_q_heads = config.num_attention_heads // attn_tp_size
+            num_kv_heads = config.get_num_kv_heads(attn_tp_size)
+            if (
+                num_q_heads // num_kv_heads <= 1
+                or config.head_dim != config.v_head_dim
+                or self.page_size & (self.page_size - 1) != 0
+            ):
+                raise ValueError(
+                    f"trtllm_mha with page_size={self.page_size} requires "
+                    f"trtllm-gen's dynamic tokens-per-page kernels, which only "
+                    f"support GQA (q heads per kv head > 1, got "
+                    f"{num_q_heads}/{num_kv_heads}) with equal QK/V head dims "
+                    f"(got {config.head_dim}/{config.v_head_dim}) and a "
+                    f"power-of-2 page size. Use --page-size 64 instead."
+                )
 
-    def _maybe_translate_swa(
-        self, token_indices: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Translate full-pool token indices to SWA-pool indices, or return None."""
-        if not self.use_sliding_window_kv_pool:
-            return None
-        shape = token_indices.shape
-        return self._swa_kv_pool.translate_loc_from_full_to_swa(
-            token_indices.reshape(-1)
-        ).reshape(shape)
+        # Owned here, and sized for the widest batch this backend can see, so
+        # FlashInfer does not allocate and zero a fresh counter buffer per
+        # attention layer inside the captured decode graph.
+        self._multi_ctas_kv_counter_buffer = (
+            make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                num_q_heads=config.num_attention_heads,
+                max_batch_size=(model_runner.max_running_requests + 1)
+                * max(1, self.speculative_num_draft_tokens or 1),
+            )
+        )
+        # Same reason for the fused FP8 KV-cache write's fallback scales: it
+        # needs float32 [1] tensors, and layers without checkpoint kv scales
+        # would otherwise have torch.ones() build them on every call.
+        self._default_kv_scale = get_buffer(
+            "trtllm_mha_default_kv_scale",
+            lambda: torch.ones(1, dtype=torch.float32, device=self.device),
+        )
+        self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        if self.decode_seq_len_splits < 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
+                f"got {self.decode_seq_len_splits}"
+            )
+
+    def _check_decode_kv_access(self) -> None:
+        supported_kinds = {
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        }
+        if (
+            self.decode_kv_access is not None
+            and self.decode_kv_access.kind in supported_kinds
+        ):
+            return
+
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses("decode")
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support decode with "
+            f"trtllm_mha. Available decode accesses: {available}."
+        )
+
+    def _check_prefill_kv_access(self) -> None:
+        supported_kinds = {
+            KVCacheAttentionAccessKind.PLAIN,
+            KVCacheAttentionAccessKind.NATIVE_FP4,
+        }
+        if (
+            self.prefill_kv_access is not None
+            and self.prefill_kv_access.kind in supported_kinds
+        ):
+            return
+
+        method_name = getattr(self.kv_cache_quant_method, "name", "unknown")
+        available = self.kv_cache_quant_method.describe_attention_accesses("prefill")
+        raise ValueError(
+            f"KV cache method {method_name!r} does not support prefill with "
+            f"trtllm_mha. Available prefill accesses: {available}."
+        )
+
+    def _nvfp4_output_view(self, q: torch.Tensor) -> torch.Tensor:
+        if self._nvfp4_fp8_output is None:
+            raise RuntimeError("Native NVFP4 output buffer was not initialized.")
+        if q.shape[0] > self._nvfp4_fp8_output.shape[0]:
+            raise RuntimeError(
+                "TRT-LLM NVFP4 attention received more query tokens than its "
+                f"preallocated FP8 output buffer: {q.shape[0]} > "
+                f"{self._nvfp4_fp8_output.shape[0]}. Increase "
+                "--chunked-prefill-size, --max-running-requests, or the "
+                "speculative/CUDA-graph output capacity."
+            )
+        return self._nvfp4_fp8_output[: q.shape[0]].view_as(q)
+
+    def _forward_extend_uses_native_fp4(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this extend-family call must consume physical NVFP4.
+
+        A hybrid backend can route TARGET_VERIFY to its decode child. That
+        child's normal extend role belongs to FlashInfer, so its prefill flag
+        is false even though this particular verify call must use the native
+        GenMHA decode layout.
+        """
+        return self.uses_trtllm_gen_native_fp4 and (
+            self.prefill_uses_native_fp4
+            or (
+                self.decode_uses_native_fp4
+                and forward_batch.forward_mode.is_target_verify()
+            )
+        )
+
+    def _finalize_nvfp4_output(
+        self, output: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if output.dtype == self.q_data_type:
+            return output
+        model_output = forward_batch._attn_output
+        if model_output is not None and model_output.numel() == output.numel():
+            model_output = model_output.view_as(output)
+            model_output.copy_(output)
+            return model_output
+        return output.to(self.q_data_type)
+
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+        """Return the SWAKVPool to translate against, or None for non-SWA models.
+
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
+        allocator = model_runner.token_to_kv_pool_allocator
+        kvcache = allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
         """Allocate a SWA page_table buffer, or return None for non-SWA models."""
-        if not self.use_sliding_window_kv_pool:
+        if self._swa_kv_pool is None:
             return None
         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
-    def _copy_swa_page_table(
+    def _fill_page_table_device(
         self,
         metadata: TRTLLMMHAMetadata,
-        page_indices: torch.Tensor,
-        num_pages: int,
+        req_pool_indices: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ):
-        """Translate and copy SWA page indices into metadata. No-op for non-SWA."""
-        if metadata.swa_page_table is None:
-            return
-        swa_indices = self._maybe_translate_swa(page_indices)
-        metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
+        """Build the page table on-device from per-request KV lengths (no sync).
+
+        Fills ``metadata.page_table`` (a [bs, max_num_pages] buffer) in place with
+        block ids derived from ``cache_seqlens`` (a GPU tensor); for SWA models it
+        also fills ``metadata.swa_page_table`` via the full->SWA lookup. The Triton
+        kernel self-guards per request on the device-side length, so the grid and
+        buffer width use the static ``max_num_pages`` upper bound while the actual
+        writes stay bounded by ``cache_seqlens`` — no host-side max / D2H sync.
+        """
+        has_swa = self._swa_kv_pool is not None
+        build_trtllm_mha_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            cache_seqlens=cache_seqlens,
+            page_table=metadata.page_table,
+            page_size=self.page_size,
+            swa_page_table=metadata.swa_page_table if has_swa else None,
+            full_to_swa=(
+                self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
+            ),
+        )
 
     def _get_layer_cache_loc(
         self,
@@ -184,12 +538,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Return cache locations in the correct index space for the given layer."""
-        if self.use_sliding_window_kv_pool:
+        if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                swa_loc = self.forward_metadata.swa_out_cache_loc
+                assert (
+                    swa_loc is not None
+                    and swa_loc.shape[0] >= forward_batch.out_cache_loc.shape[0]
+                ), (
+                    "SWA write locs missing or too short: init_forward_metadata "
+                    "must translate out_cache_loc once; a per-layer gather of "
+                    "the live mapping would race the scheduler after the WAR "
+                    "fence releases"
                 )
+                # Piecewise prefill narrows out_cache_loc per attention call;
+                # the snapshot keeps the padded batch length.
+                return swa_loc[: forward_batch.out_cache_loc.shape[0]]
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(
@@ -211,6 +575,64 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    def _maybe_build_cp_zigzag_page_tables(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Duplicate request rows once for the combined prev-then-next CP launch."""
+        if not is_cp_active(forward_batch):
+            return
+
+        # TODO: Avoid materializing duplicated page tables to reduce zigzag CP
+        # page-table memory usage.
+        metadata.zigzag_page_table = torch.cat(
+            (metadata.page_table, metadata.page_table), dim=0
+        )
+        if metadata.swa_page_table is not None:
+            metadata.zigzag_swa_page_table = torch.cat(
+                (metadata.swa_page_table, metadata.swa_page_table), dim=0
+            )
+
+    @staticmethod
+    def _get_scalar_scale(
+        layer: RadixAttention,
+        float_attr: str,
+        scale_attr: str,
+    ) -> float:
+        scale = getattr(layer, float_attr, None)
+        if scale is None:
+            scale = getattr(layer, scale_attr, None)
+        if scale is None:
+            return 1.0
+        if isinstance(scale, torch.Tensor):
+            logger.warning_once(
+                "Ignoring tensor %s for TRT-LLM MHA FP8 KV cache scale. "
+                "Expected %s to be populated with a Python scalar.",
+                scale_attr,
+                float_attr,
+            )
+            return 1.0
+        scale = float(scale)
+        return scale if scale > 0.0 else 1.0
+
+    def _get_bmm_scales(
+        self, layer: RadixAttention, q_scale: float | torch.Tensor = 1.0
+    ) -> tuple[float | torch.Tensor, float]:
+        """Return FlashInfer TRT-LLM MHA BMM scales.
+
+        The FP8 paths store Q/K/V as values divided by their per-tensor scales.
+        FlashInfer applies bmm1_scale to QK and bmm2_scale to PV, so FP8 reads
+        need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
+        entries are already in model dtype.
+        """
+        if self.data_type != torch.float8_e4m3fn:
+            return layer.scaling, 1.0
+
+        k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
+        v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
+        return q_scale * k_scale * layer.scaling, v_scale
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -218,7 +640,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "page_table": torch.zeros(
@@ -228,10 +650,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=self.device,
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-            "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
-            ),
         }
+
+        # SWA write-target buffer; bound as a [:num_tokens] view in
+        # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
+        self.cuda_graph_swa_out_cache_loc = (
+            torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
+            if self.use_sliding_window_kv_pool
+            else None
+        )
 
         if (
             self.speculative_num_draft_tokens is not None
@@ -257,6 +684,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
+                # Static uniform preset (Q_MODE_NONE: the fused kernel never
+                # rewrites it). Ragged verify overwrites the [:bs+1] slice
+                # eagerly on every capture/replay-prep, and the ragged-verify
+                # mode is fixed for the whole server run, so the two never mix.
                 "cu_seqlens_q": torch.arange(
                     0,
                     max_bs * self.speculative_num_draft_tokens + 1,
@@ -274,10 +705,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
             }
+            if self.expand_encoder_only_verify:
+                max_verify_rows = max_bs * self.speculative_num_draft_tokens
+                self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
+                    max_verify_rows, dtype=torch.int32, device=self.device
+                )
+                self.target_verify_metadata["encoder_page_table"] = torch.zeros(
+                    max_verify_rows,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -298,44 +737,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     device=self.device,
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
-                "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
-                ),
             }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _build_cuda_graph_metadata(
         self,
         bs: int,
         num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Initialize metadata for CUDA graph capture."""
+        spec_info,
+        device: torch.device,
+    ) -> TRTLLMMHAMetadata:
+        """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
         metadata = TRTLLMMHAMetadata()
-        device = seq_lens.device
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
-                # Draft Decode
-                # Here we only support topk = 1 for now.
+                # Draft Decode (topk = 1)
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.max_seq_len_k = seq_lens.max().item() + (
-                    self.speculative_step_id + 1
-                )
                 metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
                     : bs + 1
                 ]
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
                 metadata.page_table = self.decode_cuda_graph_metadata[
                     "page_table_draft_decode"
                 ][:bs, :]
@@ -348,20 +774,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
-                # Get sequence information
-                metadata.cache_seqlens_int32 = seq_lens[:bs].to(torch.int32)
-                batch_size = len(seq_lens)
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-
-                # Precompute maximum sequence length
-                metadata.max_seq_len_k = seq_lens.max().item()
-                # Precompute cumulative sequence lengths
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
                 metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
+                    0, bs + 1, dtype=torch.int32, device=device
                 )
-                # Precompute page table
+                metadata.cu_seqlens_k = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=device
+                )
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
@@ -373,29 +794,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
-            # Target Verify
-            # Here we only support topk = 1 for now.
-            tokens_per_req = num_tokens // bs
+            # Target Verify (topk = 1)
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cache_seqlens_int32.copy_(seq_lens + tokens_per_req)
-
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * tokens_per_req + 1,
-                tokens_per_req,
-                dtype=torch.int32,
-                device=device,
-            )
-
-            metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
-                : (bs + 1)
+            metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
+                : bs + 1
             ]
-
-            metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = seq_lens.max().item() + tokens_per_req
-
+            metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
+                : bs + 1
+            ]
+            metadata.is_ragged_verify = (
+                spec_info is not None and spec_info.ragged_verify_layout is not None
+            )
+            metadata.max_seq_len_q = (
+                self.speculative_num_draft_tokens
+                if metadata.is_ragged_verify
+                else num_tokens // bs
+            )
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
                 metadata,
@@ -403,29 +819,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
-
+            if self._needs_encoder_only_expand(forward_mode, metadata):
+                verify_rows = bs * metadata.max_seq_len_q
+                # Static per-capture row map (expanded row i -> request i // L);
+                # the recorded refresh in _apply_cuda_graph_metadata uses it.
+                metadata.encoder_row_map = (
+                    torch.arange(verify_rows, device=self.device)
+                    // metadata.max_seq_len_q
+                )
+                metadata.encoder_cache_seqlens = self.target_verify_metadata[
+                    "encoder_cache_seqlens"
+                ][:verify_rows]
+                metadata.encoder_page_table = self.target_verify_metadata[
+                    "encoder_page_table"
+                ][:verify_rows, :]
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-            num_tokens_per_bs = num_tokens // bs
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
-                dtype=torch.int32,
-                device=device,
-            )
-
-            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
-                : (bs + 1)
-            ]
-            num_tokens_per_bs = num_tokens // bs
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.max_seq_len_k = seq_lens.max().item()
-
+            metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
+            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][: bs + 1]
+            metadata.max_seq_len_q = num_tokens_per_req
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
                 metadata,
@@ -433,108 +849,131 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
-
             self.draft_extend_metadata[bs] = metadata
-        self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+        # Bind the SWA write-target buffer slice (refilled by in-graph metadata).
+        if self.use_sliding_window_kv_pool:
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
+
+        return metadata
+
+    def _needs_encoder_only_expand(
+        self, forward_mode: ForwardMode, metadata: TRTLLMMHAMetadata
+    ) -> bool:
+        # The single gate for building the expanded ENCODER_ONLY verify
+        # metadata; forward() consumes it per-layer where attn_type is ENCODER_ONLY.
+        return (
+            self.expand_encoder_only_verify
+            and forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+        )
+
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Replay CUDA graph with new inputs."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        One fused triton kernel (update_trtllm_mha_graph_metadata) rebuilds
+        cache_seqlens, cu_seqlens_k/q, the page table(s), and swa_out_cache_loc.
+        The previous aten-op implementation issued ~25 host dispatches per graph
+        replay, whose per-rank jitter was paid as spin time inside the first
+        all-reduce of every replayed graph.
+
+        The page table is rewritten to the static ``max_num_pages`` width (the
+        same upper bound ``_fill_page_table_device`` uses); the kernel
+        bounds the actual KV reads by the on-device ``cache_seqlens``, so no
+        runtime host max / seq_lens_cpu D2H sync is needed.
+
+        Public entry: :py:meth:`init_forward_metadata_in_graph`.
+        """
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
+
         metadata = None
+        seqlen_offset = 0
+        cu_seqlens_q = None
+        qlens = None
+        q_stride = 0
+        q_mode = Q_MODE_NONE
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
-
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-
-                metadata.cache_seqlens_int32.copy_(
-                    seq_lens + self.speculative_step_id + 1
-                )
+                seqlen_offset = self.speculative_step_id + 1
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-                metadata.max_seq_len_k = max_len
-
-                metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                    None, :
-                ],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
-            max_len = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_draft_extend():
+            if spec_info is not None and spec_info.ragged_verify_layout is not None:
+                # Ragged verify: the per-request k-extension is not a
+                # uniform scalar seqlen_offset, so the fused kernel cannot
+                # rebuild this metadata. It is written eagerly on every
+                # capture/replay-prep in init_forward_metadata_out_graph;
+                # record nothing here.
+                return
+            seqlen_offset = metadata.max_seq_len_q
+        elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            max_len = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            if spec_info.num_accept_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-            else:
-                metadata.max_seq_len_q = 1
-
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+            # Static per-request query width, fixed by the captured graph shape.
+            # Do not inspect replay-time tensors here; this body is recorded into
+            # the CUDA graph.
+            num_tokens_per_req = metadata.max_seq_len_q
+            cu_seqlens_q = metadata.cu_seqlens_q
+            q_stride = num_tokens_per_req
+            q_mode = Q_MODE_STRIDED
+        else:
+            raise ValueError(
+                "TRTLLM-MHA CUDA graph metadata build got an unsupported forward "
+                f"mode: {forward_mode}"
             )
 
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+        assert metadata is not None
+        # Static upper-bound page-table width (see docstring); the kernel
+        # bounds real KV reads by cache_seqlens, so this is a fixed loop
+        # bound only — never a host max / seq_lens_cpu D2H sync.
+        max_seq_pages = self.max_num_pages
+        unified = self.kv_index_translator.is_translating
+        update_trtllm_mha_graph_metadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            req_to_token=self.req_to_token,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            page_table=None if unified else metadata.page_table,
+            bs=bs,
+            seqlen_offset=seqlen_offset,
+            max_seq_pages=max_seq_pages,
+            page_size=self.page_size,
+            swa_mapping=self._swa_full_to_swa_mapping,
+            swa_page_table=None if unified else metadata.swa_page_table,
+            out_cache_loc=out_cache_loc,
+            swa_out_cache_loc=None if unified else metadata.swa_out_cache_loc,
+            cu_seqlens_q=cu_seqlens_q,
+            qlens=qlens,
+            q_stride=q_stride,
+            q_mode=q_mode,
+            skip_page_table=unified,
+        )
+
+        if self._needs_encoder_only_expand(forward_mode, metadata):
+            # Recorded into the graph: refresh the expanded rows from the
+            # freshly rebuilt base metadata.
+            metadata.encoder_cache_seqlens.copy_(
+                metadata.cache_seqlens_int32[metadata.encoder_row_map]
+            )
+            metadata.encoder_page_table.copy_(
+                metadata.page_table[metadata.encoder_row_map]
+            )
+
         self.forward_metadata = metadata
 
     def update_verify_buffers_to_fill_after_draft(
@@ -546,34 +985,182 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
+    def _should_use_fused_fp8_path(
+        self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
+        return (
+            not is_cp_active(forward_batch)
+            and save_kv_cache
+            and k is not None
+            and self.data_type == torch.float8_e4m3fn
+        )
 
-    def _fused_fp8_set_kv_buffer(
+    def _fused_fp8_qkv_kv_cache(
         self,
-        q: torch.Tensor,
+        q: torch.Tensor | None,
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        **kwargs,
-    ):
-        """Fused FP8 quantization and KV cache write."""
+    ) -> torch.Tensor | None:
+        from sglang.kernels.ops.kvcache.fused_fp8_qkv_kv_cache import (
+            fused_fp8_qkv_kv_cache,
+        )
+
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
-
-        # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        fused_fp8_set_kv_buffer(
+        # Layers without checkpoint KV scales fall back to the backend-owned
+        # float32 ones tensor; letting the op synthesize one costs a fill
+        # kernel per layer per forward, baked into the captured graph.
+        return fused_fp8_qkv_kv_cache(
+            q=q,
             k=k,
             v=v,
             k_cache=k_cache,
             v_cache=v_cache,
             cache_loc=cache_loc,
-            k_scale=layer.k_scale,  # May be None
-            v_scale=layer.v_scale,  # May be None
-            page_size=self.page_size,
+            k_scale=(
+                layer.k_scale if layer.k_scale is not None else self._default_kv_scale
+            ),
+            v_scale=(
+                layer.v_scale if layer.v_scale is not None else self._default_kv_scale
+            ),
+        )
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if (
+            forward_mode.is_target_verify()
+            and resolve_ragged_verify_layout(forward_batch) is not None
+        ):
+            self._assert_ragged_verify_supported()
+
+        if in_capture:
+            num_tokens = forward_batch.positions.numel()
+            self._build_cuda_graph_metadata(
+                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+            )
+
+        if forward_mode.is_decode_or_idle():
+            self.forward_metadata = self.decode_cuda_graph_metadata[bs]
+        elif forward_mode.is_target_verify():
+            self.forward_metadata = self.target_verify_metadata[bs]
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                self._write_ragged_verify_graph_metadata(
+                    self.forward_metadata,
+                    forward_batch,
+                    ragged_layout,
+                    bs,
+                    in_capture=in_capture,
+                )
+        elif forward_mode.is_draft_extend_v2():
+            self.forward_metadata = self.draft_extend_metadata[bs]
+        else:
+            raise ValueError(
+                f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
+            )
+
+        if self.kv_index_translator.is_translating:
+            # Unified pool: refill this mode's own page table (this runs
+            # out-of-graph on BOTH capture and every replay-prep; the recorded
+            # fused kernel skips its page-table writes so the graph reads the
+            # refreshed content through pointers baked at capture).
+            metadata = self.forward_metadata
+            # `cache_seqlens_int32` is what the attention kernels bound their
+            # page-table reads by, and the fused metadata call above wrote it.
+            # A target verify reads `draft_token_num` further than `seq_lens`
+            # goes, so filling to `seq_lens` leaves those columns untranslated.
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=metadata.cache_seqlens_int32,
+                sliding_window_out=metadata.swa_page_table,
+            )
+            # A capture batch carries no prepared write loc; zeros are the
+            # page-0 sink.
+            if (
+                self.use_sliding_window_kv_pool
+                and forward_batch.out_cache_loc is not None
+            ):
+                n = forward_batch.out_cache_loc.shape[0]
+                self.cuda_graph_swa_out_cache_loc[n:].zero_()
+                if in_capture:
+                    self.cuda_graph_swa_out_cache_loc[:n].zero_()
+                else:
+                    self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                        self.kv_index_translator.sliding_window_write_loc_for(
+                            forward_batch.out_cache_loc
+                        )
+                    )
+
+    def _assert_ragged_verify_supported(self) -> None:
+        if self.is_xqa_impl:
+            raise NotImplementedError(
+                "Compact ragged verify (variable-length cum_seq_lens_q) "
+                "requires the trtllm-gen decode kernel; the xqa impl (sm90 / sm120) "
+                "rejects it. Disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+            )
+
+    def _write_ragged_verify_graph_metadata(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        forward_batch: ForwardBatch,
+        ragged_layout: RaggedVerifyLayout,
+        bs: int,
+        in_capture: bool = False,
+    ) -> None:
+        """Eagerly rebuild the target-verify graph metadata for ragged verify.
+
+        The per-request verify lengths make the k-extension non-uniform, which
+        the fused in-graph kernel cannot express (scalar ``seqlen_offset``
+        only), so this runs out-of-graph on every capture/replay-prep and
+        ``_apply_cuda_graph_metadata`` records nothing for ragged batches.
+        """
+        seq_lens = forward_batch.seq_lens[:bs]
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        padded_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+        geometry = build_ragged_target_verify_geometry(
+            seq_lens=seq_lens, layout=padded_layout
+        )
+        metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
+        metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+        self._fill_page_table_device(
+            metadata, req_pool_indices, metadata.cache_seqlens_int32
+        )
+        # The fused in-graph kernel also skips ragged batches, so refill the
+        # SWA write-target buffer here (out_cache_loc -> SWA locs).
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            n = forward_batch.out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+            out_cache_loc=forward_batch.out_cache_loc,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -591,9 +1178,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
-                )
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -603,91 +1187,245 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.page_table = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
         elif forward_batch.forward_mode.is_target_verify():
-            # Only support topk = 1 for now.
-            tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
-            metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
-                torch.int32
-            )
-            metadata.max_seq_len_q = tokens_per_req
-            metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
-            )
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                batch_size * tokens_per_req + 1,
-                tokens_per_req,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            if ragged_layout is not None:
+                self._assert_ragged_verify_supported()
+                geometry = build_ragged_target_verify_geometry(
+                    seq_lens=seqlens_in_batch, layout=ragged_layout
+                )
+                metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
+                # Device-only layouts carry no host lens; the verify window
+                # is a valid varlen upper bound.
+                metadata.max_seq_len_q = (
+                    geometry.max_seq_len_q
+                    if geometry.max_seq_len_q is not None
+                    else self.speculative_num_draft_tokens
+                )
+                metadata.cu_seqlens_q = geometry.cu_seqlens_q
+                metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                metadata.is_ragged_verify = True
+            else:
+                tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
+                metadata.cache_seqlens_int32 = (
+                    forward_batch.seq_lens + tokens_per_req
+                ).to(torch.int32)
+                metadata.max_seq_len_q = tokens_per_req
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * tokens_per_req + 1,
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
+                )
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-
-            if any(
-                forward_batch.extend_prefix_lens_cpu
-            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            # Query-side max length, sourced from the host-resident extend lengths
+            # (sync-free); for plain prefill these equal the full seq lens.
+            metadata.max_seq_len_q = int(max(forward_batch.extend_seq_lens_cpu))
+            if (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens = forward_batch.extend_seq_lens
-                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
-                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
-                max_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.max_seq_len_q = (
-                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
-                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        # Compute SWA page table (None for non-SWA models)
-        metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
-
-        # Convert the page tables to a strided format
-        if self.page_size > 1:
-            self.strided_indices = torch.arange(
-                0, metadata.page_table.shape[1], self.page_size, device=self.device
+        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
+        if kv_view.is_translated:
+            # No fill kernel: the kernels take the tensor's own width/stride
+            # and bound their reads by cache_seqlens.
+            metadata.page_table = kv_view.ids
+            metadata.swa_page_table = kv_view.sliding_window_ids
+        else:
+            has_swa = self._swa_kv_pool is not None
+            metadata.page_table = torch.empty(
+                (batch_size, self.max_num_pages), dtype=torch.int32, device=device
             )
-            metadata.page_table = (
-                metadata.page_table[:, self.strided_indices] // self.page_size
-            )
-            if metadata.swa_page_table is not None:
-                metadata.swa_page_table = (
-                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+            metadata.swa_page_table = (
+                torch.empty(
+                    (batch_size, self.max_num_pages), dtype=torch.int32, device=device
                 )
+                if has_swa
+                else None
+            )
+            self._fill_page_table_device(
+                metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
+            )
+        self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
+
+        if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
+            row_map = (
+                torch.arange(batch_size * metadata.max_seq_len_q, device=device)
+                // metadata.max_seq_len_q
+            )
+            metadata.encoder_row_map = row_map
+            metadata.encoder_cache_seqlens = metadata.cache_seqlens_int32[row_map]
+            metadata.encoder_page_table = metadata.page_table[row_map]
+
+        # int64 scatter index (unlike the int32 read page table above).
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            metadata.swa_out_cache_loc = (
+                self.kv_index_translator.sliding_window_write_loc_for(
+                    forward_batch.out_cache_loc
+                )
+            )
 
         self.forward_metadata = metadata
+
+    def _reshape_paged_kv_cache(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: RadixAttention,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, head_dim
+        ).permute(0, 2, 1, 3)
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+        return k_cache, v_cache
+
+    def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
+        assert self.is_nvfp4_kvcache
+        return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
+
+    def _run_fixed_q_len_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        bmm1_scale,
+        bmm2_scale,
+        window_left: int,
+        sinks: Optional[torch.Tensor],
+        q_len_per_req: int = 1,
+        kv_cache_sf=None,
+        out: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Run decode, optionally sorting and splitting requests by KV length."""
+
+        resolved_out_dtype = (
+            out_dtype
+            if out_dtype is not None
+            else (out.dtype if out is not None else self.q_data_type)
+        )
+
+        def run_group(group_query, group_block_tables, group_seq_lens, group_out=None):
+            kwargs = {}
+            if q_len_per_req != 1:
+                kwargs["q_len_per_req"] = q_len_per_req
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=group_query,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=group_block_tables,
+                seq_lens=group_seq_lens,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                out=group_out,
+                out_dtype=None if group_out is not None else resolved_out_dtype,
+                kv_cache_sf=kv_cache_sf,
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                **kwargs,
+            )
+
+        num_requests = seq_lens.shape[0]
+        num_splits = min(self.decode_seq_len_splits, num_requests)
+        if num_splits == 1:
+            return run_group(query, block_tables, seq_lens, out)
+
+        order = torch.argsort(seq_lens)
+        query_by_request = query.view(
+            num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
+        )
+        output_by_request = (
+            out.view_as(query_by_request)
+            if out is not None
+            else torch.empty(
+                query_by_request.shape,
+                dtype=resolved_out_dtype,
+                device=query.device,
+            )
+        )
+        for indices in torch.tensor_split(order, num_splits):
+            group_output = run_group(
+                query_by_request.index_select(0, indices).reshape(
+                    -1, query.shape[-2], query.shape[-1]
+                ),
+                block_tables.index_select(0, indices),
+                seq_lens.index_select(0, indices),
+            )
+            output_by_request.index_copy_(
+                0,
+                indices,
+                group_output.view(-1, q_len_per_req, query.shape[-2], query.shape[-1]),
+            )
+        return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        assert self.is_nvfp4_kvcache
+        if self.is_xqa_impl:
+            k_fp4, v_fp4, k_scale, v_scale = self.token_to_kv_pool.get_raw_kv_buffer(
+                layer.layer_id
+            )
+        else:
+            k_fp4, v_fp4, k_scale, v_scale = _trtllm_native_nvfp4_kv_buffer(
+                self.token_to_kv_pool, layer.layer_id
+            )
+        kv_cache = self._reshape_paged_kv_cache(
+            k_fp4, v_fp4, layer, layer.head_dim // 2
+        )
+        if self.is_xqa_impl:
+            kv_cache_block_scales = self._reshape_paged_kv_cache(
+                k_scale, v_scale, layer, layer.head_dim // 16
+            )
+        else:
+            # SM100 native scale buffers are already physical HND with
+            # contiguous [page-token, block-scale] dimensions. V is
+            # four-token interleaved.
+            kv_cache_block_scales = (k_scale, v_scale)
+        return kv_cache, kv_cache_block_scales
 
     def forward_decode(
         self,
@@ -702,77 +1440,89 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
+        )
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
+        pool = self.token_to_kv_pool
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
+            fused_q = self._fused_fp8_qkv_kv_cache(
+                q if use_fused_qkv else None, k, v, layer, forward_batch
             )
+            if fused_q is not None:
+                q = fused_q
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
                 )
 
-        # For XQA, q_dtype should be bf16
-        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
-            q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
-
-        # TODO: add support for quantization
+        # For XQA, q_dtype should be bf16. For trtllm-gen,
+        # q_dtype should be FP8 when KV is in FP8.
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
-        # sink: additional value per head in the denominator of the softmax.
+        if self.decode_uses_native_fp4 and not self.is_xqa_impl:
+            # SM100 TRT-LLM GenMHA requires FP8 Q for native NVFP4 KV.
+            q = q.to(torch.float8_e4m3fn)
+        elif (
+            self.data_type == torch.float8_e4m3fn
+            and not self.is_xqa_impl
+            and not use_fused_qkv
+        ):
+            q = q.to(torch.float8_e4m3fn)
+        if self.is_xqa_impl:
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if self.is_nvfp4_kvcache:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+        else:
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self._reshape_paged_kv_cache(
+                k_cache, v_cache, layer, layer.head_dim
+            )
+            kv_cache_block_scales = None
+
+        if self.is_nvfp4_kvcache:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
-
-        # Call TRT-LLM kernel
-        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
-        o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.max_context_len,
+        native_out = (
+            self._nvfp4_output_view(q)
+            if self.decode_uses_native_fp4 and not self.is_xqa_impl
+            else None
+        )
+        o = self._run_fixed_q_len_decode(
+            q,
+            kv_cache,
+            page_table,
+            self.forward_metadata.cache_seqlens_int32,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
+            out=native_out,
+            out_dtype=(
+                None
+                if self.decode_uses_native_fp4 and not self.is_xqa_impl
+                else self.q_data_type
+            ),
+            kv_cache_sf=kv_cache_block_scales,
         )
+        if self.decode_uses_native_fp4 and not self.is_xqa_impl:
+            o = self._finalize_nvfp4_output(o, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -787,101 +1537,276 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         cache_loc = forward_batch.out_cache_loc
+        cp_active = is_cp_active(forward_batch)
+        uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
+        if uses_native_fp4 and cp_active:
+            raise NotImplementedError(
+                "Native NVFP4 TRT-LLM prefill does not yet support context parallelism."
+            )
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        # The fused path writes rank-local K/V directly to cache. CP needs
+        # the strategy to gather K/V into full logical token order first.
+        use_fused_fp8_path = self._should_use_fused_fp8_path(
+            save_kv_cache, k, forward_batch
+        )
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
+            fused_q = self._fused_fp8_qkv_kv_cache(
+                q if use_fused_qkv else None, k, v, layer, forward_batch
             )
+            if fused_q is not None:
+                q = fused_q
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                if cp_active:
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    cp_strategy.materialize_full_kv(
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                    )
+
+        q_scale = 1.0
+        if uses_native_fp4:
+            q = q.to(torch.float8_e4m3fn)
+        elif (
+            self.data_type == torch.float8_e4m3fn
+            and (
+                not self.is_xqa_impl
+                or not forward_batch.forward_mode.is_target_verify()
+            )
+            and not use_fused_qkv
+        ):
+            q = q.to(torch.float8_e4m3fn)
+        if self.use_fmha_v2:
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+
+        is_decode_mode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+
+        if uses_native_fp4:
+            kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
+            k_cache, v_cache = kv_cache
+        else:
+            # Native pool format is NHD:
+            # [num_pages, page_size, num_kv_heads, head_dim].
+            k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            if not self.use_fmha_v2 or is_decode_mode:
+                # Decode and SM100 batch_context kernels require HND layout.
+                k_cache, v_cache = self._reshape_paged_kv_cache(
+                    k_cache_raw, v_cache_raw, layer, layer.head_dim
+                )
+            else:
+                k_cache = k_cache_raw.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                v_cache = v_cache_raw.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
-
+            kv_cache = (k_cache, v_cache)
+            kv_cache_block_scales = None
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        if uses_native_fp4:
+            k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
+            bmm1_scale = q_scale * k_scale * layer.scaling
+            bmm2_scale = v_scale
+        else:
+            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
+        native_out = self._nvfp4_output_view(q) if uses_native_fp4 else None
 
-        if forward_batch.forward_mode.is_target_verify():
-            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
+        if is_decode_mode:
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+            ):
+                # ENCODER_ONLY layers need bidirectional attention over the
+                # verify window; the spec-decode kernel is causal in-window, so
+                # run bs*L single-token rows over the full window instead (the
+                # window's K/V are already in the pool).
+                assert not self.forward_metadata.is_ragged_verify, (
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
+                )
+                assert self.forward_metadata.encoder_cache_seqlens is not None, (
+                    "ENCODER_ONLY target_verify requires the expanded decode "
+                    "metadata (built only on the draft worker)"
+                )
+                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=self.forward_metadata.encoder_page_table,
+                    seq_lens=self.forward_metadata.encoder_cache_seqlens,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out=native_out,
+                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    kv_cache_sf=kv_cache_block_scales,
+                    q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                )
+            elif self.forward_metadata.is_ragged_verify:
+                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=self.forward_metadata.cache_seqlens_int32,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out=native_out,
+                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    kv_cache_sf=kv_cache_block_scales,
+                    q_len_per_req=None,
+                    max_q_len=self.forward_metadata.max_seq_len_q,
+                    cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                )
+            else:
+                o = self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    self.forward_metadata.cache_seqlens_int32,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    out=native_out,
+                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    kv_cache_sf=kv_cache_block_scales,
+                    q_len_per_req=self.forward_metadata.max_seq_len_q,
+                )
+        elif self.use_fmha_v2 and not cp_active:
+            # CP must go through cp_strategy.run_attention (per-shard
+            # masking); the plain-causal fmha_v2 call below would be wrong.
+            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            o = flashinfer.prefill.trtllm_fmha_v2_prefill(
+                (q, paged_kv),
+                input_layout="Q_PAGED_KV_NHD",
                 workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
-                q_len_per_req=self.forward_metadata.max_seq_len_q,
-            )
-        else:
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
+                batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                block_tables=page_table,
+                out_dtype=self.q_data_type,
+                mask_mode="causal",
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                or 0.0,
             )
+        else:
 
+            def _trtllm_context_attn(
+                q_chunk,
+                cu_seqlens_q,
+                cache_seqlens,
+                max_seqlen_q,
+                *,
+                cu_seqlens_kv,
+                use_zigzag_page_table=False,
+                out=None,
+            ):
+                block_tables = page_table
+                if use_zigzag_page_table:
+                    block_tables = self.forward_metadata.zigzag_page_table
+                    zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
+                    if zigzag_swa_pt is not None:
+                        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+                        if is_swa:
+                            block_tables = zigzag_swa_pt
+                return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                    query=q_chunk,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=block_tables,
+                    seq_lens=cache_seqlens,
+                    max_q_len=max_seqlen_q,
+                    max_kv_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    batch_size=cu_seqlens_q.shape[0] - 1,
+                    cum_seq_lens_q=cu_seqlens_q,
+                    cum_seq_lens_kv=cu_seqlens_kv,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    out=out,
+                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    kv_cache_sf=kv_cache_block_scales,
+                )
+
+            if cp_active:
+                cp_strategy = get_cp_strategy()
+                assert cp_strategy is not None
+                o = cp_strategy.run_attention(
+                    q,
+                    forward_batch,
+                    self.device,
+                    _trtllm_context_attn,
+                    attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+                )
+            else:
+                out = native_out if uses_native_fp4 else forward_batch._attn_output
+                if out is not None:
+                    out = out.view_as(q)
+                o = _trtllm_context_attn(
+                    q,
+                    self.forward_metadata.cu_seqlens_q,
+                    self.forward_metadata.cache_seqlens_int32,
+                    self.forward_metadata.max_seq_len_q,
+                    cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
+                    out=out,
+                )
+
+        if uses_native_fp4:
+            o = self._finalize_nvfp4_output(o, forward_batch)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
 class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
+
+    # Per-step backends build the page table on-device (sync-free); mirror that so
+    # decide_needs_cpu_seq_lens sees a consistent target + draft value.
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
@@ -904,39 +1829,40 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        # TRTLLM-MHA uses encoder_lens from the original fb for inner dispatch
+        # (FlashInfer parent forces encoder_lens=None instead).
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
             )
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
         for i in range(self.speculative_num_steps - 1):
-
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)

@@ -2,7 +2,8 @@ from typing import Any, Optional
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -10,15 +11,9 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
-        import os
-
-        from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-            dpsk_v4_fp8_attention_fwd,
-        )
-
-        backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
+        backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
     else:
-        import flash_mla
+        import sgl_kernel.flash_mla as flash_mla
 
     if backend == "comparison":
         pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
@@ -36,7 +31,18 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return flash_mla_with_kvcache_torch(**kwargs)
 
     if backend == "tilelang":
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            dpsk_v4_fp8_attention_fwd,
+        )
+
         return dpsk_v4_fp8_attention_fwd(**kwargs)
+
+    if backend == "triton":
+        from sglang.kernels.ops.attention.nsa_triton_decode import (
+            triton_fp8_attention_fwd,
+        )
+
+        return triton_fp8_attention_fwd(**kwargs)
 
     if backend == "kernel":
         return flash_mla.flash_mla_with_kvcache(**kwargs)

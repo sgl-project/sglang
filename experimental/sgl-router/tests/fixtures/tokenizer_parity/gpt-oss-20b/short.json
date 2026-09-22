@@ -1,0 +1,12 @@
+{
+  "model_id": "openai/gpt-oss-20b",
+  "shape": "short",
+  "prompt_text": "Hello, world!",
+  "expected_token_ids": [
+    13225,
+    11,
+    2375,
+    0
+  ],
+  "skip_special_tokens": false
+}

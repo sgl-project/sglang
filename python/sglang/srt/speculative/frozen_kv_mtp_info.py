@@ -13,15 +13,13 @@
 # ==============================================================================
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Dict
 
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.speculative.eagle_info import (
-    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
-    EagleVerifyOutput,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
@@ -55,39 +53,10 @@ class FrozenKVMTPDraftInput(EagleDraftInput):
 
 
 @dataclass
-class FrozenKVMTPDraftExtendInput(EagleDraftExtendInput):
-    """Draft-extend input for Frozen-KV MTP. Tag-only subclass."""
-
-    def __post_init__(self):
-        SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND)
-
-
-@dataclass
 class FrozenKVMTPVerifyInput(EagleVerifyInput):
     """Verify input for Frozen-KV MTP."""
 
     def __post_init__(self):
-        SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_VERIFY)
-
-    def verify(self, *args, **kwargs) -> EagleVerifyOutput:
-        output = super().verify(*args, **kwargs)
-        output.draft_extend_input = _to_frozen_kv_mtp_draft_extend_input(
-            output.draft_extend_input
-        )
-        return output
-
-
-FrozenKVMTPVerifyOutput = EagleVerifyOutput
-
-
-def _to_frozen_kv_mtp_draft_extend_input(
-    draft_extend_input: EagleDraftExtendInput,
-) -> FrozenKVMTPDraftExtendInput:
-    if isinstance(draft_extend_input, FrozenKVMTPDraftExtendInput):
-        return draft_extend_input
-    return FrozenKVMTPDraftExtendInput(
-        **{
-            field.name: getattr(draft_extend_input, field.name)
-            for field in fields(EagleDraftExtendInput)
-        }
-    )
+        # Run EagleVerifyInput's width auto-fill, then correct the type tag.
+        super().__post_init__()
+        self.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY
