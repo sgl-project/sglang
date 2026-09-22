@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
+    resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
@@ -218,12 +219,12 @@ def fast_prefill_plan(
     is identical to plan()'s.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
-    assert (
-        getattr(self, "_backend", None) == "fa2"
-    ), "fast_prefill_plan supports the fa2 backend only"
-    assert (
-        getattr(self, "_cached_module", None) is not None
-    ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    assert getattr(self, "_backend", None) == "fa2", (
+        "fast_prefill_plan supports the fa2 backend only"
+    )
+    assert getattr(self, "_cached_module", None) is not None, (
+        "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    )
 
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -314,7 +315,7 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
-        self.enable_mis = model_runner.server_args.enable_mis
+        self.enable_mis = get_exec().features.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -472,9 +473,25 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if get_platform().is_sm100:
+            fmha_backend = "fa2"
             # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs.
-            if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            # due to TMA descriptor initialization issues on SM100 GPUs. The
+            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
+            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
+            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
+            cutlass_supported_head_dims = {
+                (64, 64),
+                (128, 128),
+                (192, 128),
+            }
+            head_dims = (
+                model_runner.model_config.head_dim,
+                model_runner.model_config.v_head_dim,
+            )
+            if (
+                head_dims in cutlass_supported_head_dims
+                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -1309,9 +1326,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q = q.contiguous()
 
-        assert not (
-            self.prefill_uses_dequant_workspace and layer.is_cross_attention
-        ), "FP4 dequant KV cache is not supported for cross-attention"
+        assert not (self.prefill_uses_dequant_workspace and layer.is_cross_attention), (
+            "FP4 dequant KV cache is not supported for cross-attention"
+        )
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
@@ -1377,9 +1394,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
-                assert (
-                    not self.prefill_uses_dequant_workspace
-                ), "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
+                assert not self.prefill_uses_dequant_workspace, (
+                    "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
+                )
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -2241,15 +2258,15 @@ class FlashInferIndicesUpdaterPrefill:
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
-            assert (
-                seq_lens_cpu is not None
-            ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
-            assert (
-                num_tokens_per_req is not None and num_tokens_per_req > 0
-            ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            assert (
-                use_custom_mask is None
-            ), "fast_prefill_plan does not support custom_mask; keep the plain plan()"
+            assert seq_lens_cpu is not None, (
+                "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+            )
+            assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
+                f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
+            )
+            assert use_custom_mask is None, (
+                "fast_prefill_plan does not support custom_mask; keep the plain plan()"
+            )
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
@@ -2341,6 +2358,9 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
+            model_runner
+        )
 
     def common_template(
         self,
@@ -2379,6 +2399,8 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            self.draft_window_size,
+            self.draft_sink_size,
         )
 
         assert forward_batch.spec_info is not None

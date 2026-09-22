@@ -45,9 +45,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 saw_chunking = True
-                assert (
-                    not t.is_idle
-                ), "scheduler must not idle while chunked_req is in flight"
+                assert not t.is_idle, (
+                    "scheduler must not idle while chunked_req is in flight"
+                )
             if r.finished:
                 break
             yield
@@ -102,9 +102,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 break
             yield
 
-        assert (
-            t.scheduler.chunked_req is None
-        ), f"abort must clear the chunked slot; got {t.scheduler.chunked_req!r}"
+        assert t.scheduler.chunked_req is None, (
+            f"abort must clear the chunked slot; got {t.scheduler.chunked_req!r}"
+        )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -193,19 +193,19 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             if r1.is_chunking:
                 saw_r1_chunking = True
                 comp = t.batch_composition()
-                assert r1.rid in comp.get(
-                    "chunked", []
-                ), f"mid-chunk r1 must occupy the chunked role; got {comp!r}"
-                assert r1.rid not in comp.get(
-                    "running", []
-                ), f"chunked r1 must be excluded from the running role; got {comp!r}"
+                assert r1.rid in comp.get("chunked", []), (
+                    f"mid-chunk r1 must occupy the chunked role; got {comp!r}"
+                )
+                assert r1.rid not in comp.get("running", []), (
+                    f"chunked r1 must be excluded from the running role; got {comp!r}"
+                )
             if r1.finished and r2.finished:
                 break
             yield
         assert r1.finished and r2.finished
-        assert (
-            saw_r1_chunking
-        ), "r1 must have chunked at some point to exercise the exclude branch"
+        assert saw_r1_chunking, (
+            "r1 must have chunked at some point to exercise the exclude branch"
+        )
 
     @unittest.skip(
         "pdmux split_prefill_batch requires the pdmux topology — "
@@ -257,9 +257,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert (
-            t.scheduler.chunked_req is None
-        ), f"pause(retract) must clear chunked_req; got {t.scheduler.chunked_req!r}"
+        assert t.scheduler.chunked_req is None, (
+            f"pause(retract) must clear chunked_req; got {t.scheduler.chunked_req!r}"
+        )
         assert not r.finished, "retract must re-queue r, not finish or abort it"
         assert r.status == "waiting", (
             f"retracted chunked req must return to the waiting queue; "
@@ -268,9 +268,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.continue_generation()
         yield from run_until_finished(r)
-        assert (
-            r.finished
-        ), "continue_generation must drive the re-queued req to completion"
+        assert r.finished, (
+            "continue_generation must drive the re-queued req to completion"
+        )
 
     def test_retract_during_gap_inflight_middle_chunks_positive(self):
         self.server.execute_script(
@@ -304,9 +304,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.continue_generation()
         yield from run_until_finished(r, max_steps=2000)
-        assert (
-            r.finished
-        ), "continue_generation must drive the re-queued req to completion"
+        assert r.finished, (
+            "continue_generation must drive the re-queued req to completion"
+        )
         assert r.kv_pages == 0
         assert len(r.req.output_ids) == 2
 
@@ -344,9 +344,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert (
-            saw_chunking
-        ), "test must observe the dual-queue chunked state at least once"
+        assert saw_chunking, (
+            "test must observe the dual-queue chunked state at least once"
+        )
         assert saw_dedup, (
             "test must observe the chunked req with a committed prefix so the "
             "dedup subtraction is actually exercised"
@@ -491,9 +491,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert (
-            saw_mid_chunk
-        ), "test must observe the fill_ids reset boundary at least once"
+        assert saw_mid_chunk, (
+            "test must observe the fill_ids reset boundary at least once"
+        )
         assert r.finished
 
     def test_chunked_req_slot_cleared_when_chunk_completes(self):
@@ -516,9 +516,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             yield
         assert r.finished
         assert saw_chunking, "req should have occupied the chunked_req slot mid-chunk"
-        assert (
-            s.chunked_req is None
-        ), f"chunked_req slot must clear after last chunk; got {s.chunked_req!r}"
+        assert s.chunked_req is None, (
+            f"chunked_req slot must clear after last chunk; got {s.chunked_req!r}"
+        )
 
     def test_second_chunked_admit_blocked_when_chunked_req_set(self):
         self.server.execute_script(
@@ -571,9 +571,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         progressed = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
-                assert (
-                    not t.is_idle
-                ), "scheduler must not go idle while a chunked req is in flight"
+                assert not t.is_idle, (
+                    "scheduler must not go idle while a chunked req is in flight"
+                )
             cur_chunks_done = r.chunks_done
             if cur_chunks_done > prev_chunks_done:
                 progressed = True
@@ -681,9 +681,9 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
             prompt_token=310,
         )
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (
-            t.last_batch_forward_mode != "MIXED"
-        ), f"return_logprob must disable mixed-chunk path; got {t.last_batch_forward_mode!r}"
+        assert t.last_batch_forward_mode != "MIXED", (
+            f"return_logprob must disable mixed-chunk path; got {t.last_batch_forward_mode!r}"
+        )
         yield from run_until_finished(r)
 
     def test_mixed_chunk_with_running_batch(self):
@@ -700,9 +700,9 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         yield
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
-        assert (
-            t.last_batch_forward_mode == "MIXED"
-        ), f"chunked admission with running batch must enter MIXED; got {t.last_batch_forward_mode!r}"
+        assert t.last_batch_forward_mode == "MIXED", (
+            f"chunked admission with running batch must enter MIXED; got {t.last_batch_forward_mode!r}"
+        )
         for _ in range(DEFAULT_MAX_STEPS * 2):
             if r_chunk.finished and r_dec.finished:
                 break
@@ -743,9 +743,9 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
     def _script_chunk_size_negative_disables_chunking(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
-            assert (
-                not r.is_chunking
-            ), "chunked_prefill_size=-1 should disable chunked path"
+            assert not r.is_chunking, (
+                "chunked_prefill_size=-1 should disable chunked path"
+            )
             if r.finished:
                 return
             yield
@@ -825,9 +825,9 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
             yield
         assert r.finished
         assert saw_chunking, "test must observe r mid-chunk at least once"
-        assert (
-            first_chunk_snap is not None
-        ), "test must snapshot cached_tokens at the first chunk boundary"
+        assert first_chunk_snap is not None, (
+            "test must snapshot cached_tokens at the first chunk boundary"
+        )
 
     def test_hicache_cached_tokens_set_once_invariant(self):
         self.server.execute_script(
@@ -862,9 +862,9 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert (
-            saw_chunking
-        ), "test must observe the req mid-chunk (chunks_done >= 1) at least once"
+        assert saw_chunking, (
+            "test must observe the req mid-chunk (chunks_done >= 1) at least once"
+        )
         assert snap is not None, "test must snapshot the cached_tokens_* breakdown"
 
 
@@ -1011,24 +1011,23 @@ class TestSpecialCaseRetractMerge(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert (
-            s.last_batch is None
-        ), "retract must clear last_batch after merging the extend chunk batch"
+        assert s.last_batch is None, (
+            "retract must clear last_batch after merging the extend chunk batch"
+        )
         assert len(s.running_batch.reqs) == 0, (
             "the merged extend chunk batch must be retracted out of running_batch, "
             f"not stranded; got {len(s.running_batch.reqs)} reqs"
         )
-        assert (
-            r.status == "waiting"
-        ), f"retracted chunked req must return to the waiting queue; got {r.status!r}"
+        assert r.status == "waiting", (
+            f"retracted chunked req must return to the waiting queue; got {r.status!r}"
+        )
         assert r.kv_pages == 0
 
         t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
         assert len(r.req.output_ids) == 2, (
-            f"resumed req must emit exactly max_new_tokens; got "
-            f"{len(r.req.output_ids)}"
+            f"resumed req must emit exactly max_new_tokens; got {len(r.req.output_ids)}"
         )
 
 
@@ -1183,9 +1182,9 @@ class TestSpecialCaseRetractedStain(ScriptedTestCase):
         assert r.finished
 
         req = r.req
-        assert (
-            req.retracted_stain is True
-        ), "retract must set retracted_stain so the cached-token recount is suppressed"
+        assert req.retracted_stain is True, (
+            "retract must set retracted_stain so the cached-token recount is suppressed"
+        )
         assert req.cached_tokens == cached_before, (
             f"retracted_stain must suppress re-adding pre_len-already_computed on "
             f"resume; cached_tokens grew from {cached_before} to {req.cached_tokens}"
@@ -1237,17 +1236,17 @@ class TestSpecialCaseMiddleChunkNoToken(ScriptedTestCase):
                     f"middle chunk must not append an output token; got "
                     f"output_ids len {len(r.req.output_ids)}"
                 )
-                assert (
-                    r.status != "finished"
-                ), "middle chunk must not finish the req (skip_stream_req)"
+                assert r.status != "finished", (
+                    "middle chunk must not finish the req (skip_stream_req)"
+                )
             if r.finished:
                 break
             yield
         assert r.finished
         assert saw_middle_chunk, "test must observe r mid-chunk at least once"
-        assert (
-            len(r.req.output_ids) >= 1
-        ), "output tokens must appear only after the chunked prefill completes"
+        assert len(r.req.output_ids) >= 1, (
+            "output tokens must appear only after the chunked prefill completes"
+        )
 
 
 if __name__ == "__main__":

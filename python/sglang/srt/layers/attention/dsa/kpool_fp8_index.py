@@ -19,9 +19,9 @@ def build_pooled_page_table_64(
 ) -> torch.Tensor:
     # Advanced indexing is required: a (1, 1) strided slice can remain non-unit-
     # stride even after contiguous(), which DeepGEMM rejects.
-    assert (
-        BLOCK_SIZE_K % pool_size == 0
-    ), f"pool_size ({pool_size}) must divide page_size ({BLOCK_SIZE_K})"
+    assert BLOCK_SIZE_K % pool_size == 0, (
+        f"pool_size ({pool_size}) must divide page_size ({BLOCK_SIZE_K})"
+    )
     idx = torch.arange(
         0, page_table_64.shape[-1], pool_size, device=page_table_64.device
     )
@@ -218,9 +218,9 @@ def _prep_update_kpool_write_plan_launch(
     assert write_loc_out.stride(1) == 1, write_loc_out.stride()
 
     has_per_q_outputs = pool_seqlens_per_q_out is not None
-    assert has_per_q_outputs == (
-        seqlens_per_q_out is not None
-    ), "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+    assert has_per_q_outputs == (seqlens_per_q_out is not None), (
+        "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+    )
     per_q_dummy = (
         pool_seqlens_per_q_out
         if has_per_q_outputs
@@ -596,9 +596,9 @@ def topk_from_pooled_history_logits(
         padded[: result.shape[0]] = result
         return padded
 
-    assert (
-        page_table_row_index is None
-    ), "page_table_row_index requires the fused fast_kpool group_topk path"
+    assert page_table_row_index is None, (
+        "page_table_row_index requires the fused fast_kpool group_topk path"
+    )
 
     from sgl_kernel import fast_topk_v2
 

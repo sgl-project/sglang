@@ -1,9 +1,9 @@
 """FlashInfer CUTLASS MoE fused funcs.
 
 This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
-unquantized, ModelOpt FP8, ModelOpt NVFP4, and MXFP4 MoE paths.
-Quantization methods prepare a small quant_info payload and route through
-``MoeRunner``.
+unquantized, ModelOpt FP8, ModelOpt NVFP4, and CUTLASS MXFP4 MoE paths, plus
+the shared ``flashinfer_mxfp4`` dispatcher. Quantization methods prepare a
+small quant_info payload and route through ``MoeRunner``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -25,6 +24,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -160,6 +160,36 @@ def _maybe_apply_routed_scaling_factor(
     return output
 
 
+def _prescale_router_weight_on_input(
+    dispatch_output: StandardDispatchOutput | FlashinferDispatchOutput,
+    runner_config: MoeRunnerConfig,
+) -> StandardDispatchOutput | FlashinferDispatchOutput:
+    if not runner_config.apply_router_weight_on_input:
+        return dispatch_output
+
+    topk_output = dispatch_output.topk_output
+    topk_weights = topk_output.topk_weights
+
+    if dispatch_output.hidden_states_scale is not None:
+        raise NotImplementedError(
+            "apply_router_weight_on_input is not supported when activations are "
+            "quantized before dispatch (flashinfer_cutlass fp4 all-gather path)."
+        )
+
+    assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
+        "apply_router_weight_on_input requires topk=1"
+    )
+
+    hidden_states = dispatch_output.hidden_states * topk_weights.to(
+        dispatch_output.hidden_states.dtype
+    )
+    unit_scales = torch.ones_like(topk_weights, dtype=torch.float32)
+    return dispatch_output._replace(
+        hidden_states=hidden_states,
+        topk_output=topk_output._replace(topk_weights=unit_scales),
+    )
+
+
 def _prepare_input(
     dispatch_output,
     quant_info: FlashInferCutlassMoeQuantInfo,
@@ -197,8 +227,9 @@ def _run_flashinfer_cutlass(
 ) -> torch.Tensor:
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
+    dispatch_output = _prescale_router_weight_on_input(dispatch_output, runner_config)
     topk_output = dispatch_output.topk_output
-    topk_weights = topk_output.topk_weights
+    topk_weights = topk_output.topk_weights.to(torch.float32)
     topk_ids = topk_output.topk_ids
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
@@ -206,7 +237,7 @@ def _run_flashinfer_cutlass(
 
     if output is None:
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             output = torch.empty(
                 x.shape[0],
@@ -264,12 +295,9 @@ def fused_experts_none_to_flashinfer_cutlass(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
@@ -289,12 +317,9 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         FlashinferCombineInput,
     )
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
@@ -312,17 +337,46 @@ def fused_experts_none_to_flashinfer_mxfp4(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    """Run the FlashInfer CUTLASS MXFP4 fused experts."""
+    """Dispatch flashinfer_mxfp4 by quant-info type.
+
+    Both mxfp4 paths register under this single ``("none", "flashinfer_mxfp4")``
+    key but call different kernels.
+    """
+    if isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
+
+    # Keep one fused-op registration for the shared backend while loading the
+    # TRT-LLM implementation only when its quant-info type is dispatched.
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+    )
+
+    if isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output, quant_info, runner_config
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    )
+
+
+def _fused_experts_flashinfer_mxfp4_cutlass(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMxfp4MoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    x = dispatch_output.hidden_states
+    if x.shape[0] == 0:
+        return StandardCombineInput(hidden_states=x)
 
     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
-    x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
     # Under ``--moe-runner-backend flashinfer_mxfp4`` topk may be in bypassed
@@ -406,7 +460,9 @@ def fused_experts_none_to_flashinfer_mxfp4(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
     flashinfer_cutlass_fused_moe(

@@ -72,12 +72,10 @@ def handle_mamba_backend(server_args: Any):
 
 
 def handle_int8_mamba_checkpoint(server_args: Any):
-    # The int8 mamba checkpoint pool is only wired into the built-in
-    # MambaRadixCache. The host-offload path (enabled by
-    # --enable-hierarchical-cache) and custom radix-cache backends are NOT
-    # int8-aware: they would read int8 checkpoint slots as bf16 active slots
-    # (wrong pool / out-of-range). Reject the combination up front rather than
-    # silently corrupting state.
+    # The host-offload path (enabled by --enable-hierarchical-cache) and
+    # custom radix-cache backends are NOT int8-aware: they would read int8
+    # checkpoint slots as bf16 active slots (wrong pool / out-of-range).
+    # Reject the combination up front rather than silently corrupting state.
     cfg = resolving_view(server_args)
     if not cfg.enable_int8_mamba_checkpoint:
         return
@@ -97,9 +95,9 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
 
-    assert supports_mamba_cache_extra_buffer(
-        view, model_arch
-    ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+    assert supports_mamba_cache_extra_buffer(view, model_arch), (
+        f"extra_buffer is not supported for {model_arch}; use no_buffer."
+    )
     assert (
         get_platform().is_cuda
         or get_platform().is_musa
@@ -142,9 +140,9 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
 
 def validate_mamba_no_buffer(view, model_arch: str):
     assert view.page_size in (1, None), "no_buffer only supports page_size=1."
-    assert (
-        view.disable_overlap_schedule
-    ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
-    assert (
-        view.attention_backend != "trtllm_mha"
-    ), "no_buffer do not support trtllm_mha attention backend."
+    assert view.disable_overlap_schedule, (
+        "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+    )
+    assert view.attention_backend != "trtllm_mha", (
+        "no_buffer do not support trtllm_mha attention backend."
+    )

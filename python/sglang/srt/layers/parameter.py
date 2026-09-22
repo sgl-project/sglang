@@ -54,9 +54,9 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
     bf16/fp16 share the same rank, and all fp8 variants share the same rank.
     """
 
-    assert (
-        target.shape == loaded_weight.shape
-    ), f"{target.shape=}, {loaded_weight.shape=}"
+    assert target.shape == loaded_weight.shape, (
+        f"{target.shape=}, {loaded_weight.shape=}"
+    )
 
     if target.dtype == loaded_weight.dtype:
         target.copy_(loaded_weight)
@@ -268,9 +268,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=}, {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=}, {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 

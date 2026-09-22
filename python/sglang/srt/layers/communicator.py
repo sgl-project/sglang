@@ -23,8 +23,6 @@ import torch
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
-    get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -37,6 +35,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.cp.utils import (
+    is_mla_cp_active,
+    is_mla_cp_enabled,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -56,6 +58,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -63,10 +67,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
-)
-from sglang.srt.layers.utils.cp_utils import (
-    is_mla_prefill_cp_enabled,
-    mla_use_prefill_cp,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -238,7 +238,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
+        if is_dsa_enable_prefill_cp() or is_mla_cp_enabled():
             return ScatterMode.SCATTERED
 
         return ScatterMode.TP_ATTN_FULL
@@ -250,17 +250,22 @@ class AttentionInputs:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_latent_func: Callable,
+        *,
+        is_pre_gathered: bool = False,
     ):
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
         self.hidden_states_ = None
         self.qkv_latent_ = None
+        # When True, hidden_states_local is already attn_tp-gathered upstream
+        # (e.g. by MHC's prepare_attn for DSA). fetch_* must NOT gather again.
+        self.is_pre_gathered = is_pre_gathered
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
         output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
-        get_tp_group().all_gather_into_tensor(output, hidden_states)
+        get_parallel().tp_group.all_gather_into_tensor(output, hidden_states)
         return output
 
     def fetch_qkv_latent(self):
@@ -270,7 +275,7 @@ class AttentionInputs:
         self.qkv_latent_ = self.qkv_latent_func(
             self.hidden_states_local, self.forward_batch
         )
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
@@ -280,7 +285,7 @@ class AttentionInputs:
         if self.hidden_states_ is not None:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
@@ -292,13 +297,15 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.is_dsa = False
 
-    def init_context(self, q_lora_rank, is_dsa):
+    def init_context(self, q_lora_rank, is_dsa, is_mhc=False):
+        # Only MHC pre-gathers hidden states before DSA attention, so non-MHC DSA
+        # cannot use scattered inputs.
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_parallel().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_dsa
+            and (is_mhc or not is_dsa)
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -329,6 +336,11 @@ class AttnTpContext:
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
         get_forward().set("attn_inputs", attn_inputs)
+
+    def set_hidden_states_local(self, hidden_states: torch.Tensor) -> None:
+        attn_inputs = get_forward().attn_inputs
+        if attn_inputs is not None:
+            attn_inputs.hidden_states_local = hidden_states
 
     def fetch_qkv_latent(self):
         attn_inputs = get_forward().attn_inputs
@@ -420,16 +432,22 @@ class LayerScatterModes:
                 return ScatterMode.SCATTERED
             # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
             if is_enable_moe_cp_allgather() and not (
-                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
             ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:
-            return (
-                ScatterMode.SCATTERED
-                if enable_moe_dense_fully_dp()
-                else ScatterMode.FULL
-            )
+            if enable_moe_dense_fully_dp():
+                return ScatterMode.SCATTERED
+            # A TP-sharded dense MLP reduces over the whole TP group, which spans
+            # every CP rank; a CP-sharded prefill must gather tokens across CP
+            # first or the all-reduce sums different tokens' partial outputs.
+            # MLA/DSA CP models do this in DSACPLayerCommunicator instead.
+            if _generic_prefill_cp_shards_tokens() and not (
+                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
+            ):
+                return ScatterMode.MOE_FULL
+            return ScatterMode.FULL
 
     @classmethod
     def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
@@ -467,8 +485,34 @@ def enable_moe_dense_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
 
 
+def _generic_prefill_cp_shards_tokens() -> bool:
+    """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
+    parallel = get_parallel()
+    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+
+
 def enable_dwdp():
     return get_parallel().dwdp_size > 1
+
+
+def tp_reduce_scatter(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    context: "CommunicateContext",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Module-level so MHC communicators can reuse it without a
+    ``LayerCommunicator`` instance."""
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    assert hidden_states.shape[0] % context.tp_size == 0, (
+        f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    )
+    local_tokens = hidden_states.shape[0] // context.tp_size
+    output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+    get_parallel().tp_group.reduce_scatter_tensor(output, hidden_states)
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return output, residual
 
 
 class LayerCommunicator:
@@ -680,7 +724,9 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    # Fusion was published but this shape can't use the kernel,
+                    # so run the deferred reduction inline.
+                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -811,19 +857,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
-        local_tokens = hidden_states.shape[0] // self._context.tp_size
-        output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-        get_tp_group().reduce_scatter_tensor(output, hidden_states)
-        if residual is not None:
-            residual = residual.tensor_split(self._context.tp_size)[
-                self._context.tp_rank
-            ]
-        return output, residual
+        return tp_reduce_scatter(hidden_states, residual, self._context)
 
     def prepare_mlp(
         self,
@@ -846,6 +880,13 @@ class LayerCommunicator:
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        return
 
     def postprocess_layer(
         self,
@@ -876,7 +917,10 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        # Prefill CP predicates must stay out of decode graph capture.
+        if forward_batch.forward_mode.is_context_parallel_extend() and (
+            dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch)
+        ):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
@@ -890,19 +934,22 @@ class LayerCommunicator:
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
-        if is_enable_moe_cp_allgather():
+        if (
+            is_enable_moe_cp_allgather()
+            or self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL
+        ):
             return False
 
-        # Fusing makes the next layer's residual+LN absorb the post-experts
-        # all-reduce, and that fused kernel reduces over a single group. Under
-        # hybrid EP+TP the post-experts reduction spans two disjoint groups
-        # (moe_expert_parallel_all_reduce over _MOE_EP, then
-        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-        # should_skip_post_experts_all_reduce() skips *both* once fusion is
-        # published -- so the fused reduce would cover only half the peers and
-        # silently return under-reduced activations.
+        # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
+        # two disjoint groups; post_experts_all_reduce() merges them into one
+        # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
+        # When merging is blocked, no single group covers both, so fusion stays off.
         parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        if (
+            parallel.moe_ep_size > 1
+            and parallel.moe_tp_size > 1
+            and not can_merge_post_experts_all_reduce()
+        ):
             return False
 
         if (
@@ -1027,7 +1074,7 @@ class CommunicateSimpleFn:
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     output = torch.empty(
@@ -1222,7 +1269,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         hidden_states
                     )
                 with use_symmetric_memory(
-                    get_tp_group(),
+                    get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
@@ -1230,7 +1277,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if use_layer_norm_before_gather:
@@ -1333,7 +1380,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
         # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-        # - CUDA graph warmup: not applicable when --disable-piecewise-cuda-graph is used.
+        # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
 
@@ -1462,7 +1509,7 @@ class CommunicateSummableTensorPairFn:
         allow_reduce_scatter: bool = False,
     ):
         if get_parallel().tp_size == get_parallel().attn_dp_size:
-            group = get_tp_group()
+            group = get_parallel().tp_group
         else:
             group = get_parallel().attn_tp_group
         hidden_states, global_hidden_states = (
@@ -1470,7 +1517,7 @@ class CommunicateSummableTensorPairFn:
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():
-            get_tp_group().reduce_scatterv(
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
@@ -1552,7 +1599,7 @@ class CommunicateSummableTensorPairFn:
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
-                group = get_tp_group()
+                group = get_parallel().tp_group
             else:
                 group = get_parallel().attn_tp_group
             hidden_states_output, global_hidden_states = (

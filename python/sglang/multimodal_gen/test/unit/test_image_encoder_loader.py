@@ -41,6 +41,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             ),
             component_weights_paths={},
             component_quantizations={},
+            component_quantization_ignored_layers={},
+            component_paths={},
+            batching_max_size=1,
             component_precisions={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
@@ -61,7 +64,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def _config_patch(self, config):
         return mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "image_encoder_loader.get_diffusers_component_config",
+            "text_encoder_loader.get_diffusers_component_config",
             return_value=config,
         )
 
@@ -110,8 +113,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def test_native_only_quantized_architecture_does_not_fall_back(self):
         self.server_args.pipeline_config.native_only_components = ("image_encoder",)
         config = self._component_config("UnknownVisionModel", quantized=True)
-        with self._config_patch(config), self.assertRaises(
-            NativeComponentLoaderRequired
+        with (
+            self._config_patch(config),
+            self.assertRaises(NativeComponentLoaderRequired),
         ):
             self._load()
         self.load_native.assert_not_called()
@@ -121,8 +125,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             "architectures": ["UnknownVisionModel"],
             "quantization_config": {"quant_method": "not-a-format"},
         }
-        with self._config_patch(config), self.assertRaises(
-            ComponentCheckpointUnsupportedError
+        with (
+            self._config_patch(config),
+            self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
             self._load()
         self.load_native.assert_not_called()
@@ -159,18 +164,22 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
         ):
             component = loader.load_native(
                 "/model/image_encoder",
@@ -211,16 +220,20 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "requires resident placement"
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "requires resident placement"
+            ),
         ):
             loader.load_native(
                 "/model/image_encoder",
@@ -266,34 +279,42 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch.object(
-            loader,
-            "load_customized",
-            side_effect=NativeComponentLoaderRequired("use Transformers"),
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.current_platform.get_available_gpu_memory",
-            return_value=10.0,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_memory_usage_of_component",
-            return_value=0.0,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.format_component_residency",
-            return_value="resident",
+        with (
+            mock.patch.object(
+                loader,
+                "load_customized",
+                side_effect=NativeComponentLoaderRequired("use Transformers"),
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.current_platform.get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_memory_usage_of_component",
+                return_value=0.0,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.format_component_residency",
+                return_value="resident",
+            ),
         ):
             component, _ = loader.load(
                 "/model/image_encoder",

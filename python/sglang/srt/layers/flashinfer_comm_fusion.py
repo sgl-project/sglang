@@ -6,12 +6,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed import (
-    get_attn_tp_group,
-    get_moe_ep_group,
-    get_moe_tp_group,
-    get_tp_group,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -335,7 +329,7 @@ def _preflight_check_workspace_memory(
 
     group = cpu_group
     if group is None:
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group.world_size <= 1:
             return True
         group = tp_group.cpu_group
@@ -647,6 +641,37 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return manager
 
 
+def resolve_fusion_world_size(*, use_attn_tp_group: bool) -> int:
+    """Peer count of the fusion group. Reads sizes only -- deliberately does not
+    reach for a group coordinator, which some callers hit before one exists."""
+    from sglang.srt.layers.moe.utils import can_merge_post_experts_all_reduce
+
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_size
+    return parallel.moe_ep_size if parallel.moe_ep_size > 1 else parallel.moe_tp_size
+
+
+def resolve_fusion_group(*, use_attn_tp_group: bool):
+    """Return (world_size, rank, coordinator) for the fusion workspace.
+
+    Must match the group the fused residual+LN kernel reduces over; a mismatch
+    silently reduces across the wrong peers.
+    """
+    from sglang.srt.layers.moe.utils import can_merge_post_experts_all_reduce
+
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size, parallel.attn_tp_rank, parallel.attn_tp_group
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_size, parallel.tp_rank, parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_size, parallel.moe_ep_rank, parallel.moe_ep_group
+    return parallel.moe_tp_size, parallel.moe_tp_rank, parallel.moe_tp_group
+
+
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
@@ -660,7 +685,7 @@ def _sync_allreduce_unavailable_across_tp():
     try:
         import torch.distributed as dist
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         if tp_group.world_size <= 1:
             return
         flag = torch.tensor(
@@ -694,19 +719,9 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-        rank = get_parallel().attn_tp_rank
-        coordinator = get_attn_tp_group()
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-            rank = get_parallel().moe_ep_rank
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_parallel().moe_tp_size
-            rank = get_parallel().moe_tp_rank
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = resolve_fusion_group(
+        use_attn_tp_group=use_attn_tp_group
+    )
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
     # rendezvous group from `group=...` (falling back to WORLD when None),
@@ -765,7 +780,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
@@ -785,7 +800,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -801,7 +816,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         max_token_num: Maximum token number
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
-        fp32_acc: Whether to use fp32 precision
+        fp32_acc: Accumulate the allreduce in fp32 (trtllm backend only; the
+            mnnvl backends always accumulate in fp32)
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
@@ -813,13 +829,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-        else:
-            world_size = get_parallel().moe_tp_size
+    world_size = resolve_fusion_world_size(use_attn_tp_group=use_attn_tp_group)
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
@@ -865,8 +875,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         rms_gamma=weight,
         rms_eps=eps,
         use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     _flashinfer_comm.allreduce_fusion(**kwargs)
@@ -922,6 +933,15 @@ def can_use_flashinfer_allreduce(
     # Dynamo, so statically-off configs must short-circuit before reaching them
     # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
+
+    # MNNVL hard-fails instead of falling back when the width is not float4-aligned
+    # (FlashInfer csrc/trtllm_mnnvl_allreduce.cu).
+    if (
+        workspace_manager.backend == "mnnvl"
+        and hidden_dim % (16 // input_.element_size()) != 0
+    ):
+        return False
+
     if torch.compiler.is_compiling():
         # Don't call into the flashinfer workspace object while tracing. The
         # workspace was allocated for (max_token_num, hidden_dim, dtype) and
@@ -976,9 +996,10 @@ def flashinfer_allreduce(
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         launch_with_pdl=True,
-        fp32_acc=False,
         output=output,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = True
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
     _flashinfer_comm.allreduce_fusion(**kwargs)

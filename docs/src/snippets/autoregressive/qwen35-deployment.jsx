@@ -65,7 +65,8 @@ export const Qwen35Deployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
-          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 }
+          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 },
+          { id: 'arc_b',  label: 'BMG',    default: false,     disabled: isNvfp4 }
         ];
       }
     },
@@ -76,11 +77,12 @@ export const Qwen35Deployment = () => {
         const hasFp8 = FP8_MODELS.has(values.model);
         const hasFp4 = values.model === '397b';
         const isXeon = values.hardware === 'xeon';
+        const isArcB = values.hardware === 'arc_b';
         return [
-          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon, disabled: !hasFp8,
+          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon || isArcB },
+          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon && !isArcB, disabled: !hasFp8 || isArcB,
             disabledReason: 'No FP8 variant available for this model' },
-          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
+          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon || isArcB,
             disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
         ];
       }
@@ -104,7 +106,7 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'arc_b',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -124,7 +126,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon',
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'arc_b',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -184,7 +186,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } },
+      arc_b:  { bf16: { tp: 4, mem: 0.8 } }
     },
     '27b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -204,7 +207,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 } },
+      arc_b:  { bf16: { tp: 1, mem: 0.8 } }
     },
     '4b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -214,7 +218,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 } },
+      arc_b:  { bf16: { tp: 1, mem: 0.8 } }
     },
     '2b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -286,7 +291,17 @@ export const Qwen35Deployment = () => {
   }, [values.hardware, values.model]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      if (prev.hardware === 'arc_b' && optionName === 'model' && !['35b', '9b', '4b'].includes(value)) {
+        return prev;
+      }
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b' && !['35b', '9b', '4b'].includes(next.model)) {
+        next.model = '35b';
+      }
+      return next;
+    });
   };
 
   // Multi-node flag template — mirrors DeepSeek-V4 cookbook's multiNodeFlags.
@@ -334,9 +349,9 @@ export const Qwen35Deployment = () => {
 
     let modelName;
     if (quantization === 'fp4') {
-      // AMD MI355X uses the MXFP4 checkpoint; Blackwell uses NVFP4-V2.
+      // AMD MI355X uses MXFP4-AttnFP8-V2 (MXFP4 MoE, FP8 attention); Blackwell uses NVFP4-V2.
       modelName = hardware === 'mi355x'
-        ? 'amd/Qwen3.5-397B-A17B-MXFP4'
+        ? 'amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2'
         : 'nvidia/Qwen3.5-397B-A17B-NVFP4-V2';
     } else {
       const suffix = MODEL_SUFFIX[model];
@@ -354,6 +369,9 @@ export const Qwen35Deployment = () => {
     let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --linear-attn-backend intel_xpu`;
     }
     if (tpValue > 1) {
       cmd += ` \\\n  --tp ${tpValue}`;
@@ -378,7 +396,7 @@ export const Qwen35Deployment = () => {
     // would emit a spurious --mamba-radix-cache-strategy extra_buffer. The UI
     // radio is hidden for dense models, so users can't manually correct it.
     // MoE keeps the old behavior — the UI radio is the recovery path there.
-    const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon'];
+    const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon', 'arc_b'];
     const actualMambaCache = mamba_v1_dev.includes(hardware)
       ? 'v1'
       : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
@@ -410,8 +428,9 @@ export const Qwen35Deployment = () => {
       }
     }
 
-    // Enable NCCL symmetric memory for H100 FP8 deployments.
-    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+    // Enable NCCL symmetric memory for H100 and Blackwell FP8 deployments.
+    const symmMemFp8Hw = ['h100', 'b200', 'b300'];
+    if (symmMemFp8Hw.includes(hardware) && quantization === 'fp8' && hwConfig.tp > 1) {
       cmd += ` \\\n  --enable-symm-mem`;
     }
 
@@ -426,7 +445,7 @@ export const Qwen35Deployment = () => {
     // benchmark only enables this for TP>=8). AMD MI GPUs use the AITER allreduce
     // fusion flag instead, handled in the AMD backend block below.
     const amdGpu = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    if (quantization !== 'fp4' && hardware !== 'xeon' && !amdGpu) {
+    if (quantization !== 'fp4' && hardware !== 'xeon' && hardware !== 'arc_b' && !amdGpu) {
       cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
     }
 
@@ -455,12 +474,22 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --attention-backend flashinfer`;
     }
 
+    // Enable FlashInfer GDN (linear attention) prefill for Blackwell FP8 deployments.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
+      cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
+    }
+
+    // Enable FlashInfer trtllm MoE for FP8 Blackwell deployments for MoE models.
+    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+      cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
+    }
+
     // Append AMD GPU-specific backend configurations.
     // All AMD MI GPUs use the AITER unified-attention backend (pair with
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Multi-GPU runs enable AITER allreduce fusion,
-    // except the MXFP4 MI355X recipe, which uses ROCm INT8 quantized quick
-    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT8) instead.
+    // except the MXFP4 MI355X recipe, which uses ROCm INT4 quantized quick
+    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT4) instead.
     if (amdGpu) {
       const amdFp4 = quantization === 'fp4' && hardware === 'mi355x';
       let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
@@ -468,7 +497,7 @@ export const Qwen35Deployment = () => {
         amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
       }
       if (amdFp4) {
-        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \\\n";
+        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\n";
       }
       cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
@@ -495,7 +524,7 @@ export const Qwen35Deployment = () => {
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       if (hardware === 'mi355x') {
-        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT8 quantized
+        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT4 quantized
         // ROCm quick all-reduce env are emitted by the AMD backend block above
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
@@ -506,8 +535,8 @@ export const Qwen35Deployment = () => {
           cmd += ' \\\n  --enable-hierarchical-cache';
           cmd += ' \\\n  --hicache-ratio 1.5';
           cmd += ' \\\n  --hicache-write-policy write_through';
-          cmd += ' \\\n  --hicache-io-backend direct';
-          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
+          cmd += ' \\\n  --hicache-io-backend kernel';
+          cmd += ' \\\n  --hicache-mem-layout page_first';
         } else {
           cmd += ' \\\n  --disable-radix-cache';
         }
@@ -569,7 +598,11 @@ export const Qwen35Deployment = () => {
             <div style={itemsStyle}>
               {items.map(item => {
                 const isChecked = values[option.name] === item.id;
-                const isDisabled = !!item.disabled;
+                const isArcBModelLocked =
+                  values.hardware === 'arc_b' &&
+                  option.name === 'model' &&
+                  !['35b', '9b', '4b'].includes(item.id);
+                const isDisabled = !!item.disabled || isArcBModelLocked;
                 return (
                   <label
                     key={item.id}

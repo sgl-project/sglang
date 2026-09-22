@@ -512,7 +512,9 @@ def make_forward_inputs_2d(
     return hidden_states, topk_weights, topk_ids, top_k, num_experts
 
 
-def run_moe_preprocess(topk_ids: torch.Tensor, num_experts: int) -> tuple[
+def run_moe_preprocess(
+    topk_ids: torch.Tensor, num_experts: int
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -562,9 +564,9 @@ def activation(
     use_interleaved: bool = True,
 ):
     if activation_type == "silu_and_mul":
-        assert (
-            gateup_output.is_contiguous()
-        ), f"{gateup_output.shape=} {gateup_output.stride()=}"
+        assert gateup_output.is_contiguous(), (
+            f"{gateup_output.shape=} {gateup_output.stride()=}"
+        )
         assert gateup_output.ndim == 2, f"{gateup_output.shape=}"
         out_dtype = None
         if gateup_output.numel() == 0:
@@ -669,11 +671,13 @@ class InklingSharedFusedMoE(FusedMoE):
         quant_config: QuantizationConfig | None,
         inference_moe_w13_interleaved: bool,
     ) -> None:
-        # FusedMoE.__init__ reads get_parallel() once and caches it on self, so
-        # scoping the override to just this call is sufficient for the module's lifetime.
+        # FusedMoE caches this topology at construction. Shared experts are
+        # replicated, so they need no expert-parallel group.
         with get_parallel().override(
             moe_ep_size=1,
             moe_ep_rank=0,
+            moe_ep_group=None,
+            moe_dp_size=1,
             moe_tp_size=get_parallel().tp_size,
             moe_tp_rank=get_parallel().tp_rank,
         ):

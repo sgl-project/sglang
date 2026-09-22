@@ -12,7 +12,7 @@ from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
@@ -84,6 +84,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -128,6 +129,46 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+
+class TestPrefillCudaGraphVote(CustomTestCase):
+    def _vote(self, mode):
+        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner.max_context_size = None
+        runner.can_replay_locally.return_value = True
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            extend_num_tokens=4,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[1, 1],
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        vote = dp_attn._local_prefill_cuda_graph_vote(
+            local_batch=batch,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=object(),
+        )
+        return vote, runner
+
+    def test_extend_batch_votes_for_prefill_graph(self):
+        vote, runner = self._vote(ForwardMode.EXTEND)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertFalse(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    def test_mixed_batch_delegates_to_runner_policy(self):
+        vote, runner = self._vote(ForwardMode.MIXED)
+
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
 
 if __name__ == "__main__":

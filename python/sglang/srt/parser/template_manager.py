@@ -50,6 +50,7 @@ from sglang.srt.parser.template_detection import (
     detect_reasoning_pattern,
     match_rules,
 )
+from sglang.srt.runtime_context import get_serving
 
 logger = logging.getLogger(__name__)
 
@@ -290,9 +291,9 @@ class TemplateManager:
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of chat template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of chat template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)
@@ -319,9 +320,9 @@ class TemplateManager:
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of completion template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of completion template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)
@@ -384,7 +385,7 @@ class TemplateManager:
         logger.info(f"Multiple HuggingFace chat templates available: {available_names}")
 
         # Use specified template if provided
-        if preferred_name := tokenizer_manager.server_args.hf_chat_template_name:
+        if preferred_name := get_serving().hf_chat_template_name:
             if preferred_name not in templates:
                 raise ValueError(
                     f"Specified template '{preferred_name}' not found. "

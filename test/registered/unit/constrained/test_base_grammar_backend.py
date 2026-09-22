@@ -259,6 +259,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
             "enable_strict_thinking": enable_strict_thinking,
             "constrained_json_whitespace_pattern": None,
             "constrained_json_disable_any_whitespace": False,
+            "constrained_json_max_whitespace_cnt": None,
         }
         published.update(fields)
         self._publish(**published)
@@ -335,7 +336,11 @@ class TestCreateGrammarBackend(unittest.TestCase):
 
         result = create_grammar_backend(args, "tok", 32000, {1, 2})
         mock_xgrammar_cls.assert_called_once_with(
-            "tok", vocab_size=32000, model_eos_token_ids=[1, 2], any_whitespace=False
+            "tok",
+            vocab_size=32000,
+            model_eos_token_ids=[1, 2],
+            any_whitespace=False,
+            max_whitespace_cnt=None,
         )
         self.assertIs(result, mock_backend)
 
@@ -399,6 +404,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertIs(result.grammar_backend, mock_backend)
+        self.assertEqual(result.think_end_ids, [42])
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_think_end_ids(self, mock_outlines_cls):

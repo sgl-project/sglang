@@ -31,7 +31,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _is_hip = is_hip()
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 HEAD_DIM = 128
@@ -178,9 +178,9 @@ def test_q_rope_quant_matches_reference(pos_dtype):
     # scale step at the bottom of the range.
     deq = q_fp8.float() * scale
     err = (deq - ref).abs()
-    assert (
-        err <= 0.0625 * ref.abs() + scale
-    ).all(), f"max fp8 dequant error {err.max().item()}"
+    assert (err <= 0.0625 * ref.abs() + scale).all(), (
+        f"max fp8 dequant error {err.max().item()}"
+    )
 
 
 # ----------------------------------------------------------------------------
