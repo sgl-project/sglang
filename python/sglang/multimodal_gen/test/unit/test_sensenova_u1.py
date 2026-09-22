@@ -2551,6 +2551,8 @@ def test_sensenova_t2i_reuses_request_noise_embedding(
             torch.zeros(1, 1, dtype=torch.long),
             torch.zeros(3, 1, dtype=torch.long),
             None,
+            torch.ones(1, 1, dtype=torch.bool),
+            torch.ones(1, dtype=torch.long),
         ),
         _build_t2i_image_indexes=lambda h, w, *a, **k: torch.zeros(3, h * w),
         _t2i_prefix_forward=lambda *a: (SimpleNamespace(layers=[]), torch.zeros(1)),

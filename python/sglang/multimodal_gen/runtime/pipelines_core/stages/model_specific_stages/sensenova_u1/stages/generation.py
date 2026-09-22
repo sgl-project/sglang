@@ -426,12 +426,12 @@ class SenseNovaU1GenerationStage(PipelineStage):
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        options = SenseNovaU1GenerationOptions.from_batch(batch)
         if int(batch.num_outputs_per_prompt) != 1:
             raise ValueError(
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
+        options = SenseNovaU1GenerationOptions.from_batch(batch)
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
         batch_size = len(prompts)
         if batch_size == 0:
