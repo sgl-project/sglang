@@ -3,17 +3,17 @@
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
 - **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
-- **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
+- **CI pipeline internals** — stage flow diagrams, fail-fast layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
 
-The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
+The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fail-fast mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
 
 ## Folder Organization
 
-- `registered/`: CI test files, auto-discovered by `run_suite.py`. Most tests live here. JIT kernel tests are an exception (see below).
+- `registered/`: CI test files, including kernel tests and benchmarks, auto-discovered by `run_suite.py`.
 - `manual/`: Non-CI tests for local debugging or special setups.
-- `run_suite.py`: CI runner — scans `registered/` and JIT kernel directories.
+- `run_suite.py`: CI runner — scans `registered/` recursively.
 
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
@@ -44,7 +44,7 @@ python3 test/registered/core/test_srt_endpoint.py
 python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 
 # Single JIT kernel test
-python3 test/registered/jit/test_add_constant.py
+python3 test/registered/kernels/ops/elementwise/test_add_constant.py
 
 # Run a suite
 python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
@@ -72,28 +72,26 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-New and renamed tests use this layout:
-
-```text
-test/registered/<kind>/<subsystem>/test_*.py
-```
-
-`<kind>` is one of `unit`, `kernel`, `e2e`, `accuracy`, `perf`, or `stress`.
-Hardware is expressed by one or more `register_*_ci` calls, never by creating a
-new top-level hardware directory. The admission checker applies the layout and
-kind/suite contract incrementally while legacy paths are migrated.
+Directories under `test/registered/` group tests by topic and are free-form
+(`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...); unit tests cover one srt
+module, so they mirror the source tree under `unit/`. What a test costs, which
+stage gates it and which runner it needs are declared by its `register_*_ci`
+call -- including hardware, which is expressed by one or more `register_*_ci`
+calls and never by a new top-level directory. Kernel tests use
+`test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
+plural `kernels` root.
 
 Diffusion workflows also enter through `test/run_suite.py`; registered bridge
 files preserve their case-level pytest partitioning until the remaining
 diffusion cases are moved out of the package test-support tree.
 
-New JIT kernel correctness tests and benchmarks live under
-`test/registered/kernel/jit/`; legacy `test/registered/jit/` files are migrated
-incrementally. Helpers stay alongside the kernel source under
-`python/sglang/kernels/jit/` and are imported by absolute path:
+Kernel correctness tests and benchmarks use the established plural `kernels`
+root and mirror the operator group under `python/sglang/kernels/ops/`. Helpers
+stay alongside the kernel source under `python/sglang/kernels/jit/` and are
+imported by absolute path:
 
-- Correctness tests: `test/registered/kernel/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
-- Benchmarks: `test/registered/kernel/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
+- Correctness tests: `test/registered/kernels/ops/<group>/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
+- Benchmarks: `test/registered/kernels/benchmark/<group>/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 
 ## Choosing a Suite
 
