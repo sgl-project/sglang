@@ -206,9 +206,11 @@
             "estimated_full_test_time_s": 65.6
         },
         "qwen_image21_t2i_tp2": {
+            "expected_load_ms": 45596.77,
+            "notes": "H100 CI run 35549625911 attempt 3, job 106188864502, PR head 044e71f5ecb507ffdf66729f934b51c3dc68b59f; request 1 after server warmup, complete cached public model snapshot b3179ad355be050328e483a9dfdd9e60cd62adfa. Existing tolerances are unchanged.",
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 0.0,
+            "expected_e2e_ms": 2914.82,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 300.0

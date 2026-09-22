@@ -2071,12 +2071,17 @@ if _is_hip:
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                # Only vLLM needs `scale` pre-zeroed: segmented_max_reduction
+                # accumulates into it with atomicMax. AITER zeroes it itself
+                # and the native path overwrites it.
                 if _use_aiter:
+                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     dynamic_per_tensor_quant(output, input, scale)
                 elif _has_vllm:
+                    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
+                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling

@@ -47,12 +47,9 @@ register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
-    """Create a mock scheduler with necessary attributes.
+    """Create a mock scheduler and publish its configuration and placement.
 
-    The grammar manager reads its config and its place in the pipeline from
-    the context, so the settings that used to be hung off the mock are
-    published instead. The caller resets the context; every test here goes
-    through `_GrammarFixture`.
+    The caller must reset the context during teardown.
     """
     reset_context()
     server_args = ServerArgs(
@@ -778,9 +775,7 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        # After that override, not before: installing a server-args override
-        # re-resolves the parallel bag from defaults, which puts `pp_size`
-        # back to 1 whatever was published.
+        # Override ranks after the server-args override rebuilds the config bags.
         enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
         scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)

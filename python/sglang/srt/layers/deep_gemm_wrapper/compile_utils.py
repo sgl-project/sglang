@@ -510,7 +510,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
         "PP-parallel DeepGEMM warmup start "
         "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
         get_parallel().pp_rank,
-        model_runner.ps.tp_rank,
+        model_runner.tp_rank,
         batch_sizes,
         disagg_mode,
     )
