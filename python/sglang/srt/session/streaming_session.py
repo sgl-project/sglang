@@ -610,6 +610,9 @@ class StreamingSession(BasePrefixCache):
     def supports_swa(self):
         return self.inner.supports_swa()
 
+    def uses_bigram_key(self):
+        return self.inner.uses_bigram_key()
+
     def supports_mamba(self):
         return self.inner.supports_mamba()
 

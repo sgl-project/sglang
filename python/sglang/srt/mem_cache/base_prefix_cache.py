@@ -573,6 +573,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def uses_bigram_key(self) -> bool:
+        """EAGLE bigram keys: n tokens insert n - 1 entries."""
+        return False
+
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
         # that pairs SWA with mamba/conv checkpoints has to keep the window behind

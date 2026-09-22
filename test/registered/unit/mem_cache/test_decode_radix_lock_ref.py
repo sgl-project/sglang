@@ -132,6 +132,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.uses_bigram_key.return_value = False
 
         tail_len = queue._swa_tail_len(895)
 
@@ -139,6 +141,42 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         swa_start = 895 - tail_len
         radix_key_len = (895 // 64) * 64
         self.assertGreaterEqual(radix_key_len - swa_start, 127)
+
+    def test_swa_tail_len_keeps_window_below_bigram_insert_boundary(self):
+        """Bigram key: insert boundary is one page lower at page multiples."""
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=127,
+            server_args=SimpleNamespace(),
+        )
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.tree_cache = MagicMock()
+
+        for seq_len in (384, 385, 383, 320, 895):
+            for bigram in (False, True):
+                queue.tree_cache.uses_bigram_key.return_value = bigram
+                tail_len = queue._swa_tail_len(seq_len)
+                swa_start = seq_len - tail_len
+                self.assertEqual(swa_start % 64, 0)
+                insert_boundary = ((seq_len - int(bigram)) // 64) * 64
+                self.assertGreaterEqual(
+                    insert_boundary - swa_start,
+                    127,
+                    f"{seq_len=} {bigram=} {tail_len=}",
+                )
+
+        queue.tree_cache.uses_bigram_key.return_value = True
+        self.assertEqual(queue._swa_tail_len(384), 192)
+        queue.tree_cache.uses_bigram_key.return_value = False
+        self.assertEqual(queue._swa_tail_len(384), 128)
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

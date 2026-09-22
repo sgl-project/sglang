@@ -1214,6 +1214,14 @@ class UnifiedRadixCache(BasePrefixCache):
         assert new_prefix_len <= len(new_indices), (
             f"{new_prefix_len=}, {len(new_indices)=}"
         )
+        # Anything the rematch leaves out stays tree-owned but unlocked while
+        # the request still writes to it.
+        assert len(new_indices) >= page_aligned_len, (
+            f"cache_unfinished_req rematch covers {len(new_indices)} of "
+            f"{page_aligned_len} inserted tokens (rid={req.rid}, "
+            f"{req.kv.swa_evicted_seqlen=}, {req.kv.cache_protected_len=}, "
+            f"bigram={self.tree_core.is_eagle})"
+        )
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -3524,6 +3532,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
+
+    def uses_bigram_key(self) -> bool:
+        return self.tree_core.is_eagle
 
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled

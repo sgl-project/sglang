@@ -370,6 +370,9 @@ class RadixCache(BasePrefixCache):
 
     ##### Public API #####
 
+    def uses_bigram_key(self) -> bool:
+        return self.is_eagle
+
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)

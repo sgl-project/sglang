@@ -523,10 +523,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         page_size = self.token_to_kv_pool_allocator.page_size
         if get_disagg().disaggregation_decode_enable_radix_cache:
-            # Keep enough SWA before the page-aligned radix-cache insert
-            # boundary for the cached key to contain a complete window.
-            # `seq_len - 1` is the last committed position.
-            window_start = max(0, seq_len - 1 - max(window_size, page_size))
+            # Keep a full window below the page-aligned insert boundary. The
+            # key ends at seq_len - 1, one earlier for a bigram key.
+            key_end = seq_len - 1 - int(self.tree_cache.uses_bigram_key())
+            window_start = max(0, key_end - max(window_size, page_size))
         else:
             window_start = max(0, seq_len - window_size)
         window_start = (window_start // page_size) * page_size

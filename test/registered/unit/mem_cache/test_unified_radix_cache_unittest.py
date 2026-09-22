@@ -625,6 +625,58 @@ def build_fixture(
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestUnfinishedInsertRematchCoverage(CustomTestCase):
+    """Bigram-key arrival insert: locked in full, or rejected."""
+
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=127,
+        is_eagle=True,
+        kv_size=4096,
+        max_context_len=1024,
+    )
+
+    def _arrival(self, swa_evicted_seqlen):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        suite = UnifiedRadixCacheSuite()
+        suite.cfg = self.cfg
+        req = suite._make_req(req_to_token_pool)
+        tokens = list(range(1, 385))
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        kv_indices = suite._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.kv.swa_evicted_seqlen = swa_evicted_seqlen
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        cache.cache_unfinished_req(req)
+        return cache, req
+
+    def test_full_window_below_bigram_boundary_locks_insert(self):
+        cache, req = self._arrival(192)
+        self.assertEqual(req.kv.cache_protected_len, 320)
+        self.assertEqual(cache.full_protected_size(), 320)
+        self.assertEqual(cache.full_evictable_size(), 0)
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        self.assertEqual(cache.full_protected_size(), 0)
+        cache.sanity_check()
+
+    def test_short_window_below_bigram_boundary_fails_loudly(self):
+        with self.assertRaises(AssertionError) as context:
+            self._arrival(256)
+        self.assertIn("rematch covers 0 of 320", str(context.exception))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
     """Run Full load-back ownership semantics through either TreeCore backend."""
 

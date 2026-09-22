@@ -1150,6 +1150,28 @@ class TestLoadBalanceMethod(unittest.TestCase):
             str(context.exception),
         )
 
+    def test_pd_decode_radix_cache_spec_allowlist(self):
+        for algo in ("EAGLE", "EAGLE3", "DSPARK"):
+            server_args = ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="nixl",
+                speculative_algorithm=algo,
+            )
+            handle_pd_disaggregation(server_args)
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="NGRAM",
+        )
+        with self.assertRaises(ValueError) as context:
+            handle_pd_disaggregation(server_args)
+        self.assertIn("EAGLE/EAGLE3 and DSPARK", str(context.exception))
+
     def test_pd_decode_radix_cache_rejects_fake_backend(self):
         server_args = ServerArgs(
             model_path="dummy",

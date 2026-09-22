@@ -17,9 +17,21 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE, is_in_ci
 
-register_cuda_ci(est_time=365, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=720, stage="extra-b", runner_config="8-gpu-h200")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
+EAGLE3_ARGS = [
+    "--speculative-algorithm",
+    "EAGLE3",
+    "--speculative-draft-model-path",
+    "zhuyksir/EAGLE3-gpt-oss-20b-bf16",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+]
 
 
 def _has_nixl():
@@ -51,6 +63,24 @@ class TestDisaggregationDecodeRadixCacheSWANixl(
     extra_decode_args = [
         "--disaggregation-decode-enable-radix-cache",
         *SWA_SERVER_ARGS,
+    ]
+
+
+class TestDisaggregationDecodeRadixCacheSWAEagle3Nixl(
+    TestDisaggregationDecodeRadixCacheSWANixl
+):
+    """SWA decode radix cache with EAGLE3."""
+
+    extra_prefill_env = {
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+    }
+    extra_decode_env = extra_prefill_env
+    extra_prefill_args = [*SWA_SERVER_ARGS, *EAGLE3_ARGS]
+    extra_decode_args = [
+        "--disaggregation-decode-enable-radix-cache",
+        *SWA_SERVER_ARGS,
+        *EAGLE3_ARGS,
     ]
 
 

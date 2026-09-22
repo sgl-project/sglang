@@ -76,12 +76,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
-                )
+            if cfg.speculative_algorithm is not None:
+                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+                algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+                if not (algo.is_eagle() or algo.is_dspark()):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache supports "
+                        "speculative decoding only with EAGLE/EAGLE3 and DSPARK "
+                        f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                    )
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(

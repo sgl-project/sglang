@@ -79,6 +79,7 @@ class DisaggregationDecodeRadixCacheTestMixin:
             request_length=384,
             output_length=64,
             max_parallel=4,
+            page_size=decode_info.get("page_size"),
         )
         self.assertGreater(
             result["overall"]["total_cached_tokens"],
