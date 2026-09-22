@@ -939,10 +939,11 @@ mod tests {
     /// the request's own stops.
     #[test]
     fn template_stops_merge_before_request_stops() {
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter { spec: chatml },
-        ));
+        let chatml = sglang_renderer::builtin_template("chatml").unwrap();
+        let formatter =
+            super::super::ChatFormatter::Legacy(Box::new(sglang_renderer::LegacyFormatter {
+                spec: chatml,
+            }));
         assert_eq!(
             formatter.stop_strs(),
             Some(crate::message::types::OneOrMany::Many(vec![
@@ -1001,11 +1002,10 @@ mod tests {
         // A prompt formatter is not constructible here without a tokenizer; the
         // empty-legacy-spec twin proves the merge is formatter-gated, and the
         // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter {
-                spec: super::super::template::LegacySpec::default(),
-            },
-        ));
+        let legacy =
+            super::super::ChatFormatter::Legacy(Box::new(sglang_renderer::LegacyFormatter {
+                spec: sglang_renderer::LegacySpec::default(),
+            }));
         assert!(legacy.stop_strs().is_none());
         merge_template_stops(&mut req, &legacy);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
