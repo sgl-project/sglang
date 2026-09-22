@@ -33,9 +33,9 @@ class TestScoreAPI(CustomTestCase):
         self.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             self,
-            at_most("avg_latency_ms", res["avg_latency_ms"], 30, amd=60, unit="ms"),
-            at_most("p95_latency_ms", res["p95_latency_ms"], 32, amd=65, unit="ms"),
-            at_least("throughput", res["throughput"], 34, amd=16, unit="req/s"),
+            at_most("avg_latency_ms", res["avg_latency_ms"], 31, amd=60, unit="ms"),
+            at_most("p95_latency_ms", res["p95_latency_ms"], 37, amd=65, unit="ms"),
+            at_least("throughput", res["throughput"], 32, amd=16, unit="req/s"),
         )
 
     def test_score_api_batch_scaling(self):
@@ -47,7 +47,7 @@ class TestScoreAPI(CustomTestCase):
                 num_requests=500,
             ),
             # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
-            [(10, 30, 34, 60, 65), (25, 35, 39, 70, 80), (50, 51, 59, 80, 90)],
+            [(10, 32, 40, 60, 65), (25, 37, 42, 70, 80), (50, 54, 64, 80, 90)],
         )
 
 

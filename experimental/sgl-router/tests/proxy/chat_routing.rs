@@ -17,10 +17,14 @@ use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use sgl_router::state::load_monitor::router_inflight_load::{
+    spawn_janitor, JanitorHandle, RouterInflightLoadRegistry,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+mod cancellation;
 mod reorg;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,6 +76,36 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     // `forward_*_to(&worker.url, ...)`; the proxy itself is URL-less.
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+/// Expire requests after 50ms; keep the janitor handle alive during the test.
+fn build_ctx_with_janitor(url: &str) -> (Arc<AppContext>, JanitorHandle) {
+    let cfg = config_for(url);
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: url.to_string(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let router_inflight_load = RouterInflightLoadRegistry::new(
+        Arc::new(sgl_router::state::load_monitor::router_inflight_load::SystemTimeClock),
+        Duration::from_millis(50),
+    );
+    let janitor = spawn_janitor(Arc::clone(&router_inflight_load), Duration::from_millis(20));
+    let ctx = Arc::new(AppContext::with_router_inflight_load(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        router_inflight_load,
+    ));
+    (ctx, janitor)
 }
 
 #[tokio::test]
@@ -939,6 +973,21 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
+#[tokio::test]
+async fn unknown_model_without_workers_returns_404() {
+    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
+    ctx.registry.remove(&WorkerId("w1".into()));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"unknown","messages":[]}"#))
+        .unwrap();
+    let response = build_router(ctx).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["x-router-error-code"], "model_not_found");
+}
+
 /// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a
@@ -1018,6 +1067,7 @@ async fn forward_json_to_records_failure_on_body_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
         )
         .await;
     assert!(res.is_err(), "body drop should surface as ApiError");
@@ -1075,6 +1125,7 @@ async fn forward_json_to_records_success_only_after_body_completes() {
             "/v1/chat/completions",
             &headers,
             bytes::Bytes::from_static(b"{}"),
+            None,
         )
         .await;
     assert!(res.is_ok(), "clean OK call must succeed: {res:?}");
@@ -1126,6 +1177,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
             None,
             None,
@@ -1233,6 +1285,7 @@ async fn forward_json_to_records_failure_on_5xx() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
         )
         .await;
 
@@ -1267,6 +1320,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
         )
         .await;
 
@@ -1305,6 +1359,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
             "/v1/chat/completions",
             &headers,
             body,
+            None,
         )
         .await;
 
@@ -1592,58 +1647,17 @@ async fn streaming_active_load_drops_on_client_disconnect() {
 /// returns; cancellation fires; handler returns 504.
 #[tokio::test]
 async fn janitor_expiry_returns_504_stale_request_expired() {
-    use sgl_router::state::load_monitor::router_inflight_load::{
-        spawn_janitor, RouterInflightLoadRegistry,
-    };
-    // Upstream that takes 2s to respond — longer than our 50ms
-    // stale_request_timeout.
+    // Upstream that takes 2s to respond — longer than the helper's 50ms
+    // stale_request_timeout, so the janitor sweeps before it answers.
     let worker =
         crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(2)).await;
-
-    let cfg = config_for(&worker.url);
-    let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
-        id: WorkerId("w1".into()),
-        url: worker.url.clone(),
-        mode: WorkerMode::Plain,
-        model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
-    });
-    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
-    // Aggressive 50ms timeout: the janitor will sweep on the next
-    // tick (every 20ms) and fire the cancellation token before the
-    // upstream returns.
-    let router_inflight_load = RouterInflightLoadRegistry::new(
-        Arc::new(sgl_router::state::load_monitor::router_inflight_load::SystemTimeClock),
-        Duration::from_millis(50),
-    );
-    let _janitor = spawn_janitor(Arc::clone(&router_inflight_load), Duration::from_millis(20));
-    let ctx = Arc::new(AppContext::with_router_inflight_load(
-        cfg,
-        tokenizers,
-        proxy,
-        registry,
-        policies,
-        router_inflight_load,
-    ));
+    let (ctx, _janitor) = build_ctx_with_janitor(&worker.url);
     let app = build_router(ctx);
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": false,
-            }))
-            .unwrap(),
-        ))
+    let res = app
+        .oneshot(cancellation::request(serde_json::json!({})))
+        .await
         .unwrap();
-    let res = app.oneshot(req).await.unwrap();
     assert_eq!(
         res.status(),
         StatusCode::GATEWAY_TIMEOUT,
@@ -1661,6 +1675,53 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     assert!(
         body_str.contains("\"code\":\"stale_request_expired\""),
         "504 body must encode the same code in the JSON envelope: {body_str}",
+    );
+
+    assert_engine_abort(&worker).await;
+}
+
+#[tokio::test]
+async fn janitor_expiry_aborts_before_headers_and_mid_stream() {
+    use crate::common::mock_worker::MockWorker;
+    for before_headers in [true, false] {
+        let worker = if before_headers {
+            MockWorker::start_hanging(Duration::from_secs(2)).await
+        } else {
+            MockWorker::start_slow_stream(vec!["data: a\n\n"], Duration::from_secs(2)).await
+        };
+        let (ctx, _janitor) = build_ctx_with_janitor(&worker.url);
+        let response = build_router(ctx)
+            .oneshot(cancellation::request(serde_json::json!({"stream":true})))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if before_headers {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::OK
+            }
+        );
+        let result = response.into_body().collect().await;
+        assert_eq!(result.is_ok(), before_headers);
+        assert_engine_abort(&worker).await;
+    }
+}
+
+async fn assert_engine_abort(worker: &crate::common::mock_worker::MockWorker) {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while worker.abort_log.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(worker.captured.lock().unwrap().last_body.as_ref().unwrap())
+            .unwrap();
+    assert_eq!(
+        *worker.abort_log.lock().unwrap(),
+        vec![serde_json::json!({"rid":forwarded["rid"], "abort_all":false})]
     );
 }
 

@@ -55,6 +55,13 @@ def _unsupported_derived_weight_cache_error(
             "online weight updates."
         )
 
+    if model is not None:
+        # Model-owned caches can publish the same rank-uniform constraint
+        # without importing individual model implementations in the updater.
+        for module in model.modules():
+            reason = getattr(module, "_derived_weight_cache_error", None)
+            if reason is not None:
+                return reason
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
