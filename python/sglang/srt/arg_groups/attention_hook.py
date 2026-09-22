@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
+    use_mla_backend,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -36,6 +37,57 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _xpu_fmha_emits_softmax_lse() -> bool:
+    """True iff the installed sgl-kernel-xpu FMHA kernels write softmax_lse."""
+    try:
+        import sgl_kernel  # noqa: F401  (registers the op read below)
+        import torch
+
+        return "return_softmax_lse" in str(torch.ops.sgl_kernel.fwd.default._schema)
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+# Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
+XPU_DECODE_MAX_Q_GROUP_SIZE = 16
+
+
+def xpu_dcp_decode_q_group_error(
+    model_config: Any, *, attn_tp_size: int, dcp_size: int
+) -> Optional[str]:
+    """Why this tp/dcp split overflows the XPU decode kernel's GQA group, or None."""
+    if dcp_size <= 1:
+        return None
+
+    def group_at(dcp: int) -> int:
+        q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
+        kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp))
+        return q_heads * dcp // kv_heads
+
+    group = group_at(dcp_size)
+    if group <= XPU_DECODE_MAX_Q_GROUP_SIZE:
+        return None
+
+    fitting = [
+        d
+        for d in range(1, dcp_size)
+        if attn_tp_size % d == 0 and group_at(d) <= XPU_DECODE_MAX_Q_GROUP_SIZE
+    ]
+    remedy = (
+        f"Use --dcp-size {max(fitting)} or lower, raise --tp-size, or use "
+        "--attention-backend triton."
+        if fitting
+        else "No --dcp-size fits at this --tp-size; use --attention-backend triton."
+    )
+    return (
+        f"--dcp-size {dcp_size} with intel_xpu gives the decode FMHA a "
+        f"q_group_size of {group} for "
+        f"{model_config.hf_config.architectures[0]} at attention TP size "
+        f"{attn_tp_size}; only up to {XPU_DECODE_MAX_Q_GROUP_SIZE} is built. "
+        f"{remedy}"
+    )
 
 
 def handle_attention_backend_compatibility(server_args: Any):
@@ -203,6 +255,48 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
     # XPU platforms backends
+    if (
+        cfg.dcp_size > 1
+        and "intel_xpu" in attention_backends_of(resolved_view(server_args))
+        and not _xpu_fmha_emits_softmax_lse()
+    ):
+        raise ValueError(
+            "--dcp-size > 1 with intel_xpu needs an sgl-kernel-xpu build whose "
+            "FMHA kernels emit the softmax LSE. Upgrade it, or use "
+            "--attention-backend triton."
+        )
+
+    if cfg.dcp_size > 1 and "intel_xpu" in attention_backends_of(
+        resolved_view(server_args)
+    ):
+        view = resolved_view(server_args)
+        message = xpu_dcp_decode_q_group_error(
+            model_config,
+            attn_tp_size=cfg.tp_size
+            // (cfg.dp_size if view.enable_dp_attention else 1)
+            // view.attn_cp_size,
+            dcp_size=cfg.dcp_size,
+        )
+        if message is not None:
+            raise ValueError(message)
+
+    if (
+        cfg.dcp_size > 1
+        and cfg.speculative_algorithm is not None
+        and "intel_xpu" in attention_backends_of(resolved_view(server_args))
+    ):
+        raise ValueError(
+            f"--speculative-algorithm {cfg.speculative_algorithm} with "
+            "--dcp-size > 1 is not supported on intel_xpu (no TARGET_VERIFY "
+            "metadata). Use --attention-backend triton."
+        )
+
+    if cfg.dcp_size > 1 and get_platform().is_xpu and use_mla_backend(server_args):
+        raise ValueError(
+            "--dcp-size > 1 is not supported for MLA models on Intel XPU. "
+            "Use an MHA/GQA model."
+        )
+
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
 

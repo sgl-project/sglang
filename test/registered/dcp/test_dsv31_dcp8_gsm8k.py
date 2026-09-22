@@ -1,6 +1,9 @@
 """
 DCP (Decode Context Parallelism) correctness tests for DeepSeek-V3.1.
 
+Everything below describes the CUDA configuration. The same test IDs also run on
+Intel XPU, against the model, backend and shape in _XPU_PLATFORM.
+
 Test classes:
     TestDSV31DCP8TP8GSM8K          — CI gate: DCP=8 + TP=8 GSM8K accuracy + decode sanity
     TestDSV31DCP8LogprobParity     — (manual) DCP=8 vs non-DCP logprob equivalence
@@ -40,11 +43,12 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_xpu, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -56,43 +60,113 @@ from sglang.test.test_utils import (
 # CI registration — only TestDSV31DCP8TP8GSM8K runs in CI
 # ---------------------------------------------------------------------------
 register_cuda_ci(est_time=213, stage="extra-b", runner_config="8-gpu-h200")
+register_xpu_ci(est_time=1200, suite="nightly-xpu-4-gpu", nightly=True)
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
+_IS_XPU = is_xpu()
+
+
+class _PlatformConfig:
+    def __init__(
+        self,
+        *,
+        model,
+        backend,
+        tp_size,
+        dcp_size,
+        dcp_alt,
+        gsm8k_threshold,
+        gsm8k_questions,
+        gsm8k_threads,
+        launch_timeout_mult,
+        extra_args,
+    ):
+        self.model = model
+        self.backend = backend
+        self.tp_size = tp_size
+        self.dcp_size = dcp_size
+        self.dcp_alt = dcp_alt
+        self.gsm8k_threshold = gsm8k_threshold
+        self.gsm8k_questions = gsm8k_questions
+        self.gsm8k_threads = gsm8k_threads
+        self.launch_timeout_mult = launch_timeout_mult
+        self.extra_args = extra_args
+
+
+_CUDA_PLATFORM = _PlatformConfig(
+    model=DEEPSEEK_V31_MODEL_PATH,
+    backend="flashinfer",
+    tp_size=8,
+    dcp_size=8,
+    dcp_alt=4,
+    gsm8k_threshold=0.90,
+    gsm8k_questions=200,
+    gsm8k_threads=128,
+    launch_timeout_mult=5,
+    extra_args=[
+        "--enable-cache-report",
+        "--enable-metrics",
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.88",
+        "--chunked-prefill-size",
+        "16384",
+        "--max-running-requests",
+        "256",
+        "--cuda-graph-max-bs-decode",
+        "256",
+        "--log-requests",
+        "--log-requests-level",
+        "3",
+    ],
+)
+
+_XPU_PLATFORM = _PlatformConfig(
+    model=DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
+    backend="intel_xpu",
+    tp_size=4,
+    dcp_size=2,
+    dcp_alt=None,
+    gsm8k_threshold=0.80,
+    gsm8k_questions=100 if is_in_ci() else 200,
+    gsm8k_threads=32,
+    launch_timeout_mult=3,
+    extra_args=[
+        "--device",
+        "xpu",
+        "--mem-fraction-static",
+        "0.60",
+        "--chunked-prefill-size",
+        "2048",
+        "--disable-radix-cache",
+    ],
+)
+
+_PLATFORM = _XPU_PLATFORM if _IS_XPU else _CUDA_PLATFORM
+
+_SKIP_REASON = None
+if _IS_XPU:
+    from sglang.srt.arg_groups.attention_hook import _xpu_fmha_emits_softmax_lse
+
+    if not _xpu_fmha_emits_softmax_lse():
+        _SKIP_REASON = "installed sgl-kernel-xpu does not emit softmax_lse"
+
 _COMMON_SERVER_ARGS = [
     "--tp-size",
-    "8",
-    "--enable-cache-report",
-    "--enable-metrics",
+    str(_PLATFORM.tp_size),
     "--random-seed",
     "0",
-    "--trust-remote-code",
-    "--mem-fraction-static",
-    "0.88",
-    "--chunked-prefill-size",
-    "16384",
-    "--max-running-requests",
-    "256",
-    "--cuda-graph-max-bs-decode",
-    "256",
     "--attention-backend",
-    "flashinfer",
+    _PLATFORM.backend,
     "--cuda-graph-backend-prefill=disabled",
     "--log-level",
     "info",
-    "--log-requests",
-    "--log-requests-level",
-    "3",
+    *_PLATFORM.extra_args,
 ]
 
-_DCP8_ARGS = [
-    "--dcp-size",
-    "8",
-]
-_DCP4_ARGS = [
-    "--dcp-size",
-    "4",
-]
+_DCP8_ARGS = ["--dcp-size", str(_PLATFORM.dcp_size)]
+_DCP4_ARGS = ["--dcp-size", str(_PLATFORM.dcp_alt or _PLATFORM.dcp_size)]
 
 # Prompts used for logprob parity verification between DCP and non-DCP.
 _LOGPROB_PARITY_PROMPTS = [
@@ -105,12 +179,6 @@ _LOGPROB_PARITY_PROMPTS = [
 
 
 def _get_max_total_num_tokens(base_url: str) -> int:
-    """Fetch max_total_num_tokens from /server_info.
-
-    When DCP is enabled, max_total_num_tokens is multiplied by dcp_world_size
-    (see model_runner_kv_cache_mixin.py), so this value can be used to verify
-    that DCP is actually active.
-    """
     resp = requests.get(f"{base_url}/server_info", timeout=30)
     resp.raise_for_status()
     info = resp.json()
@@ -121,6 +189,7 @@ def _get_max_total_num_tokens(base_url: str) -> int:
 # ---------------------------------------------------------------------------
 # Test 1: CI accuracy gate + decode sanity (DCP=8, TP=8)
 # ---------------------------------------------------------------------------
+@unittest.skipIf(_SKIP_REASON is not None, _SKIP_REASON or "")
 class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestCase):
     """DCP=8 with TP=8 on DeepSeek-V3.1 — CI accuracy gate + basic decode probes.
 
@@ -136,15 +205,15 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         no-repetition, temp=0 determinism, max_new_tokens=1)
     """
 
-    model = DEEPSEEK_V31_MODEL_PATH
+    model = _PLATFORM.model
     base_url = DEFAULT_URL_FOR_TEST
 
     # Non-DCP V3.1 baseline on 200 questions typically scores ~0.93–0.94.
     # The 0.90 threshold provides ~3–4% headroom for initial DCP validation.
     # For tighter verification, run TestDSV31DCP8LogprobParity manually.
-    gsm8k_accuracy_thres = 0.90
-    gsm8k_num_questions = 200
-    gsm8k_num_threads = 128
+    gsm8k_accuracy_thres = _PLATFORM.gsm8k_threshold
+    gsm8k_num_questions = _PLATFORM.gsm8k_questions
+    gsm8k_num_threads = _PLATFORM.gsm8k_threads
     gsm8k_num_shots = 5
 
     @classmethod
@@ -152,7 +221,7 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * _PLATFORM.launch_timeout_mult,
             other_args=_DCP8_ARGS + _COMMON_SERVER_ARGS,
         )
         # Store max_total_num_tokens so we can verify DCP is active.
@@ -197,7 +266,7 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
       3. Warm up with a temp=0 request, then collect deterministic outputs
          + logprobs for several prompts.
       4. Kill the baseline, launch a DCP=8 (TP=8) server on the same port.
-      5. Verify max_total_num_tokens is ~8x the baseline (DCP activation check).
+      5. Verify both servers report a nonzero max_total_num_tokens (liveness).
       6. Warm up and collect outputs + logprobs for the same prompts.
       7. Assert:
          - Output text matches exactly (temperature=0 must be deterministic)
@@ -212,12 +281,12 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
 
     # Maximum per-token logprob difference between DCP and non-DCP.
     # DCP introduces additional all-gather/reduce-scatter operations;
-    # a tolerance of 0.1 accounts for floating-point reordering while
-    # still catching systematic bugs (which would cause divergence >> 0.1).
+    # a tolerance of 1.0 accounts for floating-point reordering while
+    # still catching systematic bugs (which diverge by many nats).
     LOGPROB_TOLERANCE = 1.0
     base_url = "http://127.0.0.1:31500"
 
-    model = DEEPSEEK_V31_MODEL_PATH
+    model = _PLATFORM.model
 
     @classmethod
     def setUpClass(cls):
@@ -225,10 +294,10 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
         env = os.environ.copy()
         env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         cls._baseline_process = popen_launch_server(
-            DEEPSEEK_V31_MODEL_PATH,
+            cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=_COMMON_SERVER_ARGS,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * _PLATFORM.launch_timeout_mult,
+            other_args=list(_COMMON_SERVER_ARGS),
             env=env,
         )
         cls._processes = [cls._baseline_process]
@@ -286,6 +355,7 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
     def test_logprob_parity(self):
         # --- Phase 1: collect baseline (non-DCP) outputs ---
         self._warmup_request(self.base_url)
+        baseline_max_total = _get_max_total_num_tokens(self.base_url)
 
         baseline_results = []
         for prompt in _LOGPROB_PARITY_PROMPTS:
@@ -299,14 +369,17 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
         env = os.environ.copy()
         env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         dcp_process = popen_launch_server(
-            DEEPSEEK_V31_MODEL_PATH,
+            self.model,
             self.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * _PLATFORM.launch_timeout_mult,
             other_args=_DCP8_ARGS + _COMMON_SERVER_ARGS,
             env=env,
         )
         self._processes.append(dcp_process)
         self._warmup_request(self.base_url)
+
+        self.assertGreater(baseline_max_total, 0)
+        self.assertGreater(_get_max_total_num_tokens(self.base_url), 0)
 
         dcp_results = []
         for prompt in _LOGPROB_PARITY_PROMPTS:
@@ -319,9 +392,9 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
             self.assertEqual(
                 baseline["text"],
                 dcp["text"],
-                f"Prompt '{prompt_short}...': output text differs between non-DCP and DCP=8.\n"
+                f"Prompt '{prompt_short}...': output text differs between non-DCP and DCP.\n"
                 f"  non-DCP: {baseline['text']!r}\n"
-                f"  DCP=8:   {dcp['text']!r}",
+                f"  DCP:     {dcp['text']!r}",
             )
             # Token logprobs must be within tolerance
             b_probs = baseline["output_logprobs"]
@@ -367,7 +440,15 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
 # Test 3: DCP=4 variant (manual-only, exercises different all-gather pattern)
 # ---------------------------------------------------------------------------
 @unittest.skipIf(
-    is_in_ci(), "Requires 8 GPUs; run locally for additional DCP coverage."
+    _PLATFORM.dcp_alt is None,
+    "Platform admits only one DCP width (XPU: the KV-head replication rule caps "
+    "dcp_size at tp_size // total_num_kv_heads = 2), so this would re-run the CI "
+    "shape.",
+)
+@unittest.skipIf(
+    is_in_ci(),
+    "Second DCP shape; run locally rather than paying for another full model load "
+    "in CI.",
 )
 class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestCase):
     """DCP=4 with TP=8 — exercises a different all-gather pattern than DCP=8.
@@ -382,12 +463,12 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
       - all_gather_kv_cache_for_dcp (4-way vs 8-way interleave pattern)
     """
 
-    model = DEEPSEEK_V31_MODEL_PATH
+    model = _PLATFORM.model
     base_url = "http://127.0.0.1:31501"
 
-    gsm8k_accuracy_thres = 0.90
-    gsm8k_num_questions = 200
-    gsm8k_num_threads = 128
+    gsm8k_accuracy_thres = _PLATFORM.gsm8k_threshold
+    gsm8k_num_questions = _PLATFORM.gsm8k_questions
+    gsm8k_num_threads = _PLATFORM.gsm8k_threads
     gsm8k_num_shots = 5
 
     @classmethod
@@ -396,7 +477,7 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * _PLATFORM.launch_timeout_mult,
             other_args=_DCP4_ARGS + _COMMON_SERVER_ARGS,
             env=env,
         )

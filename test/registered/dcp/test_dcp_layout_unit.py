@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt import runtime_context as rc
+from sglang.srt.arg_groups.parallel_hook import dcp_kv_head_replication_error
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
@@ -376,6 +377,57 @@ class TestGetDcpLens(CustomTestCase):
             self.assertTrue(torch.equal(q, q_weight[tp_rank * 4 : (tp_rank + 1) * 4]))
             self.assertTrue(torch.equal(k, k_weight[kv_start : kv_start + 2]))
             self.assertTrue(torch.equal(v, v_weight[kv_start : kv_start + 2]))
+
+    @staticmethod
+    def _replication_config(arch: str, total_num_kv_heads: int):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = SimpleNamespace(architectures=[arch], model_type="")
+        model_config.hf_text_config = SimpleNamespace(
+            num_key_value_heads=total_num_kv_heads
+        )
+        model_config.is_draft_model = False
+        return model_config
+
+    def _replication_error(self, arch, total_kv, *, tp_size, dcp_size, is_mla=False):
+        return dcp_kv_head_replication_error(
+            self._replication_config(arch, total_kv),
+            tp_size=tp_size,
+            dcp_size=dcp_size,
+            is_mla=is_mla,
+        )
+
+    def test_plain_tp_gqa_model_is_refused_when_the_head_counts_diverge(self):
+        message = self._replication_error("LlamaForCausalLM", 8, tp_size=4, dcp_size=2)
+        self.assertIsNotNone(message)
+        self.assertIn("4 KV heads per rank", message)
+        self.assertIn("produces 2", message)
+        self.assertIn("--dcp-size 1 or lower", message)
+
+    def test_coinciding_head_counts_are_admitted(self):
+        self.assertIsNone(
+            self._replication_error("Qwen2ForCausalLM", 2, tp_size=4, dcp_size=2)
+        )
+        self.assertIsNotNone(
+            self._replication_error("Qwen2ForCausalLM", 2, tp_size=4, dcp_size=4)
+        )
+
+    def test_qwen3_5_is_admitted_because_its_qkv_is_dcp_aware(self):
+        for dcp_size in (2, 4):
+            self.assertIsNone(
+                self._replication_error(
+                    "Qwen3_5ForConditionalGeneration", 4, tp_size=4, dcp_size=dcp_size
+                )
+            )
+
+    def test_mla_and_dcp_size_one_are_admitted(self):
+        self.assertIsNone(
+            self._replication_error(
+                "DeepseekV3ForCausalLM", 8, tp_size=4, dcp_size=2, is_mla=True
+            )
+        )
+        self.assertIsNone(
+            self._replication_error("LlamaForCausalLM", 8, tp_size=4, dcp_size=1)
+        )
 
     def test_configurator_scales_only_the_virtual_dcp_allocator(self):
         physical_kv_size = 1024

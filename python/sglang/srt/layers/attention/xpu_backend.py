@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -12,12 +13,21 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mha,
+    dcp_empty_lse_rows,
+    dcp_gather_q_heads,
+    dcp_shard_page_table,
+    dcp_ungather_heads,
+    get_dcp_lens,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -34,6 +44,22 @@ from sgl_kernel import (
     merge_state_v2,
 )
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+class XPUDCPMetadata(msgspec.Struct):
+    """This rank's shard of the KV region the paged kernel may read."""
+
+    page_table: Optional[torch.Tensor] = None
+    cache_seqlens_int32: Optional[torch.Tensor] = None
+    max_seq_len_k: int = 0
+    empty_lse_rows: Optional[torch.Tensor] = None
+
+
+_DCP_SINKS_MSG = "DCP with attention sinks is not supported on intel_xpu."
+
+_DCP_SWA_MSG = (
+    "DCP with sliding-window layers is not supported on intel_xpu. Drop --dcp-size."
+)
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -132,8 +158,164 @@ class XPUAttentionBackend(AttentionBackend):
                 "graph decode path cannot run the varlen KV gather."
             )
 
+        is_draft = model_runner.is_draft_worker
+        self.dcp_size = 1 if is_draft else get_parallel().attn_dcp_size
+        self.dcp_rank = 0 if is_draft else get_parallel().attn_dcp_rank
+        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, self.dcp_size
+        )
+        self.dcp_q_per_kv_head = self.num_local_heads // max(1, self.num_kv_head)
+        self.dcp_group = None
+        self.dcp_metadata: XPUDCPMetadata = None
+        if self.dcp_size > 1:
+            self.dcp_group = get_parallel().dcp_group
+            self._assert_dcp_supported(model_runner)
+
+    def _assert_dcp_supported(self, model_runner: ModelRunner):
+        """Reject the DCP combinations that would read the wrong KV."""
+        if self.use_mla:
+            raise ValueError(
+                "DCP on intel_xpu supports MHA/GQA only (the MLA kernels return "
+                "no softmax LSE)."
+            )
+        if self.has_swa:
+            raise ValueError(_DCP_SWA_MSG)
+        if self.attention_chunk_size is not None:
+            raise ValueError(
+                "DCP with chunked local attention (iRoPE) is not supported on "
+                "intel_xpu."
+            )
+        if self.is_encoder_decoder:
+            raise ValueError(
+                "DCP is not supported for encoder-decoder models on intel_xpu."
+            )
+        if model_runner.spec_algorithm.is_speculative():
+            raise ValueError(
+                "DCP with speculative decoding is not supported on intel_xpu."
+            )
+        if self.kv_cache_dtype_str != "auto":
+            raise ValueError(
+                "DCP with a quantized KV cache is not supported on intel_xpu."
+            )
+
+        from sglang.srt.arg_groups.attention_hook import XPU_DECODE_MAX_Q_GROUP_SIZE
+
+        gathered_q_group = (
+            self.num_local_heads * self.dcp_size // max(1, self.num_kv_head)
+        )
+        if gathered_q_group > XPU_DECODE_MAX_Q_GROUP_SIZE:
+            raise ValueError(
+                f"DCP over {self.dcp_size} ranks needs a q_group_size of "
+                f"{gathered_q_group} from the intel_xpu decode FMHA, which supports "
+                f"{XPU_DECODE_MAX_Q_GROUP_SIZE}. Lower --dcp-size or raise --tp-size."
+            )
+
+        from sglang.srt.model_executor.cuda_graph_config import (
+            cuda_graph_fully_disabled,
+        )
+
+        if not cuda_graph_fully_disabled():
+            raise ValueError(
+                "DCP on intel_xpu requires CUDA graph disabled (it is off by "
+                "default on XPU)."
+            )
+
+    def _set_kv_buffer_mha(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """Write this rank's K/V into the paged MHA pool."""
+        if self.dcp_size == 1:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+            return
+
+        positions = forward_batch.positions
+        if positions is not None and positions.numel() == cache_loc.numel():
+            dcp_kv_mask = positions % self.dcp_size == self.dcp_rank
+        else:
+            dcp_kv_mask = forward_batch.dcp_kv_mask
+        self.token_to_kv_pool.set_kv_buffer(
+            layer,
+            KVWriteLoc(cache_loc // self.dcp_size),
+            k,
+            v,
+            layer.k_scale,
+            layer.v_scale,
+            dcp_kv_mask=dcp_kv_mask,
+        )
+
+    def _dcp_ungather(self, x: torch.Tensor) -> torch.Tensor:
+        """Undo the query-head gather's KV-head-major order on a kernel result."""
+        return dcp_ungather_heads(
+            x, self.dcp_size, self.num_kv_head, self.dcp_q_per_kv_head
+        )
+
+    def _init_forward_metadata_dcp(self, forward_batch: ForwardBatch):
+        """Build the DCP read metadata: this rank's shard of the KV region."""
+        metadata = FlashAttentionMetadata()
+        dcp_metadata = XPUDCPMetadata()
+        device = forward_batch.seq_lens.device
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            lens, lens_cpu = forward_batch.seq_lens, forward_batch.seq_lens_cpu
+            seq_lens_q_cpu = None
+            metadata.max_seq_len_q = 1
+            metadata.cu_seqlens_q = torch.arange(
+                0, forward_batch.batch_size + 1, dtype=torch.int32, device=device
+            )
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            lens = forward_batch.extend_prefix_lens
+            lens_cpu = torch.as_tensor(forward_batch.extend_prefix_lens_cpu)
+            seq_lens_q_cpu = torch.as_tensor(forward_batch.extend_seq_lens_cpu)
+            metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+            metadata.cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+        else:
+            raise ValueError(
+                f"DCP on intel_xpu does not support {forward_batch.forward_mode}"
+            )
+
+        dcp_metadata.cache_seqlens_int32 = get_dcp_lens(
+            lens, self.dcp_size, self.dcp_rank
+        ).to(torch.int32)
+        local_lens_cpu = get_dcp_lens(lens_cpu, self.dcp_size, self.dcp_rank)
+        dcp_metadata.max_seq_len_k = int(local_lens_cpu.max())
+        # Blocking copy: the source is a pageable temporary that Python frees as soon
+        # as .to() returns, so an async copy could read it after free.
+        dcp_metadata.empty_lse_rows = dcp_empty_lse_rows(
+            local_lens_cpu, seq_lens_q_cpu
+        ).to(device)
+        dcp_metadata.page_table = dcp_shard_page_table(
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            self.page_size,
+            self.dcp_size,
+            self.dcp_rank,
+            dcp_metadata.max_seq_len_k,
+        )
+
+        self.forward_metadata = metadata
+        self.dcp_metadata = dcp_metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        if self.dcp_size > 1:
+            self._init_forward_metadata_dcp(forward_batch)
+            return
+
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -511,17 +693,7 @@ class XPUAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(
-                            cache_loc,
-                            self.forward_metadata.swa_out_cache_loc,
-                        ),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+                    self._set_kv_buffer_mha(layer, forward_batch, cache_loc, k, v)
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -561,6 +733,12 @@ class XPUAttentionBackend(AttentionBackend):
             or layer.attn_type
             in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
         )
+
+        if self.dcp_size > 1:
+            assert not is_hybrid_swa, _DCP_SWA_MSG
+            return self._forward_extend_dcp(
+                q, k, v, layer, forward_batch, causal, sinks
+            )
 
         # Check if we should use local attention
         use_local_attn = (
@@ -911,6 +1089,171 @@ class XPUAttentionBackend(AttentionBackend):
             out[(cache_seqlens == 0).repeat_interleave(seg)] = 0
         return out
 
+    def _dcp_partial_paged_attn(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+    ):
+        """This rank's fp32 partial attention over its KV shard, with the merge LSE."""
+        tokens, heads, _ = q.shape
+        dcp = self.dcp_metadata
+        if dcp.page_table is None:
+            return (
+                q.new_zeros((tokens, heads, layer.v_head_dim), dtype=torch.float32),
+                q.new_full((tokens, heads), -float("inf"), dtype=torch.float32),
+            )
+
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        out, softmax_lse, *_ = flash_attn_with_kvcache(
+            q=q,
+            k_cache=key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ),
+            v_cache=value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            ),
+            page_table=dcp.page_table,
+            cache_seqlens=dcp.cache_seqlens_int32,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=None,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            causal=False,
+            window_size=(-1, -1),
+            softcap=layer.logit_cap,
+            return_softmax_lse=True,
+            num_splits=self.num_splits,
+        )
+        lse = softmax_lse.transpose(0, 1).to(torch.float32).contiguous()
+        empty = dcp.empty_lse_rows
+        if empty.numel() < tokens:
+            # Rows past cu_seqlens_q are padding; they must not enter the merge.
+            empty = torch.cat([empty, empty.new_ones(tokens - empty.numel())])
+        return out.to(torch.float32), lse.masked_fill_(
+            empty.unsqueeze(-1), -float("inf")
+        )
+
+    def _forward_decode_dcp(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        sinks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Decode attention over KV sharded across the DCP group."""
+        assert sinks is None, _DCP_SINKS_MSG
+        q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_all = dcp_gather_q_heads(
+            q_local, self.dcp_group, self.num_kv_head, self.dcp_q_per_kv_head
+        )
+        out, lse = self._dcp_partial_paged_attn(
+            q_all, layer, self.forward_metadata.cu_seqlens_q, 1
+        )
+        o = cp_lse_ag_out_rs_mha(
+            self._dcp_ungather(out), self._dcp_ungather(lse), self.dcp_group
+        )
+        return o.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    @staticmethod
+    def _single_token_self_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Closed-form (out, lse) for one query token attending only to itself.
+
+        sgl-kernel-xpu's varlen prefill kernel hangs at seqlen_q == 1, which the DCP
+        extend leg reaches on a 1-token chunk; softmax over a single score is 1, so
+        out is v and the LSE is that score.
+        """
+        tokens, q_heads, _ = q.shape
+        kv_heads = k.shape[1]
+        group = q_heads // kv_heads
+        scores = (
+            q.view(tokens, kv_heads, group, -1).to(torch.float32) * k.unsqueeze(2)
+        ).sum(-1).view(tokens, q_heads) * layer.scaling
+        if layer.logit_cap is not None and layer.logit_cap > 0:
+            scores = layer.logit_cap * torch.tanh(scores / layer.logit_cap)
+        out = (
+            v.unsqueeze(2)
+            .expand(tokens, kv_heads, group, layer.v_head_dim)
+            .reshape(tokens, q_heads, layer.v_head_dim)
+            .to(torch.float32)
+        )
+        return out, scores.contiguous()
+
+    def _forward_extend_dcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        sinks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Extend attention over KV sharded across the DCP group."""
+        assert sinks is None, _DCP_SINKS_MSG
+        assert k is not None and v is not None, (
+            "DCP with cross-layer KV sharing is not supported on intel_xpu."
+        )
+        metadata = self.forward_metadata
+        q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        k_local = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+        v_local = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        if metadata.max_seq_len_q == 1:
+            current_out, current_lse = self._single_token_self_attn(
+                q_local, k_local, v_local, layer
+            )
+        else:
+            current_out, current_lse, *_ = flash_attn_varlen_func(
+                q=q_local,
+                k=k_local,
+                v=v_local,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k=metadata.cu_seqlens_q,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                softcap=layer.logit_cap,
+                return_softmax_lse=True,
+            )
+            current_out = current_out.to(torch.float32)
+            current_lse = current_lse.transpose(0, 1).to(torch.float32).contiguous()
+
+        no_prefix_on_any_rank = not any(forward_batch.extend_prefix_lens_cpu)
+        if no_prefix_on_any_rank:
+            return current_out.to(q.dtype).view(
+                -1, layer.tp_q_head_num * layer.v_head_dim
+            )
+
+        q_all = dcp_gather_q_heads(
+            q_local, self.dcp_group, self.num_kv_head, self.dcp_q_per_kv_head
+        )
+        prefix_out, prefix_lse = self._dcp_partial_paged_attn(
+            q_all, layer, metadata.cu_seqlens_q, metadata.max_seq_len_q
+        )
+        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
+            self._dcp_ungather(prefix_out),
+            self._dcp_ungather(prefix_lse),
+            self.dcp_group,
+            return_lse=True,
+        )
+
+        final_lse = torch.logaddexp(prefix_lse, current_lse)
+        prefix_scale = torch.nan_to_num(
+            torch.exp(prefix_lse - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+        ).unsqueeze(-1)
+        current_scale = torch.nan_to_num(
+            torch.exp(current_lse - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+        ).unsqueeze(-1)
+        out = prefix_out * prefix_scale + current_out * current_scale
+        return out.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -937,17 +1280,7 @@ class XPUAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(
-                            cache_loc,
-                            self.forward_metadata.swa_out_cache_loc,
-                        ),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+                    self._set_kv_buffer_mha(layer, forward_batch, cache_loc, k, v)
                 else:
                     # Pass k_rope as-is like forward_extend: when rope is folded into
                     # k (k_rope is None), set_mla_kv_buffer stores the whole kv row.
@@ -987,6 +1320,10 @@ class XPUAttentionBackend(AttentionBackend):
             or layer.attn_type
             in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
         )
+
+        if self.dcp_size > 1:
+            assert window_size == (-1, -1), _DCP_SWA_MSG
+            return self._forward_decode_dcp(q, layer, sinks)
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}

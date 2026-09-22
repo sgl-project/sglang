@@ -311,6 +311,55 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Not yet implemented |
 
+## Decode Context Parallel (DCP) on Intel XPU [Experimental]
+
+DCP shards the KV cache across TP ranks by token position
+(`pos % dcp_size == dcp_rank`) and merges each rank's partial attention output by
+log-sum-exp over oneCCL (`xccl`). It buys context length, not throughput: the
+servable context grows by `dcp_size`, while decode runs roughly half as fast at
+`--dcp-size 2` on PCIe-connected parts, because the two extra collectives per layer
+outweigh the halved per-rank KV read. Leave it at 1 unless the context you need does
+not fit.
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --attention-backend intel_xpu \
+    --tp 4 --dcp-size 2 --mem-fraction-static 0.70
+```
+
+`max_total_num_tokens` reported at startup is the **per-rank** slot count; the
+servable context is `max_total_num_tokens * dcp_size`.
+
+Both XPU attention backends implement DCP and neither is selected automatically, so
+pass `--attention-backend` explicitly. `intel_xpu` is the faster one — on
+GLM-4.1V-9B-Thinking at TP=4/DCP=2, 32.38 vs 29.03 tok/s decode and 8514 vs 2957
+tok/s prefill against `triton` at the same width — but needs an
+[sgl-kernel-xpu](https://github.com/sgl-project/sgl-kernel-xpu) build whose FMHA
+kernels emit the softmax LSE; `triton` runs on any build.
+
+### Requirements
+
+Each of these is checked at startup and refused with a message naming the fix.
+
+| Requirement | Reason |
+|---|---|
+| `dcp_size` divides `tp_size` | A DCP group is a subdivision of a TP group. |
+| An MHA/GQA model | Neither XPU backend has an MLA path under DCP: the XPU MLA kernels emit no softmax LSE, and the MLA writes reachable from Triton cannot resolve the per-rank owner rule. |
+| `total_num_kv_heads <= tp_size / dcp_size` | Every rank of a DCP group must hold the same KV heads, and only `models/qwen3_5.py` shards its qkv projection that way. For any other model a wider `dcp_size` would write the KV cache at the wrong stride instead of failing. |
+| For `intel_xpu`: an sgl-kernel-xpu build that emits `softmax_lse` | The cross-rank merge weights each rank's partial by its log-sum-exp. Older builds accept `return_softmax_lse` and leave the buffer unwritten, so the merge would run on uninitialized memory. Probed from the `sgl_kernel::fwd` op schema. |
+| For `intel_xpu`: at most 16 query heads per KV head after the gather | The query all-gather multiplies the decode kernel's packed GQA group by `dcp_size`, and it is instantiated only up to 16. GLM-4.1V-9B-Thinking (32 query / 2 KV heads) lands on exactly 16 at TP=4/DCP=2, with no headroom for `--dcp-size 4`. |
+| A lower `--mem-fraction-static` than the same model without DCP | The per-layer xccl all-gather / reduce-scatter need Level Zero scratch outside the static pool. A 9B model at TP=4/DCP=2 on 4x Arc Pro B60 serves at `0.70` and fails at `0.85` with `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the TP all-reduce. |
+
+### Not supported under DCP
+
+Decode graph capture is auto-disabled at startup, since the per-layer collectives are
+not capturable in an XPU graph. The `intel_xpu` backend refuses sliding window
+attention, chunked local attention (iRoPE), encoder-decoder models, attention sinks,
+speculative decoding, a quantized KV cache (`--kv-cache-dtype` other than `auto`) and
+cross-layer KV sharing rather than attending over the wrong tokens — each of them
+reaches the KV cache through indices the sharded page table no longer describes.
+`--dcp-comm-backend fi_a2a` is CUDA-only; use the default `ag_rs` or `a2a`.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

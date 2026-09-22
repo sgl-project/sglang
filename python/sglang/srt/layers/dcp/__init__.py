@@ -40,6 +40,10 @@ from sglang.srt.layers.dcp.comm import (
     init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
+    dcp_empty_lse_rows,
+    dcp_gather_q_heads,
+    dcp_shard_page_table,
+    dcp_ungather_heads,
     filter_dcp_local_kv_indices,
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
@@ -66,6 +70,10 @@ __all__ = [
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
     "create_triton_kv_indices_for_dcp_triton",
+    "dcp_empty_lse_rows",
+    "dcp_gather_q_heads",
+    "dcp_shard_page_table",
+    "dcp_ungather_heads",
     "filter_dcp_local_kv_indices",
     "get_dcp_lens",
     "update_local_kv_lens_for_dcp",
