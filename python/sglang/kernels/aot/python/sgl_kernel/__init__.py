@@ -135,17 +135,6 @@ else:
         from sgl_kernel.elementwise import gelu_quick
         from sgl_kernel.top_k import deepseek_v4_topk_transform_512
 
-    if torch.version.cuda is not None:
-        try:
-            from sgl_kernel.deepselect import (
-                deepselect_topk,
-                get_deepselect_supported_architectures,
-                get_stride_requirement,
-                is_deepselect_supported,
-            )
-        except (ImportError, OSError):
-            pass
-
     if hasattr(torch.version, "musa") and torch.version.musa is not None:
         from sgl_kernel.musa import (
             min_p_sampling_from_probs,
@@ -216,8 +205,6 @@ else:
     if torch.version.hip is not None:
         _DEBUG_EXPORT_NAMES.append("gelu_quick")
         _DEBUG_EXPORT_NAMES.append("deepseek_v4_topk_transform_512")
-    if "deepselect_topk" in globals():
-        _DEBUG_EXPORT_NAMES.append("deepselect_topk")
 
     for _name in _DEBUG_EXPORT_NAMES:
         if _name in globals():
