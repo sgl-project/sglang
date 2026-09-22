@@ -1,12 +1,14 @@
 import concurrent.futures
 import unittest
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -128,6 +130,224 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestDcpDraftHeadTransfer(unittest.TestCase):
+    def test_transfers_draft_heads_to_logical_destination_rows(self):
+        for src_tp, dst_tp in ((4, 8), (8, 4), (8, 8), (4, 32), (32, 4)):
+            for custom_pool in (False, True):
+                for batch_size in (0, 37):
+                    with self.subTest(
+                        src_tp=src_tp,
+                        dst_tp=dst_tp,
+                        custom_pool=custom_pool,
+                        batch_size=batch_size,
+                    ):
+                        self._check_transfer(src_tp, dst_tp, custom_pool, batch_size)
+
+    def test_rejects_pure_mla_with_unequal_draft_head_widths(self):
+        for src_tp, dst_tp in ((4, 8), (8, 4)):
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp):
+                with self.assertRaisesRegex(ValueError, "dummy prefill senders"):
+                    self._check_transfer(src_tp, dst_tp, False, 37, pure_mla=True)
+
+    def test_sliced_draft_stops_after_failed_batch(self):
+        self._check_transfer(4, 8, False, 37, fail_draft=True)
+
+    def _check_transfer(
+        self, src_tp, dst_tp, custom_pool, batch_size, fail_draft=False, pure_mla=False
+    ):
+        page_size, tokens, heads, head_bytes = 64, 249, 16, 4
+        src_width, dst_width = (
+            max(1, heads // src_tp) * head_bytes,
+            max(1, heads // dst_tp) * head_bytes,
+        )
+        src_pages = np.array([1, 3, 4, 7], dtype=np.int32)
+        logical = np.arange(tokens)
+        src_rows = src_pages[logical // page_size] * page_size + logical % page_size
+        expected = (
+            np.arange(tokens * heads * head_bytes, dtype=np.int64)
+            .reshape(tokens, heads, head_bytes)
+            .astype(np.uint8)
+        )
+        for dst_rank in range(dst_tp):
+            dst_buffers = {
+                base: np.zeros(16384 * max(8, dst_width), dtype=np.uint8)
+                for base in (1000000, 2000000, 3000000, 4000000)
+            }
+            source_ranks = (
+                range(dst_rank * src_tp // dst_tp, (dst_rank + 1) * src_tp // dst_tp)
+                if src_tp >= dst_tp
+                else [dst_rank * src_tp // dst_tp]
+            )
+            for src_rank in source_ranks:
+                src_head_start = (src_rank // max(1, src_tp // heads)) * max(
+                    1, heads // src_tp
+                )
+                source = np.zeros(1024 * src_width, dtype=np.uint8)
+                source.reshape(-1, src_width)[src_rows] = expected[
+                    :, src_head_start : src_head_start + max(1, heads // src_tp)
+                ].reshape(tokens, src_width)
+                target = np.zeros(1024 * 8, dtype=np.uint8)
+                target.reshape(-1, 8)[src_rows] = (
+                    np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)
+                )
+                src_buffers = {10000: target, 100000: source, 200000: source}
+
+                failed_batches = []
+
+                def transfer(
+                    session, blocks, src_buffers=src_buffers, dst_buffers=dst_buffers
+                ):
+                    draft_blocks = [block for block in blocks if block[1] >= 3000000]
+                    if fail_draft and draft_blocks:
+                        failed_batches.append(draft_blocks)
+                        return 17
+                    if batch_size and src_width != dst_width:
+                        self.assertLessEqual(
+                            len(draft_blocks), batch_size * (1 if custom_pool else 2)
+                        )
+                    for src, dst, size in blocks:
+                        src_base = max(base for base in src_buffers if base <= src)
+                        dst_base = max(base for base in dst_buffers if base <= dst)
+                        dst_buffers[dst_base][
+                            dst - dst_base : dst - dst_base + size
+                        ] = src_buffers[src_base][
+                            src - src_base : src - src_base + size
+                        ]
+                    return 0
+
+                manager = SimpleNamespace(
+                    is_mla_backend=pure_mla,
+                    kv_args=SimpleNamespace(
+                        page_size=page_size,
+                        kv_layer_ids=[47, 93, 93],
+                        kv_data_ptrs=[10000, 100000, 200000],
+                        num_draft_entries=2,
+                        engine_rank=src_rank + 2 * src_tp,
+                    ),
+                    attn_tp_size=src_tp,
+                    max_transfer_batch_indices=batch_size,
+                    enable_custom_mem_pool=custom_pool,
+                    _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
+                )
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    result = MooncakeKVManager.send_kvcache_dcp(
+                        manager,
+                        "session",
+                        src_pages,
+                        [1000000, 2000000, 3000000, 4000000],
+                        np.array([2], dtype=np.int32),
+                        dcp_token_item_lens=[8, src_width, src_width],
+                        dst_dcp_size=dst_tp,
+                        dst_dcp_rank=dst_rank,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=tokens,
+                        executor=executor,
+                        dst_layer_ids=[3, 47, 93, 93],
+                        dst_kv_item_lens=[
+                            page_size * 8,
+                            page_size * 8,
+                            page_size * dst_tp * dst_width,
+                            page_size * dst_tp * dst_width,
+                        ],
+                        dst_tp_rank=dst_rank,
+                        dst_attn_tp_size=dst_tp,
+                    )
+                if fail_draft:
+                    self.assertEqual(result, 17)
+                    self.assertEqual(len(failed_batches), 1)
+                    return
+                self.assertEqual(result, 0)
+            dst_head_start = (dst_rank // max(1, dst_tp // heads)) * max(
+                1, heads // dst_tp
+            )
+            for base in (3000000, 4000000):
+                actual = dst_buffers[base].reshape(-1, dst_width)[
+                    2 * page_size * dst_tp + logical
+                ]
+                np.testing.assert_array_equal(
+                    actual,
+                    expected[
+                        :,
+                        dst_head_start : dst_head_start + max(1, heads // dst_tp),
+                    ].reshape(tokens, dst_width),
+                )
+            owned = np.arange(dst_rank, tokens, dst_tp)
+            actual_target = dst_buffers[2000000].reshape(-1, 8)[
+                2 * page_size + owned // dst_tp
+            ]
+            np.testing.assert_array_equal(
+                actual_target,
+                np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)[owned],
+            )
+            self.assertFalse(dst_buffers[1000000].any())
+
+
+class TestDcpPackLifetime(CustomTestCase):
+    def test_failed_transfer_drains_before_pack_buffer_reuse(self):
+        """A failed layer must not release the pack buffer while another transfer reads it."""
+        manager = TestMooncakeTransferBatching._make_manager(
+            enable_custom_mem_pool=True
+        )
+        manager.kv_args = SimpleNamespace(
+            page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
+        )
+        source = np.array([11], dtype=np.uint8)
+        observed = []
+        running, release = Event(), Event()
+
+        def transfer(session, blocks):
+            if blocks[0][0] == 1000:
+                self.assertTrue(running.wait(10))
+                return 17
+            running.set()
+            self.assertTrue(release.wait(10))
+            observed.append(int(source[0]))
+            return 0
+
+        def send(executor):
+            result = MooncakeKVManager.send_kvcache_dcp(
+                manager,
+                "session",
+                np.array([0, 1], dtype=np.int32),
+                [5000, 6000],
+                np.array([0], dtype=np.int32),
+                dcp_token_item_lens=[1, 1],
+                dst_dcp_size=2,
+                dst_dcp_rank=0,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=2,
+                executor=executor,
+                dst_layer_ids=[],
+                pack_buffer=object(),
+            )
+            source[0] = 22
+            return result
+
+        manager._transfer_data = transfer
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+                return_value=([1000, 2000], np.array([0], dtype=np.int64)),
+            ),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as transfers,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker,
+        ):
+            future = worker.submit(send, transfers)
+            try:
+                self.assertTrue(running.wait(10))
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    future.result(timeout=1)
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=10), 17)
+        self.assertEqual(observed, [11])
 
 
 if __name__ == "__main__":
