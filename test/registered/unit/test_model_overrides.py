@@ -908,6 +908,69 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             # pinned to flashinfer_trtllm.
             self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
 
+    def test_mimo_v2_sm120_mxfp4_selects_native_runner(self):
+        """Packed MXFP4 experts must not fall through to the FP8 Triton runner."""
+        with override_platform(is_sm100=False, is_sm120=True, is_hip=False):
+            for architecture in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
+                with self.subTest(architecture=architecture):
+                    args = SimpleNamespace(
+                        speculative_algorithm=None,
+                        device="cuda",
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=True
+                        ),
+                    )
+                    self.assertEqual(
+                        collect_model_override_declarations(
+                            architecture,
+                            args,
+                            SimpleNamespace(architectures=[architecture]),
+                        ),
+                        [
+                            (
+                                "_mimo_v2_overrides",
+                                {"moe_runner_backend": "flashinfer_mxfp4"},
+                            )
+                        ],
+                    )
+
+    def test_mimo_v2_sm120_mxfp4_preserves_other_configurations(self):
+        from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
+
+        with override_platform(is_sm100=False, is_sm120=True, is_hip=False):
+            for override in (
+                {"moe_runner_backend": "marlin"},
+                {"moe_a2a_backend": "deepep"},
+                {"device": "cpu"},
+                {
+                    "_model_config": SimpleNamespace(
+                        quantization="fp8", is_fp4_experts=False
+                    )
+                },
+                {
+                    "_model_config": SimpleNamespace(
+                        quantization=None, is_fp4_experts=False
+                    )
+                },
+            ):
+                with self.subTest(override=override):
+                    values = dict(
+                        speculative_algorithm="EAGLE",
+                        device="cuda",
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=True
+                        ),
+                    )
+                    values.update(override)
+                    self.assertEqual(
+                        _mimo_v2_overrides(SimpleNamespace(**values), _hf("fp8")),
+                        {"enable_multi_layer_eagle": True},
+                    )
+
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
             self.assertEqual(
