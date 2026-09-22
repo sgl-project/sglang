@@ -309,6 +309,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
     # it also pins that the placement happens at load, not on the first use.
     # The encoder is already layerwise under the default component set.
+    # No consistency check: the lifetime moves weights, not math, so the
+    # output is the base case's and that case already guards it.
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_encoder_permanent_residents",
         DiffusionServerArgs(
@@ -319,6 +321,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT),
+        run_consistency_check=False,
     ),
     # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
