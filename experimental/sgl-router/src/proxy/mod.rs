@@ -16,6 +16,7 @@ use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
@@ -38,14 +39,14 @@ enum BreakerOutcome {
     /// The worker was responsive — a 2xx, or a 4xx it answered cleanly (a
     /// client's bad request says nothing about worker health). The non-streaming
     /// arm records success immediately; the streaming arm defers to the pump's
-    /// completion hook, which records success or failure by
-    /// [`sse::StreamEnd::transport_ok`], since a 2xx head can still be followed
+    /// completion hook, which classifies [`sse::StreamEnd::reason`],
+    /// since a 2xx head can still be followed
     /// by a body that never completes.
     Success,
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure (the worker is responsive but at capacity) →
+    /// Backpressure or router-side stream expiry →
     /// `record_backpressure`: never opens the breaker and, while Closed, leaves
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
@@ -78,6 +79,20 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
         StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => BreakerOutcome::Neutral,
         s if s.is_server_error() => BreakerOutcome::Failure,
         _ => BreakerOutcome::Success,
+    }
+}
+
+/// Router-side expiry says nothing about worker health. Preserve the existing
+/// treatment of completed streams and client disconnects; upstream faults,
+/// idle timeouts, and pump panics remain failures.
+fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
+    use sse::StreamEndReason;
+    match end.reason {
+        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => BreakerOutcome::Failure,
     }
 }
 
@@ -163,13 +178,23 @@ fn abort_auth(headers: &HeaderMap) -> Option<HeaderValue> {
 /// Whether the engine may still be generating, given how the SSE pump reported
 /// the stream ended.
 ///
-/// The one shape that proves the engine stopped on its own is a stream drained
-/// to its clean end with the client still attached. A `client_disconnect` means
-/// the reader went away mid-generation. A transport failure (which
-/// [`Proxy::forward_streaming_to`] folds a pump panic into) means the router
-/// lost the connection to the engine, which is no evidence at all about what
-/// the engine is doing — and is precisely when it may still be producing tokens
-/// for a reader that no longer exists.
+/// The one shape that proves the engine stopped on its own is
+/// [`Completed`](sse::StreamEndReason::Completed): a stream drained to its
+/// clean end with the client still attached. Every other reason leaves the
+/// engine either known-still-running or unknown, so it aborts.
+/// `ClientDisconnect` means the reader went away mid-generation.
+/// `UpstreamError` and `PumpPanicked` mean the router lost its own side of the
+/// stream, which is no evidence at all about what the engine is doing — and is
+/// precisely when it may still be producing tokens for a reader that no longer
+/// exists. `IdleTimeout` and `Expired` are router-side deadlines: they fire on
+/// the router's clock and say nothing about whether the engine stopped.
+///
+/// Matched exhaustively on purpose — a reason added to
+/// [`sse::StreamEndReason`] later must be classified here rather than
+/// defaulting to either answer. Note this is a different question from
+/// [`stream_breaker_outcome`]'s, so the two classifications do not track each
+/// other: an `Expired` stream is not the worker's fault (Neutral there) but the
+/// engine is very likely still generating (abort here).
 ///
 /// `saw_error_event` is deliberately not consulted: an engine reporting its own
 /// failure as an SSE `data: {"error"…}` event then closes the stream cleanly,
@@ -181,12 +206,20 @@ fn abort_auth(headers: &HeaderMap) -> Option<HeaderValue> {
 /// Note when this report arrives, which bounds how fast a streaming abort can
 /// land. The pump only learns the client is gone when it next tries to hand a
 /// chunk downstream, so it is parked in `stream.next()` until the engine emits
-/// one: a client that leaves during a long prefill is not acted on until TTFT,
-/// and `forward_streaming_to` sets no request timeout to cap that (only
-/// `forward_json_to` does). Bounding the wait needs an idle/total-stream
-/// deadline, which is the streaming reaper's job, not this hook's.
+/// one: a client that leaves during a long prefill is not acted on at
+/// disconnect but at TTFT. The stream deadlines are what cap that wait —
+/// silence past `stream_idle_timeout_secs` ends the stream as `IdleTimeout`,
+/// and the stale-request token as `Expired` — and both abort here.
 fn engine_may_still_be_generating(end: sse::StreamEnd) -> bool {
-    end.client_disconnect || !end.transport_ok
+    use sse::StreamEndReason;
+    match end.reason {
+        StreamEndReason::Completed => false,
+        StreamEndReason::ClientDisconnect
+        | StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::Expired
+        | StreamEndReason::PumpPanicked => true,
+    }
 }
 
 /// Drop guard that aborts an in-flight engine request when the client goes
@@ -271,6 +304,8 @@ pub struct Proxy {
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+    /// Maximum silence between streamed upstream chunks; `None` waits forever.
+    pub stream_idle_timeout: Option<Duration>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -304,7 +339,13 @@ impl Proxy {
             default_client: build_client(WireProtocol::Http1)?,
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
+            stream_idle_timeout: None,
         })
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
     }
 
     /// The forwarding client for `protocol`, taken from the selected worker's
@@ -383,7 +424,7 @@ impl Proxy {
         }
     }
 
-    /// Breaker-gated JSON POST: checks `breaker.allow()` first, classifies the
+    /// Breaker-gated JSON POST: acquires a cancellation-safe permit first, classifies the
     /// response status through [`breaker_outcome`] (success / failure /
     /// backpressure), and returns `ApiError::BreakerOpen` immediately when the
     /// breaker is Open.
@@ -402,11 +443,9 @@ impl Proxy {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -458,6 +497,7 @@ impl Proxy {
             // worker that answers a probe with 503 isn't wedged shut.
             BreakerOutcome::Neutral => breaker.record_backpressure(),
         }
+        permit.disarm();
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -467,7 +507,7 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Breaker-gated streaming POST: checks `breaker.allow()` first, classifies
+    /// Breaker-gated streaming POST: acquires a cancellation-safe permit first, classifies
     /// the response status through [`breaker_outcome`], and returns
     /// `ApiError::BreakerOpen` when Open.
     ///
@@ -503,12 +543,11 @@ impl Proxy {
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         abort_rid: Option<&str>,
+        expiration: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -580,10 +619,10 @@ impl Proxy {
                 BreakerOutcome::Success => {
                     let breaker_for_hook = Arc::clone(breaker);
                     Some(Box::new(move |end| {
-                        if end.transport_ok {
-                            breaker_for_hook.record_success();
-                        } else {
-                            breaker_for_hook.record_failure();
+                        match stream_breaker_outcome(end) {
+                            BreakerOutcome::Success => breaker_for_hook.record_success(),
+                            BreakerOutcome::Failure => breaker_for_hook.record_failure(),
+                            BreakerOutcome::Neutral => breaker_for_hook.record_backpressure(),
                         }
                         if engine_may_still_be_generating(end) {
                             if let Some((client, abort_url, rid, auth)) = abort_on_end {
@@ -609,11 +648,16 @@ impl Proxy {
         } else {
             None
         };
+        permit.disarm();
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
             on_complete,
             first_byte_hook,
+            sse::StreamLimits {
+                idle_timeout: self.stream_idle_timeout,
+                expiration,
+            },
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
@@ -666,6 +710,50 @@ mod tests {
             p.client_for(WireProtocol::Http1),
             p.admin_client()
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_forwards_release_half_open_probes() {
+        use futures::FutureExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let proxy = Proxy::new(Duration::from_secs(60)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let headers = HeaderMap::new();
+        assert!(proxy
+            .forward_json_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
+        assert!(proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
     }
 
     #[test]
@@ -733,6 +821,147 @@ mod tests {
                 .await;
         });
         (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    async fn spawn_pending_stream_worker() -> (String, oneshot::Sender<()>) {
+        use futures::StreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Body::from_stream(
+                    futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"data: chunk\n\n",
+                    ))])
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        );
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), tx)
+    }
+
+    async fn pending_stream_body(
+        proxy: &Proxy,
+        url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        expiration: Option<CancellationToken>,
+    ) -> Body {
+        use http_body_util::BodyExt;
+
+        let response = proxy
+            .forward_streaming_to(
+                url,
+                WireProtocol::Http1,
+                breaker,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                None,
+                // No router-minted rid: these tests exercise expiration, not aborts.
+                None,
+                expiration,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_preserves_breaker_failure_streak() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::new());
+        breaker.record_failure();
+        breaker.record_failure();
+        for _ in 0..6 {
+            let expiration = CancellationToken::new();
+            let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+            expiration.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("stale_request_timeout"));
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "expiry must not add a failure"
+            );
+        }
+        breaker.record_failure();
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "expiry must not reset prior failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_expiry_resolves_half_open_probe() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let expiration = CancellationToken::new();
+        let body = pending_stream_body(&proxy, &url, &breaker, Some(expiration.clone())).await;
+        assert_eq!(breaker.snapshot().state_code, 2);
+        assert!(!breaker.would_allow());
+        expiration.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_request_timeout"));
+        assert_eq!(breaker.snapshot().state_code, 0);
+        assert!(breaker.would_allow());
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_still_trips_breaker() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_pending_stream_worker().await;
+        let mut proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        proxy.stream_idle_timeout = Some(Duration::from_millis(20));
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_secs(30),
+        }));
+        let body = pending_stream_body(&proxy, &url, &breaker, None).await;
+        let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("idle timeout"));
+        assert_eq!(breaker.snapshot().state_code, 1);
+        assert!(!breaker.would_allow());
     }
 
     /// A saturated engine's own queue-full 503s must not trip the router's
@@ -875,6 +1104,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,
@@ -1077,6 +1307,7 @@ mod tests {
                 None,
                 None,
                 Some("rid-stream-authed"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1151,10 +1382,10 @@ mod tests {
     /// every other shape leaves it possibly still generating for nobody.
     #[test]
     fn engine_may_still_be_generating_only_spares_a_clean_attached_end() {
+        use sse::StreamEndReason;
         let clean = sse::StreamEnd {
-            transport_ok: true,
+            reason: StreamEndReason::Completed,
             saw_error_event: false,
-            client_disconnect: false,
         };
         assert!(
             !engine_may_still_be_generating(clean),
@@ -1168,20 +1399,35 @@ mod tests {
             "an engine that reported its own error then closed cleanly is done — \
              aborting it would be a spurious abort on every failed generation"
         );
-        assert!(
-            engine_may_still_be_generating(sse::StreamEnd {
-                client_disconnect: true,
-                ..clean
-            }),
-            "the client went away mid-generation"
-        );
-        assert!(
-            engine_may_still_be_generating(sse::StreamEnd {
-                transport_ok: false,
-                ..clean
-            }),
-            "losing the router-to-engine connection says nothing about the engine"
-        );
+        // Every other reason, enumerated so a new one added to StreamEndReason
+        // fails this test until it is classified.
+        for (reason, why) in [
+            (
+                StreamEndReason::ClientDisconnect,
+                "the client went away mid-generation",
+            ),
+            (
+                StreamEndReason::UpstreamError,
+                "losing the router-to-engine connection says nothing about the engine",
+            ),
+            (
+                StreamEndReason::PumpPanicked,
+                "a pump that died mid-stream says nothing about the engine",
+            ),
+            (
+                StreamEndReason::IdleTimeout,
+                "the router gave up on the silence; the engine was never told to stop",
+            ),
+            (
+                StreamEndReason::Expired,
+                "the stale-request deadline is the router's clock, not the engine's",
+            ),
+        ] {
+            assert!(
+                engine_may_still_be_generating(sse::StreamEnd { reason, ..clean }),
+                "{why}"
+            );
+        }
     }
 
     /// `send_abort` posts `{rid, abort_all:false}` to the given URL.
@@ -1285,6 +1531,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-1"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1336,6 +1583,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-2"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1369,6 +1617,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-3"),
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1431,6 +1680,7 @@ mod tests {
                     None,
                     None,
                     Some(&format!("breaker-test-rid-{i}")),
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| {

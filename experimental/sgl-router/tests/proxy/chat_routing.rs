@@ -1167,6 +1167,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1705,6 +1706,46 @@ async fn janitor_expiry_on_streaming_request_before_headers_still_aborts() {
     assert!(crate::common::is_engine_shaped_rid(
         log[0]["rid"].as_str().expect("rid must be a string")
     ));
+}
+
+/// The mirror case: the stale-request deadline fires AFTER headers arrive, with
+/// the client still attached and reading. No pre-headers guard is armed by then
+/// — it stood down when the response came back — so the abort can only come
+/// from the SSE pump reporting `StreamEndReason::Expired`. That reason is a
+/// router-side clock running out, which says nothing about whether the engine
+/// stopped, so it must abort.
+#[tokio::test]
+async fn janitor_expiry_mid_stream_aborts_the_engine() {
+    use http_body_util::BodyExt;
+
+    // First chunk is 1s out — far past the helper's 50ms stale_request_timeout,
+    // so expiration wins while the pump is parked waiting on the engine.
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n"],
+        Duration::from_secs(1),
+    )
+    .await;
+    let (ctx, _janitor) = build_ctx_with_janitor(&worker.url);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_req(true, None, None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "headers arrive before expiry");
+    // Hold the body open and drain it so the stream ends on expiry rather than
+    // on a client disconnect — that is what isolates `Expired` here.
+    let _ = res.into_body().collect().await;
+
+    wait_for_aborts(&worker.abort_log, 1, Duration::from_secs(2)).await;
+    let log = worker.abort_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "a stale timeout firing mid-stream must trigger exactly one abort — the \
+         router stopped waiting, but nothing told the engine to stop generating"
+    );
+    assert!(crate::common::is_engine_shaped_rid(
+        log[0]["rid"].as_str().expect("rid must be a string")
+    ));
+    assert_eq!(log[0]["abort_all"], false);
 }
 
 /// Task A: a non-streaming request that errors out (upstream

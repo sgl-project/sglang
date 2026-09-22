@@ -5,7 +5,7 @@
 
 use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
 // Expose the selected decode worker to both PD workers and the client.
@@ -64,8 +65,6 @@ pub(super) async fn forward_chat_request(
         request.input_token_count,
         0,
     );
-    // PD requests keep using the prefill expiration token after dispatching decode.
-    let expiration_token = active_request_guard.cancel_token().clone();
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
@@ -113,12 +112,15 @@ pub(super) async fn forward_chat_request(
         (prefill, prefill_load_guards)
     };
 
+    // In PD mode, prefill can finish before decode. Watch the registration
+    // held by the response so expiration remains live for its full lifetime.
+    let expiration_token = response_load_guards.1.cancel_token().clone();
     // Abort-on-disconnect, armed across the dispatch. A streaming forward hands
     // the decision to the SSE pump's completion report once it has a response,
     // but that report only exists after one arrives: this guard covers the
     // window before it, and the whole forward in the non-streaming case. If the
-    // handler future is dropped (client disconnect) or the request-expiration
-    // token fires, it drops armed and tells the engine to stop.
+    // handler future is dropped (client disconnect) or the expiration token
+    // fires, it drops armed and tells the engine to stop.
     let mut abort_guard = engine_rid.as_deref().and_then(|rid| {
         ctx.proxy.abort_guard_for(
             &response_worker.url,
@@ -135,6 +137,7 @@ pub(super) async fn forward_chat_request(
         response_load_guards,
         &metrics,
         engine_rid.as_deref(),
+        expiration_token.clone(),
     );
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
@@ -233,6 +236,11 @@ fn spawn_prefill_request(
     });
 }
 
+// Every parameter is a distinct, required input to a single forward: where to
+// send it, what to send, the guards and metrics that outlive it, and the two
+// request-lifetime handles (abort rid, expiration). Bundling them into a struct
+// purely to satisfy the arg-count heuristic would add indirection, not clarity.
+#[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
@@ -241,6 +249,7 @@ async fn forward_to_response_worker(
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
     engine_rid: Option<&str>,
+    expiration: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
@@ -260,6 +269,7 @@ async fn forward_to_response_worker(
                 // Abort the engine if the client disconnects before it finishes
                 // streaming; the pump's completion report decides.
                 engine_rid,
+                Some(expiration),
             )
             .await
     } else {
@@ -331,6 +341,9 @@ impl DispatchMetrics {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
         Box::new(move |end| {
+            if end.reason == StreamEndReason::Expired {
+                metrics.record_stale_request(StaleRequestOutcome::Expired);
+            }
             metrics.record_stream_outcome(&response_worker_url, &model, classify_stream_end(end));
         })
     }

@@ -92,7 +92,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -242,14 +242,19 @@ pub enum StreamOutcome {
     UpstreamError,
     /// The client disconnected before the stream finished.
     ClientDisconnect,
+    /// The router's stale-request deadline aborted the stream.
+    Expired,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
-    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
-        (false, _, _) => StreamOutcome::UpstreamError,
-        (_, true, _) => StreamOutcome::StreamErrorEvent,
-        (_, _, true) => StreamOutcome::ClientDisconnect,
-        _ => StreamOutcome::Ok,
+    match end.reason {
+        StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
+        _ if end.saw_error_event => StreamOutcome::StreamErrorEvent,
+        StreamEndReason::ClientDisconnect => StreamOutcome::ClientDisconnect,
+        StreamEndReason::Completed => StreamOutcome::Ok,
     }
 }
 
@@ -260,6 +265,7 @@ impl StreamOutcome {
             Self::StreamErrorEvent => "stream_error_event",
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
+            Self::Expired => "expired",
         }
     }
 }
@@ -1506,22 +1512,26 @@ mod tests {
     fn stream_outcome_precedence() {
         use StreamOutcome::*;
 
-        for (transport_ok, saw_error_event, client_disconnect, expected) in [
-            (false, false, false, UpstreamError),
-            (false, false, true, UpstreamError),
-            (false, true, false, UpstreamError),
-            (false, true, true, UpstreamError),
-            (true, false, false, Ok),
-            (true, false, true, ClientDisconnect),
-            (true, true, false, StreamErrorEvent),
-            (true, true, true, StreamErrorEvent),
+        for (reason, expected) in [
+            (StreamEndReason::Completed, Ok),
+            (StreamEndReason::ClientDisconnect, ClientDisconnect),
+            (StreamEndReason::UpstreamError, UpstreamError),
+            (StreamEndReason::IdleTimeout, UpstreamError),
+            (StreamEndReason::PumpPanicked, UpstreamError),
+            (StreamEndReason::Expired, Expired),
         ] {
-            let end = StreamEnd {
-                transport_ok,
-                saw_error_event,
-                client_disconnect,
-            };
-            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            for saw_error_event in [false, true] {
+                let end = StreamEnd {
+                    reason,
+                    saw_error_event,
+                };
+                let expected = if saw_error_event && matches!(expected, Ok | ClientDisconnect) {
+                    StreamErrorEvent
+                } else {
+                    expected
+                };
+                assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            }
         }
     }
 
@@ -1533,12 +1543,14 @@ mod tests {
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Expired);
         let out = reg.render();
         for expected in [
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="expired"} 1"#,
         ] {
             assert_metric_line(&out, expected);
         }

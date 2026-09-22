@@ -170,6 +170,7 @@ async fn h2c_client_streams_sse_from_http2_only_worker() {
             None,
             // This test forwards no router-minted rid, so no abort is armed.
             None,
+            None,
         )
         .await
         .expect("h2c client must stream from an HTTP/2-only worker");
