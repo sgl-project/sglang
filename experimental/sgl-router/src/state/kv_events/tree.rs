@@ -1885,9 +1885,6 @@ impl HashTree {
     /// the other writer (`KvEventIndex::remove_worker`, off the discovery
     /// task) cannot prune a parent that an earlier chunk placed and a later
     /// chunk is about to hang a child from.
-    // The in-module tests are the only caller until the bootstrap consumer
-    // lands; `pub(super)` is the provenance boundary, not an oversight.
-    #[allow(dead_code)]
     pub(super) fn restore_snapshot(
         &self,
         worker_table: &[KvWorkerId],

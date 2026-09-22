@@ -84,7 +84,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::tree::{KvWorkerId, SnapshotNode};
+use super::tree::{KvWorkerId, RestoreError, SnapshotNode};
 
 /// Wire-format version. Bump on any incompatible change to
 /// [`PeerSnapshot`]; a receiver rejects anything it does not recognise, so a
@@ -413,6 +413,432 @@ impl PeerSnapshot {
             .iter()
             .find(|(i, _)| *i == idx)
             .map(|(_, seq)| *seq)
+    }
+}
+
+/// Why a wire snapshot was refused before any tree mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VetError {
+    UnknownFormat {
+        got: u32,
+        want: u32,
+    },
+    /// A node's `parent` was not a backward reference into the node list.
+    ///
+    /// Checked here rather than left to `restore_snapshot` because
+    /// `prune_carrier_less` INDEXES with it, on the wire data, before the tree
+    /// ever sees it — an out-of-range value panicked the bootstrap task.
+    InvalidParentReference {
+        index: usize,
+        parent: u32,
+    },
+    /// A node's `tiers` was neither empty nor the same length as its
+    /// `workers`, so carriers cannot be paired with their tiers.
+    ///
+    /// Checked here for the same reason as `InvalidParentReference`:
+    /// `retain_carriers` rebuilds both lists from the wire data before the
+    /// tree's own `TierTableMismatch` check runs, and would otherwise repair
+    /// the mismatch silently — padding missing entries as device owners.
+    TierTableMismatch {
+        index: usize,
+    },
+    BlockSizeMismatch {
+        peer: u32,
+        local: u32,
+    },
+    ProducerCold,
+    /// The snapshot was well formed, but nothing in it survives vetting for this
+    /// replica — every carrier was a worker we do not know.
+    ///
+    /// Distinct from `ProducerCold`: the peer has a real tree, it just has no
+    /// overlap with ours. Must be refused rather than accepted-as-empty, because
+    /// accepting it would seed the peer's cursor with no corresponding tree state
+    /// and thereby filter away every delta at or below that watermark.
+    NothingUsable {
+        wire_nodes: usize,
+        dropped_workers: usize,
+    },
+}
+
+impl std::fmt::Display for VetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownFormat { got, want } => {
+                write!(f, "unknown snapshot format {got} (want {want})")
+            }
+            Self::InvalidParentReference { index, parent } => write!(
+                f,
+                "snapshot node {index} has parent {parent}, not a backward reference",
+            ),
+            Self::TierTableMismatch { index } => write!(
+                f,
+                "snapshot node {index} has a tiers list that does not pair with its workers",
+            ),
+            Self::BlockSizeMismatch { peer, local } => write!(
+                f,
+                "peer block_size {peer} disagrees with local {local}; block hashes are incomparable",
+            ),
+            Self::NothingUsable {
+                wire_nodes,
+                dropped_workers,
+            } => write!(
+                f,
+                "none of the peer's {wire_nodes} nodes survive vetting \
+                 ({dropped_workers} of its workers are unknown here)",
+            ),
+            Self::ProducerCold => write!(
+                f,
+                "peer is not a usable source (still bootstrapping, or settled with an empty tree)",
+            ),
+        }
+    }
+}
+
+impl VetError {
+    pub fn outcome(&self) -> SnapshotOutcome {
+        match self {
+            // Not the peer's fault and not permanent — it may discover our
+            // workers moments later, so this must stay retriable.
+            Self::NothingUsable { .. } => SnapshotOutcome::ColdPeer,
+            Self::ProducerCold => SnapshotOutcome::ColdPeer,
+            _ => SnapshotOutcome::Rejected,
+        }
+    }
+}
+
+/// A snapshot whose worker identities have been resolved against the local
+/// live set and whose carrier lists have been remapped onto the surviving
+/// workers.
+///
+/// # Vetting is structural, not conventional
+///
+/// Every field is private and [`VettedSnapshot::from_wire`] is the only way to
+/// obtain one outside this module's tests, so "has been vetted" is a property of
+/// having the value rather than a rule callers are trusted to have followed.
+/// [`VettedSnapshot::graft_into`] is likewise the only route to the tree's
+/// restore path from outside [`super`], which keeps
+/// `format` / `block_size` / parent-bounds checking from being bypassable by a
+/// caller that assembles nodes itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VettedSnapshot {
+    /// Locally-minted worker ids; safe to hand to the tree's restore path
+    /// precisely because they came out of the live set.
+    worker_table: Vec<KvWorkerId>,
+    /// Nodes with carrier indices remapped into `worker_table`.
+    ///
+    /// Nodes are never dropped, even when every carrier was filtered out:
+    /// records are parent-linked by index, so removing one would misplace its
+    /// descendants. A carrier-less interior node is legitimate structure.
+    nodes: Vec<SnapshotNode>,
+    /// `(worker, last-applied seq)` for workers that survived vetting.
+    cursors: Vec<(KvWorkerId, i64)>,
+    /// Wire workers the local replica does not know. Expected and benign
+    /// during a rolling worker change; logged, and worth watching if
+    /// persistently large.
+    dropped_workers: usize,
+}
+
+impl VettedSnapshot {
+    /// Nodes in dependency order, for logging and for the tree restore.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Workers that survived vetting.
+    pub fn worker_count(&self) -> usize {
+        self.worker_table.len()
+    }
+
+    /// Wire workers this replica does not know; see the field docs.
+    pub fn dropped_workers(&self) -> usize {
+        self.dropped_workers
+    }
+
+    /// Whether `id` survived vetting as a carrier source.
+    pub fn has_worker(&self, id: &KvWorkerId) -> bool {
+        self.worker_table.contains(id)
+    }
+
+    /// Graft this snapshot's nodes into `tree`, returning how many were applied.
+    ///
+    /// The single entry point to the tree's restore path from outside
+    /// [`super`]: the ids handed over are the ones vetting resolved against the
+    /// live set, which is the precondition the restore path documents and
+    /// trusts. MUST be called on the single writer (the KV-event pump), like
+    /// every other tree mutation.
+    pub fn graft_into(&self, tree: &super::tree::HashTree) -> Result<usize, RestoreError> {
+        tree.restore_snapshot(&self.worker_table, &self.nodes)
+    }
+
+    /// Build one directly, for tests that need a specific shape without going
+    /// through a wire round trip. Test-only BECAUSE it is exactly the bypass the
+    /// private fields exist to prevent.
+    #[cfg(test)]
+    pub fn from_parts_for_test(
+        worker_table: Vec<KvWorkerId>,
+        nodes: Vec<SnapshotNode>,
+        cursors: Vec<(KvWorkerId, i64)>,
+        dropped_workers: usize,
+    ) -> Self {
+        Self {
+            worker_table,
+            nodes,
+            cursors,
+            dropped_workers,
+        }
+    }
+
+    /// Drop every carrier that is not in `keep`, leaving node structure
+    /// intact.
+    ///
+    /// WHY: by the time a snapshot reaches the pump some ranks may have left
+    /// [`BootstrapState::Pending`] — their live stream is already being
+    /// applied, so grafting older state underneath it is exactly the stale
+    /// splice this module refuses to do. Filtering carriers (rather than
+    /// discarding the whole snapshot) keeps the ranks that are still pending
+    /// bootstrappable.
+    pub fn retain_workers(&mut self, keep: &HashSet<KvWorkerId>) {
+        let allowed: HashSet<u32> = self
+            .worker_table
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| keep.contains(*w))
+            .map(|(i, _)| i as u32)
+            .collect();
+        if allowed.len() == self.worker_table.len() {
+            return;
+        }
+        for node in &mut self.nodes {
+            node.retain_carriers(|w| allowed.contains(&w).then_some(w));
+        }
+        self.cursors.retain(|(w, _)| keep.contains(w));
+        // Filtering carriers strands structure; leaving it would suppress real
+        // cache hits permanently. See `prune_carrier_less`.
+        let pruned = self.prune_carrier_less();
+        if pruned > 0 {
+            debug!(
+                pruned,
+                remaining = self.nodes.len(),
+                "kv-bootstrap: dropped carrier-less nodes after filtering to pending ranks",
+            );
+        }
+    }
+
+    /// Drop nodes that carry no worker and have no surviving descendant that
+    /// does, remapping parent indices.
+    ///
+    /// WHY this is not cosmetic: `match_prefix` returns the carrier set of the
+    /// DEEPEST matched node, not of the deepest node that has carriers. Grafting
+    /// carrier-less structure therefore lets a query descend past a node that
+    /// does have carriers into one that does not, turning a real cache hit into
+    /// `matched_blocks > 0, workers = {}` — which routes to min-load while the
+    /// hit-rate metric still counts the match. Worse, a node born carrier-less is
+    /// never reclaimed: `clear_worker` only prunes nodes it actually removed a
+    /// worker from, so the damage is permanent.
+    ///
+    /// Carrier-less nodes arise routinely, not exceptionally: `from_wire` filters
+    /// out carriers the local replica has not discovered, and `retain_workers`
+    /// filters out ranks that already left `Pending`.
+    ///
+    /// Returns the number of nodes dropped.
+    pub fn prune_carrier_less(&mut self) -> usize {
+        let n = self.nodes.len();
+        if n == 0 {
+            return 0;
+        }
+        // Records are in dependency order (parent before child), so iterating in
+        // reverse means a node's "has a kept child" flag is final by the time we
+        // decide the node itself.
+        let mut keep = vec![false; n];
+        let mut has_kept_child = vec![false; n];
+        for i in (0..n).rev() {
+            keep[i] = !self.nodes[i].workers.is_empty() || has_kept_child[i];
+            if keep[i] {
+                if let Some(p) = self.nodes[i].parent {
+                    has_kept_child[p as usize] = true;
+                }
+            }
+        }
+        let pruned = keep.iter().filter(|k| !**k).count();
+        if pruned == 0 {
+            return 0;
+        }
+
+        let mut new_index: Vec<Option<u32>> = vec![None; n];
+        let mut out: Vec<SnapshotNode> = Vec::with_capacity(n - pruned);
+        for i in 0..n {
+            if !keep[i] {
+                continue;
+            }
+            // A kept node's parent is always kept (keeping a child forces it), so
+            // this resolves; `and_then` degrades a violation to "root the chain"
+            // rather than misplacing the subtree.
+            let parent = self.nodes[i].parent.and_then(|p| new_index[p as usize]);
+            new_index[i] = Some(out.len() as u32);
+            out.push(SnapshotNode {
+                parent,
+                block_hash: self.nodes[i].block_hash,
+                workers: std::mem::take(&mut self.nodes[i].workers),
+                tiers: std::mem::take(&mut self.nodes[i].tiers),
+            });
+        }
+        self.nodes = out;
+        pruned
+    }
+
+    /// Whether this snapshot can actually bootstrap any of `ranks`.
+    ///
+    /// A snapshot vets fine while knowing nothing about the ranks we are trying
+    /// to bootstrap — a warm peer that has not yet discovered a newly added
+    /// engine is the common case. Treating that as success ends the peer sweep on
+    /// a snapshot that will be filtered down to nothing, so the rank runs cold
+    /// when a retry moments later would have worked.
+    pub fn covers_any(&self, ranks: &[KvWorkerId]) -> bool {
+        ranks.iter().any(|r| self.cursor_for(r).is_some())
+    }
+
+    /// Last-applied sequence the producer had for `worker`, if it tracked it.
+    ///
+    /// `None` means the producer knew nothing about this rank, so its tree
+    /// slice cannot be spliced under our live stream and the rank must run
+    /// cold.
+    pub fn cursor_for(&self, worker: &KvWorkerId) -> Option<i64> {
+        self.cursors
+            .iter()
+            .find(|(w, _)| w == worker)
+            .map(|(_, seq)| *seq)
+    }
+
+    /// Validate a wire snapshot and resolve its worker table against `live`.
+    ///
+    /// `local_block_size` is `None` before any worker has established one, in
+    /// which case the peer's value is accepted — there is nothing yet to
+    /// contradict it, and `add_worker` will reject any worker that disagrees.
+    ///
+    /// The producer's `is_bigram` stamp is deliberately NOT vetted. Hashing
+    /// mode is a property of the publishing worker, and the live-set filter
+    /// below already drops every node whose carriers this replica does not
+    /// know — so the surviving nodes all come from workers this replica
+    /// discovered itself, and it hashes queries for those workers with its own
+    /// established mode. Vetting the producer's process-wide stamp on top of
+    /// that would reject snapshots whose usable payload is perfectly
+    /// comparable: during a rolling update that changes the fleet's
+    /// speculative-decoding config, a producer that exported while the old
+    /// generation was still draining stamps the old mode and would be refused
+    /// outright, so no replica starting on the converged fleet could prewarm.
+    /// The sweep logs the disagreement instead.
+    pub fn from_wire(
+        snap: PeerSnapshot,
+        live: &HashSet<KvWorkerId>,
+        local_block_size: Option<u32>,
+    ) -> Result<Self, VetError> {
+        if snap.format != SNAPSHOT_FORMAT {
+            return Err(VetError::UnknownFormat {
+                got: snap.format,
+                want: SNAPSHOT_FORMAT,
+            });
+        }
+        // Defence in depth against a producer that miscomputes the flag: an
+        // empty tree is worthless to graft either way, and accepting it would
+        // mark the rank Recovered and stop the search at a peer with nothing.
+        if snap.is_cold() {
+            return Err(VetError::ProducerCold);
+        }
+        if let Some(local) = local_block_size {
+            if local != snap.block_size {
+                return Err(VetError::BlockSizeMismatch {
+                    peer: snap.block_size,
+                    local,
+                });
+            }
+        }
+
+        // Bounds-check every `parent` BEFORE anything indexes with it.
+        // `prune_carrier_less` below indexes `has_kept_child[parent]` and
+        // `new_index[parent]` directly on this wire data, so an out-of-range or
+        // forward reference from a buggy or hostile peer would panic the
+        // bootstrap task rather than being rejected. Mirrors the same rule
+        // `HashTree::restore_snapshot` enforces later.
+        for (i, rec) in snap.nodes.iter().enumerate() {
+            if let Some(p) = rec.parent {
+                if p as usize >= i {
+                    return Err(VetError::InvalidParentReference {
+                        index: i,
+                        parent: p,
+                    });
+                }
+            }
+            if !rec.tiers.is_empty() && rec.tiers.len() != rec.workers.len() {
+                return Err(VetError::TierTableMismatch { index: i });
+            }
+        }
+
+        // Resolve wire identities to live ones. `remap[i]` is the new index of
+        // wire worker `i`, or `None` when this replica does not know it.
+        let mut worker_table: Vec<KvWorkerId> = Vec::new();
+        let mut remap: Vec<Option<u32>> = Vec::with_capacity(snap.workers.len());
+        let mut dropped_workers = 0usize;
+        for w in &snap.workers {
+            // Construct only to look up; the id kept is the one from `live`,
+            // preserving registry provenance.
+            let probe = KvWorkerId::new(w.url.clone(), w.dp_rank);
+            match live.get(&probe) {
+                Some(known) => {
+                    remap.push(Some(worker_table.len() as u32));
+                    worker_table.push(known.clone());
+                }
+                None => {
+                    remap.push(None);
+                    dropped_workers += 1;
+                }
+            }
+        }
+
+        let nodes: Vec<SnapshotNode> = snap
+            .nodes
+            .into_iter()
+            .map(|mut n| {
+                n.retain_carriers(|w| remap.get(w as usize).copied().flatten());
+                n
+            })
+            .collect();
+
+        let cursors = snap
+            .cursors
+            .into_iter()
+            .filter_map(|(idx, seq)| {
+                let new_idx = remap.get(idx as usize).copied().flatten()?;
+                Some((worker_table[new_idx as usize].clone(), seq))
+            })
+            .collect();
+
+        let wire_nodes = nodes.len();
+        let mut vetted = Self {
+            worker_table,
+            nodes,
+            cursors,
+            dropped_workers,
+        };
+        let pruned = vetted.prune_carrier_less();
+        if pruned > 0 {
+            debug!(
+                pruned,
+                remaining = vetted.nodes.len(),
+                dropped_workers,
+                "kv-bootstrap: dropped carrier-less nodes left by unknown workers",
+            );
+        }
+        // The emptiness gate earlier ran on the WIRE node list; pruning can empty
+        // it afterwards, so the verdict has to be re-taken here. Accepting an
+        // empty result would seed the peer's cursor with no grafted tree behind
+        // it, filtering away every delta at or below that watermark.
+        if vetted.nodes.is_empty() {
+            return Err(VetError::NothingUsable {
+                wire_nodes,
+                dropped_workers,
+            });
+        }
+        Ok(vetted)
     }
 }
 
@@ -1141,6 +1567,41 @@ fn decode_snapshot(body: &[u8], gzipped: bool) -> Result<PeerSnapshot, anyhow::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::kv_events::tree::Tiers;
+
+    fn wire_worker(url: &str, dp_rank: u32) -> WireWorker {
+        WireWorker {
+            url: url.into(),
+            dp_rank,
+        }
+    }
+
+    fn node(parent: Option<u32>, block_hash: i64, workers: Vec<u32>) -> SnapshotNode {
+        SnapshotNode {
+            parent,
+            block_hash,
+            workers,
+            tiers: vec![],
+        }
+    }
+
+    fn snapshot(workers: Vec<WireWorker>, nodes: Vec<SnapshotNode>) -> PeerSnapshot {
+        PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 64,
+            is_bigram: false,
+            producer_ready: true,
+            workers,
+            cursors: vec![],
+            nodes,
+        }
+    }
+
+    fn live(ids: &[(&str, u32)]) -> HashSet<KvWorkerId> {
+        ids.iter()
+            .map(|(u, r)| KvWorkerId::new((*u).to_string(), *r))
+            .collect()
+    }
 
     /// A caller with no freshness requirement must send a bare path, so an older
     /// router image sees the request it has always seen.
@@ -1204,6 +1665,164 @@ mod tests {
         );
     }
 
+    /// The splice probe reads a cursor by WIRE identity, deliberately skipping
+    /// vetting: it wants one sequence number as evidence, not tree state. A
+    /// worker the snapshot does not mention yields `None` rather than a
+    /// misaddressed cursor from another rank's table slot.
+    #[test]
+    fn wire_cursor_is_addressed_by_identity_not_table_position() {
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 4,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![wire_worker("http://w1", 0), wire_worker("http://w2", 1)],
+            // Out of table order, and with no entry for index 0.
+            cursors: vec![(1, 77)],
+            nodes: vec![],
+        };
+        assert_eq!(snap.wire_cursor_for("http://w2", 1), Some(77));
+        assert_eq!(
+            snap.wire_cursor_for("http://w1", 0),
+            None,
+            "a worker in the table without a cursor must not borrow another's",
+        );
+        assert_eq!(
+            snap.wire_cursor_for("http://w2", 0),
+            None,
+            "dp_rank matters"
+        );
+        assert_eq!(snap.wire_cursor_for("http://nope", 0), None);
+    }
+
+    #[test]
+    fn vet_rejects_unknown_format() {
+        let mut snap = snapshot(vec![], vec![]);
+        snap.format = SNAPSHOT_FORMAT + 1;
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
+        assert_eq!(
+            err,
+            VetError::UnknownFormat {
+                got: SNAPSHOT_FORMAT + 1,
+                want: SNAPSHOT_FORMAT
+            }
+        );
+        assert_eq!(err.outcome(), SnapshotOutcome::Rejected);
+    }
+
+    #[test]
+    fn vet_rejects_cold_producer() {
+        let mut snap = snapshot(vec![], vec![]);
+        snap.producer_ready = false;
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
+        assert_eq!(err, VetError::ProducerCold);
+        assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
+    }
+
+    /// The `!producer_ready` arm in isolation: a replica still holding blocks
+    /// while another rank is pending (producer_ready conjoins settled AND
+    /// non-empty) is not a usable source either — grafting from it would mark
+    /// the rank Recovered and stop the search at an incomplete tree.
+    #[test]
+    fn vet_rejects_a_not_ready_producer_even_with_nodes() {
+        let mut snap = snapshot(
+            vec![WireWorker {
+                url: "http://w1:30000".into(),
+                dp_rank: 0,
+            }],
+            vec![node(None, 7, vec![0])],
+        );
+        snap.producer_ready = false;
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://w1:30000", 0)]), Some(64))
+            .unwrap_err();
+        assert_eq!(err, VetError::ProducerCold);
+    }
+
+    /// A settled-but-empty replica (its own bootstrap timed out) must not be
+    /// accepted as a source — otherwise two new replicas in a rolling update
+    /// bootstrap from each other and both inherit nothing.
+    /// Regression: an out-of-range `parent` from a peer used to PANIC the
+    /// bootstrap task inside `prune_carrier_less`, which indexes with it on raw
+    /// wire data before the tree's own validation ever runs.
+    #[test]
+    fn vet_rejects_out_of_range_parent_reference() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(None, 1, vec![0]), node(Some(99), 2, vec![0])],
+        );
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64))
+            .expect_err("an out-of-range parent must be refused, not panic");
+        assert_eq!(
+            err,
+            VetError::InvalidParentReference {
+                index: 1,
+                parent: 99
+            },
+        );
+        assert_eq!(err.outcome(), SnapshotOutcome::Rejected);
+    }
+
+    /// A forward reference is equally unusable and equally panic-prone.
+    #[test]
+    fn vet_rejects_forward_parent_reference_on_the_wire() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(Some(1), 1, vec![0]), node(None, 2, vec![0])],
+        );
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64))
+            .expect_err("a forward parent must be refused");
+        assert_eq!(
+            err,
+            VetError::InvalidParentReference {
+                index: 0,
+                parent: 1
+            }
+        );
+    }
+
+    /// A `tiers` list that does not pair with `workers` must be refused on the
+    /// wire. `retain_carriers` rebuilds both lists before the tree sees them
+    /// and would otherwise pad the short list with device tiers, turning a
+    /// host-only carrier on the peer into a preferred device owner here.
+    #[test]
+    fn vet_rejects_tiers_that_do_not_pair_with_workers() {
+        let mut bad = node(None, 1, vec![0, 1]);
+        bad.tiers = vec![Tiers::HOST.bits()]; // one entry for two carriers
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://b", 0)],
+            vec![node(None, 7, vec![0]), bad],
+        );
+        let err =
+            VettedSnapshot::from_wire(snap, &live(&[("http://a", 0), ("http://b", 0)]), Some(64))
+                .expect_err("mispaired tiers must be refused, not repaired");
+        assert_eq!(err, VetError::TierTableMismatch { index: 1 });
+        assert_eq!(err.outcome(), SnapshotOutcome::Rejected);
+    }
+
+    /// Regression: pruning can empty the node list AFTER the wire-level
+    /// emptiness gate. Accepting that would seed the peer's cursor with no
+    /// grafted tree behind it, filtering away every delta at or below it.
+    #[test]
+    fn vet_rejects_snapshot_that_prunes_to_nothing() {
+        let snap = snapshot(
+            vec![wire_worker("http://rogue", 0)],
+            vec![node(None, 1, vec![0]), node(Some(0), 2, vec![0])],
+        );
+        // The only carrier is a worker this replica has never discovered, so
+        // every node becomes carrier-less and is pruned.
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64))
+            .expect_err("a snapshot that prunes to nothing must be refused");
+        assert_eq!(
+            err,
+            VetError::NothingUsable {
+                wire_nodes: 2,
+                dropped_workers: 1
+            },
+        );
+        // Retriable: the peer may discover our workers moments later.
+        assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
+    }
+
     /// An empty peer set is only conclusive if siblings were never seen. The set
     /// dips to empty transiently during slice repacks and rolling updates, and
     /// the bootstrap retry loop samples it many times per boot.
@@ -1223,6 +1842,26 @@ mod tests {
         assert!(
             !r.known_to_have_no_peers(),
             "once siblings have been seen, an empty set must be read as transient",
+        );
+    }
+
+    /// A snapshot that vets fine but knows nothing about the ranks being
+    /// bootstrapped must not be treated as a usable result — accepting it ends
+    /// the peer sweep and leaves those ranks cold.
+    #[test]
+    fn covers_any_is_false_when_the_peer_knows_none_of_our_ranks() {
+        let mut snap = snapshot(
+            vec![wire_worker("http://known", 0)],
+            vec![node(None, 1, vec![0])],
+        );
+        snap.cursors = vec![(0, 7)];
+        let vetted =
+            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64)).unwrap();
+
+        assert!(vetted.covers_any(&[KvWorkerId::new("http://known".into(), 0)]));
+        assert!(
+            !vetted.covers_any(&[KvWorkerId::new("http://other".into(), 0)]),
+            "a snapshot with no cursor for our rank cannot bootstrap it",
         );
     }
 
@@ -1246,6 +1885,175 @@ mod tests {
             second[0].1, e1,
             "remove + re-add must invalidate the previous incarnation",
         );
+    }
+
+    #[test]
+    fn vet_rejects_snapshot_with_no_nodes_even_when_producer_claims_ready() {
+        let mut snap = snapshot(vec![wire_worker("http://a", 0)], vec![]);
+        snap.producer_ready = true;
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap_err();
+        assert_eq!(err, VetError::ProducerCold);
+        assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
+    }
+
+    #[test]
+    fn vet_rejects_block_size_mismatch() {
+        let snap = snapshot(vec![], vec![node(None, 1, vec![])]);
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(32)).unwrap_err();
+        assert_eq!(
+            err,
+            VetError::BlockSizeMismatch {
+                peer: 64,
+                local: 32
+            }
+        );
+    }
+
+    /// The producer's `is_bigram` stamp is advisory, not vetted: nodes survive
+    /// only when carried by workers this replica knows, and those workers'
+    /// modes are what query hashing uses — a rolling update that migrates the
+    /// fleet between hashing modes must not make sibling snapshots
+    /// permanently rejectable.
+    #[test]
+    fn vet_ignores_the_producer_bigram_stamp() {
+        let mut snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(None, 1, vec![0])],
+        );
+        for stamp in [false, true] {
+            snap.is_bigram = stamp;
+            VettedSnapshot::from_wire(snap.clone(), &live(&[("http://a", 0)]), Some(64))
+                .unwrap_or_else(|e| panic!("is_bigram={stamp} must not affect vetting: {e}"));
+        }
+    }
+
+    /// Before any worker establishes a block size there is nothing to
+    /// contradict the peer, so the snapshot is accepted.
+    #[test]
+    fn vet_accepts_when_local_block_size_unset() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(None, 1, vec![0])],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), None).unwrap();
+        assert_eq!(vetted.worker_table.len(), 1);
+    }
+
+    /// The core trust-boundary test: a peer naming a worker this replica has
+    /// never discovered must not be able to introduce it.
+    #[test]
+    fn vet_drops_unknown_workers_and_remaps_carriers() {
+        let snap = snapshot(
+            vec![
+                wire_worker("http://known", 0),
+                wire_worker("http://rogue", 0),
+                wire_worker("http://known", 1),
+            ],
+            vec![node(None, 100, vec![0, 1, 2]), node(Some(0), 200, vec![1])],
+        );
+        let vetted = VettedSnapshot::from_wire(
+            snap,
+            &live(&[("http://known", 0), ("http://known", 1)]),
+            Some(64),
+        )
+        .unwrap();
+
+        assert_eq!(vetted.dropped_workers, 1);
+        assert_eq!(
+            vetted.worker_table,
+            vec![
+                KvWorkerId::new("http://known".into(), 0),
+                KvWorkerId::new("http://known".into(), 1),
+            ],
+        );
+        // Wire indices 0 and 2 survive as 0 and 1; the rogue index vanishes.
+        assert_eq!(vetted.nodes[0].workers, vec![0, 1]);
+        // The node whose only carrier was the rogue worker is PRUNED, not kept
+        // as bare structure: leaving it would let `match_prefix` descend past
+        // node 100 (which has carriers) into a carrier-less node, reporting a
+        // deeper match with no holders and destroying a real cache hit.
+        assert_eq!(
+            vetted.nodes.len(),
+            1,
+            "carrier-less leaf must be pruned, not retained as structure",
+        );
+    }
+
+    /// Interior structure leading to a surviving carrier must be KEPT — pruning
+    /// it would detach the carrier and lose the match entirely.
+    #[test]
+    fn vet_keeps_carrier_less_interior_nodes_on_a_live_path() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![
+                node(None, 1, vec![]),     // carrier-less interior
+                node(Some(0), 2, vec![]),  // carrier-less interior
+                node(Some(1), 3, vec![0]), // the surviving carrier, at depth 3
+            ],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        assert_eq!(vetted.nodes.len(), 3, "path to a carrier must survive");
+        assert_eq!(vetted.nodes[2].workers, vec![0]);
+        // Parent links must still be backward references after any remap.
+        for (i, rec) in vetted.nodes.iter().enumerate() {
+            assert!(rec.parent.is_none_or(|p| (p as usize) < i));
+        }
+    }
+
+    /// Pruning must remap parent indices, not just drop entries.
+    #[test]
+    fn prune_remaps_parent_indices() {
+        let mut vetted = VettedSnapshot {
+            worker_table: vec![KvWorkerId::new("http://a".into(), 0)],
+            nodes: vec![
+                node(None, 10, vec![]),     // 0: dead leaf, pruned
+                node(None, 20, vec![]),     // 1: interior on a live path, kept -> 0
+                node(Some(1), 30, vec![0]), // 2: carrier, kept -> 1
+                node(Some(1), 40, vec![]),  // 3: dead leaf, pruned
+            ],
+            cursors: vec![],
+            dropped_workers: 0,
+        };
+        assert_eq!(vetted.prune_carrier_less(), 2);
+        assert_eq!(vetted.nodes.len(), 2);
+        assert_eq!(vetted.nodes[0].block_hash, 20);
+        assert_eq!(vetted.nodes[0].parent, None);
+        assert_eq!(vetted.nodes[1].block_hash, 30);
+        assert_eq!(
+            vetted.nodes[1].parent,
+            Some(0),
+            "surviving child must point at its parent's NEW index",
+        );
+    }
+
+    #[test]
+    fn vet_drops_cursors_for_unknown_workers() {
+        let mut snap = snapshot(
+            vec![
+                wire_worker("http://known", 0),
+                wire_worker("http://rogue", 0),
+            ],
+            vec![node(None, 1, vec![0])],
+        );
+        snap.cursors = vec![(0, 42), (1, 99)];
+        let vetted =
+            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64)).unwrap();
+        assert_eq!(
+            vetted.cursors,
+            vec![(KvWorkerId::new("http://known".into(), 0), 42)],
+        );
+    }
+
+    /// Out-of-range carrier indices from a malformed peer are dropped rather
+    /// than panicking the bootstrap task.
+    #[test]
+    fn vet_ignores_out_of_range_carrier_indices() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(None, 1, vec![0, 7])],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        assert_eq!(vetted.nodes[0].workers, vec![0]);
     }
 
     #[test]
@@ -1357,6 +2165,47 @@ mod tests {
         let mut want = peers;
         want.sort();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 64,
+            is_bigram: true,
+            producer_ready: true,
+            workers: vec![wire_worker("http://a", 0)],
+            cursors: vec![(0, 17)],
+            nodes: vec![
+                node(None, -9_000_000_000, vec![0]),
+                node(Some(0), 2, vec![]),
+            ],
+        };
+        let encoded = serde_json::to_vec(&snap).unwrap();
+        let decoded: PeerSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.nodes, snap.nodes);
+        assert_eq!(decoded.cursors, snap.cursors);
+        assert_eq!(decoded.workers, snap.workers);
+        assert!(decoded.is_bigram);
+    }
+
+    /// A body from a producer that predates tiering omits `tiers` entirely.
+    /// It must still parse — that is what lets a mixed-version fleet bootstrap
+    /// at all, and why the tier addition needed no format bump.
+    #[test]
+    fn a_pre_tiering_body_still_parses() {
+        let json = r#"{
+            "format": 1,
+            "block_size": 64,
+            "is_bigram": false,
+            "producer_ready": true,
+            "workers": [{"url": "http://a:30000", "dp_rank": 0}],
+            "cursors": [[0, 12]],
+            "nodes": [{"parent": null, "block_hash": 5, "workers": [0]}]
+        }"#;
+        let snap: PeerSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.nodes.len(), 1);
+        assert!(snap.nodes[0].tiers.is_empty());
     }
 
     #[test]
