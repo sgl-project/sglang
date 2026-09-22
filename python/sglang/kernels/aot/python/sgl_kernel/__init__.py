@@ -138,8 +138,9 @@ else:
     if torch.version.cuda is not None:
         try:
             from sgl_kernel.deepselect import (
-                deepselect_topk_fp32,
+                deepselect_topk,
                 get_deepselect_supported_architectures,
+                get_stride_requirement,
                 is_deepselect_supported,
             )
         except (ImportError, OSError):
@@ -215,8 +216,8 @@ else:
     if torch.version.hip is not None:
         _DEBUG_EXPORT_NAMES.append("gelu_quick")
         _DEBUG_EXPORT_NAMES.append("deepseek_v4_topk_transform_512")
-    if "deepselect_topk_fp32" in globals():
-        _DEBUG_EXPORT_NAMES.append("deepselect_topk_fp32")
+    if "deepselect_topk" in globals():
+        _DEBUG_EXPORT_NAMES.append("deepselect_topk")
 
     for _name in _DEBUG_EXPORT_NAMES:
         if _name in globals():

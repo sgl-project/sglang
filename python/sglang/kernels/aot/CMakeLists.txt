@@ -379,11 +379,15 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 # Keep this target isolated: DeepSelect relies on C++20 and non-flushed FP32
 # subnormals for its integer-count simulation.
 if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
+    file(GLOB DEEPSELECT_CUDA_SOURCES CONFIGURE_DEPENDS
+        "csrc/deepselect/cuda_kernels/v3/instantiations/*.cu"
+        "csrc/deepselect/cuda_kernels/v3_cluster/instantiations/*.cu"
+        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/*.cu"
+    )
+    list(SORT DEEPSELECT_CUDA_SOURCES)
     set(DEEPSELECT_SOURCES
         "csrc/deepselect/api.cpp"
-        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_512_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu"
-        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_1024_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu"
-        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_4096_numthreads_256_occupancy_1_b_4096_b2_4096_tma_3.cu"
+        ${DEEPSELECT_CUDA_SOURCES}
     )
     set(DEEPSELECT_CUDA_ARCH_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"

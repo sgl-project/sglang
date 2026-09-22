@@ -1,6 +1,9 @@
-"""AOT FP32 DeepSelect Top-K for supported NVIDIA CUDA architectures."""
+"""AOT DeepSelect Top-K for supported NVIDIA CUDA architectures."""
 
 from __future__ import annotations
+
+import functools
+from typing import Optional
 
 import torch
 
@@ -8,6 +11,12 @@ from . import deepselect_ops as _deepselect_ops  # noqa: F401
 
 _INPUT_ALIGNMENT_BYTES = 1024
 _OUTPUT_ALIGNMENT_BYTES = 32
+
+
+@functools.lru_cache(maxsize=1)
+def get_stride_requirement() -> tuple[int, int]:
+    """Return the input and output row-stride requirements in bytes."""
+    return _INPUT_ALIGNMENT_BYTES, _OUTPUT_ALIGNMENT_BYTES
 
 
 def get_deepselect_supported_architectures() -> tuple[int, ...]:
@@ -49,43 +58,86 @@ def _aligned_empty(rows: int, cols: int, alignment_bytes: int, dtype, device):
     return torch.empty((rows, stride), dtype=dtype, device=device)[:, :cols]
 
 
-def deepselect_topk_fp32(
-    input: torch.Tensor, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return unsorted FP32 values and int32 indices for each input row."""
-    if input.dtype != torch.float32 or input.dim() != 2:
-        raise ValueError("input must be a 2D float32 tensor")
+def topk(
+    input: torch.Tensor,
+    topk: int,
+    sorted: bool = False,
+    begin: Optional[torch.Tensor] = None,
+    end: Optional[torch.Tensor] = None,
+    indices_type: torch.dtype = torch.int64,
+    sorted_index: bool = False,
+    hint: Optional[torch.Tensor] = None,
+    output_idx: Optional[torch.Tensor] = None,
+    output_idx_offset: Optional[torch.Tensor] = None,
+    idx_oob_fill_value: int = 2147483647,
+    value_oob_fill_value: float = float("-inf"),
+    return_value: bool = True,
+    abort_when_nan_found: bool = True,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Select the largest values from every input row.
+
+    This follows the public DeepSelect ``topk`` interface. ``end`` contains the
+    per-row exclusive valid length and is the ``topk_lengths`` input used by
+    variable-length decode.
+    """
+    if input.dim() != 2 or input.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("input must be a 2D bfloat16 or float32 tensor")
     if not input.is_cuda:
         raise ValueError("input must be a CUDA tensor")
+    if not 0 < topk <= 4096:
+        raise ValueError("topk must be in [1, 4096]")
     if not is_deepselect_supported(input.device):
         raise RuntimeError(
-            f"deepselect_topk_fp32 does not support CUDA device {input.device}; "
+            f"DeepSelect does not support CUDA device {input.device}; "
             f"compiled architectures: {get_deepselect_supported_architectures()}"
         )
-    if not 0 < topk <= min(4096, input.shape[1]):
-        raise ValueError("topk must be in [1, min(4096, input.shape[1])]")
+    if begin is not None:
+        raise ValueError("begin is not supported currently")
+    if hint is not None:
+        raise ValueError("hint is not supported currently")
+    if indices_type not in (torch.int32, torch.int64):
+        raise ValueError("indices_type must be torch.int32 or torch.int64")
 
-    if (
-        input.stride(1) != 1
-        or input.stride(0) * input.element_size() % _INPUT_ALIGNMENT_BYTES
-    ):
-        aligned = _aligned_empty(
+    values = (
+        _aligned_empty(
             input.shape[0],
-            input.shape[1],
-            _INPUT_ALIGNMENT_BYTES,
+            topk,
+            _OUTPUT_ALIGNMENT_BYTES,
             input.dtype,
             input.device,
         )
-        aligned.copy_(input)
-        input = aligned
+        if return_value
+        else None
+    )
+    if output_idx is None:
+        output_idx = _aligned_empty(
+            input.shape[0],
+            topk,
+            _OUTPUT_ALIGNMENT_BYTES,
+            indices_type,
+            input.device,
+        )
+    elif output_idx.dtype != indices_type:
+        raise ValueError("output_idx dtype must match indices_type")
 
-    values = _aligned_empty(
-        input.shape[0], topk, _OUTPUT_ALIGNMENT_BYTES, input.dtype, input.device
-    )
-    indices = _aligned_empty(
-        input.shape[0], topk, _OUTPUT_ALIGNMENT_BYTES, torch.int32, input.device
-    )
     if input.shape[0] == 0:
-        return values, indices
-    torch.ops.sgl_kernel.deepselect_topk_fp32(input, values, indices, topk)
-    return values, indices
+        return values, output_idx
+    torch.ops.sgl_kernel.deepselect_topk(
+        input,
+        topk,
+        begin,
+        end,
+        sorted,
+        sorted_index,
+        values,
+        output_idx,
+        output_idx_offset,
+        idx_oob_fill_value,
+        value_oob_fill_value,
+        return_value,
+        abort_when_nan_found,
+    )
+    return values, output_idx
+
+
+deepselect_topk = topk

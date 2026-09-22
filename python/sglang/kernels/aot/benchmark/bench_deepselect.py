@@ -6,7 +6,7 @@ import torch
 import triton.testing
 
 from sgl_kernel import (
-    deepselect_topk_fp32,
+    deepselect_topk,
     is_deepselect_supported,
 )
 
@@ -34,7 +34,7 @@ def benchmark(rows, width, topk, provider):
     if provider == "deepselect":
 
         def fn():
-            return deepselect_topk_fp32(scores, topk)
+            return deepselect_topk(scores, topk, indices_type=torch.int32)
 
     else:
 
