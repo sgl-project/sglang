@@ -178,6 +178,7 @@ def _jit_sparse_module(
     top_k_is_blocks: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    batched_prefix: bool = False,
 ) -> Module:
     # record_miss_plan / skip_io are compile-time kernel flags; the
     # (False, False) production instantiation stays byte-identical.
@@ -204,8 +205,11 @@ def _jit_sparse_module(
         record_miss_plan,
         skip_io,
     )
+    # Keep the original key and template arguments when disabled.
+    if batched_prefix:
+        template_args = f"{template_args}, true"
     return load_jit(
-        "sparse_cache",
+        "sparse_cache_batched_prefix" if batched_prefix else "sparse_cache",
         *cache_args,
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
@@ -297,12 +301,26 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    batched_prefix: bool = False,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
     )
 
     record_miss_plan = miss_src is not None
+    # Only the wave64 linear metadata planner has a qualified batched scan.
+    batched_prefix = (
+        batched_prefix
+        and not is_dsv4_layout
+        and record_miss_plan
+        and skip_io
+        and (block_size, num_top_k, hot_buffer_size) == (1024, 2048, 4096)
+        and torch.version.hip is not None
+        and top_k_tokens.device.type == "cuda"
+        and torch.cuda.get_device_properties(
+            top_k_tokens.device
+        ).gcnArchName.startswith("gfx95")
+    )
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -312,6 +330,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        batched_prefix=batched_prefix,
     )
 
     empty = torch.empty(0, device=top_k_tokens.device)
@@ -374,11 +393,14 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    batched_prefix: bool = False,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
     Optional miss_src/miss_dst/miss_count record the miss plan for replay by
-    copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    copy_cache_planned_mla; skip_io elides only this kernel's KV bytes.
+    batched_prefix opts into the gfx95 1024/2048/4096 metadata planner; callers
+    must copy the recorded plan before reading restored KV.
     """
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
@@ -402,6 +424,7 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        batched_prefix=batched_prefix,
     )
 
 

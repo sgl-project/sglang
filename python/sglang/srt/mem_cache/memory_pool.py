@@ -1870,6 +1870,14 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def translate_write_locations(self, locations: torch.Tensor) -> torch.Tensor:
+        """Resolve write locations for kernels that bypass the pool's setters.
+
+        Ordinary pools already use physical locations. Virtual pools override
+        this stateless mapping; the caller owns any prepared result's lifetime.
+        """
+        return locations
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
