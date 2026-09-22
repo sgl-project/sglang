@@ -39,7 +39,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import init_dp_gathered_buffer
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention_flags,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -610,6 +613,7 @@ class MMEncoder:
             moe_tp_size=parallel.tp_size,
         )
         initialize_model_parallel()
+        initialize_dp_attention_flags(server_args)
         init_dp_gathered_buffer(self.model_config)
 
         self.model = load_model(

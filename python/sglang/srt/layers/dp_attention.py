@@ -394,39 +394,33 @@ def compute_dp_attention_world_info(
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
+def initialize_dp_attention_flags(server_args: ServerArgs):
+    """Initialize DP runtime flags without changing the worker's placement."""
+    dp = get_flags().dp
+    dp.enabled = get_parallel().enable_dp_attention
+
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        if ep_scale_joiner_of(resolving_view(server_args)):
+            dp.joiner_skip_all_gather = True
+
+
 def initialize_dp_attention(server_args: ServerArgs):
-    """State this worker's attention-DP placement from the published topology.
+    """Initialize DP flags and state placement from the published topology.
 
     Takes no model config: the placement follows from the parallel sizes alone,
     so the group build can reach it before a model is known. What the model's
     shape decides lives in ``init_dp_gathered_buffer``.
     """
-    dp = get_flags().dp
-    enable_dp_attention = get_parallel().enable_dp_attention
-    dp_size = get_parallel().dp_size
-    attn_cp_size = get_parallel().attn_cp_size
-
-    dp.enabled = enable_dp_attention
-
-    tp_rank = get_parallel().tp_rank
-    tp_size = get_parallel().tp_size
-
+    initialize_dp_attention_flags(server_args)
+    parallel = get_parallel()
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
+        parallel.enable_dp_attention,
+        parallel.tp_rank,
+        parallel.tp_size,
+        parallel.dp_size,
+        parallel.attn_cp_size,
     )
-
-    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        # Reads the resolution, not a bag: this runs under
-        # `initialize_dp_attention`, which the weight-cache daemon calls from
-        # `_init_distributed` -- and other callers reach it from processes
-        # whose publish is not guaranteed to have happened yet. (The daemon
-        # itself publishes first, at `daemon.py:284`, before `:320`.)
-        if ep_scale_joiner_of(resolving_view(server_args)):
-            dp.joiner_skip_all_gather = True
-
-    get_parallel().override_permanently(
-        attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
-    )
+    parallel.override_permanently(attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank)
 
 
 def init_dp_gathered_buffer(model_config: ModelConfig):

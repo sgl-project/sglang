@@ -2664,6 +2664,7 @@ class TestTheParallelPhase(CustomTestCase):
         import torch
 
         from sglang.srt.distributed import bootstrap
+        from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 
         reset_context()
         self.addCleanup(reset_context)
@@ -2687,6 +2688,7 @@ class TestTheParallelPhase(CustomTestCase):
             attn_cp_rank=0,
         )
 
+        initialize_dp_attention_flags(get_server_args())
         bootstrap.init_layer_runtime(
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"]),
@@ -2695,8 +2697,61 @@ class TestTheParallelPhase(CustomTestCase):
             )
         )
 
+        self.assertTrue(get_flags().dp.enabled)
         self.assertEqual(get_parallel().attn_dp_size, 1)
         self.assertEqual(get_parallel().attn_dp_rank, 0)
+
+    def test_encoder_cp_mlp_reduces_over_attention_tp(self):
+        from unittest.mock import Mock
+
+        import torch
+
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention_flags,
+        )
+        from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cpu",
+            tp_size=4,
+            attn_cp_size=2,
+            enable_dp_attention=True,
+        )
+        publish(server_args, role="test", ranks=SpawnRanks(world_rank=0))
+        # Identical shards contribute equally; reducing across CP replicas
+        # would double the output even though the layer uses attention TP.
+        tp_group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 4),
+        )
+        attn_tp_group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 2),
+        )
+        get_parallel().override_permanently(
+            tp_group=tp_group, attn_tp_group=attn_tp_group
+        )
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(), hidden_size=4, dtype=torch.float32
+            )
+        )
+        mlp = Qwen3_VisionMLP(4, 4, bias=False, hidden_act="relu")
+        with torch.no_grad():
+            for parameter in mlp.parameters():
+                parameter.fill_(1)
+            output = mlp(torch.ones(1, 4))
+
+        torch.testing.assert_close(output, torch.full((1, 4), 16.0))
+        attn_tp_group.all_reduce.assert_called_once()
+        tp_group.all_reduce.assert_not_called()
 
     def test_building_twice_is_refused(self):
         from sglang.srt.distributed import bootstrap
