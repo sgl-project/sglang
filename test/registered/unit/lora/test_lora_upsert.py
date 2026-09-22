@@ -265,9 +265,14 @@ class TestStreamedUpsert(CustomTestCase):
         ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=False)
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         old_config, old_lora = manager.configs[ref.lora_id], manager.loras[ref.lora_id]
-        manager.memory_pool.install_streamed_adapter.side_effect = ValueError("bad shape")
+        manager.memory_pool.install_streamed_adapter.side_effect = ValueError(
+            "bad shape"
+        )
         result = manager.load_lora_adapter_from_tensors(
-            ref, {"weight": torch.ones(1)}, dict(CONFIG_DICT, lora_alpha=32), upsert=True
+            ref,
+            {"weight": torch.ones(1)},
+            dict(CONFIG_DICT, lora_alpha=32),
+            upsert=True,
         )
         self.assertFalse(result.success)
         self.assertIn("bad shape", result.error_message)
@@ -279,7 +284,9 @@ class TestStreamedUpsert(CustomTestCase):
     def test_failed_fresh_install_publishes_no_metadata(self):
         manager = _make_manager(lora_no_cpu_backup=True)
         ref = LoRARef(lora_name="a", lora_path="__stream__")
-        manager.memory_pool.install_streamed_adapter.side_effect = RuntimeError("No free slot")
+        manager.memory_pool.install_streamed_adapter.side_effect = RuntimeError(
+            "No free slot"
+        )
         result = manager.load_lora_adapter_from_tensors(
             ref, {"weight": torch.ones(1)}, CONFIG_DICT
         )
@@ -317,7 +324,9 @@ class TestStreamedUpsert(CustomTestCase):
 
     def test_invalid_pool_blocks_batch_preparation(self):
         manager = _make_manager(lora_no_cpu_backup=True)
-        manager.memory_pool.check_valid.side_effect = RuntimeError("incomplete GPU installs")
+        manager.memory_pool.check_valid.side_effect = RuntimeError(
+            "incomplete GPU installs"
+        )
         with self.assertRaisesRegex(RuntimeError, "incomplete GPU installs"):
             manager.prepare_lora_batch(Mock())
 

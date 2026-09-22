@@ -683,8 +683,12 @@ class TestStreamedInstall(unittest.TestCase):
             layers=[
                 types.SimpleNamespace(
                     weights={
-                        f"model.layers.{i}.mlp.down_proj.lora_A.weight": torch.full((2, 3), 2.0),
-                        f"model.layers.{i}.mlp.down_proj.lora_B.weight": torch.full((5, 2), 3.0),
+                        f"model.layers.{i}.mlp.down_proj.lora_A.weight": torch.full(
+                            (2, 3), 2.0
+                        ),
+                        f"model.layers.{i}.mlp.down_proj.lora_B.weight": torch.full(
+                            (5, 2), 3.0
+                        ),
                     },
                     pinned_weights={},
                 )
@@ -696,13 +700,17 @@ class TestStreamedInstall(unittest.TestCase):
         )
 
     def install(self, uid="adapter"):
-        with mock.patch.dict("sys.modules", {"sglang.srt.lora.layers": _LORA_LAYERS_STUB}):
-            self.pool.install_streamed_adapter(uid, self.adapter, self.modules, None, None)
+        with mock.patch.dict(
+            "sys.modules", {"sglang.srt.lora.layers": _LORA_LAYERS_STUB}
+        ):
+            self.pool.install_streamed_adapter(
+                uid, self.adapter, self.modules, None, None
+            )
 
     def test_later_shape_error_preserves_all_resident_weights(self):
-        self.adapter.layers[1].weights[
-            "model.layers.1.mlp.down_proj.lora_B.weight"
-        ] = torch.zeros(4, 2)
+        self.adapter.layers[1].weights["model.layers.1.mlp.down_proj.lora_B.weight"] = (
+            torch.zeros(4, 2)
+        )
         with self.assertRaisesRegex(AssertionError, "LoRA buffer shape"):
             self.install()
         for buffer in (self.pool.A_buffer, self.pool.B_buffer):
@@ -723,9 +731,9 @@ class TestStreamedInstall(unittest.TestCase):
     def test_invalid_weights_preserve_base_placeholder(self):
         self.pool.uid_to_buffer_id = {None: 0}
         self.pool.buffer_id_to_uid = [None]
-        self.adapter.layers[1].weights[
-            "model.layers.1.mlp.down_proj.lora_B.weight"
-        ] = torch.zeros(4, 2)
+        self.adapter.layers[1].weights["model.layers.1.mlp.down_proj.lora_B.weight"] = (
+            torch.zeros(4, 2)
+        )
         with self.assertRaisesRegex(AssertionError, "LoRA buffer shape"):
             self.install()
         self.assertEqual(self.pool.uid_to_buffer_id, {None: 0})
@@ -742,7 +750,9 @@ class TestStreamedInstall(unittest.TestCase):
                 raise RuntimeError("injected copy failure")
             copy_weight(buffer, weight)
 
-        with mock.patch.object(mem_pool_module, "copy_weight_into_buffer", fail_on_third_copy):
+        with mock.patch.object(
+            mem_pool_module, "copy_weight_into_buffer", fail_on_third_copy
+        ):
             with self.assertRaisesRegex(RuntimeError, "injected copy failure"):
                 self.install()
         self.assertTrue(torch.all(self.pool.A_buffer["down_proj"][0] == 2))
@@ -754,7 +764,9 @@ class TestStreamedInstall(unittest.TestCase):
 
         self.install()
         self.pool.check_valid()
-        for a, b in zip(self.pool.A_buffer["down_proj"], self.pool.B_buffer["down_proj"]):
+        for a, b in zip(
+            self.pool.A_buffer["down_proj"], self.pool.B_buffer["down_proj"]
+        ):
             self.assertTrue(torch.all(a == 2))
             self.assertTrue(torch.all(b == 3))
         self.adapter.release_staged_weights.assert_called_once()

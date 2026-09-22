@@ -1561,7 +1561,9 @@ class LoRAMemoryPool:
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
                         # Zero beyond loaded rank — MoE kernel reads full max_rank.
-                        load_lora_weight_tensor(target_buffer[buffer_id, 0, :, lora_rank:], None)
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, 0, :, lora_rank:], None
+                        )
                     elif weights is None:
                         load_lora_weight_tensor(target_buffer[buffer_id], None)
                     elif isinstance(weights, (torch.Tensor, dict)):
@@ -1603,7 +1605,9 @@ class LoRAMemoryPool:
                     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
-                        load_lora_weight_tensor(target_buffer[buffer_id, :, lora_rank:], None)
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, :, lora_rank:], None
+                        )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
@@ -1745,7 +1749,9 @@ class LoRAMemoryPool:
                 self.lora_added_tokens_size > 0
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
-                load_lora_weight_tensor(self.new_embeddings_buffer["input_embeddings"][buffer_id], None)
+                load_lora_weight_tensor(
+                    self.new_embeddings_buffer["input_embeddings"][buffer_id], None
+                )
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
