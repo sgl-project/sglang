@@ -1390,6 +1390,9 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_prefill_interleaving=get_schedule().enable_prefill_interleaving,
+            disable_prefill_interleaving=get_schedule().disable_prefill_interleaving,
+            prefill_interleaving_min_continuation_tokens=get_schedule().prefill_interleaving_min_continuation_tokens,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -3907,11 +3910,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_interleaving=self.policy.prefill_interleaving,
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.policy.prefill_interleaving_chunk_limit(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,

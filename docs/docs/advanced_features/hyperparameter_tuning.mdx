@@ -64,6 +64,35 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
+### Interleave waiting prefills with a continuing request
+
+Prefill interleaving lets waiting requests finish their uncached prefill alongside
+a continuing request. It requires chunked prefill, radix caching, and an
+autoregressive model. Enable it for `hrrn` with `--enable-prefill-interleaving`;
+it is enabled by default for `shortest-prefill-first`. Use
+`--disable-prefill-interleaving` to turn it off.
+
+`--prefill-interleaving-min-continuation-tokens` reserves one KV page by default
+for `shortest-prefill-first`, or half the current chunk budget rounded up to a
+page for `hrrn` (8K of 16K). An explicit minimum must be a positive multiple of
+`--page-size` below `--chunked-prefill-size`. If no waiter fits, the continuation
+uses the normal chunk budget. Memory admission can still limit either allocation.
+
+| Policy | Waiting-request selection |
+| --- | --- |
+| `shortest-prefill-first` | Select requests shorter than the continuation; stop at the first ineligible request. |
+| `hrrn` | Select fitting requests in queue order, skipping those that do not fit. |
+
+Both policies check at most the first 128 waiting requests per interleaving pass;
+the unscanned tail stays in place. HRRN uses FCFS ordering when the waiting queue
+exceeds its existing 128-request fallback threshold. The interleaving scan cap
+limits eligibility checks, not prefix matching or total scheduler work.
+
+Only one unfinished prefill is supported: waiters must fit after the continuation
+reservation and finish in this pass. Interleaving longer requests needs support
+for multiple partial prefills. Non-fitting waiters can be bypassed, so HRRN aging
+does not guarantee bounded tail TTFT.
+
 ### Tune `--cuda-graph-max-bs-decode`
 By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).
 However, for some models, especially at large tensor parallelism sizes, CUDA graph can be useful for batch sizes up to 512 or 768.
