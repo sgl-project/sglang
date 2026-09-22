@@ -112,6 +112,14 @@ class HiCacheNixl(HiCacheStorage):
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
+        # See HiCacheFile: strict unified-kv SWA HiCache persists the SWA window
+        # and its coupled c4/indexer overlap state as INDEPENDENT L3 pools coupled
+        # by key (no A-gather blob packing), so the SWA blob layout differs from the
+        # older ``_swapk1`` packed blobs. Namespace the key family by layout version
+        # so a stale packed blob can never be read under the new independent layout.
+        if envs.SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE.get():
+            self.config_suffix += "_swaind1"
+
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
         )
