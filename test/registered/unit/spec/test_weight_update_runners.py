@@ -1,5 +1,6 @@
 """Every spec family must name exactly the draft runners that own weights."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -92,3 +93,7 @@ def test_weight_update_runners_cover_each_spec_family(cls, attrs, expected):
     got = worker.weight_update_runners()
 
     assert [(role, runners.index(r)) for role, r in got] == expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
