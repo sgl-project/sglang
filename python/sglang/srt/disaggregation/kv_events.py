@@ -20,6 +20,7 @@ KV caching events
 import atexit
 import enum
 import logging
+import os
 import queue
 import threading
 import time
@@ -522,9 +523,7 @@ class ZmqEventPublisher(EventPublisher):
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
                 self._pub.bind(self._endpoint)
-                self._local_pub_endpoint = self._pub.getsockopt_string(
-                    zmq.LAST_ENDPOINT
-                )
+                self._local_pub_endpoint = self._bound_endpoint(self._pub)
             else:
                 self._pub.connect(self._endpoint)
 
@@ -538,9 +537,19 @@ class ZmqEventPublisher(EventPublisher):
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
-            self._local_replay_endpoint = self._replay.getsockopt_string(
-                zmq.LAST_ENDPOINT
-            )
+            self._local_replay_endpoint = self._bound_endpoint(self._replay)
+
+    @staticmethod
+    def _bound_endpoint(socket: zmq.Socket) -> str:
+        endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        if endpoint.startswith("ipc://"):
+            path = endpoint[len("ipc://") :]
+            # Capture the publisher's working directory at bind time so a
+            # separate process can use the address. Abstract IPC names are
+            # independent of the filesystem and must remain unchanged.
+            if not path.startswith("@"):
+                endpoint = f"ipc://{os.path.abspath(path)}"
+        return endpoint
 
     def _publisher_thread(self) -> None:
         """Background thread that processes the event queue."""
