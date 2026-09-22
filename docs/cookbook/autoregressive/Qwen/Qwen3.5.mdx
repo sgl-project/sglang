@@ -1029,6 +1029,136 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through_selective
 ```
 
+#### 5.2.4 Agentic Long-Context, Multi-Node (GB300 FP8, MTP)
+
+Container image (pinned for reproducibility):
+`lmsysorg/sglang:nightly-dev-cu13-20260913-fa663e72`.
+
+**Aggregated, TP4 (single GB300 node, 4 GPUs):**
+```bash Command
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+MC_FORCE_MNNVL=1 \
+NVSHMEM_REMOTE_TRANSPORT=none \
+SGLANG_ENABLE_SPEC_V2=1 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend trtllm_mha \
+  --moe-runner-backend flashinfer_trtllm \
+  --linear-attn-decode-backend triton \
+  --disable-shared-experts-fusion \
+  --mamba-ssm-dtype bfloat16 \
+  --page-size 64 \
+  --mem-fraction-static 0.85 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 6 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 7 \
+  --speculative-moe-runner-backend flashinfer_trtllm \
+  --enable-hierarchical-cache \
+  --hicache-write-policy write_back \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first_direct \
+  --hicache-size 32 \
+  --enable-linear-replayssm-spec \
+  --disable-attn-tp-gather
+```
+
+The TP8 variant (2 GB300 nodes) uses the same flags with `--tensor-parallel-size 8`.
+
+**Disaggregated PD (1P1D, PP4 prefill / DEP4 decode), concurrency 200.** Prefill, on one 4-GPU node:
+```bash Command
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+MC_FORCE_MNNVL=1 \
+NVSHMEM_REMOTE_TRANSPORT=none \
+SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True \
+SGLANG_PP_LAYER_PARTITION=16,16,16,12 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 4 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend trtllm_mha \
+  --moe-runner-backend flashinfer_trtllm \
+  --linear-attn-decode-backend triton \
+  --disable-shared-experts-fusion \
+  --page-size 64 \
+  --mem-fraction-static 0.85 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-moe-runner-backend flashinfer_trtllm \
+  --pp-async-batch-depth 1 \
+  --enable-hierarchical-cache \
+  --hicache-host-memory-mode cache \
+  --hicache-write-policy write_back \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first_direct \
+  --hicache-ratio 1.0 \
+  --disaggregation-mode prefill \
+  --disaggregation-bootstrap-port 31000
+```
+
+Decode, on a second 4-GPU node:
+```bash Command
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+MC_FORCE_MNNVL=1 \
+NVSHMEM_REMOTE_TRANSPORT=none \
+SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True \
+SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS=4 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --data-parallel-size 4 \
+  --expert-parallel-size 4 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend trtllm_mha \
+  --moe-runner-backend flashinfer_trtllm \
+  --linear-attn-decode-backend triton \
+  --disable-shared-experts-fusion \
+  --moe-a2a-backend flashinfer \
+  --ep-dispatch-algorithm static \
+  --eplb-algorithm deepseek \
+  --page-size 64 \
+  --mem-fraction-static 0.85 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-moe-runner-backend flashinfer_trtllm_routed \
+  --speculative-moe-a2a-backend flashinfer \
+  --disable-radix-cache \
+  --disaggregation-mode decode \
+  --disaggregation-bootstrap-port 31000 \
+  --disaggregation-decode-extra-slots 2 \
+  --enable-linear-replayssm-spec \
+  --linear-replayssm-cache-len 32
+```
+
+Router:
+```bash Command
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 \
+  --decode http://<decode-host>:30000 \
+  --host 0.0.0.0 --port 8000
+```
+
+HiCache runs on the prefill role only (`--hicache-ratio`, sized against the device KV pool), decode instead drops radix caching with `--disable-radix-cache`. Concurrency 600 scales to 3P2D and concurrency 1000 to 5P3D — same per-role command, only the number of prefill/decode workers behind the router changes.
+
 ### 5.3 Vision Speed Benchmark
 
 We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. Each request has 128 input tokens, two 720p images, and 1024 output tokens.
