@@ -699,6 +699,9 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            attn_tp_group=tp_group,
+            attn_tp_rank=tp_group.rank_in_group,
+            moe_tp_rank=tp_group.rank_in_group,
             # Only tensor parallelism folds here, so every other dimension is
             # one and the quotients come out of the shared derivation.
             **derive_parallel_widths(

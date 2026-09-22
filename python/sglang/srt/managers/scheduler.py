@@ -595,6 +595,12 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                if self.enable_unified_memory:
+                    # Keep device rows stable until host transfers are acknowledged.
+                    # Queue reads and relocation both run on the scheduler thread.
+                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
+                        lambda c=cache_controller: not c.has_inflight_device_transfers()
+                    )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -4526,10 +4532,13 @@ class Scheduler(
                         if is_verify_round
                         else batch_result.next_draft_input
                     )
-                    if batch_result.new_seq_lens is not None:
-                        batch.seq_lens = batch_result.new_seq_lens
+                    new_seq_lens = batch_result.new_seq_lens
+                    # Extend rounds return batch.seq_lens itself; copying it back
+                    # would block the scheduler until the whole forward has run.
+                    if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
+                        batch.seq_lens = new_seq_lens
                         if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_cpu = new_seq_lens.to("cpu")
                             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     self.update_cache_from_scheduler(batch, batch_result)
