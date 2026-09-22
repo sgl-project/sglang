@@ -386,8 +386,17 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
-    # Encoders that stage bounded chunks keep their raw inputs on the host.
+    # Recorded after asynchronous copies; CPU readers wait before accessing them.
+    host_offload_event: Optional[object] = None
+    # Let the encoder manage device transfer of raw features.
     keep_feature_on_cpu: bool = False
+
+    def wait_host_offload(self) -> None:
+        """Block until the async host offload of this item's tensors landed."""
+        event = self.host_offload_event
+        if event is not None:
+            event.synchronize()
+            self.host_offload_event = None
 
     def __post_init__(self) -> None:
         if self.hash is not None:

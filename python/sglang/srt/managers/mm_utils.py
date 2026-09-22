@@ -635,6 +635,45 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _offload_mm_items_to_host(mm_inputs_list: List[MultimodalInputs]) -> None:
+    """Move the prefilled items' GPU tensors to pinned host memory asynchronously."""
+    language_only = get_disagg().language_only
+    stream = None
+    for mm_input_obj in mm_inputs_list:
+        for mm_item in mm_input_obj.mm_items:
+            offloaded = False
+            feature = mm_item.feature
+            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                if stream is None:
+                    stream = torch.cuda.current_stream()
+                # The transport reconstructed this block on the scheduler stream
+                # and nothing else pins it to ours: without record_stream the
+                # allocator recycles it into the next scheduler allocation while
+                # the encoder read and this copy are still queued here.
+                feature.record_stream(stream)
+                mm_item.feature = feature.to("cpu", non_blocking=True)
+                offloaded = True
+            if language_only:
+                precomputed = mm_item.precomputed_embeddings
+                if (
+                    isinstance(precomputed, torch.Tensor)
+                    and precomputed.is_cuda
+                    and not mm_item.keep_device_embedding
+                ):
+                    if stream is None:
+                        stream = torch.cuda.current_stream()
+                    precomputed.record_stream(stream)
+                    mm_item.precomputed_embeddings = precomputed.to(
+                        "cpu", non_blocking=True
+                    )
+                    offloaded = True
+            if offloaded:
+                # Host readers wait on this before touching the pinned copy.
+                event = torch.cuda.Event()
+                event.record(stream)
+                mm_item.host_offload_event = event
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -725,26 +764,7 @@ def general_mm_embed_routine(
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
             if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_disagg().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
-                                )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                    and not mm_item.keep_device_embedding
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
-                                    )
+                _offload_mm_items_to_host(mm_inputs_list)
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()

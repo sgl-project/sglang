@@ -97,6 +97,8 @@ def _get_precomputed_embedding(
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
+            for item in items_per_req:
+                item.wait_host_offload()
             req_embeddings = torch.concat(
                 [item.precomputed_embeddings for item in items_per_req]
             )
@@ -221,6 +223,18 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
+def _prepare_items_for_encoding(
+    items: List[MultimodalDataItem],
+    device: torch.device,
+    data_embedding_func: DataEmbeddingFunc,
+) -> None:
+    if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        _move_items_to_device(items, device)
+    for item in items:
+        if isinstance(item.feature, torch.Tensor) and item.feature.is_cpu:
+            item.wait_host_offload()
+
+
 def _acknowledge_deferred_cuda_ipc_cache_hits(
     items: List[MultimodalDataItem],
 ) -> None:
@@ -274,8 +288,9 @@ def _get_chunked_embedding_full(
             embedding_per_req = None
 
     if embedding_per_req is None:
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(embedding_items_per_req, device)
+        _prepare_items_for_encoding(
+            embedding_items_per_req, device, data_embedding_func
+        )
         embedding = data_embedding_func(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
@@ -387,8 +402,7 @@ def _batch_encode_per_image_misses(
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_items, device)
+        _prepare_items_for_encoding(miss_items, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_items)
 
         if isinstance(all_miss_embedding, list):
@@ -465,8 +479,7 @@ def _get_chunked_embedding_by_item(
 
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_item_list, device)
+        _prepare_items_for_encoding(miss_item_list, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_item_list)
 
         if isinstance(all_miss_embedding, list):
