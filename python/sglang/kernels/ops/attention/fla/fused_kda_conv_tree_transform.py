@@ -269,8 +269,8 @@ def fused_kda_conv_tree_transform(
     if x.ndim != 3:
         raise ValueError("x must be [batch, 3 * HV * K, tree_width]")
     batch, dim, tree_width = x.shape
-    if tree_width not in (31, 33, 49, 65):
-        raise ValueError(f"tree_width must be 31, 33, 49, or 65, got {tree_width}")
+    if tree_width not in (17, 31, 33, 49, 65):
+        raise ValueError(f"tree_width must be 17, 31, 33, 49, or 65, got {tree_width}")
     hv, key_dim = processed_beta.shape[1], processed_k.shape[-1]
     if dim != 3 * hv * key_dim or processed_k.shape != (batch, hv, tree_width, key_dim):
         raise ValueError("only equal Q/K/V head geometry is supported")
