@@ -1061,7 +1061,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
         packed_draft_decls=packed_drafts,
     )
-    _validate_host_pool_buffers(configs, page_size=params.page_size, use_mla=use_mla)
+    _validate_host_pool_buffers(configs, page_size=params.page_size)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1263,11 +1263,16 @@ def _root_config(configs: tuple[HostPoolBuildConfig, ...]) -> HostPoolBuildConfi
 
 
 def _validate_host_pool_buffers(
-    configs: tuple[HostPoolBuildConfig, ...], *, page_size: int, use_mla: bool
+    configs: tuple[HostPoolBuildConfig, ...], *, page_size: int
 ) -> None:
+    """Every check that can fail before any host memory is reserved."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     root = _root_config(configs)
     _check_packed_kv_rows(
-        root.decl.device_pool, root.packed_draft_device_pools, use_mla=use_mla
+        root.decl.device_pool,
+        root.packed_draft_device_pools,
+        use_mla=isinstance(root.decl.device_pool, MLATokenToKVPool),
     )
     for config in configs:
         if not config.decl.is_layout_root:
@@ -1345,7 +1350,7 @@ def assemble_host_pools_from_decls(
         transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
         packed_draft_decls=packed_drafts,
     )
-    _validate_host_pool_buffers(configs, page_size=params.page_size, use_mla=use_mla)
+    _validate_host_pool_buffers(configs, page_size=params.page_size)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1422,8 +1427,6 @@ def build_full_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build the separate draft sidecars declared by a full-attention draft pool;
     their indices follow target KV and their layout roots on the draft KV host pool."""
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-
     decls = draft_kv_pool.host_pool_decls()
     # A hybrid draft declares its KV on the full-attention sub-pool.
     pool = layout_root(decls).device_pool
@@ -1439,11 +1442,7 @@ def build_full_draft_pools(
         transfer_layer_id_max=pool.layer_num,
         index_primary=PoolName.KV,
     )
-    _validate_host_pool_buffers(
-        configs,
-        page_size=controller.page_size,
-        use_mla=isinstance(pool, MLATokenToKVPool),
-    )
+    _validate_host_pool_buffers(configs, page_size=controller.page_size)
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(

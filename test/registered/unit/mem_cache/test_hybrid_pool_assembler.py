@@ -347,19 +347,19 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
 
 
 def _kv_pool_stub(*, layer_num: int, size: int = 4096):
-    """A plain full-attention KV pool: declares KV only."""
-    pool = SimpleNamespace(
-        layer_num=layer_num,
-        size=size,
-        start_layer=0,
-        end_layer=layer_num - 1,
-        store_dtype=torch.bfloat16,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        kv_cache_dim=576,
-        layer_shard_enabled=False,
-    )
-    pool.host_pool_decls = lambda: (make_kv_pool_decl(pool),)
+    """A plain MLA KV pool without CUDA: declares KV only."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    pool = object.__new__(MLATokenToKVPool)
+    pool.layer_num = layer_num
+    pool.size = size
+    pool.start_layer = 0
+    pool.end_layer = layer_num - 1
+    pool.store_dtype = torch.bfloat16
+    pool.kv_lora_rank = 512
+    pool.qk_rope_head_dim = 64
+    pool.kv_cache_dim = 576
+    pool.layer_shard_enabled = False
     return pool
 
 
@@ -437,9 +437,9 @@ def _entry_shape(group, transfer_layer_num):
     ]
 
 
-def _target_params(drafts=()):
+def _target_params(drafts=(), page_size=64):
     return SimpleNamespace(
-        page_size=64,
+        page_size=page_size,
         mtp_draft_device_pools=tuple(drafts),
         token_to_kv_pool_allocator=None,
         tp_cache_group=None,
@@ -1239,7 +1239,7 @@ class TestHostPoolPreflight(CustomTestCase):
         with patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate:
             with self.assertRaisesRegex(ValueError, "multiple"):
                 assemble_host_pools_from_decls(
-                    params=SimpleNamespace(page_size=63, mtp_draft_device_pools=()),
+                    params=_target_params(page_size=63),
                     decls=pool.host_pool_decls(),
                     full_layer_mapping={0: 0},
                     load_cache_event=None,
