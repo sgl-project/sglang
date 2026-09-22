@@ -764,20 +764,29 @@ def fused_qkv_split_gdn_prefill(
 
 
 @triton.jit
-def fused_qkv_split_l2norm_gdn_prefill_kernel(
+def fused_gdn_prefill_prepare_kernel(
     q,
     k,
     v,
+    g,
+    beta_output,
     mixed_qkv,
+    A_log,
+    a,
+    b,
+    dt_bias,
     eps,
     MIXED_QKV_STRIDE_T: tl.constexpr,
     MIXED_QKV_STRIDE_D: tl.constexpr,
+    A_STRIDE_T: tl.constexpr,
+    B_STRIDE_T: tl.constexpr,
     NUM_QK_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
     NUM_QK_HEADS_POW2: tl.constexpr,
     HEAD_QK_POW2: tl.constexpr,
+    NUM_V_HEADS_POW2: tl.constexpr,
     V_BLOCK: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -813,27 +822,42 @@ def fused_qkv_split_l2norm_gdn_prefill_kernel(
     b_v = tl.load(row + (2 * qk_dim + v_off) * MIXED_QKV_STRIDE_D, mask=v_mask)
     tl.store(v + i_t * v_dim + v_off, b_v, mask=v_mask)
 
+    # Match fused_gdn_gating_kernel, including its bf16/fp16 beta rounding.
+    gate_head = tl.arange(0, NUM_V_HEADS_POW2)
+    gate_mask = gate_head < NUM_V_HEADS
+    gate_off = i_t * NUM_V_HEADS + gate_head
+    b_a_log = tl.load(A_log + gate_head, mask=gate_mask)
+    b_a = tl.load(a + i_t * A_STRIDE_T + gate_head, mask=gate_mask)
+    b_b = tl.load(b + i_t * B_STRIDE_T + gate_head, mask=gate_mask)
+    b_dt_bias = tl.load(dt_bias + gate_head, mask=gate_mask)
+    x = b_a.to(tl.float32) + b_dt_bias.to(tl.float32)
+    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+    b_g = -tl.exp(b_a_log.to(tl.float32)) * softplus_x
+    tl.store(g + gate_off, b_g.to(g.dtype.element_ty), mask=gate_mask)
+    b_beta = tl.sigmoid(b_b.to(tl.float32))
+    tl.store(beta_output + gate_off, b_beta.to(b.dtype.element_ty), mask=gate_mask)
 
-def fused_qkv_split_l2norm_gdn_prefill(
+
+def fused_gdn_prefill_prepare(
     mixed_qkv: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
     num_qk_heads: int,
     num_v_heads: int,
     head_qk: int,
     head_v: int,
     eps: float = 1e-6,
 ):
-    """Split post-conv GDN QKV and L2-normalize Q/K in a single launch.
+    """Split/normalize QKV and prepare GDN gates in a single launch.
 
-    This is the HIP counterpart of the CUDA `gdn_prefill_qkv_prepare_fwd`
-    path, which materializes Q/K/V and then runs `l2norm_fwd` twice. Folding
-    the norm into the split drops those two launches and the extra Q/K
-    round-trip through HBM, so the caller must pass
-    `use_qk_l2norm_in_kernel=False` to the chunk kernel.
-
-    `mixed_qkv` is laid out per token as `[all_q | all_k | all_v]` and may be a
-    strided `[T, qkv_dim]` view.
+    Inputs may be the strided post-conv QKV and BA projection views. The caller
+    must disable the chunk kernel's Q/K norm because it is already applied.
     """
     seq_len = mixed_qkv.shape[0]
+    assert a.shape == b.shape == (seq_len, num_v_heads)
+    assert a.stride(1) == b.stride(1) == 1
     q = torch.empty(
         (1, seq_len, num_qk_heads, head_qk),
         dtype=mixed_qkv.dtype,
@@ -845,25 +869,36 @@ def fused_qkv_split_l2norm_gdn_prefill(
         dtype=mixed_qkv.dtype,
         device=mixed_qkv.device,
     )
+    g = torch.empty((1, seq_len, num_v_heads), dtype=torch.float32, device=a.device)
+    beta_output = torch.empty_like(g)
     if seq_len == 0:
-        return q, k, v
+        return q, k, v, g, beta_output
 
-    fused_qkv_split_l2norm_gdn_prefill_kernel[(seq_len,)](
+    fused_gdn_prefill_prepare_kernel[(seq_len,)](
         q,
         k,
         v,
+        g,
+        beta_output,
         mixed_qkv,
+        A_log,
+        a,
+        b,
+        dt_bias,
         eps,
         mixed_qkv.stride(0),
         mixed_qkv.stride(1),
+        a.stride(0),
+        b.stride(0),
         num_qk_heads,
         num_v_heads,
         head_qk,
         head_v,
         NUM_QK_HEADS_POW2=triton.next_power_of_2(num_qk_heads),
         HEAD_QK_POW2=triton.next_power_of_2(head_qk),
+        NUM_V_HEADS_POW2=triton.next_power_of_2(num_v_heads),
         V_BLOCK=triton.next_power_of_2(num_v_heads * head_v),
         num_warps=8,
         num_stages=3,
     )
-    return q, k, v
+    return q, k, v, g, beta_output

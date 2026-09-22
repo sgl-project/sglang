@@ -10,7 +10,11 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
-from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.kernels.ops.attention.fla.utils import (
+    check_shared_mem,
+    is_amd,
+    is_nvidia_hopper,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -145,7 +149,10 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    use_amd_gdn_tuning = is_amd and g is not None and K == V == 128
+    o = torch.empty_like(v) if use_amd_gdn_tuning else torch.zeros_like(v)
+    config = (64, 128, 2, 3) if use_amd_gdn_tuning else (128, 64, 4, 2)
+    BK, BV, num_warps, num_stages = config
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
@@ -166,11 +173,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=BK,
+        BV=BV,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o

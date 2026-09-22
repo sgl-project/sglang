@@ -35,8 +35,8 @@ if not is_cpu():
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         can_use_fused_qkvzba_causal_conv1d_update_contiguous,
+        fused_gdn_prefill_prepare,
         fused_qkv_split_gdn_prefill,
-        fused_qkv_split_l2norm_gdn_prefill,
         fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkvzba_split_reshape_cat_contiguous,
     )
@@ -1020,10 +1020,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
         )
-        # HIP folds the Q/K L2-norm into the split; CUDA uses
-        # gdn_prefill_qkv_prepare_fwd. Only TritonGDNKernel.extend reads the
-        # flag, so gate on the kernel rather than on the platform.
-        qk_l2norm_applied = (
+        # HIP Triton folds Q/K norm and gating into the split; CUDA prepares
+        # QKV inside the FlashInfer backend.
+        use_fused_prepare = (
             use_fused_split
             and is_hip()
             and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
@@ -1031,9 +1030,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and layer.num_q_heads == layer.num_k_heads
             and layer.head_q_dim == layer.head_k_dim
         )
-        if qk_l2norm_applied:
-            query, key, value = fused_qkv_split_l2norm_gdn_prefill(
+        if use_fused_prepare:
+            query, key, value, g, beta = fused_gdn_prefill_prepare(
                 mixed_qkv,
+                layer.A_log,
+                a,
+                b,
+                layer.dt_bias,
                 layer.num_k_heads,
                 layer.num_v_heads,
                 layer.head_k_dim,
@@ -1119,7 +1122,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if not use_fused_prepare:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1137,7 +1141,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
-                use_qk_l2norm_in_kernel=not qk_l2norm_applied,
+                use_qk_l2norm_in_kernel=not use_fused_prepare,
             )
 
             if is_npu() and last_recurrent_state is not None:
