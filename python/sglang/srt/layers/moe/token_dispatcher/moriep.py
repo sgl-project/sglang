@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
@@ -439,8 +440,8 @@ class _MoriEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
 
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")

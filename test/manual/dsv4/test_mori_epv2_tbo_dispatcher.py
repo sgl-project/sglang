@@ -8,6 +8,7 @@ import torch.distributed as dist
 
 import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.runtime_context import get_flags
@@ -71,8 +72,9 @@ def main():
         params_dtype=torch.bfloat16,
         async_finish=True,
     )
-    with get_flags().moe.override(
-        tbo_enabled=True, a2a_backend=MoeA2ABackend.MORI_EPV2
+    with (
+        envs.SGLANG_MORI_EP_VERSION.override("epv2"),
+        get_flags().moe.override(tbo_enabled=True, a2a_backend=MoeA2ABackend.MORI),
     ):
         dispatcher = MaybeTboDeepEPDispatcher(**kwargs)
     children = dispatcher._inners
