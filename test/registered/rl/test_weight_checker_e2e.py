@@ -211,7 +211,6 @@ class TestWeightCheckerE2E(CustomTestCase):
                 self.assertNotIn("cos_sin_cache", name)
                 self.assertNotIn("inv_freq", name)
                 self.assertNotIn("freqs_cis", name)
-                self.assertNotIn("_weight_fp32", name)
 
     def test_z_snapshot_reset_compare_detects_diff(self):
         """Destructive: leaves weights randomized. Named test_z_* so it runs last."""

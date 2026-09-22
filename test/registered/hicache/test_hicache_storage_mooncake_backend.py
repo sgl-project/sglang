@@ -18,10 +18,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     find_available_port,
     get_gpu_count,
-    is_in_ci,
 )
 
-register_cuda_ci(est_time=236, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=391, stage="base-b", runner_config="2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -211,37 +210,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         return server_args, env_vars
 
 
-'''
-# Same as #10131, layer first layout test TODO(mateng): will make it work
-class TestMooncakeBackendLayerFirstLayout(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
-    """Layer first layout tests for HiCache-Mooncake backend"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "layer_first"
-        server_args["--hicache-io-backend"] = "direct"
-        return server_args, env_vars
-'''
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestMooncakeBackendPageFirstLayout(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
-    """Page first layout tests for HiCache-Mooncake backend"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args, env_vars = super()._get_additional_server_args_and_env()
-        server_args["--hicache-mem-layout"] = "page_first"
-        return server_args, env_vars
-
-
 class TestMooncakeBackendMLAModel(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -279,7 +247,8 @@ class TestMooncakeBackendQwen330BCP2(
                 "--tp-size": 2,
                 "--moe-dp-size": 2,
                 "--attn-cp-size": 2,
-                "--enable-prefill-context-parallel": True,
+                "--enable-prefill-cp": True,
+                "--cp-strategy": "zigzag",
                 "--trust-remote-code": True,
                 "--cuda-graph-max-bs-decode": 32,
                 "--max-running-requests": 32,

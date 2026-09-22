@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
@@ -15,7 +16,7 @@ from sglang.srt.speculative.spec_registry import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RegistryIsolated(CustomTestCase):
@@ -231,13 +232,16 @@ class TestServerArgsHook(_RegistryIsolated):
             decrypted_draft_config_file=None,
             trust_remote_code=False,
             speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
         )
 
         handle_speculative_decoding(server_args)
 
-        self.assertEqual(server_args.speculative_algorithm, "MY_HANDLE_ARGS")
+        self.assertEqual(
+            resolution_result(server_args, "speculative_algorithm"), "MY_HANDLE_ARGS"
+        )
         self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.speculative_num_draft_tokens, 7)
 

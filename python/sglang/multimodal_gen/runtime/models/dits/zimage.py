@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -86,9 +87,7 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
-            rmsnorm_tanh_residual,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual
 
         y = rmsnorm_tanh_residual(
             x,
@@ -109,9 +108,7 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.kernels.ops.diffusion.triton.native_bf16_rmsnorm import (
-            rmsnorm_scale,
-        )
+        from sglang.kernels.ops.diffusion import rmsnorm_scale
 
         y = rmsnorm_scale(
             x,
@@ -137,7 +134,7 @@ def zimage_native_qk_rmsnorm(
     with one Triton launch per tensor that reads the strided fused-qkv slices
     directly. Returns contiguous (q, k) or None when unsupported.
     """
-    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+    from sglang.kernels.ops.diffusion import (
         can_use_qk_rmsnorm_native,
         zimage_qk_rmsnorm_native,
     )
@@ -258,12 +255,12 @@ class ZImageAttention(nn.Module):
         self.enable_zimage_qk_fusion = quant_config is None
 
         tp_size = get_tp_world_size()
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
-        assert (
-            num_kv_heads % tp_size == 0
-        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        assert num_heads % tp_size == 0, (
+            f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        )
+        assert num_kv_heads % tp_size == 0, (
+            f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
 
@@ -707,9 +704,9 @@ class RopeEmbedder:
         self.theta = theta
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
-        assert len(axes_dims) == len(
-            axes_lens
-        ), "axes_dims and axes_lens must have the same length"
+        assert len(axes_dims) == len(axes_lens), (
+            "axes_dims and axes_lens must have the same length"
+        )
 
         self.cos_cached = None
         self.sin_cached = None
@@ -768,7 +765,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
-    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_zimage_layer]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping

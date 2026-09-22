@@ -28,8 +28,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -256,7 +254,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -307,7 +307,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.ep_size = get_parallel().tp_size
 
             self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -707,7 +707,6 @@ class LLaDA2MoeBlock(nn.Module):
 
 
 class LLaDA2MoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -716,7 +715,7 @@ class LLaDA2MoeModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
@@ -803,7 +802,7 @@ class LLaDA2MoeModelLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None

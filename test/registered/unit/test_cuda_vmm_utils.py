@@ -21,8 +21,8 @@ import torch.distributed as dist
 from cuda.bindings import driver as drv
 
 from sglang.kernels.jit.utils import cache_once
-from sglang.srt import cuda_vmm_utils
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils import cuda_vmm_utils
+from sglang.srt.utils.cuda_vmm_utils import (
     check_drv,
     exchange_posix_fds,
     export_shareable_handles,
@@ -37,7 +37,7 @@ from sglang.srt.cuda_vmm_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 
 _FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 _POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
@@ -104,9 +104,7 @@ def _byte(rank: int, chunk: int) -> int:
 def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
     host = np.empty(16, dtype=np.uint8)
     check_drv(drv.cuMemcpyDtoH(host.ctypes.data, va, host.nbytes), "cuMemcpyDtoH")
-    assert (
-        host == expected
-    ).all(), (
+    assert (host == expected).all(), (
         f"read {host.tolist()} from peer {peer} chunk {chunk}, expected all {expected}"
     )
 
@@ -157,6 +155,46 @@ def test_default_handle_type_fallback(monkeypatch, rejected, expected) -> None:
             make_device_allocation_prop(device_id, handle_types=42)
     finally:
         get_device_allocation_handle_type.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("handle_types", "expected"),
+    [
+        (None, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        (0, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
+        (_POSIX_FD, _POSIX_FD),
+        (_FABRIC, _FABRIC),
+    ],
+)
+def test_allocation_prop_assigns_handle_type_enum(
+    monkeypatch, handle_types, expected
+) -> None:
+    """CUDA bindings 13.0.x reject integer VMM handle types at assignment."""
+
+    class Fields:
+        pass
+
+    class StrictAllocationProp:
+        def __init__(self):
+            self.location = Fields()
+            self.allocFlags = Fields()
+            self._requested_handle_types = None
+
+        @property
+        def requestedHandleTypes(self):
+            return self._requested_handle_types
+
+        @requestedHandleTypes.setter
+        def requestedHandleTypes(self, value):
+            if not isinstance(value, drv.CUmemAllocationHandleType):
+                raise TypeError("requestedHandleTypes requires a CUDA enum")
+            self._requested_handle_types = value
+
+    monkeypatch.setattr(drv, "CUmemAllocationProp", StrictAllocationProp)
+
+    prop = make_device_allocation_prop(0, handle_types=handle_types)
+
+    assert prop.requestedHandleTypes is expected
 
 
 def test_granularity_defaults_to_recommended(monkeypatch) -> None:

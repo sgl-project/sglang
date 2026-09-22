@@ -58,7 +58,7 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         self.vae_config.load_decoder = True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(auto_dit_layerwise_offload=True)
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

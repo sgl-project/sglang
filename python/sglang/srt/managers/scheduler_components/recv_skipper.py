@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -12,10 +12,10 @@ if TYPE_CHECKING:
 
 class SchedulerRecvSkipper:
     @staticmethod
-    def maybe_create(server_args: ServerArgs):
-        if server_args.scheduler_recv_interval <= 1:
+    def maybe_create():
+        if get_schedule().scheduler_recv_interval <= 1:
             return None
-        return SchedulerRecvSkipper(server_args)
+        return SchedulerRecvSkipper()
 
     @staticmethod
     def derive_forward_mode(gathered_modes: List[int]) -> Optional[ForwardMode]:
@@ -33,10 +33,10 @@ class SchedulerRecvSkipper:
             return ForwardMode.TARGET_VERIFY
         return ForwardMode.DECODE
 
-    def __init__(self, server_args: ServerArgs):
-        self._use_synced_mode = server_args.enable_dp_attention
+    def __init__(self):
+        self._use_synced_mode = get_parallel().enable_dp_attention
         self._counter = 0
-        self._threshold = server_args.scheduler_recv_interval
+        self._threshold = get_schedule().scheduler_recv_interval
         # All can be tuned if needed
         self._default_weight = envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT.get()
         self._weight_of_forward_mode = {
