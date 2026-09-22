@@ -959,8 +959,6 @@ class Envs:
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
-    # Set to 0 to use the separate PyTorch decode compression metadata ops.
-    SGLANG_NPU_DSV4_FUSED_DECODE_METADATA = EnvBool(True)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.

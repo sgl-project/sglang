@@ -1359,11 +1359,7 @@ class DeepseekV4AscendAttnBackend(
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
 
-        if (
-            forward_mode.is_decode()
-            and metadata.start_pos.device.type == "npu"
-            and envs.SGLANG_NPU_DSV4_FUSED_DECODE_METADATA.get()
-        ):
+        if forward_mode.is_decode() and metadata.start_pos.device.type == "npu":
             # Warm this bucket before capture. Reading the still-zero start_pos
             # as lengths leaves all initial metadata zero, as before. Real loc
             # counts stay dynamic, including the first C128 boundary.
@@ -1637,10 +1633,7 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
-        if (
-            ctx.live_seq_lens.device.type == "npu"
-            and envs.SGLANG_NPU_DSV4_FUSED_DECODE_METADATA.get()
-        ):
+        if ctx.live_seq_lens.device.type == "npu":
             self._refresh_graph_decode_compress_1d_fused(ctx.live_seq_lens, fm, bundle)
             return
         for ratio in self._dsv4_unique_compress_ratios:

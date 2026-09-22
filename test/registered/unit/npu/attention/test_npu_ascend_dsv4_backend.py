@@ -475,19 +475,15 @@ class TestNPUDecodeCompressionMetadata(CustomTestCase):
         stream = torch.npu.Stream()
         stream.wait_stream(torch.npu.current_stream())
         ready = torch.npu.Event()
-        with patch(
-            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.envs.SGLANG_NPU_DSV4_FUSED_DECODE_METADATA.get",
-            return_value=True,
-        ):
-            for values in ([128, 256, 384, 512, 640], [129, 132, 0, 1, 256], [0] * 5):
-                # Preparation and replay must honor the caller's stream. The
-                # default stream waits only when the test reads back results.
-                with torch.npu.stream(stream):
-                    _, expected = self._refresh(values, (4, 128), device="npu", fm=fm)
-                    graph.replay()
-                    ready.record()
-                torch.npu.current_stream().wait_event(ready)
-                self._assert_metadata(outputs, expected)
+        for values in ([128, 256, 384, 512, 640], [129, 132, 0, 1, 256], [0] * 5):
+            # Preparation and replay must honor the caller's stream. The
+            # default stream waits only when the test reads back results.
+            with torch.npu.stream(stream):
+                _, expected = self._refresh(values, (4, 128), device="npu", fm=fm)
+                graph.replay()
+                ready.record()
+            torch.npu.current_stream().wait_event(ready)
+            self._assert_metadata(outputs, expected)
         self.assertEqual(
             pointers, [getattr(fm, key).data_ptr() for key in self._fields]
         )
