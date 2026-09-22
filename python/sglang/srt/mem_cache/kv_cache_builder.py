@@ -138,19 +138,7 @@ def get_draft_kv_pool(
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
-    pool = draft_runner.token_to_kv_pool
-    if (
-        spec_algorithm.is_dflash()
-        and get_disagg().disaggregation_transfer_backend == "nixl"
-        and not draft_worker.use_compact_draft_cache
-        and isinstance(pool, MHATokenToKVPool)
-    ):
-        # Only full draft pools share the target's logical token indices.
-        pool._pd_dflash_full_kv = True
-        pool._pd_dflash_window = getattr(
-            draft_runner.model_config.hf_text_config, "sliding_window", None
-        )
-    return pool
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(

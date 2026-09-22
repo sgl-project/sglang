@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
+    from sglang.srt.disaggregation.dflash_kv import DFlashDraftTransfer
     from sglang.srt.managers.schedule_batch import Req
 
 if is_npu():
@@ -1326,6 +1327,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    dflash_draft_transfer: Optional[DFlashDraftTransfer] = None,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1349,11 +1351,6 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
-    if getattr(draft_token_to_kv_pool, "_pd_dflash_full_kv", False):
-        from sglang.srt.disaggregation.dflash_kv import draft_transfer_buffers
-
-        dp, dl, il = draft_transfer_buffers(draft_token_to_kv_pool, kv_args.page_size)
-        append_state_component(kv_args, StateType.DFLASH_KV, dp, dl, il)
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
@@ -1730,6 +1727,15 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+    # Last, so the other components keep their positions when only one side
+    # registers the draft (decode-only speculative decoding).
+    if dflash_draft_transfer is not None:
+        append_state_component(
+            kv_args,
+            StateType.DFLASH_KV,
+            *dflash_draft_transfer.buffer_infos(kv_args.page_size),
+        )
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:

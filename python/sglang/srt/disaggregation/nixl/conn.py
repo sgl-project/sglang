@@ -1606,6 +1606,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
+        # Draft MHA heads shard by attention TP even when the target is MLA.
+        if (
+            StateType.DFLASH_KV in self.kv_args.state_types
+            and decode_kv_args.decode_tp_size != self.attn_tp_size
+        ):
+            raise RuntimeError(
+                "PD transfer of full DFlash draft KV requires equal prefill and "
+                f"decode attention TP sizes, got prefill={self.attn_tp_size}, "
+                f"decode={decode_kv_args.decode_tp_size}."
+            )
         if decode_kv_args.requires_dcp_relayout:
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         self.decode_kv_args_table[agent_name] = decode_kv_args
@@ -2590,13 +2600,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
-            if (
-                st == StateType.DFLASH_KV
-                and self.pp_size is not None
-                and self.pp_size > 1
-            ):
-                raise RuntimeError("Logical DFlash KV transfer requires PP=1")
-
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
                     if 0 in src_dims:
@@ -2674,9 +2677,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
-                if (
-                    not self.is_mla_backend or st == StateType.DFLASH_KV
-                ) and self.attn_tp_size != decode_tp_size:
+                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )

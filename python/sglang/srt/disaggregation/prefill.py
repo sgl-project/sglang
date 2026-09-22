@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.dflash_kv import resolve_dflash_draft_transfer
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -186,6 +187,11 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.dflash_draft_transfer = resolve_dflash_draft_transfer(
+            allocator=self.scheduler.token_to_kv_pool_allocator,
+            draft_worker=self.scheduler.draft_worker,
+            transfer_backend=transfer_backend,
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -273,8 +279,12 @@ class PrefillBootstrapQueue:
             else None
         )
         num_draft_entries = 0
-        draft_full = getattr(draft_kv_pool, "_pd_dflash_full_kv", False)
-        if draft_kv_pool is not None and not draft_full:
+        dflash_draft_transfer = (
+            self.dflash_draft_transfer if transfer_draft_cache else None
+        )
+        if dflash_draft_transfer is not None:
+            draft_kv_pool = None
+        if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -291,7 +301,7 @@ class PrefillBootstrapQueue:
         kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=None if draft_full else draft_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
@@ -315,6 +325,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            dflash_draft_transfer=dflash_draft_transfer,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1354,17 +1365,14 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _draft_payload():
-                from sglang.srt.disaggregation.dflash_kv import draft_transfer_start
-
-                draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
-                wire_page = self.token_to_kv_pool.page_size
-                start = draft_transfer_start(
-                    seq_len, getattr(draft_pool, "_pd_dflash_window", None), wire_page
+                return self.disagg_prefill_bootstrap_queue.dflash_draft_transfer.page_indices(
+                    req_to_token=self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx
+                    ],
+                    prefix_len=req.disagg_decode_prefix_len,
+                    seq_len=seq_len,
+                    wire_page_size=self.token_to_kv_pool.page_size,
                 )
-                logical_indices = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, start:seq_len
-                ]
-                return kv_to_page_indices(logical_indices, wire_page)
 
             def _mamba_payload():
                 return [
