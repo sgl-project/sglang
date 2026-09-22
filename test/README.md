@@ -3,11 +3,11 @@
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
 - **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
-- **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
+- **CI pipeline internals** — stage flow diagrams, fail-fast layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
 
-The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
+The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fail-fast mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
 
 ## Folder Organization
 
@@ -72,18 +72,14 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-New and renamed non-kernel tests use this layout:
-
-```text
-test/registered/<kind>/<subsystem>/test_*.py
-```
-
-`<kind>` is one of `unit`, `e2e`, `accuracy`, `perf`, or `stress`. Kernel tests
-use `test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
+Directories under `test/registered/` group tests by topic and are free-form
+(`lora/`, `hicache/`, `disaggregation/`, `perf/`, ...); unit tests cover one srt
+module, so they mirror the source tree under `unit/`. What a test costs, which
+stage gates it and which runner it needs are declared by its `register_*_ci`
+call -- including hardware, which is expressed by one or more `register_*_ci`
+calls and never by a new top-level directory. Kernel tests use
+`test/registered/kernels/{ops,benchmark}/<group>/`, retaining the established
 plural `kernels` root.
-Hardware is expressed by one or more `register_*_ci` calls, never by creating a
-new top-level hardware directory. The admission checker applies the layout and
-kind/suite contract incrementally while legacy paths are migrated.
 
 Diffusion workflows also enter through `test/run_suite.py`; registered bridge
 files preserve their case-level pytest partitioning until the remaining

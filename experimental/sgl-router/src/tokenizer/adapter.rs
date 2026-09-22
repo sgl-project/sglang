@@ -6,22 +6,15 @@ use dynamo_tokenizers::{traits::DecodeResult, Tokenizer};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Load a tokenizer from `source`, which is either a local `tokenizer.json`
-/// path or a HuggingFace repo id.
-///
-/// An existing local file (or anything with a filesystem-path shape) is
-/// loaded directly via `Tokenizer::from_file`. Otherwise `source` is treated
-/// as a HuggingFace repo id and its `tokenizer.json` is downloaded (once, at
-/// startup) into the HF cache, honoring `HF_TOKEN` / `HF_HOME` /
-/// `HF_HUB_OFFLINE`. `dynamo_tokenizers` itself has no HF-download path, so
-/// the fetch is done here via `hf-hub`.
+/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings.
+/// Tiktoken `.model` files also require sibling config.json and tokenizer_config.json.
 pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
     if Path::new(source).is_file() || looks_like_path(source) {
         return Tokenizer::from_file(source)
             .map(Arc::new)
             .with_context(|| format!("load tokenizer from {source}"));
     }
-    let downloaded = download_tokenizer_json(source)?;
+    let downloaded = download_tokenizer(source)?;
     let path = downloaded
         .to_str()
         .context("downloaded tokenizer path is not valid UTF-8")?;
@@ -31,8 +24,8 @@ pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
 }
 
 /// Treat `source` as a filesystem path (rather than a HuggingFace repo id)
-/// when it has a path-like shape — an absolute/relative prefix or a `.json`
-/// suffix. HF repo ids are `namespace/name` with none of these markers, so a
+/// when it has a path-like shape — an absolute/relative prefix or a
+/// tokenizer-file suffix. HF repo ids are `namespace/name` with none of these markers, so a
 /// missing local file like `/models/tok.json` reports a load error instead of
 /// silently attempting a (doomed) network fetch.
 fn looks_like_path(source: &str) -> bool {
@@ -41,20 +34,26 @@ fn looks_like_path(source: &str) -> bool {
         || source.starts_with("../")
         || source.starts_with('~')
         || source.ends_with(".json")
+        || source.ends_with(".model")
 }
 
-/// Download `tokenizer.json` for a HuggingFace repo id and return the cached
-/// local path, adding an actionable error context. The actual fetch (blocking
-/// `ureq`, `from_env` so `HF_TOKEN` / `HF_HOME` / endpoint overrides apply)
-/// lives in [`download_repo_file`].
-fn download_tokenizer_json(repo_id: &str) -> Result<std::path::PathBuf> {
-    download_repo_file(repo_id, "tokenizer.json").with_context(|| {
+/// Keep the tokenizer.json path unchanged; tiktoken models additionally need
+/// their configuration siblings in the same HF snapshot directory.
+fn download_tokenizer(repo_id: &str) -> Result<std::path::PathBuf> {
+    if let Ok(path) = download_repo_file(repo_id, "tokenizer.json") {
+        return Ok(path);
+    }
+    let path = download_repo_file(repo_id, "tiktoken.model").with_context(|| {
         format!(
-            "download tokenizer.json for HuggingFace repo {repo_id:?} \
-             (pass --tokenizer-path with a local tokenizer.json, or set HF_TOKEN \
+            "download tokenizer.json or tiktoken.model for HuggingFace repo {repo_id:?} \
+             (pass --tokenizer-path with a local tokenizer file, or set HF_TOKEN \
              for a gated/private repo)"
         )
-    })
+    })?;
+    for sibling in ["config.json", "tokenizer_config.json"] {
+        download_repo_file(repo_id, sibling)?;
+    }
+    Ok(path)
 }
 
 /// Download `file` from a HuggingFace repo id and return the cached local path.
