@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -306,7 +307,8 @@ class PagedIndexerMetadata:
         ):
             return None
         if (
-            torch.cuda.is_current_stream_capturing()
+            get_is_capture_mode()
+            or torch.cuda.is_current_stream_capturing()
             or is_in_breakable_cuda_graph()
             or is_in_tc_piecewise_cuda_graph()
         ):
@@ -325,14 +327,27 @@ class PagedIndexerMetadata:
 
     def row_chunks(self):
         num_rows = self.compressed_seq_lens.shape[0]
-        if self.row_chunk <= 0:
+        if self.row_chunk > 0:
+            rows_per_chunk = self.row_chunk
+        elif isinstance(self.deep_gemm_metadata, list):
+            assert self.rows_per_chunk is not None, (
+                "chunked DeepGEMM metadata requires rows_per_chunk"
+            )
+            rows_per_chunk = self.rows_per_chunk
+        else:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]
-        return [
-            (slice(start, min(start + self.row_chunk, num_rows)), plan)
+
+        chunks = [
+            (slice(start, min(start + rows_per_chunk, num_rows)), plan)
             for start, plan in zip(
-                range(0, num_rows, self.row_chunk), self.deep_gemm_metadata
+                range(0, num_rows, rows_per_chunk), self.deep_gemm_metadata
             )
         ]
+        assert chunks and chunks[-1][0].stop == num_rows, (
+            f"chunk schedules do not cover all rows: {num_rows=} {rows_per_chunk=} "
+            f"{len(chunks)=}"
+        )
+        return chunks
 
     def copy_(self, other: PagedIndexerMetadata):
         # A chunked schedule list has no in-place copy; rebind it instead.

@@ -84,7 +84,15 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                 with (
                     self.subTest(route=expected_route, attn_tp=attn_tp, rank=rank),
                     get_parallel().override(
-                        tp_size=4, tp_rank=3, attn_tp_size=attn_tp, attn_tp_rank=rank
+                        tp_size=4,
+                        tp_rank=rank,
+                        attn_tp_size=attn_tp,
+                        attn_tp_rank=rank,
+                        attn_dp_size=4 // attn_tp,
+                        attn_dp_rank=0,
+                        attn_cp_size=1,
+                        attn_cp_rank=0,
+                        moe_tp_size=4,
                     ),
                 ):
                     quant = MockFp8Config(ignored)

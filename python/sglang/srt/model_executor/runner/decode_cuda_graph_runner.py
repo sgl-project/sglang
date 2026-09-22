@@ -41,7 +41,6 @@ from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
-    set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -1053,7 +1052,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
             else:
-                set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
                     with (
                         graph_capture(stream=sg[1]) as graph_capture_context,
