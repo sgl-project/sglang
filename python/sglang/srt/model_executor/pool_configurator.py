@@ -220,7 +220,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size == 0
             and mambaish is not None
             and bool(mambaish.full_attention_layer_ids)
-            and kvc.ps.pp_size > 1
+            and kvc.pp_size > 1
         )
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
@@ -877,7 +877,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self._swa_cap = compute_swa_request_cap(
             page_size=kvc.page_size,
             window=kvc.sliding_window_size,
-            attn_dp_size=kvc.ps.attn_dp_size,
+            attn_dp_size=kvc.attn_dp_size,
         )
 
     @staticmethod
@@ -1015,7 +1015,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
         ]
-        if kvc.ps.pp_size > 1:
+        if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
@@ -1032,9 +1032,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
-        self.attn_dp_size = kvc.ps.attn_dp_size
+        self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            get_schedule().max_running_requests // kvc.attn_dp_size
             if get_schedule().max_running_requests is not None
             else None
         )
