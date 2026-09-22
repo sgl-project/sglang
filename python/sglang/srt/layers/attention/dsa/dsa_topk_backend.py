@@ -14,6 +14,12 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+# Row count above which `_topk_unfused` splits a ragged batch, and the size of
+# each split. They are the same number on purpose: a batch just over the
+# threshold becomes one full chunk plus a small remainder, so the scratch peak
+# is bounded by exactly one chunk's worth of `torch.topk` workspace.
+_TOPK_ROW_CHUNK = 4096
+
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,
@@ -284,11 +290,12 @@ def _topk_unfused(
 
     # Keep torch.topk's temporary score/index work bounded on very wide ragged
     # batches. Without this, a 32K-row prefill can ask for several GiB of scratch
-    # even when only a few hundred MiB of final output is needed.
-    if batch_size > 4096:
-        chunk_size = 4096
-        for start in range(0, batch_size, chunk_size):
-            end = min(start + chunk_size, batch_size)
+    # even when only a few hundred MiB of final output is needed. Chunking is a
+    # pure memory optimization: each row's top-k depends only on that row, so
+    # the result is identical to the unchunked call on every backend.
+    if batch_size > _TOPK_ROW_CHUNK:
+        for start in range(0, batch_size, _TOPK_ROW_CHUNK):
+            end = min(start + _TOPK_ROW_CHUNK, batch_size)
             topk_indices[start:end] = _topk_unfused(
                 score[start:end],
                 lengths[start:end],

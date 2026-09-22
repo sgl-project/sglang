@@ -1270,16 +1270,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             is_gfx95_supported()
             and 1 <= batch_size <= 16
             and draft_token_num in (6, 8)
-            and layer.num_q_heads == layer.num_v_heads == 16
-            and layer.head_k_dim == layer.head_v_dim == 128
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
-            and layer.bias is None
-            and layer.lower_bound == -5.0
         ):
-            # Measured GLM TP4 wins only: larger gfx950 batches lose the
-            # launch saving to duplicated convolution work. Keep the
-            # reference path for them and for unmeasured ROCm shapes.
+            # Measured GLM TP4 wins only: larger gfx950 batches lose the launch
+            # saving to duplicated convolution work. Keyed on what the fused
+            # kernel actually needs — gfx950, an fp32 conv weight, a bf16 QKV,
+            # and a measured draft width — rather than on checkpoint-specific
+            # head counts or gate values, so a later GLM revision does not need
+            # an edit here. Keep the reference path for unmeasured ROCm shapes.
             return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim

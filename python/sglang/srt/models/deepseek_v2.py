@@ -924,14 +924,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if _is_hip:
-            num_token_non_padded = None
-        else:
-            num_token_non_padded = (
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            )
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded if forward_batch is not None else None
+        )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
@@ -1027,13 +1022,17 @@ class DeepseekV2MoE(nn.Module):
                     self,
                     router_logits,
                     input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
+                    num_token_non_padded=self._moe_topk_num_token_non_padded(
+                        num_token_non_padded
+                    ),
                 )
             else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
-                    num_token_non_padded=num_token_non_padded,
+                    num_token_non_padded=self._moe_topk_num_token_non_padded(
+                        num_token_non_padded
+                    ),
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
@@ -1209,6 +1208,19 @@ class DeepseekV2MoE(nn.Module):
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    @staticmethod
+    def _moe_topk_num_token_non_padded(
+        num_token_non_padded: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        # ROCm: the AITER fused topk kernel does not take this bound, so the
+        # padded rows it leaves behind are routed as real tokens and corrupt the
+        # MoE output (DeepSeek-V4-Pro TP8DP8 TBO GSM8K collapse). Padded rows
+        # contribute zero weight anyway, so dropping the bound is safe here.
+        # See sgl-project/sglang#39804.
+        if _is_hip:
+            return None
+        return num_token_non_padded
 
     def forward_normal(
         self,
