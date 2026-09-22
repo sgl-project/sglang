@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -297,6 +301,8 @@ class LoRAPipeline(ComposedPipelineBase):
         offload_disabled_modules = []
         for module_name in module_names:
             module = self.modules.get(module_name)
+            if isinstance(module, torch.nn.Module):
+                restore_weight_snapshot(module)
             if module is not None and is_layerwise_offloaded_module(module):
                 module.disable_offload()
                 offload_disabled_modules.append(module)
@@ -320,6 +326,11 @@ class LoRAPipeline(ComposedPipelineBase):
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
             module = self.modules.get(module_name)
+            if (
+                isinstance(module, torch.nn.Module)
+                and weight_snapshot(module) is not None
+            ):
+                return True
             if module is not None and is_layerwise_offloaded_module(module):
                 return True
         return False
@@ -1392,9 +1403,17 @@ class LoRAPipeline(ComposedPipelineBase):
             if not self._is_lora_effective_for_module(module_name, lora_layers):
                 return None
             else:
+                nicknames, strengths = self.cur_adapter_config.get(
+                    module_name,
+                    (
+                        [self.cur_adapter_name.get(module_name, None)],
+                        [self.cur_adapter_strength.get(module_name, None)],
+                    ),
+                )
                 return [
                     {
                         "nickname": self.cur_adapter_name.get(module_name, None),
+                        "nicknames": nicknames,
                         "path": self.cur_adapter_path.get(module_name, None),
                         "merged": self.is_lora_merged.get(module_name, False),
                         "mode": (
@@ -1403,6 +1422,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             else "unmerged"
                         ),
                         "strength": self.cur_adapter_strength.get(module_name, None),
+                        "strengths": strengths,
                     }
                 ]
 

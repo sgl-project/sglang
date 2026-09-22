@@ -31,6 +31,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -64,6 +65,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -80,13 +82,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-
-if _is_cuda:
-    from sgl_kernel import fast_topk
-elif _is_hip:
-    from sgl_kernel import fast_topk
-else:
-    from sglang.srt.utils.common import fast_topk
 
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
@@ -165,15 +160,46 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+def sample_draft_proposal(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
     only if q is exactly the distribution X was drawn from, so callers must hand
     the returned q (not a recomputed one) to the verify.
+
+    A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
+    rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
+    tell a greedy request from a T=1 one, and sampling a sharp-but-not-
+    degenerate distribution proposes a non-argmax token often enough to cost
+    real accept length.
+
+    That row's X is then not drawn from the q returned beside it, which the
+    unbiasedness argument above otherwise rests on. It stays correct because
+    eagle_sample renormalises the target by the same per-row ``top_ks`` before
+    the accept test, so a greedy row's p is one-hot: X equal to the target
+    argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
+    (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
+    which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
+    if top_ks is not None:
+        # Assert rather than skip on a device mismatch: a host-side top_ks would
+        # make this correction silently vanish, and the symptom -- draft accept
+        # length quietly dropping about 20% -- reads as a model problem, not a
+        # plumbing one.
+        assert top_ks.device == probs.device, (
+            f"top_ks must be on {probs.device} to reach the draft proposal, "
+            f"got {top_ks.device}; the caller has to carry the real per-request "
+            "top_k, not a host placeholder"
+        )
+        greedy = (top_ks <= 1).view(-1, 1)
+        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
+        topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 
@@ -211,6 +237,41 @@ def draft_kv_indices_used_len(
     num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
     """
     return seq_lens_sum * topk + bs * num_steps
+
+
+def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
+    """Resolve (window_size, sink_size) for generate_draft_decode_kv_indices.
+
+    Returns (0, 0) -- full draft attention, the pristine read plan -- when
+    --speculative-draft-window-size is unset, and also when the draft model
+    already has a sliding window of its own: the index builder emits one KV list
+    shared by every draft layer, so it cannot express a per-layer window, and the
+    draft model's own window is authoritative -- whether it comes from the
+    checkpoint or, for LlamaForCausalLMEagle3, from this same flag.
+    """
+    # Read through the resolving view: handle_speculative_decoding declares both
+    # fields rather than assigning them, so the raw field holds the unvalidated input.
+    cfg = resolving_view(model_runner.server_args)
+    window_size = int(cfg.speculative_draft_window_size or 0)
+    if window_size <= 0:
+        return 0, 0
+    # The runner's resolved window, not the raw config field: config keys
+    # (sliding_window / window_size) are overloaded across model families, while
+    # this is the same value the attention backends key their own SWA paths on.
+    native_window = getattr(model_runner, "sliding_window_size", None)
+    if native_window is not None and native_window > 0:
+        # An equal window is the one that was asked for, applied per layer instead
+        # of here (LlamaForCausalLMEagle3 routes this flag into its own window).
+        if native_window != window_size:
+            logger.warning(
+                "Ignoring --speculative-draft-window-size=%d: this draft model has a "
+                "sliding window of %d, which the attention backend applies per layer. "
+                "Draft-decode windowing stays off.",
+                window_size,
+                native_window,
+            )
+        return 0, 0
+    return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
 def record_stream_each(tensors, stream):
@@ -686,10 +747,10 @@ def draft_pp_context():
 
 
 @contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
+def draft_tp_context(tp_group: GroupCoordinator, *, owns_attention: bool):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+    with patch_tensor_parallel_group(tp_group, owns_attention=owns_attention):
         yield
 
 
@@ -791,6 +852,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+    batch.mamba_prefill_track_mask_cpu = None
+    batch.mamba_track_seqlens_cpu = None
 
 
 def _verify_commit_step_indices(
@@ -805,6 +868,23 @@ def _verify_commit_step_indices(
     mamba-track interval-crossing step (-1 = no crossing; None when tracking
     is off)."""
     bs = accept_lens.shape[0]
+    if accept_index.is_cuda:
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_commit_track_indices,
+        )
+
+        track_grid = (
+            mamba_track_grid(batch.tree_cache.page_size)
+            if batch.mamba_track_indices is not None
+            else 0
+        )
+        return fused_commit_track_indices(
+            accept_index,
+            accept_lens,
+            batch.seq_lens if track_grid > 0 else None,
+            draft_token_num,
+            track_grid,
+        )
     accept_indices_offset = torch.arange(
         0,
         bs * draft_token_num,

@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'rust/**'
+      - 'proto/**'
       - 'python/setup.py'
       - 'python/pyproject.toml'
       - 'python/sglang/srt/rust_extensions/torch_build.py'

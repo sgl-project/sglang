@@ -509,3 +509,19 @@ holding Mamba state, MP mode, and the hybrid cache path do not use this mechanis
 CPU regressions cover admission, request ownership, repeated deferral, abort,
 reset, and reused request IDs. These checks do not establish GPU/model accuracy,
 performance, multi-node correctness, or production readiness.
+
+### Current scheduler lifecycle
+
+The adapter accepts `CacheRequestHandle` at scheduler boundaries and encodes
+both `rid` and `attempt_id` into FlexKV tracking keys. Operation logs retain the
+original request ID. Cancelling an older attempt therefore leaves a retried
+attempt's lookup, prefetch, and restore state intact.
+
+Host load-back follows the scheduler's admission-before-materialization
+contract. A completed partial MP restore remains tree-owned but is reported as
+a miss so recomputation can be budgeted. A shortened lookup does not start a
+partial request-owned IP restore. `owned_kv_len` bounds cache completion, while
+FlexKV's newly restored IP/SWA slots remain request-owned until normal cache
+commit. Hybrid adapters forward NodeId and allocation-reclamation operations to
+the inner unified cache; `release_host_resources()` drains the external FlexKV
+connector during scheduler shutdown.

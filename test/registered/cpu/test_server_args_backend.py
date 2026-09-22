@@ -17,7 +17,7 @@ register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 class TestServerArgsCPUBackend(CustomTestCase):
     def _make_server_args(self, attention_backend=None):
-        server_args = ServerArgs.__new__(ServerArgs)
+        server_args = ServerArgs(model_path="dummy")
         server_args.device = "cpu"
         server_args.attention_backend = attention_backend
         server_args.sampling_backend = None

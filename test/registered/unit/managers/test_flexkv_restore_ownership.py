@@ -1,6 +1,7 @@
 """Exercise the real scheduling methods without loading the GPU serving stack."""
 
 import ast
+import json
 from enum import Enum, auto
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,9 +9,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _tracking_key(rid, attempt=0):
+    return json.dumps([rid, attempt], separators=(",", ":"))
 
 
 def _load_method(filename, class_name, method_name, namespace):
@@ -49,6 +57,7 @@ class AddReqResult(Enum):
 def _scheduler_case(*, chunked=False, flexkv=False, defer_shared=None):
     req = SimpleNamespace(
         rid="restore",
+        cache_request_handle=CacheRequestHandle("restore", 0),
         init_next_round_input=MagicMock(),
         mamba_pool_idx=None,
         beam_group=None,
@@ -56,6 +65,7 @@ def _scheduler_case(*, chunked=False, flexkv=False, defer_shared=None):
     )
     leased = {req.rid}
     cache = SimpleNamespace(
+        buffer_pipeline=None,
         has_uncommitted_restore=lambda r: r.rid in leased,
         check_hicache_events=MagicMock(),
         check_prefetch_progress=MagicMock(return_value=True),
@@ -65,12 +75,14 @@ def _scheduler_case(*, chunked=False, flexkv=False, defer_shared=None):
         cache.should_defer_shared_restore = defer_shared
     adder = SimpleNamespace(
         can_run_list=[],
+        rem_chunk_tokens=16,
         add_one_req=MagicMock(return_value=AddReqResult.OTHER),
         add_chunked_req=MagicMock(return_value=None),
     )
     scheduler = SimpleNamespace(
         grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
         tree_cache=cache,
+        processed_tokens_counter=0,
         enable_hierarchical_cache=False,
         enable_unified_cache_external_linker=False,
         enable_priority_preemption=False,
@@ -79,7 +91,10 @@ def _scheduler_case(*, chunked=False, flexkv=False, defer_shared=None):
         chunked_req=req if chunked else None,
         min_free_slots_delayer=None,
         get_num_allocatable_reqs=lambda *_args, **_kwargs: 8,
-        policy=SimpleNamespace(calc_priority=MagicMock()),
+        policy=SimpleNamespace(
+            calc_priority=MagicMock(),
+            shortest_prefill_chunk_limit=MagicMock(return_value=None),
+        ),
         chunked_prefill_size=16,
         dynamic_chunk_sizer=None,
         tp_worker=SimpleNamespace(model_runner=SimpleNamespace(attn_backend=object())),
@@ -182,6 +197,7 @@ def test_lease_guard_and_shared_restore_deferral_run_at_distinct_stages():
 def test_priority_matching_preserves_uncommitted_restore(cache_aware):
     req = SimpleNamespace(
         rid="restore",
+        cache_request_handle=CacheRequestHandle("restore", 0),
         origin_input_ids=list(range(4)),
         output_ids=[],
         prefix_indices=list(range(4)),

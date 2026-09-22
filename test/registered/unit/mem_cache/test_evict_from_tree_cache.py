@@ -1,10 +1,11 @@
-import dataclasses
+import ast
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams as _EvictParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -26,13 +27,6 @@ class _FakeSWAAllocator:
 
     def swa_available_size(self):
         return self.availability["swa"]
-
-
-@dataclasses.dataclass
-class _EvictParams:
-    num_tokens: int = 0
-    swa_num_tokens: int = 0
-    mamba_num: int = 0
 
 
 def _load_evict_from_tree_cache():
@@ -91,6 +85,29 @@ def _load_evict_from_tree_cache():
                 sys.modules[name] = original
     return module.evict_from_tree_cache
 
+
+def _allocator_evict_method():
+    # Exercise the allocator implementation now owning the eviction policy.
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/mem_cache/allocator/swa.py"
+    )
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "SWATokenToKVPoolAllocator"
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "evict_to_free_tokens"
+    )
+    scope = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope)
+    return scope[method.name]
+
+
+_FakeSWAAllocator.evict_to_free_tokens = _allocator_evict_method()
 
 evict_from_tree_cache = _load_evict_from_tree_cache()
 

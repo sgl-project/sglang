@@ -17,8 +17,8 @@ An allocation succeeds only when both pools have enough free capacity for their 
 ```text
 _alloc_restore_slots()
   -> evict_from_tree_cache()
-  -> tree_cache.evict(EvictParams(...))   # loops until the demand is met
-                                          # or eviction stops making progress
+  -> allocator.evict_to_free_tokens(...)
+  -> tree_cache.evict_for_alloc(EvictParams(...))
   -> retry the allocation
 ```
 
@@ -38,7 +38,7 @@ evict_from_tree_cache(
 
 `num_tokens` and `swa_num_tokens` describe how much capacity the pending allocation needs. They do not describe how many cached tokens to evict.
 
-For each pool, evict only its deficit:
+For independent fixed-capacity pools, evict only each pool's deficit:
 
 ```python
 full_to_evict = max(0, full_need - full_available)
@@ -70,14 +70,11 @@ With paged allocation, `alloc_extend_swa_tail()` restores full-attention KV for 
 
 If a caller omits `swa_num_tokens`, `evict_from_tree_cache()` defaults it to `num_tokens`. This keeps existing callers compatible because normal hybrid allocations reserve the same token demand from both pools.
 
-## Avoid an infinite eviction loop
+## Let the allocator plan reclamation
 
-One radix-tree eviction may not release enough usable slots from both pools. The helper rechecks both capacities and may evict again. It stops when either condition is true:
+`evict_from_tree_cache()` forwards the allocation demand to the allocator. The fixed SWA allocator computes separate Full and SWA deficits. Shared-memory allocators can instead calculate a reclaim plan and compact the shared pool before retrying allocation; their physical-capacity accounting cannot be replaced by a generic token-count loop.
 
-- both pools satisfy the pending allocation; or
-- an eviction attempt does not increase either pool's available capacity.
-
-The second condition prevents an infinite loop when protected cache entries cannot be evicted.
+The FlexKV adapter retries allocation once after reclamation. If capacity is still unavailable, it returns without launching H2D, and scheduler admission can retry later. It does not spin on protected cache entries.
 
 ## Recognize the failure pattern
 

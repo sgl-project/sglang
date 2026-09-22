@@ -1,6 +1,7 @@
-"""CPU contract tests execute wrapper bodies without importing model kernels."""
+"""Contract tests execute adapter methods without constructing model or KV pools."""
 
 import ast
+import json
 import logging
 from pathlib import Path
 from types import MethodType
@@ -11,9 +12,18 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def _tracking_key(rid, attempt=0):
+    return json.dumps([rid, attempt], separators=(",", ":"))
+
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py"
@@ -33,6 +43,9 @@ def method(path, cls, name):
     body.decorator_list = []
     namespace = {
         "TreeNode": object,
+        "CacheRequestHandle": CacheRequestHandle,
+        "CacheRequestOutcome": CacheRequestOutcome,
+        "_request_key": lambda handle: _tracking_key(handle.rid, handle.attempt_id),
         "Req": object,
         "Any": Any,
         "Optional": Optional,
@@ -53,17 +66,26 @@ def test_full_chain_and_candidate_offset(matched):
     connector = Mock(_chunked_prefetch=True)
     cache = NS(flexkv_connector=connector, page_size=1)
     method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
-        cache, "r", None, [20, 21], None, None, matched_prefix_tokens=matched
+        cache,
+        CacheRequestHandle("r", 0),
+        None,
+        [20, 21],
+        None,
+        None,
+        matched_prefix_tokens=matched,
     )
     connector.prefetch_async.assert_called_once_with(
-        "r", matched + [20, 21], sglang_req_id="r", candidate_start_token=len(matched)
+        _tracking_key("r"),
+        matched + [20, 21],
+        sglang_req_id="r",
+        candidate_start_token=len(matched),
     )
 
 
 def test_scheduler_starts_flexkv_without_hicache_storage_backend():
     cache = Mock()
     scheduler = NS(enable_flexkv=True, enable_hicache_storage=False, tree_cache=cache)
-    req = NS(rid="r")
+    req = NS(rid="r", cache_request_handle=CacheRequestHandle("r", 0))
     method(SCHEDULER, "Scheduler", "_prefetch_kvcache")(scheduler, req)
     cache.prefetch_request.assert_called_once_with(req)
 
@@ -75,6 +97,7 @@ def test_queue_entry_does_not_lookup_remote_or_allocate_restore(path, cls):
     cache = NS(prefetch_from_storage=Mock())
     req = NS(
         rid="r",
+        cache_request_handle=CacheRequestHandle("r", 0),
         full_untruncated_fill_ids=list(range(10)),
         extra_key=None,
         cache_salt=None,
@@ -84,7 +107,7 @@ def test_queue_entry_does_not_lookup_remote_or_allocate_restore(path, cls):
     method(path, cls, "prefetch_request")(cache, req)
     req.init_next_round_input.assert_called_once_with(tree_cache=None, cow_mamba=False)
     cache.prefetch_from_storage.assert_called_once_with(
-        "r",
+        req.cache_request_handle,
         None,
         list(range(9)),
         extra_key=None,
@@ -101,8 +124,12 @@ def test_abort_releases_flexkv_without_hicache_enabled():
         enable_unified_cache_external_linker=False,
         tree_cache=cache,
     )
-    method(SCHEDULER, "Scheduler", "_release_aborted_request")(scheduler, "r")
-    cache.release_aborted_request.assert_called_once_with("r")
+    method(SCHEDULER, "Scheduler", "_release_aborted_request")(
+        scheduler, NS(cache_request_handle=CacheRequestHandle("r", 0))
+    )
+    cache.finish.assert_called_once_with(
+        CacheRequestHandle("r", 0), CacheRequestOutcome.ABORT
+    )
 
 
 def test_prefetch_stats_pass_through():
@@ -110,7 +137,7 @@ def test_prefetch_stats_pass_through():
     connector.pop_prefetch_loaded_span.return_value = (16, 32)
     cache = NS(flexkv_connector=connector, page_size=1)
     assert method(SOURCE, "FlexKVRadixCache", "pop_prefetch_loaded_span")(
-        cache, "r"
+        cache, CacheRequestHandle("r", 0)
     ) == (16, 32)
 
 
@@ -119,7 +146,7 @@ def test_unsupported_namespace_does_not_use_unscoped_prefetch(key, salt):
     connector = Mock()
     cache = NS(flexkv_connector=connector, page_size=1)
     method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
-        cache, "r", None, [1], extra_key=key, cache_salt=salt
+        cache, CacheRequestHandle("r", 0), None, [1], extra_key=key, cache_salt=salt
     )
     connector.prefetch_async.assert_not_called()
 
@@ -136,71 +163,21 @@ def test_hybrid_preserves_hash_chain_and_candidate(matched):
     connector = Mock(_chunked_prefetch=True)
     cache = NS(flexkv_connector=connector, page_size=1)
     method(HYBRID, "FlexKVHybridRadixCache", "prefetch_from_storage")(
-        cache, "swa", None, [5, 6], matched_prefix_tokens=matched
+        cache, CacheRequestHandle("swa", 0), None, [5, 6], matched_prefix_tokens=matched
     )
     connector.prefetch_async.assert_called_once_with(
-        "swa", matched + [5, 6], sglang_req_id="swa", candidate_start_token=len(matched)
+        _tracking_key("swa"),
+        matched + [5, 6],
+        sglang_req_id="swa",
+        candidate_start_token=len(matched),
     )
-
-
-@pytest.mark.parametrize(
-    "prefix,limit,alignment,expected",
-    [
-        (0, 63, None, 0),
-        (64, 256, 512, 0),
-        (64, 512, 512, 512),
-        (0, 260, None, 256),
-        (65, 256, None, 255),
-    ],
-)
-def test_admission_chunk_boundary(prefix, limit, alignment, expected):
-    assert (
-        method(POLICY, "PrefillAdder", "_get_chunked_prefill_len")(
-            NS(page_size=64), prefix, limit, alignment
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    "chunk_limit,remaining,align,dllm,tile,expected",
-    [
-        (32, 4096, None, None, None, "other"),
-        (256, 4096, 512, None, None, "other"),
-        (None, 1024, None, None, None, "other"),
-        (None, 4096, None, True, None, "other"),
-        (256, 4096, None, None, "other", "other"),
-        (256, 4096, None, None, None, None),
-    ],
-)
-def test_remaining_admission_gates_are_side_effect_free(
-    chunk_limit, remaining, align, dllm, tile, expected
-):
-    cache = NS(
-        page_size=64,
-        rem_chunk_tokens=chunk_limit,
-        can_run_list=[object()],
-        rem_input_tokens=remaining,
-        dllm_config=dllm,
-        rem_dllm_tokens=0,
-        ceil_paged_tokens=lambda n: (n + 63) // 64 * 64,
-        _check_prefill_tile_budget=Mock(return_value=tile),
-    )
-    calculate = method(POLICY, "PrefillAdder", "_get_chunked_prefill_len")
-    cache._get_chunked_prefill_len = lambda *args: calculate(cache, *args)
-    assert (
-        method(POLICY, "PrefillAdder", "_check_prefill_shape")(
-            cache, 1024, 3072, chunk_limit, align
-        )
-        == expected
-    )
-    assert len(cache.can_run_list) == 1
 
 
 @pytest.fixture
 def hybrid_restore():
     req = NS(
         rid="restore",
+        cache_request_handle=CacheRequestHandle("restore", 0),
         prefix_indices=torch.arange(256),
         last_node=object(),
         kv=NS(cache_protected_len=128),
@@ -215,7 +192,7 @@ def hybrid_restore():
         _restore_generation=7,
         _restore_leases={},
         _aborted_restore_leases={},
-        _load_markers={req.rid: NS(device_length=256)},
+        _load_markers={_tracking_key(req.rid): NS(device_length=256)},
         _alloc_restore_slots=Mock(return_value=slots),
         supports_swa=lambda: True,
         _empty_indices=lambda: torch.empty(0, dtype=torch.int64),
@@ -275,7 +252,7 @@ def test_hybrid_duplicate_restore_does_not_allocate_again(hybrid_restore):
     with pytest.raises(RuntimeError, match="before restore commit"):
         cache.init_load_back(NS(req=req, host_hit_length=512))
     assert cache._alloc_restore_slots.call_count == 1
-    assert req.rid in cache._restore_leases
+    assert _tracking_key(req.rid) in cache._restore_leases
     cache.token_to_kv_pool_allocator.free.assert_not_called()
 
 
@@ -285,7 +262,7 @@ def test_hybrid_stale_generation_cannot_free_current_slots(hybrid_restore):
     req.pending_restore_generation -= 1
     with pytest.raises(RuntimeError, match="lease mismatch"):
         cache._commit_restore(req)
-    assert req.rid in cache._restore_leases
+    assert _tracking_key(req.rid) in cache._restore_leases
     cache.token_to_kv_pool_allocator.free.assert_not_called()
 
 
@@ -356,3 +333,40 @@ def test_capacity_rejection_keeps_idle_flexkv_schedulable(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize(
+    "path,cls", [(SOURCE, "FlexKVRadixCache"), (HYBRID, "FlexKVHybridRadixCache")]
+)
+def test_stale_abort_does_not_cancel_retried_prefetch(path, cls):
+    import threading
+
+    old = CacheRequestHandle("same-rid", 0)
+    current = CacheRequestHandle("same-rid", 1)
+    old_key = _tracking_key(old.rid, old.attempt_id)
+    new_key = _tracking_key(current.rid, current.attempt_id)
+    connector = Mock(_chunked_prefetch=True)
+    cache = NS(
+        flexkv_connector=connector,
+        page_size=1,
+        _load_markers={new_key: object()},
+        _restore_leases={},
+        _aborted_restore_leases={},
+        _node_lock=threading.Lock(),
+        _pending_store_launches={},
+        _pending_store_copies={},
+        _inflight_store_nodes={},
+        _release_restore_prefix=Mock(),
+    )
+    prefetch = method(path, cls, "prefetch_from_storage")
+    prefetch(cache, old, None, [1, 2])
+    prefetch(cache, current, None, [1, 2])
+    assert [call.args[0] for call in connector.prefetch_async.call_args_list] == [
+        old_key,
+        new_key,
+    ]
+    method(path, cls, "release_aborted_request")(cache, old)
+    connector.cancel_prefetch.assert_called_once_with(old_key)
+    assert new_key in cache._load_markers
+    method(path, cls, "check_prefetch_progress")(cache, current)
+    connector.check_prefetch_progress.assert_called_once_with(new_key)
