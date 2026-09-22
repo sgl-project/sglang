@@ -608,13 +608,17 @@ class TpModelWorker(BaseTpWorker):
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
+        out = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        if isinstance(out, GenerationBatchResult):
+            return out
+
         (
             logits_output,
             next_token_ids,
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        ) = out
 
         return GenerationBatchResult(
             logits_output=logits_output,

@@ -1733,6 +1733,10 @@ def _dllm_overlap_disable(view: Any) -> dict:
         return {}
     if view.disable_overlap_schedule:
         return {}
+    # FDFO + LowConfidence is one denoise step per run_batch, so overlap pays off.
+    # Sync keeps many steps inside one run_batch; other algorithms are not on this path yet.
+    if view.dllm_algorithm == "LowConfidence" and view.dllm_fdfo:
+        return {}
     logger.warning(
         "Overlap schedule is disabled because of using diffusion LLM inference"
     )

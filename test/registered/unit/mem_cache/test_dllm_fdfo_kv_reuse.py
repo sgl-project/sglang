@@ -63,6 +63,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         rid=rid,
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
+        dllm_block_done=False,
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,

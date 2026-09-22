@@ -4,6 +4,8 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -45,8 +47,14 @@ class SchedulerDllmMixin:
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
-        # Initialize DLLM manager and transfer requests
+        # Initialize DLLM manager and transfer requests.
+        # Overlap keeps the block-done marker until the in-flight extra step's
+        # result is processed; sync consumes it here, after the next block is opened.
+        staging = list(self.dllm_manager.staging_queue)
         self.dllm_manager.init_next_round()
+        if not self.enable_overlap:
+            for req in staging:
+                req.dllm_block_done = False
         self._fetch_waiting_reqs()
 
         # Process batches
@@ -73,6 +81,14 @@ class SchedulerDllmMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+
+        if isinstance(result.next_token_ids, torch.Tensor):
+            result.next_token_ids = result.next_token_ids.tolist()
+        if result.dllm_done is not None:
+            result.accept_length_per_req_cpu = [
+                self.dllm_config.block_size if done else 0
+                for done in result.dllm_done.tolist()
+            ]
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
@@ -110,6 +126,12 @@ class SchedulerDllmMixin:
                 next_token_ids = result.next_token_ids[idx]
                 assert len(next_token_ids) == block_size
 
+                # The step after a block finishes can still be in flight: its result
+                # arrives after the marker is set, and must not be emitted again.
+                if req.dllm_block_done:
+                    req.dllm_block_done = False
+                    continue
+
                 if result.accept_length_per_req_cpu[idx] == 0:
                     # Unresolved: keep partial state and KV for the next FDFO round.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
@@ -118,6 +140,7 @@ class SchedulerDllmMixin:
                     )
                     continue
 
+                req.dllm_block_done = True
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
 
@@ -144,6 +167,7 @@ class SchedulerDllmMixin:
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
+                    self._clear_dllm_block_tokens(req)
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
@@ -437,6 +461,15 @@ class DllmManager:
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
+        fdfo = (
+            self.dllm_config is not None
+            and self.dllm_config.first_done_first_out_mode
+        )
         for req in self.staging_queue:
+            # Incomplete ids are this block's denoised tokens. init writes them
+            # back and does not append a mask block. Skip only while overlap has
+            # not processed the step yet, so an empty open block is not extended.
+            if fdfo and not req.dllm_block_done and not req.dllm_incomplete_ids:
+                continue
             req.init_next_round_input()
         self.staging_queue = []
