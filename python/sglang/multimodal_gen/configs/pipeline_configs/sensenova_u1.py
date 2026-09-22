@@ -115,7 +115,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return False
 
     def supports_sequential_multi_output_inference(self):
-        return True
+        return False
 
     def validate_server_args(self, server_args) -> None:
         if server_args.num_gpus != 1:

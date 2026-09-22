@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
     _copy_right_aligned_prefix_bnsd,
+    _randn_with_generators,
     _randn_with_seed,
     prepare_flash_kv_cache,
 )
@@ -65,9 +66,6 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     npu_fia_available,
     position_ids_from_indexes,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
-    PipelineExecutor,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -77,7 +75,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     should_include_warmup_image,
 )
@@ -85,26 +82,38 @@ from sglang.srt.layers.layernorm import RMSNorm
 
 
 class _FakeSenseNovaModel:
-    def __init__(self):
+    def __init__(
+        self, output: torch.Tensor | None = None, error: Exception | None = None
+    ):
         self.call_kwargs = None
         self.t2i_calls = []
         self.it2i_calls = []
+        self.call_count = 0
+        self._error = error
+        self._output = (
+            output
+            if output is not None
+            else torch.tensor(
+                [
+                    [
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                    ]
+                ]
+            )
+        )
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
+        self.call_count += 1
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
         self.t2i_calls.append(self.call_kwargs)
-        sample = torch.tensor(
-            [
-                [
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                ]
-            ]
-        )
-        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+        if self._error is not None:
+            raise self._error
+        return self._output.repeat(kwargs["batch_size"], 1, 1, 1)
 
     def it2i_generate(self, tokenizer, prompt, images, **kwargs):
+        self.call_count += 1
         self.call_kwargs = {
             "tokenizer": tokenizer,
             "prompt": prompt,
@@ -112,16 +121,9 @@ class _FakeSenseNovaModel:
             **kwargs,
         }
         self.it2i_calls.append(self.call_kwargs)
-        sample = torch.tensor(
-            [
-                [
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                ]
-            ]
-        )
-        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+        if self._error is not None:
+            raise self._error
+        return self._output.repeat(kwargs["batch_size"], 1, 1, 1)
 
 
 class _FakeTokenizer:
@@ -384,6 +386,9 @@ class _RecordingTraceContext:
         self.started_slices = []
         self.finished_slices = []
 
+    def rebuild_thread_context(self):
+        pass
+
     def trace_req_finish(self):
         self.finish_count += 1
 
@@ -394,58 +399,34 @@ class _RecordingTraceContext:
         self.finished_slices.append((name, level))
 
 
-class _SequentialTestExecutor(PipelineExecutor):
-    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
-        super().__init__(server_args)
-        self.fail = fail
-        self.fail_request_ids = set(fail_request_ids or [])
-        self.executed_requests = []
+class _DirectDispatchPipeline:
+    """Mirrors the two real stages this test cares about: input validation
+    then generation. No executor/expansion machinery -- ``execute_forward``
+    calls ``pipeline.forward`` directly for a non-expanding request."""
 
-    def execute_group(self, stages, batches, server_args):
-        for batch in batches:
-            batch.metrics.record_stage("InputValidationStage", 0.125)
-            batch.metrics.record_memory_snapshot(
-                "after_validation",
-                MemorySnapshot(
-                    allocated_mb=100.0,
-                    reserved_mb=200.0,
-                    peak_allocated_mb=300.0,
-                    peak_reserved_mb=400.0,
-                ),
-            )
-        return batches
-
-    def execute(self, stages, batch, server_args):
-        self.executed_requests.append(batch)
-        if self.fail or batch.request_id in self.fail_request_ids:
-            raise RuntimeError(f"generation failed for {batch.request_id}")
-        return OutputBatch(
-            output_file_paths=[batch.output_file_name],
-            metrics=batch.metrics,
-        )
-
-
-class _SequentialTestPipeline:
-    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
+    def __init__(self, generation_stage):
         self.input_stage = InputValidationStage()
-        self.executor = _SequentialTestExecutor(
-            server_args,
-            fail=fail,
-            fail_request_ids=fail_request_ids,
-        )
+        self.generation_stage = generation_stage
+        self.forward_calls = 0
 
-    def forward_batch_sequentially(self, batches, server_args):
-        return self.executor.execute_group_sequentially(
-            [self.input_stage, object()], batches, server_args
-        )
+    def forward(self, batch, server_args):
+        self.forward_calls += 1
+        batch = self.input_stage.forward(batch, server_args)
+        return self.generation_stage.forward(batch, server_args)
 
 
-class _WorkerBackedSchedulerClient:
-    def __init__(self, worker):
-        self.worker = worker
+class _SchedulerDispatchedSchedulerClient:
+    """Drives the real ``Scheduler._handle_generation`` dispatch decision on a
+    bare, un-``__init__``-ed instance, instead of forcing a specific worker
+    method the way a hand-rolled fake would."""
+
+    def __init__(self, worker, server_args):
+        self._scheduler = Scheduler.__new__(Scheduler)
+        self._scheduler.worker = worker
+        self._scheduler.server_args = server_args
 
     async def forward(self, batches):
-        return next(self.worker.execute_forward_sequentially(batches))
+        return self._scheduler._handle_generation(batches)
 
 
 @pytest.mark.parametrize(
@@ -1032,7 +1013,7 @@ def test_sensenova_u1_scheduler_capabilities():
 
     assert config.task_type.name == "TI2I"
     assert config.supports_dynamic_batching()
-    assert config.supports_sequential_multi_output_inference()
+    assert not config.supports_sequential_multi_output_inference()
 
 
 def test_sensenova_u1_warmup_defaults_to_text_to_image_signature():
@@ -1504,6 +1485,7 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         num_inference_steps=30,
         seed=123,
     )
+    generator = torch.Generator().manual_seed(123)
     batch = SimpleNamespace(
         prompt=sampling.prompt,
         width=sampling.width,
@@ -1515,6 +1497,7 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=generator,
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
@@ -1532,13 +1515,14 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
             ]
         ),
     )
+    assert model.call_count == 1
     assert model.call_kwargs["tokenizer"] == "tok"
     assert model.call_kwargs["prompt"] == "a mountain lake"
     assert model.call_kwargs["image_size"] == (2304, 4096)
     assert model.call_kwargs["cfg_scale"] == 4.5
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
-    assert model.call_kwargs["seed"] == 123
+    assert model.call_kwargs["generators"] == [generator]
     assert len(model.t2i_calls) == 1
     assert model.it2i_calls == []
 
@@ -1567,6 +1551,7 @@ def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(11),
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
@@ -1584,7 +1569,8 @@ def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
     assert call["img_cfg_scale"] == 1.25
     assert call["cfg_norm"] == "channel"
     assert call["num_steps"] == 50
-    assert call["seed"] == 11
+    assert len(call["generators"]) == 1
+    assert call["generators"][0].initial_seed() == 11
     assert len(call["images"]) == 1
     assert call["images"][0].mode == "RGB"
     assert call["images"][0].size != (64, 32)
@@ -1609,6 +1595,7 @@ def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
     )
     model = _FakeSenseNovaModel()
 
@@ -1644,6 +1631,7 @@ def test_sensenova_u1_it2i_preserves_explicit_output_size():
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
     )
     model = _FakeSenseNovaModel()
 
@@ -1675,6 +1663,7 @@ def test_sensenova_u1_generation_stage_rejects_cfg_zero_star_for_it2i():
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
     )
 
     with pytest.raises(ValueError, match="cfg_zero_star"):
@@ -2139,7 +2128,9 @@ def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
         ).forward(batch, server_args=_cache_dit_server_args())
 
 
-def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
+def test_sensenova_u1_generation_stage_uses_native_multi_output_batch():
+    g0 = torch.Generator().manual_seed(42)
+    g1 = torch.Generator().manual_seed(43)
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -2148,6 +2139,90 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
         # Keep the fake model off the Cache-DiT path regardless of SGLANG_* env.
         enable_cache_dit=False,
     )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        generator=[g0, g1],
+    )
+    model = _FakeSenseNovaModel(output=torch.zeros(2, 3, 64, 64))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert model.call_count == 1
+    assert model.call_kwargs["batch_size"] == 2
+    assert model.call_kwargs["generators"] == [g0, g1]
+    assert len(output.output) == 2
+
+
+def test_sensenova_u1_rejects_generator_count_mismatch():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        generator=[torch.Generator().manual_seed(42)],
+    )
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+
+    with pytest.raises(ValueError, match="Expected 2 generators, got 1"):
+        stage.forward(batch, server_args=SimpleNamespace())
+
+
+def test_sensenova_u1_batched_generators_match_independent_rng():
+    shape = (2, 3, 8, 8)
+
+    batched = _randn_with_generators(
+        shape,
+        device="cpu",
+        dtype=torch.float32,
+        generators=[
+            torch.Generator().manual_seed(42),
+            torch.Generator().manual_seed(43),
+        ],
+    )
+
+    expected_0 = torch.randn(
+        (1, 3, 8, 8),
+        generator=torch.Generator().manual_seed(42),
+        dtype=torch.float32,
+    )
+    expected_1 = torch.randn(
+        (1, 3, 8, 8),
+        generator=torch.Generator().manual_seed(43),
+        dtype=torch.float32,
+    )
+    expected = torch.cat([expected_0, expected_1], dim=0)
+
+    torch.testing.assert_close(batched, expected)
+
+
+def test_sensenova_u1_multi_output_request_is_not_expanded():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        seed=42,
+    )
     batch = Req(
         request_id="req-0",
         prompt=sampling.prompt,
@@ -2155,63 +2230,27 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
         height=sampling.height,
         guidance_scale=sampling.guidance_scale,
         num_inference_steps=sampling.num_inference_steps,
-        seed=42,
+        seed=sampling.seed,
         sampling_params=sampling,
         extra=sampling.build_request_extra(),
         output_file_name="sample.png",
     )
-    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    input_stage = InputValidationStage()
-    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
-    batch.metrics.record_stage("InputValidationStage", 0.125)
-    batch.metrics.record_memory_snapshot(
-        "after_validation",
-        MemorySnapshot(
-            allocated_mb=100.0,
-            reserved_mb=200.0,
-            peak_allocated_mb=300.0,
-            peak_reserved_mb=400.0,
-        ),
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), enable_cfg_parallel=False
     )
+    stage = InputValidationStage()
 
-    expanded = list(input_stage.iter_sequential_requests(batch, server_args))
+    batch = stage.forward(batch, server_args)
+    requests = list(stage.iter_sequential_requests(batch, server_args))
 
-    assert [req.num_outputs_per_prompt for req in expanded] == [1, 1]
-    assert [req.seed for req in expanded] == [42, 43]
-    assert [req.request_id for req in expanded] == ["req-0:0", "req-0:1"]
-    assert [req.output_file_name for req in expanded] == [
-        "sample_0.png",
-        "sample_1.png",
-    ]
-    assert [req.metrics.request_id for req in expanded] == ["req-0:0", "req-0:1"]
-    assert all(req.trace_ctx is batch.trace_ctx for req in expanded)
-    assert all(req.metrics is not batch.metrics for req in expanded)
-    assert expanded[0].metrics is not expanded[1].metrics
-    assert all(
-        req.metrics.stages == {"InputValidationStage": 125.0} for req in expanded
-    )
-    assert all(
-        req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for req in expanded
-    )
-    assert (
-        expanded[0].metrics.memory_snapshots["after_validation"]
-        is not expanded[1].metrics.memory_snapshots["after_validation"]
-    )
+    assert len(requests) == 1
+    assert requests[0] is batch
 
-    expanded[0].metrics.record_stage("child-only", 0.5)
-    expanded[0].metrics.memory_snapshots["after_validation"].peak_reserved_mb = 999.0
-    assert "child-only" not in expanded[1].metrics.stages
-    assert "child-only" not in batch.metrics.stages
-    assert (
-        expanded[1].metrics.memory_snapshots["after_validation"].peak_reserved_mb
-        == 400.0
-    )
-    assert batch.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-
-    for req in expanded:
-        output = stage.forward(req, server_args=_cache_dit_server_args())
-        assert len(output.output) == 1
+    assert batch.num_outputs_per_prompt == 2
+    assert batch.seeds == [42, 43]
+    assert len(batch.generator) == 2
+    assert batch.generator[0].initial_seed() == 42
+    assert batch.generator[1].initial_seed() == 43
 
 
 def test_sensenova_u1_multi_output_rejects_short_seed_list():
@@ -2237,10 +2276,14 @@ def test_sensenova_u1_multi_output_rejects_short_seed_list():
     server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
 
     with pytest.raises(ValueError, match="seed list length"):
-        list(InputValidationStage().iter_sequential_requests(batch, server_args))
+        InputValidationStage().forward(batch, server_args)
 
 
-def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=None):
+def _make_sensenova_u1_dispatch_entrypoint(model=None):
+    """Build a parent n=2 request and drive it through the real
+    ``Scheduler._handle_generation`` dispatch decision, not a hand-forced
+    worker method -- so the test fails if dispatch ever regresses back to
+    per-output expansion for a model that opted out of it."""
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -2259,17 +2302,15 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         sampling_params=sampling,
         extra=sampling.build_request_extra(),
         output_file_name="sample.png",
+        output_path="",
         trace_ctx=trace_ctx,
     )
     server_args = SimpleNamespace(
-        pipeline_config=SenseNovaU1PipelineConfig(),
-        disable_conditioning_cache=False,
-        conditioning_cache_max_size_mb=512,
-        use_fsdp_inference=False,
+        pipeline_config=SenseNovaU1PipelineConfig(), enable_cfg_parallel=False
     )
-    pipeline = _SequentialTestPipeline(
-        server_args, fail=fail, fail_request_ids=fail_request_ids
-    )
+    model = model or _FakeSenseNovaModel(output=torch.zeros(2, 3, 2, 2))
+    generation_stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    pipeline = _DirectDispatchPipeline(generation_stage)
     worker = GPUWorker.__new__(GPUWorker)
     worker.pipeline = pipeline
     worker.server_args = server_args
@@ -2277,7 +2318,9 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
     worker._runtime_peak_reserved_mb = 0.0
     worker._release_warmup_pool_before_serving = False
     worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
-    return batch, trace_ctx, pipeline.executor, _WorkerBackedSchedulerClient(worker)
+    worker.memory_occupation = None
+    scheduler_client = _SchedulerDispatchedSchedulerClient(worker, server_args)
+    return batch, trace_ctx, pipeline, model, scheduler_client
 
 
 def _force_cpu_entrypoint(monkeypatch):
@@ -2292,82 +2335,41 @@ def _force_cpu_entrypoint(monkeypatch):
 
 def test_sensenova_u1_multi_output_entrypoint_success(monkeypatch):
     _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint()
+    batch, trace_ctx, pipeline, model, scheduler_client = (
+        _make_sensenova_u1_dispatch_entrypoint()
     )
 
     paths, result = asyncio.run(process_generation_batch(scheduler_client, batch))
 
     assert paths == ["sample_0.png", "sample_1.png"]
     assert result.error is None
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert [req.seed for req in executor.executed_requests] == [42, 43]
-    assert result.metrics_list is not None
-    assert [metrics.request_id for metrics in result.metrics_list] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(
-        "InputValidationStage" in metrics.stages
-        and "PipelineExecutor.sequential_wait" in metrics.stages
-        and metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for metrics in result.metrics_list
-    )
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert len(result.output) == 2
+    assert pipeline.forward_calls == 1
+    assert model.call_count == 1
+    assert model.call_kwargs["batch_size"] == 2
+    assert trace_ctx.started_slices == [("scheduler_dispatch", 1), ("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2), ("scheduler_dispatch", 1)]
     assert trace_ctx.finish_count == 1
 
 
 def test_sensenova_u1_multi_output_entrypoint_failure(monkeypatch):
     _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint(fail=True)
-    )
-
-    with pytest.raises(RuntimeError, match="generation failed for req-0:0"):
-        asyncio.run(process_generation_batch(scheduler_client, batch))
-
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(
-        "InputValidationStage" in req.metrics.stages
-        and "PipelineExecutor.sequential_wait" in req.metrics.stages
-        and req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for req in executor.executed_requests
-    )
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finish_count == 1
-
-
-@pytest.mark.parametrize("failed_request_id", ["req-0:0", "req-0:1"])
-def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
-    monkeypatch, failed_request_id
-):
-    _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint(fail_request_ids={failed_request_id})
+    batch, trace_ctx, pipeline, model, scheduler_client = (
+        _make_sensenova_u1_dispatch_entrypoint(
+            model=_FakeSenseNovaModel(error=RuntimeError("model batch failed"))
+        )
     )
 
     with pytest.raises(
-        RuntimeError, match=f"generation failed for {failed_request_id}"
+        RuntimeError,
+        match="Model generation returned no output.*model batch failed",
     ):
         asyncio.run(process_generation_batch(scheduler_client, batch))
 
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert pipeline.forward_calls == 1
+    assert model.call_count == 1
+    assert trace_ctx.started_slices == [("scheduler_dispatch", 1), ("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2), ("scheduler_dispatch", 1)]
     assert trace_ctx.finish_count == 1
 
 
