@@ -7,7 +7,6 @@ use crate::config::{
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware::CacheAwarePolicy,
-    kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
@@ -20,6 +19,7 @@ use crate::policies::{
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
+use crate::state::kv_events::{BlockSizeOracle, HashTree};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,7 +237,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
+        Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ProxyConfig, ServerConfig,
         StaticUrlsDiscoveryConfig,
     };
 
@@ -353,7 +353,7 @@ mod tests {
                 urls: vec!["http://placeholder:0".into()],
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 

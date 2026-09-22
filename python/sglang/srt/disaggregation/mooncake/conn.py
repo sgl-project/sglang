@@ -1173,6 +1173,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for entry in range(num_target)
             ]
         sliced_draft_params = []
+        draft_to_pack = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
             if not dst_kv_item_lens and dst_attn_tp_size not in (
                 None,
@@ -1224,14 +1225,45 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_rank = dst_tp_rank // max(1, dst_span // src_span)
                 src_offset = (dst_rank * dst_width) % src_width
                 dst_offset = (src_rank * src_width) % dst_width
-                sliced_draft_params.append(
-                    (
-                        src_kv_ptrs[entry] + src_offset,
-                        dst_kv_ptrs[entry] + dst_offset,
-                        src_width,
-                        dst_width,
-                        copy_width,
-                    )
+                params = (
+                    src_kv_ptrs[entry] + src_offset,
+                    dst_kv_ptrs[entry] + dst_offset,
+                    src_width,
+                    dst_width,
+                    copy_width,
+                )
+                if pack_buffer is not None and src_width > dst_width:
+                    draft_to_pack.append(params)
+                else:
+                    sliced_draft_params.append(params)
+
+        if draft_to_pack:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            draft_src_ptrs, draft_dst_ptrs, src_strides, _, copy_widths = zip(
+                *draft_to_pack
+            )
+            target_pack_bytes = plan.target_src_token_indices.size * sum(
+                dcp_token_item_lens[:num_target]
+            )
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=draft_src_ptrs,
+                src_token_indices=plan.draft_src_token_indices,
+                token_item_lens=copy_widths,
+                src_token_item_lens=src_strides,
+                pack_offset_bytes=target_pack_bytes,
+            )
+            if packed is None:
+                sliced_draft_params.extend(draft_to_pack)
+            else:
+                packed_ptrs, packed_indices = packed
+                packed_groups = group_concurrent_contiguous(
+                    packed_indices, plan.draft_dst_token_indices
+                )
+                layers_params.extend(
+                    (src, dst, width, packed_groups)
+                    for src, dst, width in zip(packed_ptrs, draft_dst_ptrs, copy_widths)
                 )
 
         def process_sliced_draft(params) -> int:
@@ -1284,7 +1316,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor.submit(process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
-            return self._await_transfer_futures(futures)
+            try:
+                return self._await_transfer_futures(futures)
+            finally:
+                if pack_buffer is not None:
+                    concurrent.futures.wait(futures)
 
         transfer_blocks = []
         for layer_params in layers_params:
@@ -2492,7 +2528,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 decode_kv_args.dst_dcp_size,
                             )
                         )
-                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+                        self._init_dcp_pack_buffers_once(
+                            decode_kv_args.dst_dcp_size, include_draft=True
+                        )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:

@@ -523,6 +523,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
+        self.assertEqual(info["frontend"], "python")
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the
