@@ -279,7 +279,9 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
         for manager in module.layerwise_offload_managers:
-            manager.release_all()
+            # Not release_all: this is a use ending, not a reset. The default
+            # still drops the resident set, so behaviour is unchanged here.
+            manager.release_after_use()
         # The layers are gone; the rest of this component is dead weight on the
         # device until it is used again, and the stage that follows may be the
         # one that needs the room.
@@ -310,7 +312,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
                 if advise_cold is not None:
                     paged_out += int(advise_cold(room_bytes=room_bytes) or 0)
             if paged_out:
-                logger.info(
+                logger.debug(
                     "Layerwise offload: paged out the first %.1f GiB of %s so the "
                     "next request's stream fits the %.1f GiB the cache can give it.",
                     paged_out / 1024**3,
