@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.managers.request_preprocessor import RequestPreprocessor  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -34,7 +35,8 @@ class _FakeOpenAIServingChat:
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
-            tokenizer=SimpleNamespace(chat_template=chat_template)
+            tokenizer=SimpleNamespace(chat_template=chat_template),
+            request_preprocessor=RequestPreprocessor(),
         )
 
     def supports_native_reasoning_history(self):
@@ -58,6 +60,9 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns a configurable error response from the OpenAI handler."""
 
     def __init__(self, status_code=400, body=None, content=None):
+        self.tokenizer_manager = SimpleNamespace(
+            request_preprocessor=RequestPreprocessor()
+        )
         self._status_code = status_code
         self._body = body
         self._content = content
@@ -90,6 +95,9 @@ class _FakeNonStreamingOpenAI:
     """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
 
     def __init__(self, response):
+        self.tokenizer_manager = SimpleNamespace(
+            request_preprocessor=RequestPreprocessor()
+        )
         self._response = response
 
     def _validate_request(self, chat_request):

@@ -106,6 +106,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.request_preprocessor import RequestPreprocessor
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -188,6 +189,10 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+
+# Arbitrary cutoff: prompts this short hold the event loop for well under a
+# millisecond, and tokenizing them inline keeps their dispatch timing unchanged.
+_INLINE_TOKENIZE_MAX_CHARS = 2048
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +509,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Init request preprocessing worker
+        self.init_request_preprocessor()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -533,6 +541,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+
+    def init_request_preprocessor(self):
+        self.request_preprocessor = RequestPreprocessor()
 
     def init_model_config(self):
         server_args = self.server_args
@@ -1007,15 +1018,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
-                token_type_ids = None
-            else:
+            def tokenize():
+                if not is_cross_encoder and (
+                    not getattr(self.tokenizer, "is_fast", False)
+                ):
+                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-                input_ids = encoded["input_ids"]
-                token_type_ids = (
-                    encoded.get("token_type_ids") if is_cross_encoder else None
+                return (
+                    encoded["input_ids"],
+                    encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
+
+            input_ids, token_type_ids = await self.request_preprocessor.run(
+                tokenize,
+                inline_if_idle=input_format == InputFormat.SINGLE_STRING
+                and len(texts) <= _INLINE_TOKENIZE_MAX_CHARS,
+            )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS

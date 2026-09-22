@@ -27,6 +27,7 @@ from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.managers.request_preprocessor import RequestPreprocessor
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -71,6 +72,7 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+        self.request_preprocessor = RequestPreprocessor()
 
     def config_value(self, name: str):
         """The value in effect for one config field."""

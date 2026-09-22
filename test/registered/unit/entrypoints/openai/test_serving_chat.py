@@ -41,6 +41,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.request_preprocessor import RequestPreprocessor
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -122,6 +123,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
+        self.request_preprocessor = RequestPreprocessor()
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
