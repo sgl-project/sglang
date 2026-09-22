@@ -8,6 +8,7 @@ from unittest.mock import patch
 from jsonschema import Draft202012Validator
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,6 +37,105 @@ class TestKimiK2Inference(CustomTestCase):
                 "required": ["city"],
             },
         )
+
+    def _stream(self, chunks, tools=None):
+        parser = FunctionCallParser(
+            [self.weather, _tool("read", self.path_schema)] if tools is None else tools,
+            tool_call_parser="kimi_k2",
+        )
+        results = [parser.parse_stream_chunk(chunk) for chunk in chunks]
+        results.append(parser.parse_stream_end())
+        self.assertEqual(parser.parse_stream_end(), ("", []))
+        return "".join(text for text, _ in results), [
+            call for _, calls in results for call in calls
+        ]
+
+    def test_fragmented_call_end_is_not_an_argument(self):
+        end = "<|tool_call_end|>"
+        for identifier, tools in (
+            ("functions.weather:0", [self.weather, _tool("read", self.path_schema)]),
+            ("call_9", [self.weather]),
+        ):
+            for ending in ([end[:-3], end[-3:]], list(end)):
+                with self.subTest(identifier=identifier, ending=ending):
+                    chunks = [
+                        "<|tool_calls_section_begin|><|tool_call_begin|>"
+                        + identifier
+                        + '<|tool_call_argument_begin|>{"city":"Paris"}',
+                        *ending,
+                        "<|tool_calls_section_end|>",
+                    ]
+                    normal, calls = self._stream(chunks, tools)
+                    self.assertEqual(normal, "")
+                    self.assertEqual(
+                        [item.name for item in calls if item.name], ["weather"]
+                    )
+                    self.assertEqual(
+                        "".join(item.parameters for item in calls), '{"city":"Paris"}'
+                    )
+
+    def test_literal_angle_bracket_in_arguments_survives(self):
+        normal, calls = self._stream(
+            [
+                "<|tool_calls_section_begin|><|tool_call_begin|>functions.weather:0"
+                '<|tool_call_argument_begin|>{"city":"<',
+                '"}',
+                "<|tool_call_end|><|tool_calls_section_end|>",
+            ]
+        )
+        self.assertEqual(normal, "")
+        self.assertEqual(
+            json.loads("".join(item.parameters for item in calls)), {"city": "<"}
+        )
+
+    def test_fragmented_section_end_is_not_normal_text(self):
+        end = "<|tool_calls_section_end|>"
+        call = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>550e8400-e29b-41d4-a716-446655440000"
+            '<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>'
+        )
+        for ending in ([end], [end[:-1], end[-1:]], list(end)):
+            with self.subTest(ending=ending):
+                normal, calls = self._stream([call, *ending])
+                self.assertEqual(normal, "")
+                self.assertEqual(
+                    [item.name for item in calls if item.name], ["weather"]
+                )
+                self.assertEqual(
+                    json.loads("".join(item.parameters for item in calls)),
+                    {"city": "Paris"},
+                )
+
+    def test_fragmented_call_begin_after_rejected_call(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"unknown":"x"}<|tool_call_end|>',
+            "<",
+            '|tool_call_begin|>call_4<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>',
+            "<|tool_calls_section_end|>",
+        ]
+        normal, calls = self._stream(chunks)
+        self.assertEqual(normal, "")
+        self.assertEqual([item.name for item in calls if item.name], ["weather"])
+        self.assertEqual({item.tool_index for item in calls}, {0})
+
+    def test_finish_releases_unmatched_normal_text_prefix(self):
+        for text in ("Compare 1 <", "Show <|tool_call_beg"):
+            with self.subTest(text=text):
+                normal, calls = self._stream([text])
+                self.assertEqual(normal, text)
+                self.assertEqual(calls, [])
+
+    def test_finish_does_not_release_incomplete_call_markup(self):
+        normal, calls = self._stream(
+            [
+                "Before the call. <|tool_calls_section_begin|>",
+                '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"city":',
+            ]
+        )
+        self.assertEqual(normal, "Before the call. ")
+        self.assertEqual(calls, [])
 
     def test_evaluated_properties_preserve_unique_and_ambiguous_matches(self):
         schemas = {

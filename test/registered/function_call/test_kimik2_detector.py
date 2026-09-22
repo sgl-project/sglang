@@ -212,12 +212,13 @@ class TestKimiK2DetectorStreaming(CustomTestCase):
     """Streaming incremental parsing tests for KimiK2Detector."""
 
     def test_streaming_trailing_literal_left_angle_is_not_dropped(self):
-        """A final literal '<' must remain in normal_text instead of being buffered away."""
+        """EOF releases a literal '<' held as a possible marker prefix."""
         detector = KimiK2FuncDetector()
 
         result = detector.parse_streaming_increment("normal text <", [])
+        end = detector.finish([])
 
-        self.assertEqual(result.normal_text, "normal text <")
+        self.assertEqual(result.normal_text + end.normal_text, "normal text <")
         self.assertEqual(detector._buffer, "")
 
     def setUp(self):
@@ -788,9 +789,9 @@ class TestKimiK2EndToEnd(CustomTestCase):
 
     def test_e2e_chunk_split_invariance(self):
         """The detector must produce identical results across a few realistic
-        chunking variants. Special tokens (e.g. ``<|tool_calls_section_begin|>``)
-        are atomic and never split, so cuts only fall on token boundaries or
-        inside JSON args.
+        chunking variants. This fixture keeps special-token spellings whole
+        and varies cuts inside JSON args. Separate inference regressions cover
+        decoded marker fragments observed in constrained GPU generation.
         """
         prefix = "<think>Thinking about it...</think>This is a content:"
         call1 = (

@@ -23,13 +23,13 @@ from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
 
-_KIMI_K2_SPECIAL_TOKENS = [
+_KIMI_K2_SPECIAL_TOKENS = (
     "<|tool_calls_section_begin|>",
     "<|tool_calls_section_end|>",
     "<|tool_call_begin|>",
     "<|tool_call_end|>",
     "<|tool_call_argument_begin|>",
-]
+)
 
 _KIMI_NON_STRICT_ARGUMENTS_SCHEMA = {"type": "object"}
 
@@ -272,7 +272,9 @@ class KimiK2Detector(BaseFormatDetector):
             and self.bot_token not in self._buffer
             and self.tool_call_start_token not in self._buffer
         ):
-            emit, hold = self._split_pending_start(self._buffer)
+            emit, hold = self._split_pending_marker(
+                self._buffer, _KIMI_K2_SPECIAL_TOKENS
+            )
             self._buffer = hold
             return StreamingParseResult(normal_text=_strip_special_tokens(emit))
 
@@ -369,7 +371,9 @@ class KimiK2Detector(BaseFormatDetector):
                 if end_idx != -1:
                     args_full = buffer[args_start:end_idx]
                 else:
-                    args_full = buffer[args_start:]
+                    args_full, _ = self._split_pending_marker(
+                        buffer[args_start:], (self.tool_call_end_token,)
+                    )
                 argument_diff = args_full[len(self._last_arguments) :]
                 if argument_diff or name_just_resolved:
                     calls.append(
@@ -426,7 +430,7 @@ class KimiK2Detector(BaseFormatDetector):
         """
         begin_idx = buffer.find(self.tool_call_start_token)
         if begin_idx == -1:
-            emit, hold = self._split_pending_start(buffer)
+            emit, hold = self._split_pending_marker(buffer, _KIMI_K2_SPECIAL_TOKENS)
             if emit:
                 normal_text_parts.append(_strip_special_tokens(emit))
             self._buffer = hold
@@ -437,18 +441,26 @@ class KimiK2Detector(BaseFormatDetector):
             self._buffer = buffer[begin_idx:]
         return 0
 
-    def _split_pending_start(self, text: str) -> tuple[str, str]:
-        """Hold back a trailing fragment that could be the start of
-        <|tool_calls_section_begin|> or <|tool_call_begin|>. Everything
-        before it is safe to emit as normal text.
-        """
-        candidates = (self.bot_token, self.tool_call_start_token)
-        max_tail = max(len(t) for t in candidates) - 1
-        for n in range(min(len(text), max_tail), 1, -1):
-            tail = text[-n:]
-            if any(t.startswith(tail) for t in candidates):
-                return text[:-n], tail
+    def _split_pending_marker(
+        self, text: str, markers: tuple[str, ...]
+    ) -> tuple[str, str]:
+        """Hold a suffix that could become a special token on the next chunk."""
+        start = text.rfind("<")
+        if start != -1:
+            tail = text[start:]
+            if any(
+                len(tail) < len(token) and token.startswith(tail) for token in markers
+            ):
+                return text[:start], tail
         return text, ""
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # A recognized but incomplete call is not normal text. An unmatched
+        # prefix (including a literal trailing '<') must not be lost at EOF.
+        text = "" if self.tool_call_start_token in self._buffer else self._buffer
+        self._buffer = ""
+        self._reset_inflight_call_state()
+        return StreamingParseResult(normal_text=_strip_special_tokens(text))
 
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
