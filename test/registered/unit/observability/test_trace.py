@@ -24,6 +24,7 @@ from sglang.srt.observability.trace import (
     set_global_trace_level,
     trace_set_thread_info,
 )
+from sglang.test.test_utils import CustomTestCase
 
 try:
     from opentelemetry import trace as otel_trace
@@ -237,7 +238,7 @@ class TestTraceReqContextDisabled(unittest.TestCase):
 
 
 @unittest.skipUnless(_has_otel, "opentelemetry not installed")
-class TestTraceReqContextEnabled(unittest.TestCase):
+class TestTraceReqContextEnabled(CustomTestCase):
     def setUp(self):
 
         self.orig_initialized = mod.opentelemetry_initialized
@@ -405,6 +406,79 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         s = TraceSliceContext("dispatch", 1500, end_time_ns=2000, level=2)
         ctx.trace_slice(s, thread_finish_flag=True)
         self.assertIsNone(ctx.thread_context)
+
+    def test_filtered_slice_still_finishes_thread(self):
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        self.provider.add_span_processor(SimpleSpanProcessor(exporter))
+        for combined in (False, True):
+            with self.subTest(combined=combined):
+                exporter.clear()
+                ctx = TraceReqContext(rid="req-1", trace_level=1)
+                ctx.trace_req_start(ts=1000)
+                # DP controller owns a serialized copy, not the request root.
+                copied = ctx.copy_for_thread()
+                copied.rebuild_thread_context(ts=1200)
+                if combined:
+                    copied.trace_slice(
+                        TraceSliceContext(
+                            "dpc_dispatch", 1500, end_time_ns=2000, level=2
+                        ),
+                        thread_finish_flag=True,
+                    )
+                else:
+                    copied.trace_slice_start("dpc_dispatch", level=2, ts=1500)
+                    copied.trace_slice_end(
+                        "dpc_dispatch", level=2, ts=2000, thread_finish_flag=True
+                    )
+                self.assertIsNone(copied.thread_context)
+                copied.__del__()
+                copied.abort(ts=2500)
+                ctx.trace_req_finish(ts=3000)
+                spans = exporter.get_finished_spans()
+                self.assertEqual(len(spans), 3)
+                self.assertEqual(sum(s.end_time == 2000 for s in spans), 1)
+                self.assertTrue(
+                    all(
+                        s.status.status_code != otel_trace.StatusCode.ERROR
+                        for s in spans
+                    )
+                )
+                self.assertTrue(all(s.end_time <= 3000 for s in spans))
+
+    def test_filtered_thread_completion_preserves_real_error(self):
+        for reason in ("dispatch failed", "cancelled", "timeout"):
+            with self.subTest(reason=reason):
+                ctx = TraceReqContext(rid="req-1", trace_level=1)
+                ctx.trace_req_start(ts=1000)
+                thread_span = ctx.thread_context.thread_span
+                ctx.abort(ts=2000, abort_info={"reason": reason})
+                ctx.trace_slice_end(
+                    "dpc_dispatch", level=2, ts=3000, thread_finish_flag=True
+                )
+                self.assertEqual(
+                    thread_span.status.status_code, otel_trace.StatusCode.ERROR
+                )
+                self.assertEqual(thread_span.attributes["reason"], reason)
+                self.assertEqual(thread_span.end_time, 2000)
+                ctx.trace_req_finish(ts=4000)
+
+    def test_request_finish_closes_children_at_request_timestamp(self):
+        ctx = TraceReqContext(rid="req-1")
+        ctx.trace_req_start(ts=1000)
+        ctx.trace_slice_start("stream", level=1, ts=1500)
+        root_span = ctx.root_span
+        thread_span = ctx.thread_context.thread_span
+        slice_span = ctx.thread_context.cur_slice_stack[-1].span
+        ctx.trace_req_finish(ts=2000)
+        ctx.trace_req_finish(ts=3000)
+        for span in (root_span, thread_span, slice_span):
+            self.assertEqual(span.end_time, 2000)
+            self.assertNotEqual(span.status.status_code, otel_trace.StatusCode.ERROR)
 
     def test_nested_slices(self):
         ctx = TraceReqContext(rid="req-1")

@@ -581,7 +581,7 @@ class TraceReqContext:
         ts = ts or get_cur_time_ns()
 
         # End all unclosed thread spans.
-        self.abort()
+        self.abort(ts)
 
         if attrs:
             self.root_span.set_attributes(attrs)
@@ -651,6 +651,10 @@ class TraceReqContext:
         thread_finish_flag: bool = False,
     ):
         if self.__check_fast_return(level):
+            # Thread completion is independent of the slice's recording level.
+            # In particular, level-1 tracing filters the level-2 DP dispatch.
+            if thread_finish_flag:
+                self.abort(ts)
             return
 
         if not self.thread_context.cur_slice_stack:
@@ -705,6 +709,8 @@ class TraceReqContext:
         thread_finish_flag: bool = False,
     ):
         if self.__check_fast_return(slice.level):
+            if thread_finish_flag:
+                self.abort(slice.end_time_ns)
             return
 
         parent_span = self.thread_context.thread_span
