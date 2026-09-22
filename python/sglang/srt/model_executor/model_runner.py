@@ -945,12 +945,13 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_hisparse:
+        if not self.enable_hisparse or self.is_draft_worker:
             return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
+        from sglang.srt.mem_cache.hisparse_spec import resolve_hisparse_spec_plan
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config()
@@ -974,6 +975,11 @@ class ModelRunner:
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=get_parallel().pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
+            ),
+            spec_plan=resolve_hisparse_spec_plan(
+                server_args=self.server_args,
+                hf_text_config=self.model_config.hf_text_config,
+                is_draft_worker=self.is_draft_worker,
             ),
         )
 
@@ -1599,6 +1605,9 @@ class ModelRunner:
         forward path needs — the cuda-graph path does the equivalent inside the
         runner's capture/replay, so this is skipped there.
         """
+        real_num_reqs = (
+            0 if forward_batch.forward_mode.is_idle() else forward_batch.batch_size
+        )
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
@@ -1623,7 +1632,7 @@ class ModelRunner:
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+            self.hisparse_coordinator.num_real_reqs.fill_(real_num_reqs)
 
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:
         """Build the pp_proxy_tensors forward kwarg, in one place.
@@ -1849,12 +1858,16 @@ class ModelRunner:
             )
 
             if (
-                forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ) and self.hisparse_coordinator is not None:
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                self.hisparse_coordinator.num_real_reqs.fill_(
+                    0
+                    if forward_batch.forward_mode.is_idle()
+                    else forward_batch.batch_size
+                )
 
             # Replay cuda graph if applicable
             if can_run_graph:

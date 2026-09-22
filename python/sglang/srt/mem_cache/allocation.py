@@ -748,19 +748,36 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
+            coordinator = batch.hisparse_coordinator if batch is not None else None
+            if coordinator is not None and coordinator.speculative_verify_enabled:
+                out_cache_loc = (
+                    tree_cache.token_to_kv_pool_allocator.alloc_logical_only(
+                        cur_kv_lens,
+                        cur_kv_lens_cpu,
+                        nxt_kv_lens,
+                        nxt_kv_lens_cpu,
+                        last_loc,
+                        num_needed_tokens,
+                    )
+                )
+            else:
+                device_type = getattr(
+                    batch.device, "type", str(batch.device).split(":", 1)[0]
+                )
+                out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
+        if out_cache_loc is None:
+            raise RuntimeError(
+                f"KV cache pool is full. {available_and_evictable_str(tree_cache)}"
             )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.

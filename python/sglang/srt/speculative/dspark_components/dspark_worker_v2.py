@@ -896,6 +896,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             commit_lens=accept.commit_lens,
         )
+        coordinator = batch.hisparse_coordinator
+        if coordinator is not None and coordinator.speculative_verify_enabled:
+            coordinator.finalize_speculative_verify(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                commit_lens=accept.commit_lens,
+            )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,

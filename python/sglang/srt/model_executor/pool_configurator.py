@@ -215,6 +215,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
+        from sglang.srt.mem_cache.hisparse_spec import resolve_hisparse_spec_plan
+
+        self.hisparse_spec_plan = None
+        if (
+            get_memory().enable_hisparse
+            and not kvc.is_draft_worker
+            and get_spec().speculative_algorithm is not None
+        ):
+            self.hisparse_spec_plan = resolve_hisparse_spec_plan(
+                server_args=kvc.server_args,
+                hf_text_config=kvc.model_config.hf_text_config,
+            )
+        self._hisparse_num_layers = num_layers
+        self._hisparse_context_len = kvc.model_config.context_len
+        requested_reqs = get_schedule().max_running_requests
+        self._hisparse_requested_reqs = (
+            requested_reqs // kvc.attn_dp_size
+            if requested_reqs is not None
+            else None
+        )
+        self._hisparse_extra_req_slots = (
+            get_disagg().disaggregation_decode_extra_slots
+            if get_disagg().disaggregation_mode == "decode"
+            else 0
+        )
+
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
@@ -258,6 +284,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
+                    if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                        # Draft KV spans size_full, unlike target attention KV.
+                        # The indexer cost below already includes this ratio.
+                        draft_kv_size *= parse_hisparse_config().host_to_device_ratio
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -493,7 +525,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
-        if memory_config.enable_hisparse:
+        if memory_config.enable_hisparse and not kvc.is_draft_worker:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
@@ -552,6 +584,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes = max(available_bytes, 0)
+        if self.hisparse_spec_plan is not None:
+            # Request-indexed speculative state grows with the final token
+            # capacity. Solve both together instead of subtracting state for
+            # a provisional request count and recomputing it after allocation.
+            lo, hi = 0, available_bytes // self._cell_size // page_size
+            while lo < hi:
+                pages = (lo + hi + 1) // 2
+                tokens = pages * page_size
+                num_reqs = self._hisparse_num_reqs(tokens)
+                fixed = self.hisparse_spec_plan.layout.fixed_state_bytes(
+                    num_layers=self._hisparse_num_layers,
+                    num_req_slots=num_reqs + self._hisparse_extra_req_slots + 1,
+                )
+                if (tokens + page_size) * self._cell_size + fixed <= available_bytes:
+                    lo = pages
+                else:
+                    hi = pages - 1
+            return self.calculate_pool_sizes_from_max_tokens(lo * page_size, page_size)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -564,7 +614,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if self.hisparse_spec_plan is not None:
+            num_reqs = self._hisparse_num_reqs(max_total_num_tokens)
+            if num_reqs < 1:
+                raise RuntimeError(
+                    "Not enough memory for a HiSparse speculative request buffer "
+                    "and its metadata. Reduce --hisparse-config device_buffer_size "
+                    "or increase --mem-fraction-static."
+                )
+            return MemoryPoolConfig(
+                max_total_num_tokens=max_total_num_tokens,
+                max_running_requests=num_reqs,
+            )
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+
+    def _hisparse_num_reqs(self, token_capacity: int) -> int:
+        estimated = max(
+            min(int(token_capacity / self._hisparse_context_len * 512), 4096), 2048
+        )
+        requested = self._hisparse_requested_reqs
+        # Every speculative request owns the entire hot buffer plus tail.
+        return min(
+            estimated if requested is None else requested,
+            token_capacity // 2,
+            token_capacity // self.hisparse_spec_plan.layout.total_buffer_slots,
+        )
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
@@ -1099,6 +1173,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "switch or run without disaggregation."
             )
 
+        from sglang.srt.mem_cache.hisparse_spec import resolve_hisparse_spec_plan
+
+        self.hisparse_spec_plan = resolve_hisparse_spec_plan(
+            server_args=kvc.server_args,
+            hf_text_config=kvc.model_config.hf_text_config,
+            is_draft_worker=kvc.is_draft_worker,
+        )
+
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(
@@ -1485,11 +1567,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         swa_fixed_bytes = self._get_swa_fixed_bytes()
+        hisparse_spec_fixed_bytes = 0
+        if self.hisparse_spec_plan is not None:
+            hisparse_spec_fixed_bytes = (
+                self.hisparse_spec_plan.layout.fixed_state_bytes(
+                    num_layers=self.num_layers_ca4,
+                    num_req_slots=self._get_num_req_slots(
+                        max_running_requests_per_worker
+                    ),
+                )
+            )
         fixed_bytes = (
             c128_state_fixed_bytes
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
+            + hisparse_spec_fixed_bytes
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
@@ -1513,6 +1606,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"hisparse_spec_fixed={hisparse_spec_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

@@ -60,14 +60,20 @@ def _create_backend_adaptor(
 
 
 def _parse_sparse_config() -> SparseConfig:
+    return parse_hisparse_config_json(get_memory().hisparse_config)
+
+
+def parse_hisparse_config_json(extra_config_str: Optional[str]) -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
+
+    Takes an explicit value so startup validation can run before runtime
+    configuration bags have been published.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
     host_to_device_ratio (2), swap_in_block_size (960).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
-    extra_config_str = get_memory().hisparse_config
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)
