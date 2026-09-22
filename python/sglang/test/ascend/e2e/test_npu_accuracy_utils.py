@@ -120,7 +120,6 @@ def run_evalscope(
     eval_type="openai_api",
     judge=None,
     api_key=None,
-    few_shot_num=None,
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
@@ -152,8 +151,6 @@ def run_evalscope(
         config_dict["judge"] = judge
     if api_key:
         config_dict["api_key"] = api_key
-    if few_shot_num is not None:
-        config_dict["few_shot_num"] = few_shot_num
 
     config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
     config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
@@ -329,7 +326,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     test_type = "accuracy"
     judge = None
     api_key = None
-    few_shot_num = None
 
     @classmethod
     def _get_tc_name(cls):
@@ -515,7 +511,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
                     api_key=getattr(self, "api_key", None),
-                    few_shot_num=getattr(self, "few_shot_num", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -551,7 +546,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     accuracy = 0.1
     judge = None
     api_key = None
-    few_shot_num = None
 
     @classmethod
     def setUpClass(cls):
@@ -623,7 +617,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
                     api_key=getattr(self, "api_key", None),
-                    few_shot_num=getattr(self, "few_shot_num", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -658,7 +651,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     accuracy = 0.1
     judge = None
     api_key = None
-    few_shot_num = None
 
     @classmethod
     def setUpClass(cls):
@@ -746,7 +738,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
                     api_key=getattr(self, "api_key", None),
-                    few_shot_num=getattr(self, "few_shot_num", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)

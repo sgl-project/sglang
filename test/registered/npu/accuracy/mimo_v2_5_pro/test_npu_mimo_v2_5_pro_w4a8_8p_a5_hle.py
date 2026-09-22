@@ -99,7 +99,6 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
             },
         }
     }
-    few_shot_num = 0
     eval_batch_size = 5
     limit = 3
     generation_config = {
