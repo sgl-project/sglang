@@ -909,6 +909,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=add_prefix("wo_b", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
