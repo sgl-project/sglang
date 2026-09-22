@@ -3003,6 +3003,22 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+        if (
+            not _is_hip
+            and q_all.is_cuda
+            and q_all.dtype == torch.bfloat16
+            and q_all.shape[-1] == v_head_dim == 512
+            and kv_cache.dtype == torch.float8_e4m3fn
+            and kv_cache.shape[-1] == 528
+        ):
+            from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+                dequantize_sparse_nope_cache,
+            )
+
+            kv_cache, page_table_1 = dequantize_sparse_nope_cache(
+                kv_cache, page_table_1
+            )
+
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
         # so mask-pad the tail-extended table to the next complete block.

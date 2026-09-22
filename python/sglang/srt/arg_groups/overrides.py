@@ -620,6 +620,8 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    nope_group_scaled: bool = False,
+    dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -634,10 +636,18 @@ def _check_dsa_backend_constraints(
 
     cuda_fp8_unsupported = {"tilelang"} & chosen
     if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+        # Both phases must consume the same group-scaled NoPE layout. Mixed
+        # backend pairs can select a raw KV pool or a RoPE-only consumer.
+        if (
+            nope_group_scaled
+            and prefill_backend == decode_backend == "tilelang"
+            and dcp_size == 1
+        ):
+            return
         raise ValueError(
-            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
-            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
-            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
+            "CUDA TileLang DSA with fp8_e4m3 KV requires BF16 queries, "
+            "latent512/RoPE0 group-scaled KV, both DSA backends set to tilelang, "
+            "and --dcp-size 1. Use --kv-cache-dtype bfloat16, or keep "
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
@@ -781,7 +791,16 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        nope_group_scaled=(
+            getattr(model_config_of(view), "kv_lora_rank", None) == 512
+            and getattr(model_config_of(view), "qk_rope_head_dim", None) == 0
+            and getattr(model_config_of(view), "dtype", None) == torch.bfloat16
+        ),
+        dcp_size=getattr(view, "dcp_size", 1),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
