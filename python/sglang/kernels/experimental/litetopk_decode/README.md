@@ -1,5 +1,10 @@
 # Experimental LiteTopK B200 decode kernels
 
+An additional, explicitly selected **SGL DeepGEMM main fusion path supports
+actual batch sizes 1 through 128**, including non-powers of two. See
+[FUSED.md](FUSED.md) for its isolated build, API and qualification. The original
+build commands and dispatch below retain their existing B1/B2/B4/B8/B16 behavior.
+
 This source-only package contains the final exact-FP32 decode kernels qualified on
 NVIDIA B200 for batch sizes 1, 2, 4, 8, and 16 at 128K through approximately 1M
 tokens. It is opt-in and does not change SGLang's default top-k path.
