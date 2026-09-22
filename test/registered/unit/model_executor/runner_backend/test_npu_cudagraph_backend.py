@@ -15,19 +15,28 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _make_backend(graph):
-    backend = NPUCudaGraphBackend.__new__(NPUCudaGraphBackend)
-    backend._graphs = {1: graph}
-    backend._outputs = {1: object()}
-    backend._device_module = SimpleNamespace(set_device=Mock())
-    backend._device_id = 0
-    return backend
+@pytest.fixture
+def make_backend(request):
+    def make(graph):
+        runner = SimpleNamespace(
+            device_module=SimpleNamespace(
+                current_device=Mock(return_value=0), set_device=Mock()
+            ),
+            model_runner=SimpleNamespace(tp_group=Mock()),
+        )
+        backend = NPUCudaGraphBackend(runner)
+        request.addfinalizer(backend.cleanup)
+        backend._graphs = {1: graph}
+        backend._outputs = {1: object()}
+        return backend
+
+    return make
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_npu_graph_update_success(legacy):
+def test_npu_graph_update_success(legacy, make_backend):
     graph = SimpleNamespace(update=Mock(), replay=Mock())
-    backend = _make_backend(graph)
+    backend = make_backend(graph)
     if legacy:
         output = backend.replay_with_input_update(
             1, [3, 5], attr_name="actual_seq_lengths_kv", attr_type=torch.empty(0)
@@ -45,20 +54,48 @@ def test_npu_graph_update_success(legacy):
     backend._device_module.set_device.assert_called_once_with(0)
 
 
-def test_npu_graph_waits_for_update_before_returning():
-    replay_started = threading.Event()
-    update_finished = threading.Event()
+def test_npu_graph_waits_for_update_before_replay_and_reuses_worker(make_backend):
+    caller_thread = threading.get_ident()
+    update_threads = []
+    events = []
 
     def update(**kwargs):
-        if not replay_started.wait(timeout=5):
-            raise RuntimeError("Replay did not run concurrently with update")
-        update_finished.set()
+        backend._device_module.set_device.assert_called_once_with(0)
+        update_threads.append(threading.get_ident())
+        events.append("update")
 
-    graph = SimpleNamespace(update=update, replay=replay_started.set)
-    backend = _make_backend(graph)
-    result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
-    assert update_finished.is_set()
-    assert result is backend._outputs[1]
+    graph = SimpleNamespace(update=update, replay=lambda: events.append("replay"))
+    backend = make_backend(graph)
+    for _ in range(2):
+        result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
+        assert result is backend._outputs[1]
+    assert events == ["update", "replay", "update", "replay"]
+    assert update_threads[0] == update_threads[1] != caller_thread
+    backend._device_module.set_device.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize("failure", ["update", "replay"])
+def test_npu_graph_propagates_failures(failure, make_backend):
+    graph = SimpleNamespace(update=Mock(), replay=Mock())
+    error = RuntimeError(f"{failure} failed")
+    getattr(graph, failure).side_effect = error
+    backend = make_backend(graph)
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.replay_with_input_update(1, None, cpu_update_input=[{}])
+    assert exc_info.value is error
+    if failure == "update":
+        graph.replay.assert_not_called()
+
+
+def test_npu_graph_cleanup_stops_update_worker(make_backend):
+    graph = SimpleNamespace(update=Mock(), replay=Mock())
+    backend = make_backend(graph)
+    backend.replay_with_input_update(1, None, cpu_update_input=[{}])
+    backend.cleanup()
+    assert backend._graphs == {} and backend._outputs == {}
+    assert backend._pool is None
+    with pytest.raises(RuntimeError, match="shutdown"):
+        backend._update_executor.submit(lambda: None)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +149,10 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
         replay_with_input_update=Mock(return_value=output),
     )
     runner = SimpleNamespace(
-        model_runner=SimpleNamespace(model_config=SimpleNamespace(hf_config=config)),
+        model_runner=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config),
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+        ),
         backend=backend,
         bs=2,
         raw_bs=1,

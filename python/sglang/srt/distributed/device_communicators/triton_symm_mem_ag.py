@@ -469,8 +469,10 @@ class MultimemAllGatherer:
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
-            from sglang.srt.distributed import get_tp_group
-            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+            from sglang.srt.distributed.parallel_state import (
+                get_tp_group,
+                in_the_same_node_as,
+            )
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
@@ -527,7 +529,7 @@ class MultimemAllGatherer:
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
         try:
-            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.parallel_state import get_tp_group
 
             tp_group = get_tp_group()
             if tp_group.world_size <= 1:
