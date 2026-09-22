@@ -20,6 +20,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 
@@ -123,6 +124,13 @@ def _patch_model_forward(*, model_runner: ModelRunner, manager: CanaryManager) -
             return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
+    if get_parallel().enable_prefill_cp:
+        # CP prefill calls the transformer body directly, bypassing the outer
+        # model.forward. Decode still enters through the outer model; the shared
+        # bracket scope prevents the body from running a second pair of hooks.
+        wrap_method(
+            model_runner.model.model, "forward", wrapper=_with_canary_bracketing
+        )
 
 
 def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:
