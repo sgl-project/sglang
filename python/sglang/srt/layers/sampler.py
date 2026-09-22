@@ -112,10 +112,7 @@ class Sampler(nn.Module):
         self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
-            # Only when there is more than one context shard to reconcile. The
-            # sync below already short-circuits on that, and a model running on
-            # one shard -- a speculative draft, under the scope that says so --
-            # has no context-parallel communicator to name.
+            # Single-shard drafts may have no context-parallel group.
             if get_parallel().attn_cp_size > 1:
                 self.cp_sync_group = get_parallel().attn_cp_group.device_group
 

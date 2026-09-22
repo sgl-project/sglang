@@ -12,11 +12,15 @@ N=6144 does), so they agree to bf16 rounding, not bitwise.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
-from sglang.srt.models.kimi_k3 import _merge_weights_as_views
+from sglang.srt.models.kimi_k3 import (
+    KimiK3DeltaAttention,
+    _merge_weights_as_views,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -116,6 +120,40 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
                     scale = want.float().abs().max().clamp_min(1e-6)
                     rel = ((got.float() - want.float()).abs().max() / scale).item()
                     self.assertLess(rel, TOL, f"{name} rel err {rel:.2e}")
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only fused path")
+    def test_deferred_f_b_returns_raw_f_a(self):
+        x = torch.randn(1, HIDDEN, dtype=torch.bfloat16, device=self.merged.device)
+        fused_states = torch.nn.functional.linear(x, self.merged)
+        expected_f_a = torch.split(fused_states, self.all_sizes, dim=-1)[2]
+        fake_attention = SimpleNamespace(
+            use_full_rank_gate=True,
+            _bfa_w=object(),
+            _bfa_fa_size=HEAD_DIM,
+            _bfa_b_size=HEADS_TP,
+            _qkvgbfa_sizes=self.all_sizes,
+            _qkvgbfa_bs_limit=256,
+            _qkvgbfa_layer=None,
+            _bfa_f_b_w=self.f_b_w,
+            _bfa_alt_stream=None,
+            fused_qkvg_proj=SimpleNamespace(
+                quant_method=SimpleNamespace(
+                    apply=lambda _layer, _hidden_states, _bias: fused_states
+                )
+            ),
+        )
+
+        _, _, deferred_f_a, _ = KimiK3DeltaAttention.forward_qkvbfg_fused(
+            fake_attention, x, defer_f_b=True
+        )
+        self.assertEqual(deferred_f_a.shape[-1], HEAD_DIM)
+        self.assertTrue(torch.equal(deferred_f_a, expected_f_a))
+
+        expected_gate = kimi_k3_tiny_gemm(expected_f_a, self.f_b_w)
+        _, _, eager_gate, _ = KimiK3DeltaAttention.forward_qkvbfg_fused(
+            fake_attention, x, defer_f_b=False
+        )
+        torch.testing.assert_close(eager_gate, expected_gate)
 
 
 if __name__ == "__main__":

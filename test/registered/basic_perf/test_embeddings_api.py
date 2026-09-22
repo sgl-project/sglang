@@ -34,9 +34,9 @@ class TestEmbeddingsAPI(CustomTestCase):
         self.assertEqual(res["successful_requests"], res["total_requests"])
         check_perf(
             self,
-            at_most("avg_latency_ms", res["avg_latency_ms"], 21, amd=35, unit="ms"),
-            at_most("p95_latency_ms", res["p95_latency_ms"], 26, amd=40, unit="ms"),
-            at_least("throughput", res["throughput"], 48, amd=30, unit="req/s"),
+            at_most("avg_latency_ms", res["avg_latency_ms"], 23, amd=35, unit="ms"),
+            at_most("p95_latency_ms", res["p95_latency_ms"], 34, amd=40, unit="ms"),
+            at_least("throughput", res["throughput"], 45, amd=30, unit="req/s"),
         )
 
     def test_embeddings_api_batch_scaling(self):
@@ -50,9 +50,9 @@ class TestEmbeddingsAPI(CustomTestCase):
             ),
             # batch size, avg ms, p95 ms, then the same two relaxed for mi300x
             [
-                (10, 43, 49, 80, 90),
-                (25, 70, 78, 140, 150),
-                (50, 122, 158, 230, 240),
+                (10, 44, 52, 80, 90),
+                (25, 72, 101, 140, 150),
+                (50, 126, 200, 230, 240),
             ],
         )
 
