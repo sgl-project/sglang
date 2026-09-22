@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=10000,
-    suite="nightly-acc-8-npu-a5-test",
+    suite="nightly-acc-8-npu-a5",
     nightly=True,
 )
 
@@ -20,7 +20,7 @@ MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
 )
 # TODO: Update HLE dataset path for CI environment
-HLE_DATASET_PATH = "/root/.cache/modelscope/hub/datasets/AI-ModelScope/hle"
+HLE_DATASET_PATH = "/mnt/share/w00937173/run_file/mimo-v2.5-pro/data/hle_dataset"
 
 MIMO_V2_5_PRO_FP4_8P_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -104,10 +104,12 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
     generation_config = {
         "temperature": 0,
         "parallel_tool_calls": True,
+        "stream": True,
     }
-    stream = True
     judge_model_args = {
         "model_id": "MiMo-V2.5-Pro-FP4-DFlash",
+        "api_url": "http://127.0.0.1:8010/v1",
+        "api_key": "EMPTY",
     }
 
     def test_hle(self):
