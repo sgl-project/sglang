@@ -211,24 +211,46 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
 
 
 def _move_items_to_device(
-    items: List[MultimodalDataItem], device: torch.device
-) -> None:
-    """Move item features to the target device (in-place, non-blocking)."""
-    for item in items:
-        if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
-            item.feature = item.feature.to(device, non_blocking=True)
-
-
-def _prepare_items_for_encoding(
     items: List[MultimodalDataItem],
     device: torch.device,
     data_embedding_func: DataEmbeddingFunc,
-) -> None:
-    if not _can_skip_pre_embed_feature_move(data_embedding_func):
-        _move_items_to_device(items, device)
+) -> Optional[torch.cuda.Event]:
+    """Move features or return readiness for inputs the encoder packs on CPU."""
+    offload_events = {
+        item.host_offload_event
+        for item in items
+        if isinstance(item.feature, torch.Tensor)
+        and item.feature.is_cpu
+        and item.host_offload_event is not None
+    }
+    ready_event = None
+    if len(offload_events) == 1:
+        ready_event = next(iter(offload_events))
+    elif offload_events:
+        # Items can come from different prefill batches. Join only their
+        # offloads, without waiting for unrelated work on the forward stream.
+        event_device = next(iter(offload_events)).device
+        stream = torch.cuda.Stream(device=event_device)
+        if stream == torch.cuda.current_stream(event_device):
+            stream = torch.cuda.Stream(device=event_device)
+        for event in offload_events:
+            stream.wait_event(event)
+        ready_event = torch.cuda.Event()
+        ready_event.record(stream)
+
+    if _can_skip_pre_embed_feature_move(data_embedding_func):
+        return ready_event
+
+    if ready_event is not None:
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).wait_event(ready_event)
+        else:
+            # A non-CUDA consumer cannot enqueue a CUDA stream dependency.
+            ready_event.synchronize()
     for item in items:
-        if isinstance(item.feature, torch.Tensor) and item.feature.is_cpu:
-            item.wait_host_offload()
+        if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
+            item.feature = item.feature.to(device, non_blocking=True)
+    return None
 
 
 def _acknowledge_deferred_cuda_ipc_cache_hits(
@@ -284,9 +306,11 @@ def _get_chunked_embedding_full(
             embedding_per_req = None
 
     if embedding_per_req is None:
-        _prepare_items_for_encoding(
+        ready_event = _move_items_to_device(
             embedding_items_per_req, device, data_embedding_func
         )
+        if ready_event is not None:
+            ready_event.synchronize()
         embedding = data_embedding_func(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
@@ -396,9 +420,10 @@ def _batch_encode_per_image_misses(
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
+        ready_event = _move_items_to_device(miss_items, device, data_embedding_func)
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
-
-        _prepare_items_for_encoding(miss_items, device, data_embedding_func)
+        if ready_event is not None:
+            ready_event.synchronize()
         all_miss_embedding = data_embedding_func(miss_items)
 
         if isinstance(all_miss_embedding, list):
@@ -475,7 +500,9 @@ def _get_chunked_embedding_by_item(
 
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        _prepare_items_for_encoding(miss_item_list, device, data_embedding_func)
+        ready_event = _move_items_to_device(miss_item_list, device, data_embedding_func)
+        if ready_event is not None:
+            ready_event.synchronize()
         all_miss_embedding = data_embedding_func(miss_item_list)
 
         if isinstance(all_miss_embedding, list):

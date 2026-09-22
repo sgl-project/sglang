@@ -727,6 +727,7 @@ def general_mm_embed_routine(
             if mm_inputs_list:
                 language_only = get_disagg().language_only
                 stream = None
+                offloaded_items = []
                 for mm_input_obj in mm_inputs_list:
                     for mm_item in mm_input_obj.mm_items:
                         offloaded = False
@@ -756,10 +757,13 @@ def general_mm_embed_routine(
                                 )
                                 offloaded = True
                         if offloaded:
-                            # Host readers wait on this before touching the pinned copy.
-                            event = torch.cuda.Event()
-                            event.record(stream)
-                            mm_item.host_offload_event = event
+                            offloaded_items.append(mm_item)
+                if offloaded_items:
+                    # One completion event covers this batch's host copies.
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    for mm_item in offloaded_items:
+                        mm_item.host_offload_event = event
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
