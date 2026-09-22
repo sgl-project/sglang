@@ -223,6 +223,8 @@ pub struct RequestLogContext {
     /// line and `worker_requests_total` cannot disagree — the middleware can
     /// only see the status, which cannot express a router-side cancellation.
     pub outcome: RequestOutcome,
+    /// Router-minted engine ID, logged beside the caller's correlation ID.
+    pub engine_rid: Option<String>,
 }
 
 /// Final outcome of a 2xx SSE stream.
