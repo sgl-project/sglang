@@ -82,8 +82,6 @@ jobs:
           outputs: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' && 'type=registry,oci-mediatypes=false' || '' }}
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=${{ matrix.device_type }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.device_type }}-${{ matrix.platform }}
           build-args: |
             SGLANG_KERNEL_NPU_TAG=2026.9.0.post5
             CANN_VERSION=${{ matrix.cann_version }}
