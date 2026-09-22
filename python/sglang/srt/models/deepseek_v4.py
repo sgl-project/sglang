@@ -4890,8 +4890,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
-        # Ranks of this group run identical image chunks; one owner encodes each
-        # span and broadcasts it. None keeps the replicated encoder.
         self.mm_owner_group = (
             select_owner_group(get_parallel())
             if self.vision is not None and _is_cuda

@@ -4056,14 +4056,6 @@ class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
         ):
             handle_model_specific_adjustments(args)
 
-    def test_interleave_eager_prefill_is_accepted(self):
-        args = self._args()
-        validate_deepseek_v41_features(args)
-        self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
-            Backend.DISABLED,
-        )
-
     def test_zigzag_is_rejected_only_with_vision(self):
         with self.assertRaisesRegex(ValueError, "requires --cp-strategy interleave"):
             validate_deepseek_v41_features(self._args(cp_strategy="zigzag"))

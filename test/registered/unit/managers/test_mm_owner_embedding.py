@@ -229,8 +229,6 @@ class _VisionStub(DeepseekV4ForCausalLM):
 
 
 class _TracedGroup:
-    """Records every collective (op, source, shape, group size) around a real coordinator."""
-
     def __init__(self, inner):
         self.inner = inner
         self.trace = []
@@ -441,7 +439,6 @@ def _topology_program(rank, world_size):
     singles = _coordinator([[r] for r in range(8)], rank)
     out = {}
 
-    # TP8, DP1, CP off.
     tp_group, attn_tp, attn_cp = (
         _TracedGroup(tp8),
         _TracedGroup(tp8),
@@ -469,7 +466,6 @@ def _topology_program(rank, world_size):
     assert torch.equal(embeds, _expected_embeds(embed, requests, {x: 0, y: 5, z: 2}))
     out["cp1"] = {"encoded": list(model.encoded), "trace": list(attn_tp.trace)}
 
-    # TP8, DP1, CP8 through the CP runner.
     tp_group, attn_tp, attn_cp = (
         _TracedGroup(tp8),
         _TracedGroup(singles),
@@ -516,7 +512,7 @@ def _topology_program(rank, world_size):
     finally:
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")
 
-    # TP8, attention-DP2, CP off: one replica is text-only first.
+    # One attention-DP replica is text-only first.
     tp_group, attn_tp, attn_cp = (
         _TracedGroup(tp8),
         _TracedGroup(replicas),
@@ -804,7 +800,6 @@ def test_owner_actions_and_cache_lifetime_across_asymmetric_ranks():
 
 
 def test_tp8_cp1_and_cp8_dedupe_and_attention_dp_replicas_stay_isolated():
-    """One encode per key on TP8 with CP off and CP8; attention-DP replicas never share a collective."""
     results = _run_ranks(8, _topology_program)
 
     cp1 = [r["cp1"] for r in results]
@@ -839,7 +834,6 @@ def test_tp8_cp1_and_cp8_dedupe_and_attention_dp_replicas_stay_isolated():
 
 
 def test_failures_agree_before_payload_text_embedding_or_body():
-    """Every rank raises the same error and none enters a later collective."""
     results = _run_ranks(4, _failure_program)
     cases = (
         "prepare",

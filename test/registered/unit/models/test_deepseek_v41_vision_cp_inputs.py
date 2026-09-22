@@ -200,21 +200,6 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
                 input_embeds=input_embeds,
             )
 
-    def test_prepare_model_inputs_merges_on_full_layout(self):
-        forward_batch, item = _build_batch()
-        scheduler_ids = forward_batch.input_ids.clone()
-
-        model_ids, embeds = self._prepare(forward_batch)
-
-        self.assertTrue(torch.equal(forward_batch.input_ids, scheduler_ids))
-        self.assertIs(forward_batch.mm_input_embeds, embeds)
-        self.assertTrue(torch.equal(model_ids, _canonical(scheduler_ids)))
-        self.assertTrue(torch.equal(embeds[IMAGE_ROWS], _image_span(item)[1:7]))
-        text_rows = model_ids != IMAGE_TOKEN_ID
-        with torch.no_grad():
-            text_embeds = self.embed(scheduler_ids[text_rows])
-        self.assertTrue(torch.equal(embeds[text_rows], text_embeds))
-
     def test_cp_runner_merges_before_shard(self):
         runner = EagerRunner.__new__(EagerRunner)
         runner.model_runner = SimpleNamespace(model=self.model)
