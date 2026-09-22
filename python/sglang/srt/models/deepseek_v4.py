@@ -111,6 +111,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -2521,10 +2522,19 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
-        o, _ = self.wo_b(
-            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
-            skip_all_reduce=mhc is not None,
-        )
+        swizzled = isinstance(o, Mxfp8SwizzledInput)
+        o_in = o if swizzled else o.flatten(1)
+        # ROCm gfx950 TP-only: wo_b's GEMM and its all-reduce can overlap. The
+        # helper returns None whenever it does not apply -- decode, ragged
+        # chunks, no SDMA -- and disables itself for the process on any failure.
+        # mHC and the swizzled input each own the all-reduce themselves, so the
+        # fused path stands aside for both rather than relying on neither being
+        # reachable on ROCm today.
+        fused_o = None if (mhc is not None or swizzled) else fused_wo_b(self.wo_b, o_in)
+        if fused_o is not None:
+            o = fused_o
+        else:
+            o, _ = self.wo_b(o_in, skip_all_reduce=mhc is not None)
         if mhc is not None and mhc.overlap_only:
             mhc.start_stats_before_all_reduce()
             o = attn_tp_all_reduce(o)
