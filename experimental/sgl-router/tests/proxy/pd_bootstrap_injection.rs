@@ -376,3 +376,61 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     let pv = parse_body(&prefill_body);
     assert_eq!(bootstrap_port(&pv), Some(8997));
 }
+
+fn streaming_chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pd_mode_disconnect_does_not_abort_either_worker() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for worker in [&prefill, &decode] {
+        assert!(worker.abort_log.lock().unwrap().is_empty());
+        let body = await_captured_body(worker, Duration::from_secs(2), "PD worker").await;
+        assert!(parse_body(&body).get("rid").is_none());
+    }
+}

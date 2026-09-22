@@ -23,7 +23,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 torch.manual_seed(42)
 random.seed(44)  # keep the deterministic seed
@@ -117,7 +117,8 @@ class TestQuickAllReduce(CustomTestCase):
             distributed_init_method=distributed_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
+        publish_build_topology(tp_size=world_size, world_rank=rank)
+        initialize_model_parallel()
         group = get_tensor_model_parallel_group().device_group
 
         # A small all_reduce for warmup.
@@ -186,7 +187,8 @@ class TestQuickAllReduce(CustomTestCase):
             distributed_init_method=distributed_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
+        publish_build_topology(tp_size=world_size, world_rank=rank)
+        initialize_model_parallel()
         group = get_tensor_model_parallel_group().device_group
 
         for sz in self.TEST_SIZES:
