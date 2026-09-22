@@ -497,8 +497,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
                 f"Expected {num_experts} experts in {name}, got {source.shape}."
             )
 
-        # expert i occupies the same byte range before and after, so writing
-        # expert i only overwrites bytes already consumed by its own transform
+        # expert i keeps its byte range, so writing it only overwrites bytes its transform read
         first = transform(source[0])
         output_shape = (num_experts, *first.shape)
         output = _view_tensor_storage(source, output_shape, first.dtype)

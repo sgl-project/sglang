@@ -164,8 +164,7 @@ class LoRAAdapter(nn.Module):
         self._normalize_weights()
 
     def _stage_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
-        # streamed weights are CUDA-IPC views into the trainer's buckets, valid until the adapter is
-        # installed and the session closes; a full-adapter clone would not fit next to the base
+        # streamed weights are IPC views into the trainer's buckets; a full-adapter clone would not fit
         if self.keep_weights_on_device and loaded_weight.is_cuda:
             return loaded_weight
         return loaded_weight.cpu()
