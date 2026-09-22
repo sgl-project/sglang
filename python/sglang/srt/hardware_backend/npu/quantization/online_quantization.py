@@ -8,7 +8,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.dequantization import copy_missing_attrs
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_model
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ def get_npu_online_integer_quant_spec(
     mode: Optional[str] = None,
 ) -> Optional[NPUOnlineIntegerQuantSpec]:
     if mode is None:
-        mode = get_server_args().online_quantization
+        mode = get_model().online_quantization
     return _ONLINE_INTEGER_QUANT_SPECS.get(mode)
 
 
@@ -47,7 +47,7 @@ def get_npu_online_moe_integer_quant_spec(
     weight_prefix: str, mode: Optional[str] = None
 ) -> Optional[NPUOnlineIntegerQuantSpec]:
     if mode is None:
-        mode = get_server_args().online_quantization
+        mode = get_model().online_quantization
     if mode != "w4a4_int":
         return get_npu_online_integer_quant_spec(mode)
     if weight_prefix not in {"w13", "w2"}:

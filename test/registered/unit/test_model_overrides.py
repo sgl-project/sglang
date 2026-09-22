@@ -77,6 +77,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
+                    "online_quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
