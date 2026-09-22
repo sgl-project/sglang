@@ -429,9 +429,6 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BV, num_warps = _select_recurrent_launch_config(N, H, HV, K, V, is_kda)
-    if q.device.type == "xpu":
-        # XPU caps BV at 16 to reduce register pressure.
-        BV = min(BV, 16)
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
