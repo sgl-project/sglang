@@ -343,8 +343,8 @@ class HiCacheController:
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
-        self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.transfer_layer_id_max = self.mem_pool_device.layer_num
+        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -601,6 +601,7 @@ class HiCacheController:
                     "nixl",
                     "simm",
                     "mori",
+                    "tensorcast",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -790,6 +791,15 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
+    def has_inflight_device_transfers(self) -> bool:
+        """Whether queued or unacknowledged L2 transfers still use device rows."""
+        return bool(
+            self.write_queue
+            or self.load_queue
+            or self.ack_write_queue
+            or self.ack_load_queue
+        )
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -961,7 +971,7 @@ class HiCacheController:
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
-            layer_num=self.layer_num,
+            transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
         self.ack_load_queue.append(
