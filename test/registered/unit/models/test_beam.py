@@ -242,6 +242,8 @@ class TestBeamConfig(CustomTestCase):
             )
 
     def test_unsupported_rope_and_single_token_window_fail_early(self):
+        with self.assertRaisesRegex(ValueError, "per-layer-type"):
+            BeamConfig(rope_parameters={"rope_type": "default", "rope_theta": 500000.0})
         with self.assertRaisesRegex(ValueError, "only default RoPE"):
             BeamConfig(
                 rope_parameters={

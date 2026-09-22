@@ -23,6 +23,8 @@ _DEFAULT_ROPE_THETA = 10000.0
 def _normalize_rope_parameters(raw: Optional[dict]) -> dict:
     """Return the per-layer-type RoPE dict: default RoPE on sliding layers, NoPE on full."""
     raw = raw or {}
+    if raw.keys() - {"sliding_attention", "full_attention"}:
+        raise ValueError("rope_parameters must use per-layer-type keys")
     if raw.get("full_attention") is not None:
         raise ValueError("full_attention must run without rotary embeddings")
     sliding = raw.get("sliding_attention") or {}
