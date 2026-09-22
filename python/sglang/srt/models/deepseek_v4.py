@@ -4584,6 +4584,11 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4622,10 +4627,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             if (
                 get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
                     "V4.1 vision supports TP/EP/DP and prefill CP without PP; "

@@ -207,7 +207,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
 
     def test_interleave_capacity_is_independent_of_request_boundaries(self):
         init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
-        inputs = PrefillCPBCGInput(torch.empty(0), torch.empty(0), {16: 4, 32: 8})
+        inputs = PrefillCPBCGInput(
+            torch.empty(0), torch.empty(0), bucket_local_tokens={16: 4, 32: 8}
+        )
         with patch(
             "sglang.srt.layers.cp.bcg.get_cp_padding_align_size", return_value=4
         ):
@@ -243,6 +245,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             seq_lens_cpu=[length + 20 for length in lengths],
             global_num_tokens_cpu=None,
             attn_cp_metadata=None,
+            num_token_non_padded=None,
         )
 
     def test_repeated_padded_replay_preserves_addresses_and_global_order(self):
@@ -252,7 +255,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
             inputs = [
                 PrefillCPBCGInput(
-                    torch.zeros(bucket, 1), torch.zeros(bucket, dtype=torch.int64)
+                    torch.zeros(bucket, 1),
+                    torch.zeros(bucket, dtype=torch.int64),
+                    input_ids=torch.zeros(bucket, dtype=torch.int64),
                 )
                 for _ in range(cp_size)
             ]
@@ -291,7 +296,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         batch.input_embeds[: len(local_ids), 0], local_ids
                     )
                     torch.testing.assert_close(
-                        batch.positions[: len(local_ids)],
+                        batch._cp_positions[: len(local_ids)],
                         global_positions[:n][rank::cp_size],
                     )
                     self.assertEqual(
@@ -301,15 +306,20 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         0,
                     )
                     self.assertEqual(
-                        torch.count_nonzero(batch.positions[len(local_ids) :]).item(), 0
+                        torch.count_nonzero(
+                            batch._cp_positions[len(local_ids) :]
+                        ).item(),
+                        0,
                     )
                     self.assertEqual(
                         batch.input_embeds.data_ptr(),
                         inputs[rank].input_embeds.data_ptr(),
                     )
                     self.assertEqual(
-                        batch.positions.data_ptr(), inputs[rank].positions.data_ptr()
+                        batch._cp_positions.data_ptr(),
+                        inputs[rank].positions.data_ptr(),
                     )
+                    torch.testing.assert_close(batch.positions, global_positions)
                     self.assertIs(batch.out_cache_loc, cache_loc)
                     self.assertEqual(batch.out_cache_loc.shape[0], bucket)
                     self.assertEqual(batch.attn_cp_metadata.total_seq_lens, bucket)
