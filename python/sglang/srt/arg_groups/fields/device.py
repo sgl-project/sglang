@@ -17,7 +17,7 @@ from typing import (
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import A
+from sglang.srt.arg_groups.arg_utils import A, Derived
 
 
 class Device(msgspec.Struct):
@@ -40,6 +40,17 @@ class Device(msgspec.Struct):
         int,
         "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
     ] = 1
+    gpu_id = Derived(
+        doc=(
+            "Which device this process runs on. Nobody types it and nothing "
+            "computes it from the configuration: the parent decides -- "
+            "reindexing narrows the visible devices before the spawn, and Ray "
+            "allocates from its own pool -- so the entry states it in the "
+            "bundle it hands `publish`. `None` is an answer rather than an "
+            "absence: most roles run on no device at all."
+        ),
+        default=None,
+    )
     random_seed: A[Optional[int], "The random seed."] = None
     mlx_enable_sampling: A[
         bool,
