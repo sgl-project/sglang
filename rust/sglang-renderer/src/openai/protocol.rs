@@ -39,9 +39,6 @@ fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), Stri
     ))
 }
 
-/// SGLang-owned sampling fields that extend the OpenAI chat and completion
-/// request schemas. Keeping these outside Dynamo's DTO prevents dependency
-/// omissions from silently changing SGLang request behavior.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub(crate) struct SamplingParamsOverrides {
     #[serde(default)]
