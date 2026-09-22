@@ -16,8 +16,11 @@
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
+//! - [`bootstrap`] — peer-snapshot wire format, so a booting replica can
+//!   prewarm its tree from a warm sibling instead of routing cache-blind.
 
 pub mod block_size_oracle;
+pub mod bootstrap;
 pub mod discovery;
 pub mod hash;
 pub mod index;
