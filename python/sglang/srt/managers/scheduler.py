@@ -3968,8 +3968,6 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if draft_cohort is not None and not draft_cohort.admit(req.draft_adapter):
-                # Do not skip the first foreign adapter: drain the active cohort
-                # so a stream of same-adapter arrivals cannot starve it.
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue

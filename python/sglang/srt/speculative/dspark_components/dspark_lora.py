@@ -1,10 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only PEFT LoRA merge for dense DSpark draft checkpoints.
-
-This is deliberately separate from the target's LoRAManager: adapter IDs and
-per-request target routing never enter this loader. Merging before TP sharding
-also covers the draft's direct weight accesses and fused context-KV projection.
-"""
 
 from __future__ import annotations
 
@@ -44,7 +38,6 @@ def validate_dspark_lora_args(*, algorithm: str | None, draft_load_format: str) 
 
 
 def _canonical_module(name: str) -> str:
-    # PEFT adds base_model.model.; the underlying HF model may also use model.
     return name.removeprefix("base_model.model.").removeprefix("model.")
 
 
@@ -58,8 +51,6 @@ def _validate_config(config: Mapping) -> tuple[int, float]:
             "DSpark draft LoRA does not support initialization methods that "
             "may require a transformed base checkpoint."
         )
-    # These change merge semantics or introduce extra trainable parameters.
-    # Reject explicitly instead of silently treating their tensors as plain LoRA.
     for option in (
         "fan_in_fan_out",
         "use_dora",
@@ -119,7 +110,6 @@ def _read_adapter(adapter_path: str) -> tuple[dict, dict[str, torch.Tensor]]:
     if not isinstance(config, dict):
         raise ValueError("adapter_config.json must contain an object.")
     _validate_config(config)
-    # No pickle fallback or network resolution: use an explicit local artifact.
     return config, load_file(str(path / "adapter_model.safetensors"), device="cpu")
 
 
@@ -129,12 +119,6 @@ def merge_dspark_lora_weights(
     *,
     model_parameter_names: Iterable[str],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Merge W + (alpha/r) B@A without mutating any checkpoint tensor.
-
-    Consume the iterator completely before loading model parameters. This
-    ensures every adapter pair matched exactly one unsharded checkpoint weight.
-    Packed/quantized input and unknown adapter tensors fail closed.
-    """
     config, adapter = _read_adapter(adapter_path)
     rank, scaling = _validate_config(config)
     model_parameters = {_canonical_module(name) for name in model_parameter_names}
@@ -200,8 +184,6 @@ def merge_dspark_lora_weights(
             )
         if weight.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
             raise ValueError(f"Quantized draft weight is unsupported: {name}")
-        # The checkpoint may already be on the loading device. FP32 accumulation
-        # avoids performing a low-rank update in BF16 before the final cast.
         merged = weight.float() + scaling * (
             b.to(device=weight.device, dtype=torch.float32)
             @ a.to(device=weight.device, dtype=torch.float32)
@@ -219,14 +201,6 @@ def merge_dspark_lora_weights(
 
 
 class DSparkDraftAdapterBank:
-    """Immutable merged variants for TP=1, eager, homogeneous draft batches.
-
-    This deliberately trades GPU memory for reuse of the model's existing
-    linear and fused KV kernels. Only modified packed weights are duplicated;
-    shared embeddings, LM head, norms, and untouched draft parameters are not.
-    No request-time disk IO, additive merge/unmerge drift, or target mutation.
-    """
-
     @torch.no_grad()
     def __init__(self, model, adapter_paths: Mapping[str, str]):
         self.model = model
@@ -236,8 +210,6 @@ class DSparkDraftAdapterBank:
         self.active = None
         self.switch_count = 0
 
-        # Present the same logical unsharded weights accepted by the startup
-        # merger. TP=1 is enforced before loading; no shard offsets are guessed.
         logical = {}
         destinations = {}
         for name, param in parameters.items():
@@ -266,8 +238,6 @@ class DSparkDraftAdapterBank:
                 logical[name] = param.detach()
                 destinations[name] = (name, slice(None))
 
-        # Build all variants without modifying the live model. A bad adapter
-        # aborts startup before any request can observe partial weights.
         for adapter, path in adapter_paths.items():
             replacement = {}
             for key, merged in merge_dspark_lora_weights(
@@ -297,19 +267,13 @@ class DSparkDraftAdapterBank:
             raise ValueError(f"Unknown draft adapter: {name!r}")
         if name == self.active:
             return False
-        # Non-overlap execution is required, but kernels may still be queued.
-        # Drain all device streams before replacing weights or cached KV views.
         device = next(iter(self.parameters.values())).device
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         variant = self.variants.get(name, {})
         for key, param in self.parameters.items():
             param.copy_(variant.get(key, self.base[key]))
-        # The fused writer stacks weights: clearing just its pointers is not
-        # enough. Discard the entire bundle so it is rebuilt for this adapter.
         self.model._fused_kv_write_cache = None
-        # FP16 / unsupported fused-write layouts use a second stacked-weight
-        # cache. False means "rebuild"; None means "do not use this fast path".
         self.model._stacked_ctx_kv_cache = False
         if device.type == "cuda":
             torch.cuda.synchronize(device)

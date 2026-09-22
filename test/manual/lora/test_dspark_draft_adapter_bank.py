@@ -1,5 +1,3 @@
-"""CPU numerical tests for draft-only materialized adapter switching."""
-
 import ast
 import importlib.util
 import types
@@ -165,8 +163,6 @@ class TestDraftAdapterBank(unittest.TestCase):
         self.assertIs(model.lm_head, target.lm_head)
 
     def test_stacked_context_kv_projection_rebuilds_after_adapter_switch(self):
-        # Execute the real fallback cache builder. FP16 always misses the BF16
-        # fused writer, so this path is part of the supported dense draft mode.
         path = SOURCE.parents[2] / "models/dspark.py"
         tree = ast.parse(path.read_text())
         mixin = next(

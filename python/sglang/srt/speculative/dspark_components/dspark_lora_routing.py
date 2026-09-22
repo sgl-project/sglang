@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only contracts for immutable, per-request DSpark draft adapters."""
 
 from __future__ import annotations
 
@@ -78,8 +77,6 @@ def validate_draft_adapter_server_config(cfg):
             )
     if not cfg.device.startswith("cuda"):
         raise ValueError("Per-request draft adapters currently require CUDA.")
-    # The graph resolution hook has already run. Inspect resolved backends,
-    # not legacy booleans, so explicit JSON graph settings cannot bypass this.
     for phase in (cfg.cuda_graph_config.prefill, cfg.cuda_graph_config.decode):
         if phase.backend != "disabled":
             raise ValueError(
@@ -105,7 +102,6 @@ def normalize_draft_adapter(value, *, batch_size, parallel_samples, single):
     if value is None or (single and parallel_samples == 1):
         return value
     values = value if isinstance(value, list) else [value] * batch_size
-    # Matches GenerateReqInput._expand_inputs: repeat the entire input batch.
     return values * parallel_samples
 
 
@@ -115,8 +111,6 @@ def validate_draft_adapter_request(request, registry):
     for name in names:
         if name is not None and name not in registry:
             raise ValueError(f"Unknown draft_adapter {name!r}; use a configured name.")
-    # Session-held KV may outlive a cohort. Reject for the whole bank deployment,
-    # including base-draft requests, until adapter affinity is stored in sessions.
     if registry:
         params = request.sampling_params
         params = params if isinstance(params, list) else [params or {}]
@@ -139,13 +133,6 @@ def homogeneous_draft_adapter(names):
 
 
 class DraftAdapterCohort:
-    """FCFS admission gate. Stop scanning at the first foreign adapter.
-
-    Existing requests (including chunked prefills) keep their draft until they
-    finish or retract. A retracted request receives a full prefill because radix
-    caching is disabled. Keeping Req.draft_adapter immutable preserves affinity.
-    """
-
     def __init__(self, active_names):
         self.selected = bool(active_names)
         self.name = homogeneous_draft_adapter(active_names) if active_names else None

@@ -571,11 +571,6 @@ class DSparkDraftMixin:
                 merge_dspark_lora_weights,
             )
 
-            # Merge the unsharded checkpoint before DFlash packs Q/K/V and
-            # gate/up projections and dispatches TP-aware weight loaders.
-            # Materialize first so missing/invalid adapter weights fail before
-            # any model parameters are loaded. Shared target modules have not
-            # been attached yet and are never valid adapter targets.
             weights = list(
                 merge_dspark_lora_weights(
                     weights,
@@ -630,7 +625,6 @@ class DSparkDraftMixin:
                 parse_draft_adapters,
             )
 
-            # Allocate variants during weight loading, before KV pool profiling.
             self.draft_adapter_bank = DSparkDraftAdapterBank(
                 self, parse_draft_adapters(self._dspark_lora_paths)
             )

@@ -1,10 +1,3 @@
-"""CPU contracts and real request normalization, without CUDA-serving imports.
-
-GenerateReqInput is loaded from its source AST because its module imports the
-CUDA scheduler. The class/method bodies are unchanged; this is not a substitute
-for the HTTP/IPC integration test on a GPU server.
-"""
-
 import ast
 import asyncio
 import dataclasses
@@ -221,19 +214,15 @@ class TestDraftAdapterRouting(unittest.TestCase):
         self.assertEqual(
             cohorts, [["rust", "rust"], ["python"], ["rust"], [None], ["python"]]
         )
-        # Active Rust cannot admit new Rust arrivals past an older Python job.
         gate = routing.DraftAdapterCohort(["rust", "rust"])
         self.assertFalse(gate.admit("python"))
 
     def test_chunk_filter_retraction_and_base_are_not_wildcards(self):
         gate = routing.DraftAdapterCohort([None])
         self.assertFalse(gate.admit("rust"))
-        gate = routing.DraftAdapterCohort(
-            ["rust"]
-        )  # remaining chunk or filtered survivor
+        gate = routing.DraftAdapterCohort(["rust"])
         self.assertTrue(gate.admit("rust"))
         self.assertFalse(gate.admit(None))
-        # Retracted Rust is selected again after the intervening Python cohort drains.
         gate = routing.DraftAdapterCohort([])
         self.assertTrue(gate.admit("rust"))
         with self.assertRaises(ValueError):

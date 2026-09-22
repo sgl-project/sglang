@@ -47,9 +47,6 @@ def _unsupported_derived_weight_cache_error(
         get_context().is_config_namespace_published("spec")
         and get_spec().speculative_dspark_lora_paths is not None
     ):
-        # Check the deployment config, not just the model object: disk/IPC
-        # updates visit the target before the draft. Reject before either is
-        # changed, since the worker retains the startup bank and its base copies.
         return (
             "Online weight updates are not supported with per-request DSpark "
             "draft adapters. Restart the server to rebuild the adapter bank "

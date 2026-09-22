@@ -1,8 +1,3 @@
-"""CPU-only loader tests; no SGLang server/GPU dependencies are imported.
-
-Run: python -m unittest discover -s test/manual/lora -p test_dspark_static_draft_lora.py -v
-"""
-
 import importlib.util
 import json
 import tempfile
@@ -116,8 +111,6 @@ class TestStaticDraftLoRA(unittest.TestCase):
                     self.tensors.update(self.pair(name))
                     weights.append((name + ".weight", self.weight + index))
                 merged = self.merge(weights, [f"layers.0.{packed}.weight"])
-                # Each column-parallel projection is sharded independently,
-                # then concatenated locally by the existing SGLang loader.
                 for rank in [0, 1]:
                     actual = torch.cat([w.chunk(2, dim=0)[rank] for _, w in merged])
                     expected = torch.cat(

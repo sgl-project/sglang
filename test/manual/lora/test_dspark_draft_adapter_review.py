@@ -1,5 +1,3 @@
-"""Regression tests from the independent review of the draft adapter patch."""
-
 import ast
 import importlib.util
 import sys
@@ -68,8 +66,6 @@ class TestDraftAdapterReviewRegressions(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("dspark_field_order_review", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        # collect_input_fields appends fields omitted from this compatibility
-        # table. Inserting either here moves every later existing argument.
         for name in ("speculative_dspark_lora_path", "speculative_dspark_lora_paths"):
             self.assertNotIn(name, module.POSITIONAL_FIELD_ORDER)
         index = module.POSITIONAL_FIELD_ORDER.index("uno_lora_path")
@@ -88,8 +84,6 @@ class TestDraftAdapterReviewRegressions(unittest.TestCase):
         functions = load_weight_updater_functions(
             NS(speculative_dspark_lora_paths='{"rust":"/a"}')
         )
-        # The guard must apply even when the first runner being updated is the
-        # target, which does not own a draft_adapter_bank attribute.
         hpc = types.ModuleType(HPC_MODULE)
         hpc.hpc_bf16xfp32_gemm_enabled = lambda: False
         worker = NS(

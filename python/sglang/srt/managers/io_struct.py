@@ -266,8 +266,6 @@ class GenerateReqInput:
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
 
-    # Name in the immutable DSpark draft adapter registry; None uses base draft.
-    # This namespace is independent of target lora_path/lora_id.
     draft_adapter: Optional[Union[List[Optional[str]], str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
@@ -412,7 +410,6 @@ class GenerateReqInput:
             normalize_draft_adapter,
         )
 
-        # Validate against the original input count, before n-way expansion.
         original_single = self.is_single
         self._handle_parallel_sampling()
         self.draft_adapter = normalize_draft_adapter(

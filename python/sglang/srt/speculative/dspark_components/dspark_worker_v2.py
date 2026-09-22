@@ -555,8 +555,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 homogeneous_draft_adapter,
             )
 
-            # Before target prefill as well as drafting: the target's hidden
-            # projection callback uses the currently selected draft fc weight.
             adapter = homogeneous_draft_adapter(
                 [req.draft_adapter for req in batch.reqs]
             )
