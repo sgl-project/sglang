@@ -171,10 +171,6 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestIdeogramCheckpointLayout(unittest.TestCase):
     def test_layout_selected_before_construction(self):
         import tempfile
@@ -308,3 +304,7 @@ class TestIdeogramCheckpointLayout(unittest.TestCase):
                             model.input_proj.weight.dtype == torch.float8_e4m3fn,
                             layout == "fp8",
                         )
+
+
+if __name__ == "__main__":
+    unittest.main()
