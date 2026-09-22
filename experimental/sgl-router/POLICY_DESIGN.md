@@ -7,8 +7,9 @@ listed at the end.
 
 ## Principles
 
-1. **Order compatible buckets by token length first.** `BucketResolver` returns
-   all matching buckets, smallest capacity first, without inspecting workers or policies.
+1. **Filter buckets by token length, then order preferences.** `BucketResolver`
+   returns all compatible buckets, applying optional SLO preferences before
+   capacity/rank/ID ordering, without inspecting workers or policies.
 2. **The bucket owns plain versus PD engine selection.** `Bucket::pick_engines`
    calls its one plain group or both prefill and decode groups, returning a
    complete selection. Both PD engines come from that same bucket.
@@ -79,7 +80,7 @@ tier executor, or separate selection framework is required.
 
 ## 2. Responsibilities and request flow
 
-`BucketResolver::resolve(input_tokens, expected_peak_tokens)` returns an ordered
+`BucketResolver::resolve(input_tokens, expected_peak_tokens, ttft_ms, tokens_per_second)` returns an ordered
 list of compatible bucket references (possibly empty), or an invalid-signal error.
 It does not receive a stage or a load view, resolve live engines, or invoke policies.
 The handler iterates this list until a bucket supplies the complete engine selection.
@@ -153,9 +154,10 @@ the existing body-size estimate when tokenization is unavailable.
 2. Keep buckets whose inclusive input-token range contains the input length.
 3. Check the bucket context capacity against input plus requested output when
    known, or against input length when the output budget is unknown.
-4. Sort by ascending input capacity (the lesser of the input upper bound and
-   context capacity). Unbounded capacities sort last. Break ties by ascending
-   bucket rank, then ID, and return the entire ordered list.
+4. Apply enabled SLO preferences to complete buckets. Count unmet preferences
+   equally, then sort by ascending input capacity (the lesser of the input upper
+   bound and context capacity), rank, and ID. Unbounded capacities sort last.
+   Return the entire ordered list, retaining nonpreferred buckets for fallback.
 5. The handler calls each bucket's `pick_engines` until one supplies its complete
    selection. A failed PD attempt never contributes an engine to a later pair.
 
@@ -172,7 +174,29 @@ bucket, both groups share this one request-length decision. Policy fallback on
 a cache/affinity miss stays within that group's candidates. There is no second
 pass with relaxed admission and no post-policy substitution.
 
-SLO ordering, global session modes, and sticky policies are follow-ups. Their
+### Optional SLO ordering
+
+`Bucket` has optional `ttft_ms` and `tokens_per_second` estimates. The resolver
+has independent `ttft_slo` and `tps_slo` preferences: `Disabled` (default),
+`SloFirst` (matching first), and `BestEffort` (nonmatching first). The handler
+parses `x-sgl-ttft-slo-ms` and `x-sgl-tps-slo` only when their preference is enabled;
+invalid enabled headers return 400 before dispatch. Disabled headers are ignored.
+SLO targets belong to bucket resolution, not the engine policy's `PickRequest`.
+
+Absent targets are neutral. A bucket matches TTFT when its positive estimate is
+at most the target, and throughput when its finite positive estimate is at least
+the target. Missing or invalid estimates do not match a supplied target. Enabled
+TTFT targets must be positive; throughput targets must be finite and positive.
+
+Each unmet preference adds one ordering penalty. With both preferences set to
+`SloFirst`, a bucket matching both comes before one matching either, followed by
+buckets matching neither. Capacity/rank/ID breaks ties within these tiers. The
+same logic applies to plain and PD buckets, and a PD bucket always supplies both
+engines. TTFT and throughput preferences never independently resolve P/D groups.
+Length constraints are applied first and admission rejection still advances to
+the next complete bucket, including a bucket outside the preferred SLO tier.
+
+Global session modes and sticky policies are follow-ups. Their
 integration must preserve bucket-first selection and the same-bucket PD rule.
 Cross-bucket affinity probing is not part of this interface. Session/routing
 keys still pass through `PickRequest` for policies operating inside the selected
@@ -490,8 +514,8 @@ do not accept and ignore them.
 - Keep `load_based` as the CLI name for `LeastLoadPolicy`.
 - Preserve explicit engine membership and context constraints. Bucket-level
   ranges and ordering replace independent per-stage selection.
-  Restore existing SLO behavior in the separate SLO PR before serving switchover;
-  legacy routing continues to support SLOs during this skeleton-only phase.
+  SLO preferences order whole buckets; deployment configuration remains explicit
+  until the production configuration factory and serving switchover are ready.
 - Preserve cache-provider selection, endpoint validation, query timeout and
   concurrency limits, and unavailable-backend fallback.
 - Preserve cache thresholds and tuning: the 1,024-token default minimum hit,
@@ -558,7 +582,8 @@ This PR adds the side-by-side interfaces in `src/buckets_reorg.rs` and
 
 Implemented here:
 
-- `BucketResolver::resolve` returns all length-compatible buckets in capacity/rank/ID order.
+- `BucketResolver::resolve` returns all length-compatible buckets in optional
+  SLO-preference tiers, with capacity/rank/ID order within each tier.
 - `Bucket::pick_engines` owns plain/PD orchestration and stage-specific policy
   requests; `BucketRequest` carries prepared facts and `BucketPick` retains picks.
 - `Bucket` owns input limits, context capacity, rank, and plain-or-PD groups.
@@ -576,6 +601,8 @@ Implemented here:
   dispatches only after one complete selection. Exhaustion retains admission reasons.
 - `AppContext::chat_routing` configures legacy versus reorg routing on the same
   endpoint and carries the reorg model-resolver map.
+- Optional bucket TTFT/throughput estimates and preferences, with enabled-header
+  parsing and whole-bucket fallback in the shared chat route.
 - `CacheAwarePolicy` reads local radix-tree or remote indexer prefixes, intersects
   exact worker URLs with the current group, applies hit thresholds and candidate
   bounds, and preserves the soft queue gate, saturation pin and pressure guard.
@@ -594,13 +621,11 @@ Implemented here:
   The caller owns expiry and sweeper lifecycle. A binding may remain after a
   later PD group fails, because it records placement rather than dispatch.
 
-Follow-up work includes bucket SLO ordering, remaining selection policies,
-and production configuration.
+Follow-up work includes remaining selection policies and production configuration.
 
 Not yet implemented in the reorg path:
 
 - Other concrete selection policies.
-- SLO estimates, targets, and bucket preference ordering.
 - CLI/configuration parsing, validation, and model-specific construction.
   The YAML above is illustrative; reorg resolvers are installed in code.
 - Global session modes and sticky routing-key affinity.
