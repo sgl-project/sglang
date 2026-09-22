@@ -1,0 +1,92 @@
+---
+title: LongCat-Image
+metatags:
+    description: "Deploy LongCat-Image with SGLang Diffusion and its native in-process Qwen2.5-VL prompt rewriter."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "prompt rewriting", "Qwen2.5-VL"]} />
+
+## 1. Model Introduction
+
+[LongCat-Image](https://huggingface.co/meituan-longcat/LongCat-Image) is a
+text-to-image model from Meituan. SGLang runs its Qwen2.5-VL prompt rewriter
+in process with the native SGLang runtime before text encoding and denoising.
+
+The native pipeline keeps prompt rewriting and diffusion behind one OpenAI-compatible
+image endpoint. Rewriting is enabled by default for stronger prompt expansion, but
+each request can disable it when lower latency matters more than the rewritten prompt.
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+pip install -e "python[diffusion]"
+```
+
+For other installation options, see the
+[SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Serve the model
+
+```bash Command
+sglang serve \
+  --model-path meituan-longcat/LongCat-Image \
+  --performance-mode auto \
+  --port 30010
+```
+
+Prompt rewriting is enabled by default for LongCat-Image. It adds an
+autoregressive Qwen2.5-VL pass before diffusion; set
+`enable_prompt_rewrite=false` on a request when lower latency is more important
+than rewritten prompt quality.
+
+## 4. Generate an image
+
+```python Python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30010/v1")
+
+response = client.images.generate(
+    model="meituan-longcat/LongCat-Image",
+    prompt="A quiet bookshop on a rainy evening, warm light in the windows",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("longcat_image.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+To skip prompt rewriting with the OpenAI client, pass the model-specific request
+field through `extra_body`:
+
+```python Python
+response = client.images.generate(
+    model="meituan-longcat/LongCat-Image",
+    prompt="A quiet bookshop on a rainy evening",
+    extra_body={"enable_prompt_rewrite": False},
+)
+```
+
+## 5. Memory placement
+
+Use the unified component-residency selector when the complete pipeline does
+not fit on the accelerator. For example, keep the repeatedly used DiT resident
+while moving auxiliary components to CPU between stages:
+
+```bash Command
+sglang serve \
+  --model-path meituan-longcat/LongCat-Image \
+  --component-residency dit=resident text_encoder=component-offload vae=component-offload \
+  --pin-cpu-memory \
+  --port 30010
+```
+
+See [Component Residency](/docs/sglang-diffusion/api/cli#component-residency)
+for mode semantics and compatibility with the existing CPU-offload flags.

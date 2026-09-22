@@ -7,6 +7,11 @@ from contextlib import nullcontext
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+try:
+    from torch.nn.attention.varlen import varlen_attn as torch_varlen_attn
+except ImportError:
+    torch_varlen_attn = None
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -24,9 +29,10 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
+_MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
 
 class SDPABackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -47,7 +53,6 @@ class SDPABackend(AttentionBackend):
 
 
 class SDPAImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -65,7 +70,7 @@ class SDPAImpl(AttentionImpl):
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
-            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
         return nullcontext()
 
     def forward(
@@ -79,10 +84,24 @@ class SDPAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        attn_mask = None
+        is_causal = self.causal
+        if self.causal and query.shape[-2] != key.shape[-2]:
+            is_causal = False
+            if query.shape[-2] > 1:
+                query_length = query.shape[-2]
+                key_length = key.shape[-2]
+                attn_mask = torch.ones(
+                    query_length,
+                    key_length,
+                    dtype=torch.bool,
+                    device=query.device,
+                ).tril(diagonal=key_length - query_length)
+
         attn_kwargs = {
-            "attn_mask": None,
+            "attn_mask": attn_mask,
             "dropout_p": self.dropout,
-            "is_causal": self.causal,
+            "is_causal": is_causal,
             "scale": self.softmax_scale,
         }
         if query.shape[1] != key.shape[1]:
@@ -104,7 +123,46 @@ class SDPAImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del max_seqlen
+        if (
+            type(self) is SDPAImpl
+            and torch_varlen_attn is not None
+            and not torch.compiler.is_compiling()
+            and not torch.is_grad_enabled()
+            and query.is_cuda
+            and torch.version.hip is None
+            and query.ndim == 3
+            and query.shape == key.shape == value.shape
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and query.dtype == key.dtype == value.dtype
+            and query.device == key.device == value.device == cu_seqlens.device
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and query.numel() > 0
+            and query.shape[-1] <= 256
+            and query.shape[-1] % 8 == 0
+            and cu_seqlens.dtype == torch.int32
+            and cu_seqlens.ndim == 1
+            and cu_seqlens.is_contiguous()
+            and cu_seqlens.numel() > 2
+            and max_seqlen > 0
+            and self.dropout == 0.0
+            and not self.allow_cudnn_sdp
+            and torch.backends.cuda.flash_sdp_enabled()
+            and not torch.backends.cuda.cudnn_sdp_enabled()
+            and torch.cuda.get_device_capability(query.device)[0] == 9
+        ):
+            # Keep the existing Flash SDPA arithmetic while consuming all
+            # packed windows in one call, including ragged and empty windows.
+            return torch_varlen_attn(
+                query,
+                key,
+                value,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                scale=self.softmax_scale,
+                window_size=(-1, 0) if self.causal else (-1, -1),
+            )
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
@@ -114,13 +172,31 @@ class SDPAImpl(AttentionImpl):
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
                 continue
-            segment = self.forward(
-                query[start:stop].unsqueeze(0),
-                key[start:stop].unsqueeze(0),
-                value[start:stop].unsqueeze(0),
-                None,
-            )
-            output[start:stop].copy_(segment[0])
+            if query.device.type != "mps":
+                segment = self.forward(
+                    query[start:stop].unsqueeze(0),
+                    key[start:stop].unsqueeze(0),
+                    value[start:stop].unsqueeze(0),
+                    None,
+                )
+                output[start:stop].copy_(segment[0])
+                continue
+
+            # mps SDPA materializes a quadratic temporary for a varlen segment
+            # chunking query rows keeps every row's complete K/V context intact
+            keys = key[start:stop].unsqueeze(0)
+            values = value[start:stop].unsqueeze(0)
+            for query_start in range(start, stop, _MPS_VARLEN_QUERY_CHUNK_SIZE):
+                query_stop = min(query_start + _MPS_VARLEN_QUERY_CHUNK_SIZE, stop)
+                segment = self.forward(
+                    query[query_start:query_stop].unsqueeze(0),
+                    keys,
+                    values,
+                    None,
+                )
+                output[query_start:query_stop].copy_(segment[0])
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
         return output
 
 
@@ -234,7 +310,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
                 # cuDNN raises "No available kernel" for some shapes; pin the
                 # FA fail-safe path for this layer and keep going.
                 logger.warning(
-                    "cuDNN SDPA failed (%s); falling back to FlashAttention " "for %s.",
+                    "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
                     e,
                     type(self).__name__,
                 )

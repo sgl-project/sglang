@@ -396,15 +396,26 @@ class ControlStateQueue:
         self._current_item = default_item
         self._current_seq_id: int | None = None
         self._latest_sampled_seq_id: int | None = None
+        # A queue that never received a transition has no state to hold, so
+        # sampling reports None and the caller omits the control entirely;
+        # after the first transition the level stays held, default included.
+        self._received_any = False
 
     def clear(self) -> None:
         self._pending.clear()
         self._current_item = self.default_item
         self._current_seq_id = None
         self._latest_sampled_seq_id = None
+        self._received_any = False
 
     def push(self, transition: ControlStateTransition) -> None:
         self._pending.append(transition)
+        self._received_any = True
+
+    def mark_received(self) -> None:
+        """Arm the hold without a transition: a replacing script is itself a
+        signal, so a drained script keeps sampling its end state as held."""
+        self._received_any = True
 
     def push_many(self, transitions: Sequence[ControlStateTransition]) -> None:
         for transition in transitions:
@@ -416,6 +427,8 @@ class ControlStateQueue:
 
         transitions = self._drain_pending()
         if not transitions:
+            if not self._received_any:
+                return None
             self._latest_sampled_seq_id = self._current_seq_id
             return [self._copy_item(self._current_item) for _ in range(chunk_size)]
 

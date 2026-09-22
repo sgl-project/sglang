@@ -6,7 +6,7 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 try:
     if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":

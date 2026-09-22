@@ -228,7 +228,7 @@ class HiCacheHF3FS(HiCacheStorage):
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
             f"file_path={self.file_path}, "
-            f"file_size={self.file_size / (2 ** 30):.2f} GB, "
+            f"file_size={self.file_size / (2**30):.2f} GB, "
             f"num_pages={self.num_pages}, "
             f"is_mla_model={self.is_mla_model}"
         )

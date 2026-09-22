@@ -9,49 +9,6 @@ def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
-def _dequantize_k_cache_ref(
-    quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
-    dv: int = 512,
-    tile_size: int = 128,
-    d: int = 576,
-) -> torch.Tensor:
-    """
-    De-quantize the k-cache
-    """
-    assert dv % tile_size == 0
-    original_ndim = quant_k_cache.ndim
-    if original_ndim == 3:
-        # set block_size = 1
-        quant_k_cache = quant_k_cache.unsqueeze(1)
-    num_tiles = dv // tile_size
-    num_blocks, block_size, h_k, _ = quant_k_cache.shape
-    assert h_k == 1
-    result = torch.empty(
-        (num_blocks, block_size, d), dtype=torch.bfloat16, device=quant_k_cache.device
-    )
-
-    quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
-
-    input_nope = quant_k_cache[..., :dv]
-    input_scale = quant_k_cache[..., dv : dv + num_tiles * 4].view(torch.float32)
-    input_rope = quant_k_cache[..., dv + num_tiles * 4 :].view(torch.bfloat16)
-    result[..., dv:] = input_rope
-
-    for tile_idx in range(0, num_tiles):
-        cur_nope = input_nope[
-            ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
-        ].to(torch.float32)
-        cur_scales = input_scale[..., tile_idx].unsqueeze(-1)
-        result[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
-            cur_nope * cur_scales
-        )
-
-    if original_ndim == 3:
-        return result.view(num_blocks, 1, -1)
-    else:
-        return result.view(num_blocks, block_size, 1, -1)
-
-
 def _dequantize_k_cache_fast_wrapped(
     quant_k_cache: torch.Tensor,
     dv: int = 512,
@@ -134,7 +91,7 @@ def _dequantize_k_cache_fast_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
@@ -181,9 +138,9 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert (
-        dim_quant == 656
-    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant == 656, (
+        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    )
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
@@ -249,8 +206,8 @@ def _dequantize_k_cache_paged_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    token_id = tl.program_id(0).to(tl.int64)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
