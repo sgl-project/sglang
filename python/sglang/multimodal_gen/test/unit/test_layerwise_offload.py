@@ -1381,6 +1381,60 @@ def test_disable_offload_short_circuits_residency_release(monkeypatch):
         assert tuple(param.shape) != (1,), name
 
 
+def test_finish_use_drops_residents_unless_the_use_says_otherwise(monkeypatch):
+    """`retain_resident_layers` defaults off, so finish_use behaves as before.
+
+    Every existing pipeline builds its uses without the flag, so this is the
+    path they all take and it must keep releasing the resident set.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(stage_name="test", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is False for keep in released)
+    assert parked == [True]
+
+
+def test_finish_use_keeps_residents_when_the_use_declares_it(monkeypatch):
+    """The declaration reaches the manager, and parking is skipped with it.
+
+    Parking pushes the component's non-layer weights to host; doing that right
+    after deciding the room is available would undo the transfer being kept.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(
+            stage_name="test",
+            component_name="transformer",
+            retain_resident_layers=True,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is True for keep in released)
+    assert parked == []
+
+
 def test_enable_offload_rearms_after_disable(monkeypatch):
     model = _configure_mixin_model(monkeypatch)
     # blocks[2] holds a placeholder right after configure; the real values are
