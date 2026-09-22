@@ -14,6 +14,11 @@ _DEEPEP_V2_MODELS: dict[str, bool] = {
     "DeepseekV3ForCausalLM": False,
     "DeepseekV4ForCausalLM": False,
     "Qwen3MoeForCausalLM": False,
+    # Qwen4-Exp (Qwen3.8-Flash-Next) hand-rolls its MoE-region comms and its
+    # post-expert step is the hyper-connection combine only, so DeepEP v2's
+    # folded reduction is not duplicated. Validated on block-scaled FP8, which
+    # does not take the MXFP8 path -> no FP32 SiLU intermediates requested.
+    "Qwen4ExpForConditionalGeneration": False,
 }
 
 
