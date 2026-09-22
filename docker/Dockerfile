@@ -287,7 +287,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
-        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
+        && cp -r /opt/sglang/lib/python3.12/site-packages/flashinfer_jit_cache*.dist-info /flashinfer_jit_output/ ; \
     fi
 
 ########################################################

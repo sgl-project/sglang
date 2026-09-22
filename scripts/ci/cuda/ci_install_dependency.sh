@@ -424,9 +424,9 @@ uninstall_stale_flashinfer() {
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
     FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
-    FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
-    FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
+    FLASHINFER_CUBIN_INSTALLED=$(python3 -m pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    FLASHINFER_JIT_INSTALLED=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+    FLASHINFER_JIT_CU_VERSION=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
 
     UNINSTALL_CUBIN=true
     UNINSTALL_JIT_CACHE=true
@@ -439,8 +439,13 @@ uninstall_stale_flashinfer() {
     fi
 
     if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
-        UNINSTALL_JIT_CACHE=false
+        # Since 0.7.0 that version is the shim's; it does not imply a provider.
+        if bash "${SCRIPT_DIR}/ci_check_flashinfer_jit_cache.sh"; then
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
+            UNINSTALL_JIT_CACHE=false
+        else
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} installed but serves no cubins, will reinstall"
+        fi
     else
         echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
     fi
@@ -452,7 +457,16 @@ uninstall_stale_flashinfer() {
 
     FLASHINFER_UNINSTALL="flashinfer-python"
     [ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
-    [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
+    if [ "$UNINSTALL_JIT_CACHE" = true ]; then
+        # Which per-arch packages exist varies by release, so drop whatever is
+        # installed rather than a fixed list.
+        JIT_CACHE_PKGS=$(python3 -m pip list --format=freeze) || {
+            echo "ERROR: pip list failed; cannot enumerate per-arch jit-cache packages"
+            return 1
+        }
+        JIT_CACHE_ARCH=$(printf '%s\n' "$JIT_CACHE_PKGS" | sed -n 's/^\(flashinfer-jit-cache-[0-9a-z]*\)==.*/\1/p' | tr '\n' ' ')
+        FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache $JIT_CACHE_ARCH"
+    fi
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
