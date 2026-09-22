@@ -559,7 +559,33 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn test_cache_aware_treats_dp_ranks_as_independent_workers() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(DPAwareWorkerBuilder::new("http://node:8000", 0, 2).build()),
+            Arc::new(DPAwareWorkerBuilder::new("http://node:8000", 1, 2).build()),
+        ];
+
+        assert_eq!(workers[0].base_url(), workers[1].base_url());
+        assert_ne!(workers[0].url(), workers[1].url());
+        policy.init_workers(&workers);
+
+        let request = SelectWorkerInfo {
+            request_text: Some("shared prefix for rank-local cache affinity"),
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &request).await.unwrap();
+        let second = policy.select_worker(&workers, &request).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(workers[first].dp_rank(), Some(first));
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {

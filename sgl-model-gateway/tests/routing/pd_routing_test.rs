@@ -439,8 +439,10 @@ mod pd_responses_routing_tests {
             decode_body["bootstrap_room"],
             prefill_body["bootstrap_room"]
         );
+        assert_eq!(prefill_body["routed_dp_rank"], 2);
         assert_eq!(prefill_body["data_parallel_rank"], 2);
         assert!(prefill_body.get("disagg_prefill_dp_rank").is_none());
+        assert_eq!(decode_body["routed_dp_rank"], 1);
         assert_eq!(decode_body["disagg_prefill_dp_rank"], 2);
         prefill_task.abort();
         decode_task.abort();

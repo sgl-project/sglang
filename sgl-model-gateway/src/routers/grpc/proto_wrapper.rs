@@ -36,6 +36,19 @@ pub enum ProtoGenerateRequest {
 }
 
 impl ProtoGenerateRequest {
+    /// Pin this request to the DP rank selected by the logical worker.
+    pub fn set_dp_rank(&mut self, rank: usize) -> Result<(), String> {
+        let rank = i32::try_from(rank)
+            .map_err(|_| "DP rank exceeds the gRPC protocol range".to_string())?;
+        match self {
+            Self::Sglang(request) => {
+                request.data_parallel_rank = rank;
+                Ok(())
+            }
+            Self::Vllm(_) => Err("DP rank routing requires the SGLang protocol".to_string()),
+        }
+    }
+
     /// Get SGLang variant (panics if vLLM)
     pub fn as_sglang(&self) -> &sglang::GenerateRequest {
         match self {
@@ -400,6 +413,18 @@ pub enum ProtoEmbedRequest {
 }
 
 impl ProtoEmbedRequest {
+    /// Pin this request to the DP rank selected by the logical worker.
+    pub fn set_dp_rank(&mut self, rank: usize) -> Result<(), String> {
+        let rank = i32::try_from(rank)
+            .map_err(|_| "DP rank exceeds the gRPC protocol range".to_string())?;
+        match self {
+            Self::Sglang(request) => {
+                request.data_parallel_rank = rank;
+                Ok(())
+            }
+        }
+    }
+
     /// Get SGLang variant
     pub fn as_sglang(&self) -> &sglang::EmbedRequest {
         match self {

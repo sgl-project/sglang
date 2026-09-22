@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     app_context::AppContext,
@@ -79,22 +79,24 @@ impl Router {
         })
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
+    fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
         let workers = self.worker_registry.get_all();
-        let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
-        if healthy_workers.is_empty() {
-            Err("No workers are available".to_string())
-        } else {
-            Ok(healthy_workers[0].url().to_string())
-        }
+        workers
+            .into_iter()
+            .find(|worker| worker.is_healthy())
+            .ok_or_else(|| "No workers are available".to_string())
     }
 
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
-            Ok(worker_url) => {
-                let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
+            Ok(worker) => {
+                let mut request_builder = self.client.get(format!(
+                    "{}/{}",
+                    worker.base_url().trim_end_matches('/'),
+                    endpoint.trim_start_matches('/')
+                ));
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
@@ -336,16 +338,6 @@ impl Router {
         response
     }
 
-    // Helper: return base worker URL (strips DP suffix when enabled)
-    fn worker_base_url(&self, worker_url: &str) -> String {
-        if self.dp_aware {
-            if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
-                return prefix.to_string();
-            }
-        }
-        worker_url.to_string()
-    }
-
     // Generic simple routing for GET/POST without JSON body
     async fn route_simple_request(
         &self,
@@ -371,9 +363,11 @@ impl Router {
         let futures: Vec<_> = workers
             .into_iter()
             .map(|worker| {
-                let worker_url = worker.url();
-                let base = self.worker_base_url(worker_url);
-                let url = format!("{}/{}", base, endpoint);
+                let url = format!(
+                    "{}/{}",
+                    worker.base_url().trim_end_matches('/'),
+                    endpoint.trim_start_matches('/')
+                );
                 let client = self.client.clone();
                 let method = method.clone();
 
@@ -466,23 +460,6 @@ impl Router {
             .await
     }
 
-    // TODO (rui): Better accommodate to the Worker abstraction
-    fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
-        let parts: Vec<&str> = worker_url.split('@').collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid worker_url format: {}", worker_url));
-        }
-
-        // Parse the second part (dp_rank) into an integer
-        match parts[1].parse::<usize>() {
-            Ok(dp_rank) => Ok((parts[0], dp_rank)),
-            Err(_) => Err(format!(
-                "failed to parse dp_rank from worker_url: {}",
-                worker_url
-            )),
-        }
-    }
-
     // Send typed request directly without conversion
     async fn send_typed_request<T: serde::Serialize>(
         &self,
@@ -496,55 +473,22 @@ impl Router {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
 
-        // Static key string to avoid per-request allocations
-        const DP_RANK_KEY: &str = "data_parallel_rank";
-
-        let mut request_builder = if self.dp_aware {
-            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return error::internal_error(
-                        "dp_rank_extraction_failed",
-                        format!("Failed to extract dp_rank: {}", e),
-                    );
+        let mut request_builder = if worker.is_dp_aware() {
+            let body = match serde_json::to_value(typed_req) {
+                Ok(body) => body,
+                Err(error) => {
+                    return error::bad_request("serialization_failed", error.to_string());
                 }
             };
-
-            let mut json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return error::bad_request(
-                        "serialization_failed",
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    );
+            let body = match worker.prepare_request(body).await {
+                Ok(body) => body,
+                Err(error) => {
+                    return error::bad_request("dp_rank_insertion_failed", error.to_string());
                 }
             };
-
-            if let Some(map) = json_val.as_object_mut() {
-                // Use static key string to avoid allocation
-                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
-                // Only serialize if debug logging is enabled to avoid CPU overhead
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(
-                        "Modified request body: {}",
-                        serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
-                    );
-                }
-            } else {
-                return error::bad_request(
-                    "dp_rank_insertion_failed",
-                    "Failed to insert the data_parallel_rank field into the request body",
-                );
-            }
-
-            self.client
-                .post(format!("{}{}", worker_url_prefix, route))
-                .json(&json_val)
+            self.client.post(worker.endpoint_url(route)).json(&body)
         } else {
-            self.client
-                .post(format!("{}{}", worker_url, route))
-                .json(typed_req) // Use json() directly with typed request
+            self.client.post(worker.endpoint_url(route)).json(typed_req)
         };
 
         if let Some(key) = api_key {
@@ -561,6 +505,12 @@ impl Router {
                     request_builder = request_builder.header(name, value);
                 }
             }
+        }
+
+        if let Some(rank) = worker.dp_rank() {
+            // The selected logical worker must override any caller-provided rank,
+            // including when the router retries on another rank.
+            request_builder = request_builder.header("x-data-parallel-rank", rank.to_string());
         }
 
         let res = match request_builder.send().await {
@@ -907,7 +857,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
+        let url = result.unwrap().url().to_string();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
@@ -918,9 +868,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
-
-        let worker = router.worker_registry.get_by_url(&url).unwrap();
+        let worker = result.unwrap();
         assert!(worker.is_healthy());
     }
 }

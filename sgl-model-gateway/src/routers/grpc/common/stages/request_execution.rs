@@ -105,7 +105,7 @@ impl PipelineStage for RequestExecutionStage {
                         self.execute_dual_dispatch(req, clients, workers).await
                     }
                 },
-                ProtoRequest::Embed(req) => self.execute_single_embed(req, clients).await,
+                ProtoRequest::Embed(req) => self.execute_single_embed(req, clients, workers).await,
             }
         }
         .instrument(span)
@@ -124,10 +124,15 @@ impl PipelineStage for RequestExecutionStage {
 impl RequestExecutionStage {
     async fn execute_single(
         &self,
-        proto_request: ProtoGenerateRequest,
+        mut proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
+        if let Some(rank) = workers.single().and_then(|worker| worker.dp_rank()) {
+            proto_request
+                .set_dp_rank(rank)
+                .map_err(|message| error::bad_request("unsupported_dp_rank", message))?;
+        }
         let client = clients.single_mut().ok_or_else(|| {
             error!(
                 function = "execute_single",
@@ -161,9 +166,15 @@ impl RequestExecutionStage {
 
     async fn execute_single_embed(
         &self,
-        proto_request: ProtoEmbedRequest,
+        mut proto_request: ProtoEmbedRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
+        if let Some(rank) = workers.single().and_then(|worker| worker.dp_rank()) {
+            proto_request
+                .set_dp_rank(rank)
+                .map_err(|message| error::bad_request("unsupported_dp_rank", message))?;
+        }
         let client = clients.single_mut().ok_or_else(|| {
             error!(
                 function = "execute_single_embed",
@@ -232,8 +243,20 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let prefill_request = proto_request.clone_inner();
-        let decode_request = proto_request;
+        let mut prefill_request = proto_request.clone_inner();
+        let mut decode_request = proto_request;
+        if let Some((prefill, decode)) = workers.dual() {
+            if let Some(rank) = prefill.dp_rank() {
+                prefill_request
+                    .set_dp_rank(rank)
+                    .map_err(|message| error::bad_request("unsupported_dp_rank", message))?;
+            }
+            if let Some(rank) = decode.dp_rank() {
+                decode_request
+                    .set_dp_rank(rank)
+                    .map_err(|message| error::bad_request("unsupported_dp_rank", message))?;
+            }
+        }
 
         let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
             prefill_client.generate(prefill_request),

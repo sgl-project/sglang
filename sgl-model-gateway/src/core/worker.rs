@@ -869,6 +869,9 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
+                // A DP-aware worker uses `base_url@rank` as its logical identity.
+                // The rank suffix must never be used as part of the network address.
+                let endpoint = self.normalised_url()?.to_string();
                 // OnceCell provides lock-free reads after initialization.
                 // get_or_try_init only acquires internal lock on first call.
                 let client = self
@@ -880,7 +883,7 @@ impl Worker for BasicWorker {
                             runtime_str,
                             self.metadata.url
                         );
-                        match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
+                        match GrpcClient::connect(&endpoint, &runtime_str).await {
                             Ok(client) => {
                                 tracing::info!(
                                     "Successfully connected gRPC client ({}) for worker: {}",
@@ -1105,6 +1108,12 @@ impl Worker for DPAwareWorker {
 
     async fn prepare_request(&self, mut req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         if let Some(map) = req.as_object_mut() {
+            map.insert(
+                "routed_dp_rank".to_string(),
+                serde_json::json!(self.dp_rank),
+            );
+            // Keep the deprecated alias while older SGLang gRPC/HTTP clients are
+            // still in use. SGLang gives routed_dp_rank precedence when both exist.
             map.insert(
                 "data_parallel_rank".to_string(),
                 serde_json::json!(self.dp_rank),
@@ -1803,6 +1812,7 @@ mod tests {
 
         assert_eq!(prepared_req["prompt"], "Hello");
         assert_eq!(prepared_req["max_tokens"], 100);
+        assert_eq!(prepared_req["routed_dp_rank"], 3);
         assert_eq!(prepared_req["data_parallel_rank"], 3);
     }
 

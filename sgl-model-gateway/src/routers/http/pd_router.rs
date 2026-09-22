@@ -1382,6 +1382,11 @@ impl PDRouter {
                 }
             }
         }
+        if let Some(rank) = json_request.get("routed_dp_rank").and_then(Value::as_u64) {
+            // Override any caller-provided value with the rank selected by the
+            // router for this prefill or decode request.
+            request = request.header("x-data-parallel-rank", rank.to_string());
+        }
         request
     }
 
@@ -1902,6 +1907,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_selected_dp_rank_overrides_forwarded_header() {
+        let router = create_test_pd_router();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-data-parallel-rank", "99".parse().unwrap());
+        let body = json!({"routed_dp_rank": 2});
+
+        let request = router
+            .build_post_with_headers(
+                &router.client,
+                "http://worker:30000/v1/completions",
+                &body,
+                Some(&headers),
+                false,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers()["x-data-parallel-rank"], "2");
+    }
+
     #[tokio::test]
     async fn test_prepare_pd_worker_requests_uses_dp_aware_rank() {
         let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
@@ -1929,6 +1955,7 @@ mod tests {
             prefill_request.endpoint_url,
             "http://prefill:30000/v1/completions"
         );
+        assert_eq!(prefill_request.body["routed_dp_rank"], 2);
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
@@ -1936,6 +1963,7 @@ mod tests {
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
+        assert_eq!(decode_request.body["routed_dp_rank"], 1);
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
@@ -1974,6 +2002,8 @@ mod tests {
         );
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
         assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert!(prefill_request.body.get("routed_dp_rank").is_none());
+        assert!(decode_request.body.get("routed_dp_rank").is_none());
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
