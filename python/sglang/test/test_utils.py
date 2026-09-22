@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import doctest
 import importlib.util
@@ -28,6 +29,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 import aiohttp
 import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -59,7 +61,6 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -666,6 +667,7 @@ def unified_radix_tree_server_env(
     return {
         **os.environ,
         **extra_env,
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
     }
@@ -846,14 +848,17 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
+    pids = collect_process_tree_pids(process.pid)
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
     kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
 
 
 def popen_launch_pd_server(
@@ -1161,6 +1166,29 @@ def run_score_benchmark(
     device="auto",
 ):
     """Score API benchmark function compatible with run_bench_serving pattern"""
+    return run_score_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_score_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size.
+
+    Batch size is a property of the request, not of the server, so the launch
+    is shared rather than repeated per size.
+    """
     if other_server_args is None:
         other_server_args = []
 
@@ -1176,7 +1204,7 @@ def run_score_benchmark(
         other_args=other_server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1199,7 +1227,7 @@ def run_score_benchmark(
                 )
             return text
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "query": generate_text_with_token_count(score_query_tokens),
                 "items": [
@@ -1247,12 +1275,16 @@ def run_score_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_embeddings_benchmark(
@@ -1265,6 +1297,27 @@ def run_embeddings_benchmark(
     device="auto",
 ):
     """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    return run_embeddings_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        input_tokens=input_tokens,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_embeddings_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size. See run_score_benchmark_multi."""
     if other_server_args is None:
         other_server_args = []
 
@@ -1283,7 +1336,7 @@ def run_embeddings_benchmark(
         other_args=server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
 
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
@@ -1294,7 +1347,7 @@ def run_embeddings_benchmark(
         # Generate input text
         input_text = generate_text_with_token_count(input_tokens)
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "input": input_text,
                 "model": model,
@@ -1334,12 +1387,16 @@ def run_embeddings_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_bench_serving_multi(
@@ -1997,9 +2054,59 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+@contextlib.contextmanager
+def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
+    """Publish a test topology, defaulting to WORLD rank zero.
+
+    ``ranks`` overrides the launcher placement. Reset the context before
+    publication and on exit, including when the test fails.
+    """
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    bundle = dict(world_rank=0, dp_rank=None)
+    bundle.update(ranks or {})
+    server_args = ServerArgs(model_path="dummy", **server_args_fields)
+    reset_context()
+    publish(server_args, role=role, ranks=SpawnRanks(**bundle))
+    try:
+        yield server_args
+    finally:
+        reset_context()
+
+
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """Publish the topology for a subsequent ``initialize_model_parallel`` call.
+
+    Preserve an existing WORLD group across the context reset. The caller is
+    responsible for tearing down groups and resetting the context afterward.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Restore the existing WORLD handle after resetting the context.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
+
+
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2101,6 +2208,95 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
+
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
 # Names the runner kits stamp onto a record that are not members of it.
 # `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
 # onto the record they hand the runner, and `hasattr` cannot see it.
@@ -2154,6 +2350,17 @@ def enter_override(test_case, override):
     installed = override.install()
     test_case.addCleanup(override.restore)
     return installed
+
+
+def enter_scope(test_case, scope):
+    """Enter a context manager for the length of one test.
+
+    The `with`-statement form of `enter_override` above, and 3.10-safe for the
+    same reason: `enterContext` arrived in 3.11.
+    """
+    entered = scope.__enter__()
+    test_case.addCleanup(scope.__exit__, None, None, None)
+    return entered
 
 
 class CustomTestCase(unittest.TestCase):

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
+    install_move_gate,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -124,6 +125,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.min_slot_index,
             self.full_attn_allocator.available_size(),
             self.mamba_allocator.available_size(),
+        )
+
+        # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
         )
 
     # -- size: dynamic --
@@ -306,15 +312,54 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
-    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Install the PD-disaggregation move gate on both sub-allocators."""
-        assert self.lazy_compaction, (
-            "PD disaggregation with the unified memory pool requires lazy "
-            "compaction (eager free-path compaction moves pages under "
-            "in-flight transfers)."
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Retraction backup for the FULL + mamba pair.
+
+        `Req.offload_kv_cache` hands over `req_to_token` rows, which hold
+        VIRTUAL ids here; both unified full pools index their host copy by
+        PHYSICAL ids. The mamba side is already slot-addressed and is
+        translated by the pool.
+        """
+        return self._kvcache.get_cpu_copy(
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
         )
-        self.full_attn_allocator.disagg_move_gate = gate
-        self.mamba_allocator.disagg_move_gate = gate
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu,
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
+    def _move_gate_targets(self):
+        """Every member a compaction gate must cover. The mamba end is gated
+        even where its state is not itself transferred: the gate is about the
+        MOVER, and the two ends compact as peers."""
+        return (self.full_attn_allocator, self.mamba_allocator)
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="disagg_move_gate",
+            gate=gate,
+            feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
+            lazy_compaction=self.lazy_compaction,
+        )
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)

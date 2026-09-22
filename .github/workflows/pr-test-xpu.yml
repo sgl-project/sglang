@@ -62,6 +62,7 @@ jobs:
               - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
               - "test/registered/xpu/**/!(*.md)"
+              - "test/registered/disaggregation/test_disaggregation_xpu.py"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
               - "test/registered/attention/test_deterministic.py"
               - "test/registered/lora/test_moe_lora_info.py"
@@ -150,6 +151,11 @@ jobs:
           docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
+        continue-on-error: true
+        run: |
+          docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir ".[checkpoint-engine]" --extra-index-url https://download.pytorch.org/whl/xpu
 
       - name: Run tests
         # Old stage-a (30) + stage-b (120) = 150; +20% headroom for --enable-retry.
@@ -246,7 +252,9 @@ jobs:
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          # xpu_b60.json is seeded with this flag on; without it the SYCL queue
+          # is deep enough that step timings record host enqueue, not device time.
+          docker exec -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
