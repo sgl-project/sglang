@@ -596,6 +596,8 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
+        # This override must initialize the pointers and row strides used by HiCache.
+        self._init_data_ptrs_and_strides()
 
     def _clear_buffers(self):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
@@ -751,6 +753,22 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
+        views are indexed by; the formula is the one in the class docstring."""
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
@@ -1216,6 +1234,28 @@ def _check_bs1_feasibility_floor(
     )
 
 
+def _wire_mamba_slot_allocator(
+    *,
+    mamba_end,
+    req_to_token_pool,
+    device,
+) -> UnifiedMambaSlotAllocator:
+    """Install Mamba slot allocation, host capacities, and transfer translation."""
+    slot_allocator = UnifiedMambaSlotAllocator(
+        mamba_end,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = slot_allocator
+    state_pool = req_to_token_pool.mamba_pool
+    state_pool.host_transfer_translate = slot_allocator.translate
+    state_pool.host_capacity_tokens = req_to_token_pool._shared_mamba_size
+    state_pool.host_capacity_bytes = (
+        state_pool.host_capacity_tokens * mamba_end.entry_bytes
+    )
+    return slot_allocator
+
+
 def init_unified_mamba_pools(
     *,
     device: str,
@@ -1385,15 +1425,19 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+    # Size host storage from the configured token cap, not the dynamic buffer view.
+    full_pool = token_to_kv_pool.full_kv_pool
+    full_pool.host_capacity_tokens = max_total_num_tokens
+    full_pool.host_capacity_bytes = (
+        max_total_num_tokens * allocator.full_attn_allocator.entry_bytes
+    )
 
-    # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    mamba_slot_allocator = _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+    # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
     # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
@@ -2058,14 +2102,11 @@ def init_unified_mamba_swa_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
-    # Wrap the composite's mamba end in the slot allocator (PHYSICAL view) the
-    # radix MambaComponent / model-side sconv reads consume.
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
 
     logger.info(
         "[unified-memory-pool] ============================================================"

@@ -165,18 +165,12 @@ class DecodeKVCacheOffloadManager:
     def _resolve_offload_transfers(
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
-        full_indices = (
-            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                virtual_indices
-            )
-        )
+        full_indices = virtual_indices
         if not isinstance(self.kv_cache, UnifiedSWAKVPool):
             return full_indices, []
 
-        swa_indices = (
-            self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                virtual_indices
-            )
+        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            virtual_indices
         )
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)

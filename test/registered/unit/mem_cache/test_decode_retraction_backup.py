@@ -184,12 +184,10 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             torch.arange(self.pool_size, device=self.device),
             shifts=self.pool_size // 2,
         )
-        allocator.translate_kv_indices_for_transfer = lambda indices: (
-            virtual_to_physical[indices]
-        )
-        source_physical_indices = allocator.translate_kv_indices_for_transfer(
-            source_indices
-        )
+        target_pool.host_transfer_translate = lambda indices: virtual_to_physical[
+            indices
+        ]
+        source_physical_indices = target_pool.host_transfer_translate(source_indices)
         self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
         self._seed_pool(target_pool, source_physical_indices, base=1000)
@@ -219,7 +217,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
-        destination_physical_indices = allocator.translate_kv_indices_for_transfer(
+        destination_physical_indices = target_pool.host_transfer_translate(
             destination_indices
         )
 

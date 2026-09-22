@@ -17,9 +17,10 @@ from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -75,35 +76,41 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
     )
     engine = L2TransferEngine(backend)
     producer = torch.cuda.Stream()
-    device_indices = torch.tensor([1], device=DEVICE)
+    allocator = bundle.token_to_kv_pool_allocator
+    virtual_indices = allocator.alloc(5)
+    device_indices = virtual_indices[:1].clone()
     host_indices = host_pool.alloc(1)
     transfer = L2Transfer(host_pool, device_pool, host_indices, device_indices)
     device_pages = device_pool.get_page_envelope_buffer()
     try:
         # Warm both copy paths before creating the delayed producer dependency.
         engine.submit_device_to_host([transfer]).finish_event.synchronize()
-        engine.submit_host_to_device([transfer], layer_num=1).finish_event.synchronize()
+        engine.submit_host_to_device(
+            [transfer], transfer_layer_id_max=1
+        ).finish_event.synchronize()
         device_pages.zero_()
-        device_pages[5].fill_(77)
+        physical_pages = allocator.translate_kv_indices_for_transfer(virtual_indices)
+        first_page, last_page = int(physical_pages[0]), int(physical_pages[-1])
+        device_pages[last_page].fill_(77)
         host_pool.get_data_page(int(host_indices[0])).fill_(33)
         producer.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(producer):
             torch.cuda._sleep(400_000_000)
-            device_indices.fill_(5)
+            device_indices.copy_(virtual_indices[-1:])
             if direction == "d2h":
                 completion = engine.submit_device_to_host([transfer])
             else:
                 ready = torch.cuda.Event()
                 ready.record()
                 completion = engine.submit_host_to_device(
-                    [transfer], layer_num=1, start_event=ready
+                    [transfer], transfer_layer_id_max=1, start_event=ready
                 )
         completion.finish_event.synchronize()
         if direction == "d2h":
             assert torch.all(host_pool.get_data_page(int(host_indices[0])) == 77)
         else:
-            assert torch.all(device_pages[5] == 33)
-            assert torch.all(device_pages[1] == 0)
+            assert torch.all(device_pages[last_page] == 33)
+            assert torch.all(device_pages[first_page] == 0)
     finally:
         producer.synchronize()
         host_pool.destroy()

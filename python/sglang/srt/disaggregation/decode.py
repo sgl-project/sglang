@@ -61,10 +61,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce,
@@ -83,15 +82,13 @@ from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    supports_swa_byte_budget,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -115,6 +112,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_memory,
     get_parallel,
@@ -397,7 +395,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
-        self.pp_size = scheduler.ps.pp_size
+        self.pp_size = get_parallel().pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -443,7 +441,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
@@ -459,47 +457,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
-    def _supports_unified_swa_reservation(self) -> bool:
-        return supports_swa_byte_budget(self.token_to_kv_pool_allocator)
-
     def _uses_swa_reservation(self) -> bool:
-        return self._uses_swa_tail_prealloc() or supports_swa_byte_budget(
-            self.token_to_kv_pool_allocator
-        )
-
-    def _unified_swa_reservation_fits(
-        self,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        full_allocatable_tokens: Optional[int] = None,
-        swa_allocatable_tokens: Optional[int] = None,
-        empty_pool: bool = False,
-    ) -> bool:
-        allocator = self.token_to_kv_pool_allocator
-        full_evictable = swa_evictable = 0
-        if not empty_pool:
-            full_evictable = self._radix_full_evictable()
-            swa_evictable = self.tree_cache.swa_evictable_size()
-            if full_allocatable_tokens is not None:
-                full_tokens += (
-                    allocator.full_available_size()
-                    + full_evictable
-                    - full_allocatable_tokens
-                )
-            if swa_allocatable_tokens is not None:
-                swa_tokens += (
-                    allocator.swa_available_size()
-                    + swa_evictable
-                    - swa_allocatable_tokens
-                )
-
-        return allocator.can_reserve(
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable,
-            swa_evictable_tokens=swa_evictable,
-            empty_pool=empty_pool,
+        return (
+            self._uses_swa_tail_prealloc()
+            or self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim()
         )
 
     def _prealloc_reservation_fits(
@@ -510,15 +471,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
     ) -> bool:
-        if self._supports_unified_swa_reservation():
-            return self._unified_swa_reservation_fits(
-                full_tokens,
-                swa_tokens,
-                full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=swa_allocatable_tokens,
-            )
-        return full_tokens <= full_allocatable_tokens and (
-            swa_allocatable_tokens is None or swa_tokens <= swa_allocatable_tokens
+        return self.token_to_kv_pool_allocator.prealloc_fits(
+            self.tree_cache,
+            full_tokens,
+            swa_tokens,
+            full_budget_tokens=full_allocatable_tokens,
+            swa_budget_tokens=swa_allocatable_tokens,
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
@@ -533,38 +491,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> Optional[str]:
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
-        if self._supports_unified_swa_reservation():
-            full_required = ceil_align(full_len, page_size)
-            swa_required = ceil_align(swa_tail_len, page_size)
-            capacity_ready = allocator.evict_to_free_tokens(
-                self.tree_cache,
-                full_required,
-                swa_num_tokens=swa_required,
-            )
-            if capacity_ready is None:
-                capacity_ready = allocator.ensure_capacity(full_required, swa_required)
-            if capacity_ready:
-                return None
-            return (
-                "Unified FULL/SWA byte reclamation insufficient: "
-                f"needed=({full_required}, {swa_required}), req={req_id}"
-            )
-
-        required = ceil_align(swa_tail_len, page_size)
-        available = allocator.swa_available_size()
-        if available < required:
-            self.tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=required - available)
-            )
-            available = allocator.swa_available_size()
-
-        if available < required:
-            return (
-                f"SWA eviction insufficient: needed={required}, "
-                f"available={available}, req={req_id}"
-            )
-
-        return None
+        shortfall = allocator.reclaim_for_prealloc(
+            self.tree_cache,
+            ceil_align(full_len, page_size),
+            ceil_align(swa_tail_len, page_size),
+        )
+        return None if shortfall is None else f"{shortfall}, req={req_id}"
 
     # SWA caches expose full-attention accounting through full_* accessors.
     def _radix_full_evictable(self) -> int:
@@ -635,7 +567,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
@@ -644,8 +576,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            transfer_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            transfer_kv_pool
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -703,7 +635,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.gpu_id = get_device().gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -759,6 +691,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
+        if is_retracted and dsv41_dspark_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
+            if req.output_ids:
+                req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+            req.pd_rebootstrap_in_progress = True
+            req.time_stats.set_retract_time()
+            is_retracted = False
+            is_rebootstrap = True
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -889,18 +831,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
-        if self._supports_unified_swa_reservation():
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if not self._uses_swa_tail_prealloc():
-                swa_required = full_required
-            if not self._unified_swa_reservation_fits(
-                full_required, swa_required, empty_pool=True
-            ):
-                message = (
-                    f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
-                    f"budget: full={full_required}, swa={swa_required}"
-                )
-        else:
+        allocator = self.token_to_kv_pool_allocator
+        full_required, swa_required = self._prealloc_required_tokens(req)
+        if not self._uses_swa_tail_prealloc():
+            swa_required = full_required
+        ceiling_fits = allocator.prealloc_ceiling_fits(full_required, swa_required)
+        if ceiling_fits is False:
+            message = (
+                f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
+                f"budget: full={full_required}, swa={swa_required}"
+            )
+        elif ceiling_fits is None:
             # HiSparse admits up to the host-backed logical capacity.
             capacity = (
                 self.scheduler.tp_worker.model_runner.max_token_pool_size
@@ -981,7 +922,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            if self._supports_unified_swa_reservation():
+            if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
                 full_len, swa_len = self._prealloc_kv_lens(req)
                 if (
                     self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
@@ -1350,6 +1291,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            # Hybrid models (e.g. K3 with KDA): guard against prealloc
+            # draining the mamba pool before the KV pool (would assert "Not
+            # enough space for mamba cache"). Evict a cached mamba slot from
+            # the radix tree first (only if it manages mamba states;
+            # ChunkCache.evict is a no-op), else stop.
+            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
+                supports_mamba = self.tree_cache.supports_mamba()
+                if supports_mamba and hasattr(self.tree_cache, "evict"):
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                if mamba_allocator.available_size() <= 0:
+                    break
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
@@ -1606,23 +1560,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
-                    int(decode_req.req.kv.req_pool_idx),
-                    seq_len,
-                    online=online,
-                    ring_size=ring_size,
+            def _request_state_payload():
+                return self.token_to_kv_pool.request_state_transfer_indices(
+                    int(decode_req.req.kv.req_pool_idx), seq_len
                 )
 
             state_types = self.kv_manager.kv_args.state_types
             if StateType.DSV4_REQUEST_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
+                clear_request_state = getattr(
+                    self.token_to_kv_pool, "clear_request_scoped_state", None
                 )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.kv.req_pool_idx))
+                if clear_request_state is not None:
+                    clear_request_state(int(decode_req.req.kv.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,
@@ -1631,8 +1580,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
-                StateType.DSV4_REQUEST_STATE: _c128_state_payload,
+                StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1894,13 +1844,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # remaining headroom up to per-req window cap.
         window_size = self.scheduler.sliding_window_size or 0
         allocator = self.token_to_kv_pool_allocator
-        if self._supports_unified_swa_reservation():
-            _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
-                full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
-            )
-        else:
-            swa_total = allocator.size_swa
-            swa_available = allocator.swa_available_size()
+        _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
+            full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
+        )
         # Per-request SWA ring: cached prefixes still report swa_evictable, but
         # evicting them frees no ring space.
         swa_evictable = (
@@ -2016,6 +1962,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
+        swa_pages_charged = (
+            uses_swa_tail
+            and not is_swa_req_ring(allocator)
+            and not self.scheduler.enable_hisparse
+        )
+        required_swa_tokens = (
+            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
+        )
+        if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
+            # Admission includes evictable pages; allocation needs free pages.
+            # Separate-pool resumes skip the caller's unified-only reclaim.
+            reclaim_error = self._reclaim_swa_tail_capacity(
+                swa_tail_len, req.rid, full_len=required_alloc_tokens
+            )
+            if reclaim_error is not None:
+                logger.warning("%s", reclaim_error)
+
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -2059,7 +2022,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
+            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
 
@@ -2713,6 +2679,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
+                self._sched_idled = True
                 self.on_idle()
 
             # Update last_batch
@@ -2764,6 +2731,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self._sched_idled = True
 
             # Process the last batch
             if self.last_batch:
@@ -2945,6 +2913,10 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
+        # The prebuilt batch never reaches the forward loop's prepare call.
+        self.ngram_embedding_manager.prepare_for_forward(
+            new_batch, chunked_req=self.chunked_req
+        )
         new_batch.process_prebuilt(self.future_map)
 
         return new_batch
