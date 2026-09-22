@@ -3024,9 +3024,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
+        finish_type = (recv_obj.finished_reasons[i] or {}).get("type")
         if (
             not state.ttft_observed
-            and completion_tokens > 0
+            and finish_type != "abort"
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             state.ttft_observed = True
@@ -3038,14 +3039,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         elif self.disaggregation_mode != DisaggregationMode.PREFILL:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens > 0:
-                self.metrics_collector.observe_inter_token_latency(
-                    labels,
-                    state.time_stats.get_interval(),
-                    num_new_tokens,
-                )
+            self.metrics_collector.observe_inter_token_latency(
+                labels,
+                state.time_stats.get_interval(),
+                num_new_tokens,
+            )
             if num_new_tokens != 0:
-                # A reset starts a new baseline, not a negative observation.
+                # On a decrease the collector drops the negative delta; restart
+                # the baseline from the new count.
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
 
