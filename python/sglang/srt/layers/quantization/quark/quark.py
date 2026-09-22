@@ -400,7 +400,9 @@ class QuarkConfig(QuantizationConfig):
         input_config = layer_quant_config.get("input_tensors") or {}
         block_size = weight_config.get("block_size")
         if not (
-            weight_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            not layer_quant_config.get("output_tensors")
+            and not layer_quant_config.get("bias")
+            and weight_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
             and weight_config.get("qscheme") == "per_block"
             and weight_config.get("is_dynamic") is False
             and isinstance(block_size, list)
@@ -420,18 +422,6 @@ class QuarkConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-        explicit_layer_config = self._find_matched_layer_config(prefix, layer)
-        block_fp8_config = self._get_block_fp8_config(
-            explicit_layer_config, self.packed_modules_mapping
-        )
-        if block_fp8_config is not None:
-            if isinstance(layer, LinearBase):
-                return Fp8LinearMethod(block_fp8_config)
-            if isinstance(layer, FusedMoE):
-                return Fp8MoEMethod(block_fp8_config)
-
         # Check if the layer is skipped for quantization.
         if should_ignore_layer(
             prefix,
@@ -449,6 +439,17 @@ class QuarkConfig(QuantizationConfig):
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        block_fp8_config = self._get_block_fp8_config(
+            self._find_matched_config(prefix, layer), self.packed_modules_mapping
+        )
+        if block_fp8_config is not None:
+            if isinstance(layer, LinearBase):
+                return Fp8LinearMethod(block_fp8_config)
+            if isinstance(layer, FusedMoE):
+                return Fp8MoEMethod(block_fp8_config)
 
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
@@ -834,9 +835,9 @@ class QuarkConfig(QuantizationConfig):
         )
         return is_mx_fp4_weight and is_static_fp8_activation
 
-    def _find_matched_layer_config(
+    def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any]:
 
         proj_name = layer_name.split(".")[-1]
         if proj_name in self.packed_modules_mapping:
@@ -848,17 +849,9 @@ class QuarkConfig(QuantizationConfig):
                 for shard_proj_name in shard_proj_names
             ]
             shard_configs = [
-                self._find_matched_layer_config(shard_name, module)
+                self._find_matched_config(shard_name, module)
                 for shard_name in shard_names
             ]
-            if all(q_config is None for q_config in shard_configs):
-                return None
-            if any(q_config is None for q_config in shard_configs):
-                raise ValueError(
-                    f"Found a partially specified quantization configuration for "
-                    f"{shard_proj_names} in {layer_name}. SGLang requires all "
-                    "fused shards to use the same scheme."
-                )
             if not all(
                 deep_compare(q_config, shard_configs[0]) for q_config in shard_configs
             ):
@@ -883,19 +876,10 @@ class QuarkConfig(QuantizationConfig):
             if layer_type in layer_type_quant_config:
                 return layer_type_quant_config[layer_type]
 
-            return None
-
-    def _find_matched_config(
-        self, layer_name: str, module: torch.nn.Module
-    ) -> dict[str, Any]:
-        layer_config = self._find_matched_layer_config(layer_name, module)
-        if layer_config is not None:
-            return layer_config
-
-        global_quant_config = cast(
-            dict[str, Any], self.quant_config.get("global_quant_config")
-        )
-        return global_quant_config
+            global_quant_config = cast(
+                dict[str, Any], self.quant_config.get("global_quant_config")
+            )
+            return global_quant_config
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):
