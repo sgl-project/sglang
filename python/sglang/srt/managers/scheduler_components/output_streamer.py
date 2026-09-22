@@ -19,7 +19,6 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -53,7 +52,6 @@ class SchedulerOutputStreamer:
 
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm

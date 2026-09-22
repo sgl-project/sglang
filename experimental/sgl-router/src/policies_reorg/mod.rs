@@ -5,6 +5,7 @@
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+pub mod cache_aware;
 pub mod power_of_two;
 pub mod session_aware;
 
@@ -26,6 +27,7 @@ pub struct PickRequest<'a> {
     pub bucket: &'a str,
     pub input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
+    pub prefix: Option<&'a cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
@@ -39,6 +41,7 @@ impl<'a> PickRequest<'a> {
             bucket: "",
             input_tokens,
             expected_peak_tokens: None,
+            prefix: None,
             token_ids: None,
             session_key: None,
             routing_key: None,
@@ -86,6 +89,11 @@ pub trait Policy: Send + Sync + Debug {
         engines: &'a [Arc<Worker>],
         request: &'a PickRequest<'a>,
     ) -> BoxFuture<'a, Result<Pick, PickError>>;
+
+    /// Whether this policy may serve `stage`; checked when a resolver is built.
+    fn supports(&self, _stage: Stage) -> bool {
+        true
+    }
 
     /// Runs on a miss within the same candidates; never on an admission rejection.
     fn fallback(&self) -> Option<&dyn Policy> {
