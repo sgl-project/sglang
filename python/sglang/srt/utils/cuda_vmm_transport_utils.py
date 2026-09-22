@@ -30,12 +30,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.utils.cuda_vmm_utils import (
-    _FD_SEND_TIMEOUT_S,
     VmmReservation,
     _get_cuda_driver,
-    _recv_fd,
-    _send_fd,
-    align_up,
     allocation_handle_type_name,
     check_drv,
     get_allocation_granularity,
@@ -44,6 +40,12 @@ from sglang.srt.utils.cuda_vmm_utils import (
     make_device_allocation_prop,
     release_mappings,
     tensor_from_pointer,
+)
+from sglang.srt.utils.vmm_common import (
+    _FD_SEND_TIMEOUT_S,
+    _recv_fd,
+    _send_fd,
+    align_up,
 )
 
 logger = logging.getLogger(__name__)
