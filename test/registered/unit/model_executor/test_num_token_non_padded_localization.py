@@ -9,17 +9,33 @@ localizer clamps ``real - chunk * attn_tp_rank`` into ``[0, chunk]``: a replicat
 identical whether the MoE runs TP or EP -- it is an attention-side quantity both
 backends consume. This table locks the exact per-rank counts and that the GPU
 tensor and host-int twin agree, so a change to the sharding math fails loudly.
+
+``ForwardBatch.moe_num_token_non_padded()`` decides whether that LOCAL count may
+bound a sparse MoE's input at all: it may only while the input is this rank's
+own shard, which the layer communicator's scatter mode for a sparse MLP states.
+SCATTERED hands the MoE the local shard; FULL and MOE_FULL hand it a buffer
+gathered from every source rank's padded slot, where the real rows are not a
+prefix and the dispatcher masks the padding instead. Masking a gathered buffer
+with the local count truncates every peer rank's rows -- with
+``--moe-a2a-backend none`` each rank then sums a truncated partial output, which
+collapsed gsm8k accuracy under DP attention. The second table locks that
+mode x layout x CP decision.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
 )
@@ -64,6 +80,109 @@ class TestNumTokenNonPaddedLayoutTable(CustomTestCase):
                         )
                         self.assertEqual(got_cpu, want)
                         self.assertEqual(int(got_gpu), want)
+
+
+LOCAL, GLOBAL = 7, 30
+
+
+def _forward_batch(*, sharded: bool, local=LOCAL, glob=GLOBAL) -> ForwardBatch:
+    empty = torch.empty(0, dtype=torch.int32)
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=1,
+        input_ids=empty,
+        req_pool_indices=empty,
+        seq_lens=empty,
+        out_cache_loc=empty,
+        seq_lens_sum=0,
+    )
+    batch.num_token_non_padded = (
+        None if local is None else torch.tensor(local, dtype=torch.int32)
+    )
+    batch.global_num_token_non_padded = (
+        None if glob is None else torch.tensor(glob, dtype=torch.int32)
+    )
+    batch.attn_tp_sequence_sharded = sharded
+    return batch
+
+
+def _value(batch: ForwardBatch):
+    got = batch.moe_num_token_non_padded()
+    return None if got is None else int(got)
+
+
+class TestMoeNumTokenNonPaddedTable(CustomTestCase):
+    # (label, mode, sharded, attn_dp_size, expected)
+    #
+    # The MoE input is the local shard only under SCATTERED, or under FULL with
+    # a single attention-DP group -- FULL all-reduces across attn-TP there
+    # instead of gathering, so a sharded forward is bounded by the GLOBAL count
+    # and a replicated one by the LOCAL count (they are equal).
+    _TABLE = [
+        ("scattered.replicated", ScatterMode.SCATTERED, False, 1, LOCAL),
+        ("scattered.sharded", ScatterMode.SCATTERED, True, 1, LOCAL),
+        ("scattered.dp", ScatterMode.SCATTERED, True, 4, LOCAL),
+        ("moe_full.replicated", ScatterMode.MOE_FULL, False, 1, None),
+        ("moe_full.sharded", ScatterMode.MOE_FULL, True, 1, None),
+        ("full.dp_gathered", ScatterMode.FULL, True, 4, None),
+        ("full.dp_gathered.replicated", ScatterMode.FULL, False, 4, None),
+        ("full.tp_sharded", ScatterMode.FULL, True, 1, GLOBAL),
+        ("full.replicated", ScatterMode.FULL, False, 1, LOCAL),
+    ]
+
+    def test_table(self):
+        for label, mode, sharded, attn_dp_size, expected in self._TABLE:
+            with (
+                self.subTest(case=label),
+                get_parallel().override(attn_dp_size=attn_dp_size, attn_cp_size=1),
+                patch.object(comm, "sparse_mlp_scatter_mode", return_value=mode),
+            ):
+                self.assertEqual(_value(_forward_batch(sharded=sharded)), expected)
+
+    def test_cp_gathered_full_is_unmasked(self):
+        """DSA / MLA CP fall back to FULL but still all-gather across CP, and
+        those rows are zigzag-permuted rather than a prefix."""
+        for sharded in (False, True):
+            for dsa_cp, mla_cp in ((True, False), (False, True)):
+                with (
+                    self.subTest(sharded=sharded, dsa_cp=dsa_cp),
+                    get_parallel().override(attn_dp_size=1, attn_cp_size=2),
+                    patch.object(
+                        comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                        return_value=dsa_cp,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.utils.is_mla_cp_active",
+                        return_value=mla_cp,
+                    ),
+                ):
+                    self.assertIsNone(_value(_forward_batch(sharded=sharded)))
+
+    def test_graph_replay_without_global_count_skips_masking(self):
+        """A captured batch carries the LOCAL buffer alone, so the attn-TP
+        sharded FULL case has no bound to mask with and must not use the local
+        one."""
+        with (
+            get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+            patch.object(
+                comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.FULL
+            ),
+        ):
+            self.assertIsNone(_value(_forward_batch(sharded=True, glob=None)))
+
+    def test_absent_local_count_stays_absent(self):
+        """Without expert parallelism the count is never filled; routing must
+        not mask every row against it."""
+        for mode in (ScatterMode.SCATTERED, ScatterMode.FULL, ScatterMode.MOE_FULL):
+            with (
+                self.subTest(mode=mode),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                patch.object(comm, "sparse_mlp_scatter_mode", return_value=mode),
+            ):
+                self.assertIsNone(_value(_forward_batch(sharded=False, local=None)))
 
 
 if __name__ == "__main__":

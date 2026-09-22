@@ -70,10 +70,8 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
-    sparse_mlp_scatter_mode,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
@@ -559,33 +557,6 @@ class MoEGate(nn.Module):
 _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
-def _moe_padded_row_mask(
-    *,
-    num_token_non_padded: Optional[torch.Tensor],
-    attn_tp_sequence_sharded: bool,
-) -> Optional[torch.Tensor]:
-    """Bound the MoE input with this rank's padded-row count, where that is valid.
-
-    ``num_token_non_padded`` is LOCAL (see forward_batch_info.py): it counts this
-    rank's own tokens. It only bounds the MoE input while that input IS this
-    rank's own shard. A gathered buffer's padding is interleaved per source rank,
-    so no local scalar can mask it -- that is the dispatcher's job, and masking
-    with the local count instead truncates every peer rank's tokens.
-
-    deepseek_v4.py's ``_use_tp_moe_gather`` nulls the field for the same reason,
-    under the narrower ``attn_dp_size > 1`` form of this condition.
-    """
-    mode = sparse_mlp_scatter_mode()
-    if mode is ScatterMode.SCATTERED:
-        # MoE runs on the local shard (a2a dispatch, fp4 all-gather, or dwdp).
-        return num_token_non_padded
-    if mode is ScatterMode.MOE_FULL:
-        # Gathered across the MoE-DP (CP) group regardless of attn-TP sharding.
-        return None
-    # FULL: a gathered buffer iff the sequence was attn-TP sharded to begin with.
-    return None if attn_tp_sequence_sharded else num_token_non_padded
-
-
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -954,10 +925,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         num_token_non_padded = (
-            _moe_padded_row_mask(
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
-            )
+            forward_batch.moe_num_token_non_padded()
             if forward_batch is not None
             else None
         )
@@ -1491,7 +1459,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -1885,7 +1853,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
                             layer_id=self.layer_id,

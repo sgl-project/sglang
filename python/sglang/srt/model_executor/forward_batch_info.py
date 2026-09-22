@@ -1178,6 +1178,52 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sharded=sharded,
         )
 
+    def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
+        """The padded-row bound a sparse MoE may mask its input with, or None.
+
+        ``num_token_non_padded`` is LOCAL: it bounds the MoE input only while
+        that input is this rank's own shard. When the layer communicator hands
+        the MoE a gathered buffer, each source rank contributes its own padded
+        slot, so the real rows are not a prefix and no scalar can mask them --
+        the dispatcher masks the padding instead, and the local count would cut
+        off every peer rank's tokens. Sparse MoE call sites read this rather
+        than the raw field; the two agree wherever the MoE input is local.
+        """
+        from sglang.srt.layers.communicator import ScatterMode, sparse_mlp_scatter_mode
+
+        if self.num_token_non_padded is None:
+            return None
+
+        mode = sparse_mlp_scatter_mode()
+        if mode == ScatterMode.SCATTERED:
+            # a2a dispatch, FP4 all-gather or dwdp: the MoE routes the local shard.
+            return self.num_token_non_padded
+        if mode == ScatterMode.MOE_FULL:
+            # All-gathered over the MoE-DP (CP) group, whatever the attn-TP layout.
+            return None
+        # FULL. DSA / MLA CP fall back to it but still all-gather across CP on a
+        # CP prefill, and those rows are zigzag-permuted rather than a prefix.
+        if get_parallel().attn_cp_size > 1 and self._moe_input_gathered_across_cp():
+            return None
+        if get_parallel().attn_dp_size != 1:
+            # dp_gather concatenates one padded slot per attention-DP rank.
+            return None
+        # One attention-DP group: FULL all-reduces instead of gathering, so the
+        # MoE sees the whole sequence with tail-only padding. A sharded forward's
+        # LOCAL count covers only this rank's slice of it, and the GLOBAL count is
+        # that buffer's real bound -- absent under cuda-graph replay, where the
+        # static batch carries the LOCAL buffer alone, and masking is skipped.
+        if not self.attn_tp_sequence_sharded:
+            return self.num_token_non_padded
+        return self.global_num_token_non_padded
+
+    def _moe_input_gathered_across_cp(self) -> bool:
+        """Whether this forward's MLP input is all-gathered across the CP group."""
+        from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+        from sglang.srt.layers.cp.utils import is_mla_cp_active
+
+        return dsa_use_prefill_cp(self) or is_mla_cp_active(self)
+
     def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
         """Tokens of this extend chunk covered by the tracked mamba state,
         floored to the mamba_cache_chunk_size boundary the scheduler snapshots at;
