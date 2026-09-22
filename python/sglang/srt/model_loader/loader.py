@@ -314,15 +314,11 @@ def post_load_weights(model: nn.Module) -> None:
 
 
 def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
-    """Run a quant_method hook (restore/process) on every quantized module.
-
-    LoRA wrappers forward `quant_method` for forward-path dispatch but don't own
-    the packed params; skip them so the inner base layer (yielded separately by
-    `named_modules`) handles it.
-    """
+    """Run one quant_method hook on every quantized module."""
     from sglang.srt.lora.layers import BaseLayerWithLoRA
 
     for _, module in model.named_modules():
+        # LoRA wrappers forward quant_method but do not own the packed params
         if isinstance(module, BaseLayerWithLoRA):
             continue
         quant_method = getattr(module, "quant_method", None)
@@ -332,14 +328,12 @@ def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) ->
 
 
 def restore_weights_before_loading(model: nn.Module, target_device) -> None:
-    """Undo in-place quant packing so fresh weights can be loaded
-    (no-op for schemes that don't repack, e.g. plain fp8)."""
+    """Undo in-place quant packing so fresh weights can be loaded."""
     _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
 
 
 def process_weights_after_loading(model: nn.Module, target_device) -> None:
-    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant,
-    transpose, ...)."""
+    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant, ...)."""
     _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
 
 

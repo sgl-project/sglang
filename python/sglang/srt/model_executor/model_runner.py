@@ -2046,14 +2046,11 @@ class ModelRunner:
         )
 
     def begin_weight_update(self) -> None:
-        """Begin a weight-update session: restore in-place-packed weights to a
-        loadable state (no-op for schemes that don't repack)."""
+        """Restore in-place-packed weights to a loadable state."""
         restore_weights_before_loading(self.model, torch.device(self.device))
 
     def end_weight_update(self, run_post_load: bool) -> None:
-        """End the weight-update session: optionally run model.post_load_weights
-        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
-        quantized weights into kernel layout."""
+        """Finalize quantized weights into kernel layout, after post_load_weights if requested."""
         if run_post_load:
             post_load_weights(self.model)
         process_weights_after_loading(self.model, torch.device(self.device))

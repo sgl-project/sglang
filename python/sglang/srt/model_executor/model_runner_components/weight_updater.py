@@ -249,12 +249,9 @@ class WeightUpdater:
         group_name,
         load_format: Optional[str] = None,
     ):
-        """Receive one weight broadcast from the training engine over this runner's
-        `_model_update_group` and return the named tensors WITHOUT loading them.
+        """Receive one broadcast over `_model_update_group` and return the tensors unloaded.
 
-        Only the runner that joined the group (the target / main model) can receive;
-        the caller loads the result into each runner it wants updated. Speculative
-        draft runners never join the group, so they are fed from here.
+        Only the target runner joined the group; the caller loads the result into each runner.
         """
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "

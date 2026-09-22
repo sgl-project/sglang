@@ -128,8 +128,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         )
 
     def _runner_updater(self, target_result):
-        """The distributed/tensor paths fan out over runners: the target runner
-        receives, every selected runner loads. Failure surfaces as a raise on load."""
+        """Manager over one target runner; a failed load surfaces as a raise."""
         self.recorded = []
         success, message = target_result
 

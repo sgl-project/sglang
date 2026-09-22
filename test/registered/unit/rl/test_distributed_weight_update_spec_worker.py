@@ -29,8 +29,6 @@ def _distributed_req(selector="all"):
 
 
 def _manager(tp_worker, draft_worker):
-    # metrics_collector defaults to None, so _observe_weight_load is a no-op; the
-    # reqs below set flush_cache=False so flush_cache is never called either.
     manager = SchedulerWeightUpdaterManager(
         tp_worker=tp_worker,
         draft_worker=draft_worker,
@@ -45,9 +43,7 @@ def _manager(tp_worker, draft_worker):
 
 
 def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
-    # Default selector ("all"): only the target (main model) owns the update group,
-    # so it receives the broadcast once; that single weights object is then loaded
-    # into every selected runner — receive once on the target, load into each.
+    """A draft runner that received its own broadcast would deadlock the update group."""
     weights = object()
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
@@ -72,14 +68,12 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
         "weight_update_group",
         None,
     )
-    # The single received weights object is loaded into every selected runner.
     target_runner.model.load_weights.assert_called_once_with(weights)
     draft_runner.model.load_weights.assert_called_once_with(weights)
 
 
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
-    # selector="target": the target still receives once, but the draft worker is
-    # never enumerated and no draft runner is loaded.
+    """selector="target" must not touch the draft worker at all."""
     weights = object()
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
@@ -114,8 +108,7 @@ def _session_manager(target_runner, draft_runner):
 
 
 def test_begin_weight_update_restores_target_and_draft():
-    # The session begins on every runner (target + draft): the draft model is
-    # restored to a loadable state identically to the target.
+    """A draft left packed would reject the weights the target accepts."""
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
@@ -132,8 +125,7 @@ def test_begin_weight_update_restores_target_and_draft():
 
 
 def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
-    # No load_weights happened this session (e.g. P2P/RDMA), so end runs
-    # post_load_weights then quant finalize on BOTH target and draft.
+    """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
@@ -149,8 +141,7 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
 
 
 def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
-    # A distributed/tensor load happened this session, so post_load is skipped on
-    # both runners; only quant finalize runs.
+    """load_weights already ran post_load_weights; running it twice would double-apply."""
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
@@ -164,8 +155,7 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
 
 
 def test_model_runner_begin_end_wire_to_loader_hooks():
-    # ModelRunner.begin/end delegate to the loader: begin restores; end runs
-    # post_load only when requested, always finalizes quant layout.
+    """end must finalize even when post_load is skipped."""
     import sglang.srt.model_executor.model_runner as mr
 
     runner = SimpleNamespace(model=object(), device="cpu")
@@ -192,8 +182,7 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
 
 
 def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
-    # begin(selector="draft") opens the session on the draft only; the target is
-    # untouched, and the selector is recorded for end to reuse.
+    """begin(selector="draft") must leave the target packed and remember the choice."""
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
@@ -208,7 +197,7 @@ def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
 
 
 def test_end_weight_update_reuses_session_selector_from_begin():
-    # end has no selector of its own; it finalizes exactly the set begin opened.
+    """end finalizing a runner begin never restored would repack unrestored weights."""
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
@@ -223,8 +212,7 @@ def test_end_weight_update_reuses_session_selector_from_begin():
 
 
 def test_begin_weight_update_rejects_reentry():
-    # A second begin while a session is open would leave the first session's
-    # restored runners unfinalized — reject it loudly.
+    """A second begin would leave the first session's runners unfinalized."""
     manager = _session_manager(Mock(), Mock())
     manager._session_open = True
 

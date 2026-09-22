@@ -86,7 +86,6 @@ def _checksum_info(tag: str) -> ChecksumInfo:
     return ChecksumInfo(
         checksums={f"model.layers.{tag}": "deadbeef"},
         per_gpu_checksum="cafef00d",
-        # One entry per role: the target model plus each speculative draft runner.
         parallelism_info=[_parallelism_info("target"), _parallelism_info("draft")],
     )
 
@@ -212,10 +211,7 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertIn("tp_rank", as_dict["parallelism_info"][0])
 
     def test_check_weights_producer_conversion(self):
-        # Mirrors weight_updater.check_weights end to end: each runner's
-        # WeightChecker returns a single-role ChecksumInfo.model_dump(),
-        # _merge_checksum_payloads folds the roles into one per-role payload, and
-        # that is what msgspec.convert has to accept.
+        # the merged per-role payload is what msgspec.convert has to accept
         def _dump():
             return PydanticChecksumInfo(
                 checksums={"model.layers.0": "deadbeef"},
@@ -234,7 +230,6 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
 
         merged = _merge_checksum_payloads([("target", _dump()), ("draft", _dump())])
         converted = msgspec.convert(merged, ChecksumInfo)
-        # Draft keys are role-prefixed so they never collide with the target's.
         self.assertEqual(
             sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]
         )

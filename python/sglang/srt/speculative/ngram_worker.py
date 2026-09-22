@@ -80,8 +80,7 @@ def _derive_tree_links(
 
 class NGRAMWorker(BaseSpecWorker):
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # NGRAM shares the target's model_runner -- no independent draft weights
-        # (the n-gram corpus is a CPU lookup structure built from token streams).
+        # the n-gram corpus is a CPU structure; no draft weights
         return []
 
     def alloc_memory_pool(self, **kwargs):

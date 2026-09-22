@@ -68,8 +68,7 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
-    # One skip group shared by reset / compare / checksum; the _skip_weight_check
-    # flag is set on kv-cache k/v_scale and process_weights_after_loading placeholders.
+    # one skip set shared by reset / compare / checksum
     return (
         _is_non_persistent_buffer_name(name)
         or getattr(param, "_skip_weight_check", False)
@@ -145,8 +144,7 @@ class WeightChecker:
 
     def _reset_tensors(self, skip_tensor_list: Optional[List[str]] = None):
         for name, param in self._model_state():
-            # Skip exactly what compare/checksum skip, so reset only poisons
-            # tensors compare will verify.
+            # reset must skip exactly what compare skips
             if _is_skip_weight_check(name, param, skip_tensor_list):
                 continue
             param.copy_(_random_like(param))

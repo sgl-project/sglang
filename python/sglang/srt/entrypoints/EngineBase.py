@@ -47,8 +47,7 @@ class EngineBase(ABC):
 
     @abstractmethod
     def begin_weight_update(self, selector: str = "all"):
-        """Open a weight-update session; update_weights_from_{tensor,distributed}
-        must run inside one."""
+        """Open a weight-update session; update_weights_from_* must run inside one."""
         pass
 
     @abstractmethod

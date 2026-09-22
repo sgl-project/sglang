@@ -95,8 +95,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     _session_open: bool = False
     _session_loaded_weights: bool = False
-    # Runner selector for the open session, recorded at begin_weight_update and
-    # reused by end_weight_update so the same set is restored and finalized.
+    # recorded at begin so end finalizes the same runners
     _session_selector: str = "all"
 
     @contextmanager
@@ -173,9 +172,7 @@ class SchedulerWeightUpdaterManager:
             "update_weights_from_distributed requires an open begin_weight_update session"
         )
         with self._observe_weight_load("distributed"):
-            # Only the target (main) model joined this process's update group, so it
-            # receives the broadcast once; the received weights are then loaded into
-            # each selected runner locally. Draft runners never join the group.
+            # only the target runner joined the update group; drafts load its receive
             try:
                 weights = self.tp_worker.model_runner.weight_updater.receive_weights_from_distributed(
                     recv_req.names,
@@ -203,8 +200,7 @@ class SchedulerWeightUpdaterManager:
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        """Update the online model parameter from tensors, fanning out to the
-        selected runners."""
+        """Update the online model parameter from tensors on the selected runners."""
         assert self._session_open, (
             "update_weights_from_tensor requires an open begin_weight_update session"
         )
@@ -267,10 +263,7 @@ class SchedulerWeightUpdaterManager:
             )
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
-        """Begin a weight-update session: restore in-place-packed weights to a
-        loadable state on the selected runners (target and/or draft), so the draft
-        model is prepared identically to the target. The selector is recorded and
-        reused by end_weight_update so the same set is finalized."""
+        """Open the session: restore in-place-packed weights on the selected runners."""
         assert not self._session_open, (
             "begin_weight_update called while a weight-update session is already open"
         )
@@ -283,9 +276,7 @@ class SchedulerWeightUpdaterManager:
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
-        """End the weight-update session on the runners begin_weight_update opened
-        (its recorded selector): quant finalize on each, plus model.post_load_weights
-        only when load_weights was bypassed this session (e.g. P2P/RDMA)."""
+        """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
         assert self._session_open, (
             "end_weight_update called without begin_weight_update"
         )

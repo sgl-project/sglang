@@ -1253,6 +1253,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         layer.scheme.process_weights_after_loading(layer)
 
     def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        # only schemes that repack in place define it
         if hasattr(layer.scheme, "restore_weights_before_loading"):
             layer.scheme.restore_weights_before_loading(layer)
 

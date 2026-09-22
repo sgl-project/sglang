@@ -1833,8 +1833,7 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
-    # Which model runners to update: "target" (target model only), "draft" (draft
-    # worker(s) only), or "all" (default).
+    # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
@@ -1862,8 +1861,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Which model runners to update: "target" (target model only), "draft" (draft
-    # worker(s) only), or "all" (default).
+    # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
@@ -2017,8 +2015,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
-    """Open a weight-update session: unpack in-place-quantized weights on the
-    selected runners so fresh weights can be loaded into them."""
+    """Open a weight-update session: restore in-place-packed weights so new ones can load."""
 
     selector: Literal["target", "draft", "all"] = "all"
 
@@ -2042,8 +2039,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     allow_quant_error: bool = False
     # Substrings of tensor names to exclude from reset/compare/checksum.
     skip_tensor_list: Optional[List[str]] = None
-    # Which model runners to update: "target" (target model only), "draft" (draft
-    # worker(s) only), or "all" (default).
+    # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
 
 
@@ -2051,8 +2047,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 # sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
-    # Which runner this describes: "target", or a draft role such as "draft" /
-    # "draft_step_0". One entry per runner the checksum covers.
+    # "target", or a draft role such as "draft" / "draft_step_0"
     role: str
     tp_rank: int
     tp_size: int
@@ -2067,9 +2062,7 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
-    # One entry per role the checksum covers: the target model plus, under
-    # speculative decoding, each draft runner. All roles on a rank share the GPU
-    # rank; consumers key off it to merge the shards.
+    # one entry per role (target plus each draft runner); all share the GPU rank
     parallelism_info: List[ParallelismInfo]
 
 

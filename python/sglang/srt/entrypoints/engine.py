@@ -1554,17 +1554,14 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def begin_weight_update(self, selector: str = "all"):
-        """Open a weight-update session: unpack in-place-quantized weights on the
-        selected runners so update_weights_from_{distributed,tensor} can load into
-        them. Must be closed with end_weight_update()."""
+        """Open a weight-update session; close it with end_weight_update()."""
         obj = BeginWeightUpdateReqInput(selector=selector)
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
     def end_weight_update(self):
-        """Close the session opened by begin_weight_update() and finalize quantized
-        weights into kernel layout."""
+        """Close the session and finalize quantized weights into kernel layout."""
         obj = EndWeightUpdateReqInput()
         return self.loop.run_until_complete(
             self.tokenizer_manager.end_weight_update(obj, None)
