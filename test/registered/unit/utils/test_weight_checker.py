@@ -20,11 +20,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.weight_checker import (
     CheckEntry,
     ChecksumInfo,
@@ -42,10 +42,11 @@ from sglang.srt.utils.weight_checker_comparator import (
     Fp8BlockComparable,
     RawComparable,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +76,7 @@ def _assert_entries_close(
             torch.testing.assert_close(
                 a_ref.w_s, e_ref.w_s, msg=f"[{i}] w_s {a_name!r}"
             )
+            assert a_ref.is_shuffled == e_ref.is_shuffled
         else:
             torch.testing.assert_close(
                 a_ref.tensor, e_ref.tensor, msg=f"[{i}] tensor {a_name!r}"
@@ -82,18 +84,61 @@ def _assert_entries_close(
 
 
 def _build_fp8_quant_pair(device: str = "cuda"):
-    """Construct a real fp8-quantized weight + matching fp32 + ue8m0-packed scales.
+    """Construct a real fp8-quantized weight and matching fp32 scales.
 
-    Returns (qweight, sf_fp32, sf_packed_int32) so callers can pick which scale dtype
-    drives the _build_check_entries branch under test.
+    Returns (qweight, sf_fp32).
     """
     weight_bf16 = torch.randn((256, 128), dtype=torch.bfloat16, device=device)
     block_size = [128, 128]
     qweight, sf_fp32 = quant_weight_ue8m0(
         weight_dequant=weight_bf16, weight_block_size=block_size
     )
-    sf_packed_int32 = transform_scale_ue8m0(sf_fp32, mn=qweight.shape[-2])
-    return qweight, sf_fp32, sf_packed_int32
+    return qweight, sf_fp32
+
+
+# ---------------------------------------------------------------------------
+# Shuffled FP8 integration
+# ---------------------------------------------------------------------------
+
+
+class TestShuffledFp8Comparable(CustomTestCase):
+    def test_iter_chunks_unshuffles_before_dequantization(self):
+        shuffled = torch.zeros((32, 64), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((2, 4), dtype=torch.float32)
+        comparable = Fp8BlockComparable(shuffled, scale, is_shuffled=True)
+
+        with (
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
+                side_effect=lambda weight: weight,
+            ) as unshuffle,
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                side_effect=lambda weight, *_args, **_kwargs: weight,
+            ),
+        ):
+            next(iter(comparable.iter_chunks()))
+
+        unshuffle.assert_called_once()
+
+    def test_dequantize_unshuffles_before_checksum(self):
+        shuffled = torch.zeros((32, 64), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((2, 4), dtype=torch.float32)
+        comparable = Fp8BlockComparable(shuffled, scale, is_shuffled=True)
+
+        with (
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
+                side_effect=lambda weight: weight,
+            ) as unshuffle,
+            patch(
+                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                side_effect=lambda weight, *_args, **_kwargs: weight,
+            ),
+        ):
+            comparable.dequantize()
+
+        unshuffle.assert_called_once_with(shuffled)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +158,8 @@ class _TinyModel(nn.Module):
         self.register_buffer("running_mean", torch.zeros(4))
         # Buffer names used to exercise weight checker's hard-coded filters.
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
+        self.register_buffer("rotary_emb_cos_cache", torch.full((8,), 1.62))
+        self.register_buffer("rotary_emb_sin_cache", torch.full((8,), 0.58))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
 
@@ -133,15 +180,6 @@ class _FakeModelRunner:
         attn_dp_size: int | None = None,
     ):
         self.model = model
-        self.ps = ParallelState.trivial(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            attn_dp_size=attn_dp_size if attn_dp_size is not None else dp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +298,10 @@ class TestPostprocessTensors(CustomTestCase):
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
+    @unittest.skipIf(is_hip(), "DeepGEMM is not supported on ROCm")
     def test_fp8_quant_pair_yields_lazy_pair(self):
-        qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
+        qweight, sf_fp32 = _build_fp8_quant_pair()
+        sf_packed_int32 = transform_scale_ue8m0(sf_fp32, mn=qweight.shape[-2])
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
 
         ref = Fp8BlockComparable(qweight, sf_packed_int32)
@@ -273,8 +313,24 @@ class TestPostprocessTensors(CustomTestCase):
             [("x.weight", True, ref)],
         )
 
+    def test_fp8_quant_pair_preserves_shuffled_flag(self):
+        qweight = torch.zeros((128, 128), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        raw = {"x.weight": qweight, "x.weight_scale_inv": scale}
+        quantized_set = {
+            "x.weight": QuantizedWeight(
+                Fp8BlockComparable,
+                "x.weight_scale_inv",
+                is_shuffled=True,
+            )
+        }
+        _assert_entries_close(
+            _build_check_entries(raw, set(), quantized_set),
+            [("x.weight", True, Fp8BlockComparable(qweight, scale, True))],
+        )
+
     def test_fp8_quant_pair_yield_order_alongside_other_entries(self):
-        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        qweight, sf_fp32 = _build_fp8_quant_pair()
         bias = torch.ones(4, device="cuda")
         raw = {
             "x.weight": qweight,
@@ -453,11 +509,12 @@ class TestBuildQuantizedSet(CustomTestCase):
         model.proj.register_parameter(
             "weight_scale_inv", nn.Parameter(torch.zeros(1, 1), requires_grad=False)
         )
+        model.proj.weight.is_shuffled = True
         self.assertEqual(
             _build_quantized_set(model),
             {
                 "proj.weight": QuantizedWeight(
-                    Fp8BlockComparable, "proj.weight_scale_inv"
+                    Fp8BlockComparable, "proj.weight_scale_inv", is_shuffled=True
                 )
             },
         )
@@ -484,7 +541,8 @@ class _WeightCheckerTestBase(CustomTestCase):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
         runner = _FakeModelRunner(self.model)
-        self.checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
+        enter_scope(self, published_topology())
+        self.checker = WeightChecker(get_model=lambda: runner.model)
 
 
 class TestSnapshot(_WeightCheckerTestBase):
@@ -496,6 +554,8 @@ class TestSnapshot(_WeightCheckerTestBase):
             "b",
             "running_mean",
             "rotary_emb_cos_sin_cache",
+            "rotary_emb_cos_cache",
+            "rotary_emb_sin_cache",
             "rotary_emb_freqs_cis",
             "gate_proj_weight_fp32_cache",
         }
@@ -525,6 +585,16 @@ class TestResetTensors(_WeightCheckerTestBase):
         before = self.model.rotary_emb_cos_sin_cache.clone()
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_cos_sin_cache, before)
+
+    def test_skips_cos_cache(self):
+        before = self.model.rotary_emb_cos_cache.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_cos_cache, before)
+
+    def test_skips_sin_cache(self):
+        before = self.model.rotary_emb_sin_cache.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_sin_cache, before)
 
     def test_skips_freqs_cis(self):
         before = self.model.rotary_emb_freqs_cis.clone()
@@ -681,9 +751,16 @@ class _ChecksumTestBase(CustomTestCase):
             pp_rank=0,
             pp_size=1,
         )
-        self.checker = WeightChecker(
-            get_model=lambda: self.runner.model, ps=self.runner.ps
+        enter_scope(
+            self,
+            published_topology(
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                ranks={"world_rank": 2, "dp_rank": 1},
+            ),
         )
+        self.checker = WeightChecker(get_model=lambda: self.runner.model)
 
 
 class TestComputeChecksum(_ChecksumTestBase):

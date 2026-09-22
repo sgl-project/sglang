@@ -36,7 +36,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"

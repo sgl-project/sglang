@@ -10,14 +10,17 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     update_environment_variables,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_default_distributed_backend,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, get_device_count
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.test_utils import publish_build_topology
 
-register_cuda_ci(est_time=32, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
+register_xpu_ci(est_time=60, suite="nightly-xpu-2-gpu", nightly=True)
 
 NUM_GPUS = 2
 
@@ -96,11 +99,15 @@ def mixer2_gated_norm_tensor_parallel(
         }
     )
 
-    # initialize distributed
+    # nccl on CUDA, xccl on XPU, ...; the parameter default is always "nccl".
     init_distributed_environment(
-        world_size=world_size, rank=local_rank, local_rank=local_rank
+        world_size=world_size,
+        rank=local_rank,
+        local_rank=local_rank,
+        backend=get_default_distributed_backend(device.type),
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(tp_size=world_size, world_rank=local_rank)
+    initialize_model_parallel()
 
     # create random weights an inputs
     weight = torch.rand((hidden_size,), dtype=dtype, device=device)
@@ -122,8 +129,24 @@ def mixer2_gated_norm_tensor_parallel(
         )
         mixer.weight.weight_loader(mixer.weight, weight)
 
-    # m2 reads tp via get_parallel().tp_size/rank — force it through the context.
-    with get_parallel().override(tp_size=1, tp_rank=0):
+    with get_parallel().override(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_tp_group=None,
+        attn_dp_size=1,
+        attn_dp_rank=0,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        attn_cp_group=None,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        moe_ep_group=None,
+        moe_dp_size=1,
+        moe_tp_size=1,
+    ):
         # create gated-norm without TP to compute reference
         mixer_single_gpu = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,

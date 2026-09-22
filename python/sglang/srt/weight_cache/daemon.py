@@ -50,7 +50,13 @@ import torch.distributed as dist
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_exec,
+    get_parallel,
+    publish,
+    spawn_world_rank,
+)
 
 from .protocol import (
     CacheConfig,
@@ -226,16 +232,7 @@ class WeightCacheDaemon:
                 moe_a2a_backend=self.moe_a2a_backend,
             )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=self.pp_size,
-            expert_model_parallel_size=self.ep_size,
-            attention_data_parallel_size=(
-                self.dp_size if self.enable_dp_attention else 1
-            ),
-            attention_context_model_parallel_size=self.attn_cp_size,
-            moe_data_model_parallel_size=self.moe_dp_size,
-        )
+        initialize_model_parallel()
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
         from sglang.srt.layers.dp_attention import initialize_dp_attention
@@ -277,7 +274,16 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        publish(server_args, role="weight_cache_daemon")
+        publish(
+            server_args,
+            role="weight_cache_daemon",
+            ranks=SpawnRanks(
+                world_rank=spawn_world_rank(
+                    server_args, tp_rank=self.tp_rank, pp_rank=self.pp_rank
+                ),
+                gpu_id=self.gpu_id,
+            ),
+        )
 
         from sglang.srt.layers.moe import initialize_moe_config
 
@@ -465,7 +471,7 @@ class WeightCacheDaemon:
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
-        if not self.server_args.enable_eplb:
+        if not get_exec().moe.enable_eplb:
             return
 
         from sglang.srt.eplb.expert_location import (

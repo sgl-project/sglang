@@ -11,10 +11,10 @@
 #
 # Test command:
 #   python3 -m pytest -q \
-#     test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py
+#     test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py
 #
 # Runtime-shape benchmark command:
-#   python3 test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py \
+#   python3 test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py \
 #     --benchmark \
 #     --shape-source runtime \
 #     --warmup 20 \
@@ -22,7 +22,7 @@
 #     --csv /data00/eval_results/operator_bench/runtime_shape_bench.csv
 #
 # Synthetic Flash/Pro shape benchmark command:
-#   python3 test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py \
+#   python3 test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py \
 #     --benchmark \
 #     --shape-source preset \
 #     --shape-presets all \

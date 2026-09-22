@@ -38,7 +38,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -129,6 +129,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -216,6 +217,91 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     return BatchStrOutput(**kwargs)
 
 
+class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.incremental_streaming_output = True
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.state = _make_req_state("engine_wait")
+        self.state.obj.stream = True
+        self.state.obj.background = False
+        self.tm.rid_to_state[self.state.obj.rid] = self.state
+
+    async def test_available_and_later_outputs_keep_order(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        first = {"output_ids": [1], "meta_info": {"finish_reason": None}}
+        final = {"output_ids": [2], "meta_info": {"finish_reason": {"type": "length"}}}
+        self.state.out_list.append(first)
+        self.state.event.set()
+        with patch(
+            "asyncio.wait_for",
+            side_effect=AssertionError("Engine installed an HTTP timeout"),
+        ):
+            self.assertEqual((await anext(stream))["output_ids"], [1])
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            self.assertFalse(pending.done())
+            self.state.out_list.append(final)
+            self.state.finished = True
+            self.state.event.set()
+            self.assertEqual((await pending)["output_ids"], [2])
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+    async def test_cancelling_pending_wait_removes_event_waiter(self):
+        stream = self.tm._wait_one_response(self.state.obj)
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        self.assertTrue(self.state.event._waiters)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertFalse(self.state.event._waiters)
+        await stream.aclose()
+
+    async def test_abort_and_shutdown_errors_wake_engine_iterator(self):
+        for status in (400, 500, 503):
+            with self.subTest(status=status):
+                state = _make_req_state(f"engine_abort_{status}")
+                state.obj.stream = True
+                self.tm.rid_to_state[state.obj.rid] = state
+                stream = self.tm._wait_one_response(state.obj)
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                self.tm._handle_abort_req(
+                    AbortReq(
+                        rid=state.obj.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": status,
+                            "message": "test",
+                        },
+                    )
+                )
+                result = await pending
+                self.assertEqual(
+                    result["meta_info"]["finish_reason"]["status_code"], status
+                )
+                self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(stream)
+
+    async def test_http_timeout_still_checks_disconnection(self):
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=True)
+        self.tm.abort_request = Mock()
+        stream = self.tm._wait_one_response(self.state.obj, request)
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 0.001
+        ):
+            with self.assertRaisesRegex(ValueError, "disconnected"):
+                await anext(stream)
+        request.is_disconnected.assert_awaited_once()
+        self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
+
+
 class TestRidToStateCleanupOnAbort(CustomTestCase):
     """Test that _handle_abort_req removes rid from rid_to_state."""
 
@@ -268,6 +354,51 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
+
+
+class TestAbortOutputPayload(CustomTestCase):
+    """An abort chunk is often the only thing a client sees;
+    it must carry the same optional fields as a normal finish chunk."""
+
+    def test_abort_includes_prompt_token_ids_only_when_requested(self):
+        """The abort chunk carries prompt_token_ids captured at tokenization,
+        and omits the field when the request did not ask for them."""
+        tm = _make_tokenizer_manager(self)
+        with_ids = _make_req_state("abort_prompt_ids_rid")
+        with_ids.prompt_token_ids = [1, 2, 3]
+        without_ids = _make_req_state("abort_no_prompt_ids_rid")
+
+        for state in (with_ids, without_ids):
+            tm.rid_to_state[state.obj.rid] = state
+            tm._handle_abort_req(_make_abort_req(state.obj.rid))
+
+        self.assertEqual(with_ids.out_list[0]["prompt_token_ids"], [1, 2, 3])
+        self.assertNotIn("prompt_token_ids", without_ids.out_list[0])
+
+    def test_abort_output_ids_match_the_streaming_mode(self):
+        """Only incremental streaming collapses the abort chunk to the last
+        token; cumulative chunks supersede, so they carry the whole generation.
+        """
+        cases = [
+            ("incremental stream", True, True, [7]),
+            ("cumulative stream", True, False, [5, 6, 7]),
+            ("non-stream", False, False, [5, 6, 7]),
+        ]
+        for name, is_stream, incremental, expected in cases:
+            with self.subTest(name):
+                tm = _make_tokenizer_manager(self)
+                tm.incremental_streaming_output = incremental
+                rid = f"abort_output_ids_{name}"
+                state = _make_req_state(rid)
+                state.obj.stream = is_stream
+                state.output_ids = [5, 6, 7]
+                tm.rid_to_state[rid] = state
+
+                tm._handle_abort_req(_make_abort_req(rid))
+
+                out = state.out_list[0]
+                self.assertEqual(out["output_ids"], expected)
+                self.assertEqual(out["meta_info"]["completion_tokens"], 3)
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
