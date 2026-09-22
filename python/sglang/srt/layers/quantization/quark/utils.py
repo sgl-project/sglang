@@ -55,21 +55,11 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
-    # Some checkpoints serialize an ALREADY-FUSED module and list that exact
-    # fused name in `exclude`. OneNexus/GLM-5.3-Flash-MXFP4 does: its vision
-    # tower ships visual.blocks.N.attn.qkv_proj as one tensor and all 125 such
-    # names appear verbatim in quantization_config.exclude. The packed-mapping
-    # expansion below rewrites that to q_proj/k_proj/v_proj, none of which are
-    # in `exclude`, so the layer is quantized while the checkpoint holds it
-    # unpacked. Honor a direct match before expanding.
+    # a fused module can be excluded under its fused name, so match it before expanding
     if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
         return True
 
-    # MoE exclusions may likewise be written PER EXPERT while SGLang fuses a
-    # layer's experts into a single FusedMoE module. The same checkpoint lists
-    # model.layers.{3,5,6}.mlp.experts.{0..287}.{down,gate,up}_proj -- 1728
-    # entries -- but the module is named model.layers.N.mlp.experts, which
-    # matches none of them, so those BF16 experts get loaded as MXFP4.
+    # excludes may name experts individually, so an excluded expert excludes the module
     if layer_name.endswith(".experts"):
         expert_prefix = layer_name + "."
         if any(
@@ -110,12 +100,9 @@ def should_ignore_layer(
                     "requires all to use the same scheme."
                 )
 
-    # Unfused layers like down_proj and o_proj will match
-    # the safetensors checkpoint already.
+    # an unfused name was already tried by the direct check above
     else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=layer_name, targets=ignore
-        )
+        should_ignore_layer = False
 
     assert should_ignore_layer is not None
 

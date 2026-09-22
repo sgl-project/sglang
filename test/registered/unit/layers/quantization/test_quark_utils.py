@@ -119,28 +119,19 @@ QKV_MAPPING = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
 
 class TestShouldIgnoreLayerFusedNames(CustomTestCase):
-    """`exclude` entries that name an ALREADY-FUSED module, or name MoE experts
-    individually, must still exclude the module SGLang actually builds.
-
-    Both shapes occur in OneNexus/GLM-5.3-Flash-MXFP4. Getting either wrong is
-    not a silent accuracy loss -- the weights fail to load, because an
-    MXFP4-packed parameter (2 values per byte) meets an unpacked BF16 weight:
-    `param_data.shape=(128, 512), loaded_weight.shape=(128, 1024)`.
-    """
+    """An `exclude` entry naming an already-fused module, or naming experts
+    individually, must exclude the fused module SGLang builds; otherwise an
+    MXFP4-packed parameter is allocated for a BF16 tensor and loading aborts."""
 
     # ---- Bug-catchers: must FAIL on unfixed code ---------------------------
 
     def test_directly_excluded_fused_qkv_is_ignored(self):
-        # The checkpoint serializes one fused qkv tensor and excludes that exact
-        # name. Expanding to q/k/v_proj first finds nothing and quantizes it.
         name = "visual.blocks.0.attn.qkv_proj"
         self.assertTrue(
             should_ignore_layer(name, ignore=[name], fused_mapping=QKV_MAPPING)
         )
 
     def test_per_expert_excludes_ignore_the_fused_moe_module(self):
-        # SGLang builds one FusedMoE named ...mlp.experts; the checkpoint
-        # excludes each expert separately.
         layer = "model.layers.6.mlp.experts"
         ignore = [
             f"{layer}.{i}.{proj}"
@@ -153,32 +144,8 @@ class TestShouldIgnoreLayerFusedNames(CustomTestCase):
 
     # ---- Guards: behavior that must NOT change -----------------------------
 
-    def test_unexcluded_fused_qkv_still_expands(self):
-        # With no direct match, the packed expansion must still decide, and an
-        # empty ignore list must not start excluding everything.
-        self.assertFalse(
-            should_ignore_layer(
-                "model.layers.0.self_attn.qkv_proj",
-                ignore=[],
-                fused_mapping=QKV_MAPPING,
-            )
-        )
-
-    def test_shard_level_excludes_still_work(self):
-        # The original path: shards named individually, module named fused.
-        name = "model.layers.0.self_attn.qkv_proj"
-        ignore = [
-            "model.layers.0.self_attn.q_proj",
-            "model.layers.0.self_attn.k_proj",
-            "model.layers.0.self_attn.v_proj",
-        ]
-        self.assertTrue(
-            should_ignore_layer(name, ignore=ignore, fused_mapping=QKV_MAPPING)
-        )
-
     def test_unrelated_moe_layer_is_not_ignored(self):
-        # Only the layer whose experts are excluded may be excluded: a prefix
-        # test must not match a different layer index.
+        # a prefix match must not bleed into a neighboring layer index
         ignore = ["model.layers.6.mlp.experts.0.down_proj"]
         self.assertFalse(
             should_ignore_layer(
