@@ -274,6 +274,13 @@ HTTP server-only arguments are ignored by `sglang generate`.
 
 For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](/docs/sglang-diffusion/cache_dit).
 
+Native conditioning reuse is enabled by default, independently of Cache-DiT:
+
+- `--disable-conditioning-cache`: disable cross-request text/image conditioning reuse and VAE posterior caching.
+- `--conditioning-cache-max-size-mb {MiB}`: CPU LRU capacity per executor/rank, default `512`; `0` disables. The cache holds at most 128 entries and bypasses oversized outputs.
+
+See [conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache) for model coverage, invalidation, and the distinction between cold and repeated-input latency.
+
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 LongCat-Image is supported by this path. Its DiT always consumes a fixed

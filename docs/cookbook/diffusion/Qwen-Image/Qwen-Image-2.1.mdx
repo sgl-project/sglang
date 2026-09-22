@@ -113,9 +113,12 @@ Qwen-Image 2.1 supports text-to-image generation, single- and multi-image editin
 and RGBA output. Use one checkpoint for all modes.
 
 For multi-round editing, send the previous output as the next reference image.
-The server does not retain conversation state. Condition-prefix KV caches are
-reused within one request; cross-request and dialogue-history caching are not
-implemented.
+The server does not retain conversation state. Repeated prompts and reference
+images can reuse exact encoder outputs and VAE posteriors through the default
+[conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache).
+Changing the prompt or image recomputes their joint embedding; unchanged images
+can still reuse vision features. Condition-prefix KV reuse stays within each
+request. Use `--disable-conditioning-cache` to turn off cross-request reuse.
 
 ## 3. Checkpoint layout
 

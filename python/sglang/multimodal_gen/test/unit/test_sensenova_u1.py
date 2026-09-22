@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import itertools
 import json
+import sys
 import time
+import types
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from transformers.cache_utils import DynamicCache
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -19,6 +24,10 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -54,6 +63,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation im
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
     _copy_right_aligned_prefix_bnsd,
+    _randn_with_generators,
     _randn_with_seed,
     prepare_flash_kv_cache,
 )
@@ -69,9 +79,6 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     npu_fia_available,
     position_ids_from_indexes,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
-    PipelineExecutor,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -81,26 +88,60 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    should_include_warmup_image,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 
 
 class _FakeSenseNovaModel:
-    def __init__(self):
+    def __init__(
+        self, output: torch.Tensor | None = None, error: Exception | None = None
+    ):
         self.call_kwargs = None
+        self.t2i_calls = []
+        self.it2i_calls = []
+        self.call_count = 0
+        self._error = error
+        self._output = (
+            output
+            if output is not None
+            else torch.tensor(
+                [
+                    [
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                        [[-1.0, 0.0], [0.5, 1.0]],
+                    ]
+                ]
+            )
+        )
+
+    def _output_for_batch(self, batch_size: int) -> torch.Tensor:
+        if self._output.shape[0] == batch_size:
+            return self._output
+        return self._output.repeat(batch_size, 1, 1, 1)
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
+        self.call_count += 1
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
-        sample = torch.tensor(
-            [
-                [
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                    [[-1.0, 0.0], [0.5, 1.0]],
-                ]
-            ]
-        )
-        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+        self.t2i_calls.append(self.call_kwargs)
+        if self._error is not None:
+            raise self._error
+        return self._output_for_batch(kwargs["batch_size"])
+
+    def it2i_generate(self, tokenizer, prompt, images, **kwargs):
+        self.call_count += 1
+        self.call_kwargs = {
+            "tokenizer": tokenizer,
+            "prompt": prompt,
+            "images": images,
+            **kwargs,
+        }
+        self.it2i_calls.append(self.call_kwargs)
+        if self._error is not None:
+            raise self._error
+        return self._output_for_batch(kwargs["batch_size"])
 
 
 class _FakeTokenizer:
@@ -133,6 +174,248 @@ def _supported_sensenova_config(**llm_overrides):
     )
 
 
+def _install_sensenova_cache_dit_stub(
+    monkeypatch,
+    *,
+    enable_error: Exception | None = None,
+    disable_error: Exception | None = None,
+):
+    calls = {"enable": [], "disable": [], "refresh": []}
+    module = types.ModuleType(
+        "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
+    )
+
+    class CacheDitConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    module.CacheDitConfig = CacheDitConfig
+    module.cache_dit_overrides_key = lambda overrides: tuple(sorted(overrides.items()))
+    module.resolve_cache_dit_request_overrides = lambda raw: dict(raw or {})
+    module.CACHE_DIT_DBCACHE_KEYS = frozenset(
+        {
+            "Fn_compute_blocks",
+            "Bn_compute_blocks",
+            "max_warmup_steps",
+            "residual_diff_threshold",
+            "max_continuous_cached_steps",
+        }
+    )
+    module.cache_dit_env_defaults = lambda: {
+        "Fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
+        "Bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
+        "max_warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
+        "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
+        "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
+    }
+
+    def enable_cache_on_transformer(transformer, config, **kwargs):
+        calls["enable"].append((transformer, config, kwargs))
+        if enable_error is not None:
+            # Model the important part of a real mid-mount failure: the
+            # transformer has already been mutated before enable raises.
+            transformer._partial_cache_dit_hook = True
+            raise enable_error
+        return transformer
+
+    def disable_cache_on_transformer(transformer):
+        calls["disable"].append(transformer)
+        if disable_error is not None:
+            raise disable_error
+        if hasattr(transformer, "_partial_cache_dit_hook"):
+            del transformer._partial_cache_dit_hook
+        return transformer
+
+    module.enable_cache_on_transformer = enable_cache_on_transformer
+    module.disable_cache_on_transformer = disable_cache_on_transformer
+
+    def refresh_context_on_transformer(transformer, steps, *, config=None):
+        calls["refresh"].append((transformer, steps, config))
+
+    module.refresh_context_on_transformer = refresh_context_on_transformer
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return calls
+
+
+def _cache_dit_server_args(*, enable_breakable_cuda_graph: bool = False):
+    return SimpleNamespace(
+        enable_breakable_cuda_graph=enable_breakable_cuda_graph,
+    )
+
+
+def _cache_dit_batch(
+    *,
+    num_inference_steps: int = 8,
+    guidance_scale: float = 1.0,
+    enable_cache_dit: bool | None = True,
+    cache_dit_params: dict | None = None,
+    extra: dict | None = None,
+):
+    """Request double carrying the fields the generation stage reads directly."""
+    return SimpleNamespace(
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
+        ),
+        extra={} if extra is None else extra,
+    )
+
+
+def _t2i_guidance_profile(cfg_scale: float) -> SenseNovaGuidanceProfile:
+    return derive_guidance_profile(
+        is_edit=False,
+        cfg_scale=cfg_scale,
+        img_cfg_scale=1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_edit", "cfg_scale", "img_cfg_scale", "expected_profile"),
+    [
+        (False, 0.5, 1.0, SenseNovaGuidanceProfile.CONDITION),
+        (False, 4.0, 1.0, SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL),
+        (True, 0.5, 1.0, SenseNovaGuidanceProfile.CONDITION_IMAGE),
+        (True, 1.0, 1.0, SenseNovaGuidanceProfile.CONDITION),
+        (True, 4.0, 1.0, SenseNovaGuidanceProfile.CONDITION_IMAGE),
+        (True, 4.0, 4.0, SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL),
+        (
+            True,
+            4.0,
+            2.0,
+            SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL,
+        ),
+    ],
+)
+def test_sensenova_u1_guidance_profile_matches_generation_schedule(
+    is_edit, cfg_scale, img_cfg_scale, expected_profile
+):
+    profile = derive_guidance_profile(
+        is_edit=is_edit,
+        cfg_scale=cfg_scale,
+        img_cfg_scale=img_cfg_scale,
+    )
+    assert profile is expected_profile
+    assert profile.branch_count == len(expected_profile.value)
+
+
+@pytest.mark.parametrize(
+    ("profile", "cfg_interval", "expected_enabled"),
+    [
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.0, 1.0), True),
+        (SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL, (0.0, 1.0), True),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL, (0.0, 1.0), False),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.2, 0.8), False),
+        (SenseNovaGuidanceProfile.CONDITION_IMAGE, (0.0, 0.5), False),
+    ],
+)
+def test_sensenova_u1_it2i_cache_dit_fails_closed_for_unsupported_schedules(
+    monkeypatch, profile, cfg_interval, expected_enabled
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+
+    stage._maybe_enable_cache_dit(
+        _cache_dit_batch(),
+        _cache_dit_server_args(),
+        guidance_profile=profile,
+        cfg_interval=cfg_interval,
+    )
+
+    assert bool(calls["enable"]) is expected_enabled
+    if expected_enabled:
+        assert calls["enable"][0][2]["has_separate_cfg"] is profile.has_separate_cfg
+
+
+def test_sensenova_u1_cache_dit_requires_an_explicit_guidance_profile():
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+
+    with pytest.raises(TypeError, match="guidance_profile"):
+        stage._maybe_enable_cache_dit(
+            _cache_dit_batch(),
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+        )
+
+
+class _CacheDitRecordingBlock(torch.nn.Module):
+    def __init__(self, transform=None):
+        super().__init__()
+        self.calls = []
+        self.attention_type = "full_attention"
+        self.transform = transform or (lambda hidden_states: hidden_states + 1)
+
+    def forward(self, hidden_states, *, sensenova_marker=None, **kwargs):
+        self.calls.append((sensenova_marker, kwargs))
+        return self.transform(hidden_states)
+
+
+class _CacheDitSenseNovaTransformer(torch.nn.Module):
+    """Small SenseNova-shaped transformer for the real cache-dit wrapper test."""
+
+    def __init__(self, layers=None):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            layers
+            if layers is not None
+            else [_CacheDitRecordingBlock(), _CacheDitRecordingBlock()]
+        )
+        self.config = SimpleNamespace(num_hidden_layers=2)
+        self.used_native_layers = []
+
+    def forward(
+        self,
+        hidden_states,
+        *,
+        image_gen_indicators=None,
+        update_cache=True,
+        sensenova_marker=None,
+    ):
+        exist_non_image_gen_tokens = image_gen_indicators is None or bool(
+            (~image_gen_indicators).any().item()
+        )
+        exist_image_gen_tokens = image_gen_indicators is not None and bool(
+            image_gen_indicators.any().item()
+        )
+        layers = self.layers
+        native_layers = getattr(self, "_sensenova_cache_dit_native_layers", None)
+        if native_layers is not None and (
+            update_cache or exist_non_image_gen_tokens or not exist_image_gen_tokens
+        ):
+            layers = native_layers
+        self.used_native_layers.append(layers is native_layers)
+
+        for layer in layers:
+            hidden_states = layer(
+                hidden_states,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                update_cache=update_cache,
+                sensenova_marker=sensenova_marker,
+            )
+        return hidden_states
+
+
+_CacheDitQwen3Model = type(
+    "Qwen3Model",
+    (_CacheDitSenseNovaTransformer,),
+    {
+        "__module__": (
+            "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3"
+        )
+    },
+)
+
+
 class _RecordingTraceContext:
     tracing_enable = True
 
@@ -140,6 +423,9 @@ class _RecordingTraceContext:
         self.finish_count = 0
         self.started_slices = []
         self.finished_slices = []
+
+    def rebuild_thread_context(self):
+        pass
 
     def trace_req_finish(self):
         self.finish_count += 1
@@ -151,58 +437,34 @@ class _RecordingTraceContext:
         self.finished_slices.append((name, level))
 
 
-class _SequentialTestExecutor(PipelineExecutor):
-    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
-        super().__init__(server_args)
-        self.fail = fail
-        self.fail_request_ids = set(fail_request_ids or [])
-        self.executed_requests = []
+class _DirectDispatchPipeline:
+    """Mirrors the two real stages this test cares about: input validation
+    then generation. No executor/expansion machinery -- ``execute_forward``
+    calls ``pipeline.forward`` directly for a non-expanding request."""
 
-    def execute_group(self, stages, batches, server_args):
-        for batch in batches:
-            batch.metrics.record_stage("InputValidationStage", 0.125)
-            batch.metrics.record_memory_snapshot(
-                "after_validation",
-                MemorySnapshot(
-                    allocated_mb=100.0,
-                    reserved_mb=200.0,
-                    peak_allocated_mb=300.0,
-                    peak_reserved_mb=400.0,
-                ),
-            )
-        return batches
-
-    def execute(self, stages, batch, server_args):
-        self.executed_requests.append(batch)
-        if self.fail or batch.request_id in self.fail_request_ids:
-            raise RuntimeError(f"generation failed for {batch.request_id}")
-        return OutputBatch(
-            output_file_paths=[batch.output_file_name],
-            metrics=batch.metrics,
-        )
-
-
-class _SequentialTestPipeline:
-    def __init__(self, server_args, *, fail=False, fail_request_ids=None):
+    def __init__(self, generation_stage):
         self.input_stage = InputValidationStage()
-        self.executor = _SequentialTestExecutor(
-            server_args,
-            fail=fail,
-            fail_request_ids=fail_request_ids,
-        )
+        self.generation_stage = generation_stage
+        self.forward_calls = 0
 
-    def forward_batch_sequentially(self, batches, server_args):
-        return self.executor.execute_group_sequentially(
-            [self.input_stage, object()], batches, server_args
-        )
+    def forward(self, batch, server_args):
+        self.forward_calls += 1
+        batch = self.input_stage.forward(batch, server_args)
+        return self.generation_stage.forward(batch, server_args)
 
 
-class _WorkerBackedSchedulerClient:
-    def __init__(self, worker):
-        self.worker = worker
+class _SchedulerDispatchedSchedulerClient:
+    """Drives the real ``Scheduler._handle_generation`` dispatch decision on a
+    bare, un-``__init__``-ed instance, instead of forcing a specific worker
+    method the way a hand-rolled fake would."""
+
+    def __init__(self, worker, server_args):
+        self._scheduler = Scheduler.__new__(Scheduler)
+        self._scheduler.worker = worker
+        self._scheduler.server_args = server_args
 
     async def forward(self, batches):
-        return next(self.worker.execute_forward_sequentially(batches))
+        return self._scheduler._handle_generation(batches)
 
 
 @pytest.mark.parametrize(
@@ -744,6 +1006,9 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
         "cfg_interval": (0.0, 1.0),
         "t_eps": 0.02,
         "think_mode": False,
+        "img_cfg_scale": 1.0,
+        "input_max_pixels": None,
+        "do_resize": True,
     }
 
 
@@ -764,11 +1029,112 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
     assert params.data_type == DataType.IMAGE
 
 
+def test_sensenova_u1_resolves_edit_auto_size_from_first_input_ratio():
+    assert resolve_sensenova_u1_edit_auto_size(416, 608) == (1408, 2048)
+    assert resolve_sensenova_u1_edit_auto_size(1600, 800) == (2048, 1024)
+    assert resolve_sensenova_u1_edit_auto_size(100, 1000) == (512, 2048)
+
+
+def test_sensenova_u1_detects_explicit_size_fields():
+    assert has_sensenova_u1_explicit_size({"size"})
+    assert has_sensenova_u1_explicit_size({"width"})
+    assert has_sensenova_u1_explicit_size({"height"})
+    assert not has_sensenova_u1_explicit_size({"prompt", "image_path"})
+
+
+def test_sensenova_u1_sampling_adjust_scales_first_input_to_2k_long_side(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (2048, 1024)
+
+
+def test_sensenova_u1_sampling_adjust_uses_preprocessed_image_size(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+
+    def load_transposed_image(path, convert_method=None):
+        assert path == str(image_path)
+        image = Image.new("RGB", (800, 1600))
+        return convert_method(image) if convert_method is not None else image
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.sample.sensenova_u1.load_image",
+        load_transposed_image,
+    )
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 2048)
+
+
+def test_sensenova_u1_sampling_adjust_preserves_explicit_size(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=1024,
+        height=1024,
+    )
+    params._explicit_fields = {"prompt", "image_path", "size"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 1024)
+
+
 def test_sensenova_u1_scheduler_capabilities():
     config = SenseNovaU1PipelineConfig()
 
+    assert config.task_type.name == "TI2I"
     assert config.supports_dynamic_batching()
-    assert config.supports_sequential_multi_output_inference()
+    assert not config.supports_sequential_multi_output_inference()
+
+
+def test_sensenova_u1_warmup_defaults_to_text_to_image_signature():
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(),
+        enable_breakable_cuda_graph=False,
+    )
+
+    assert should_include_warmup_image(server_args, server_based_warmup=True) is False
+    assert should_include_warmup_image(server_args, server_based_warmup=False) is False
 
 
 def _make_sensenova_u1_scheduler_request(
@@ -801,28 +1167,15 @@ def test_sensenova_u1_batch_cost_tracks_resolution_steps_and_cfg():
     assert config.estimate_request_cost(batch) == 32 * 32 * 5 * 2
 
 
-def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
+def test_sensenova_u1_native_multi_output_request_can_batch_with_itself():
     scheduler = object.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    sampling = SenseNovaU1SamplingParams(
-        prompt="a mountain lake", num_outputs_per_prompt=2
-    )
-    request = SimpleNamespace(
-        is_warmup=False,
-        realtime_session_id=None,
-        session=None,
-        prompt=sampling.prompt,
-        image_path=None,
-        return_file_paths_only=False,
-        num_outputs_per_prompt=2,
-        sampling_params=sampling,
+    request = _make_sensenova_u1_scheduler_request(
+        "request-0", "a mountain lake", 42, num_outputs_per_prompt=2
     )
 
-    assert not scheduler._can_dynamic_batch(request, request)
-    assert (
-        scheduler._get_dynamic_batch_reject_reason(request, request)
-        == "sequential_multi_output"
-    )
+    assert scheduler._can_dynamic_batch(request, request)
+    assert scheduler._get_dynamic_batch_reject_reason(request, request) is None
 
 
 def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
@@ -1100,7 +1453,6 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
         ({"use_fsdp_inference": True}, "FSDP inference"),
         ({"direct_gpu_weight_loading": True}, "direct-gpu-weight-loading"),
         ({"enable_torch_compile": True}, "torch.compile"),
-        ({"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"}, "LoRA adapters"),
         (
             {"component_residency": {"transformer": "component-offload"}},
             "component residency offload",
@@ -1218,27 +1570,84 @@ def test_sensenova_u1_rejects_video_frame_count():
 def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     args = SimpleNamespace(
         prompt="hello",
+        image_path="image_google.png",
         width=2304,
         height=4096,
         guidance_scale=4.5,
         num_inference_steps=30,
         num_outputs_per_prompt=2,
+        profile=True,
+        profile_all_stages=True,
+        num_profiled_timesteps=3,
+        perf_dump_path="/tmp/sensenova-perf.json",
         cfg_norm="global",
         timestep_shift=9.0,
         think_mode=True,
+        enable_cache_dit=True,
+        cache_dit_params={"residual_diff_threshold": 0.1},
     )
 
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
 
     assert cli_args["prompt"] == "hello"
+    assert cli_args["image_path"] == "image_google.png"
     assert cli_args["width"] == 2304
     assert cli_args["height"] == 4096
     assert cli_args["guidance_scale"] == 4.5
     assert cli_args["num_inference_steps"] == 30
     assert cli_args["num_outputs_per_prompt"] == 2
+    assert cli_args["enable_cache_dit"] is True
+    assert cli_args["cache_dit_params"] == {"residual_diff_threshold": 0.1}
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
     assert "think_mode" not in cli_args
+    request = Req(sampling_params=SenseNovaU1SamplingParams(**cli_args))
+    assert request.profile
+    assert request.profile_all_stages
+    assert request.num_profiled_timesteps == 3
+    assert request.perf_dump_path == "/tmp/sensenova-perf.json"
+
+
+def test_sensenova_u1_generation_stage_loads_image_path_rgba_with_white_background(
+    tmp_path,
+):
+    image_path = tmp_path / "transparent.png"
+    image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+    image.putpixel((1, 0), (255, 0, 0, 255))
+    image.save(image_path)
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=2048,
+        height=2048,
+        seed=7,
+        do_resize=False,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=None,
+        image_path=str(image_path),
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(7),
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    loaded = model.it2i_calls[0]["images"][0]
+    assert loaded.mode == "RGB"
+    assert loaded.getpixel((0, 0)) == (255, 255, 255)
+    assert loaded.getpixel((1, 0)) == (255, 0, 0)
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
@@ -1250,6 +1659,7 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         num_inference_steps=30,
         seed=123,
     )
+    generator = torch.Generator().manual_seed(123)
     batch = SimpleNamespace(
         prompt=sampling.prompt,
         width=sampling.width,
@@ -1260,11 +1670,13 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         num_outputs_per_prompt=sampling.num_outputs_per_prompt,
         extra=sampling.build_request_extra(),
         metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=generator,
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
 
-    output = stage.forward(batch, server_args=SimpleNamespace())
+    output = stage.forward(batch, server_args=_cache_dit_server_args())
 
     assert len(output.output) == 1
     assert torch.allclose(
@@ -1277,13 +1689,570 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
             ]
         ),
     )
+    assert model.call_count == 1
     assert model.call_kwargs["tokenizer"] == "tok"
     assert model.call_kwargs["prompt"] == "a mountain lake"
     assert model.call_kwargs["image_size"] == (2304, 4096)
     assert model.call_kwargs["cfg_scale"] == 4.5
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
-    assert model.call_kwargs["seed"] == 123
+    assert model.call_kwargs["generators"] == [generator]
+    assert len(model.t2i_calls) == 1
+    assert model.it2i_calls == []
+
+
+def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="make the sky orange",
+        width=2048,
+        height=2048,
+        guidance_scale=3.5,
+        img_cfg_scale=1.25,
+        cfg_norm="channel",
+        input_max_pixels=512 * 512,
+        seed=11,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGBA", (64, 32), (255, 0, 0, 128))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(11),
+    )
+    model = _FakeSenseNovaModel()
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert len(output.output) == 1
+    assert model.t2i_calls == []
+    assert len(model.it2i_calls) == 1
+    call = model.it2i_calls[0]
+    assert call["tokenizer"] == "tok"
+    assert call["prompt"] == "make the sky orange"
+    assert call["image_size"] == (2048, 1024)
+    assert call["cfg_scale"] == 3.5
+    assert call["img_cfg_scale"] == 1.25
+    assert call["cfg_norm"] == "channel"
+    assert call["num_steps"] == 50
+    assert len(call["generators"]) == 1
+    assert call["generators"][0].initial_seed() == 11
+    assert len(call["images"]) == 1
+    assert call["images"][0].mode == "RGB"
+    assert call["images"][0].size != (64, 32)
+
+
+def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace the text",
+        width=1024,
+        height=1024,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (1600, 800))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    out_width, out_height = model.it2i_calls[0]["image_size"]
+    assert (out_width, out_height) == (2048, 1024)
+    assert out_width % 32 == 0
+    assert out_height % 32 == 0
+    assert abs((out_width / out_height) - 2.0) < 0.05
+    assert (batch.width, batch.height) == (out_width, out_height)
+
+
+def test_sensenova_u1_it2i_preserves_explicit_output_size():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace the text",
+        width=1024,
+        height=1024,
+    )
+    sampling._explicit_fields = {"width", "height"}
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (1600, 800))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert model.it2i_calls[0]["image_size"] == (1024, 1024)
+    assert (batch.width, batch.height) == (1024, 1024)
+
+
+def test_sensenova_u1_generation_stage_rejects_cfg_zero_star_for_it2i():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="edit",
+        width=2048,
+        height=2048,
+        cfg_norm="cfg_zero_star",
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (64, 64))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(sampling.seed),
+    )
+
+    with pytest.raises(ValueError, match="cfg_zero_star"):
+        SenseNovaU1GenerationStage(
+            model=_FakeSenseNovaModel(), tokenizer="tok"
+        ).forward(batch, server_args=SimpleNamespace())
+
+
+def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
+    monkeypatch,
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch(
+        guidance_scale=4.0,
+        cache_dit_params={
+            "Fn_compute_blocks": 3,
+            "Bn_compute_blocks": 1,
+            "max_warmup_steps": 2,
+            "residual_diff_threshold": 0.1,
+            "max_continuous_cached_steps": 4,
+        },
+    )
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+
+    assert len(calls["enable"]) == 1
+    assert transformer._sensenova_cache_dit_native_layers is transformer.layers
+    assert transformer._sensenova_cache_dit_attention_type == "full_attention"
+    config = calls["enable"][0][1]
+    assert config.kwargs["num_inference_steps"] == 8
+    assert config.kwargs["Fn_compute_blocks"] == 3
+    assert config.kwargs["Bn_compute_blocks"] == 1
+    assert config.kwargs["max_warmup_steps"] == 2
+    assert config.kwargs["residual_diff_threshold"] == 0.1
+    assert config.kwargs["max_continuous_cached_steps"] == 4
+    assert calls["enable"][0][2]["has_separate_cfg"] is True
+
+    # A sequential n>1 request enters the generation stage once per output.
+    # The second output refreshes the context instead of remounting Cache-DiT.
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    assert len(calls["refresh"]) == 1
+    refreshed_transformer, refreshed_steps, refreshed_config = calls["refresh"][0]
+    assert refreshed_transformer is transformer
+    assert refreshed_steps == 8
+    assert refreshed_config is config
+    assert refreshed_config.kwargs == config.kwargs
+
+    batch.sampling_params.enable_cache_dit = False
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    assert calls["disable"] == [transformer]
+    assert stage._cache_dit_active_config is None
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+@pytest.mark.parametrize("prior_enabled", [False, True])
+@pytest.mark.parametrize("disable_reason", ["explicit", "cuda_graph", "partial_cfg"])
+def test_sensenova_u1_disabled_cache_ignores_params(
+    monkeypatch, prior_enabled, disable_reason
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    batch = _cache_dit_batch(guidance_scale=4.0)
+    server_args = _cache_dit_server_args()
+    cfg_interval = (0.0, 1.0)
+    if prior_enabled:
+        stage._maybe_enable_cache_dit(
+            batch,
+            server_args,
+            cfg_interval=cfg_interval,
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
+
+    # A shared client config may retain knobs that SenseNova does not support.
+    batch.sampling_params.cache_dit_params = {"enable_taylorseer": False}
+    if disable_reason == "explicit":
+        batch.sampling_params.enable_cache_dit = False
+    elif disable_reason == "cuda_graph":
+        server_args.enable_breakable_cuda_graph = True
+    else:
+        cfg_interval = (0.2, 0.8)
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        server_args,
+        cfg_interval=cfg_interval,
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+
+    assert len(calls["enable"]) == int(prior_enabled)
+    assert calls["disable"] == ([transformer] if prior_enabled else [])
+    assert calls["refresh"] == []
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_active_config is None
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+def test_sensenova_u1_forward_guards_on_the_request_cfg_interval(monkeypatch):
+    """A timestep-gated CFG interval must reach the guard that vetoes the mount."""
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = _FakeSenseNovaModel()
+    model.language_model = SimpleNamespace(model=transformer)
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        prompt="a mountain lake",
+        width=64,
+        height=64,
+        guidance_scale=4.0,
+        num_inference_steps=8,
+        seed=7,
+        num_outputs_per_prompt=1,
+        extra={SENSENOVA_U1_REQUEST_EXTRA_KEY: {"cfg_interval": (0.2, 0.8)}},
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    stage.forward(batch, server_args=_cache_dit_server_args())
+
+    assert calls == {"enable": [], "disable": [], "refresh": []}
+    assert model.call_kwargs["cfg_interval"] == (0.2, 0.8)
+
+
+def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
+    mount_error = RuntimeError("cache-dit mount failed")
+    calls = _install_sensenova_cache_dit_stub(monkeypatch, enable_error=mount_error)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch()
+
+    with pytest.raises(RuntimeError, match="cache-dit mount failed"):
+        stage._maybe_enable_cache_dit(
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
+
+    assert calls["disable"] == [transformer]
+    assert not hasattr(transformer, "_partial_cache_dit_hook")
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_cleanup_required is False
+
+
+def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(
+        monkeypatch,
+        enable_error=RuntimeError("cache-dit mount failed"),
+        disable_error=RuntimeError("cache-dit cleanup failed"),
+    )
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch()
+
+    # Preserve the original mount error even when its rollback also fails.
+    with pytest.raises(RuntimeError, match="cache-dit mount failed"):
+        stage._maybe_enable_cache_dit(
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
+
+    assert stage._cache_dit_enabled is False
+    assert stage._cache_dit_active_key is None
+    assert stage._cache_dit_cleanup_required is True
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+    # A later ordinary request must retry cleanup and fail closed instead of
+    # reaching the early return while the transformer may still be wrapped.
+    batch.sampling_params.enable_cache_dit = False
+    with pytest.raises(RuntimeError, match="cache-dit cleanup failed"):
+        stage._maybe_enable_cache_dit(
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
+
+    assert calls["disable"] == [transformer, transformer]
+    assert stage._cache_dit_cleanup_required is True
+
+
+@pytest.mark.parametrize(
+    ("first_guidance_scale", "second_guidance_scale"),
+    [(4.0, 1.0), (1.0, 4.0)],
+)
+def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
+    monkeypatch, first_guidance_scale, second_guidance_scale
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch(
+        guidance_scale=first_guidance_scale,
+        cache_dit_params={"residual_diff_threshold": 0.1},
+    )
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    batch.guidance_scale = second_guidance_scale
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+
+    assert len(calls["enable"]) == 2
+    assert calls["disable"] == [transformer]
+    assert calls["refresh"] == []
+    assert [call[2]["has_separate_cfg"] for call in calls["enable"]] == [
+        first_guidance_scale > 1.0,
+        second_guidance_scale > 1.0,
+    ]
+
+
+def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
+    pytest.importorskip("cache_dit")
+
+    transformer = _CacheDitQwen3Model()
+    native_layers = transformer.layers
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch(
+        num_inference_steps=2,
+        cache_dit_params={
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 2,
+            "residual_diff_threshold": 0.1,
+        },
+    )
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    try:
+        inputs = torch.zeros(1, 2, 4)
+        transformer(
+            inputs,
+            image_gen_indicators=torch.zeros(1, 2, dtype=torch.bool),
+            update_cache=True,
+            sensenova_marker="prefix",
+        )
+        transformer(
+            inputs,
+            image_gen_indicators=torch.ones(1, 2, dtype=torch.bool),
+            update_cache=False,
+            sensenova_marker="denoise",
+        )
+
+        # cache-dit patches ``layers`` only inside its forward wrapper.
+        # Prefix/text selects the preserved ModuleList, while pure denoising
+        # selects the real UnifiedBlocks wrapper. Both native blocks must still
+        # receive SenseNova's model-specific kwargs through that wrapper.
+        assert transformer.used_native_layers == [True, False]
+        assert transformer.layers is native_layers
+        assert hasattr(transformer, "_original_forward")
+        for layer in native_layers:
+            assert [call[0] for call in layer.calls] == ["prefix", "denoise"]
+            denoise_kwargs = layer.calls[1][1]
+            assert denoise_kwargs["exist_non_image_gen_tokens"] is False
+            assert denoise_kwargs["exist_image_gen_tokens"] is True
+            assert denoise_kwargs["update_cache"] is False
+    finally:
+        stage._unmount_cache_dit()
+
+    assert transformer.layers is native_layers
+    assert not hasattr(transformer, "_original_forward")
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+def test_sensenova_u1_real_cache_dit_wrapper_isolates_cfg_residuals():
+    pytest.importorskip("cache_dit")
+
+    transformer = _CacheDitQwen3Model(
+        layers=[
+            _CacheDitRecordingBlock(transform=lambda hidden_states: hidden_states),
+            _CacheDitRecordingBlock(transform=lambda hidden_states: hidden_states * 2),
+        ]
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = _cache_dit_batch(
+        guidance_scale=4.0,
+        num_inference_steps=2,
+        cache_dit_params={
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 1,
+            # Force the second visit to each branch to consume its cached
+            # residual, making cross-branch state immediately observable.
+            "residual_diff_threshold": 1.0,
+        },
+    )
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL,
+    )
+    try:
+        indicators = torch.ones(1, 1, dtype=torch.bool)
+
+        def denoise(value, marker):
+            return transformer(
+                torch.full((1, 1, 1), value),
+                image_gen_indicators=indicators,
+                update_cache=False,
+                sensenova_marker=marker,
+            )
+
+        # First pair populates residuals: +1 for condition, +10 for uncondition.
+        torch.testing.assert_close(denoise(1.0, "condition-0"), torch.tensor([[[2.0]]]))
+        torch.testing.assert_close(
+            denoise(10.0, "uncondition-0"), torch.tensor([[[20.0]]])
+        )
+
+        # Each second-pass result must use its own branch's previous residual.
+        torch.testing.assert_close(denoise(2.0, "condition-1"), torch.tensor([[[3.0]]]))
+        torch.testing.assert_close(
+            denoise(20.0, "uncondition-1"), torch.tensor([[[30.0]]])
+        )
+    finally:
+        stage._unmount_cache_dit()
+
+
+def test_sensenova_u1_invalid_generator_count_does_not_mount_cache_dit(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        enable_cache_dit=True,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+        generator=[torch.Generator().manual_seed(42)],
+    )
+
+    with pytest.raises(ValueError, match="Expected 2 generators, got 1"):
+        stage.forward(batch, server_args=_cache_dit_server_args())
+
+    assert calls == {"enable": [], "disable": [], "refresh": []}
 
 
 def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
@@ -1308,11 +2277,16 @@ def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
             "dynamic_batch_seeds": [7, 19],
         },
         metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=[
+            torch.Generator().manual_seed(7),
+            torch.Generator().manual_seed(19),
+        ],
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
 
-    output = stage.forward(batch, server_args=SimpleNamespace())
+    output = stage.forward(batch, server_args=_cache_dit_server_args())
 
     assert len(output.output) == 2
     assert model.call_kwargs["prompt"] == [
@@ -1320,7 +2294,7 @@ def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
         "a longer second prompt",
     ]
     assert model.call_kwargs["batch_size"] == 2
-    assert model.call_kwargs["seed"] == [7, 19]
+    assert [g.initial_seed() for g in model.call_kwargs["generators"]] == [7, 19]
 
 
 def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
@@ -1343,20 +2317,111 @@ def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
             "dynamic_batch_seeds": [7, 19],
         },
         metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
     )
 
     with pytest.raises(ValueError, match="think_mode"):
         SenseNovaU1GenerationStage(
             model=_FakeSenseNovaModel(), tokenizer="tok"
-        ).forward(batch, server_args=SimpleNamespace())
+        ).forward(batch, server_args=_cache_dit_server_args())
 
 
-def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
+def test_sensenova_u1_generation_stage_uses_native_multi_output_batch():
+    g0 = torch.Generator().manual_seed(42)
+    g1 = torch.Generator().manual_seed(43)
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
         height=4096,
         num_outputs_per_prompt=2,
+        # Keep the fake model off the Cache-DiT path regardless of SGLANG_* env.
+        enable_cache_dit=False,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        generator=[g0, g1],
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+    )
+    model = _FakeSenseNovaModel(output=torch.zeros(2, 3, 64, 64))
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert model.call_count == 1
+    assert model.call_kwargs["batch_size"] == 2
+    assert model.call_kwargs["generators"] == [g0, g1]
+    assert len(output.output) == 2
+
+
+def test_sensenova_u1_rejects_generator_count_mismatch():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        generator=[torch.Generator().manual_seed(42)],
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+    )
+    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
+
+    with pytest.raises(ValueError, match="Expected 2 generators, got 1"):
+        stage.forward(batch, server_args=SimpleNamespace())
+
+
+def test_sensenova_u1_batched_generators_match_independent_rng():
+    shape = (2, 3, 8, 8)
+
+    batched = _randn_with_generators(
+        shape,
+        device="cpu",
+        dtype=torch.float32,
+        generators=[
+            torch.Generator().manual_seed(42),
+            torch.Generator().manual_seed(43),
+        ],
+    )
+
+    expected_0 = torch.randn(
+        (1, 3, 8, 8),
+        generator=torch.Generator().manual_seed(42),
+        dtype=torch.float32,
+    )
+    expected_1 = torch.randn(
+        (1, 3, 8, 8),
+        generator=torch.Generator().manual_seed(43),
+        dtype=torch.float32,
+    )
+    expected = torch.cat([expected_0, expected_1], dim=0)
+
+    torch.testing.assert_close(batched, expected)
+
+
+def test_sensenova_u1_multi_output_request_is_not_expanded():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        seed=42,
     )
     batch = Req(
         request_id="req-0",
@@ -1365,63 +2430,27 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
         height=sampling.height,
         guidance_scale=sampling.guidance_scale,
         num_inference_steps=sampling.num_inference_steps,
-        seed=42,
+        seed=sampling.seed,
         sampling_params=sampling,
         extra=sampling.build_request_extra(),
         output_file_name="sample.png",
     )
-    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    input_stage = InputValidationStage()
-    stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
-    batch.metrics.record_stage("InputValidationStage", 0.125)
-    batch.metrics.record_memory_snapshot(
-        "after_validation",
-        MemorySnapshot(
-            allocated_mb=100.0,
-            reserved_mb=200.0,
-            peak_allocated_mb=300.0,
-            peak_reserved_mb=400.0,
-        ),
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), enable_cfg_parallel=False
     )
+    stage = InputValidationStage()
 
-    expanded = list(input_stage.iter_sequential_requests(batch, server_args))
+    batch = stage.forward(batch, server_args)
+    requests = list(stage.iter_sequential_requests(batch, server_args))
 
-    assert [req.num_outputs_per_prompt for req in expanded] == [1, 1]
-    assert [req.seed for req in expanded] == [42, 43]
-    assert [req.request_id for req in expanded] == ["req-0:0", "req-0:1"]
-    assert [req.output_file_name for req in expanded] == [
-        "sample_0.png",
-        "sample_1.png",
-    ]
-    assert [req.metrics.request_id for req in expanded] == ["req-0:0", "req-0:1"]
-    assert all(req.trace_ctx is batch.trace_ctx for req in expanded)
-    assert all(req.metrics is not batch.metrics for req in expanded)
-    assert expanded[0].metrics is not expanded[1].metrics
-    assert all(
-        req.metrics.stages == {"InputValidationStage": 125.0} for req in expanded
-    )
-    assert all(
-        req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for req in expanded
-    )
-    assert (
-        expanded[0].metrics.memory_snapshots["after_validation"]
-        is not expanded[1].metrics.memory_snapshots["after_validation"]
-    )
+    assert len(requests) == 1
+    assert requests[0] is batch
 
-    expanded[0].metrics.record_stage("child-only", 0.5)
-    expanded[0].metrics.memory_snapshots["after_validation"].peak_reserved_mb = 999.0
-    assert "child-only" not in expanded[1].metrics.stages
-    assert "child-only" not in batch.metrics.stages
-    assert (
-        expanded[1].metrics.memory_snapshots["after_validation"].peak_reserved_mb
-        == 400.0
-    )
-    assert batch.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-
-    for req in expanded:
-        output = stage.forward(req, server_args=SimpleNamespace())
-        assert len(output.output) == 1
+    assert batch.num_outputs_per_prompt == 2
+    assert batch.seeds == [42, 43]
+    assert len(batch.generator) == 2
+    assert batch.generator[0].initial_seed() == 42
+    assert batch.generator[1].initial_seed() == 43
 
 
 def test_sensenova_u1_multi_output_rejects_short_seed_list():
@@ -1447,10 +2476,14 @@ def test_sensenova_u1_multi_output_rejects_short_seed_list():
     server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
 
     with pytest.raises(ValueError, match="seed list length"):
-        list(InputValidationStage().iter_sequential_requests(batch, server_args))
+        InputValidationStage().forward(batch, server_args)
 
 
-def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=None):
+def _make_sensenova_u1_dispatch_entrypoint(model=None):
+    """Build a parent n=2 request and drive it through the real
+    ``Scheduler._handle_generation`` dispatch decision, not a hand-forced
+    worker method -- so the test fails if dispatch ever regresses back to
+    per-output expansion for a model that opted out of it."""
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -1469,12 +2502,15 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         sampling_params=sampling,
         extra=sampling.build_request_extra(),
         output_file_name="sample.png",
+        output_path="",
         trace_ctx=trace_ctx,
     )
-    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    pipeline = _SequentialTestPipeline(
-        server_args, fail=fail, fail_request_ids=fail_request_ids
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(), enable_cfg_parallel=False
     )
+    model = model or _FakeSenseNovaModel(output=torch.zeros(2, 3, 2, 2))
+    generation_stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    pipeline = _DirectDispatchPipeline(generation_stage)
     worker = GPUWorker.__new__(GPUWorker)
     worker.pipeline = pipeline
     worker.server_args = server_args
@@ -1482,7 +2518,9 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
     worker._runtime_peak_reserved_mb = 0.0
     worker._release_warmup_pool_before_serving = False
     worker._realtime_sessions = SimpleNamespace(attach=lambda _req: None)
-    return batch, trace_ctx, pipeline.executor, _WorkerBackedSchedulerClient(worker)
+    worker.memory_occupation = None
+    scheduler_client = _SchedulerDispatchedSchedulerClient(worker, server_args)
+    return batch, trace_ctx, pipeline, model, scheduler_client
 
 
 def _force_cpu_entrypoint(monkeypatch):
@@ -1497,80 +2535,740 @@ def _force_cpu_entrypoint(monkeypatch):
 
 def test_sensenova_u1_multi_output_entrypoint_success(monkeypatch):
     _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint()
+    batch, trace_ctx, pipeline, model, scheduler_client = (
+        _make_sensenova_u1_dispatch_entrypoint()
     )
 
     paths, result = asyncio.run(process_generation_batch(scheduler_client, batch))
 
     assert paths == ["sample_0.png", "sample_1.png"]
     assert result.error is None
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert [req.seed for req in executor.executed_requests] == [42, 43]
-    assert result.metrics_list is not None
-    assert [metrics.request_id for metrics in result.metrics_list] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(
-        "InputValidationStage" in metrics.stages
-        and "PipelineExecutor.sequential_wait" in metrics.stages
-        and metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for metrics in result.metrics_list
-    )
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert len(result.output) == 2
+    assert pipeline.forward_calls == 1
+    assert model.call_count == 1
+    assert model.call_kwargs["batch_size"] == 2
+    assert trace_ctx.started_slices == [("scheduler_dispatch", 1), ("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2), ("scheduler_dispatch", 1)]
     assert trace_ctx.finish_count == 1
 
 
 def test_sensenova_u1_multi_output_entrypoint_failure(monkeypatch):
     _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint(fail=True)
-    )
-
-    with pytest.raises(RuntimeError, match="generation failed for req-0:0"):
-        asyncio.run(process_generation_batch(scheduler_client, batch))
-
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(
-        "InputValidationStage" in req.metrics.stages
-        and "PipelineExecutor.sequential_wait" in req.metrics.stages
-        and req.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
-        for req in executor.executed_requests
-    )
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finish_count == 1
-
-
-@pytest.mark.parametrize("failed_request_id", ["req-0:0", "req-0:1"])
-def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
-    monkeypatch, failed_request_id
-):
-    _force_cpu_entrypoint(monkeypatch)
-    batch, trace_ctx, executor, scheduler_client = (
-        _make_sensenova_u1_sequential_entrypoint(fail_request_ids={failed_request_id})
+    batch, trace_ctx, pipeline, model, scheduler_client = (
+        _make_sensenova_u1_dispatch_entrypoint(
+            model=_FakeSenseNovaModel(error=RuntimeError("model batch failed"))
+        )
     )
 
     with pytest.raises(
-        RuntimeError, match=f"generation failed for {failed_request_id}"
+        RuntimeError,
+        match="Model generation returned no output.*model batch failed",
     ):
         asyncio.run(process_generation_batch(scheduler_client, batch))
 
-    assert [req.request_id for req in executor.executed_requests] == [
-        "req-0:0",
-        "req-0:1",
-    ]
-    assert all(req.trace_ctx is trace_ctx for req in executor.executed_requests)
-    assert trace_ctx.started_slices == [("gpu_forward", 2)]
-    assert trace_ctx.finished_slices == [("gpu_forward", 2)]
+    assert pipeline.forward_calls == 1
+    assert model.call_count == 1
+    assert trace_ctx.started_slices == [("scheduler_dispatch", 1), ("gpu_forward", 2)]
+    assert trace_ctx.finished_slices == [("gpu_forward", 2), ("scheduler_dispatch", 1)]
     assert trace_ctx.finish_count == 1
+
+
+_GUIDANCE_SCALE_MATRIX = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0]
+
+
+def _expected_it2i_branches(cfg_scale, img_cfg_scale, use_cfg):
+    """Independent oracle for the public IT2I guidance semantics."""
+    if not use_cfg or (cfg_scale == 1 and img_cfg_scale == 1):
+        return ("condition",)
+    if img_cfg_scale == 1:
+        return ("condition", "image_condition")
+    if cfg_scale == img_cfg_scale:
+        return ("condition", "uncondition")
+    return ("condition", "image_condition", "uncondition")
+
+
+@pytest.mark.parametrize(
+    ("cfg_interval", "cfg_active_by_step"),
+    [
+        ((0.0, 1.0), (True, True, True, True, True)),
+        ((0.25, 0.75), (False, False, True, True, False)),
+        # IT2I's lo == 0 escape deliberately makes every step active.
+        ((0.0, 0.5), (True, True, True, True, True)),
+    ],
+)
+@pytest.mark.parametrize(
+    ("cfg_scale", "img_cfg_scale"),
+    list(itertools.product(_GUIDANCE_SCALE_MATRIX, repeat=2)),
+)
+def test_sensenova_it2i_guidance_profile_drives_real_loop_branches(
+    monkeypatch,
+    cfg_scale,
+    img_cfg_scale,
+    cfg_interval,
+    cfg_active_by_step,
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    forward_globals = NEOChatModel.it2i_generate.__wrapped__.__globals__
+    monkeypatch.setitem(forward_globals, "prepare_flash_kv_cache", lambda *a, **k: None)
+    monkeypatch.setitem(forward_globals, "clear_flash_kv_cache", lambda *a: None)
+    monkeypatch.setitem(
+        forward_globals,
+        "load_image_native",
+        lambda *a, **k: (torch.zeros(1, 3), torch.tensor([[1, 1]])),
+    )
+
+    branch_ids = {
+        "condition": 1.0,
+        "image_condition": 2.0,
+        "uncondition": 3.0,
+    }
+    branch_names = {int(value): key for key, value in branch_ids.items()}
+    calls = []
+
+    def build_query(question, *, system_message=None, append_text=None):
+        if system_message is not None:
+            return "condition"
+        return "image_condition" if question else "uncondition"
+
+    def build_inputs(_tokenizer, query, *_args):
+        inputs = torch.full((1, 1, 3), branch_ids[query])
+        indexes = torch.zeros(3, 1, dtype=torch.long)
+        return inputs, indexes, None
+
+    def prefix_forward(inputs, *_args):
+        branch = branch_names[int(inputs[0, 0, 0].item())]
+        return SimpleNamespace(branch=branch, layers=[]), torch.zeros(1)
+
+    def predict(_image_embeds, _indexes, _mask, past_key_values, t, *_args, **_kwargs):
+        calls.append(
+            (
+                round(float(t), 6),
+                None if past_key_values is None else past_key_values.branch,
+            )
+        )
+        return torch.zeros_like(_image_embeds)
+
+    class _ZeroEmbedder(torch.nn.Module):
+        def forward(self, values):
+            return torch.zeros(values.numel(), 3, device=values.device)
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        config=SimpleNamespace(),
+        patch_size=1,
+        downsample_ratio=1,
+        noise_scale=0.0,
+        noise_scale_mode="constant",
+        noise_scale_max_value=1.0,
+        add_noise_scale_embedding=False,
+        fm_modules={"timestep_embedder": _ZeroEmbedder()},
+        _notify_layer_offload_phase=lambda _phase: None,
+        _build_t2i_query=build_query,
+        _build_it2i_inputs=build_inputs,
+        _build_t2i_image_indexes=lambda h, w, *a, **k: torch.zeros(3, h * w),
+        _it2i_prefix_forward=prefix_forward,
+        patchify=lambda x, *a, **k: x.flatten(2).transpose(1, 2).contiguous(),
+        extract_feature=lambda x, **k: torch.zeros_like(x),
+        _t2i_predict_v=predict,
+        unpatchify=lambda z, patch, h, w: z.transpose(1, 2).reshape(-1, 3, h, w),
+    )
+    tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 0)
+
+    output = NEOChatModel.it2i_generate(
+        model,
+        tokenizer,
+        "prompt",
+        [Image.new("RGB", (2, 2))],
+        image_size=(2, 2),
+        num_steps=len(cfg_active_by_step),
+        cfg_scale=cfg_scale,
+        img_cfg_scale=img_cfg_scale,
+        cfg_interval=cfg_interval,
+        enable_timestep_shift=False,
+    )
+
+    expected_by_step = [
+        _expected_it2i_branches(cfg_scale, img_cfg_scale, use_cfg)
+        for use_cfg in cfg_active_by_step
+    ]
+    actual_by_step = [
+        tuple(branch for _, branch in grouped_calls)
+        for _, grouped_calls in itertools.groupby(calls, key=lambda call: call[0])
+    ]
+    assert actual_by_step == expected_by_step
+    assert output.shape == (1, 3, 2, 2)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("num_steps", [0, 1, 4])
+@pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
+def test_sensenova_t2i_reuses_request_noise_embedding(
+    monkeypatch, enabled, num_steps, cfg_scale
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_fm_modules import (
+        TimestepEmbedder,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    # Exercise the real generation loop and embedders without a checkpoint.
+    forward_globals = NEOChatModel.t2i_generate.__wrapped__.__globals__
+    monkeypatch.setitem(forward_globals, "prepare_flash_kv_cache", lambda *a, **k: None)
+    monkeypatch.setitem(forward_globals, "clear_flash_kv_cache", lambda *a: None)
+    timestep_embedder = TimestepEmbedder(3).eval()
+    noise_embedder = TimestepEmbedder(3).eval()
+    calls = []
+    predictions = []
+
+    def record_noise(module, args, output):
+        calls.append(args[0].clone())
+
+    hook = noise_embedder.register_forward_hook(record_noise)
+
+    def predict(image_embeds, *args, **kwargs):
+        predictions.append(image_embeds.clone())
+        return image_embeds
+
+    model = SimpleNamespace(
+        concat_time_token_num=0,
+        downsample_ratio=1,
+        patch_size=1,
+        config=SimpleNamespace(),
+        noise_scale=0.5,
+        noise_scale_mode="constant",
+        noise_scale_max_value=2.0,
+        add_noise_scale_embedding=enabled,
+        fm_modules={
+            "timestep_embedder": timestep_embedder,
+            "noise_scale_embedder": noise_embedder,
+        },
+        _notify_layer_offload_phase=lambda phase: None,
+        _build_cfg_schedule=lambda timesteps, cfg_interval, needs_cfg: (
+            NEOChatModel._build_cfg_schedule(timesteps, cfg_interval, needs_cfg)
+        ),
+        _build_t2i_query=lambda *a, **k: "query",
+        _build_t2i_text_inputs=lambda *a: (
+            torch.zeros(1, 1, dtype=torch.long),
+            torch.zeros(3, 1, dtype=torch.long),
+            None,
+            torch.ones(1, 1, dtype=torch.bool),
+            torch.ones(1, dtype=torch.long),
+        ),
+        _build_t2i_image_indexes=lambda h, w, *a, **k: torch.zeros(3, h * w),
+        _t2i_prefix_forward=lambda *a: (SimpleNamespace(layers=[]), torch.zeros(1)),
+        patchify=lambda x, *a, **k: x.flatten(2).transpose(1, 2).contiguous(),
+        extract_feature=lambda x, **k: torch.zeros_like(x),
+        _t2i_predict_v=predict,
+        unpatchify=lambda z, patch, h, w: z.transpose(1, 2).reshape(-1, 3, h, w),
+    )
+    try:
+        # Change both shape and noise scale to detect stale cross-request reuse.
+        for width, scale in [(2, 0.5), (3, 1.0)]:
+            model.noise_scale = scale
+            calls.clear()
+            predictions.clear()
+            output = NEOChatModel.t2i_generate(
+                model,
+                None,
+                "prompt",
+                image_size=(width, 2),
+                num_steps=num_steps,
+                cfg_scale=cfg_scale,
+                enable_timestep_shift=False,
+                batch_size=2,
+            )
+            assert output.shape == (2, 3, 2, width)
+            assert len(calls) == int(enabled and num_steps > 0)
+            branches = 2 if cfg_scale > 1 else 1
+            assert len(predictions) == num_steps * branches
+            # Compare each step with the original per-step computation.
+            with torch.no_grad():
+                for step, t in enumerate(torch.linspace(0, 1, num_steps + 1)[:-1]):
+                    expanded = t.expand(2 * 2 * width)
+                    expected = timestep_embedder(expanded).view(2, 2 * width, 3)
+                    if enabled:
+                        expected += noise_embedder(
+                            torch.full_like(expanded, scale / 2.0)
+                        ).view(2, 2 * width, 3)
+                    for branch in range(branches):
+                        torch.testing.assert_close(
+                            predictions[step * branches + branch],
+                            expected,
+                            rtol=0,
+                            atol=0,
+                        )
+    finally:
+        hook.remove()
+
+
+@pytest.mark.parametrize("explicit_first", [False, True])
+def test_sensenova_cache_dit_effective_defaults_reuse_mount(
+    monkeypatch, explicit_first
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    # Pin the environment independently of the developer's cache settings.
+    monkeypatch.setenv("SGLANG_CACHE_DIT_RDT", "0.24")
+    explicit = {"residual_diff_threshold": 0.24}
+    batch = _cache_dit_batch(
+        cache_dit_params=explicit if explicit_first else None,
+    )
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    batch.sampling_params.cache_dit_params = None if explicit_first else explicit
+    batch.num_inference_steps = 12
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    assert len(calls["enable"]) == 1
+    assert calls["enable"][0][1].kwargs["residual_diff_threshold"] == 0.24
+    assert calls["refresh"] == [(transformer, 12, calls["enable"][0][1])]
+    assert calls["disable"] == []
+
+    batch.sampling_params.cache_dit_params = {"residual_diff_threshold": 0.1}
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        cfg_interval=(0.0, 1.0),
+        guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+    )
+    assert len(calls["enable"]) == 2
+    assert calls["enable"][1][1].kwargs["residual_diff_threshold"] == 0.1
+    assert calls["disable"] == [transformer]
+
+
+@pytest.mark.parametrize(
+    "attention_types", [[], ["full_attention", "sliding_attention"], [None]]
+)
+def test_sensenova_cache_dit_rejects_invalid_attention_before_mount(
+    monkeypatch, attention_types
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type=value) for value in attention_types],
+        config=SimpleNamespace(num_hidden_layers=len(attention_types)),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    batch = _cache_dit_batch()
+    with pytest.raises(ValueError, match="attention type"):
+        stage._maybe_enable_cache_dit(
+            batch,
+            _cache_dit_server_args(),
+            cfg_interval=(0.0, 1.0),
+            guidance_profile=_t2i_guidance_profile(batch.guidance_scale),
+        )
+    assert calls == {"enable": [], "disable": [], "refresh": []}
+    assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
+    assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("image_only", [False, True])
+def test_sensenova_image_only_forward_preserves_outputs_and_prefix(device, image_only):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+        NEOLLMConfig,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        prepare_flash_kv_cache,
+    )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+        get_attn_backend,
+        set_attn_backend,
+    )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    config = NEOLLMConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=128,
+    )
+    config.rope_theta_hw = 10000.0
+    config.max_position_embeddings_hw = 128
+    config._attn_implementation = "eager"
+    previous_backend = get_attn_backend()
+    set_attn_backend("sdpa")
+    try:
+        model = Qwen3Model(config).to(device).eval()
+        prefix_indexes = torch.tensor([[0, 1], [0, 0], [0, 0]], device=device)
+        indexes = torch.tensor([[2, 2], [0, 0], [0, 1]], device=device)
+        inputs = torch.randn(1, 2, 32, device=device)
+        with torch.no_grad():
+            cache = model(
+                input_ids=torch.tensor([[1, 2]], device=device),
+                indexes=prefix_indexes,
+                attention_mask={"full_attention": None},
+                use_cache=True,
+            ).past_key_values
+            prefix = [
+                (layer.keys.clone(), layer.values.clone()) for layer in cache.layers
+            ]
+            prepare_flash_kv_cache(cache, current_len=2, batch_size=1)
+            for _ in range(2):
+                common = dict(
+                    inputs_embeds=inputs,
+                    indexes=indexes,
+                    attention_mask={"full_attention": None},
+                    past_key_values=cache,
+                    use_cache=True,
+                    update_cache=False,
+                )
+                expected = model(
+                    image_gen_indicators=torch.ones(
+                        1, 2, dtype=torch.bool, device=device
+                    ),
+                    **common,
+                ).last_hidden_state
+                actual = model(
+                    image_only=image_only,
+                    image_gen_indicators=(
+                        None
+                        if image_only
+                        else torch.ones(1, 2, dtype=torch.bool, device=device)
+                    ),
+                    **common,
+                ).last_hidden_state
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert cache.get_seq_length() == 2
+                for layer, (keys, values) in zip(cache.layers, prefix):
+                    torch.testing.assert_close(layer.keys, keys, rtol=0, atol=0)
+                    torch.testing.assert_close(layer.values, values, rtol=0, atol=0)
+                inputs = actual
+    finally:
+        set_attn_backend(previous_backend)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("needs_cfg", [False, True])
+@pytest.mark.parametrize("shift", [1.0, 3.0])
+@pytest.mark.parametrize("interval", [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5), (0.7, 0.8)])
+def test_sensenova_cfg_schedule_preserves_scalar_decisions(
+    device, needs_cfg, shift, interval
+):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
+        NEOChatModel,
+    )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    timesteps = torch.linspace(0, 1, 9, device=device)
+    timesteps = NEOChatModel._apply_time_schedule(
+        SimpleNamespace(), timesteps, 4, shift
+    )
+    # Probe each endpoint from both sides. The schedule has to compare in the
+    # tensor's own dtype, and only an endpoint that is not exactly representable
+    # tells that apart from a comparison done in Python floats.
+    probes = []
+    for endpoint in dict.fromkeys(interval):
+        edge = timesteps.new_tensor(endpoint)
+        probes += [
+            torch.nextafter(edge, edge.new_tensor(0.0)),
+            edge,
+            torch.nextafter(edge, edge.new_tensor(1.0)),
+        ]
+    timesteps = torch.cat([timesteps[:-1], torch.stack(probes), timesteps[-1:]])
+    expected = [
+        bool(t >= interval[0] and t <= interval[1] and needs_cfg)
+        for t in timesteps[:-1]
+    ]
+    assert NEOChatModel._build_cfg_schedule(timesteps, interval, needs_cfg) == expected
+
+
+# ===== Shared RoPE tables =====
+
+_HIDDEN_DIM, _HEADS, _KV_HEADS, _HEAD_DIM, _LAYERS, _INTER = 8, 2, 1, 8, 2, 16
+
+
+def _tiny_dense_config():
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+        NEOLLMConfig,
+    )
+
+    config = NEOLLMConfig(
+        hidden_size=_HIDDEN_DIM,
+        intermediate_size=_INTER,
+        num_attention_heads=_HEADS,
+        num_key_value_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        num_hidden_layers=_LAYERS,
+        rms_norm_eps=1e-6,
+        attention_dropout=0.0,
+        attention_bias=False,
+        vocab_size=32,
+    )
+    config.layer_types = ["full_attention"] * _LAYERS
+    # forward_und asserts eager; the understanding path is unreachable otherwise.
+    config._attn_implementation = "eager"
+    return config
+
+
+def _tiny_dense_attention(layer_idx=0):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+    )
+
+    return Qwen3Attention(_tiny_dense_config(), layer_idx)
+
+
+def test_sensenova_u1_shared_rope_tables_match_per_layer_computation():
+    """Qwen3Model builds RoPE once per forward and shares it across layers.
+
+    Guards the assumption that makes it valid: two identically configured layers
+    derive identical tables from the same `indexes`. If the tables ever become
+    layer-dependent, sharing them would silently change every attention output.
+    """
+    torch.manual_seed(0)
+    first, other = _tiny_dense_attention(0), _tiny_dense_attention(1)
+    x = torch.randn(1, 5, _HIDDEN_DIM)
+    indexes = torch.arange(3 * 5).reshape(3, 5) % 3
+
+    shared = first._resolve_rope_tables(indexes, x)
+    reference_modules = (other.rotary_emb, other.rotary_emb_hw, other.rotary_emb_hw)
+    for (cos_shared, sin_shared), module, axis in zip(
+        shared, reference_modules, (0, 1, 2)
+    ):
+        cos_ref, sin_ref = module(x, indexes[axis].unsqueeze(0))
+        assert torch.equal(cos_shared, cos_ref), f"cos differs on axis {axis}"
+        assert torch.equal(sin_shared, sin_ref), f"sin differs on axis {axis}"
+
+
+class _CountingRotaryEmbedding(torch.nn.Module):
+    """Delegates to a real rope module and records one entry per table computed."""
+
+    def __init__(self, inner, builds: list[int]):
+        super().__init__()
+        self.inner = inner
+        self.builds = builds
+
+    def forward(self, x, position_ids):
+        self.builds.append(1)
+        return self.inner(x, position_ids)
+
+
+@pytest.mark.parametrize("image_gen", [True, False], ids=["gen", "und"])
+def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(image_gen):
+    """One build per forward, reaching every layer on both dispatch paths.
+
+    Guards the optimization itself: a dropped link, or a build moved back inside
+    the layer loop, leaves every output correct, so only the call count notices.
+    Every layer's rope modules are wrapped by a counter, so it counts the real
+    table computations however they are reached: one build is 3 entries (t, h, w),
+    and any more means some layer computed its own.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+    )
+
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    builds: list[int] = []
+    for layer in model.layers:
+        # Each slot keeps its own rope module: `rotary_emb` and `rotary_emb_hw`
+        # differ in head_dim, so sharing one wrapper across both builds h/w tables
+        # of the wrong width instead of failing this assertion.
+        for name in ("rotary_emb", "rotary_emb_hw"):
+            setattr(
+                layer.self_attn,
+                name,
+                _CountingRotaryEmbedding(getattr(layer.self_attn, name), builds),
+            )
+
+    with torch.no_grad():
+        model(
+            inputs_embeds=torch.randn(1, 5, _HIDDEN_DIM),
+            image_gen_indicators=torch.full((1, 5), image_gen, dtype=torch.bool),
+            indexes=torch.zeros(3, 5, dtype=torch.long),
+            attention_mask={"full_attention": None},
+        )
+
+    assert len(builds) == 3, f"expected one t/h/w build, got {len(builds)}"
+
+
+def _run_shared_and_per_layer(monkeypatch, model, embeds, indicators, indexes):
+    """Forward twice: once sharing the model's tables, once with every layer rebuilding."""
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Attention,
+    )
+
+    def run():
+        with torch.no_grad():
+            return model(
+                inputs_embeds=embeds,
+                image_gen_indicators=indicators,
+                indexes=indexes,
+                attention_mask={"full_attention": None},
+            ).last_hidden_state
+
+    shared = run()
+    original = Qwen3Attention._resolve_rope_tables
+    monkeypatch.setattr(
+        Qwen3Attention,
+        "_resolve_rope_tables",
+        lambda self, indexes, hidden_states, embeddings=None: original(
+            self, indexes, hidden_states, None
+        ),
+    )
+    return shared, run()
+
+
+# Use different steps so each axis has distinct relative positions.
+# Equal-step sequences differ only by a constant offset, which cancels
+# in same-axis RoPE attention scores and can hide h/w table swaps.
+_AXIS_INDEXES = torch.tensor(
+    [
+        [0, 1, 2, 3, 4],
+        [0, 2, 4, 6, 8],
+        [0, 5, 10, 15, 20],
+    ],
+    dtype=torch.long,
+)
+
+
+def test_sensenova_u1_rope_sharing_does_not_change_output(monkeypatch):
+    """The end-to-end claim: sharing must not move the output by one bit.
+
+    Ran with sharing and with sharing bypassed (each layer rebuilding its own
+    tables, as before the change) on identical inputs.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+    )
+
+    torch.manual_seed(0)
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    embeds = torch.randn(1, 5, _HIDDEN_DIM)
+    indicators = torch.ones(1, 5, dtype=torch.bool)
+
+    shared, per_layer = _run_shared_and_per_layer(
+        monkeypatch, model, embeds, indicators, _AXIS_INDEXES
+    )
+
+    assert torch.equal(shared, per_layer)
+
+
+def test_sensenova_u1_rope_sharing_holds_when_a_norm_promotes_dtype(monkeypatch):
+    """Tables are only reusable while the activation dtype is unchanged.
+
+    An attention is fed the normalized activation, not the model input, and an
+    fp32 RMSNorm weight promotes a bf16 activation back to fp32 -- what autocast
+    with fp32 weights does. Tables built from the model input are then the wrong
+    dtype, and reusing them would move the output.
+    """
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        Qwen3Model,
+    )
+
+    torch.manual_seed(0)
+    model = Qwen3Model(_tiny_dense_config()).eval()
+    embeds = torch.randn(1, 5, _HIDDEN_DIM, dtype=torch.bfloat16)
+    indicators = torch.ones(1, 5, dtype=torch.bool)
+
+    with torch.autocast(device_type=embeds.device.type, dtype=torch.bfloat16):
+        shared, per_layer = _run_shared_and_per_layer(
+            monkeypatch, model, embeds, indicators, _AXIS_INDEXES
+        )
+
+    assert torch.equal(shared, per_layer)
+
+
+def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
+        LoRAPipeline,
+    )
+
+    assert issubclass(SenseNovaU1Pipeline, LoRAPipeline)
+
+    pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
+    model, tokenizer = object(), object()
+    loaded = {"model": model, "tokenizer": tokenizer}
+    modules = pipeline.load_modules(server_args=None, loaded_modules=loaded)
+
+    assert modules["transformer"] is model
+    assert modules["model"] is model
+    assert "transformer" not in loaded
+
+
+def _validate_server_args(**overrides):
+    config = SenseNovaU1PipelineConfig()
+    args = {
+        "num_gpus": 1,
+        "enable_torch_compile": False,
+        "lora_path": None,
+        "lora_target_modules": None,
+        "component_residency": None,
+        "cpu_offload_components": None,
+        "dit_cpu_offload": None,
+        "text_encoder_cpu_offload": None,
+        "image_encoder_cpu_offload": None,
+        "vae_cpu_offload": False,
+        "dit_layerwise_offload": None,
+        "layerwise_offload_components": None,
+        "quantization": None,
+        "quantization_ignored_layers": None,
+        "transformer_weights_path": None,
+        "component_paths": {},
+        "component_weights_paths": {},
+        "component_quantizations": {},
+        "component_quantization_ignored_layers": {},
+        "component_precisions": {},
+        "attention_backend": None,
+        "component_attention_backends": {},
+        "attention_backend_config": {},
+    }
+    args.update(overrides)
+    server_args = SimpleNamespace(**args)
+    config.validate_server_args(server_args)
+    return server_args
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param(
+            {"lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"},
+            ["_mot_gen"],
+            id="startup-adapter",
+        ),
+        pytest.param(
+            {
+                "lora_path": "sensenova/SenseNova-U1.5-8B-MoT-LoRAs",
+                "lora_target_modules": ["q_proj"],
+            },
+            ["q_proj"],
+            id="explicit-targets",
+        ),
+        pytest.param({}, ["_mot_gen"], id="without-adapter"),
+    ],
+)
+def test_sensenova_u1_lora_target_modules(overrides, expected):
+    server_args = _validate_server_args(**overrides)
+    assert server_args.lora_target_modules == expected

@@ -77,12 +77,20 @@ def _set_compatible_runtime_defaults(server_args) -> None:
 
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
-    """Native SenseNova-U1 text-to-image pipeline configuration."""
+    """Native SenseNova-U1 text-to-image and image-editing pipeline configuration."""
 
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
+
+    def calculate_condition_image_size(self, image, width, height):
+        del image, width, height
+        return None
+
+    def prepare_calculated_size(self, image):
+        del image
+        return None
 
     def supports_dynamic_batching(self):
         return True
@@ -107,7 +115,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return False
 
     def supports_sequential_multi_output_inference(self):
-        return True
+        return False
 
     @staticmethod
     def validate_parallelism(server_args) -> None:
@@ -157,11 +165,9 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
                 "Please omit --enable-torch-compile."
             )
-        if getattr(server_args, "lora_path", None):
-            raise ValueError(
-                "SenseNovaU1Pipeline does not support LoRA adapters yet. "
-                "Please omit --lora-path."
-            )
+        if getattr(server_args, "lora_target_modules", None) is None:
+            # The official adapter only targets the generation branch.
+            server_args.lora_target_modules = ["_mot_gen"]
         _set_compatible_runtime_defaults(server_args)
         if _is_arg_explicitly_set(
             server_args, "component_residency"
