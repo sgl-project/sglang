@@ -1,6 +1,9 @@
 //! Pump and peer test fixtures shared by `index::tests` and the child test modules.
 
 use super::*;
+use crate::state::kv_events::bootstrap::{
+    PeerSnapshot, WireWorker, SNAPSHOT_FORMAT, SNAPSHOT_PATH,
+};
 use crate::state::kv_events::tree::SnapshotNode;
 use crate::state::kv_events::wire::{BlockStored, KvEventBatch};
 
@@ -175,4 +178,58 @@ pub(super) async fn graft_with_deferred_proof(
         .await
         .unwrap();
     (tracker, h)
+}
+
+/// A witness body: no nodes, just a cursor table, as the cursors-only
+/// producer serves it. With no entries it is a cold peer's answer.
+pub(super) fn witness_snapshot(entries: &[(&str, u32, i64)]) -> PeerSnapshot {
+    PeerSnapshot {
+        format: SNAPSHOT_FORMAT,
+        block_size: 64,
+        is_bigram: false,
+        producer_ready: false,
+        workers: entries
+            .iter()
+            .map(|(url, dp_rank, _)| WireWorker {
+                url: (*url).to_string(),
+                dp_rank: *dp_rank,
+            })
+            .collect(),
+        cursors: entries
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, seq))| (i as u32, *seq))
+            .collect(),
+        nodes: Vec::new(),
+    }
+}
+
+/// Serve a sequence of canned bodies on the real snapshot path: hit N
+/// gets `snaps[min(N, len-1)]`, so a test can flip a peer's temperature
+/// mid-sweep.
+pub(super) async fn serve_snapshot_sequence(
+    snaps: Vec<PeerSnapshot>,
+) -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+    let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&queries);
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        SNAPSHOT_PATH,
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let seen = Arc::clone(&seen);
+            let hits = Arc::clone(&hits);
+            let snaps = snaps.clone();
+            async move {
+                seen.lock()
+                    .expect("queries lock")
+                    .push(uri.query().map(str::to_string));
+                let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(snaps[n.min(snaps.len() - 1)].clone())
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), queries)
 }

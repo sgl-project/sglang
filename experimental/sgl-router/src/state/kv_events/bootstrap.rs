@@ -125,7 +125,10 @@ pub enum SnapshotOutcome {
     /// Peer did not answer, or answered non-200 (including the 404 an older
     /// router image returns for an endpoint it does not serve).
     Unreachable,
-    /// Answered, but holds no state to graft.
+    /// Answered, but holds no state to graft for the ranks being bootstrapped.
+    /// That includes WARM peers whose tree shares no carriers with our live
+    /// workers or tracks none of those ranks, so this is not
+    /// [`PeerSnapshot::is_cold`] and does not count toward a cold-fleet verdict.
     ColdPeer,
     /// Answered with an untrustworthy body: any [`VetError`] whose
     /// [`VetError::outcome`] is `Rejected`.
