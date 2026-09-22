@@ -157,6 +157,17 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_collocated_cp: A[
+        bool,
+        Arg(
+            help="(Derived) collocated prefill CP for hybrid linear-attention "
+            "models: the CP group is the TP group; the residual stream, "
+            "attention and indexer are CP-sharded while MoE and linear "
+            "attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
