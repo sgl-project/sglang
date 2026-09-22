@@ -63,7 +63,8 @@ def _load_evict_from_tree_cache():
         ),
         "sglang.srt.runtime_context": _module(
             "sglang.srt.runtime_context",
-            get_server_args=lambda: SimpleNamespace(),
+            get_serving=lambda: SimpleNamespace(),
+            get_spec=lambda: SimpleNamespace(),
         ),
         "sglang.srt.utils.common": _module(
             "sglang.srt.utils.common",
@@ -105,7 +106,7 @@ def _make_evict_fixture(*, full_available: int, swa_available: int):
     tree_cache = SimpleNamespace(
         is_chunk_cache=lambda: False,
         token_to_kv_pool_allocator=allocator,
-        evict=MagicMock(side_effect=evict),
+        evict_for_alloc=MagicMock(side_effect=evict),
     )
     return tree_cache, availability
 
@@ -115,7 +116,7 @@ def test_tail_only_demand_does_not_evict_available_swa():
 
     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
 
-    tree_cache.evict.assert_called_once_with(
+    tree_cache.evict_for_alloc.assert_called_once_with(
         _EvictParams(num_tokens=48, swa_num_tokens=0)
     )
     assert availability == {"full": 128, "swa": 64}
@@ -126,7 +127,7 @@ def test_tail_only_demand_evicts_only_swa_deficit():
 
     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
 
-    tree_cache.evict.assert_called_once_with(
+    tree_cache.evict_for_alloc.assert_called_once_with(
         _EvictParams(num_tokens=0, swa_num_tokens=32)
     )
     assert availability == {"full": 128, "swa": 64}
@@ -137,7 +138,7 @@ def test_tail_only_demand_with_enough_capacity_does_not_evict():
 
     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
 
-    tree_cache.evict.assert_not_called()
+    tree_cache.evict_for_alloc.assert_not_called()
 
 
 def test_default_swa_demand_matches_full_demand():
@@ -145,7 +146,7 @@ def test_default_swa_demand_matches_full_demand():
 
     evict_from_tree_cache(tree_cache, 128)
 
-    tree_cache.evict.assert_called_once_with(
+    tree_cache.evict_for_alloc.assert_called_once_with(
         _EvictParams(num_tokens=0, swa_num_tokens=64)
     )
     assert availability == {"full": 128, "swa": 128}
@@ -153,10 +154,10 @@ def test_default_swa_demand_matches_full_demand():
 
 def test_evict_stops_when_cache_cannot_make_progress():
     tree_cache, _ = _make_evict_fixture(full_available=0, swa_available=0)
-    tree_cache.evict.side_effect = None
+    tree_cache.evict_for_alloc.side_effect = None
 
     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
 
-    tree_cache.evict.assert_called_once_with(
+    tree_cache.evict_for_alloc.assert_called_once_with(
         _EvictParams(num_tokens=128, swa_num_tokens=64)
     )
