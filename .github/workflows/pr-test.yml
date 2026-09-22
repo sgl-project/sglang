@@ -210,8 +210,8 @@ jobs:
 
   # =============================================== Rust extensions ====================================================
 
-  # Unlike sgl-kernel, not gated on source changes: the cache key is the source
-  # hash, so the job always runs but only compiles on a miss.
+  # diffusion-only PRs do not consume SRT Rust extensions; other runs seed or
+  # reuse the source-hash cache
   rust-ext-build:
     needs: [check-changes, call-gate]
     # Ungated on the event, unlike the jobs above: a cache entry is visible to
@@ -223,6 +223,11 @@ jobs:
     if: |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
+      (github.event_name != 'pull_request' ||
+       needs.check-changes.outputs.multimodal_gen != 'true' ||
+       needs.check-changes.outputs.main_package == 'true' ||
+       needs.check-changes.outputs.jit_kernel == 'true' ||
+       needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
@@ -240,6 +245,11 @@ jobs:
     if: |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
+      (github.event_name != 'pull_request' ||
+       needs.check-changes.outputs.multimodal_gen != 'true' ||
+       needs.check-changes.outputs.main_package == 'true' ||
+       needs.check-changes.outputs.jit_kernel == 'true' ||
+       needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
@@ -387,7 +397,7 @@ jobs:
     secrets: inherit
 
   call-multimodal-gen-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       !cancelled() &&
@@ -404,7 +414,6 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-h100:

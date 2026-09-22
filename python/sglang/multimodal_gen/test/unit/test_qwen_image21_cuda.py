@@ -101,6 +101,81 @@ def inputs(seed, edit):
     )
 
 
+def batched_inputs(samples):
+    max_length = max(sample["encoder_hidden_states"].shape[1] for sample in samples)
+    return dict(
+        hidden_states=torch.cat([sample["hidden_states"] for sample in samples]),
+        encoder_hidden_states=torch.cat(
+            [
+                torch.nn.functional.pad(
+                    sample["encoder_hidden_states"],
+                    (0, 0, 0, max_length - sample["encoder_hidden_states"].shape[1]),
+                )
+                for sample in samples
+            ]
+        ),
+        condition_latents=(
+            torch.cat([sample["condition_latents"] for sample in samples])
+            if samples[0]["condition_latents"] is not None
+            else None
+        ),
+        layouts=[sample["layouts"][0] for sample in samples],
+        prefix_caches=[sample["prefix_caches"][0] for sample in samples],
+        timestep=torch.cat([sample["timestep"] for sample in samples]),
+    )
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_batched_targets_preserve_ragged_prefixes_and_cache_ownership(model, edit):
+    samples = [inputs(seed, edit) for seed in (5, 9)]
+    slots = [False] * 5 + ([True, False, False] if edit else [])
+    samples[1]["encoder_hidden_states"] = torch.randn(1, len(slots), 16, device="cuda")
+    samples[1]["layouts"] = [
+        build_layout(
+            slots, ([(1, 2, 4)] if edit else []) + [(1, 4, 4)], (8, 12, 12), "cuda"
+        )
+    ]
+    batch = batched_inputs(deepcopy(samples))
+    for timestep in (700, 300, 10):
+        for sample in samples:
+            sample["timestep"].fill_(timestep)
+        batch["timestep"].fill_(timestep)
+        with set_forward_context(None, None):
+            expected = torch.cat([model(**sample) for sample in samples])
+        calls = []
+        handles = [
+            block.register_forward_pre_hook(
+                lambda module, args: calls.append(args[0].shape)
+            )
+            for block in model.transformer_blocks
+        ]
+        try:
+            with set_forward_context(None, None):
+                actual = model(**batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert calls == [torch.Size([2, 16, model.hidden_size])] * len(
+            model.transformer_blocks
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=1e-5)
+        for sample, caches in zip(samples, batch["prefix_caches"], strict=True):
+            for cache, reference in zip(
+                caches, sample["prefix_caches"][0], strict=True
+            ):
+                torch.testing.assert_close(
+                    cache["key"], reference["key"], atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    cache["value"], reference["value"], atol=0, rtol=0
+                )
+        assert (
+            batch["prefix_caches"][0][0]["key"].data_ptr()
+            != batch["prefix_caches"][1][0]["key"].data_ptr()
+        )
+
+
 def test_bf16_qk_norm_matches_reference(model):
     norm = deepcopy(model.transformer_blocks[0].attn.norm_q).bfloat16()
     reference = ReferenceRMSNorm(32, eps=1e-6).cuda().bfloat16()
@@ -182,8 +257,10 @@ def test_cached_prefix_matches_full_recomputation(model, edit):
 
 
 @pytest.mark.parametrize("edit", [False, True])
-def test_graph_replay_uses_new_request_prefix(model, edit):
-    first, second = inputs(5, edit), inputs(9, edit)
+@pytest.mark.parametrize("sample_count", [1, 2])
+def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
+    first = batched_inputs([inputs(5 + i, edit) for i in range(sample_count)])
+    second = batched_inputs([inputs(9 + i, edit) for i in range(sample_count)])
     runner = DiffusionBreakableCudaGraphRunner(model, torch.device("cuda"))
     try:
         with torch.no_grad(), set_forward_context(None, None):
