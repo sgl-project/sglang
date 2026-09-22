@@ -72,7 +72,15 @@ if _is_hip:
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    try:
+        from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        fused_qk_rope_with_cos_sin_cache_inplace = None
+        logger.warning(
+            "sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace is unavailable; "
+            "XPU rotary embedding will use the generic rotary_embedding kernel. "
+            "Upgrade sgl_kernel to enable the fused XPU kernel."
+        )
 
 
 class RotaryEmbedding(BaseFusedOp):
@@ -86,6 +94,7 @@ class RotaryEmbedding(BaseFusedOp):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
+        position_start: int = 0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -94,6 +103,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.position_start = position_start
         self._force_native = (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
@@ -173,7 +183,11 @@ class RotaryEmbedding(BaseFusedOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float,
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -197,8 +211,9 @@ class RotaryEmbedding(BaseFusedOp):
         inv_freq = self._compute_inv_freq(self.base).to(device=device)
 
         # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        start = self.position_start + cur_len
+        end = self.position_start + new_len
+        t_new = torch.arange(start, end, dtype=inv_freq.dtype, device=device)
         if t_new.numel() == 0:
             return
 
@@ -454,7 +469,11 @@ class RotaryEmbedding(BaseFusedOp):
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
         # Fused_qk_rope only supports aligned head_size
-        if self.head_size in [128, 256, 512]:
+        if fused_qk_rope_with_cos_sin_cache_inplace is not None and self.head_size in [
+            128,
+            256,
+            512,
+        ]:
             num_tokens = positions.size(0)
             q_rope = query.view(num_tokens, -1, self.head_size)
             k_rope = key.view(num_tokens, -1, self.head_size)
@@ -471,9 +490,17 @@ class RotaryEmbedding(BaseFusedOp):
             )
             return query, key
         else:
-            # Use fallback kernel of 'rotary_embedding'
             self._match_cos_sin_cache_dtype(query)
-            return torch.ops.sgl_kernel.rotary_embedding(
+            # Use fallback kernel of 'rotary_embedding'.
+            # The kernel requires 3D tensors (batch, num_heads, head_size);
+            # add a num_heads=1 dim for 2D tensors (e.g. DSA indexer k_rope).
+            q_2d = query.dim() == 2
+            k_2d = key.dim() == 2
+            if q_2d:
+                query = query.view(query.shape[0], -1, self.head_size)
+            if k_2d:
+                key = key.view(key.shape[0], -1, self.head_size)
+            q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
                 key,
@@ -481,6 +508,11 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
+            if q_2d:
+                q_out = q_out.view(q_out.shape[0], -1)
+            if k_2d:
+                k_out = k_out.view(k_out.shape[0], -1)
+            return q_out, k_out
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

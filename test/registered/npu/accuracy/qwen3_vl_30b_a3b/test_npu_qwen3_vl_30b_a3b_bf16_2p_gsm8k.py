@@ -8,7 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4800, suite="nightly-acc-4-npu-a3", nightly=True)
+register_npu_ci(est_time=4800, suite="full-acc-4-npu-a3", nightly=True)
 
 QWEN3_VL_30B_A3B_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
