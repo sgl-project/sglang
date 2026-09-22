@@ -68,7 +68,15 @@ class TestXPUGraph(CustomTestCase):
 
     def test_prefill_full_graph_runs(self):
         args = [
-            *_COMMON_ARGS,
+            "--device",
+            "xpu",
+            "--attention-backend",
+            "intel_xpu",
+            "--disable-radix-cache",
+            "--mem-fraction-static",
+            "0.6",
+            "--batch-size",
+            "1",
             "--cuda-graph-config",
             '{"decode":{"backend":"full"},"prefill":{"backend":"full"}}',
             "--cuda-graph-bs-prefill",

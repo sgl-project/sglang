@@ -125,13 +125,7 @@ def get_or_create_global_graph_capture_stream() -> Any:
 
 
 class GraphPoolPrecarve:
-    """Pre-carve the memory pool to reduce fragmentation.
-
-    CUDA only: uses CUDA caching allocator peak reserved memory stats.
-    On non-CUDA platforms (XPU/NPU), memory stats and sysman free-bytes
-    cannot reliably reflect full allocator reserved spans, so pre-carve
-    is a safe no-op.
-    """
+    """Pre-carve the memory pool to reduce fragmentation."""
 
     def __init__(self) -> None:
         self.nbytes = 0
@@ -141,9 +135,8 @@ class GraphPoolPrecarve:
     def measure(self) -> Iterator[None]:
         """Wrap one eager warmup. the last one before ``mint`` sets the size."""
         # Pre-carve relies on torch.cuda allocator peak reserved memory stats.
-        # On non-CUDA devices (e.g., Intel XPU, Ascend NPU), torch.cuda APIs are unavailable
-        # and allocator stats cannot reliably measure graph-pool footprints, so measurement
-        # is a safe no-op.
+        # On non-CUDA devices (e.g., Intel XPU), allocator stats maynot reliably
+        # measure graph-pool footprints, so measurement is a safe no-op.
         if (
             self.minted
             or not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
