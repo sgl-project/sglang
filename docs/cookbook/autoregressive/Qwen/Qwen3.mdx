@@ -55,23 +55,46 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 ### 3.3 Ascend NPU deployment
 
-Use the selector below for **single-node, PD co-located** deployment on Atlas 800I A3:
-the same SGLang service handles prefill and decode. Select the model, quantization,
-and workload to obtain the corresponding Ascend reference recipe.
+Use the selector below for **single-node, PD co-located** deployment: the same
+SGLang service handles prefill and decode. Select **A3** for the measured 8B and
+30B-A3B recipes, or **A2** for the pending 32B and 235B-A22B validation candidates.
+Then select the model, quantization, and workload.
 
-An A3 physical card contains two 64 GB dies. Tensor parallelism counts logical
-devices, so a recipe with TP=16 needs eight physical cards on the same node.
-The selected recipe shows its card and device requirements below the command.
+An A3 physical card contains two 64 GB dies; an A2 card has one 64 GB device.
+Tensor parallelism counts logical devices: TP4 requires four A2 cards or two A3
+cards. The selector shows the card and device requirements for each recipe.
 See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
-| Model | Quantization | Workload | A3 physical cards | Logical devices / TP |
-| --- | --- | --- | --- | --- |
-| Qwen3-8B | W8A8 | Low latency | 1 | 2 |
-| Qwen3-8B | W8A8 | High throughput | 1 allocated | 1 |
-| Qwen3-30B-A3B | W8A8 | Low latency / high throughput | 1 | 2 |
-| Qwen3-32B | BF16 | Low latency | 8 | 16 |
-| Qwen3-32B | W8A8 | High throughput | 2 | 4 |
-| Qwen3-235B-A22B | BF16 / W8A8 | Low latency / high throughput, respectively | 8 | 16 |
+| Model | Quantization | Workload | Hardware / physical cards | Logical devices / TP | Status |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-8B | W8A8 | Low latency | A3 / 1 | 2 | Measured |
+| Qwen3-8B | W8A8 | High throughput | A3 / 1 allocated | 1 | Measured |
+| Qwen3-30B-A3B | W8A8 | Low latency / high throughput | A3 / 1 | 2 | Measured |
+| Qwen3-32B | BF16 | Low latency | A2 / 4 | 4 | Validation candidate |
+| Qwen3-32B | W8A8 | High throughput | A2 / 4 | 4 | Pending validation |
+| Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Validation candidate |
+
+The 32B W8A8 candidate follows the command in the
+[A2 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series).
+That source labels the scenario as two cards but launches with `--tp-size 4`.
+This selector explicitly requires four A2 devices to match the command.
+
+The 32B BF16 candidate uses TP4, one concurrent request, and chunked prefill.
+The 235B W8A8 candidate uses the tutorial's recommended TP8 with eight concurrent
+requests. Both start without EAGLE3 or graph capture, and the 235B candidate uses
+pure tensor parallelism. These are untuned starting points for validation;
+they do not inherit the A3 reference's TP16, DP16, fused MoE settings, or latency
+targets. All three A2 recipes still require startup, inference, accuracy, and
+performance testing before being marked verified.
+
+<Info>
+The [235B model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
+recommends 16 × 64 GB devices for BF16: two eight-card A2 nodes. That deployment
+needs a separate distributed configuration and validation of communication
+between the nodes. It remains pending and is not offered by this single-node
+selector. Its approximately 470 GB checkpoint also exceeds a 300 GB local volume;
+prepare sufficient shared storage before starting an instance.
+</Info>
 
 <Note>
 The 8B throughput reference uses TP=1, which uses one die of an A3 card. Preserve
@@ -87,7 +110,7 @@ and check `npu-smi info` before launching a recipe. These commands target SGLang
 record the exact SGLang commit and runtime versions used for your run. The linked
 Ascend tutorials describe v0.5.16; earlier releases can use different flags.
 
-The measurements below use this environment on 2026-09-12:
+The A3 measurements below use this environment on 2026-09-12:
 
 | Component | Measured version |
 | :--- | :--- |
@@ -104,16 +127,18 @@ commit requires `sgl_kernel_npu.sample.chain_speculative_sampling_triton`; the
 platform's older `2026.5.1` kernel failed on nonzero-temperature requests. The
 tested `2026.9.0` kernel provides that function.
 
-Download the main checkpoint and its matching **EAGLE3 draft** before starting the
-service. The following tutorials provide weight sources and environment setup:
+Download the main checkpoint before starting the service. For recipes that enable
+EAGLE3, also download the matching **EAGLE3 draft**. The following tutorials provide
+weight sources and environment setup; select the **A2 / 910B** environment for A2
+hardware and the **A3** environment for A3 hardware:
 
 - [Qwen3-8B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b#model-weights)
 - [Qwen3-30B-A3B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b#model-weights)
 - [Qwen3-32B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b#model-weights)
 - [Qwen3-235B-A22B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
 
-For W8A8, use a ModelSlim checkpoint with its quantization metadata. Keep the
-draft unquantized as specified by the recipe. Original Qwen3, Instruct-2507, and
+For W8A8, use a ModelSlim checkpoint with its quantization metadata. When EAGLE3
+is enabled, keep the draft unquantized as specified by the recipe. Original Qwen3, Instruct-2507, and
 Thinking-2507 checkpoints require compatible drafts; record both checkpoint
 revisions when testing a pair.
 
@@ -124,7 +149,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 ```
 
-Use the selector's environment settings to enter the local main and draft paths,
+Use the selector's environment settings to enter the local main path and, if used, draft path,
 the HCCL and Gloo interfaces, and the service address. Update the paths when
 switching models. These commands run inside an already prepared NPU environment.
 For the reference performance comparison, also apply the host tuning described
@@ -152,7 +177,7 @@ request example. The `/generate` request should return HTTP 200 and generated
 text containing `Paris`. Check the service logs for errors before continuing.
 
 For accuracy, use the complete evaluation below with the selected checkpoint and
-draft. For performance, use the matching reference workload. Record successful
+draft, if enabled. For performance, use the matching workload below. Record successful
 and failed requests, TTFT, TPOT, and throughput.
 See [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing)
 for the measurement procedure.
@@ -243,20 +268,25 @@ for other datasets and evaluation methods.
 
 #### Ascend reference workloads
 
-These are the workloads from the linked Ascend best practices. Each link includes
-the original deployment settings and reference measurements. ISL and OSL are
-the input and output token counts per request.
+Linked rows use the workloads from the Ascend best practices. The other A2 rows
+define initial validation workloads for the candidate commands, with no measured
+performance or latency target yet. ISL and OSL are input and output token counts
+per request.
 
-| Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3-8B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) | 3500 | 1500 | 1 | 4 | 5 ms |
-| Qwen3-8B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) | 3500 | 1500 | 64 | 256 | 37 ms |
-| Qwen3-30B-A3B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) | 3500 | 1500 | 1 | 1 | 10 ms |
-| Qwen3-30B-A3B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) | 3500 | 1500 | 160 | 640 | 50 ms |
-| Qwen3-32B / BF16 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-bf16-8p-in18k-out4k-6ms) | 18000 | 4000 | 1 | 1 | 6 ms |
-| Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) | 3584 | 1536 | 100 | 400 | 50 ms |
-| Qwen3-235B-A22B / BF16 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) | 11000 | 1500 | 1 | 1 | 8 ms |
-| Qwen3-235B-A22B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) | 3500 | 1500 | 432 | 1728 | 50.1 ms |
+| Hardware | Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| A3 | Qwen3-8B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) | 3500 | 1500 | 1 | 4 | 5 ms |
+| A3 | Qwen3-8B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) | 3500 | 1500 | 64 | 256 | 37 ms |
+| A3 | Qwen3-30B-A3B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) | 3500 | 1500 | 1 | 1 | 10 ms |
+| A3 | Qwen3-30B-A3B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) | 3500 | 1500 | 160 | 640 | 50 ms |
+| A2 | Qwen3-32B / BF16 | Low latency candidate | 18000 | 4000 | 1 | 4 | Not measured |
+| A2 | Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) | 3584 | 1536 | 100 | 400 | 55 ms (source) |
+| A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Not measured |
+
+The A2 32B reference's card-count inconsistency prevents treating its published
+55 ms as a matched-hardware baseline until the source topology is clarified.
+Record A2 results separately from A3, and compare performance only when the
+hardware, checkpoint pair, runtime, and workload match.
 
 For example, run the 8B low-latency workload on current main as follows. Set
 `MODEL_PATH` to the checkpoint used by the running service. For another row,
