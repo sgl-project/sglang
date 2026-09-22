@@ -291,8 +291,9 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
             SchedulerMlxOverlapMixin,
         )
 
-        # Ingest shutdown once. A second poll raises instead of hanging if
-        # the loop fails to exit.
+        # Iteration 1: recv the ShutdownReq stand-in (flag flips inside
+        # process_input_requests).  Iteration 2 must break before polling
+        # again; the sentinel raising instead means the loop never exits.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
 
         with patch(
