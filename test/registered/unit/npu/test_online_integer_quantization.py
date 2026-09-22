@@ -32,9 +32,7 @@ register_npu_ci(est_time=3, suite="stage-a-unit-test-npu")
 class TestOnlineIntegerQuantizationSelection(CustomTestCase):
     """Dense W4A4 caused zero accuracy and must remain on the W8A8 path."""
 
-    @patch(
-        "sglang.srt.hardware_backend.npu.quantization.online_quantization.get_model"
-    )
+    @patch("sglang.srt.hardware_backend.npu.quantization.online_quantization.get_model")
     def test_w4a4_mode_is_mixed_dense_and_moe(self, get_model):
         get_model.return_value = SimpleNamespace(online_quantization="w4a4_int")
 
@@ -58,14 +56,10 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
             "w8a8_int",
         )
 
-    @patch(
-        "sglang.srt.hardware_backend.npu.quantization.online_quantization.get_model"
-    )
+    @patch("sglang.srt.hardware_backend.npu.quantization.online_quantization.get_model")
     @patch("sglang.srt.layers.linear.is_npu")
     @patch("sglang.srt.layers.linear.current_platform.is_npu", return_value=False)
-    def test_linear_selection_uses_runtime_npu_detection(
-        self, _, is_npu, get_model
-    ):
+    def test_linear_selection_uses_runtime_npu_detection(self, _, is_npu, get_model):
         """Dense W8A8 works when torch-NPU is available without a platform plugin."""
 
         get_model.return_value = SimpleNamespace(online_quantization="w8a8_int")
