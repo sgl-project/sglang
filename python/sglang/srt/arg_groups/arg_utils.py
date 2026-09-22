@@ -92,31 +92,23 @@ class Arg(msgspec.Struct, frozen=True):
     fallback: Any = None
 
 
+_NO_DEFAULT = object()
+
+
 class Derived(msgspec.Struct, frozen=True):
-    """Metadata for a field the configuration implies, not one anyone types.
+    """Metadata for namespace fields that are not CLI inputs or record fields.
 
-    The other half of a namespace. An ``Arg`` field is the operator's input and
-    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
-    so it is not a dataclass field and never reaches the record -- which is
-    right, because it has no input to preserve and the record is what crosses a
-    process boundary.
-
-    ``fn`` names what computes it, as a dotted path resolved lazily so that a
-    declaration module stays free of runtime imports. Such a field is a pure
-    function of the published configuration, so it is computed once at
-    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
-    which is what a read inside compiled model code needs.
-
-    Every declaration carries ``fn`` today, the parallel quotients included:
-    they are a function of the configured leaves, so they are computed at
-    publish like the rest. What is special about them is not how they are
-    computed but that a stamp can move one afterwards -- an elastic scale-up
-    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
-    published leaf.
+    ``fn`` is a lazily resolved dotted function path. It computes a value from
+    resolved configuration once at publication. Fields without ``fn``, such as
+    ranks and group handles, are set at runtime. Parallel overrides take
+    precedence over published values.
     """
 
     doc: str = ""
     fn: str = ""
+    # Default for runtime-only fields, e.g. ``gpu_id=None`` without a device.
+    # Fields without a default raise if read before initialization.
+    default: Any = _NO_DEFAULT
 
 
 class NS(msgspec.Struct, frozen=True):
