@@ -72,6 +72,9 @@ class TestGdnFusedDecodeAiterCoverage(CustomTestCase):
             state_indices=torch.empty(0),
             conv_weight=torch.empty(0),
             conv_bias=torch.empty(0),
+            A_log=torch.empty(0),
+            dt_bias=torch.empty(0),
+            norm_weight=torch.empty(0),
             activation="silu",
             quant_dtype=None,
         )
@@ -134,6 +137,9 @@ class TestGdnFusedDecodeAiterOnDevice(CustomTestCase):
             state_indices=torch.arange(1, 9, dtype=torch.int32, device=dev),
             conv_weight=torch.zeros(channels, 4, dtype=torch.bfloat16, device=dev),
             conv_bias=torch.zeros(channels, dtype=torch.bfloat16, device=dev),
+            A_log=torch.zeros(vh, dtype=torch.float32, device=dev),
+            dt_bias=torch.zeros(vh, dtype=torch.bfloat16, device=dev),
+            norm_weight=torch.zeros(d, dtype=torch.bfloat16, device=dev),
             activation="silu",
             quant_dtype=None,
         )

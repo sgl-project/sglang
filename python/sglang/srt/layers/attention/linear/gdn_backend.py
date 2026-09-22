@@ -590,6 +590,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_indices,
             layer.conv_weights,
             conv_bias,
+            layer.A_log,
+            layer.dt_bias,
+            norm_weight,
             layer.activation,
             None,
         )

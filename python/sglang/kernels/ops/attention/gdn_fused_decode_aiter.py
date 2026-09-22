@@ -86,6 +86,9 @@ def covered(
     state_indices: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: Optional[torch.Tensor],
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
     activation: Optional[str],
     quant_dtype: Optional[torch.dtype],
 ) -> Tuple[bool, str]:
@@ -110,6 +113,9 @@ def covered(
         state_indices,
         conv_weight,
         conv_bias,
+        A_log,
+        dt_bias,
+        norm_weight,
         quant_dtype,
     )
 
