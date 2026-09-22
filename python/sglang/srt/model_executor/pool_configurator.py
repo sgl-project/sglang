@@ -358,11 +358,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     dcp_index_buf_widening_factor,
                 )
 
-                # Under DCP the latent KV shards but the indexer is replicated
-                # over the whole virtual loc space, so its per-token cost is
-                # dcp_size times what one rank's share would suggest. Counting
-                # it once here derives a max_total the pool cannot honour, and
-                # the symptom is an unexplained OOM during pool construction.
+                # The replicated indexer costs dcp_size times one rank's share.
                 cell_size += self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
@@ -520,11 +516,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        # This NPU branch subsumes the _is_ascend_mla_pool pricing branch this
-        # port carried: both exist to price index-K unquantized at
-        # index_head_dim when the cache is not FP8. The predicate itself is
-        # still live -- index_buf_is_replicated above needs it for the DCP
-        # widening term, which upstream has no equivalent of.
+        # Price index-K unquantized at index_head_dim unless the cache is FP8.
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
         )
@@ -537,13 +529,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            # NOTE(dcp-port): upstream forced allocate_all_layers on
-            # non-arch35, pairing with its arch35 gate on the compact
-            # indexer layout. That gate is dropped in
-            # kv_cache_configurator._build_ascend_mla_kv_pool, so forcing it
-            # here would budget 78 layers of index-K while the pool only
-            # allocates 21 -- re-inflating the ~222 GiB the elision reclaims
-            # on A3. Both changes stand or fall together.
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

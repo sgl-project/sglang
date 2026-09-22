@@ -654,25 +654,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
 
-        # How many token rows the index-K buffer spans, independent of the
-        # latent KV. The two diverge under DCP: the latent KV is sharded, so a
-        # rank keeps `size` rows, while the replicated LightningIndexer must
-        # address every global position and spans `size * dcp_size`, written at
-        # a raw loc. The CUDA DSA pool draws the same line (memory_pool.py:4444).
-        # The HiCache host mirror sizes index-K from the sharded `size`, so it
-        # asserts the page counts rather than transferring into a short buffer.
+        # Rows the index-K buffer spans, independent of the latent KV: under DCP
+        # the latent KV is sharded while the replicated indexer spans
+        # `size * dcp_size`. The CUDA DSA pool draws the same line.
         self.index_buf_size = size if index_buf_size is None else index_buf_size
 
         # The DCP extend write's owner filter, opened per forward by
-        # plan_dcp_extend_write. None means every write takes the capturable
-        # row-0 path.
+        # plan_dcp_extend_write. None keeps the capturable row-0 path.
         self._dcp_extend_write_loc: Optional[torch.Tensor] = None
         self._dcp_extend_write_plan = None
 
-        # Layers that reuse the previous layer's top-k own no Indexer and cache
-        # no index-K -- 57 of 78 on GLM-5.2. Upstream's `indexer_layer_ids` /
-        # `indexer_layer_id_to_slot` above carry that elision; read
-        # `self.num_indexer_layers` for the count.
+        # Layers that reuse the previous top-k own no Indexer and cache no
+        # index-K; upstream's indexer_layer_id_to_slot above carries that.
 
         self.custom_mem_pool = None
 
@@ -710,20 +703,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                # Pages come from index_buf_size, NOT self.size. Under DCP the
-                # latent KV is sharded so self.size is this rank's physical row
-                # count, while the indexer is replicated and has to address every
-                # GLOBAL position -- its span is size * dcp_size. At dcp_size 1
-                # the two are equal and this is the stock expression.
-                #
-                # The layer axis is num_indexer_layers, not layer_num: this pool
-                # now compacts index-K to the layers that own an Indexer and maps
-                # layer_id through indexer_layer_id_to_slot. That supersedes the
-                # ragged layer-aligned list this branch carried (d0d279c97) and
-                # is strictly better -- it also resolves the HiCache constraint
-                # that forced the ragged form, since transfer_kv_dim_exchange
-                # needs device and host layer counts to agree and both are now
-                # compacted the same way.
+                # Pages from index_buf_size, not self.size: the indexer is
+                # replicated. The layer axis is the compacted indexer layers.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
@@ -841,10 +822,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         selecting is then the whole operation, and it is correct at any
         ``dcp_size`` including 1.
         """
-        # ``layer_id`` overrides the layer's own id so a caller can read a
-        # DIFFERENT layer's KV -- which is the whole point of prefetching one
-        # layer ahead (C3). Everything else about the read is identical, so the
-        # override is a parameter rather than a second method.
+        # ``layer_id`` overrides the layer's own id so a caller can read another
+        # layer's KV; everything else about the read is identical.
         read_layer_id = layer.layer_id if layer_id is None else layer_id
         k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
         v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
@@ -860,8 +839,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.index_head_dim is None:
             return [], [], []
         # Iterates the buffer, not range(layer_num): index_k_buffer is compacted
-        # to num_indexer_layers now, so a layer_num-length loop would run off the
-        # end. This replaces the ragged-aware _index_k_item_len this branch used.
+        # to the indexer layers, so a layer_num-length loop runs off the end.
         buffers = list(self.index_k_buffer)
         if self.index_k_scale_buffer is not None:
             buffers += list(self.index_k_scale_buffer)
@@ -1003,10 +981,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         layer. ``plan_dcp_extend_write`` opens that window.
         """
         dcp_size = get_parallel().attn_dcp_size
-        # Bounds are checked against the WIDENED space, matching the CUDA
-        # pool's own widened check (memory_pool.py:4204). Checking the
-        # unscaled range here would reject every legitimate write above
-        # size/dcp_size the moment DCP came on.
+        # Bounds are checked against the widened space, as the CUDA pool does:
+        # the unscaled range would reject legitimate writes under DCP.
         maybe_detect_oob(
             loc,
             0,
@@ -1102,13 +1078,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
         if loc.numel() == 0:
-            # Reachable only on the filtered extend path, where a rank can
-            # legitimately own none of a short chunk's rows -- at dcp16 any
-            # extend under 16 tokens leaves most ranks with nothing. The row-0
-            # path never gets here because it keeps every row. Upstream's
-            # sharded pool returns on the same condition
-            # (page_interleave_pool.py, `if owned_idx.numel() == 0: return`);
-            # a zero-row scatter is not worth trusting to a vendor operator.
+            # A rank can own none of a short chunk's rows, and a zero-row
+            # scatter is not worth trusting to a vendor operator.
             return
 
         torch_npu.npu_scatter_nd_update_(
@@ -1152,16 +1123,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        # Only layers that own an Indexer produce index-K, and those are exactly
-        # the layers given a non-empty buffer. A write here to an elided layer
-        # means the pool's mask disagrees with the model's own
-        # `self.indexer is None` decision -- fail loudly rather than scatter into
-        # a zero-page tensor.
-        # The indexer is replicated: this writes at the raw, untranslated loc,
-        # so the bound is index_buf_size rather than size. That makes the two
-        # numbers a contract, and this is where a breach shows up -- an
-        # index_buf_size that did not span the virtual range would run off the
-        # end here rather than wrap, because nothing masks the scatter.
+        # A write to an elided layer means the pool's mask disagrees with the
+        # model's own `self.indexer is None`, so fail loudly. The indexer is
+        # replicated and writes at the raw loc, so the bound is index_buf_size.
         maybe_detect_oob(
             loc,
             0,

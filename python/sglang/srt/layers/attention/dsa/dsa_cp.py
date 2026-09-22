@@ -55,10 +55,8 @@ if TYPE_CHECKING:
 _enable_dsa_cp = envs.SGLANG_NPU_ENABLE_DSA_CP.get()
 
 if _enable_dsa_cp and envs.SGLANG_NPU_USE_MLAPO.get():
-    # The fused MLA preprocess writes the KV cache from inside the operator,
-    # at a slot mapping DSA-CP has already sliced, so rows the slice does not
-    # own would never be written. vLLM-Ascend refuses the same pair.
-    # DSA-CP defaults on, so it yields unless the user set both explicitly.
+    # The fused MLA preprocess writes the KV cache at a slot mapping DSA-CP has
+    # already sliced. DSA-CP defaults on, so it yields unless both were set.
     if envs.SGLANG_NPU_ENABLE_DSA_CP.is_set():
         raise ValueError(
             "SGLANG_NPU_ENABLE_DSA_CP does not compose with "
@@ -177,9 +175,8 @@ def _build_dsa_cp_plan(
         layer_scatter_modes is not None
         and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
     ):
-        # The slice assumes this rank was handed the whole batch, which is what
-        # TP_ATTN_FULL means. Under any other mode it already holds a piece and
-        # this would cut it twice.
+        # The slice assumes this rank holds the whole batch (TP_ATTN_FULL);
+        # any other mode would cut a slice twice.
         print_info_once(
             "DSA-CP is off: attention scatter mode is "
             f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
@@ -199,18 +196,13 @@ def _build_dsa_cp_plan(
         parallel.attn_tp_rank,
     )
     multi_request = sum(1 for n in extend_lens if n > 0) > 1
-    # The lift applies only where the causal crop is not load-bearing: it keeps
-    # the full per-request KV lengths and drops the crop instead. Below the
-    # bound the one-request refusal stands.
+    # The lift applies only where the causal crop is not load-bearing.
     lift_applies = _enable_dsa_cp_multi_request and dcp_crop_free_extend(
         forward_batch, index_topk
     )
     if not lift_applies and multi_request:
-        # One request per extend forward unless the lift is on, and the reason
-        # is the KV layout, not the query arithmetic: the operator reads a
-        # non-paged TND buffer whose ``actual_seq_lengths_kv`` is cumulative,
-        # so shortening one request's entry moves where the next one starts.
-        # With one request the shortened length is a true prefix of the buffer.
+        # The restriction is the KV layout, not the query arithmetic: the
+        # buffer's cumulative KV lengths double as its request boundaries.
         print_info_once(
             "DSA-CP is off for multi-request extends "
             f"({sum(1 for n in extend_lens if n > 0)} requests here); the "
@@ -310,9 +302,8 @@ def dsa_cp_redistribute_heads(x: torch.Tensor, plan: DsaCpPlan) -> torch.Tensor:
     missing = plan.num_tokens_pad - x.shape[0]
     if missing > 0:
         x = torch.cat([x, x.new_zeros((missing, h, d))], dim=0)
-    # reshape, not view: q_nope_out arrives from npu_transpose_batchmatmul
-    # with a permuted output layout, and view() refuses a non-contiguous
-    # tensor outright.
+    # reshape, not view: q_nope_out arrives non-contiguous from
+    # npu_transpose_batchmatmul and view() refuses that.
     send = x.reshape(tp, plan.rows, h, d).contiguous()
     recv = torch.empty_like(send)
     parallel.attn_tp_group.all_to_all_single(recv, send)

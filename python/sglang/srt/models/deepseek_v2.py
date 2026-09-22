@@ -2124,13 +2124,9 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
-        # DSA-CP: every head, for this rank's slice of the batch's tokens.
-        #
-        # Only the attention module needs the full head count. The weights are
-        # untouched -- q_nope_out and q_pe are redistributed across attn-TP by
-        # an all-to-all after the rope, and the output is put back by another
-        # before w_vc and o_proj -- so q_b_proj, kv_b_proj, w_kc, w_vc and
-        # o_proj all stay head-sharded exactly as they are without DSA-CP.
+        # DSA-CP: every head, for this rank's slice of the batch's tokens. Only
+        # the attention module needs the full head count -- the query is
+        # redistributed by all-to-all, so every weight stays head-sharded.
         self.attn_mqa_for_dsa_cp = None
         if dsa_cp_enabled():
             self.attn_mqa_for_dsa_cp = RadixAttention(

@@ -184,12 +184,8 @@ def _get_indexer_query_shard(
         layer_scatter_modes is not None
         and layer_scatter_modes.attn_mode != ScatterMode.TP_ATTN_FULL
     ):
-        # Same silent-fallback shape as the width check below, so it says so
-        # too. The plan assumes every attention-TP rank holds the whole batch,
-        # which is what TP_ATTN_FULL means; under any other scatter mode the
-        # rank already holds a slice and this would slice it twice. Refusing is
-        # correct -- going quiet about it is not, which is how the width check
-        # cost 16x the indexer for four weeks.
+        # The plan assumes this rank was handed the whole batch, which is what
+        # TP_ATTN_FULL means; any other mode would slice a slice.
         print_info_once(
             "DSA indexer query sharding is off: attention scatter mode is "
             f"{layer_scatter_modes.attn_mode}, not TP_ATTN_FULL"
@@ -202,19 +198,9 @@ def _get_indexer_query_shard(
     shard = forward_batch.npu_indexer_query_shard
     if shard is None:
         return None
-    # ``num_tokens`` is the query tensor's width. SGLang pads that up to a
-    # multiple of attn_tp_size for the MLP reduce-scatter
-    # (``ForwardBatch.prepare_mlp_sync_batch``, ``ceil_align(n, attn_tp_size)``)
-    # while ``shard.total`` counts real tokens only. ``rows * tp_size`` is
-    # ``ceil_align(total, tp_size)`` -- exactly that padded width -- so the plan
-    # already covers the padding, and only a width outside [total, padded] means
-    # the plan does not describe this call.
-    #
-    # Comparing against ``total`` alone silently disabled sharding for every
-    # token count that was not already a multiple of attn_tp_size: 15 counts in
-    # 16, costing 16x the indexer. It went unnoticed because every test used
-    # 16384 -- the chunked-prefill size, and a multiple of 16 -- while the
-    # prefix-cached tails this is for compute whatever the prompt leaves over.
+    # SGLang pads the query width to a multiple of attn_tp_size, which is what
+    # ``rows * tp_size`` is, so admit anything inside [total, padded]. Comparing
+    # against total alone disables sharding for 15 token counts in 16.
     padded = shard.rows * shard.tp_size
     if not shard.total <= num_tokens <= padded:
         print_info_once(

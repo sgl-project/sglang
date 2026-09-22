@@ -397,10 +397,8 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
-    # Resolve DSA-CP once per forward here, because this half of the pair
-    # receives layer_scatter_modes and the gate needs it; the core reads the
-    # cached result back. index_topk comes from m.indexer, which exists only on
-    # the layers that compute a top-k; None keeps the operator's causal crop.
+    # Resolved here because this half of the pair receives layer_scatter_modes;
+    # the core reads the cached plan back.
     get_dsa_cp_plan(
         forward_batch,
         layer_scatter_modes,
@@ -548,10 +546,8 @@ def forward_dsa_prepare_npu(
     )
 
 
-# Gathered rows per extend-gather collective. A bf16 latent row is 1024 bytes,
-# so the default caps a piece's scratch at 256 MiB of latent KV. The bytes
-# moved are the same at any piece size; the trade is launch overhead against
-# the scratch held beside the output.
+# Rows per extend-gather collective: caps the scratch held beside the output.
+# The bytes moved are the same at any piece size.
 _dcp_extend_gather_piece_rows = envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.get()
 if _dcp_extend_gather_piece_rows <= 0:
     _dcp_extend_gather_piece_rows = 1 << 62
@@ -629,9 +625,8 @@ def _dcp_gather_extend_kv_npu(
     md = forward_batch.attn_dcp_metadata
     plan = getattr(forward_batch, "npu_dcp_extend_gather", None)
     if plan is None:
-        # Sized by the shared planner for the whole context, for CUDA's
-        # kernels. Nothing on this path reads it, and held it is a
-        # context-sized tensor alive through every layer.
+        # The shared planner's context-sized buffer is for CUDA's kernels and is
+        # never read here, so drop it rather than hold it through every layer.
         md.dcp_kv_buffer = None
         plan = plan_dcp_extend_gather(
             forward_batch.extend_prefix_lens_cpu,
@@ -647,9 +642,8 @@ def _dcp_gather_extend_kv_npu(
             ]
         )
         forward_batch.npu_dcp_extend_gather = plan
-        # Tell the pool it may drop the rows this rank does not own from this
-        # forward's KV write. getattr because a wrapper pool (SWA, hybrid) may
-        # not know about this; declining leaves the pre-existing behaviour.
+        # Let the pool drop the rows this rank does not own from this forward's
+        # KV write. A wrapper pool (SWA, hybrid) may not offer it; that is fine.
         plan_write = getattr(get_token_to_kv_pool(), "plan_dcp_extend_write", None)
         if plan_write is not None:
             plan_write(forward_batch.out_cache_loc)
@@ -663,20 +657,9 @@ def _dcp_gather_extend_kv_npu(
     out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
     out_rope = dcp_extend_gather_buffer("rope", k_pe, total_rows)
 
-    # One scratch per key, sized for the widest piece and sliced per piece. The
-    # widest is not always the first: the last piece also carries this chunk's
-    # own KV.
-    scratch_rows = max(
-        (
-            (piece.send_end - piece.send_start) * parallel.dcp_size
-            + piece.extend_end
-            - piece.extend_start
-            for piece in plan.pieces
-        ),
-        default=0,
-    )
-    scratch_nope = dcp_extend_gather_buffer("latent_scratch", k_nope, scratch_rows)
-    scratch_rope = dcp_extend_gather_buffer("rope_scratch", k_pe, scratch_rows)
+    # One scratch per key, sized for the widest piece and sliced per piece.
+    scratch_nope = dcp_extend_gather_buffer("latent_scratch", k_nope, plan.scratch_rows)
+    scratch_rope = dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows)
 
     send_nope = send_rope = None
     if plan.send_rows:
@@ -727,10 +710,8 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # GLM-5.2 dispatches AttnForwardMethod.DSA_NPU here, not to
-    # forward_absorb_core, so forward_mla.py's DCP block never runs for it and
-    # DCP is composed here too. The two prepare/core pairs have different
-    # shapes, so this mirrors forward_mla.py rather than sharing it.
+    # GLM-5.2 dispatches DSA_NPU here rather than to forward_absorb_core, so
+    # forward_mla.py's DCP block never runs for it and DCP is composed here too.
     dcp_extend = (
         get_parallel().dcp_enabled
         and forward_batch.forward_mode.is_extend()
@@ -738,23 +719,17 @@ def forward_dsa_core_npu(
         and forward_batch.attn_dcp_metadata is not None
     )
     if dcp_extend:
-        # Extend under DCP: gather the context so this rank can see all of it,
-        # and hand the result to the backend on the batch. Without it the
-        # backend attends over its own shard with a full-span page table --
-        # in bounds and wrong.
+        # Gather the context so this rank can see all of it; without it the
+        # backend reads its own shard with a full-span page table.
         forward_batch.npu_dcp_extend_kv = _dcp_gather_extend_kv_npu(
             m, forward_batch, k_nope, k_pe
         )
 
     if is_dcp_mla_decode_phase(forward_batch):
-        # Every rank attends with the full head set against its own KV shard
-        # and keeps its own share after the merge, so the query is gathered
-        # across the group and attention runs on attn_mqa_for_dcp_decode, built
-        # at num_local_heads * dcp_size.
+        # Every rank attends with the full head set against its own KV shard and
+        # keeps its share after the merge, so the query is gathered first.
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out=q_nope_out, q_pe=q_pe)
-        # save_kv_cache stays True where the non-DCP branch takes
-        # `not mla_preprocess_used`: under DCP the write goes through
-        # _resolve_dcp_write, and a duplicate write is idempotent.
+        # save_kv_cache stays True here: the DCP write is idempotent.
         attn_output, lse = m.attn_mqa_for_dcp_decode(
             q_nope_out.contiguous(),
             k_nope.contiguous(),
@@ -765,16 +740,14 @@ def forward_dsa_core_npu(
             k_rope=k_pe.contiguous(),
             topk_indices=topk_indices,
         )
-        # The partials are per-head over this rank's tokens; the merge reduces
-        # the head axis back to num_local_heads, which is why the shared view
-        # below is correct for both branches.
+        # Per-head partials; the merge reduces the head axis back to
+        # num_local_heads, which is the view both branches take below.
         attn_output = attn_output.view(
             -1, m.num_local_heads * get_parallel().attn_dcp_size, m.kv_lora_rank
         )
         comm_backend = get_parallel().dcp_comm_backend
-        # Not cosmetic: feeding a base-e LSE to the base-2 combine is a monotone
-        # reweighting, so it stays finite and plausible and only acceptance
-        # degrades. "ascend" is a natural-log backend.
+        # Ascend returns a natural-log LSE; a base mismatch here degrades
+        # acceptance without failing.
         base_on_e = is_mla_dcp_lse_base_on_e(m.current_attention_backend)
         if comm_backend in ("a2a", "fi_a2a"):
             attn_output = dcp_a2a_lse_reduce(
@@ -798,36 +771,22 @@ def forward_dsa_core_npu(
         if dsa_cp_plan is not None and (
             topk_indices is None or m.attn_mqa_for_dsa_cp is None
         ):
-            # Both are built from the same condition as the plan, so a mismatch
-            # is a wiring bug rather than a configuration. Say which, instead of
-            # failing later on a shape.
+            # Same condition builds both, so a mismatch is a wiring bug.
             raise RuntimeError(
                 "DSA-CP planned this forward but the layer is not set up for "
                 f"it: attn_mqa_for_dsa_cp={m.attn_mqa_for_dsa_cp is not None}, "
                 f"topk_indices={topk_indices is not None}"
             )
         if dsa_cp_plan is not None:
-            # DSA-CP. Swap "this rank's heads for every token" for "every head
-            # for this rank's tokens". The group holds the same (token, head)
-            # pairs either way, each computed once, so the attention is
-            # unchanged; what falls is the per-query top-k KV read, which is
-            # what the operator is bound by.
-            #
-            # k_nope and k_pe stay full width: the KV write and the context
-            # gather below address every token. Attention must also return the
-            # padded width the batch carries, not plan.num_tokens -- SGLang
-            # pads tokens to a multiple of attn_tp_size, and out_cache_loc is
-            # sized by that.
+            # DSA-CP: swap "my heads for every token" for "every head for my
+            # tokens", which divides the per-query top-k KV read. k_nope/k_pe
+            # stay full width, and the padded row count must be handed back.
             dsa_cp_rows = q_nope_out.shape[0]
             q_nope_out = dsa_cp_redistribute_heads(q_nope_out, dsa_cp_plan)
             q_pe = dsa_cp_redistribute_heads(q_pe, dsa_cp_plan)
-            # The indexer ran at full width, so take this rank's rows of its
-            # top-k. Padded rows get index 0, whose output is discarded.
-            #
-            # A separate name is load-bearing: this function returns
-            # topk_indices for the next layer to reuse (only 21 of 78 layers
-            # run the indexer), so rebinding it here would hand that layer a
-            # slice, and the layer after would slice the slice.
+            # This rank's rows of the full-width top-k. A separate name is
+            # load-bearing: topk_indices is returned for the next layer to reuse,
+            # so rebinding it here would hand that layer a slice of a slice.
             attn_topk_indices = dsa_cp_slice(topk_indices, dsa_cp_plan)
             attn_mqa = m.attn_mqa_for_dsa_cp
         else:
@@ -843,18 +802,16 @@ def forward_dsa_core_npu(
             topk_indices=attn_topk_indices,
         )
         if dsa_cp_plan is not None:
-            # Undo the swap before anything else sees it: w_vc, o_proj and the
-            # layer communicator all expect this rank's own heads for the whole
-            # batch.
+            # Undo the swap: everything downstream expects this rank's own heads
+            # for the whole batch.
             attn_output = dsa_cp_restore_tokens(
                 attn_output.reshape(dsa_cp_plan.rows, -1, m.kv_lora_rank),
                 dsa_cp_plan,
                 dsa_cp_rows,
             )
     if dcp_extend:
-        # Drop the batch's reference before the MoE so a later forward on a
-        # different path cannot read a stale gather. The buffers themselves are
-        # reserved and survive.
+        # Drop the reference so a later forward cannot read a stale gather; the
+        # buffers themselves are reserved and survive.
         forward_batch.npu_dcp_extend_kv = None
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 

@@ -1615,20 +1615,9 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         is_arch35 = is_npu_arch35()
-        # NOTE(dcp-port): upstream gated this on `is_arch35`, i.e. 950/A5 only.
-        # That gate is deliberately dropped here. Layers that reuse the previous
-        # layer's top-k own no Indexer and never write index-K on ANY Ascend
-        # arch -- the predicate is `dsa_layer_skips_topk`, which reads the model
-        # config, not the device. On 910/A3 this elides 57 of 78 layers on
-        # GLM-5.2 and reclaims ~222 GiB machine-wide, measured on the box
-        # 2026-09-07 (0.447 GiB at a 32,768-token pool, matching
-        # 57 x 257 pages x 32,768 B to the byte). Keeping the arch35 gate would
-        # silently drop that on the A3 target.
-        #
-        # If upstream gated it because some 910-only consumer needs a
-        # layer-aligned index_k_buffer, this is where that would surface. The
-        # pool itself is arch-independent: it addresses index-K through
-        # indexer_layer_id_to_slot everywhere.
+        # NOTE(dcp-port): upstream gates this on `is_arch35` (950/A5 only). The
+        # gate is dropped because `dsa_layer_skips_topk` reads the model config,
+        # not the device, and the elision is worth ~222 GiB on A3.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
             is_draft_worker=self.is_draft_worker
         )
@@ -1665,13 +1654,9 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            # The indexer's extent is a separate decision from the latent KV's,
-            # and under DCP they diverge: the latent KV is sharded, so this pool
-            # keeps max_total rows and translates writes into them, while the
-            # LightningIndexer is replicated, addresses every global position at
-            # a raw loc, and so spans the whole virtual range. Not a bare
-            # multiply -- see dcp_virtual_loc_extent for why the draft worker
-            # would otherwise be scaled twice.
+            # The replicated indexer spans the whole virtual range where the
+            # sharded latent KV keeps max_total rows. Not a bare multiply -- see
+            # dcp_virtual_loc_extent for the draft worker.
             index_buf_size=dcp_virtual_loc_extent(
                 max_total_num_tokens,
                 get_parallel().attn_dcp_size,
@@ -2160,10 +2145,8 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
-                    # Widened by attn_dcp_size on both axes, matching the CUDA
-                    # branch below. The allocator issues *virtual* locs over the
-                    # whole sequence; each pool then keeps or translates them.
-                    # attn_dcp_size is 1 without DCP, so this is inert off it.
+                    # Widened on both axes like the CUDA branch below: the
+                    # allocator issues virtual locs over the whole sequence.
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                         sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                         page_size=get_schedule().page_size

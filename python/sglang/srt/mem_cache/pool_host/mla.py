@@ -355,18 +355,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
-                # This mirror is sized from the device pool's `size`, which is
-                # the rank's SHARDED latent-KV extent. The device's index-K is
-                # not sharded: the LightningIndexer is replicated and addresses
-                # every global position, so its buffer spans `index_buf_size` --
-                # the whole DCP virtual range. The two agree only while
-                # host_to_device_ratio >= dcp_size, which at a typical ratio of
-                # 2-3 and DCP16 it is not.
-                #
-                # Fail at startup rather than let transfer_kv_dim_exchange copy
-                # device pages into a host buffer that has fewer of them. That
-                # op checks the layer counts against each other
-                # (transfer_kv_dim_exchange.cpp:37) but not the page counts.
+                # This mirror is sized from the device pool's sharded `size`,
+                # but the device's index-K spans the replicated `index_buf_size`.
+                # transfer_kv_dim_exchange checks layer counts, not page counts.
                 device_index_pages = (
                     getattr(self.device_pool, "index_buf_size", self.device_pool.size)
                     // self.device_pool.page_size

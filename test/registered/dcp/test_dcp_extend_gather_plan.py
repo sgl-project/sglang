@@ -152,14 +152,20 @@ class TestDcpExtendGatherPlan(CustomTestCase):
                     piece.send_end - piece.send_start, max(1, piece_rows // dcp_size)
                 )
                 self.assertEqual(piece.index.numel(), piece.out_end - piece.out_start)
-                scratch_rows = (piece.send_end - piece.send_start) * dcp_size + (
-                    piece.extend_end - piece.extend_start
+                # the scratch the gather slices per piece, which the plan sizes
+                self.assertEqual(
+                    piece.scratch_rows,
+                    (piece.send_end - piece.send_start) * dcp_size
+                    + (piece.extend_end - piece.extend_start),
                 )
                 self.assertGreaterEqual(int(piece.index.min()), 0)
-                self.assertLess(int(piece.index.max()), scratch_rows)
+                self.assertLess(int(piece.index.max()), piece.scratch_rows)
             self.assertEqual(
                 (send, extend, out),
                 (plan.send_rows, sum(extend_lens), sum(prefix_lens) + sum(extend_lens)),
+            )
+            self.assertEqual(
+                plan.scratch_rows, max((p.scratch_rows for p in plan.pieces), default=0)
             )
 
 

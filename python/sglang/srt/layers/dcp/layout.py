@@ -131,11 +131,9 @@ def remap_dcp_local_topk_indices(
         torch.full_like(topk_indices, invalid),
     )
 
-    # Stable compaction without relying on a stable sort: offsetting a
-    # non-owned entry's key by K keeps every key distinct, so the permutation
-    # is unique. The keys are float32 because Ascend has no AiCore ArgSort for
-    # int32/int64 and falls back to AiCpu, which dominated the DCP decode cost;
-    # it stays exact because every integer below 2**24 is representable.
+    # Offsetting a non-owned key by K keeps every key distinct, so the sort is a
+    # unique permutation. float32 because Ascend argsorts int32/int64 on AiCpu;
+    # exact below 2**24, which is asserted above.
     order = torch.arange(k, device=topk_indices.device, dtype=torch.float32)
     keys = order + (~owned).to(torch.float32) * k
     return torch.gather(local, -1, torch.argsort(keys, dim=-1))
@@ -254,6 +252,7 @@ class DcpExtendGatherPiece(NamedTuple):
     out_start: int
     out_end: int
     index: torch.Tensor
+    scratch_rows: int
 
 
 class DcpExtendGatherPlan(NamedTuple):
@@ -268,6 +267,7 @@ class DcpExtendGatherPlan(NamedTuple):
     local_lens: List[int]
     padded_lens: List[int]
     send_rows: int
+    scratch_rows: int
     pieces: List[DcpExtendGatherPiece]
 
 
@@ -358,6 +358,7 @@ def plan_dcp_extend_gather(
         local_lens=local_lens,
         padded_lens=padded_lens,
         send_rows=sum(padded_lens),
+        scratch_rows=max((p.scratch_rows for p in pieces), default=0),
         pieces=pieces,
     )
 
@@ -397,6 +398,7 @@ def _dcp_extend_gather_piece(
         out_start=out_start,
         out_end=out_end,
         index=torch.cat(index),
+        scratch_rows=gathered_rows + extend_end - extend_start,
     )
 
 
