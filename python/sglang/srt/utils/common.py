@@ -608,6 +608,17 @@ def device_stream_context(stream):
     return torch.get_device_module(stream.device).stream(stream)
 
 
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
