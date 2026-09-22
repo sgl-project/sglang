@@ -375,6 +375,48 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
+# ============================ DeepSelect SM90 ============================= #
+# Keep this target isolated: DeepSelect relies on C++20, sm_90a-only code and
+# non-flushed FP32 subnormals for its integer-count simulation.
+if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
+    set(DEEPSELECT_SOURCES
+        "csrc/deepselect/api.cpp"
+        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_512_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu"
+        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_1024_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu"
+        "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_4096_numthreads_256_occupancy_1_b_4096_b2_4096_tma_3.cu"
+    )
+
+    Python_add_library(deepselect_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPSELECT_SOURCES})
+    set_target_properties(deepselect_ops PROPERTIES
+        CXX_STANDARD 20
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+    )
+    target_compile_options(deepselect_ops PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wno-deprecated-declarations>
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            -O3
+            -gencode=arch=compute_90a,code=sm_90a
+            --expt-relaxed-constexpr
+            --expt-extended-lambda
+            --use_fast_math
+            --ftz=false
+            -U__CUDA_NO_HALF_OPERATORS__
+            -U__CUDA_NO_HALF_CONVERSIONS__
+            -U__CUDA_NO_HALF2_OPERATORS__
+            -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+            -Wno-deprecated-declarations
+            --threads=${SGL_KERNEL_COMPILE_THREADS}>
+    )
+    target_include_directories(deepselect_ops PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/csrc/deepselect
+        ${CMAKE_CURRENT_LIST_DIR}/csrc/deepselect/3rdparty/kerutils/include
+        ${repo-cutlass_SOURCE_DIR}/include
+    )
+    target_link_libraries(deepselect_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    install(TARGETS deepselect_ops LIBRARY DESTINATION sgl_kernel)
+endif()
+
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
