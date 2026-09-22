@@ -33,7 +33,7 @@ export const config = {
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
       s.hicache === "off" &&
-      s.bcg === "off"
+      s.bcg === "on"
     );
   },
 
@@ -71,9 +71,9 @@ export const config = {
     {
       id: "bcg",
       title: "Breakable Cuda Graph",
-      default: "off",
+      default: "on",
       options: [
-        { id: "off", label: "Off" },
+        { id: "off", label: "Off", flags: ["--cuda-graph-backend-prefill disabled"] },
         {
           id: "on",
           label: "On",

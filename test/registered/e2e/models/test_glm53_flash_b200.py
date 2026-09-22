@@ -96,6 +96,9 @@ class TestGLM53FlashB200LowLatency(
         "--speculative-num-draft-tokens",
         "6",
         "--speculative-adaptive",
+        # Leave headroom for DeepGEMM warmup and adaptive EAGLE graphs.
+        "--mem-fraction-static",
+        "0.90",
     ]
 
 

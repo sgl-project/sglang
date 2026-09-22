@@ -95,6 +95,9 @@ class TestGLM53FlashH200LowLatency(
         "--speculative-num-draft-tokens",
         "6",
         "--speculative-adaptive",
+        # Leave headroom for additional adaptive EAGLE graph states.
+        "--mem-fraction-static",
+        "0.86",
     ]
 
 
