@@ -24,10 +24,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    get_attn_backend,
-    get_global_forced_attn_backend,
-)
+from sglang.multimodal_gen.runtime.layers.attention import selector as attention_selector
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -108,7 +105,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         self, server_args
     ) -> AttentionBackendEnum | None:
         """Resolve the H3 DiT backend using the selector's precedence."""
-        selected_backend = get_global_forced_attn_backend()
+        selected_backend = attention_selector.get_global_forced_attn_backend()
         if selected_backend is None:
             selected_backend, _ = server_args.resolve_component_attention_backend(
                 "transformer"
@@ -301,7 +298,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "validated under torch.compile or the breakable CUDA "
                     "graph; disable them or use --attention-backend fa."
                 )
-        get_attn_backend(
+        attention_selector.get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
             selected_attention_backend=selected_backend,
