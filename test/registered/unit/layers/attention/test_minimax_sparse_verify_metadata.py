@@ -157,6 +157,52 @@ class TestMiniMaxSparseVerifyMetadata(CustomTestCase):
 
         self.assertIs(backend._prefill_seqblock_meta, cached)
 
+    def test_cuda_graph_verify_metadata_is_refreshed_in_place(self):
+        backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
+        backend.is_npu = False
+        backend.is_eagle3 = True
+        backend.index_cache_enabled = False
+        backend._msa_owns_decode = False
+        backend.max_context_len = 1024
+        backend.speculative_num_draft_tokens = 8
+        backend._gpu_verify_extend_meta_cg = {}
+        batch = _verify_batch([1, 1], draft_token_num=4)
+
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        captured = backend._gpu_verify_extend_meta_cg[(2, 4)]
+        captured_seq_lens_ptr = captured.seq_lens.data_ptr()
+        captured_prefix_lens_ptr = captured.prefix_lens.data_ptr()
+        torch.testing.assert_close(
+            captured.cu_seqlens, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            captured.prefix_lens, torch.tensor([1, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            captured.seq_lens, torch.tensor([5, 5], dtype=torch.int32)
+        )
+        cu_seqlens, seq_lens, prefix_lens = backend._resolve_extend_meta(
+            batch, torch.empty(8, 1)
+        )
+        self.assertEqual(cu_seqlens.data_ptr(), captured.cu_seqlens.data_ptr())
+        self.assertEqual(seq_lens.data_ptr(), captured_seq_lens_ptr)
+        self.assertEqual(prefix_lens.data_ptr(), captured_prefix_lens_ptr)
+
+        batch.seq_lens.copy_(torch.tensor([17, 31], dtype=torch.int64))
+        batch.seq_lens_cpu = torch.tensor([17, 31], dtype=torch.int64)
+        backend.init_forward_metadata_out_graph(batch, in_capture=False)
+
+        refreshed = backend._gpu_verify_extend_meta_cg[(2, 4)]
+        self.assertIs(refreshed, captured)
+        self.assertEqual(refreshed.seq_lens.data_ptr(), captured_seq_lens_ptr)
+        self.assertEqual(refreshed.prefix_lens.data_ptr(), captured_prefix_lens_ptr)
+        torch.testing.assert_close(
+            refreshed.prefix_lens, torch.tensor([17, 31], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            refreshed.seq_lens, torch.tensor([21, 35], dtype=torch.int32)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

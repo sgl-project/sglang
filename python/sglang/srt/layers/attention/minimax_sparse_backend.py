@@ -176,6 +176,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        # CUDA EAGLE3 verify metadata keyed by (padded_bs, draft_width).  CUDA
+        # graphs retain these addresses while replay-side prep refreshes their
+        # contents from the live sequence-length buffers.
+        self._gpu_verify_extend_meta_cg: dict[tuple[int, int], SimpleNamespace] = {}
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -417,6 +421,45 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             and self.is_eagle3
             and forward_batch.forward_mode.is_target_verify()
         )
+        if is_eagle3_target_verify:
+            _bs = forward_batch.seq_lens.shape[0]
+            _ndt = _target_verify_draft_token_num(
+                forward_batch, self.speculative_num_draft_tokens
+            )
+            _key = (_bs, int(_ndt))
+            _cache = getattr(self, "_gpu_verify_extend_meta_cg", None)
+            if _cache is None:
+                # Keep __new__-constructed unit-test backends compatible.
+                _cache = self._gpu_verify_extend_meta_cg = {}
+            _meta = _cache.get(_key)
+            if _meta is None and in_capture:
+                _meta = SimpleNamespace(
+                    cu_seqlens=torch.arange(
+                        0,
+                        (_bs + 1) * int(_ndt),
+                        step=int(_ndt),
+                        dtype=torch.int32,
+                        device=forward_batch.seq_lens.device,
+                    ),
+                    seq_lens=torch.empty(
+                        (_bs,),
+                        dtype=torch.int32,
+                        device=forward_batch.seq_lens.device,
+                    ),
+                    prefix_lens=torch.empty(
+                        (_bs,),
+                        dtype=torch.int32,
+                        device=forward_batch.seq_lens.device,
+                    ),
+                )
+                _cache[_key] = _meta
+            if _meta is not None:
+                # This method runs before graph replay.  Update fixed-address
+                # buffers in place so the captured sparse kernels never retain
+                # warmup/dummy sequence lengths.
+                _meta.prefix_lens.copy_(forward_batch.seq_lens)
+                _meta.seq_lens.copy_(forward_batch.seq_lens)
+                _meta.seq_lens.add_(int(_ndt))
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -1381,27 +1424,38 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # EAGLE3 TARGET_VERIFY keeps seq_lens at the committed prefix and omits
         # regular extend metadata. Reconstruct its uniform verify width; the
         # total KV length is prefix + draft_token_num.
-        if (
+        is_gpu_eagle3_target_verify = (
             not self.is_npu
             and self.is_eagle3
             and forward_batch.forward_mode.is_target_verify()
-            and forward_batch.extend_seq_lens is None
-        ):
+        )
+        if is_gpu_eagle3_target_verify:
             _bs = forward_batch.seq_lens.shape[0]
             _ndt = _target_verify_draft_token_num(
                 forward_batch,
                 self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1)),
             )
-            forward_batch.extend_seq_lens = torch.full(
-                (_bs,),
-                int(_ndt),
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
+            if forward_batch.extend_seq_lens is None:
+                forward_batch.extend_seq_lens = torch.full(
+                    (_bs,),
+                    int(_ndt),
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
+                forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
+                if forward_batch.extend_prefix_lens is None:
+                    forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(
+                        torch.int32
+                    )
+
+            _graph_meta = getattr(self, "_gpu_verify_extend_meta_cg", {}).get(
+                (_bs, int(_ndt))
             )
-            forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
-            if forward_batch.extend_prefix_lens is None:
-                forward_batch.extend_prefix_lens = forward_batch.seq_lens.to(
-                    torch.int32
+            if _graph_meta is not None:
+                return (
+                    _graph_meta.cu_seqlens,
+                    _graph_meta.seq_lens,
+                    _graph_meta.prefix_lens,
                 )
 
         # NPU cache hit (same forward_batch).
@@ -1422,11 +1476,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ]
         )
         committed_seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if (
-            not self.is_npu
-            and self.is_eagle3
-            and forward_batch.forward_mode.is_target_verify()
-        ):
+        if is_gpu_eagle3_target_verify:
             prefix_lens = committed_seq_lens
             seq_lens = committed_seq_lens + forward_batch.extend_seq_lens.to(
                 torch.int32
@@ -1504,6 +1554,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         forward_batch.extend_seq_lens_cpu,
                     )
                 )
+                if self.is_eagle3 and forward_batch.forward_mode.is_target_verify():
+                    _bs = forward_batch.seq_lens.shape[0]
+                    _ndt = _target_verify_draft_token_num(
+                        forward_batch, self.speculative_num_draft_tokens
+                    )
+                    _graph_meta = getattr(self, "_gpu_verify_extend_meta_cg", {}).get(
+                        (_bs, int(_ndt))
+                    )
+                    if _graph_meta is not None:
+                        # get_cu_seqblocks has a small identity-LRU.  Keep the
+                        # captured pointer alive independently of that cache;
+                        # CUDA graphs retain addresses, not Python lifetimes.
+                        _graph_meta.cu_seqblocks_q = cu_seqblocks_q
             cached = (
                 forward_batch,
                 cu_seqlens,
