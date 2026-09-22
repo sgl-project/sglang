@@ -388,8 +388,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     )
     # Recorded after asynchronous copies; CPU readers wait before accessing them.
     host_offload_event: Optional[object] = None
-    # Let the encoder manage device transfer of raw features.
-    keep_feature_on_cpu: bool = False
 
     def wait_host_offload(self) -> None:
         """Block until the async host offload of this item's tensors landed."""
@@ -781,7 +779,7 @@ class MultimodalInputs:
                 init_feature_buffer(device)
             reset_buffer_offset()
             for item in mm_items:
-                if item.feature is not None and not item.keep_feature_on_cpu:
+                if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
@@ -796,7 +794,7 @@ class MultimodalInputs:
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:
-                if item.feature is not None and not item.keep_feature_on_cpu:
+                if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
 
         mm_inputs = MultimodalInputs(

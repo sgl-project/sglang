@@ -215,11 +215,7 @@ def _move_items_to_device(
 ) -> None:
     """Move item features to the target device (in-place, non-blocking)."""
     for item in items:
-        if (
-            not item.keep_feature_on_cpu
-            and isinstance(item.feature, torch.Tensor)
-            and item.feature.device != device
-        ):
+        if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
 
 
