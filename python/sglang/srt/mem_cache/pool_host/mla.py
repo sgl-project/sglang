@@ -728,7 +728,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                if _is_npu and ascendc_io_enabled():
+                if _is_npu and ascendc_io_enabled() and not self.mtp_draft_device_pools:
                     # The per-layer complete(i) event recorded by the caller lets
                     # later layers' DMA overlap the current layer's compute.
                     ik_start, ik_num = self._indexer_slot_range_for_layer(
@@ -750,25 +750,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # work on subsequent per-layer iterations.
                 if device_layer_id != 0:
                     return
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=getattr(
-                        device_pool, "k_buffer_tensor", device_pool.k_buffer
-                    ),
-                    host_k=self.k_buffer,
-                    device_v=getattr(
-                        device_pool, "v_buffer_tensor", device_pool.v_buffer
-                    ),
-                    host_v=self.v_buffer,
-                    device_index_k=device_pool.index_k_buffer,
-                    host_index_k=self.index_k_buffer,
-                    device_index_k_scale=getattr(
-                        device_pool, "index_k_scale_buffer", None
-                    ),
-                    host_index_k_scale=self.index_k_scale_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.H2D,
+                self._transfer_npu_mla_pool(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    TransferDirection.H2D,
+                    host_layer_start=host_layer_id,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -852,6 +839,53 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.mtp_draft_device_pools:
             return self.packed_device_data_ptrs, self.packed_device_kv_buffers
         return device_pool.data_ptrs, device_pool.kv_buffer
+
+    def _transfer_npu_mla_pool(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        direction,
+        host_layer_start: int,
+    ) -> None:
+        """Transfer one NPU MLA pool into its matching host-layer segment.
+
+        ``transfer_kv_dim_exchange`` requires matching device and host layer
+        counts. The host pool appends MTP draft rows after the target-model
+        rows, while each draft device pool owns only its own row.
+        """
+        host_layer_end = host_layer_start + device_pool.layer_num
+        device_k = getattr(device_pool, "k_buffer_tensor", device_pool.k_buffer)
+        device_v = getattr(device_pool, "v_buffer_tensor", device_pool.v_buffer)
+
+        if device_pool is self.device_pool:
+            host_index_k = self.index_k_buffer
+            host_index_k_scale = self.index_k_scale_buffer
+        else:
+            # Host MLA indexer storage covers physical target-model layers;
+            # MTP draft pools do not have a corresponding indexer segment.
+            if getattr(device_pool, "index_k_buffer", None) is not None:
+                raise ValueError(
+                    "NPU HiCache MTP draft pool has an indexer cache, but the "
+                    "host MLA pool has no matching draft indexer segment."
+                )
+            host_index_k = None
+            host_index_k_scale = None
+
+        transfer_kv_dim_exchange(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=self.k_buffer[:, host_layer_start:host_layer_end],
+            device_v=device_v,
+            host_v=self.v_buffer[:, host_layer_start:host_layer_end],
+            device_index_k=getattr(device_pool, "index_k_buffer", None),
+            host_index_k=host_index_k,
+            device_index_k_scale=getattr(device_pool, "index_k_scale_buffer", None),
+            host_index_k_scale=host_index_k_scale,
+            page_size=self.page_size,
+            direction=direction,
+        )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -956,7 +990,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                if _is_npu and ascendc_io_enabled():
+                if _is_npu and ascendc_io_enabled() and not self.mtp_draft_device_pools:
                     self._transfer_ascendc_sparse_copy(
                         device_pool,
                         host_indices,
@@ -964,26 +998,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=getattr(
-                        device_pool, "k_buffer_tensor", device_pool.k_buffer
-                    ),
-                    host_k=self.k_buffer,
-                    device_v=getattr(
-                        device_pool, "v_buffer_tensor", device_pool.v_buffer
-                    ),
-                    host_v=self.v_buffer,
-                    device_index_k=device_pool.index_k_buffer,
-                    host_index_k=self.index_k_buffer,
-                    device_index_k_scale=getattr(
-                        device_pool, "index_k_scale_buffer", None
-                    ),
-                    host_index_k_scale=self.index_k_scale_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
+                self._transfer_npu_mla_pool(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    TransferDirection.D2H,
+                    host_layer_start=0,
                 )
+                for draft_layer_id, draft_device_pool in enumerate(
+                    self.mtp_draft_device_pools
+                ):
+                    self._transfer_npu_mla_pool(
+                        draft_device_pool,
+                        host_indices,
+                        device_indices,
+                        TransferDirection.D2H,
+                        host_layer_start=self.target_layer_num + draft_layer_id,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
