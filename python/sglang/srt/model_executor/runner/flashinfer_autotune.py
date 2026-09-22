@@ -180,11 +180,11 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     ):
         from sglang.srt.platforms import current_platform
 
-        # Like the P2P cache's device namespace, separate colocated engines on
-        # different GPU allocations. Physical UUIDs also handle remapped CUDA
-        # indices and shared cache roots across hosts, while surviving restarts.
-        # MegaMoE's namespaced records require one writer per file. Concurrent
-        # engines sharing the same GPUs must use separate SGLANG_CACHE_DIRs.
+        # Ordinary FlashInfer tactics use best-effort merging, but MegaMoE's
+        # namespaced records currently require one writer per file. Follow the
+        # P2P cache's device isolation, using physical UUIDs for stable identity
+        # across CUDA index remapping and restarts. Engines sharing physical GPUs
+        # must use separate SGLANG_CACHE_DIRs.
         rank_key += f"_gpu{current_platform.get_device_uuid(mr.gpu_id)}"
     return cache_dir / f"{rank_key}.json"
 
