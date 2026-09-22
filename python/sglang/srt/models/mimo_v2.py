@@ -1171,6 +1171,12 @@ class MiMoV2Model(nn.Module):
 
 class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     # BitandBytes specific attributes
+    # Quantization policies name the checkpoint projections before fusion.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
         ".down_proj.",
