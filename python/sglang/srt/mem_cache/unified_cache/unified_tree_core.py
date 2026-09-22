@@ -541,6 +541,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=self.root_node.id,
             last_host_node=self.root_node.id,
             best_match_node=self.root_node.id,
+            full_kv_last_node=self.root_node.id,
             cache_actions=[],
         )
 
@@ -815,6 +816,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_last_node,
             action,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
@@ -824,6 +826,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_last_node,
             action,
         )
 
@@ -835,6 +838,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         UnifiedTreeNode,
         int,
         int,
+        UnifiedTreeNode,
         Optional[CacheAction | ComponentAction],
     ]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
@@ -914,6 +918,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            node,
             action,
         )
 
@@ -951,6 +956,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
         full_kv_hit_length: int,
+        full_kv_last_node: UnifiedTreeNode,
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
         node_update = best_match_node
@@ -984,6 +990,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            full_kv_last_node=full_kv_last_node,
         )
 
         for component in self.components:
@@ -998,6 +1005,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=result.last_device_node.id,
             last_host_node=result.last_host_node.id,
             best_match_node=result.best_match_node.id,
+            full_kv_last_node=result.full_kv_last_node.id,
             cache_actions=[action] if action is not None else [],
         )
 
@@ -1743,6 +1751,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        comp = self.components_by_type.get(component_type)
+        if comp is None or component_type != BASE_COMPONENT_TYPE:
+            return []
+        return comp.peek_host_eviction_candidates(num_tokens)
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -2114,9 +2130,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         return True
 
-    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+    def _is_host_leaf(
+        self, node: UnifiedTreeNode, *, ignore_children: bool = False
+    ) -> bool:
         """H-leaf: evicted, Full host value present, no children, unlocked on
-        both tiers, not root.
+        both tiers, not root. ``ignore_children`` answers "would this be an
+        H-leaf once its children are gone" for eviction-order simulation.
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -2131,7 +2150,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # a live segment's anchor, and _evict_host_leaf would delete it.
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
-        if len(node.children) > 0:
+        if not ignore_children and len(node.children) > 0:
             return False
         return True
 

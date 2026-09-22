@@ -646,6 +646,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _fill_evict_result(binding_result, DriveHostEvictionResult())
 
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        raise NotImplementedError(
+            "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs the python tree core"
+        )
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,

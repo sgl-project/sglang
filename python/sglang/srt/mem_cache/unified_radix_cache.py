@@ -293,6 +293,31 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "anchor_advanced": 0,
+            "anchor_advanced_tokens": 0,
+        }
+        # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
+        # of eviction, not at L2 admission. Resolved in init_hicache.
+        self._l3_write_on_host_evict = False
+        self._l3_evict_write_reserve_fraction = 0.0
+        self._l3_mamba_eager_write = False
+        self._prefetch_anchor_full_kv = False
+        # op id -> tokens of write-behind backups not yet acked; they count as
+        # covered reserve so a slow ack does not re-issue deeper into the tail.
+        self._write_behind_inflight: dict[int, int] = {}
+        # Step counter (not wall clock: the walk must run on every rank in the
+        # same steps to keep backup issue order identical).
+        self._write_behind_step = 0
+        # Tail tokens the last walk found already in storage; they count as
+        # covered until host eviction consumes them, so a steady state with a
+        # fully tiered tail does not re-walk the heap every step.
+        self._write_behind_clean_tokens = 0
+        self._l3_tier_stats: dict[str, int] = {
+            "wb_walks": 0,
+            "wb_issued_tokens": 0,
+            "wb_clean_tokens": 0,
+            "wb_unbacked_tokens": 0,
+            "mamba_eager_writes": 0,
         }
 
         self.reset()
@@ -397,6 +422,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self._write_behind_inflight.clear()
+        self._write_behind_clean_tokens = 0
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
 
@@ -472,6 +499,54 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.supports_swa():
                 swa = self.components[ComponentType.SWA]
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
+
+        self._l3_write_on_host_evict = bool(
+            envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
+            and self.cache_controller is not None
+            and self.cache_controller.enable_storage
+        )
+        if self._l3_write_on_host_evict:
+            if self.host_memory_mode == "buffer_only":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs a host cache tier; "
+                    "it does not apply to --hicache-host-memory-mode buffer_only"
+                )
+            if self._tree_core_backend != "python":
+                raise ValueError(
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT requires "
+                    "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+                )
+            self._l3_evict_write_reserve_fraction = (
+                envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+            )
+            logger.info(
+                "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
+                "of host pool (%d tokens)",
+                self._l3_evict_write_reserve_fraction,
+                int(
+                    self._l3_evict_write_reserve_fraction
+                    * self.cache_controller.mem_pool_host.size
+                ),
+            )
+        if envs.SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE.get():
+            if self._l3_write_on_host_evict:
+                self._l3_mamba_eager_write = True
+            else:
+                logger.warning(
+                    "SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE only applies with "
+                    "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT; ignored"
+                )
+        if envs.SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV.get():
+            if (
+                self._tree_core_backend == "python"
+                and self.host_memory_mode != "buffer_only"
+            ):
+                self._prefetch_anchor_full_kv = True
+            else:
+                logger.warning(
+                    "SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV needs the python tree "
+                    "core and a host cache tier; ignored"
+                )
 
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
@@ -1329,7 +1404,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
-        return result.tracker.get(component_type, 0)
+        evicted = result.tracker.get(component_type, 0)
+        if component_type == BASE_COMPONENT_TYPE and self._write_behind_clean_tokens:
+            self._write_behind_clean_tokens = max(
+                0, self._write_behind_clean_tokens - evicted
+            )
+        return evicted
 
     # ---- Decode retraction ----
 
@@ -1659,11 +1739,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        if self.enable_storage and not self._l3_write_on_host_evict:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        elif self._l3_mamba_eager_write:
+            for node_id in publish_node_ids:
+                self._write_backup_storage_mamba_only(node_id)
 
     def load_back(
         self,
@@ -1834,15 +1917,54 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
-    @rank_consensus
-    def write_backup_storage(self, node_id: NodeId) -> None:
-        if not self.enable_storage or self.cache_controller is None:
-            return
+    def _write_backup_storage_mamba_only(self, node_id: NodeId) -> Optional[int]:
+        """Exclusive tiering: persist only the node's Mamba state to L3 now; the
+        KV pages follow at host eviction and a prefetch needs both, so the state
+        must not fall out of the small host Mamba pool before the KV write."""
+        if self.cache_controller is None:
+            return None
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
-            return
+            return None
+        mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
+        if not mamba_xfers:
+            return None
+        keys = [k for x in mamba_xfers for k in (x.keys or [])]
+        if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys):
+            return None
+        self._l3_tier_stats["mamba_eager_writes"] += 1
+        # Empty KV part: the base _page_backup iterates zero hashes and the ack
+        # records no KV belief; the hybrid controller still writes extra_pools.
+        operation_id = self.cache_controller.write_storage(
+            spec.host_value[:0],
+            [],
+            [],
+            None,
+            extra_pools=list(mamba_xfers),
+        )
+        self.ongoing_backup[operation_id] = (
+            node_id,
+            self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        return operation_id
+
+    @rank_consensus
+    def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
+        """Issue the node's host->storage backup; returns the operation id, or
+        None when nothing was issued (no host copy)."""
+        if not self.enable_storage or self.cache_controller is None:
+            return None
+        spec = self.tree_core.build_storage_backup_spec(
+            node_id, self.hicache_storage_pass_prefix_keys
+        )
+        if spec is None:
+            return None
+        # A recompute after L2 eviction re-creates the node with backuped=False, so the
+        # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
+        if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -1866,6 +1988,74 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        return operation_id
+
+    def _write_behind_host_tail(self) -> None:
+        """Keep the reserve at the LRU host tail either free or already in
+        storage, so drive_host_eviction only drops pages storage holds. Every
+        input (pool state, tree, beliefs, in-flight set) is rank-replicated."""
+        self._write_behind_step += 1
+        if self._write_behind_step % 4:
+            return
+        pool = self.cache_controller.mem_pool_host
+        target = int(self._l3_evict_write_reserve_fraction * pool.size)
+        covered = (
+            pool.available_size()
+            + sum(self._write_behind_inflight.values())
+            + self._write_behind_clean_tokens
+        )
+        deficit = target - covered
+        # Refill in quarter-reserve quanta: the candidate walk heapifies every
+        # host leaf, so running it per freed page would eat the scheduler thread.
+        if deficit < max(1, target // 4):
+            return
+        stats = self._l3_tier_stats
+        stats["wb_walks"] += 1
+        # write_backup_storage repeats this check for its write-through callers;
+        # doing it here first lets clean tail tokens count toward the reserve.
+        beliefs = self.storage_existence_cache
+        clean = 0
+        for (
+            node_id,
+            num_tokens,
+            hash_value,
+        ) in self.tree_core.peek_host_eviction_candidates(
+            BASE_COMPONENT_TYPE, target - pool.available_size()
+        ):
+            if hash_value and beliefs.covers_all(PoolName.KV, hash_value):
+                clean += num_tokens
+                continue
+            operation_id = self.write_backup_storage(node_id)
+            if operation_id is None:
+                # No host copy to write from; the page leaves L2 without an L3 copy.
+                stats["wb_unbacked_tokens"] += num_tokens
+                continue
+            self._write_behind_inflight[operation_id] = num_tokens
+            stats["wb_issued_tokens"] += num_tokens
+        self._write_behind_clean_tokens = clean
+        stats["wb_clean_tokens"] += clean
+
+    def storage_prefetch_anchor(
+        self, req: Req, *, anchor: NodeId, matched_len: int
+    ) -> tuple[NodeId, int]:
+        """Hybrid models keep Mamba states only at the last leaves of a path, so
+        once a chain's tail is tiered to L3 the all-components anchor falls back
+        to an early node and the prefetch re-asks L3 for pages L2 already holds.
+        Advance to the deepest host-backed node of the Full-KV walk instead."""
+        if not self._prefetch_anchor_full_kv or req.full_kv_last_node is None:
+            return anchor, matched_len
+        tree_core = self.tree_core
+        full_kv_len = req.full_kv_hit_length
+        node = tree_core.node_by_id(req.full_kv_last_node)
+        while not tree_core.is_root(node.id) and not node.backuped:
+            full_kv_len -= len(node.key)
+            node = node.parent
+        if full_kv_len <= matched_len:
+            return anchor, matched_len
+        stats = self._prefetch_outcome_stats
+        stats["anchor_advanced"] += 1
+        stats["anchor_advanced_tokens"] += full_kv_len - matched_len
+        return node.id, full_kv_len
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2596,14 +2786,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """Drop KV beliefs beyond the folded usable cut (rank-synced): the
         next insert then re-writes the node (all pools), healing stale
         positives and aux holes at the cut through one FULL check."""
-        if self.host_memory_mode != "buffer_only":
-            return
+        # Both host-memory modes keep write-side beliefs now (cache mode dedups
+        # in write_backup_storage), so both must heal them here.
         chain = operation.all_hash_values
         if chain is None:
             return
-        self.storage_existence_cache.invalidate_beyond(
-            PoolName.KV, chain, keep_pages=operation.storage_hit_count // self.page_size
-        )
+        keep_pages = operation.storage_hit_count // self.page_size
+        beliefs = self.storage_existence_cache
+        beliefs.invalidate_beyond(PoolName.KV, chain, keep_pages=keep_pages)
+        # Mamba states are keyed by their node's last KV page hash, so the same
+        # cut heals a state whose eager write failed (see _drain_backup).
+        beliefs.invalidate_beyond(PoolName.MAMBA, chain, keep_pages=keep_pages)
 
     def _account_prefetch_outcome(self, operation, revoked: bool) -> None:
         """Feed the cumulative prefetch-outcome counters at the (rank-synced)
@@ -2624,7 +2817,11 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l3_miss_tokens"] += miss
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
-        return self._prefetch_outcome_stats.copy()
+        stats = self._prefetch_outcome_stats.copy()
+        if self._l3_write_on_host_evict:
+            stats.update(self._l3_tier_stats)
+            stats["wb_inflight_tokens"] = sum(self._write_behind_inflight.values())
+        return stats
 
     def _prefetch_occupied_span(self, prefetch_key, host_indices) -> int:
         """Occupancy units held by a prefetch: cache mode reserves the
@@ -3003,6 +3200,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                    self._write_behind_inflight.pop(operation.id, None)
+                    # Added unconditionally: completed_tokens can diverge across ranks on
+                    # backend failure and a divergent belief desyncs the rank collectives.
+                    if operation.hash_value:
+                        self.storage_existence_cache.add(
+                            PoolName.KV, operation.hash_value
+                        )
+                    for transfer in operation.pool_transfers or ():
+                        if transfer.name == PoolName.MAMBA and transfer.keys:
+                            self.storage_existence_cache.add(
+                                PoolName.MAMBA, transfer.keys
+                            )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -3436,6 +3645,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self._l3_write_on_host_evict:
+            self._write_behind_host_tail()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

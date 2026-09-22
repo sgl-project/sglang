@@ -456,6 +456,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """Host leaves in the order drive_host_eviction would take them, until
+        their tokens reach num_tokens: (node_id, tokens, hash_value). Read-only."""
+        ...
+
+    @abstractmethod
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,

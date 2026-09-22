@@ -3132,6 +3132,9 @@ class Scheduler(
 
             matched_len = len(req.prefix_indices) + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
+            last_host_node, matched_len = tree_cache.storage_prefetch_anchor(
+                req, anchor=last_host_node, matched_len=matched_len
+            )
 
             if (
                 tree_cache.is_backuped(last_host_node)

@@ -3483,6 +3483,50 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
         cache.sanity_check()
 
+    def test_hicache_l3_failed_write_still_records_belief(self):
+        """A failed storage write is acked with completed_tokens=0 but its
+        pages are still recorded as stored (rank-deterministic beliefs), so
+        the next write_backup_storage of the same span is skipped until a
+        prefetch miss invalidates the belief."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            cache,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        seq = self._make_seq(1, 4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(cache, leaf)
+        page_hashes = self._all_page_hashes(cache, leaf)
+
+        backend = cache.cache_controller.storage_backend
+        with (
+            mock.patch.object(backend, "batch_set", return_value=False),
+            mock.patch.object(
+                backend, "batch_set_v1", side_effect=lambda h, *a, **k: [False] * len(h)
+            ),
+        ):
+            self._write_path_to_l3(cache, leaf)
+            self._flush_l3_backups(cache)
+
+        self.assertEqual(backend.batch_exists(page_hashes), 0)
+        self.assertTrue(
+            cache.storage_existence_cache.contains_all(PoolName.KV, page_hashes)
+        )
+        self.assertIsNone(cache.write_backup_storage(leaf))
+        cache.sanity_check()
+
     def test_hicache_l3_prefetch(self):
         """L3 round trip: write with one tree, prefetch into a fresh tree.
 
@@ -8519,6 +8563,51 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         self.assertEqual(ckpt_pool.available_size(), ckpt_initial)
         self.assertEqual(cache.mamba_evictable_size(), 0)
+
+
+class TestStoragePrefetchAnchorFullKV(CustomTestCase):
+    """storage_prefetch_anchor walks up the Full-KV chain to the deepest
+    host-backed node and reports that node's prefix length."""
+
+    cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+    _init_hicache = TestUnifiedRadixCacheKVEvents._init_hicache
+    _insert = TestUnifiedRadixCacheKVEvents._insert
+    _backup_node = TestUnifiedRadixCacheKVEvents._backup_node
+
+    def test_anchor_advances_to_deepest_backuped_node(self):
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        head, tail = [1, 2, 3, 4], [5, 6, 7, 8]
+        self._insert(cache, allocator, head)
+        self._insert(cache, allocator, head + tail)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", head + tail)))
+        ).last_device_node
+        parent = _node_parent(cache, leaf)
+        root = cache.root_node_handle()
+        self.assertNotEqual(parent, root)
+        # Only the head node is host-backed; the leaf is device-only.
+        self._backup_node(cache, parent)
+        self.assertTrue(cache.tree_core.is_backuped(parent))
+        self.assertFalse(cache.tree_core.is_backuped(leaf))
+
+        req = SimpleNamespace(full_kv_last_node=leaf, full_kv_hit_length=8)
+        cache._prefetch_anchor_full_kv = True
+        self.assertEqual(
+            cache.storage_prefetch_anchor(req, anchor=root, matched_len=0),
+            (parent, 4),
+        )
+        # Never moves the anchor shallower than what match_prefix already found.
+        self.assertEqual(
+            cache.storage_prefetch_anchor(req, anchor=leaf, matched_len=8),
+            (leaf, 8),
+        )
+        cache._prefetch_anchor_full_kv = False
+        self.assertEqual(
+            cache.storage_prefetch_anchor(req, anchor=root, matched_len=0),
+            (root, 0),
+        )
+        cache.sanity_check()
 
 
 _CONFIGS: list[CacheConfig] = [
