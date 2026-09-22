@@ -168,7 +168,10 @@ def _port_forward_start(
 
     `resource="pod"` binds one specific pod instead of the Service. A draining
     pod is removed from the Service's ready endpoints, so a test that needs to
-    keep talking to it through the drain must address the pod directly.
+    keep talking to it through the drain must address the pod directly — as
+    must one comparing replicas against each other, since a Service target
+    load-balances and "read replica A then replica B" would silently read the
+    same pod twice.
     """
     cmd = [
         "kubectl",
