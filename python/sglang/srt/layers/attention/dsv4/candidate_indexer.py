@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_platform
 
 
 class CandidateMetadata:
@@ -130,10 +130,8 @@ class CandidateIndexer(ABC):
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
 ) -> Optional[CandidateIndexer]:
-    """DeepGEMM's paged sparse indexer on SM100, with the dense-score
-    implementation for prefill under context parallelism (a rank's local rows
-    are not the page table's rows); None on Hopper, whose decode and prefill
-    indexers select through masks inline."""
+    """DeepGEMM's paged sparse indexer on SM100, including CP prefill.
+    Hopper's decode and prefill indexers still select through masks inline."""
     if topk_blocks <= 0 or get_platform().device_sm < 100:
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -148,16 +146,8 @@ def make_candidate_indexer(
     from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
         DeepGemmCandidateIndexer,
     )
-    from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
-        DenseCandidateIndexer,
-    )
 
-    prefill_dense = None
-    if get_parallel().attn_cp_size > 1:
-        prefill_dense = DenseCandidateIndexer(topk_blocks, block_size)
-    return DeepGemmCandidateIndexer(
-        topk_blocks, block_size, prefill_dense=prefill_dense
-    )
+    return DeepGemmCandidateIndexer(topk_blocks, block_size)
 
 
 # TODO(candidate): Hopper decode and the torch prefill path still select through

@@ -875,6 +875,192 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
+class TestCandidateIndexerCPPages(CustomTestCase):
+    @staticmethod
+    def _metadata(req_to_token, requests, lengths, num_tokens):
+        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+            BuildPageTablePositions,
+        )
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+
+        prep = BuildPageTablePositions.execute(
+            req_to_token=req_to_token,
+            req_pool_indices_repeated=requests,
+            seq_lens_casual=lengths,
+            max_seq_len=int(lengths.max()),
+            page_size=256,
+            swa_window=128,
+        )
+        return DSV4AttnMetadata(
+            page_size=256,
+            page_table=prep.page_table,
+            raw_out_loc=torch.zeros(num_tokens, dtype=torch.int32),
+            cuda_int32_kwargs={"dtype": torch.int32},
+            seq_lens_casual=prep.seq_lens_casual,
+            positions_casual=prep.positions_casual,
+            swa_page_indices=torch.empty((lengths.numel(), 0), dtype=torch.int32),
+            swa_topk_lengths=prep.swa_topk_lengths,
+            index_topk=512,
+            present_ratios=(1, 2),
+            low_ratios=(1, 2),
+        )
+
+    def test_cp_pages_address_global_compressed_kv(self):
+        """Local queries, including compact tails, address the original request's KV."""
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+            expand_index_page_table,
+        )
+        from sglang.srt.layers.cp.interleave import interleave_rows_per_request
+
+        extend_lens = [7, 1, 6]
+        requests = torch.tensor([3, 1, 4])
+        positions = torch.cat(
+            [torch.arange(254, 261), torch.arange(1), torch.arange(509, 515)]
+        )
+        global_requests = torch.repeat_interleave(requests, torch.tensor(extend_lens))
+        pages = torch.tensor([[9, 2, 11], [4, 14, 1], [8, 5, 12]])
+        req_to_token = torch.zeros((5, 768), dtype=torch.int64)
+        req_to_token[requests] = (pages[:, :, None] * 256 + torch.arange(256)).flatten(
+            1
+        )
+        tail_indices = torch.tensor([4, 5, 6, 7, 11, 12, 13])
+        forward_batch = SimpleNamespace(positions=positions, batch_size=3)
+        backend = be.DeepseekV4AttnBackend.__new__(be.DeepseekV4AttnBackend)
+
+        for cp_size in (2, 4):
+            for rank, tail in product(range(cp_size), (False, True)):
+                parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=cp_size)
+                with (
+                    self.subTest(cp_size=cp_size, rank=rank, tail=tail),
+                    patch.object(be, "get_parallel", return_value=parallel),
+                ):
+                    metadata_rows = (
+                        tail_indices if tail else torch.arange(positions.numel())
+                    )
+                    local_rows = metadata_rows[metadata_rows % cp_size == rank]
+                    if tail:
+                        layout = backend._late_layer_tail_cp_layout(
+                            forward_batch, tail_indices, torch.tensor([3, 1, 3])
+                        )
+                        cp_metadata = layout["cp_metadata"]
+                        padded_rows = sum(cp_metadata.per_rank_actual_token)
+                        local_index = cp_metadata.local_index
+                        query_lens = layout["local_lens_cpu"]
+                    else:
+                        padded_rows = -(-positions.numel() // cp_size) * cp_size
+                        local_index = None
+                        query_lens = interleave_rows_per_request(
+                            extend_lens, rank, cp_size
+                        )
+                    padding = padded_rows - metadata_rows.numel()
+                    metadata = self._metadata(
+                        req_to_token,
+                        torch.nn.functional.pad(
+                            global_requests[metadata_rows], (0, padding)
+                        ),
+                        torch.nn.functional.pad(
+                            positions[metadata_rows] + 1, (0, padding)
+                        ),
+                        metadata_rows.numel(),
+                    )
+                    metadata.apply_cp_reindex(
+                        num_tokens=metadata_rows.numel(), local_index=local_index
+                    )
+                    local_requests = torch.repeat_interleave(
+                        requests, torch.tensor(query_lens)
+                    )
+                    torch.testing.assert_close(
+                        local_requests, global_requests[local_rows]
+                    )
+                    torch.testing.assert_close(
+                        metadata.positions_casual[: local_rows.numel()].long(),
+                        positions[local_rows],
+                    )
+                    local_pages = metadata.page_table[: local_rows.numel()]
+                    # DeepGEMM pairs adjacent rows of a request using one page table.
+                    torch.testing.assert_close(
+                        local_pages.long(),
+                        torch.repeat_interleave(pages, torch.tensor(query_lens), dim=0),
+                    )
+                    for ratio in (1, 2):
+                        with self.subTest(ratio=ratio):
+                            index_pages = expand_index_page_table(
+                                local_pages,
+                                full_page_size=256,
+                                compress_ratio=ratio,
+                                index_page_size=128,
+                            )
+                            for row, global_row in enumerate(local_rows):
+                                compressed = torch.arange(
+                                    (positions[global_row] + 1) // ratio
+                                )
+                                slots = (
+                                    index_pages[row, compressed // 128].long() * 128
+                                    + compressed % 128
+                                )
+                                expected = (
+                                    req_to_token[
+                                        global_requests[global_row], compressed * ratio
+                                    ]
+                                    // ratio
+                                )
+                                torch.testing.assert_close(slots, expected)
+
+    def test_empty_cp_tail_clears_candidates_without_losing_full_publication(self):
+        """A rank with no tail queries must not build an empty sparse schedule."""
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+            PrefillCandidateBlocks,
+        )
+        from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
+            DenseCandidateIndexer,
+        )
+
+        positions, tail_indices = torch.arange(512), torch.arange(384, 512)
+        batch = SimpleNamespace(positions=positions, batch_size=1)
+        backend = be.DeepseekV4AttnBackend.__new__(be.DeepseekV4AttnBackend)
+        backend.candidate_indexer = DenseCandidateIndexer(2048, 8)
+        for rank in (0, 128):
+            with (
+                self.subTest(rank=rank),
+                patch.object(
+                    be,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_cp_rank=rank, attn_cp_size=256),
+                ),
+            ):
+                layout = backend._late_layer_tail_cp_layout(
+                    batch, tail_indices, torch.tensor([128])
+                )
+                tail = be.LateLayerTail(
+                    token_indices=layout["local_token_indices"],
+                    positions=layout["local_positions"],
+                    extend_seq_lens=torch.tensor([128]),
+                    extend_seq_lens_cpu=[128],
+                    swa_out_cache_loc=tail_indices + 256,
+                    pad_rows=layout["pad_rows"],
+                    cp_metadata=layout["cp_metadata"],
+                    local_lens_cpu=layout["local_lens_cpu"],
+                )
+                published = PrefillCandidateBlocks(
+                    request_blocks=[torch.tensor([[0], [1]], dtype=torch.int32)]
+                )
+                backend.forward_metadata = be.DSV4Metadata(None, None)
+                backend.tail_forward_metadata = be.DSV4Metadata(
+                    None, None, late_layer_tail=tail, candidate_metadata=published
+                )
+                backend._publish_prefill(published)
+                self.assertIs(backend.forward_metadata.candidate_metadata, published)
+                result = backend.tail_forward_metadata.candidate_metadata
+                if rank == 0:
+                    self.assertIsNone(result)
+                else:
+                    torch.testing.assert_close(
+                        result.request_blocks[0], published.request_blocks[0][-1:]
+                    )
+
+
 class TestCandidateIndexerGating(CustomTestCase):
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import candidate_indexer

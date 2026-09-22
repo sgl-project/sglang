@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     expand_index_page_table,
 )
 from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
-    DenseCandidateIndexer,
     score_tiles,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
@@ -158,20 +157,13 @@ class PrefillSparseBlockTable(SparseBlockTable):
 
 # TODO(dark): support fusion of publish + topk of publish layer
 class DeepGemmCandidateIndexer(CandidateIndexer):
-    def __init__(
-        self,
-        topk_blocks: int,
-        block_size: int,
-        prefill_dense: Optional[DenseCandidateIndexer] = None,
-    ):
+    def __init__(self, topk_blocks: int, block_size: int):
         assert block_size == CANDIDATE_BLOCK_SIZE, block_size
         self.topk_blocks = topk_blocks
         self.block_size = block_size
         self.alt_stream = torch.cuda.Stream()
         self._row_ids: Optional[torch.Tensor] = None
         self._retired_row_ids: list = []  # captured graphs keep reading the buffers they saw
-        # set for the forwards whose prefill rows the page table does not describe
-        self._prefill_dense = prefill_dense
 
     def _request_ids(
         self, request_ids: Optional[torch.Tensor], rows: int, device: torch.device
@@ -288,8 +280,6 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
         """The source layer's own top-k and the block table of the chunk from
         one pass over its dense scores, tile by tile: per tile the plain top-k
         into ``out_positions`` and one read for the block keys."""
-        if self._prefill_dense is not None:
-            return self._prefill_dense.publish_prefill(inputs, out_positions)
         rows = inputs.num_rows
         device = inputs.q_fp4.device
         nblocks, valid_lens = candidate_row_lens(inputs.compress_lens, self.topk_blocks)
@@ -380,8 +370,6 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
     def prefill_tail(
         self, published: CandidateMetadata, tail_lens: List[int]
     ) -> CandidateMetadata:
-        if self._prefill_dense is not None:
-            return self._prefill_dense.prefill_tail(published, tail_lens)
         table = published
         assert isinstance(table, PrefillSparseBlockTable), "prefill block table missing"
         rows, start = [], 0
@@ -408,8 +396,6 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
         inputs: PrefillIndexerInputs,
         out_positions: torch.Tensor,
     ) -> None:
-        if self._prefill_dense is not None:
-            return self._prefill_dense.select_prefill(published, inputs, out_positions)
         table = published
         assert isinstance(table, PrefillSparseBlockTable), "prefill block table missing"
         rows, heads = inputs.q_sf.shape

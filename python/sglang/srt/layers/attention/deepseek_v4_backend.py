@@ -3273,6 +3273,7 @@ class DeepseekV4AttnBackend(
             kv=kv,
             k_cache=k_cache.view(k_cache.shape[0], index_page_size, 1, 68),
             page_size=index_page_size,
+            # apply_cp_reindex keeps these rows aligned with the local queries.
             kv_page_table=self.forward_metadata.core_metadata.page_table[:num_tokens],
             kv_page_size=self.page_size,
             compress_ratio=ratio,
@@ -3297,6 +3298,8 @@ class DeepseekV4AttnBackend(
         if tail_lens is not None:
             self.tail_forward_metadata.candidate_metadata = (
                 self.candidate_indexer.prefill_tail(published, tail_lens)
+                if any(tail_lens)
+                else None
             )
 
     def _publish_prefill_masks(self, masks: CandidateMasks) -> None:

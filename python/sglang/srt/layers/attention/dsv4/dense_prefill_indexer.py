@@ -174,7 +174,7 @@ class DenseCandidateIndexer(CandidateIndexer):
     """Candidates as block ids per request (``PrefillCandidateBlocks``): the
     source keeps its best blocks from its dense scores, a consumer masks its own
     dense scores to -inf outside them and runs the plain top-k, tile by tile.
-    The prefill implementation for the CP layout; Hopper still runs the same
+    Used as a reference for sparse prefill; Hopper still runs the same
     selection inline in the backend."""
 
     def __init__(self, topk_blocks: int, block_size: int):
