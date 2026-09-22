@@ -33,7 +33,8 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
 
-WORKDIR /workspace
+# Set workspace directory
+WORKDIR /sgl-workspace/sglang
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
@@ -71,12 +72,6 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-
-### Install MemFabric
-RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
-
-### Install zbal
-RUN ${PIP_INSTALL} memfabric-zbal==1.2.0
 
 ### Install SGLang Model Gateway
 RUN ${PIP_INSTALL} sglang-router

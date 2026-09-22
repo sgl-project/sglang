@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
-        "candidate_steps": [1, 3, 7],
+        "candidate_steps": [1, 3, 5, 7],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,

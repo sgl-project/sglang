@@ -5,7 +5,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. Also registered under stage-b-e2e-mlx, which the
 # macOS CI lane (pr-test-mlx.yml) only dispatches via a gated workflow_dispatch.
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-b-e2e-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

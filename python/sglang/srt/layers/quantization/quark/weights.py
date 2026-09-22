@@ -67,9 +67,9 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
     moe_ep_size = get_parallel().moe_ep_size
 
     intermediate_size = model.config.intermediate_size
-    assert (
-        intermediate_size % mxfp4_block == 0
-    ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+    assert intermediate_size % mxfp4_block == 0, (
+        f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+    )
     intermediate_size_block = intermediate_size // mxfp4_block
 
     per_rank_intermediate_size_block = math.ceil(intermediate_size_block / moe_tp_size)

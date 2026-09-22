@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _StopConstruction(Exception):
@@ -175,7 +175,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
         )
-        scheduler.ps = SimpleNamespace(gpu_id=0)
         scheduler.nccl_port = 0
         scheduler.spec_algorithm = SimpleNamespace(
             is_none=lambda: False,

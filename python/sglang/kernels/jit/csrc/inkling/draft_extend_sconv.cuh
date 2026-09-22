@@ -114,7 +114,7 @@ struct DraftExtendSconvKernel {
     W1s.set_value(W1);
 
     TensorMatcher({BT, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hidden);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(num_accepted);
     RuntimeCheck(sizeof(DType) == 2, "draft_extend: bf16x2 kernel requires 16-bit dtype");

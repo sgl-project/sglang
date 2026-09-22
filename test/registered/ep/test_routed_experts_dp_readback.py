@@ -10,16 +10,16 @@ import pybase64
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=72, stage="base-c", runner_config="4-gpu-h100")
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24
@@ -102,7 +102,7 @@ class _ReadbackMixin:
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None):
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def _one_request(self, i: int):
         resp = requests.post(
