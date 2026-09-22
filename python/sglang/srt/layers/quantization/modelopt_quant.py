@@ -1498,9 +1498,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return 80
 
     def can_fuse_shared_expert(self) -> bool:
-        # Shared experts kept BF16 via exclude_modules cannot share the packed
-        # FP4 FusedMoE buffers; TP=1 fails to load and TP>1 loads them silently wrong.
-        return not any("shared_expert" in name for name in self.exclude_modules)
+        # A shared-expert body kept BF16 via exclude_modules cannot share the packed
+        # FP4 FusedMoE buffers. The shared_expert_gate is a separate linear (kept
+        # BF16 by e.g. Qwen3-Next NVFP4 checkpoints) and must not veto fusion.
+        return not any(
+            "shared_expert" in name and "shared_expert_gate" not in name
+            for name in self.exclude_modules
+        )
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
