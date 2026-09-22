@@ -13,9 +13,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
-
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark.quark import (
     QuarkConfig,
