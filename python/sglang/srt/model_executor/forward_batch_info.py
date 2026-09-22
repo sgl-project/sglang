@@ -902,6 +902,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        watermark_state = getattr(model_runner, "watermark_state", None)
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -963,14 +964,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             watermark_prompt_tail_ids=(
-                model_runner.watermark_state.prompt_tails(batch)
-                if model_runner.watermark_state is not None
+                watermark_state.prompt_tails(batch)
+                if watermark_state is not None
                 and batch.sampling_info.has_watermark_candidates
                 else None
             ),
             watermark_context_hash_history=(
-                model_runner.watermark_state.retracted_context_hashes(batch)
-                if model_runner.watermark_state is not None
+                watermark_state.retracted_context_hashes(batch)
+                if watermark_state is not None
                 and batch.sampling_info.has_watermark_candidates
                 else None
             ),

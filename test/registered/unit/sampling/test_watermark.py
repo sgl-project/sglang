@@ -183,10 +183,15 @@ def test_per_request_batch_config_and_admission():
 
 
 def test_disabled_speculative_batch_skips_watermark_state():
-    def fake_sampling(**kwargs):
+    def fake_verify_tree_greedy(**kwargs):
         kwargs["predicts"].fill_(3)
         kwargs["accept_index"].fill_(0)
         kwargs["accept_token_num"].fill_(1)
+        return (
+            kwargs["predicts"],
+            kwargs["accept_index"],
+            kwargs["accept_token_num"],
+        )
 
     verify_input = SimpleNamespace(
         draft_token_num=2,
@@ -204,7 +209,7 @@ def test_disabled_speculative_batch_skips_watermark_state():
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
         logit_bias=None,
-        is_all_greedy=False,
+        is_all_greedy=True,
         temperatures=torch.ones((1, 1)),
         need_top_k_sampling=False,
         need_top_p_sampling=False,
@@ -236,12 +241,10 @@ def test_disabled_speculative_batch_skips_watermark_state():
                 attn_tp_group=tp_group,
             ),
         ),
-        patch(
-            "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
-        ),
-        patch(
-            "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
-            side_effect=fake_sampling,
+        patch.object(
+            eagle_utils,
+            "verify_tree_greedy_func",
+            side_effect=fake_verify_tree_greedy,
         ),
     ):
         eagle_utils.eagle_sample(
