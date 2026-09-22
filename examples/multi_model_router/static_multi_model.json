@@ -1,0 +1,30 @@
+{
+  "router": {
+    "host": "0.0.0.0",
+    "port": 30000,
+    "policy": "round_robin"
+  },
+  "worker_host": "127.0.0.1",
+  "worker_base_port": 31000,
+  "startup_timeout_secs": 1800,
+  "models": [
+    {
+      "model_id": "qwen-chat",
+      "model_path": "/models/Qwen3-0.6B",
+      "gpu_groups": [[0], [1]],
+      "server_args": {
+        "tp_size": 1,
+        "mem_fraction_static": 0.8
+      }
+    },
+    {
+      "model_id": "glm-reason",
+      "model_path": "/models/GLM-5.3-Flash",
+      "gpu_groups": [[2, 3], [4, 5]],
+      "server_args": {
+        "tp_size": 2,
+        "mem_fraction_static": 0.8
+      }
+    }
+  ]
+}

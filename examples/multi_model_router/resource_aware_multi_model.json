@@ -1,0 +1,48 @@
+{
+  "router": {
+    "host": "0.0.0.0",
+    "port": 30001,
+    "policy": "power_of_two"
+  },
+  "model_resolver": {
+    "host": "0.0.0.0",
+    "port": 30000,
+    "refresh_interval_secs": 1.0,
+    "stale_after_secs": 3.0,
+    "request_timeout_secs": 120.0,
+    "profiles": [
+      {
+        "model_id": "general-chat",
+        "candidates": ["qwen-int4-tp4", "qwen-fp16-tp2"],
+        "max_kv_utilization": 0.9,
+        "max_waiting_requests": 32,
+        "min_free_tokens": 256
+      }
+    ]
+  },
+  "worker_host": "127.0.0.1",
+  "worker_base_port": 31000,
+  "startup_timeout_secs": 1800,
+  "models": [
+    {
+      "model_id": "qwen-int4-tp4",
+      "model_path": "/models/Qwen3-INT4",
+      "gpu_groups": [[0, 1, 2, 3]],
+      "server_args": {
+        "tp_size": 4,
+        "pp_size": 1,
+        "mem_fraction_static": 0.8
+      }
+    },
+    {
+      "model_id": "qwen-fp16-tp2",
+      "model_path": "/models/Qwen3-FP16",
+      "gpu_groups": [[4, 5]],
+      "server_args": {
+        "tp_size": 2,
+        "pp_size": 1,
+        "mem_fraction_static": 0.8
+      }
+    }
+  ]
+}
