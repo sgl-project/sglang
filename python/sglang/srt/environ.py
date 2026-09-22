@@ -1262,17 +1262,8 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
-    # FlashInfer PCIe-IPC all-reduce, for switch-free intra-node hosts (no
-    # NVLink, no multicast) where the backends above do not apply. Which shapes
-    # reach the kernels is decided here: supports() only reports whether they
-    # can run a tensor, so the workspace bound is what keeps the rest on NCCL.
+    # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
-    # Elements its workspace is sized for. It cannot grow after construction, so
-    # 0 sizes it for the widest decode the runner captures for (max_bs *
-    # draft_tokens * hidden), which leaves full-width prefill chunks on NCCL --
-    # measured faster than routing them here. Raise it to hand larger
-    # reductions to the kernels, at ~2 * world_size * max_numel * itemsize
-    # bytes per rank.
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

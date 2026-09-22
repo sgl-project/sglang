@@ -81,9 +81,8 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _FALLBACK_DECODE_WIDTH = 64
 
 
-#: Exact names, not a substring test: attention_tp / moe_tp / pdmux_prefill_tp
-#: carry no pynccl or custom all-reduce communicator, and a reduction
-#: dispatched to them asserts rather than falling back.
+#: attention_tp / moe_tp / pdmux_prefill_tp carry no pynccl or custom
+#: all-reduce communicator, so a reduction dispatched to them asserts.
 _ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
 
 
@@ -106,9 +105,9 @@ def eligible_group(
         and group_name in _ELIGIBLE_GROUP_NAMES
     ):
         return False
-    # Deterministic inference pins NCCL and turns off custom and
-    # symmetric-memory all-reduce for the same reason; disabling tuning alone
-    # would not help, since the seed policy is per-shape too.
+    # Tactic is chosen per shape, so the reduction order would follow the
+    # batch shape; disabling tuning alone does not help, the seed policy is
+    # per-shape too.
     if deterministic:
         _warn_deterministic_wins()
         return False
@@ -261,13 +260,12 @@ class PcieIpcCommunicator:
         if override:
             max_numel = override
         else:
-            # The runner's width is the one the decode graphs are captured for,
-            # already clamped to the request pool; _decode_width() is the
-            # lazy-build fallback and can only re-derive it.
+            # The runner's width is already clamped to the request pool;
+            # _decode_width() can only re-derive it.
             width = self._max_rows if self._max_rows else _decode_width()
             if width is None:
-                # This bound admits a different set of batches than the server
-                # will issue; every reduction outside it silently uses NCCL.
+                # Admits a different set of batches than the server issues;
+                # every reduction outside it silently uses NCCL.
                 logger.warning(
                     "FlashInfer PCIe-IPC is sizing its workspace from the fixed "
                     "fallback width %d, not from this server's decode config; "
@@ -338,9 +336,8 @@ class PcieIpcCommunicator:
         from flashinfer.autotuner import AutoTuner
 
         if AutoTuner.get().is_tuning_mode:
-            # Reached through the lazy build in should_pcie_ipc_ar, so tuning
-            # would start at whatever point the first reduction happens; keep
-            # it to prepare(), where the caller chose the moment.
+            # Reached through the lazy build, so tuning would start at
+            # whatever point the first reduction happens; keep it to prepare().
             logger.warning(
                 "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
                 "another autotune context; skipping autotune and keeping the seed "
@@ -396,8 +393,7 @@ class PcieIpcCommunicator:
         """
         if self.disabled or not inp.is_contiguous() or inp.dim() < 2:
             return False
-        # FlashInfer keys tuning results by dtype and only bf16 is tuned here,
-        # so anything else would run the seed policy while looking tuned.
+        # FlashInfer keys tuning results by dtype, and only bf16 is tuned here.
         if inp.dtype is not torch.bfloat16:
             _warn_untuned_dtype(inp.dtype)
             return False
