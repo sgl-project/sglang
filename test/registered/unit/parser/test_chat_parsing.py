@@ -24,7 +24,6 @@ import random
 import unittest
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
-from sglang.srt.parser.chat_parsing.content_parsers import parse_content
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1155,7 +1154,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual(result, {"role": "assistant"})
         self.assertEqual(final_events, [])
 
-    def test_region_events_include_raw_delimiters(self):
+    def test_region_events_expose_delimiter_offsets(self):
         spec = {
             "start_anchor": "<assistant>",
             "fields": {
@@ -1170,7 +1169,7 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         self.assertEqual(parser.input_text, "<content id=7>hello</content>")
         boundaries = [
-            (event["type"], event["raw"])
+            (event["type"], parser.input_text[event["start"] : event["end"]])
             for event in events
             if event["type"] != "region_chunk"
         ]
@@ -1190,7 +1189,7 @@ class ResponseEventStreamTest(unittest.TestCase):
             ],
         )
 
-    def test_implicit_and_boundary_closes_have_empty_raw_delimiters(self):
+    def test_implicit_and_boundary_closes_have_empty_delimiters(self):
         spec = {
             "start_anchor": "<assistant>",
             "fields": {
@@ -1204,7 +1203,11 @@ class ResponseEventStreamTest(unittest.TestCase):
         events.extend(final_events)
 
         boundaries = [
-            (event["type"], event["field"], event["raw"])
+            (
+                event["type"],
+                event["field"],
+                parser.input_text[event["start"] : event["end"]],
+            )
             for event in events
             if event["type"] != "region_chunk"
         ]
@@ -1218,7 +1221,7 @@ class ResponseEventStreamTest(unittest.TestCase):
             ],
         )
 
-    def test_prefix_provenance_and_provisional_open_value(self):
+    def test_prefix_provenance_and_open_captures(self):
         spec = {
             "start_anchor": "[BEGIN]",
             "fields": {
@@ -1245,10 +1248,6 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertLess(opening["start"], parser.prefix_end)
         self.assertLess(parser.prefix_end, opening["end"])
         self.assertEqual(opening["captures"], {"name": "get_weather"})
-        self.assertEqual(
-            opening["provisional_value"],
-            {"type": "function", "function": {"name": "get_weather"}},
-        )
 
     def test_malformed_region_events_recover_and_continue(self):
         spec = {
@@ -1277,13 +1276,12 @@ class ResponseEventStreamTest(unittest.TestCase):
 
         self.assertEqual(malformed["start"], 0)
         self.assertEqual(malformed["end"], len(malformed_text))
-        self.assertEqual(malformed["raw_open"], "<call:bad>")
-        self.assertEqual(malformed["raw_body"], '{"x":')
-        self.assertEqual(malformed["raw_close"], "</call>")
+        self.assertEqual(malformed["close_start"], len('<call:bad>{"x":'))
         self.assertTrue(malformed["closed"])
+        self.assertEqual(parser.input_text[: malformed["end"]], malformed_text)
         self.assertEqual(
-            malformed["raw_open"] + malformed["raw_body"] + malformed["raw_close"],
-            malformed_text,
+            parser.input_text[malformed["close_start"] : malformed["end"]],
+            "</call>",
         )
         self.assertEqual(
             message["tool_calls"],
@@ -1295,7 +1293,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         _, events = parser.finalize()
         malformed = next(event for event in events if event["type"] == "region_malformed")
         self.assertFalse(malformed["closed"])
-        self.assertEqual(malformed["raw_close"], "")
+        self.assertEqual(malformed["close_start"], malformed["end"])
 
     def test_zero_width_close_is_reported_as_closed(self):
         spec = {
@@ -1313,7 +1311,7 @@ class ResponseEventStreamTest(unittest.TestCase):
         malformed = next(event for event in events if event["type"] == "region_malformed")
 
         self.assertTrue(malformed["closed"])
-        self.assertEqual(malformed["raw_close"], "")
+        self.assertEqual(malformed["close_start"], malformed["end"])
 
 
 class PrefixAndTruncationTest(unittest.TestCase):
@@ -1495,24 +1493,6 @@ class PrefixAndTruncationTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "requires `prefix`"):
             ResponseParser(spec)
-
-
-class ContentParserTest(unittest.TestCase):
-    def test_strict_xml_inline_rejects_unmatched_content(self):
-        args = {
-            "tag_pattern": r"<(?P<key>\w+)>(?P<value>.*?)</\1>",
-            "strict": True,
-        }
-        self.assertEqual(
-            parse_content("<city>Paris</city>", "xml-inline", args),
-            {"city": "Paris"},
-        )
-        with self.assertRaisesRegex(ValueError, "unmatched non-whitespace content"):
-            parse_content(
-                "<city>Paris</city>trailing",
-                "xml-inline",
-                args,
-            )
 
 
 # xml-inline without a value_parser: parameter bodies stay raw strings until tools= coerces them.

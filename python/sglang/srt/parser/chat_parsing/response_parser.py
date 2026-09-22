@@ -19,31 +19,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .content_parsers import STREAMABLE_PARSERS, _apply_transform, process_field
+from .content_parsers import STREAMABLE_PARSERS, process_field
 from .response_templates import (
     ResponseTemplate,
     ResponseTemplateField,
     load_response_template,
 )
-
-_MISSING = object()
-
-
-def _provisional_value(transform: Any, captures: dict[str, str]) -> Any:
-    if isinstance(transform, dict):
-        result = {}
-        for key, item in transform.items():
-            value = _provisional_value(item, captures)
-            if value is not _MISSING:
-                result[key] = value
-        return result
-    if isinstance(transform, list):
-        items = [_provisional_value(item, captures) for item in transform]
-        return _MISSING if _MISSING in items else items
-    try:
-        return _apply_transform(transform, captures)
-    except (KeyError, ValueError):
-        return _MISSING
 
 
 def _schema_types(schema: Any) -> tuple[str, ...]:
@@ -132,11 +113,11 @@ class ResponseParser:
     using the calling tool's JSON schema as each region closes.
 
     Events can be "region_open", "region_chunk", "region_close", or "region_malformed".
-    Every event carries its exact `start` and `end` offsets. The parser exposes the
-    `prefix_end` boundary separately.
-    Open and close events also carry `raw`, the exact delimiter text that opened or closed
-    the region. Open events expose regex `captures` and any `provisional_value` determined
-    before the body is parsed.
+    Every event carries its exact `start` and `end` offsets. Delimiter text is the
+    corresponding slice of `input_text`. The parser exposes the `prefix_end` boundary
+    separately. Open events include `captures`, the opener's named groups, when it
+    matched any. Malformed events include `close_start`, the boundary between the
+    region body and its closing delimiter.
 
     ResponseParser requires the chat `prefix` (i.e. the chat history, the prefill before the current generation).
     This is because chat templates or assistant prefills can sometimes write part of the message, and if we
@@ -183,7 +164,6 @@ class ResponseParser:
         self._finalized: bool = False
         self._prefix_end: int = 0
         self._region_start: int = 0
-        self._open_raw: str = ""
         self._malformed_fields: set[str] = set()
         self.initial_events: list[dict] = []
         if prefix:
@@ -402,8 +382,7 @@ class ResponseParser:
         end = start + len(text)
         if not self._opened:
             self._region_start = start
-            self._open_raw = ""
-            events.append(self._event("region_open", self._current, start, start, raw="", captures={}))
+            events.append(self._event("region_open", self._current, start, start))
             self._opened = True
         self._body += text
         dirty = field.content not in STREAMABLE_PARSERS
@@ -415,19 +394,14 @@ class ResponseParser:
         self._body = ""
         self._opened = True
         self._region_start = m.start()
-        self._open_raw = m.group(0)
         event = self._event(
             "region_open",
             field.name,
             m.start(),
             m.end(),
-            raw=self._open_raw,
-            captures=dict(self._captures),
         )
-        if field.transform is not None and not field.transform_each:
-            provisional_value = _provisional_value(field.transform, self._captures)
-            if provisional_value is not _MISSING:
-                event["provisional_value"] = provisional_value
+        if self._captures:
+            event["captures"] = dict(self._captures)
         events.append(event)
 
     def _close_current(
@@ -445,7 +419,7 @@ class ResponseParser:
             return
         field = self._spec.fields[self._current]
         end = self._pos if end is None else end
-        start = end - len(raw)
+        close_start = end - len(raw)
         try:
             value = process_field(self._body, field, self._captures)
             if self._tool_params:
@@ -470,16 +444,14 @@ class ResponseParser:
                     self._current,
                     self._region_start,
                     end,
-                    raw_open=self._open_raw,
-                    raw_body=self._body,
-                    raw_close=raw,
+                    close_start=close_start,
                     closed=closed,
                     error=str(error),
                 )
             )
             self._reset_to_implicit()
             return
-        events.append(self._event("region_close", self._current, start, end, value=value, raw=raw))
+        events.append(self._event("region_close", self._current, close_start, end, value=value))
         self._reset_to_implicit()
 
     def _coerce_tool_calls(self, value: Any) -> Any:
@@ -507,5 +479,4 @@ class ResponseParser:
         self._body = ""
         self._opened = False
         self._region_start = self._pos
-        self._open_raw = ""
 # fmt: on
