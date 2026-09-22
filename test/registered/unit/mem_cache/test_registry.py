@@ -364,7 +364,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         )
         self.assertIs(result, cache)
 
-    def test_swa_radix_cache_when_hybrid_swa(self):
+    def test_unified_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True)
         # SWA hybrid models now default to the unified radix tree.
         fake_components = MagicMock()
@@ -390,7 +390,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, PureSWA.return_value)
 
-    def test_mamba_radix_cache_when_hybrid_ssm(self):
+    def test_unified_radix_cache_when_hybrid_ssm(self):
         ctx = _make_ctx(self, is_hybrid_ssm=True)
         # Mamba hybrid models now default to the unified radix tree.
         fake_components = MagicMock()

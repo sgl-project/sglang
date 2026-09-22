@@ -1014,7 +1014,6 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         if get_disagg().disaggregation_mode != "decode":
             assert not get_memory().disable_radix_cache
             assert not get_schedule().disable_hybrid_swa_memory
