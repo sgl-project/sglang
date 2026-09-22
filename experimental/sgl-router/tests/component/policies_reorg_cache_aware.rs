@@ -26,6 +26,7 @@ const TOKENS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 fn engine(id: &str, active: usize) -> Arc<Worker> {
     let engine = Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url: format!("http://{id}"),
         mode: Stage::Plain,

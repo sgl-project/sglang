@@ -104,6 +104,7 @@ fn context(workers: &[(&str, Stage, &MockWorker)], buckets: Vec<Bucket>) -> Arc<
     for &(id, mode, worker) in workers {
         registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(id.into()),
                 url: worker.url.clone(),
                 mode,
@@ -341,7 +342,7 @@ async fn missing_decode_in_all_buckets_does_not_dispatch_prefill() {
     );
     assert!(prefill.captured.lock().unwrap().last_body.is_none());
     assert!(decode.captured.lock().unwrap().last_body.is_none());
-    assert_eq!(policy.calls.lock().unwrap().len(), 2);
+    assert!(policy.calls.lock().unwrap().is_empty());
     assert_eq!(ctx.router_inflight_load.inflight_count(), 0);
     assert_eq!(
         ctx.registry
@@ -521,7 +522,10 @@ async fn decode_failure_retries_both_groups_in_next_bucket_without_dispatching_f
                 .router_inflight_load(),
             0
         );
-        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            first.calls.lock().unwrap().len(),
+            usize::from(reject_decode)
+        );
         let calls = accepted.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!((&*calls[0].0, calls[0].1), ("b-second", Stage::Prefill));

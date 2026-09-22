@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use crate::workers::WorkerRegistry;
+use crate::workers::{Worker, WorkerRegistry};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenLimits {
@@ -60,16 +60,28 @@ impl EngineGroup {
         workers: &WorkerRegistry,
         request: &PickRequest<'_>,
     ) -> Result<Pick, PickError> {
-        let mut engines: Vec<_> = workers
-            .healthy_workers_for(request.model)
+        self.pick_from(self.members(workers, request.model, request.stage), request)
+            .await
+    }
+
+    fn members(&self, workers: &WorkerRegistry, model: &ModelId, stage: Stage) -> Vec<Arc<Worker>> {
+        workers
+            .healthy_workers_for(model)
             .into_iter()
-            .filter(|engine| engine.mode() == request.stage)
+            .filter(|engine| engine.mode() == stage)
             .filter(|engine| {
                 self.worker_ids
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&engine.id))
             })
-            .collect();
+            .collect()
+    }
+
+    async fn pick_from(
+        &self,
+        mut engines: Vec<Arc<Worker>>,
+        request: &PickRequest<'_>,
+    ) -> Result<Pick, PickError> {
         // Stable order so cursor-based policies see a consistent candidate list.
         engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         if engines.is_empty() {
@@ -168,16 +180,35 @@ impl Bucket {
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => (
-                self.pick_from_group(group, Stage::Plain, workers, request)
-                    .await?,
+                self.pick_from_group(
+                    group,
+                    Stage::Plain,
+                    group.members(workers, request.model, Stage::Plain),
+                    request,
+                )
+                .await?,
                 None,
             ),
             BucketGroups::Pd { prefill, decode } => {
+                let mut decoders = decode.members(workers, request.model, Stage::Decode);
+                let mut prefills = prefill.members(workers, request.model, Stage::Prefill);
+                if prefills.is_empty() {
+                    return Err((Stage::Prefill, PickError::NoCandidates));
+                }
+                prefills.retain(|p| {
+                    decoders
+                        .iter()
+                        .any(|d| d.transfer_group == p.transfer_group)
+                });
+                if prefills.is_empty() {
+                    return Err((Stage::Decode, PickError::NoCandidates));
+                }
                 let prefill = self
-                    .pick_from_group(prefill, Stage::Prefill, workers, request)
+                    .pick_from_group(prefill, Stage::Prefill, prefills, request)
                     .await?;
+                decoders.retain(|d| d.transfer_group == prefill.engine.transfer_group);
                 let decode = self
-                    .pick_from_group(decode, Stage::Decode, workers, request)
+                    .pick_from_group(decode, Stage::Decode, decoders, request)
                     .await?;
                 (prefill, Some(decode))
             }
@@ -190,7 +221,7 @@ impl Bucket {
         &self,
         group: &EngineGroup,
         stage: Stage,
-        workers: &WorkerRegistry,
+        engines: Vec<Arc<Worker>>,
         request: &BucketRequest<'_>,
     ) -> Result<Pick, (Stage, PickError)> {
         let request = PickRequest {
@@ -205,7 +236,7 @@ impl Bucket {
             routing_key: request.routing_key,
         };
         group
-            .pick(workers, &request)
+            .pick_from(engines, &request)
             .await
             .map_err(|error| (stage, error))
     }

@@ -55,6 +55,7 @@ fn build_ctx(url: String, flags: &[&str]) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,

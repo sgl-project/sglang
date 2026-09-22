@@ -189,6 +189,7 @@ async fn fixture(
     for (index, backend) in backends.iter().enumerate() {
         registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(if index == 0 { "primary" } else { "backup" }.into()),
                 url: backend.url.clone(),
                 mode: WorkerMode::Plain,
@@ -406,6 +407,7 @@ async fn chat_records_proposal_empty() {
 #[tokio::test]
 async fn chat_records_prefill_admission_exhausted_for_out_of_range_primary() {
     let outsider = Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("outsider".into()),
         url: "http://outsider:30000".into(),
         mode: WorkerMode::Plain,

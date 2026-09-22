@@ -191,6 +191,7 @@ mod tests {
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
+            transfer_group: None,
             id: WorkerId(id.into()),
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,

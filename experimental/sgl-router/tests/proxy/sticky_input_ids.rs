@@ -95,6 +95,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
     let registry = Arc::new(WorkerRegistry::default());
     for (i, url) in worker_urls.iter().enumerate() {
         let _ = registry.add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId(format!("w{i}")),
             url: url.clone(),
             mode: WorkerMode::Plain,

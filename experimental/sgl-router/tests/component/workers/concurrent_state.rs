@@ -72,6 +72,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
         handles.push(std::thread::spawn(move || {
             for _ in 0..200 {
                 let _ = r.add(WorkerSpec {
+                    transfer_group: None,
                     id: WorkerId(format!("w{i}")),
                     url: format!("http://w{i}:30000"),
                     mode: WorkerMode::Plain,
@@ -125,6 +126,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
 #[test]
 fn load_guard_decrements_on_panic_unwind() {
     let w = Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w".into()),
         url: "http://x:30000".into(),
         mode: WorkerMode::Plain,

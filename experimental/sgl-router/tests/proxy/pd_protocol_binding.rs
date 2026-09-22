@@ -167,6 +167,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
     registry
         .add_with_cb(
             WorkerSpec {
+                transfer_group: None,
                 id: prefill_id.clone(),
                 url: prefill_url,
                 mode: WorkerMode::Prefill,
@@ -180,6 +181,7 @@ fn build_ctx(prefill_url: String, decode_url: String) -> Arc<AppContext> {
     registry
         .add_with_cb(
             WorkerSpec {
+                transfer_group: None,
                 id: decode_id.clone(),
                 url: decode_url,
                 mode: WorkerMode::Decode,

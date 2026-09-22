@@ -69,6 +69,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
     let registry = Arc::new(WorkerRegistry::default());
     for (i, url) in worker_urls.iter().enumerate() {
         let _ = registry.add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId(format!("w{i}")),
             url: url.clone(),
             mode: WorkerMode::Plain,
@@ -296,6 +297,7 @@ async fn adding_a_worker_does_not_redistribute_existing_key() {
     let w2 = MockWorker::start(vec![]).await;
     ctx.registry
         .add(WorkerSpec {
+            transfer_group: None,
             id: WorkerId("w2".into()),
             url: w2.url.clone(),
             mode: WorkerMode::Plain,

@@ -21,7 +21,9 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
     let ready = match resolver.resolve(&ModelId(ctx.config.model.id.clone())) {
         Ok(PdPools::Plain { workers }) => !workers.is_empty(),
-        Ok(PdPools::Pd { prefill, decode }) => !prefill.is_empty() && !decode.is_empty(),
+        Ok(PdPools::Pd { prefill, decode }) => prefill
+            .iter()
+            .any(|p| decode.iter().any(|d| d.transfer_group == p.transfer_group)),
         Err(_) => false,
     };
     if ready {
@@ -123,6 +125,7 @@ mod tests {
             for (i, mode) in modes.into_iter().enumerate() {
                 ctx.registry
                     .add(WorkerSpec {
+                        transfer_group: None,
                         id: WorkerId(i.to_string()),
                         url: format!("http://worker-{i}:30000"),
                         mode,
@@ -144,6 +147,7 @@ mod tests {
         if with_worker {
             ctx.registry
                 .add(WorkerSpec {
+                    transfer_group: None,
                     id: WorkerId("test-w".into()),
                     url: "http://test:30000".into(),
                     mode: WorkerMode::Plain,

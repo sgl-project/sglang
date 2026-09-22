@@ -108,14 +108,33 @@ async fn select_workers(
     candidates: &[Arc<Worker>],
     resolver: &PdPoolResolver,
 ) -> Result<SelectedWorkers, ApiError> {
+    let mut candidates = candidates.to_vec();
+    if candidates
+        .iter()
+        .any(|worker| worker.mode() == WorkerMode::Prefill)
+    {
+        let decode = resolver
+            .decode_candidates(&request.model)
+            .map_err(|error| pool_error(error, &request.model))?;
+        candidates.retain(|prefill| {
+            decode
+                .iter()
+                .any(|d| d.transfer_group == prefill.transfer_group)
+        });
+        if candidates.is_empty() {
+            return Err(ApiError::NoDecodeWorkersAvailable {
+                model: request.model.0.clone(),
+            });
+        }
+    }
     // Find cached prompt prefixes and capture engine load info.
     let routing_context = RoutingContext {
         prefix_matches: lookup_prefix_matches(ctx, request).await?,
-        load_snapshot: capture_load_snapshot(ctx, policy, candidates),
+        load_snapshot: capture_load_snapshot(ctx, policy, &candidates),
         ..RoutingContext::from_headers(ctx, headers)?
     };
 
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
+    let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
     Ok(SelectedWorkers {
         prefill,
@@ -233,9 +252,10 @@ fn pick_decode_worker(
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
     }
-    let candidates = resolver
+    let mut candidates = resolver
         .decode_candidates(&request.model)
         .map_err(|error| pool_error(error, &request.model))?;
+    candidates.retain(|decode| decode.transfer_group == prefill.transfer_group);
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
         bucket_selector: ctx.bucket_selector.as_ref(),

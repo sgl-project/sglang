@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 fn worker(id: &str, mode: WorkerMode) -> Arc<Worker> {
     Arc::new(Worker::new(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url: format!("http://{id}:30000"),
         mode,

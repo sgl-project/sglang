@@ -84,6 +84,7 @@ impl EngineAdmission for Reject {
 
 fn spec(id: &str, mode: Stage, model: &str) -> WorkerSpec {
     WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url: format!("http://{id}"),
         mode,
@@ -225,16 +226,23 @@ fn context_capacity_checks_peak_when_known_and_input_otherwise() {
 #[tokio::test]
 async fn selected_pd_bucket_owns_both_memberships_and_policies() {
     let workers = registry();
-    workers.add(spec("p2", Stage::Prefill, "pd")).unwrap();
-    workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
+    for (id, stage, group) in [
+        ("p2", Stage::Prefill, "a"),
+        ("d2", Stage::Decode, "a"),
+        ("p0", Stage::Prefill, "orphan"),
+    ] {
+        let mut worker = spec(id, stage, "pd");
+        worker.transfer_group = Some(group.into());
+        workers.add(worker).unwrap();
+    }
     let model = ModelId("pd".into());
     let prefill_policy = Arc::new(TestPolicy::default());
     let decode_policy = Arc::new(TestPolicy::default());
     let resolver = BucketResolver::new(vec![Bucket::new(
         "shared",
         BucketGroups::Pd {
-            prefill: group(&["p2", "d", "a"], prefill_policy.clone()),
-            decode: group(&["d2", "p", "other"], decode_policy.clone()),
+            prefill: group(&["p0", "p2", "d", "a"], prefill_policy.clone()),
+            decode: group(&["d", "d2", "p", "other"], decode_policy.clone()),
         },
     )])
     .unwrap();
@@ -253,6 +261,8 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
     assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
     assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
+    workers.remove(&WorkerId("d2".into()));
+    assert!(bucket.pick_engines(&workers, &request).await.is_err());
 }
 
 #[tokio::test]

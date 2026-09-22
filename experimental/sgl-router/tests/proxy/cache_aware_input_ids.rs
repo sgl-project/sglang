@@ -40,6 +40,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
     );
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,

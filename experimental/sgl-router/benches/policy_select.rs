@@ -21,6 +21,7 @@ fn workers(n: usize, model: &str) -> Vec<Arc<Worker>> {
     for i in 0..n {
         registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(format!("w{i}")),
                 url: format!("http://w{i}:30000"),
                 mode: WorkerMode::Plain,

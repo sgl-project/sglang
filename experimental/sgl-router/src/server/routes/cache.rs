@@ -230,6 +230,7 @@ mod tests {
         for (i, url) in urls.iter().enumerate() {
             ctx.registry
                 .add(WorkerSpec {
+                    transfer_group: None,
                     id: WorkerId(format!("w-{i}")),
                     url: (*url).to_string(),
                     mode: WorkerMode::Plain,
@@ -349,6 +350,7 @@ mod tests {
         let ctx = AppContext::stub();
         ctx.registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId("p".into()),
                 url: p_url.clone(),
                 mode: WorkerMode::Prefill,
@@ -358,6 +360,7 @@ mod tests {
             .expect("prefill accepted");
         ctx.registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId("d".into()),
                 url: d_url.clone(),
                 mode: WorkerMode::Decode,

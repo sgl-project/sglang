@@ -86,24 +86,25 @@ pub(super) async fn forward_chat_request(
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
-    let (response_worker, response_load_guards) = if let Some((decode, bootstrap)) = pd {
-        spawn_prefill_request(
-            ctx,
-            prefill,
-            headers.clone(),
-            body.clone(),
-            prefill_load_guards,
-            bootstrap.room,
-        );
-        let decode_load_guards = (
-            decode.load_guard(),
-            ctx.router_inflight_load
-                .register(decode.id.clone(), decode.url.clone(), 0, 1),
-        );
-        (decode, decode_load_guards)
-    } else {
-        (prefill, prefill_load_guards)
-    };
+    let (response_worker, response_load_guards, prefill_task) =
+        if let Some((decode, bootstrap)) = pd {
+            let task = spawn_prefill_request(
+                ctx,
+                prefill,
+                headers.clone(),
+                body.clone(),
+                prefill_load_guards,
+                bootstrap.room,
+            );
+            let decode_load_guards = (
+                decode.load_guard(),
+                ctx.router_inflight_load
+                    .register(decode.id.clone(), decode.url.clone(), 0, 1),
+            );
+            (decode, decode_load_guards, Some(task))
+        } else {
+            (prefill, prefill_load_guards, None)
+        };
 
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.
@@ -118,6 +119,12 @@ pub(super) async fn forward_chat_request(
         &metrics,
         expiration_token.clone(),
     );
+    let response_future = async {
+        match prefill_task {
+            Some(prefill) => forward_pd(prefill, response_future).await,
+            None => response_future.await,
+        }
+    };
     // A ready response wins if request expiration fires in the same poll.
     let result = tokio::select! {
         biased;
@@ -160,12 +167,12 @@ fn spawn_prefill_request(
     body: Bytes,
     load_guards: LoadGuards,
     bootstrap_room: u64,
-) {
+) -> tokio::task::JoinHandle<Result<Response<Body>, ApiError>> {
     let proxy = Arc::clone(&ctx.proxy);
-    // Let prefill finish KV transfer after client cancellation; router shutdown still cancels it.
+    // Prefill must finish KV transfer even if the client disconnects.
     tokio::spawn(async move {
         let _load_guards = load_guards;
-        match proxy
+        let result = proxy
             .forward_json_to(
                 &prefill_worker.url,
                 prefill_worker.protocol(),
@@ -175,20 +182,41 @@ fn spawn_prefill_request(
                 body,
                 None,
             )
-            .await
-        {
-            Ok(_) => tracing::debug!(
-                prefill_url = %prefill_worker.url, bootstrap_room, "prefill side completed",
-            ),
-            // Prefill failures surface to the client through decode's bootstrap timeout.
-            Err(error) => tracing::warn!(
-                prefill_url = %prefill_worker.url,
-                bootstrap_room,
-                %error,
-                "prefill request failed; decode will time out on bootstrap_room",
-            ),
+            .await;
+        tracing::debug!(prefill_url = %prefill_worker.url, bootstrap_room, "prefill request finished");
+        result
+    })
+}
+
+async fn forward_pd(
+    prefill: tokio::task::JoinHandle<Result<Response<Body>, ApiError>>,
+    decode: impl std::future::Future<Output = Result<Response<Body>, ApiError>>,
+) -> Result<Response<Body>, ApiError> {
+    enum Failure {
+        Response(Response<Body>),
+        Proxy(ApiError),
+    }
+    let prefill = async {
+        match prefill.await {
+            Ok(Ok(response)) if response.status().is_success() => Ok(()),
+            Ok(Ok(response)) if response.status().is_client_error() => {
+                Err(Failure::Response(response))
+            }
+            Ok(Ok(response)) => Err(Failure::Proxy(ApiError::PrefillFailed {
+                status: Some(response.status()),
+            })),
+            result => {
+                tracing::warn!(?result, "prefill failed; cancelling decode");
+                Err(Failure::Proxy(ApiError::PrefillFailed { status: None }))
+            }
         }
-    });
+    };
+    let decode = async { decode.await.map_err(Failure::Proxy) };
+    match tokio::try_join!(prefill, decode) {
+        Ok(((), response)) => Ok(response),
+        Err(Failure::Response(response)) => Ok(response),
+        Err(Failure::Proxy(error)) => Err(error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

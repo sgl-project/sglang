@@ -212,6 +212,7 @@ fn build_cache_ctx_with_affinity(
 
 fn worker_spec(id: &str, url: String, mode: WorkerMode) -> WorkerSpec {
     WorkerSpec {
+        transfer_group: None,
         id: WorkerId(id.into()),
         url,
         mode,

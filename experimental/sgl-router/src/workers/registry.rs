@@ -240,6 +240,7 @@ mod tests {
 
     fn spec(id: &str, mode: WorkerMode, models: &[&str]) -> WorkerSpec {
         WorkerSpec {
+            transfer_group: None,
             id: WorkerId(id.into()),
             url: format!("http://{id}:30000"),
             mode,

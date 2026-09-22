@@ -53,6 +53,7 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     for url in [&cached.url, &uncached.url] {
         registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId(url.clone()),
                 url: url.clone(),
                 mode: WorkerMode::Plain,

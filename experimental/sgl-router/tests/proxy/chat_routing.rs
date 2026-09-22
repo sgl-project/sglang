@@ -62,6 +62,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: url.to_string(),
         mode: WorkerMode::Plain,
@@ -968,6 +969,7 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
     // Register a worker that claims to serve "ghost-7b" — a model the
     // policy registry knows nothing about.
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w-ghost".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
@@ -1367,6 +1369,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
@@ -1501,6 +1504,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Plain,
@@ -1625,6 +1629,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
     let _ = registry.add(WorkerSpec {
+        transfer_group: None,
         id: WorkerId("w1".into()),
         url: worker.url.clone(),
         mode: WorkerMode::Plain,

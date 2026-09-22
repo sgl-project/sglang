@@ -381,6 +381,7 @@ mod tests {
         let ctx = Arc::new(AppContext::stub());
         ctx.registry
             .add(WorkerSpec {
+                transfer_group: None,
                 id: WorkerId("p0".into()),
                 url: "http://p0:30000".into(),
                 mode: WorkerMode::Prefill,
