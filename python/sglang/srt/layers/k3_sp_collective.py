@@ -28,8 +28,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-# Each supported world size must also have an exact-device tuning table; see
-# the dispatch probe in _init_state().
 _SUPPORTED_WORLD_SIZES = (4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
