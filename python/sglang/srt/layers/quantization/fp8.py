@@ -18,7 +18,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -1887,6 +1886,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight.is_shuffled = True
                 layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
             return
         elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
@@ -1934,6 +1934,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight.is_shuffled = True
                 layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
@@ -1944,6 +1945,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             del t
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            layer._aiter_gate_up_interleaved = False
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
@@ -2651,6 +2653,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+            layer._aiter_gate_up_interleaved = False
 
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
@@ -2902,7 +2905,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty_like(x)
 
@@ -3159,6 +3162,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type = AiterQuantType.PER_TOKEN
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
+
+        fused_moe_kwargs = None
+        gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
+        if (
+            gate_up_interleaved is not None
+            and (self.moe_runner_config.swiglu_limit or 0.0) > 0
+        ):
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            fused_moe_kwargs = {
+                "gate_mode": (
+                    GateMode.INTERLEAVE.value
+                    if gate_up_interleaved
+                    else GateMode.SEPARATED.value
+                )
+            }
+
         return AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -3169,6 +3189,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            fused_moe_kwargs=fused_moe_kwargs,
         )
 
 
