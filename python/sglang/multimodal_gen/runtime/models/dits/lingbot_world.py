@@ -642,6 +642,7 @@ class LingBotWorldTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, ...],
         c2ws_plucker_emb: torch.Tensor | None = None,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -703,6 +704,7 @@ class LingBotWorldTransformerBlock(nn.Module):
                 key=key,
                 cos=cos,
                 sin=sin,
+                complex_freqs=complex_freqs,
             )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
@@ -996,6 +998,8 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         else:
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
+            # Built once per forward, not per block; forward_cuda ignores it.
+            complex_freqs = torch.complex(freqs_cis[0], freqs_cis[1]).unsqueeze(-2)
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states,
@@ -1003,6 +1007,7 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     timestep_proj,
                     freqs_cis,
                     c2ws_plucker_emb,
+                    complex_freqs=complex_freqs,
                 )
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
