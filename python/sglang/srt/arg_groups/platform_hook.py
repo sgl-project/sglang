@@ -45,6 +45,35 @@ def handle_ppu_backends(server_args: Any):
     # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
     if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
         envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
+    # [q_v-not-support fallback] The PPU vendor fa3 library rejects the q_v
+    # argument ("q_v is only supported for Hopper GPUs") and the DSA fa3
+    # decode path always passes q_v, so the sub-SM90 CUDA default ("fa3")
+    # crashes at CUDA-graph capture. Default the DSA decode backend to
+    # flashmla_kv, the PPU-validated DSA decode impl; the DSA
+    # split-backend resolution treats a non-None value as user-set and
+    # keeps it. An explicit "--dsa-decode-backend fa3" fails fast with an
+    # actionable message instead of the vendor crash at graph capture.
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        if cfg.dsa_decode_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_ppu_backends",
+                dsa_decode_backend="flashmla_kv",
+            )
+            logger.info(
+                "PPU fa3 does not support q_v; defaulting the DSA decode "
+                "backend to flashmla_kv."
+            )
+        elif cfg.dsa_decode_backend == "fa3":
+            raise ValueError(
+                "--dsa-decode-backend fa3 is not supported on PPU: the fa3 "
+                'vendor library rejects q_v ("q_v is only supported for '
+                'Hopper GPUs") and the DSA fa3 decode path requires it. Use '
+                "--dsa-decode-backend flashmla_kv instead (the PPU default)."
+            )
     # Use CUDA PLA fast path by default on PPU.
     if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
         envs.SGLANG_SAIL_PLA_CUDA.set(True)
