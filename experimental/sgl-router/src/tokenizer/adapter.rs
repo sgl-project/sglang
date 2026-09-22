@@ -802,6 +802,48 @@ mod tests {
         assert!(l1_safe_specials(&p).is_empty());
     }
 
+    /// The router encodes with `add_special_tokens = false`, ALWAYS — pinned
+    /// here against the one fixture that can tell the difference (a
+    /// `TemplateProcessing` post-processor that prepends `<|endoftext|>`,
+    /// id 256). Every other fixture is `ByteLevel`, where the flag is a
+    /// no-op, so without this the crate has no test that would notice the
+    /// flag being flipped.
+    ///
+    /// Flipping it is a plausible future attempt to close the `/generate`
+    /// raw-text routing gap documented on `request_tokens_for_generate` —
+    /// and it would be the wrong fix twice over: the CHAT encoder renders
+    /// specials itself from the Jinja template, so a true here double-adds
+    /// the BOS, corrupting chat routing tokens AND the `input_ids` the
+    /// router forwards to the engine on that surface. Fix `/generate` on the
+    /// `/generate` path if it needs fixing, never by moving this flag.
+    #[test]
+    fn router_encodes_without_special_tokens() {
+        let tk = load("tests/fixtures/tiny_bos_tokenizer.json").unwrap();
+        let ids = encode(&tk, "hello").unwrap();
+        assert_ne!(
+            ids.first(),
+            Some(&256),
+            "the router's encode must not carry the fixture's BOS: {ids:?}"
+        );
+
+        // And the fixture really does add one when asked — otherwise the
+        // assertion above passes for the wrong reason.
+        let with = Tokenizer::from_file_with_options(
+            "tests/fixtures/tiny_bos_tokenizer.json",
+            dynamo_tokenizers::TokenizerOptions {
+                add_special_tokens: true,
+            },
+        )
+        .unwrap();
+        let mut want = vec![256];
+        want.extend_from_slice(&ids);
+        assert_eq!(
+            encode(&with, "hello").unwrap(),
+            want,
+            "fixture must be specials-adding for this test to mean anything"
+        );
+    }
+
     /// `finalize_load_opts` zeroes the L1 budget when the tokenizer has no
     /// safe specials — BEFORE any caller collapses the shard count for a
     /// cache that cannot exist — and passes through untouched otherwise.

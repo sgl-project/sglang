@@ -101,6 +101,58 @@ pub fn request_tokens_for(
     })
 }
 
+/// The `/generate` counterpart of [`request_tokens_for`]. It NEVER takes the
+/// chat-encoder branch and never reads `prompt`: `GenerateReqInput` is a
+/// dataclass that ignores extra keys, so a `/generate` body carrying a stray
+/// `messages` or `prompt` is legal — and routing on either would key on a
+/// prompt the engine never sees. This path reads `input_ids`, else `text`,
+/// and nothing else.
+///
+/// Client-supplied `input_ids` (a flat integer array — batch bodies are
+/// rejected at the route) are used verbatim: perfect parity by construction,
+/// and no tokenizer needed.
+///
+/// A `text` body is tokenized WITHOUT the special tokens the engine adds
+/// (`/generate` encodes with `add_special_tokens = true`, the router with
+/// `false`). On a tokenizer whose post-processor adds any — a
+/// `TemplateProcessing` BOS, say — every block boundary in the routing
+/// tokens is therefore shifted against the engine's, prefix matching against
+/// engine-emitted `BlockStored` hashes finds nothing, and cache-aware
+/// routing degrades to load-only for `/generate` text traffic. Nothing fails
+/// when that happens; send `input_ids` to route such traffic by prefix.
+///
+/// `engine_equivalent` stays `false` either way: router-computed ids are
+/// never forwarded on `/generate` (the engine would prefer them and silently
+/// drop `text`), so the flag's only consumer stays off.
+pub fn request_tokens_for_generate(
+    tokenizers: &TokenizerRegistry,
+    model_id: &ModelId,
+    value: &serde_json::Value,
+) -> Option<RequestTokens> {
+    if let Some(arr) = value.get("input_ids").and_then(|v| v.as_array()) {
+        let ids: Option<Vec<u32>> = arr
+            .iter()
+            .map(|x| x.as_u64().and_then(|n| u32::try_from(n).ok()))
+            .collect();
+        if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+            return Some(RequestTokens {
+                ids,
+                engine_equivalent: false,
+                // Raw/fallback ids are never forwarded; the marker is inert.
+                parity: crate::tokenizer::ForwardParity::Conservative,
+            });
+        }
+    }
+    let text = value.get("text").and_then(|t| t.as_str())?;
+    let ids = tokenize_text(tokenizers, model_id, text)?;
+    Some(RequestTokens {
+        ids,
+        engine_equivalent: false,
+        // Raw/fallback ids are never forwarded; the marker is inert.
+        parity: crate::tokenizer::ForwardParity::Conservative,
+    })
+}
+
 /// Tokenize `text` for `model_id` via the shared registry. Returns `None` if
 /// no tokenizer is loaded (the model_id may be misconfigured) or if encoding
 /// fails / yields no tokens. An encode error logs at WARN (a loaded-but-erroring
