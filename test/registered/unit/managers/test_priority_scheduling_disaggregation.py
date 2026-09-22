@@ -398,6 +398,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             cache_salt=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
+            pd_resolved_prefill_dp_rank=None,
         )
 
     def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):

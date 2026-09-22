@@ -94,6 +94,7 @@ def _decode_queue(sched):
             return_value=SimpleNamespace(kv_receiver=MagicMock())
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
+        _init_kv_receiver=MagicMock(),
     )
     return q
 
