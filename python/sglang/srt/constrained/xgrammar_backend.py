@@ -215,6 +215,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
     ):
         super().__init__()
 
@@ -244,6 +245,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+        self.max_whitespace_cnt = max_whitespace_cnt
 
     @property
     def is_support_token_filter(self):
@@ -348,7 +350,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                    schema=key_string,
+                    any_whitespace=self.any_whitespace,
+                    max_whitespace_cnt=self.max_whitespace_cnt,
                 )
 
         except (
