@@ -58,7 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
-C4_TOPK = 512
+DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
@@ -186,7 +186,7 @@ class DSV4AttnMetadata:
     swa_page_indices: torch.Tensor
     swa_topk_lengths: torch.Tensor
 
-    c4_sparse_topk: int
+    index_topk: int
     # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None
@@ -228,7 +228,7 @@ class DSV4AttnMetadata:
             src=other,
             dst=self,
             check_eq_fields=[
-                "c4_sparse_topk",
+                "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
             ],
@@ -263,7 +263,7 @@ class DSV4AttnMetadata:
         )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
-        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.index_topk == other.index_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
 
@@ -393,22 +393,20 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(self, is_prefill: bool = False):
-        # c4_sparse_topk is set from model_config.index_topk per-model
-        # (small model: 512, large model: 1024).
-        assert self.c4_sparse_topk in (512, 1024), (
-            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
+        assert self.index_topk in (512, 1024), (
+            f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+            self.c4_topk_lengths_clamp1, max=self.index_topk
         )
         assert self.c4_topk_lengths_raw is not None
         self.c4_sparse_topk_lengths_raw = torch.clamp(
-            self.c4_topk_lengths_raw, max=self.c4_sparse_topk
+            self.c4_topk_lengths_raw, max=self.index_topk
         )
         self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
+            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
             -1,
             dtype=torch.int32,
             device=self.c4_topk_lengths_clamp1.device,
@@ -574,8 +572,8 @@ class DeepseekV4HipRadixBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.c4_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+        self.index_topk = getattr(
+            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
@@ -588,6 +586,10 @@ class DeepseekV4HipRadixBackend(
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
         self.is_dspark_draft = self.is_draft_worker and self.is_dspark
+        # Draft layers are all COMPRESS_RATIO_NEXTN_LAYER (0), so the draft pool
+        # has neither compressed kv nor an indexer pool. Settled here rather than
+        # per forward: it cannot change after construction.
+        self.need_compress = not self.is_draft_worker
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -869,7 +871,8 @@ class DeepseekV4HipRadixBackend(
             num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            need_compress=True,
+            # guarded inside init_forward_metadata_prefill, not here
+            need_compress=self.need_compress,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_gpu_plan=ragged_layout is not None,
             extend_start_loc=extend_start_loc,
@@ -900,13 +903,14 @@ class DeepseekV4HipRadixBackend(
                 bs, num_draft_tokens, seq_lens, req_pool_indices
             )
         )
+        need_compress = self.need_compress
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -921,20 +925,27 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_decode_streams(
             core_attn_metadata, req_pool_indices_repeated
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=True,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_lens=extend_seq_lens,
-            seq_lens_cpu=None,
-            extend_lens_cpu=None,
-            use_prefill_cuda_graph=True,
-            num_q_tokens=num_draft_tokens * bs,
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if need_compress
+            else None
         )
+        if not need_compress:
+            create = _create_dummy_paged_compress_data
+        else:
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=True,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                extend_lens=extend_seq_lens,
+                seq_lens_cpu=None,
+                extend_lens_cpu=None,
+                use_prefill_cuda_graph=True,
+                num_q_tokens=num_draft_tokens * bs,
+            )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -953,25 +964,33 @@ class DeepseekV4HipRadixBackend(
             # the accepted-prefix lengths unchanged across the captured loop.
             seq_lens = seq_lens + self.speculative_step_id + 1
 
+        need_compress = self.need_compress
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=need_compress,
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if need_compress
+            else None
         )
+
+        if not need_compress:
+            create = _create_dummy_paged_compress_data
+        else:
+            create = functools.partial(
+                create_paged_compressor_data,
+                is_prefill=False,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
 
         return DSV4Metadata(
             core_attn_metadata,
@@ -1467,6 +1486,22 @@ class DeepseekV4HipRadixBackend(
         state_slot = state_slot[:N]
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
+        swa_len = core.swa_topk_lengths
+        hca_len = core.c128_topk_lengths_raw
+        csa_len = core.c4_sparse_topk_lengths_raw
+        hca_page_indices = core.c128_page_indices
+        c4_page_indices = core.c4_sparse_page_indices
+        # A draft pool carries no c4/c128 metadata, but its verify store still
+        # reads the swa half below, so build these with an empty compressed tail
+        # rather than skipping the call.
+        if hca_len is None:
+            hca_len = torch.zeros_like(swa_len)
+        if csa_len is None:
+            csa_len = torch.zeros_like(swa_len)
+        if hca_page_indices is None:
+            hca_page_indices = torch.empty(
+                (N, 0), dtype=torch.int32, device=swa_len.device
+            )
         (
             core.unified.swa_indices,
             core.unified.swa_indptr,
@@ -1477,11 +1512,11 @@ class DeepseekV4HipRadixBackend(
         ) = runtime.build_decode_streams(
             state_slot=state_slot,
             positions=core.positions_casual,
-            swa_len=core.swa_topk_lengths,
-            hca_len=core.c128_topk_lengths_raw,
-            csa_len=core.c4_sparse_topk_lengths_raw,
-            hca_page_indices=core.c128_page_indices,
-            csa_width=core.c4_sparse_page_indices.shape[1],
+            swa_len=swa_len,
+            hca_len=hca_len,
+            csa_len=csa_len,
+            hca_page_indices=hca_page_indices,
+            csa_width=0 if c4_page_indices is None else c4_page_indices.shape[1],
             win=pool.unified_swa_window,
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
@@ -1666,6 +1701,10 @@ class DeepseekV4HipRadixBackend(
                     attn_sink=attn_sink,
                     v_head_dim=layer.v_head_dim,
                 )
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
+                _kv_splits_for_stream,
+            )
+
             return runtime.decode(
                 q=q,
                 unified_kv=unified,
@@ -1673,6 +1712,9 @@ class DeepseekV4HipRadixBackend(
                 kv_indptr=kv_indptr,
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
+                # Only this call site knows compress_ratio, and it is the one
+                # thing that separates the ragged stream from the clamped ones.
+                kv_splits=_kv_splits_for_stream(compress_ratio),
             )
 
         # prefill / extend
@@ -2047,7 +2089,7 @@ class DeepseekV4HipRadixBackend(
             page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=self.c4_topk,
+            index_topk=self.index_topk,
         )
 
         if need_compress:
