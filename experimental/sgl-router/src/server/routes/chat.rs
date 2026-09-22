@@ -62,15 +62,16 @@ async fn chat_completions_legacy(
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
 
+    let policy = ctx
+        .policies
+        .get(&model)
+        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
+
     // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
     let candidates = resolver
         .prefill_candidates(&model)
         .map_err(|error| pool_error(error, &model))?;
-    let policy = ctx
-        .policies
-        .get(&model)
-        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     let request =
         PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
