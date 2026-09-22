@@ -92,6 +92,112 @@ fn chat_request() -> Request<Body> {
         .unwrap()
 }
 
+#[tokio::test]
+async fn pd_decode_stream_expires_after_prefill_completes() {
+    use sgl_router::state::load_monitor::router_inflight_load::{
+        MockClock, RouterInflightLoadRegistry,
+    };
+    use std::time::Instant;
+
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: chunk\n\n"; 1000],
+        Duration::from_millis(10),
+    )
+    .await;
+    let cfg = config();
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    registry
+        .add(WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        })
+        .unwrap();
+    registry
+        .add(WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        })
+        .unwrap();
+    let prefill_worker = registry.get(&WorkerId("p1".into())).unwrap();
+    let decode_worker = registry.get(&WorkerId("d1".into())).unwrap();
+    let clock = Arc::new(MockClock::new(Instant::now()));
+    let inflight = RouterInflightLoadRegistry::new(clock.clone(), Duration::from_secs(10));
+    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::with_router_inflight_load(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        inflight.clone(),
+    ));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    // Two prior faults make any accidental expiry failure trip the default breaker.
+    decode_worker.breaker.record_failure();
+    decode_worker.breaker.record_failure();
+    let response = build_router(ctx.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while inflight.inflight_count() != 1 || prefill_worker.router_inflight_load() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("prefill must complete before expiring decode");
+    assert_eq!(decode_worker.router_inflight_load(), 1);
+    clock.advance(Duration::from_secs(11));
+    assert_eq!(inflight.sweep_stale(), 1);
+    let error = tokio::time::timeout(Duration::from_secs(2), body.collect())
+        .await
+        .expect("decode stream must stop when its registration expires")
+        .unwrap_err();
+    assert!(error.to_string().contains("stale_request_timeout"));
+    assert_eq!(decode_worker.router_inflight_load(), 0);
+    assert_eq!(decode_worker.breaker.snapshot().state_code, 0);
+    let metrics = ctx.metrics.render();
+    assert!(metrics
+        .lines()
+        .any(|line| line == r#"sgl_router_stale_requests_total{outcome="expired"} 1"#));
+    let expected = format!(
+        r#"sgl_router_stream_outcome_total{{worker_url="{}",model_id="tiny",outcome="expired"}} 1"#,
+        decode.url,
+    );
+    assert!(metrics.lines().any(|line| line == expected));
+    assert!(!metrics
+        .lines()
+        .any(|line| line.starts_with("sgl_router_stream_outcome_total{")
+            && line.contains(r#"outcome="upstream_error""#)));
+    decode_worker.breaker.record_failure();
+    assert_eq!(decode_worker.breaker.snapshot().state_code, 1);
+}
+
 /// Gap closer #1: PD mode with only decode workers → 503 with
 /// `no_prefill_workers_available`. The chat route is a prefill
 /// dispatch, so a decode-only pool means partial failure.
