@@ -250,9 +250,7 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    dst_ok = dst.is_cuda or dst.is_xpu
-    src_ok = src.is_cuda or src.is_xpu
-    if not dst_ok or not src_ok:
+    if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
         raise ValueError(
             "fused_mamba_state_scatter_with_mask only supports CUDA/XPU tensors."
         )
@@ -412,11 +410,7 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (
-        (dst.is_cuda or dst.is_xpu)
-        and (src.is_cuda or src.is_xpu)
-        and dst.device == src.device
-    ):
+    if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
         raise ValueError(
             "fused_conv_window_scatter_with_mask requires dst and src to be "
             f"CUDA/XPU tensors on the same device ({dst.device=}, {src.device=})."
