@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
+import copy
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -27,9 +28,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -95,6 +94,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
+    log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -109,6 +109,42 @@ _is_npu = is_npu()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
+
+_GLM_NEXTN_EXPERT_PROJ_RE = re.compile(
+    r"mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def enable_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    return (
+        envs.SGLANG_GLM_NEXTN_MOE_PTPC.get()
+        and quant_config is not None
+        and quant_config.get_name() == "quark"
+    )
+
+
+def glm_nextn_mtp_fused_experts_excluded(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+) -> bool:
+    exclude_layers = getattr(quant_config, "exclude_layers", None) or []
+    layer_prefix = f"model.layers.{num_hidden_layers}."
+    return any(
+        name.startswith(layer_prefix) and ".mlp.experts." in name
+        for name in exclude_layers
+    )
+
+
+def should_apply_glm_nextn_moe_ptpc(
+    quant_config: Optional[QuantizationConfig],
+    num_hidden_layers: int,
+) -> bool:
+    if not enable_glm_nextn_moe_ptpc(quant_config):
+        return False
+    return glm_nextn_mtp_fused_experts_excluded(quant_config, num_hidden_layers)
+
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -468,6 +504,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -607,7 +644,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
@@ -1020,7 +1057,7 @@ class Glm4MoeModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
@@ -1146,7 +1183,7 @@ class Glm4MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -1463,9 +1500,57 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
             return name.replace(layer_prefix, "model", 1)
         return name.replace(layer_prefix, "model.decoder", 1)
 
+    def _maybe_quant_glm_nextn_moe_to_ptpc(self, weights):
+        """Cast this GLM-5.2 draft layer's routed experts to per-channel FP8."""
+        layer_id = self.config.num_hidden_layers
+        if not should_apply_glm_nextn_moe_ptpc(self.quant_config, layer_id):
+            return weights
+
+        layer_prefix = f"model.layers.{layer_id}"
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        log_info_on_rank0(
+            logger,
+            "GLM NextN MoE PTPC: casting draft expert weights under "
+            f"{layer_prefix}.mlp to fp8_e4m3 per-channel",
+        )
+
+        def _cast() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                if not (
+                    name.startswith(layer_prefix + ".")
+                    and _GLM_NEXTN_EXPERT_PROJ_RE.search(name)
+                ):
+                    yield name, tensor
+                    continue
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        f"{name}: PTPC cast expects a 2D expert weight, "
+                        f"got {tuple(tensor.shape)}"
+                    )
+                weight = tensor.to(torch.float32)
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                scale /= fp8_max
+                yield (
+                    name,
+                    (weight / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn),
+                )
+                yield name[: -len("weight")] + "weight_scale", scale.squeeze(-1)
+
+        return _cast()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = self._maybe_quant_glm_nextn_moe_to_ptpc(weights)
+        return super().load_weights(weights)
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
+
+        # The caller reuses this QuarkConfig for the target model and lm_head,
+        # so the draft-only rewrites below need a private copy of the wrapper
+        # and of the dict its schemes are read from.
+        quant_config = copy.copy(quant_config)
+        quant_config.quant_config = copy.deepcopy(quant_config.quant_config)
 
         layer_prefix = f"model.layers.{config.num_hidden_layers}"
 
@@ -1499,16 +1584,34 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
             names.add(self._map_mtp_ckpt_name(name, layer_prefix))
 
         # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
-        # match that prefix, so add the coarse prefix when any routed expert in
-        # the MTP layer is excluded. This keeps only that fused MoE module bf16
-        # while allowing the remaining draft modules to use their quant config.
-        if any(".mlp.experts." in name for name in mtp_excluded):
+        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
+        # do not match. So that module needs its own entry: bf16 as in the
+        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
+        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
+        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+            mtp_layer_quant_config = quant_config.quant_config.setdefault(
+                "layer_quant_config", {}
+            )
+            mtp_layer_quant_config["model.decoder.mlp.experts"] = {
+                "weight": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": False,
+                    "qscheme": "per_channel",
+                },
+                # Dynamic per_channel is QuarkW8A8FP8MoE's per-token input.
+                "input_tensors": {
+                    "dtype": "fp8_e4m3",
+                    "is_dynamic": True,
+                    "qscheme": "per_channel",
+                },
+            }
+            logger.info(
+                "SGLANG_GLM_NEXTN_MOE_PTPC=1: MTP fused MoE "
+                "(model.decoder.mlp.experts) runs as PTPC-FP8"
+            )
+        elif any(".mlp.experts." in name for name in mtp_excluded):
             names.add("model.decoder.mlp.experts")
 
-        import copy
-
-        quant_config = copy.copy(quant_config)
         quant_config.exclude_layers = list(names)
         return quant_config
 

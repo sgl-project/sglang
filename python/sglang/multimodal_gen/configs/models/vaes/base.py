@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
-from sglang.multimodal_gen.utils import StoreBoolean
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")

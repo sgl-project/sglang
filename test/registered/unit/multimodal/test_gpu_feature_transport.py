@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -760,7 +761,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIs(transport.pool, pool)
 
 
-class TestSchedulerMmTransportBoundary(unittest.TestCase):
+class TestSchedulerMmTransportBoundary(CustomTestCase):
     def _publish(self, **fields):
         from sglang.srt.runtime_context import get_context
 
@@ -770,6 +771,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
     @staticmethod
     def _prepare_scheduler(scheduler):
+        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
         scheduler.scheduler_stage_metrics = None
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
@@ -785,6 +787,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
                 self.mm_inputs = object()
 
         scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
         scheduler.dp_tp_cpu_group = object()
         request = TokenizedRequest()
 
@@ -861,7 +864,9 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         ):
             scheduler.process_input_requests([request])
 
-        build_inputs.assert_called_once_with(raw_inputs)
+        build_inputs.assert_called_once_with(
+            raw_inputs, requires_mm_token_modalities=False
+        )
         self.assertIs(request.mm_inputs, materialized)
         scheduler._request_dispatcher.assert_called_once_with(request)
         cpu_broadcast.assert_not_called()
@@ -914,7 +919,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         self.assertEqual(
             build_inputs.call_args_list,
-            [call(value) for value in raw_inputs],
+            [call(value, requires_mm_token_modalities=False) for value in raw_inputs],
         )
         self.assertEqual(
             [inner.mm_inputs for inner in inner_requests],
@@ -940,6 +945,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
         scheduler.dp_tp_group = SimpleNamespace(rank_in_group=0, first_rank=0)
         scheduler.dp_tp_cpu_group = object()
 
@@ -1016,6 +1022,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.tokenizer = object()
+        scheduler.disable_radix_cache = False
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
         scheduler._get_multimodal_inputs = MagicMock(

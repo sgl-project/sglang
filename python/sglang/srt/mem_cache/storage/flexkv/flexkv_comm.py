@@ -36,7 +36,7 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ class FlexKVComm:
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
         )
 
-        self._world_cpu_group = get_world_group().cpu_group
+        self._world_cpu_group = get_parallel().world_group.cpu_group
 
         self.pp_group = (
             self.pp_cpu_group

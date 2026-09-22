@@ -14,7 +14,7 @@ import torch
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
@@ -64,7 +64,8 @@ def _run_residual_accuracy_check():
         distributed_init_method="env://",
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(tp_size=world_size, world_rank=rank)
+    initialize_model_parallel()
 
     dtype = torch.bfloat16
     eps = 1e-6

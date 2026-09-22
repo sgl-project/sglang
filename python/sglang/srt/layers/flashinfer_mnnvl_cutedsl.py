@@ -308,10 +308,10 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     assert max_m is not None
     assert rms_epsilon is not None
     assert weight_bias is not None
-    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
     device = torch.device("cuda", torch.cuda.current_device())
-    process_group = get_tp_group().device_group
+    process_group = get_parallel().tp_group.device_group
     domain = (
         int(hidden_size),
         int(top_k),
