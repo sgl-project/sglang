@@ -42,9 +42,11 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -338,7 +340,7 @@ def _fused_rope_cat_and_cache(
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
     positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
+    forward_batch: ForwardBatch,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95."""
     kv_cache_dtype = (
@@ -353,11 +355,10 @@ def _fused_rope_cat_and_cache(
         else kv_cache_dtype
     )
     kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
-        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
-        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
+    out_cache_loc = (
+        get_attn_backend().get_kv_write_locations(forward_batch).contiguous()
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -697,7 +698,7 @@ class DeepseekMLARocmForwardMixin:
                     k_nope,
                     k_pe,
                     positions,
-                    forward_batch.out_cache_loc,
+                    forward_batch,
                 )
                 save_kv_cache = False
                 # Pass q_cat straight to attn_mqa with q_rope=None so the backend
@@ -827,7 +828,7 @@ class DeepseekMLARocmForwardMixin:
                     k_nope,
                     k_pe,
                     positions,
-                    forward_batch.out_cache_loc,
+                    forward_batch,
                 )
                 save_kv_cache = False
             else:
