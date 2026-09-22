@@ -2255,16 +2255,7 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 
 def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
-    """
-    Check if a package is installed and meets the minimum version requirement.
-
-    Args:
-        pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.7.0")
-
-    Returns:
-        True if package is installed and version >= min_version, False otherwise
-    """
+    """Check if a package is installed and meets the minimum version requirement."""
     if _should_skip_kernel_pkg_version_check(pkg):
         return True
 
