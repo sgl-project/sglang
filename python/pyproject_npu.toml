@@ -65,7 +65,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
+  "xgrammar==0.2.7",
 ]
 
 [project.optional-dependencies]
@@ -104,7 +104,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
   "tabulate",
 ]
 
