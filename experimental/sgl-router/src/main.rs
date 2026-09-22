@@ -5,12 +5,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
-    discovery::spawn_discovery,
+    config::{
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, KvIndexerEndpointConfig, LogFormat,
+        PolicyKind,
+    },
+    discovery::{spawn_discovery, ModelId},
     policies::{
         factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
     },
+    policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
     server::{
         app::build_router,
@@ -54,6 +58,7 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
+    let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
@@ -73,39 +78,34 @@ async fn main() -> Result<()> {
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
-    // The reorg path owns its policies and shares the live engine monitor.
-    let (chat_routing, reorg_cleanup) = match &config.model.reorg {
-        Some(reorg) => {
-            let (resolver, cleanup) = sgl_router::policies_reorg::factory::build_resolver(
-                reorg,
+    // Build the policies that choose which workers receive each request.
+    let (routing_policies, chat_routing, reorg_cleanup) = match routing {
+        ChatRoutingKind::Legacy => (
+            Arc::new(
+                build_policy_registry(
+                    &config,
+                    engine_state.tree(),
+                    engine_state.block_size_oracle(),
+                )
+                .context("build policy registry")?,
+            ),
+            ChatRouting::Legacy,
+            None,
+        ),
+        ChatRoutingKind::Reorg => {
+            let (resolver, cleanup) = build_reorg_resolver(
+                &config.model,
                 &engine_state,
                 external_kv_indexer_client.clone(),
             )
-            .context("build reorg bucket resolver")?;
+            .context("build reorg policies")?;
             (
-                ChatRouting::Reorg(
-                    [(
-                        sgl_router::discovery::ModelId(config.model.id.clone()),
-                        resolver,
-                    )]
-                    .into(),
-                ),
+                Arc::new(PolicyRegistry::default()),
+                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
                 cleanup,
             )
         }
-        None => (ChatRouting::Legacy, None),
     };
-    // Do not construct unused legacy policies or their background tasks.
-    let routing_policies = Arc::new(if config.model.reorg.is_some() {
-        PolicyRegistry::default()
-    } else {
-        build_policy_registry(
-            &config,
-            engine_state.tree(),
-            engine_state.block_size_oracle(),
-        )
-        .context("build policy registry")?
-    });
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -202,7 +202,6 @@ fn log_startup(config: &Config) {
     }
 
     tracing::info!(
-        selection_engine = if config.model.reorg.is_some() { "reorg" } else { "legacy" },
         configured_decode_policy = ?config.model.decode_policy,
         "sgl-router {} starting on {}:{}",
         env!("CARGO_PKG_VERSION"),
@@ -212,21 +211,6 @@ fn log_startup(config: &Config) {
 }
 
 fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
-    if let Some(reorg) = &config.model.reorg {
-        return reorg
-            .kv_indexer
-            .as_ref()
-            .map(|endpoint| {
-                GrpcPrefixIndex::new(PrefixIndexConfig {
-                    endpoint: endpoint.url.clone(),
-                    query_deadline: Duration::from_millis(endpoint.query_timeout_ms),
-                    max_inflight: endpoint.query_max_inflight,
-                })
-                .map(|index| Arc::new(index) as Arc<dyn PrefixIndex>)
-                .context("configure reorg KV Indexer client")
-            })
-            .transpose();
-    }
     let endpoint = config
         .model
         .cache_aware
@@ -518,39 +502,6 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
-    }
-
-    #[tokio::test]
-    async fn reorg_remote_indexer_keeps_only_metadata_and_engine_load() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), serde_json::json!({
-            "buckets": [{"id": "cache", "groups": {"mode": "plain", "plain": {"policy": "cache_aware"}}}],
-            "kv_indexer": {"url": "http://127.0.0.1:50051", "query_timeout_ms": 25, "query_max_inflight": 17}
-        }).to_string()).unwrap();
-        let config = Cli::try_parse_from([
-            "router",
-            "--model-id",
-            "tiny",
-            "--worker-urls",
-            "http://localhost:30000",
-            "--reorg-config",
-            file.path().to_str().unwrap(),
-        ])
-        .unwrap()
-        .into_config()
-        .unwrap();
-        let index = create_external_kv_indexer_client(&config).unwrap();
-        assert!(index.is_some());
-        let state = start_engine_state_monitor(index.is_some());
-        assert!(state.metrics_source().is_none());
-        let (resolver, cleanup) = sgl_router::policies_reorg::factory::build_resolver(
-            config.model.reorg.as_ref().unwrap(),
-            &state,
-            index,
-        )
-        .unwrap();
-        assert_eq!(resolver.buckets.len(), 1);
-        assert!(cleanup.is_none());
     }
 
     #[tokio::test]

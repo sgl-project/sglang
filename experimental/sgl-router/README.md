@@ -18,7 +18,7 @@ cargo build --release
 
 ## Running
 
-The router is configured through CLI flags, with optional JSON bucket files (run
+The router is configured entirely through CLI flags (run
 `sgl-router --help` for the full list). It serves exactly one model, so
 `--model-id` is required, along with exactly one discovery backend.
 `--tokenizer-path` is optional: give it a local `tokenizer.json` path or a
@@ -68,6 +68,25 @@ sgl-router \
 The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
+
+### Reorg routing
+
+Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
+and cache/session flags configure its policies; no separate file is required.
+
+```bash
+sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
+  --chat-routing reorg --policy cache_aware
+```
+
+Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
+Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
+settings, external indexers, session headers/timeouts, and `--filter overloaded`
+with `--max-in-flight` retain their existing flags. Unsupported legacy options
+fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
+buckets and are not accepted on this path.
+
+Omitting `--chat-routing` keeps the existing policies and defaults.
 
 ### Fleet-wide sampling contract
 
@@ -168,80 +187,6 @@ What stays the router's to own either way is the enforcement half: the
 queue slot and no engine round-trip — the `sampling_contract_violation` code
 and per-parameter counter, bands, and one contract applied at a shared ingress
 across engines whose own flags the router operator may not control.
-
-## Launch the reorg policy engine
-
-`--reorg-config PATH` opts the standard `/v1/chat/completions` endpoint into
-`policies_reorg`. Without it, the router keeps using the legacy policies.
-The JSON file configures buckets for `--model-id`; discovery, tokenizer, server,
-sampling, and circuit-breaker flags still apply. Legacy policy, bucket, cache,
-and affinity flags conflict with `--reorg-config` so they cannot be silently ignored.
-
-For a plain worker, save this as `reorg.json`:
-
-```json
-{
-  "buckets": [{
-    "id": "default",
-    "groups": {
-      "mode": "plain",
-      "plain": {
-        "policy": "power_of_two",
-        "admission": {"max_inflight_requests": 64}
-      }
-    }
-  }]
-}
-```
-
-```bash
-cargo run --release --bin sgl-router -- \
-  --model-id Qwen/Qwen3-0.6B \
-  --worker-urls http://localhost:30001 \
-  --reorg-config reorg.json
-```
-
-Each bucket has an `id`, optional `rank` (default 0), inclusive
-`min_input_tokens` / `max_input_tokens`, optional `max_context_tokens`, and optional
-`ttft_ms` / `tokens_per_second` estimates. Top-level `ttft_slo` and `tps_slo` accept
-`disabled` (default), `slo_first`, or `best_effort`. The resolver orders compatible
-buckets by these preferences, capacity, rank, and ID, then tries each until a
-complete selection succeeds.
-
-For disaggregated workers, replace `groups` with a complete PD pair:
-
-```json
-{
-  "mode": "pd",
-  "prefill": {"policy": "cache_aware"},
-  "decode": {"policy": "session_aware"}
-}
-```
-
-Supported group policies are `power_of_two`, `cache_aware` (plain/prefill only),
-and `session_aware`. Both PD groups must select successfully before forwarding.
-Discovery and worker `/server_info` determine roles; bucket configuration does
-not change a worker's role. Optional group `worker_ids` restrict membership
-(static discovery uses worker URLs as IDs). Omitted membership includes all
-healthy workers for the model and role; `[]` includes none.
-
-Each group's `admission` accepts `max_running_requests`, `max_waiting_requests`,
-`max_kv_tokens`, `max_pending_prefill_tokens`, and `max_inflight_requests`.
-Unset caps are disabled; zero rejects every engine with a known measurement.
-Engine-reported metrics fail open when unavailable; in-flight counts remain
-router-local. Rejection advances to the next bucket.
-
-Session policies share an expiring store, scoped by model, bucket, and role.
-Optional top-level `session` sets `header` (default `x-session-id`), `idle_secs`
-(default 600), and `eviction_interval_secs` (default 60). Cache policies share the
-local radix tree by default. To use a remote indexer, add top-level
-`"kv_indexer": {"url": "http://localhost:50051", "query_timeout_ms": 100,
-"query_max_inflight": 64}`; this keeps engine-load monitoring but skips local KV
-subscriptions. Cache thresholds and pressure guards use `AffinityConfig` defaults;
-this launch configuration does not yet expose cache tuning or other legacy policies.
-The reorg path retains the limitations listed in [POLICY_DESIGN.md](POLICY_DESIGN.md).
-
-
 
 ## Chat rendering
 

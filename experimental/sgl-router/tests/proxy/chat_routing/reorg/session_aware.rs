@@ -5,6 +5,7 @@ use super::*;
 
 #[tokio::test]
 async fn session_aware_reuses_custom_header_binding_after_load_changes() {
+    use sgl_router::config::{AffinityConfig, PolicyKind};
     use std::sync::atomic::Ordering;
 
     let primary = MockWorker::start(vec![]).await;
@@ -16,18 +17,16 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
         ],
         vec![],
     );
-    let config = serde_json::from_value(serde_json::json!({
-        "session": {"header": "x-test-session"},
-        "buckets": [{"id": "session", "groups": {"mode": "plain", "plain": {
-            "policy": "session_aware"
-        }}}]
-    }))
-    .unwrap();
+    let mutable = Arc::get_mut(&mut ctx).unwrap();
+    mutable.config.model.policy = PolicyKind::SessionAware;
+    mutable.config.model.affinity = Some(AffinityConfig {
+        session_id_header: "x-test-session".into(),
+        ..Default::default()
+    });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
     let (resolver, cleanup) =
-        sgl_router::policies_reorg::factory::build_resolver(&config, &state, None).unwrap();
-    let mutable = Arc::get_mut(&mut ctx).unwrap();
-    mutable.config.model.reorg = Some(config);
+        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
+            .unwrap();
     mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let primary_worker = ctx.registry.get(&WorkerId("primary".into())).unwrap();
     let other_worker = ctx.registry.get(&WorkerId("other".into())).unwrap();

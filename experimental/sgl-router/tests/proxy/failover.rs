@@ -37,7 +37,6 @@ async fn failover_when_one_worker_dies() {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
-            reorg: None,
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: Some(CircuitBreakerConfig {

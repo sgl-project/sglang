@@ -55,6 +55,13 @@ impl Default for InflightLoadConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ChatRoutingKind {
+    #[default]
+    Legacy,
+    Reorg,
+}
+
 /// Routing strategies accepted by `--policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
@@ -306,8 +313,6 @@ pub struct ModelConfig {
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
     pub policy: PolicyKind,
-    /// Opt-in bucket-engine configuration loaded by --reorg-config.
-    pub reorg: Option<super::reorg::ReorgConfig>,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
     /// Optional static bucket configuration. `None` uses the global domain.

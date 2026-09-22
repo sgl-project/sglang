@@ -137,11 +137,10 @@ chooses its implementation:
 - `ChatRouting::Reorg(HashMap<ModelId, BucketResolver>)` uses the new bucket and
   policy interfaces, with explicit model-specific resolvers.
 
-Callers set this field before building the router. A missing model in the reorg
-map returns 404, without falling back to legacy routing. This PR adds the
-programmatic configuration switch; CLI/configuration factory construction and
-the remaining production policies remain follow-ups. Power-of-two is implemented
-for explicit attachments; the default serving path remains legacy.
+`--chat-routing reorg` constructs default plain/PD buckets using the existing
+`--policy` and tuning flags. Programmatic callers can still install explicit
+resolvers. A missing model returns 404 without falling back to legacy routing.
+The default serving path remains legacy.
 
 Both implementations reuse request preparation (including sampling validation
 and tokenization), forwarding, streaming, middleware, and the 32 MiB body limit.
@@ -621,17 +620,13 @@ Implemented here:
   The caller owns expiry and sweeper lifecycle. A binding may remain after a
   later PD group fails, because it records placement rather than dispatch.
 
-Launch the implemented policies with `--reorg-config PATH`; the JSON schema and
-plain/PD examples are documented in [README.md](README.md#launch-the-reorg-policy-engine).
-The factory shares live load and prefix state and owns a session eviction task
-until shutdown. Legacy routing remains the default.
-
-Follow-up work includes remaining selection policies and cache tuning configuration.
+Follow-up work includes remaining selection policies and explicit bucket configuration.
 
 Not yet implemented in the reorg path:
 
 - Other concrete selection policies.
-- The full illustrative YAML schema above; the supported launch format is JSON.
+- Explicit bucket configuration from the CLI. The YAML above remains illustrative;
+  `--chat-routing reorg` builds default plain/PD buckets from existing policy flags.
 - Global session modes and sticky routing-key affinity.
 - Power-of-k cache-miss fallback configuration and cache decision metrics.
 - Shared load interpretation, dispatch correction, and policy-specific

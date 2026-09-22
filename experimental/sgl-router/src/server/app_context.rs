@@ -30,7 +30,7 @@ const READINESS_READY: u8 = 1;
 const READINESS_DRAINING: u8 = 2;
 
 /// Routing implementation used by the standard chat-completions endpoint.
-/// The binary installs reorg resolvers when launched with `--reorg-config`.
+/// `--chat-routing reorg` builds resolvers with the selected reorg policy.
 #[derive(Debug, Default)]
 pub enum ChatRouting {
     #[default]
@@ -187,7 +187,6 @@ impl AppContext {
                     tokenizer_path: "stub".into(),
                     disable_input_ids_forwarding: false,
                     policy: crate::config::PolicyKind::RoundRobin,
-                    reorg: None,
                     decode_policy: Default::default(),
                     bucket_config: None,
                     circuit_breaker: None,

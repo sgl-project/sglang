@@ -52,7 +52,6 @@ mod tests {
             tokenizer_path: "x".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
-            reorg: None,
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,

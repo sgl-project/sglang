@@ -231,8 +231,7 @@ impl Bucket {
 }
 
 /// Soft preference; nonpreferred buckets remain available for fallback.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SloPreference {
     #[default]
     Disabled,

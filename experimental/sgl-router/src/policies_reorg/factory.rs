@@ -3,110 +3,121 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 
-use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup, TokenLimits};
-use crate::config::{
-    reorg::{GroupConfig, GroupsConfig, PolicyKind, ReorgConfig},
-    AffinityConfig,
-};
-use crate::discovery::WorkerId;
+use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
+use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, SessionAffinityMode};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
-use crate::state::load_monitor::router_inflight_load::JanitorHandle;
-use crate::state::{kv_events::KvEventIndex, AffinityStore};
+use crate::state::{
+    kv_events::KvEventIndex, load_monitor::router_inflight_load::JanitorHandle, AffinityStore,
+};
 
 use super::{
+    admission::AdmissionLimits,
     cache_aware::{CacheAwarePolicy, CacheSource},
     power_of_two::PowerOfTwoPolicy,
     session_aware::SessionAwarePolicy,
     Policy,
 };
 
-/// Construct policies once, sharing the monitor's live load table and prefix source.
-/// The caller must retain the sweeper until requests have drained.
+pub fn validate(model: &ModelConfig) -> Result<()> {
+    ensure!(
+        matches!(
+            model.policy,
+            PolicyKind::PowerOfTwo | PolicyKind::CacheAware | PolicyKind::SessionAware
+        ),
+        "reorg routing supports power_of_two, cache_aware, and session_aware"
+    );
+    ensure!(
+        model.bucket_config.is_none(),
+        "legacy --bucket-config cannot define complete reorg buckets"
+    );
+    ensure!(
+        model.decode_policy == DecodePolicyKind::PowerOfTwo,
+        "reorg routing requires --decode-policy power_of_two"
+    );
+    if let Some(filters) = &model.eligibility {
+        ensure!(
+            filters
+                .filters
+                .iter()
+                .all(|filter| *filter == FilterKind::Overloaded),
+            "reorg routing only supports --filter overloaded"
+        );
+    }
+    if let Some(affinity) = &model.affinity {
+        ensure!(
+            !affinity.stable_pair && affinity.session_affinity_mode == SessionAffinityMode::Bucket,
+            "reorg routing uses bucket-scoped sessions without --stable-pair"
+        );
+        ensure!(
+            affinity.min_load_choices == 2,
+            "reorg cache fallback requires --min-load-choices 2"
+        );
+    }
+    Ok(())
+}
+
 pub fn build_resolver(
-    config: &ReorgConfig,
+    model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
 ) -> Result<(BucketResolver, Option<JanitorHandle>)> {
-    config.validate()?;
-    anyhow::ensure!(
-        config.kv_indexer.is_some() == external_index.is_some(),
-        "reorg KV indexer configuration and client must agree"
-    );
-    let source = Arc::new(match external_index {
-        Some(index) => CacheSource::Remote {
-            index,
-            block_size: state.block_size_oracle(),
-        },
-        None => CacheSource::Local(RadixTreePrefixProvider::new(
-            state.tree(),
-            state.block_size_oracle(),
-        )),
+    validate(model)?;
+    let admission = Arc::new(AdmissionLimits {
+        max_inflight_requests: model
+            .eligibility
+            .as_ref()
+            .and_then(|e| e.max_in_flight)
+            .map(|n| n as u64),
+        ..Default::default()
     });
-    let store = AffinityStore::new(Duration::from_secs(config.session.idle_secs));
-    let group = |spec: &GroupConfig| -> Result<EngineGroup> {
-        let admission = Arc::new(spec.admission.clone());
-        let policy: Arc<dyn Policy> = match spec.policy {
-            PolicyKind::PowerOfTwo => {
-                let mut policy = PowerOfTwoPolicy::new(state.engine_reported_load());
-                policy.admission = admission;
-                Arc::new(policy)
-            }
-            PolicyKind::SessionAware => {
-                let mut policy =
-                    SessionAwarePolicy::new(Arc::clone(&store), state.engine_reported_load());
-                policy.admission = admission;
-                Arc::new(policy)
-            }
-            PolicyKind::CacheAware => {
-                let mut policy = CacheAwarePolicy::new(
-                    Arc::clone(&source),
-                    state.engine_reported_load(),
-                    AffinityConfig::default(),
-                )?;
-                policy.admission = admission;
-                Arc::new(policy)
-            }
-        };
-        Ok(EngineGroup {
-            worker_ids: spec
-                .worker_ids
-                .as_ref()
-                .map(|ids| ids.iter().cloned().map(WorkerId).collect()),
-            policy,
-        })
+    let mut decode = PowerOfTwoPolicy::new(state.engine_reported_load());
+    decode.admission = admission.clone();
+    let decode: Arc<dyn Policy> = Arc::new(decode);
+    let affinity = model.affinity.clone().unwrap_or_default();
+    let mut cleanup = None;
+    let policy: Arc<dyn Policy> = match model.policy {
+        PolicyKind::PowerOfTwo => decode.clone(),
+        PolicyKind::SessionAware => {
+            let store = AffinityStore::new(Duration::from_secs(affinity.session_idle_secs));
+            cleanup =
+                store.spawn_sweeper(Duration::from_secs(affinity.session_eviction_interval_secs));
+            let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load());
+            policy.admission = admission;
+            Arc::new(policy)
+        }
+        PolicyKind::CacheAware => {
+            let source = match external_index {
+                Some(index) => CacheSource::Remote {
+                    index,
+                    block_size: state.block_size_oracle(),
+                },
+                None => CacheSource::Local(RadixTreePrefixProvider::new(
+                    state.tree(),
+                    state.block_size_oracle(),
+                )),
+            };
+            let mut policy =
+                CacheAwarePolicy::new(Arc::new(source), state.engine_reported_load(), affinity)?;
+            policy.admission = admission;
+            Arc::new(policy)
+        }
+        _ => unreachable!("validated reorg policy"),
     };
-    let buckets = config
-        .buckets
-        .iter()
-        .map(|spec| {
-            Ok(Bucket {
-                id: spec.id.clone(),
-                rank: spec.rank,
-                limits: TokenLimits {
-                    min: spec.min_input_tokens,
-                    max: spec.max_input_tokens,
-                },
-                max_context_tokens: spec.max_context_tokens,
-                ttft_ms: spec.ttft_ms,
-                tokens_per_second: spec.tokens_per_second,
-                groups: match &spec.groups {
-                    GroupsConfig::Plain { plain } => BucketGroups::Plain(group(plain)?),
-                    GroupsConfig::Pd { prefill, decode } => BucketGroups::Pd {
-                        prefill: group(prefill)?,
-                        decode: group(decode)?,
-                    },
-                },
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut resolver = BucketResolver::new(buckets)?;
-    resolver.ttft_slo = config.ttft_slo;
-    resolver.tps_slo = config.tps_slo;
-    let sweeper = config
-        .uses(PolicyKind::SessionAware)
-        .then(|| store.spawn_sweeper(Duration::from_secs(config.session.eviction_interval_secs)))
-        .flatten();
-    Ok((resolver, sweeper))
+    // Discovery determines which serving mode has candidates.
+    let resolver = BucketResolver::new(vec![
+        Bucket::new(
+            "plain",
+            BucketGroups::Plain(EngineGroup::new(policy.clone())),
+        ),
+        Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(policy),
+                decode: EngineGroup::new(decode),
+            },
+        ),
+    ])?;
+    Ok((resolver, cleanup))
 }

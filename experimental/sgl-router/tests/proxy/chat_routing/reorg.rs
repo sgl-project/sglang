@@ -148,24 +148,33 @@ fn body(content: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
     use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
     use std::time::Instant;
 
     let worker = MockWorker::start(vec![]).await;
     let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
         .unwrap_or_else(|_| panic!("context is not shared yet"));
-    let config = serde_json::from_value(serde_json::json!({
-        "buckets": [{"id": "default", "groups": {"mode": "plain", "plain": {
-            "policy": "power_of_two", "worker_ids": ["w"],
-            "admission": {"max_running_requests": 1, "max_kv_tokens": 100}
-        }}}]
-    }))
-    .unwrap();
-    let state = sgl_router::state::kv_events::KvEventIndex::new();
-    let (resolver, _cleanup) =
-        sgl_router::policies_reorg::factory::build_resolver(&config, &state, None).unwrap();
-    ctx.engine_reported_load = state.engine_reported_load();
-    ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
+    policy.admission = Arc::new(AdmissionLimits {
+        max_running_requests: Some(1),
+        max_kv_tokens: Some(100),
+        ..Default::default()
+    });
+    ctx.chat_routing = ChatRouting::Reorg(
+        [(
+            ModelId("tiny".into()),
+            BucketResolver::new(vec![Bucket::new(
+                "default",
+                BucketGroups::Plain(EngineGroup {
+                    worker_ids: Some([WorkerId("w".into())].into()),
+                    policy: Arc::new(policy),
+                }),
+            )])
+            .unwrap(),
+        )]
+        .into(),
+    );
     let ctx = Arc::new(ctx);
     let app = build_router(ctx.clone());
     for (running, kv_tokens, expected) in [
@@ -671,40 +680,45 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
 }
 
 #[tokio::test]
-async fn configured_pd_groups_forward_only_to_their_members() {
+async fn default_pd_groups_apply_configured_inflight_admission() {
+    use sgl_router::config::{EligibilityConfig, FilterKind, PolicyKind};
+    use std::sync::atomic::Ordering;
+
     let prefill = MockWorker::start(vec![]).await;
     let decode = MockWorker::start(vec![]).await;
-    let other = MockWorker::start(vec![]).await;
-    let mut ctx = Arc::try_unwrap(context(
+    let mut ctx = context(
         &[
             ("p", Stage::Prefill, &prefill),
             ("d", Stage::Decode, &decode),
-            ("other", Stage::Decode, &other),
         ],
         vec![],
-    ))
-    .unwrap_or_else(|_| panic!("unshared context"));
-    let config = serde_json::from_value(serde_json::json!({"buckets": [{
-        "id": "pd", "max_input_tokens": 100,
-        "groups": {"mode": "pd",
-            "prefill": {"policy": "cache_aware", "worker_ids": ["p"]},
-            "decode": {"policy": "session_aware", "worker_ids": ["d"]}
-        }
-    }]}))
-    .unwrap();
+    );
+    let mutable = Arc::get_mut(&mut ctx).unwrap();
+    mutable.config.model.policy = PolicyKind::PowerOfTwo;
+    mutable.config.model.eligibility = Some(EligibilityConfig {
+        filters: vec![FilterKind::Overloaded],
+        max_in_flight: Some(1),
+        min_prefix_share: None,
+    });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
-    let (resolver, cleanup) =
-        sgl_router::policies_reorg::factory::build_resolver(&config, &state, None).unwrap();
-    ctx.config.model.reorg = Some(config);
-    ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
-    let response = build_router(Arc::new(ctx))
-        .oneshot(request(body("hi")))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    response.into_body().collect().await.unwrap();
-    assert!(prefill.captured.lock().unwrap().last_body.is_some());
-    assert!(decode.captured.lock().unwrap().last_body.is_some());
-    assert!(other.captured.lock().unwrap().last_body.is_none());
-    cleanup.unwrap().shutdown().await;
+    let (resolver, _) =
+        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
+            .unwrap();
+    mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
+    let worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
+    let app = build_router(ctx);
+    for (inflight, expected) in [(1, StatusCode::SERVICE_UNAVAILABLE), (0, StatusCode::OK)] {
+        worker.active_requests.store(inflight, Ordering::Relaxed);
+        let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(
+            prefill.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+        assert_eq!(
+            decode.captured.lock().unwrap().last_body.is_some(),
+            expected == StatusCode::OK
+        );
+    }
 }

@@ -1,5 +1,4 @@
 pub mod cli;
-pub mod reorg;
 pub mod sampling;
 pub mod types;
 pub use cli::Cli;
@@ -47,9 +46,6 @@ impl Config {
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
         if let Some(bucket_config) = self.model.bucket_config.as_ref() {
             validate_bucket_config(bucket_config)?;
-        }
-        if let Some(reorg) = &self.model.reorg {
-            reorg.validate()?;
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
@@ -231,7 +227,6 @@ mod tests {
                 tokenizer_path: "/tmp/tok.json".into(),
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
-                reorg: None,
                 decode_policy: DecodePolicyKind::PowerOfTwo,
                 bucket_config: None,
                 circuit_breaker: None,

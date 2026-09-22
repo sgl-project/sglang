@@ -55,7 +55,6 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
-            reorg: None,
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
