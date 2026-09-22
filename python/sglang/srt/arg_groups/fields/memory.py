@@ -161,6 +161,7 @@ class Memory(msgspec.Struct):
                 "shm",
                 "tensorcast",
                 "seaweedfs",
+                "radixshmem",
             ],
         ),
     ] = None

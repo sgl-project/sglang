@@ -196,6 +196,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "tensorcast":
             return backend_class(storage_config)
+        elif backend_name == "radixshmem":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -273,4 +275,10 @@ StorageBackendFactory.register_backend(
     "seaweedfs",
     "sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store",
     "SeaweedFSStore",
+)
+
+StorageBackendFactory.register_backend(
+    "radixshmem",
+    "sglang.srt.mem_cache.storage.radixshmem",
+    "RadixShmemStorage",
 )
