@@ -90,6 +90,7 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
     envs = MIMO_V2_5_PRO_FP4_8P_ENVS
     accuracy = 0.33
     datasets = ["hle"]
+    api_key = "EMPTY"
     dataset_args = {
         "hle": {
             "local_path": HLE_DATASET_PATH,
