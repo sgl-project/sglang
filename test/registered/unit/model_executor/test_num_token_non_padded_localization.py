@@ -85,10 +85,17 @@ class TestNumTokenNonPaddedLayoutTable(CustomTestCase):
 LOCAL, GLOBAL = 7, 30
 
 
-def _forward_batch(*, sharded: bool, local=LOCAL, glob=GLOBAL) -> ForwardBatch:
+def _forward_batch(
+    *,
+    sharded: bool,
+    local=LOCAL,
+    glob=GLOBAL,
+    forward_mode=ForwardMode.DECODE,
+    attn_cp_metadata=None,
+) -> ForwardBatch:
     empty = torch.empty(0, dtype=torch.int32)
     batch = ForwardBatch(
-        forward_mode=ForwardMode.DECODE,
+        forward_mode=forward_mode,
         batch_size=1,
         input_ids=empty,
         req_pool_indices=empty,
@@ -103,6 +110,7 @@ def _forward_batch(*, sharded: bool, local=LOCAL, glob=GLOBAL) -> ForwardBatch:
         None if glob is None else torch.tensor(glob, dtype=torch.int32)
     )
     batch.attn_tp_sequence_sharded = sharded
+    batch.attn_cp_metadata = attn_cp_metadata
     return batch
 
 
@@ -117,13 +125,17 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
     # The MoE input is the local shard only under SCATTERED, or under FULL with
     # a single attention-DP group -- FULL all-reduces across attn-TP there
     # instead of gathering, so a sharded forward is bounded by the GLOBAL count
-    # and a replicated one by the LOCAL count (they are equal).
+    # and a replicated one by the LOCAL count (they are equal). These are decode
+    # forwards, which is why the MOE_FULL rows follow the FULL layout: that
+    # config all-gathers over the MoE-CP group on a context-parallel extend
+    # only (the case below).
     _TABLE = [
         ("scattered.replicated", ScatterMode.SCATTERED, False, 1, LOCAL),
         ("scattered.sharded", ScatterMode.SCATTERED, True, 1, LOCAL),
         ("scattered.dp", ScatterMode.SCATTERED, True, 4, LOCAL),
-        ("moe_full.replicated", ScatterMode.MOE_FULL, False, 1, None),
-        ("moe_full.sharded", ScatterMode.MOE_FULL, True, 1, None),
+        ("moe_full.decode.replicated", ScatterMode.MOE_FULL, False, 1, LOCAL),
+        ("moe_full.decode.sharded", ScatterMode.MOE_FULL, True, 1, GLOBAL),
+        ("moe_full.decode.dp", ScatterMode.MOE_FULL, True, 4, None),
         ("full.dp_gathered", ScatterMode.FULL, True, 4, None),
         ("full.dp_gathered.replicated", ScatterMode.FULL, False, 4, None),
         ("full.tp_sharded", ScatterMode.FULL, True, 1, GLOBAL),
@@ -160,6 +172,42 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                     ),
                 ):
                     self.assertIsNone(_value(_forward_batch(sharded=sharded)))
+
+    def test_moe_full_gathers_only_on_a_context_parallel_extend(self):
+        """MOE_FULL's all-gather over the MoE-CP group runs on a CP extend and
+        is skipped on every other forward, so only the extend loses its bound.
+
+        ``get_moe_cp_size`` reads a live process group, so this stubs that one
+        accessor rather than publishing a topology with no distributed init.
+        """
+        for label, forward_mode, metadata, expected in [
+            ("cp_extend", ForwardMode.EXTEND, object(), None),
+            ("extend_without_cp_metadata", ForwardMode.EXTEND, None, LOCAL),
+            ("decode", ForwardMode.DECODE, object(), LOCAL),
+        ]:
+            with (
+                self.subTest(case=label),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=2),
+                patch.object(
+                    comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.MOE_FULL
+                ),
+                patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=2),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.utils.is_mla_cp_active", return_value=False
+                ),
+            ):
+                got = _value(
+                    _forward_batch(
+                        sharded=False,
+                        forward_mode=forward_mode,
+                        attn_cp_metadata=metadata,
+                    )
+                )
+                self.assertEqual(got, expected)
 
     def test_graph_replay_without_global_count_skips_masking(self):
         """A captured batch carries the LOCAL buffer alone, so the attn-TP

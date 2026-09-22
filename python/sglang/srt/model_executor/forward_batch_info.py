@@ -1198,11 +1198,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if mode == ScatterMode.SCATTERED:
             # a2a dispatch, FP4 all-gather or dwdp: the MoE routes the local shard.
             return self.num_token_non_padded
-        if mode == ScatterMode.MOE_FULL:
-            # All-gathered over the MoE-DP (CP) group, whatever the attn-TP layout.
+        if mode == ScatterMode.MOE_FULL and self._moe_input_gathered_across_moe_cp():
+            # All-gathered over the MoE-CP group, whatever the attn-TP layout.
             return None
-        # FULL. DSA / MLA CP fall back to it but still all-gather across CP on a
-        # CP prefill, and those rows are zigzag-permuted rather than a prefix.
+        # FULL, or the MOE_FULL forward that skipped its all-gather and so keeps
+        # the FULL layout. DSA / MLA CP fall back to FULL as well, but still
+        # all-gather across CP on a CP prefill, and those rows are zigzag-permuted
+        # rather than a prefix.
         if get_parallel().attn_cp_size > 1 and self._moe_input_gathered_across_cp():
             return None
         if get_parallel().attn_dp_size != 1:
@@ -1216,6 +1218,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if not self.attn_tp_sequence_sharded:
             return self.num_token_non_padded
         return self.global_num_token_non_padded
+
+    def _moe_input_gathered_across_moe_cp(self) -> bool:
+        """Whether this forward takes MOE_FULL's all-gather over the MoE-CP group.
+
+        Mirrors the guard on that step in the layer communicator: only a
+        context-parallel extend gathers, and decode keeps the FULL layout.
+        """
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
+
+        return (
+            self.forward_mode.is_context_parallel_extend()
+            and self.attn_cp_metadata is not None
+            and get_moe_cp_size() > 1
+        )
 
     def _moe_input_gathered_across_cp(self) -> bool:
         """Whether this forward's MLP input is all-gathered across the CP group."""
