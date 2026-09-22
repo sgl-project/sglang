@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, enter_scope, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -64,8 +64,8 @@ class RetractionOverlapBoundaryTest(CustomTestCase):
         completed=0,
         free_on_result=False,
     ):
-        self.enterContext(patch.object(scheduler_module, "TEST_RETRACT", forced))
-        self.enterContext(patch.object(scheduler_module, "TEST_RETRACT_INTERVAL", 16))
+        enter_scope(self, patch.object(scheduler_module, "TEST_RETRACT", forced))
+        enter_scope(self, patch.object(scheduler_module, "TEST_RETRACT_INTERVAL", 16))
         events = []
         batch = Batch(events, enough)
         pending = list(batch.reqs)
