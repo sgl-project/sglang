@@ -437,17 +437,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     if not cfg.enable_unified_memory:
         return
     if cfg.disaggregation_mode != "null":
-        # Constraints of the whole-envelope transfer; see
-        # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
-        assert cfg.disaggregation_transfer_backend == "mooncake", (
-            "--enable-unified-memory with PD disaggregation supports only "
-            "the mooncake transfer backend; got "
+        # Constraints of the whole-envelope transfer; see the unified MHA and
+        # MLA pool get_contiguous_buf_infos implementations.
+        supported_backends = server_args._unified_memory_pd_transfer_backends()
+        assert cfg.disaggregation_transfer_backend in supported_backends, (
+            "--enable-unified-memory with PD disaggregation supports only these "
+            f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
+        )
+        assert not (
+            cfg.disaggregation_transfer_backend == "mooncake"
+            and cfg.speculative_algorithm is not None
+        ), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "speculative decoding with the Mooncake transfer backend."
         )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with PD disaggregation requires lazy "
@@ -458,6 +466,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "with --enable-hisparse: the decode-side HiSparse prealloc path "
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
+        )
+        assert cfg.disaggregation_decode_retraction_backup != "host_pool", (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "--disaggregation-decode-retraction-backup=host_pool; use "
+            "cpu_tensor (the automatic default for unified pools)."
+        )
+        assert not cfg.disaggregation_decode_enable_offload_kvcache, (
+            "--enable-unified-memory with PD disaggregation does not yet support "
+            "--disaggregation-decode-enable-offload-kvcache."
         )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
@@ -490,12 +507,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "write loc, so a captured decode replay raises. "
         "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
     )
-    assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
-        "--enable-unified-memory is not yet compatible with hierarchical / "
-        "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-        "the unified-memory-pool init wires up no host pools, and its device mamba / "
-        "full-attention slots are VIRTUAL — the host-offload path does not "
-        "translate them to physical."
+    assert not cfg.enable_lmcache, (
+        "--enable-unified-memory is not yet compatible with --enable-lmcache: "
+        "the LMCache offload path indexes the device buffers with the ids it "
+        "is handed, and under the unified pool those are VIRTUAL."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)

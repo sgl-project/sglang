@@ -13,12 +13,11 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
@@ -1035,7 +1034,9 @@ def mhc_pre(
     # NCCL symmetric path: the Triton inplace MoE runner writes the expert
     # output back into this buffer, so a symmetric input yields a symmetric
     # all-reduce input.
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         layer_input = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
@@ -1697,7 +1698,9 @@ def mhc_fused_post_pre(
     # layer_input_cur is the post-norm activation fed into the MoE; allocate it
     # in the symmetric memory pool so the Triton inplace MoE runner yields a
     # symmetric all-reduce input (see _mhc_pre_impl).
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         layer_input_cur = torch.empty(
             num_tokens,
             hidden_size,

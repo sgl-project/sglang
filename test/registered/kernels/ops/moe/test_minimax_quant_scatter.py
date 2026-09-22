@@ -35,6 +35,15 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b
 dev = "cuda"
 
 
+@pytest.fixture
+def stated_tp_group():
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
 def test_sm120_mxfp8_dispatch_preserves_activation_scale_recipe(monkeypatch):
     """SM120 group-128 activations must not use the MXFP8 weight-scale recipe."""
     from sglang.srt.layers import deep_gemm_wrapper
@@ -257,7 +266,9 @@ def test_standard_layout_auto_memory_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
-def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_dtype):
+def test_standard_masked_runner_matches_compact_end_to_end(
+    monkeypatch, weight_dtype, stated_tp_group
+):
     """Exercise both production grouped GEMMs through the standard path."""
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if arch_major <= 9:
@@ -266,7 +277,6 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     # This kernel test runs outside a model-parallel process. Bypass only the
     # symmetric-allocation context; all pre-permute, DeepGEMM, activation,
     # quantization, down-GEMM, and post-permute kernels remain real.
-    monkeypatch.setattr(deep_gemm_runner, "get_tp_group", lambda: None)
     monkeypatch.setattr(
         deep_gemm_runner,
         "use_symmetric_memory",
