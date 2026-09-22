@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
 
 import pytest
@@ -25,8 +26,14 @@ from sglang.test.ci.ci_register import register_amd_ci
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
+def _gfx950_flydsl_available() -> bool:
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    return is_flydsl_kimi_k3_kda_decode_supported()
+
+
 pytestmark = pytest.mark.skipif(
-    not is_flydsl_kimi_k3_kda_decode_supported(),
+    not _gfx950_flydsl_available(),
     reason="gfx950 FlyDSL required",
 )
 
