@@ -41,7 +41,7 @@ docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
 The A3 selector provides **one Ascend A3 node with 8 cards / 16 NPU dies**, running prefill and decode together (PD co-located). It uses W8A8 weights and EAGLE3 speculative decoding. Each A3 card contains two dies; a cloud allocation labelled "1 NPU" is not a full node. The [minimum recommended W8A8 configuration](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#model-weights) is 4 cards / 8 dies with 64 GB per die, while this preset requires all 16 dies.
 
 <Note>
-This recipe is based on the upstream Ascend best practice. Hardware validation of the generated cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe.
+This recipe is based on the upstream Ascend best practice. Hardware validation of the generated A3 cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe. A separate A2 low-concurrency smoke test is recorded in section 5.4 and does not validate the A3 preset.
 </Note>
 
 1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.0.0 and `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
@@ -1193,3 +1193,40 @@ run_task(task_cfg=TaskConfig(
 Run the full **198-question** dataset and retain the EvalScope version, dataset revision, generation settings, reports, and all attempt scores. The upstream test declares an accuracy baseline of **0.852**; its [comparison utility](https://github.com/sgl-project/sglang/blob/c389dd086340878934bf96bc209534f1fbb8440c/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py) allows a fluctuation of 5 questions, giving a threshold of `0.852 - 5/198`, approximately **0.8267**, with up to 3 attempts. These are upstream validation criteria, not measured accuracy for this cookbook command.
 
 {/* TODO: Add A3 startup, accuracy, and performance evidence after validating the generated command on the target hardware. */}
+
+### 5.4 Supplemental A2 smoke validation
+
+On September 22, 2026, the W8A8 main model completed loading, warm-up, and three short chat requests on **8 Ascend 910B4 devices with 32 GiB HBM each**. Eight-rank HCCL all-reduce and BF16 matrix operations also passed. This experiment used no EAGLE3 draft model and is separate from the A3 selector above.
+
+The runtime was SGLang `0.5.14.dev172+gf308abc05` (commit `f308abc05212c2f5f455de22a525e14afa63ee4f`), Python 3.11.15, Torch 2.10.0+cpu, TorchNPU 2.10.0, Transformers 5.8.1, and sgl-kernel-npu 2026.5.1. The supplied environment had modified `python/pyproject.toml` and a deleted `python/pyproject_npu.toml`; this was not a clean source-build validation. An image digest, exact CANN version, and immutable model revision were not captured, so this record is not a fully pinned environment specification.
+
+After downloading the W8A8 main model listed above, the tested service settings were:
+
+```bash Command
+export HCCL_BUFFSIZE=128
+export OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+python -m sglang.launch_server \
+  --model-path /workspace/issue1215/model \
+  --tokenizer-path /workspace/issue1215/metadata \
+  --device npu --tp-size 8 --quantization modelslim --dtype bfloat16 \
+  --reasoning-parser minimax --tool-call-parser minimax-m2 \
+  --host 127.0.0.1 --port 31216 \
+  --context-length 4096 --max-running-requests 1 \
+  --chunked-prefill-size 128 --max-prefill-tokens 4096 \
+  --mem-fraction-static 0.95 --disable-cuda-graph --disable-radix-cache
+```
+
+The paths above are the experiment paths: `model` contains the complete main weights, while `metadata` contains the tokenizer and configuration files from the same model repository, downloaded separately while weights were transferring. Replace both paths with your local directories. Keep tokenizer and weights from the same revision.
+
+Requests used `/v1/chat/completions`, `temperature=0`, and `max_tokens=512`:
+
+| Prompt | Answer content | Finish reason |
+| --- | --- | --- |
+| What is the capital of France? Answer with the city name only. | `Paris` | `stop` |
+| 请用中文回答：2加2等于多少？ | `2加2等于4。` | `stop` |
+| Return only a JSON object with one key named result whose value is 7 * 8. | `{"result":56}` (parsed JSON) | `stop` |
+
+The `minimax` reasoning parser separated reasoning from answer content in this runtime. The three answers contained no thinking tags, and the final health check returned HTTP 200. The tool-call parser was configured but tool calling was not tested.
+
+These checks establish short-request functionality only. They do not establish GPQA accuracy, long-context capacity, sustained stability, or performance under the A3 reference workload. The configured 4096-token context limit was not exercised with near-limit input. This observed 8×32 GiB low-concurrency run does not replace the upstream recommended hardware configuration.
