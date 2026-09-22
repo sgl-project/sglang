@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -24,7 +26,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_budget_bytes,
+    mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    mqa_logits_should_chunk,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -58,6 +63,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_device, get_exec
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -1007,18 +1014,51 @@ class IndexerKPool(MultiPlatformOp):
         )
         return topk_result
 
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device: torch.device
-    ) -> Tuple[bool, int]:
-        if num_q * num_k < 8_000_000:
-            return False, 0
+    def _mqa_logits_row_chunks(
+        self, num_rows: int, num_cols: int, device: torch.device
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Row ranges keeping one [rows, num_cols] fp32 logits chunk in budget.
 
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4
-        logits_bytes = num_q * num_k * bytes_per_elem
-
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        None means the whole matrix fits and the caller keeps its single
+        unchunked call. deep_gemm allocates the logits as
+        [num_rows, align256(num_cols)] fp32, which no pool sized by
+        mem_fraction_static accounts for, so at long context it dwarfs the
+        remaining headroom (a 917K-token prefill chunk reaches ~14 GiB here).
+        """
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            # mem_get_info would sync the host mid-capture, and captured shapes
+            # are fixed anyway.
+            return None
+        device_index = device.index if device.index is not None else 0
+        need_chunk, budget_bytes = mqa_logits_should_chunk(
+            num_rows=num_rows,
+            num_cols=num_cols,
+            get_budget_bytes=lambda: mqa_logits_budget_bytes(
+                device_index=device_index, allow_sync=True
+            ),
+            rocm=is_hip(),
+        )
+        if not need_chunk:
+            return None
+        rows_per_chunk = mqa_logits_rows_per_chunk(
+            num_rows=num_rows,
+            row_bytes=mqa_logits_row_bytes(num_cols),
+            budget_bytes=budget_bytes,
+        )
+        if rows_per_chunk is None:
+            return None
+        logger.debug(
+            "kpool indexer chunks %d query rows x %d pooled cols into %d-row "
+            "chunks (logits budget %d bytes)",
+            num_rows,
+            num_cols,
+            rows_per_chunk,
+            budget_bytes,
+        )
+        return [
+            (start, min(start + rows_per_chunk, num_rows))
+            for start in range(0, num_rows, rows_per_chunk)
+        ]
 
     def _get_topk_ragged_kpool_plan(
         self,
@@ -1064,16 +1104,22 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = self._fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
+            kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
+            row_chunks = self._mqa_logits_row_chunks(n_real, total_k_rows, device)
+            logits = (
+                self._fp8_mqa_logits(
+                    q_fp8[:n_real].contiguous(),
+                    *kv_fp8,
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    clean_logits=True,
+                )
+                if row_chunks is None
+                else None
             )
         else:
+            row_chunks = None
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
         topk_method = metadata.topk_transform_method
@@ -1088,16 +1134,55 @@ class IndexerKPool(MultiPlatformOp):
             elif topk_method == TopkTransformMethod.RAGGED:
                 topk_offsets_all = attn_metadata.topk_indices_offset
 
-        return self._topk_from_kpool_logits(
-            logits,
-            pool_lens,
-            seq_lens=seq_lens_expanded,
-            page_table=page_table_all,
-            topk_offsets=topk_offsets_all,
-            row_starts=ks_per_q,
-            out_rows=total_q,
-            page_table_row_index=page_table_row_index_all,
-        )
+        if row_chunks is None:
+            return self._topk_from_kpool_logits(
+                logits,
+                pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
+            )
+
+        # Each row's top-k reads only its own logits row, pooled length and
+        # page-table row, so scoring the rows in chunks selects the same pages
+        # as one pass. Each chunk's logits are reduced and freed before the
+        # next one allocates, so only one chunk is live at a time.
+        def _rows(tensor: Optional[torch.Tensor], start: int, end: int):
+            return None if tensor is None else tensor[start:end]
+
+        topk_result = None
+        for start, end in row_chunks:
+            logits_chunk = self._fp8_mqa_logits(
+                q_fp8[start:end].contiguous(),
+                *kv_fp8,
+                weights[start:end].contiguous(),
+                ks_per_q[start:end],
+                ke_per_q[start:end],
+                clean_logits=True,
+            )
+            topk_chunk = self._topk_from_kpool_logits(
+                logits_chunk,
+                pool_lens[start:end],
+                seq_lens=_rows(seq_lens_expanded, start, end),
+                page_table=_rows(page_table_all, start, end),
+                topk_offsets=_rows(topk_offsets_all, start, end),
+                row_starts=ks_per_q[start:end],
+                page_table_row_index=_rows(page_table_row_index_all, start, end),
+            )
+            del logits_chunk
+            if topk_result is None:
+                topk_result = torch.full(
+                    (total_q, topk_chunk.shape[1]),
+                    -1,
+                    dtype=topk_chunk.dtype,
+                    device=topk_chunk.device,
+                )
+            topk_result[start:end] = topk_chunk
+        assert topk_result is not None
+        return topk_result
 
     def _get_topk_ragged_kpool(
         self,
@@ -1297,16 +1382,25 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = self._fp8_mqa_logits(
-                    q_fp8[q_slice].contiguous(),
-                    k_fp8.contiguous(),
-                    k_scale.contiguous(),
-                    weights[q_slice].contiguous(),
-                    row_starts,
-                    local_pool_lens,
-                    clean_logits=True,
+                local_kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
+                local_row_chunks = self._mqa_logits_row_chunks(
+                    q_len, pool_seq_len, q_fp8.device
+                )
+                local_logits = (
+                    self._fp8_mqa_logits(
+                        q_fp8[q_slice].contiguous(),
+                        *local_kv_fp8,
+                        weights[q_slice].contiguous(),
+                        row_starts,
+                        local_pool_lens,
+                        clean_logits=True,
+                    )
+                    if local_row_chunks is None
+                    else None
                 )
             else:
+                local_kv_fp8 = None
+                local_row_chunks = None
                 local_logits = torch.empty(
                     (q_len, 0), dtype=torch.float32, device=q_fp8.device
                 )
@@ -1330,13 +1424,55 @@ class IndexerKPool(MultiPlatformOp):
             ):
                 topk_offsets_local = topk_offsets[q_slice]
 
-            local_topk = self._topk_from_kpool_logits(
-                local_logits,
-                local_pool_lens,
-                seq_lens=local_seqlens,
-                page_table=page_table_local,
-                topk_offsets=topk_offsets_local,
-            )
+            if local_row_chunks is None:
+                local_topk = self._topk_from_kpool_logits(
+                    local_logits,
+                    local_pool_lens,
+                    seq_lens=local_seqlens,
+                    page_table=page_table_local,
+                    topk_offsets=topk_offsets_local,
+                )
+            else:
+                # One request's logits still scale with its own context, so a
+                # single long request needs the same row chunking.
+                local_topk = None
+                q_base = q_slice.start
+                for start, end in local_row_chunks:
+                    logits_chunk = self._fp8_mqa_logits(
+                        q_fp8[q_base + start : q_base + end].contiguous(),
+                        *local_kv_fp8,
+                        weights[q_base + start : q_base + end].contiguous(),
+                        row_starts[start:end],
+                        local_pool_lens[start:end],
+                        clean_logits=True,
+                    )
+                    topk_chunk = self._topk_from_kpool_logits(
+                        logits_chunk,
+                        local_pool_lens[start:end],
+                        seq_lens=(
+                            None if local_seqlens is None else local_seqlens[start:end]
+                        ),
+                        page_table=(
+                            None
+                            if page_table_local is None
+                            else page_table_local[start:end]
+                        ),
+                        topk_offsets=(
+                            None
+                            if topk_offsets_local is None
+                            else topk_offsets_local[start:end]
+                        ),
+                    )
+                    del logits_chunk
+                    if local_topk is None:
+                        local_topk = torch.full(
+                            (q_len, topk_chunk.shape[1]),
+                            -1,
+                            dtype=topk_chunk.dtype,
+                            device=topk_chunk.device,
+                        )
+                    local_topk[start:end] = topk_chunk
+                assert local_topk is not None
 
             topk_result[q_slice] = local_topk
             if pool_seq_len > 0 and deferred_cache_write is not None:
