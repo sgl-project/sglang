@@ -248,7 +248,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                     ] = float(layer + 1)
 
                 with (
-                    get_parallel().override(dcp_enabled=False),
+                    get_parallel().override(dcp_enabled=False, attn_dcp_rank=0),
                     mock.patch(
                         "sglang.srt.mem_cache.memory_pool.current_platform.synchronize"
                     ),
@@ -411,7 +411,9 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
             _FakeKVCache(pool.max_slots("full")),
             _FakeKVCache(pool.max_slots("mamba")),
         )
-        with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
+        with get_parallel().override(
+            dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
+        ):
             allocator = UnifiedMambaTokenToKVPoolAllocator(
                 unified_buffer=pool, kvcache=kvcache, device=_DEV, page_size=ps
             )

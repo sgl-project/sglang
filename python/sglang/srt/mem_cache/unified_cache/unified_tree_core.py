@@ -2321,6 +2321,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
+        # SWA can be evicted independently of FULL, including holes between
+        # resident SWA nodes. Describe precisely which full rows back it.
+        full_load_slices = {}
+        offset = 0
+        for nid in kv_xfer.nodes_to_load or ():
+            count = len(self.node_by_id(nid).key)
+            full_load_slices[nid] = slice(offset, offset + count)
+            offset += count
+        for xfer in comp_xfers.get(ComponentType.SWA, ()):
+            xfer.anchor_index_parts = [
+                full_load_slices[nid]
+                if nid in full_load_slices
+                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
+                for nid in xfer.nodes_to_load or ()
+            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(

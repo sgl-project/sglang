@@ -17,7 +17,6 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    ps: ParallelState
     server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
