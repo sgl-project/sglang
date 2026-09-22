@@ -8,14 +8,17 @@ use sgl_router::{
     config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
     discovery::spawn_discovery,
     policies::{
-        active_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
-        factory::build_registry as build_policy_registry,
-        kv_events::{BlockSizeOracle, KvEventIndex},
-        prefix_provider::RadixTreePrefixProvider,
+        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
     },
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
+    state::{
+        kv_events::{BlockSizeOracle, KvEventIndex},
+        load_monitor::router_inflight_load::{
+            spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
+        },
+    },
     tokenizer::TokenizerRegistry,
     workers::{manager, WorkerRegistry},
 };
@@ -228,10 +231,14 @@ fn start_engine_state_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
     }
 }
 
-fn start_local_inflight_tracker(config: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) {
-    let timeout_secs = config.active_load.stale_request_timeout_secs;
-    let local_inflight_requests =
-        ActiveLoadRegistry::new(Arc::new(SystemTimeClock), Duration::from_secs(timeout_secs));
+fn start_local_inflight_tracker(
+    config: &Config,
+) -> (Arc<RouterInflightLoadRegistry>, JanitorHandle) {
+    let timeout_secs = config.router_inflight_load.stale_request_timeout_secs;
+    let local_inflight_requests = RouterInflightLoadRegistry::new(
+        Arc::new(SystemTimeClock),
+        Duration::from_secs(timeout_secs),
+    );
     // Reap stale requests at one tenth of their timeout, bounded to 1–60 seconds.
     let sweep_interval = Duration::from_secs((timeout_secs / 10).clamp(1, 60));
     let inflight_cleanup = spawn_janitor(Arc::clone(&local_inflight_requests), sweep_interval);
@@ -242,7 +249,7 @@ async fn start_worker_discovery_and_manager(
     config: &Config,
     worker_registry: &Arc<WorkerRegistry>,
     engine_state: &Arc<KvEventIndex>,
-    local_inflight_requests: &Arc<ActiveLoadRegistry>,
+    local_inflight_requests: &Arc<RouterInflightLoadRegistry>,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let (worker_events, discovery_handle) =
         spawn_discovery(config).await.context("spawn discovery")?;
@@ -262,17 +269,18 @@ fn build_app_context(
     tokenizers: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     routing_policies: Arc<PolicyRegistry>,
-    local_inflight_requests: Arc<ActiveLoadRegistry>,
+    local_inflight_requests: Arc<RouterInflightLoadRegistry>,
     engine_state: &KvEventIndex,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
-            .context("build proxy client")?,
+            .context("build proxy client")?
+            .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs)),
     );
 
-    let mut app_context = AppContext::with_active_load(
+    let mut app_context = AppContext::with_router_inflight_load(
         config.clone(),
         tokenizers,
         proxy,
@@ -289,7 +297,7 @@ fn build_app_context(
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.block_size_oracle = block_size_oracle;
-    app_context.engine_load = engine_state.engine_load();
+    app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
     Ok(Arc::new(app_context))
 }
@@ -350,7 +358,7 @@ async fn report_drain_progress(
             tracing::$level!(
                 elapsed_secs = $elapsed,
                 inflight_http = app_context.inflight_http.count(),
-                inflight_proxied = app_context.active_load.inflight_count(),
+                inflight_proxied = app_context.router_inflight_load.inflight_count(),
                 "still draining in-flight requests; this phase is unbounded and ends at \
                  SIGKILL when terminationGracePeriodSeconds expires",
             )
