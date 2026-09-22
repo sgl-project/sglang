@@ -1,41 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Bake alibaba-pai's PDD LoRA into the official MiniMax-H3 weights.
+"""Merge alibaba-pai's PDD LoRA into a native MiniMax-H3 checkpoint.
 
     python3 -m sglang.multimodal_gen.tools.build_minimax_h3_pdd_weights \
         <base transformer dir> <lora.safetensors> <out dir>
 
-Produces two things:
-
-* `transformer/`: a complete checkpoint with the 2D LoRA deltas merged in;
-* `pdd_heads.safetensors`: the 32 position-level output heads, plus a
-  `pdd_config.json` recording num_steps / block_size. Those cannot be merged --
-  they are what PDD *is*. See below.
-
-## What PDD is, and why the output heads cannot be merged
-
-Parallel Decoding Distillation (https://research.nvidia.com/labs/genair/pdd/)
-splits the time axis into N intervals grouped into blocks of L, and "the parallel
-decoder utilizes the same backbone, but with the final linear layer replicated N
-times". At inference one backbone evaluation advances a whole block, i.e. N/L
-forwards -- here 32/4 = 8, which is where "8Step" comes from.
-
-So the checkpoint's `proj_out.weight` is (32, 96, 5376): 32 copies of the final
-linear layer, one position dimension more than the base model's (96, 5376).
-Numerically each is a small perturbation of that base layer (1-5% relative, which
-`--verify` prints), exactly what "replicate N times and fine-tune" looks like.
-
-The L heads inside a block share one backbone evaluation. The paper notes that at
-generation time one can "fuse the layers into a single linear layer that directly
-predicts a step across the full block"; for flow matching that is a weighted sum
-over the per-step sigma deltas, because the h in
-
-    x_{n+L} = x_n + sum_j dsigma_{n+j} * W_{n+j} h
-
-is shared and the sum can be moved onto the weights. This script does NOT do that
-fusion: run `fuse_minimax_h3_pdd_heads.py` on the output directory before serving.
-Keep the head files outside `transformer/` so the model loader does not treat
-them as ordinary checkpoint shards.
+Writes merged weights to `transformer/` and interval-specific output heads to
+`pdd_heads.safetensors`, alongside `pdd_config.json`. The heads must stay outside
+`transformer/` so the model loader does not treat them as checkpoint shards.
+Run `fuse_minimax_h3_pdd_heads.py` on the output directory before serving.
 
 Serve with `--transformer-weights-path <out dir>/transformer` and set
 `SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS=<out dir>/pdd_fused_heads.safetensors`.
@@ -45,32 +18,23 @@ Keep `pdd_config.json` beside the fused heads for schedule validation.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
-import os
 import shutil
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 HEAD_DIM = 128
 
 
-def _lora_delta(down: torch.Tensor, up: torch.Tensor, scale: float) -> torch.Tensor:
-    return (up.float() @ down.float()) * scale
-
-
 def _interleave_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """[3 x (heads*head_dim), in] -> the official per-head interleaved layout."""
-    heads = q.shape[0] // HEAD_DIM
     in_dim = q.shape[1]
-    grouped = torch.empty(heads, 3 * HEAD_DIM, in_dim, dtype=q.dtype)
-    grouped[:, 0 * HEAD_DIM : 1 * HEAD_DIM] = q.view(heads, HEAD_DIM, in_dim)
-    grouped[:, 1 * HEAD_DIM : 2 * HEAD_DIM] = k.view(heads, HEAD_DIM, in_dim)
-    grouped[:, 2 * HEAD_DIM : 3 * HEAD_DIM] = v.view(heads, HEAD_DIM, in_dim)
-    return grouped.reshape(heads * 3 * HEAD_DIM, in_dim)
+    return torch.stack(
+        [x.reshape(-1, HEAD_DIM, in_dim) for x in (q, k, v)], dim=1
+    ).reshape(-1, in_dim)
 
 
 def _target_of(lora_key: str) -> str | None:
@@ -86,34 +50,29 @@ def _target_of(lora_key: str) -> str | None:
         (".attn.to_out.0", ".attn.out_proj"),
         (".ff.net.0.proj", ".mlp.fc1"),
         (".ff.net.2", ".mlp.fc2"),
-        (".adaln_proj.linear", ".adaln_proj.linear"),
     ):
         if k.endswith(src):
             return k[: -len(src)] + dst
     return k  # attn.to_q/k/v pass through; the caller interleaves them
 
 
-def load_lora(path: str) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
-    with safe_open(path, "pt") as f:
-        meta = f.metadata() or {}
-        return {k: f.get_tensor(k) for k in f.keys()}, meta
-
-
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("base_dir")
+    ap.add_argument("base_dir", type=Path)
     ap.add_argument("lora_path")
-    ap.add_argument("out_dir")
+    ap.add_argument("out_dir", type=Path)
     ap.add_argument(
         "--verify",
         action="store_true",
-        help="print the relative magnitude of each class of change",
+        help="print the relative magnitude of each merged weight change",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    lora, meta = load_lora(args.lora_path)
+    with safe_open(args.lora_path, "pt") as f:
+        meta = f.metadata() or {}
+        lora = {k: f.get_tensor(k) for k in f.keys()}
     rank = int(meta.get("lora_rank", 64))
     alpha = float(meta.get("lora_alpha", rank))
     scale = alpha / rank
@@ -136,7 +95,7 @@ def main() -> int:
     for module, dv in pairs.items():
         if "lora_down" not in dv or "lora_up" not in dv:
             raise SystemExit(f"{module} has only one half of the LoRA pair")
-        delta = _lora_delta(dv["lora_down"], dv["lora_up"], scale)
+        delta = (dv["lora_up"].float() @ dv["lora_down"].float()) * scale
         target = _target_of(module)
         if target is None:
             raise SystemExit(f"no mapping rule for {module}")
@@ -155,24 +114,21 @@ def main() -> int:
         )
     print(f"2D deltas to merge: {len(deltas)} ({len(qkv)} of them qkv)")
 
-    out = Path(args.out_dir)
+    out = args.out_dir
     transformer_out = out / "transformer"
     transformer_out.mkdir(parents=True, exist_ok=True)
     applied = 0
-    for shard in sorted(glob.glob(os.path.join(args.base_dir, "*.safetensors"))):
-        with safe_open(shard, "pt") as f:
-            tensors = {k: f.get_tensor(k) for k in f.keys()}
-        for key in list(tensors):
+    for shard in sorted(args.base_dir.glob("*.safetensors")):
+        tensors = load_file(str(shard))
+        for key, base in tensors.items():
             if key in deltas:
-                base = tensors[key]
-                merged = base.float() + deltas[key].to(base.device)
+                merged = base.float() + deltas[key]
                 if args.verify:
                     rel = ((merged - base.float()).norm() / base.float().norm()).item()
                     print(f"  {key}: relative change {rel:.4f}")
                 tensors[key] = merged.to(base.dtype)
                 applied += 1
-        name = os.path.basename(shard)
-        save_file(tensors, str(transformer_out / name), metadata={"format": "pt"})
+        save_file(tensors, str(transformer_out / shard.name), metadata={"format": "pt"})
     print(f"merged {applied}/{len(deltas)} tensors")
     if applied != len(deltas):
         raise SystemExit(
@@ -184,8 +140,8 @@ def main() -> int:
         "model.safetensors.index.json",
         "diffusion_pytorch_model.safetensors.index.json",
     ):
-        src = os.path.join(args.base_dir, extra)
-        if os.path.exists(src):
+        src = args.base_dir / extra
+        if src.exists():
             shutil.copy(src, transformer_out / extra)
 
     heads = {
