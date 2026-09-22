@@ -92,7 +92,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamEnd, StreamEndReason};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -139,21 +139,92 @@ const OVERLAP_BLOCK_BUCKETS: &[f64] = &[
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
+///
+/// The split exists so `outcome="error"` means *this worker failed*, matching
+/// what [`crate::proxy`]'s `breaker_outcome` counts as a fault. A request can
+/// fail for reasons that say nothing about the worker's health — the caller sent
+/// something invalid, or the worker was merely at capacity — and folding those
+/// into `error` makes the per-worker error ratio fire on client mistakes and on
+/// exactly the backpressure the circuit breaker deliberately tolerates.
 #[derive(Debug, Clone, Copy)]
 pub enum RequestOutcome {
     Success,
+    /// The worker answered and rejected the request as invalid (a 4xx other than
+    /// 429). The caller's fault, not the worker's.
+    ClientError,
+    /// The worker was responsive but at capacity (429 / 503). Not a fault — the
+    /// same judgement `breaker_outcome` makes when it declines to open the
+    /// breaker on these statuses.
+    Backpressure,
+    /// The worker failed to serve the request: a 5xx fault, a transport failure,
+    /// a timeout, or a body that never completed.
     Error,
+    /// The router cancelled the request itself — today only the stale-request
+    /// deadline. Never derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 
 impl RequestOutcome {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::ClientError => "client_error",
+            Self::Backpressure => "backpressure",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+/// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
+/// status.
+///
+/// Deriving from the status rather than from `Result::Ok`/`Err` is what keeps a
+/// forwarded worker error honest: a worker 4xx/5xx the router proxies is an
+/// `Ok(Response)` at the handler, so keying off `Ok` credits it as a success.
+///
+/// This never returns [`RequestOutcome::Cancelled`]. A status cannot identify a
+/// router-side cancellation: a 504 is produced by the stale-request deadline, by
+/// the router's own upstream timeout, and by a worker 504 forwarded unchanged,
+/// and only the caller holding the `ApiError` can tell them apart. Callers that
+/// know they cancelled the request say so explicitly instead.
+pub fn outcome_from_status(status: u16) -> RequestOutcome {
+    match status {
+        200..=299 => RequestOutcome::Success,
+        // Responsive but at capacity. Listed before the 4xx arm so 429 lands
+        // here rather than in `ClientError`.
+        429 | 503 => RequestOutcome::Backpressure,
+        400..=499 => RequestOutcome::ClientError,
+        _ => RequestOutcome::Error,
+    }
+}
+
+/// Routing context a handler attaches to its `Response` (via response
+/// extensions) so the outermost access-log middleware can describe a dispatch it
+/// cannot see itself.
+///
+/// Attached today only by `chat_completions`. There is no compile-time
+/// obligation to attach one — any handler that dispatches to a worker must do so
+/// or its access-log line names no worker and falls back to a status-derived
+/// outcome. A line with empty `worker`/`model` is therefore normal, not a bug:
+/// it means the request was rejected before dispatch, or reached a route that
+/// does not dispatch at all.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext {
+    /// The worker the client-visible response actually came from. In PD mode
+    /// that is the decode worker, not the policy-selected prefill worker.
+    pub worker_url: String,
+    pub model_id: String,
+    /// Whether the client asked for an SSE stream. Only the handler knows this
+    /// (it is a body field, not a header or a route), and it separates
+    /// time-to-last-byte from time-to-headers when reading `latency_ms`.
+    pub streaming: bool,
+    /// The outcome the handler recorded for this request. Carried so the log
+    /// line and `worker_requests_total` cannot disagree — the middleware can
+    /// only see the status, which cannot express a router-side cancellation.
+    pub outcome: RequestOutcome,
+    /// Router-minted engine ID, logged beside the caller's correlation ID.
+    pub engine_rid: Option<String>,
 }
 
 /// Final outcome of a 2xx SSE stream.
@@ -167,14 +238,19 @@ pub enum StreamOutcome {
     UpstreamError,
     /// The client disconnected before the stream finished.
     ClientDisconnect,
+    /// The router's stale-request deadline aborted the stream.
+    Expired,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
-    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
-        (false, _, _) => StreamOutcome::UpstreamError,
-        (_, true, _) => StreamOutcome::StreamErrorEvent,
-        (_, _, true) => StreamOutcome::ClientDisconnect,
-        _ => StreamOutcome::Ok,
+    match end.reason {
+        StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::UpstreamError
+        | StreamEndReason::IdleTimeout
+        | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
+        _ if end.saw_error_event => StreamOutcome::StreamErrorEvent,
+        StreamEndReason::ClientDisconnect => StreamOutcome::ClientDisconnect,
+        StreamEndReason::Completed => StreamOutcome::Ok,
     }
 }
 
@@ -185,6 +261,7 @@ impl StreamOutcome {
             Self::StreamErrorEvent => "stream_error_event",
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
+            Self::Expired => "expired",
         }
     }
 }
@@ -306,12 +383,12 @@ impl PolicySelectionFailureReason {
 
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
-pub enum ActiveLoadKind {
+pub enum RouterInflightLoadKind {
     PrefillTokens,
     DecodeBlocks,
 }
 
-impl ActiveLoadKind {
+impl RouterInflightLoadKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::PrefillTokens => "prefill_tokens",
@@ -329,9 +406,8 @@ pub struct MetricsRegistry {
     // never answered, which `worker_requests_total` (post-dispatch) can't see.
     requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
-    // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
-    // dispatch, so blind to pre-dispatch drops; kept per-worker for the
-    // routing-convergence tests.
+    // Per-worker dispatch outcomes. Recorded after dispatch, so blind to
+    // pre-dispatch drops; kept per-worker for the routing-convergence tests.
     worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
@@ -340,7 +416,7 @@ pub struct MetricsRegistry {
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
-    active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
+    router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -402,12 +478,12 @@ pub struct WorkerSnapshot {
     pub healthy: bool,
     /// Circuit breaker state code: 0=closed, 1=open, 2=half_open.
     pub cb_state: u8,
-    /// In-flight request count for this worker (`Worker::active_load`).
+    /// In-flight request count for this worker (`Worker::router_inflight_load`).
     pub inflight: i64,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct ActiveLoadKey {
+struct RouterInflightLoadKey {
     worker_url: String,
     kind: &'static str,
 }
@@ -570,8 +646,8 @@ impl MetricsRegistry {
     }
 
     /// Bump the edge counter `responses_total{route,method,status_code}`. Called
-    /// at the middleware, so it captures every outcome — incl. early-exit
-    /// 400/413/503 that the old per-handler site skipped.
+    /// at the middleware, so it captures every response — including early-exit
+    /// 400/413/503s that never reach a handler.
     pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
         let key = EdgeResponseKey {
             route: route.to_owned(),
@@ -589,12 +665,17 @@ impl MetricsRegistry {
 
     /// Set `sgl_router_active_load` for the given worker + kind. Replaces the
     /// previous value (gauge semantics).
-    pub fn set_active_load(&self, worker_url: &str, kind: ActiveLoadKind, value: i64) {
-        let key = ActiveLoadKey {
+    pub fn set_router_inflight_load(
+        &self,
+        worker_url: &str,
+        kind: RouterInflightLoadKind,
+        value: i64,
+    ) {
+        let key = RouterInflightLoadKey {
             worker_url: worker_url.to_owned(),
             kind: kind.as_str(),
         };
-        let mut guard = self.active_load.lock();
+        let mut guard = self.router_inflight_load.lock();
         let gauge = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicI64::new(0)))
@@ -802,7 +883,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // worker_requests_total — per-worker dispatch outcomes (formerly requests_total)
+        // worker_requests_total — per-worker dispatch outcomes
         out.push_str(
             "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
         );
@@ -916,13 +997,13 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // active_load gauge
+        // router_inflight_load gauge
         out.push_str(
             "# HELP sgl_router_active_load Per-worker active load (prefill_tokens or decode_blocks).\n",
         );
         out.push_str("# TYPE sgl_router_active_load gauge\n");
-        let guard = self.active_load.lock();
-        let mut entries: Vec<(&ActiveLoadKey, i64)> = guard
+        let guard = self.router_inflight_load.lock();
+        let mut entries: Vec<(&RouterInflightLoadKey, i64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
@@ -1427,22 +1508,26 @@ mod tests {
     fn stream_outcome_precedence() {
         use StreamOutcome::*;
 
-        for (transport_ok, saw_error_event, client_disconnect, expected) in [
-            (false, false, false, UpstreamError),
-            (false, false, true, UpstreamError),
-            (false, true, false, UpstreamError),
-            (false, true, true, UpstreamError),
-            (true, false, false, Ok),
-            (true, false, true, ClientDisconnect),
-            (true, true, false, StreamErrorEvent),
-            (true, true, true, StreamErrorEvent),
+        for (reason, expected) in [
+            (StreamEndReason::Completed, Ok),
+            (StreamEndReason::ClientDisconnect, ClientDisconnect),
+            (StreamEndReason::UpstreamError, UpstreamError),
+            (StreamEndReason::IdleTimeout, UpstreamError),
+            (StreamEndReason::PumpPanicked, UpstreamError),
+            (StreamEndReason::Expired, Expired),
         ] {
-            let end = StreamEnd {
-                transport_ok,
-                saw_error_event,
-                client_disconnect,
-            };
-            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            for saw_error_event in [false, true] {
+                let end = StreamEnd {
+                    reason,
+                    saw_error_event,
+                };
+                let expected = if saw_error_event && matches!(expected, Ok | ClientDisconnect) {
+                    StreamErrorEvent
+                } else {
+                    expected
+                };
+                assert_eq!(classify_stream_end(end), expected, "{end:?}");
+            }
         }
     }
 
@@ -1454,12 +1539,14 @@ mod tests {
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
         reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Expired);
         let out = reg.render();
         for expected in [
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
             r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="expired"} 1"#,
         ] {
             assert_metric_line(&out, expected);
         }
@@ -1583,8 +1670,8 @@ mod tests {
     #[test]
     fn set_active_load_gauge_overwrites() {
         let reg = MetricsRegistry::new();
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 100);
-        reg.set_active_load("http://w:30000", ActiveLoadKind::PrefillTokens, 250);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 100);
+        reg.set_router_inflight_load("http://w:30000", RouterInflightLoadKind::PrefillTokens, 250);
         let out = reg.render();
         assert!(out.contains(
             r#"sgl_router_active_load{worker_url="http://w:30000",kind="prefill_tokens"} 250"#,
@@ -1804,5 +1891,39 @@ mod tests {
             out.contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 1"#),
             "got:\n{out}"
         );
+    }
+
+    /// The status → outcome mapping is the single definition shared by the
+    /// access log and `worker_requests_total`, so a silent change here corrupts
+    /// both surfaces at once. Pin every class, including the boundaries.
+    #[test]
+    fn outcome_from_status_maps_every_class() {
+        let cases = [
+            (200, "success"),
+            (204, "success"),
+            (299, "success"),
+            // Backpressure is listed before the 4xx arm, so 429 must not fall
+            // through to client_error.
+            (429, "backpressure"),
+            (503, "backpressure"),
+            (400, "client_error"),
+            (404, "client_error"),
+            (499, "client_error"),
+            (500, "error"),
+            (502, "error"),
+            // A 504 is NOT a cancellation: the router's own upstream timeout and
+            // a worker's forwarded 504 both land here, and only the caller
+            // holding the `ApiError` can tell a real stale-cancel apart.
+            (504, "error"),
+            (199, "error"),
+            (300, "error"),
+        ];
+        for (status, want) in cases {
+            assert_eq!(
+                outcome_from_status(status).as_str(),
+                want,
+                "status {status} must map to `{want}`",
+            );
+        }
     }
 }
