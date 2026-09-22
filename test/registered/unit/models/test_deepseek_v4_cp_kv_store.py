@@ -17,9 +17,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
         layer.fuse_wqa_wkv = False
         layer.wq_a = mock.Mock(return_value=(torch.ones(2, 2), None))
         layer.q_norm = mock.Mock(side_effect=lambda value: value)
-        layer._normalize_q_lora = mock.Mock(
-            side_effect=lambda value: (value, value)
-        )
+        layer._normalize_q_lora = mock.Mock(side_effect=lambda value: (value, value))
         q = torch.ones(2, 1, 2)
         layer._compute_q_b = mock.Mock(return_value=q)
         local_kv = torch.arange(8, dtype=torch.float32).view(2, 4)
