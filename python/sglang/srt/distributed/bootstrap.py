@@ -101,9 +101,6 @@ def init_parallel_runtime(
     Set up CPU thread binding, the current device, and the shared Mooncake
     engine before creating process groups. Draft workers reuse their target's
     groups and must not call this function.
-
-    Builds groups only. Whatever the model's shape decides is
-    ``init_layer_runtime``, which the caller runs once it has a model config.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -336,11 +333,7 @@ def _init_parallel_groups(
 
 
 def init_layer_runtime(*, model_config: ModelConfig) -> None:
-    """Materialize what the model's shape decides, once the groups exist.
-
-    The group build derives the topology without a model; the sizes and flags
-    here need one, so they run after it, from the caller that owns the config.
-    """
+    """Size the DP gathered buffer and resolve layernorm SP from the model."""
     init_dp_gathered_buffer(model_config)
     initialize_layernorm_sp(model_config=model_config)
 

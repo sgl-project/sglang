@@ -245,8 +245,6 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "override_permanently"
         )
-        # The whole stamp is one ** mapping, so every name goes through the
-        # guard below; a keyword beside it would bypass it.
         self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
         mapping = stamp.keywords[0].value
         self.assertIsInstance(mapping, ast.DictComp)
@@ -257,7 +255,6 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
         self.assertIsInstance(guard, ast.Compare)
         self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
         self.assertEqual([c.value for c in guard.comparators], [None])
-        # It is the stamped value that is tested, not some other name.
         self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
 
 
@@ -2603,7 +2600,6 @@ class TestTheTopologyIdentities(CustomTestCase):
         with self.assertRaises(ValueError):
             with get_parallel().override(**written):
                 pass
-        # Every name the write touched, not just the one that failed the check.
         self.assertEqual(
             {name: getattr(get_parallel(), name) for name in written}, before
         )
@@ -3017,8 +3013,7 @@ class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
         "get_mooncake_transfer_engine",
         "get_torch_distributed_pg_options",
     }
-    #: Widths whose group is not in ``_WIDTH_AND_GROUP``, so the context cannot
-    #: check what it would answer against the group that was built.
+    #: Widths whose group is not in ``_WIDTH_AND_GROUP``.
     WIDTH_WITHOUT_A_CHECKED_GROUP = {
         "get_dcp_world_size",
         "get_moe_data_parallel_world_size",
@@ -3036,12 +3031,7 @@ class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
         return set(_CONTEXT_NAME_OF)
 
     def test_every_getter_the_module_defines_is_classified(self):
-        """The deprecation map is what this checks, not what it checks against.
-
-        Deriving the watched set from the map would let a getter added later
-        stay outside it and never be looked at; deriving it from the module
-        means a new one has to be named here or deprecated.
-        """
+        """Every getter the module defines is deprecated or classified here."""
         from sglang.srt.distributed import parallel_state
 
         defined = {

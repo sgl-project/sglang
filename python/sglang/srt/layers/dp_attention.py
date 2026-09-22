@@ -405,12 +405,7 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
 
 
 def initialize_dp_attention(server_args: ServerArgs):
-    """Initialize DP flags and state placement from the published topology.
-
-    Takes no model config: the placement follows from the parallel sizes alone,
-    so the group build can reach it before a model is known. What the model's
-    shape decides lives in ``init_dp_gathered_buffer``.
-    """
+    """Initialize DP flags and state placement from the published topology."""
     initialize_dp_attention_flags(server_args)
     parallel = get_parallel()
     _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
