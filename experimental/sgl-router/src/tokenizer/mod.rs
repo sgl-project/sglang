@@ -739,6 +739,14 @@ impl TokenizerRegistry {
                 "DeepSeek-V4 routing enabled; chat requests route via the built-in V4 encoder");
             return Some(ChatEncoder::DeepSeekV4);
         }
+        let id = model_id.to_ascii_lowercase();
+        if id.contains("deepseek") && id.contains("v4") {
+            tracing::warn!(model = %model_id,
+                "this DeepSeek version is not compatible with the built-in V4 encoder; \
+                 chat traffic routes via raw prompt text and stays worker-encoded \
+                 (no router input_ids offload)");
+            return None;
+        }
         tracing::info!(model = %model_id,
             "no chat template or built-in encoder; chat traffic routes via raw prompt text");
         None
@@ -1189,11 +1197,27 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
 /// Whether `model_id` denotes a DeepSeek-V4 model, which the engine encodes via
 /// the built-in [`dsv4`] encoder rather than a Jinja template. Heuristic on the
 /// served model id (the router has no model architecture from `/server_info`);
-/// scoped to "deepseek" + "v4" so it doesn't claim V3-family models, whose
-/// encoding differs.
+/// Match the V4 version boundary, not the whole V4 family. V4.1 uses
+/// `encoding_dsv41` (different system markers, generation transitions, tools,
+/// and reasoning). Claiming it here also marks V4 ids engine-equivalent and
+/// forwards them to the worker, bypassing its correct V4.1 encoder.
+/// Unknown versions must stay worker-encoded until a matching encoder exists.
 fn is_deepseek_v4(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
-    id.contains("deepseek") && id.contains("v4")
+    if !id.contains("deepseek") {
+        return false;
+    }
+    id.match_indices("v4").any(|(i, marker)| {
+        let suffix = &id[i + marker.len()..];
+        let mut chars = suffix.chars();
+        match chars.next() {
+            None => true,
+            // Also exclude version aliases such as deepseek-v4-1-flash and
+            // deepseek_v4_1_flash, while allowing V4-Flash and V4-Pro.
+            Some('-' | '_') => chars.next().is_none_or(|c| !c.is_ascii_digit()),
+            Some(c) => !c.is_ascii_alphanumeric() && c != '.',
+        }
+    })
 }
 
 /// Whether `model_id` denotes a Kimi-K3 model, which ships no Jinja template and
@@ -2018,10 +2042,31 @@ mod tests {
     fn is_deepseek_v4_matches_v4_only() {
         assert!(is_deepseek_v4("deepseek-ai/DeepSeek-V4-Flash"));
         assert!(is_deepseek_v4("DeepSeek-V4-Pro"));
+        assert!(is_deepseek_v4("deepseek-ai/DeepSeek-V4"));
+        assert!(is_deepseek_v4("DEEPSEEK-V4-FLASH"));
+        assert!(is_deepseek_v4("deepseek_v4_flash"));
         // Not V4-family models.
         assert!(!is_deepseek_v4("deepseek-ai/DeepSeek-V3.2"));
         assert!(!is_deepseek_v4("Qwen/Qwen3-0.6B"));
         assert!(!is_deepseek_v4("tiny"));
+    }
+
+    #[test]
+    fn is_deepseek_v4_excludes_other_encoder_versions() {
+        for model in [
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            "DeepSeek-V4.1-Pro",
+            "deepseek-v4-1-flash-f35wbx",
+            "deepseek_v4_1_flash",
+            "DeepSeek-V4.2-Flash",
+            "DeepSeek-V40-Flash",
+            "DeepSeek-V41-Flash",
+        ] {
+            assert!(
+                !is_deepseek_v4(model),
+                "must not use the V4 encoder: {model}"
+            );
+        }
     }
 
     /// Find a real, non-trivial `tokenizer.json` in the local HuggingFace
