@@ -628,8 +628,12 @@ class DeepseekV2WeightLoaderMixin:
                         if hasattr(self_attn.kv_b_proj, "weight_scale")
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
+                    # `format_ue8m0` is only stamped by quant methods that requant
+                    # scales to UE8M0 (e.g. fp8/DeepGEMM). Quant methods like
+                    # `humming` never stamp it, so read it defensively.
                     is_ue8m0_uint8 = (
-                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
+                        getattr(weight_scale, "format_ue8m0", False)
+                        and weight_scale.dtype == torch.uint8
                     )
                     if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -653,7 +657,7 @@ class DeepseekV2WeightLoaderMixin:
                                 else None
                             )
                         )
-                        and weight_scale.format_ue8m0
+                        and getattr(weight_scale, "format_ue8m0", False)
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
