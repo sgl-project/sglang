@@ -97,9 +97,7 @@ class TestKVTransferReplicaMetric(CustomTestCase):
 
     def test_components_use_their_own_slot_sizes(self):
         mgr = _make_kv_mgr(is_mla_backend=True)
-        _set_state_components(
-            mgr, [StateType.MAMBA, StateType.SWA], [[3, 4], [10, 20]]
-        )
+        _set_state_components(mgr, [StateType.MAMBA, StateType.SWA], [[3, 4], [10, 20]])
         sender = _make_sender(mgr)
         mgr.resolve_kv_replica_factor(_room(4))
         sender._record_transfer_indices(
