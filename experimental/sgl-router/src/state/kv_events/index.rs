@@ -25,28 +25,36 @@
 //! **before** the subscriber tasks are joined, and the pump filters every
 //! event through this set before mutating the tree.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
-use super::bootstrap::PeerRegistry;
+use super::bootstrap::{
+    BootstrapState, BootstrapTracker, PeerRegistry, RankOutcome, VettedSnapshot,
+};
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
-use super::wire::KvCacheEvent;
+use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+use fallback::{discard_graft, fail_rank};
+use graft::{apply_snapshot, leaves_gap, still_owed};
 use producer::CachedSnapshot;
 
+mod fallback;
+mod graft;
 mod producer;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -58,6 +66,56 @@ pub use producer::SnapshotBody;
 /// per-worker event rates are < 1 kHz; a 1024-deep buffer absorbs a
 /// half-second burst at 2 kHz before back-pressuring the SUB sockets.
 const EVENT_CHANNEL_BUFFER: usize = 1024;
+
+/// Per-rank cap on batches held back while that rank is
+/// [`BootstrapState::Pending`].
+///
+/// A rank that overflows this cannot be spliced (see `fail_rank`), so the
+/// cap trades a small amount of memory for the chance to bootstrap at all.
+/// Sized to match `EVENT_CHANNEL_BUFFER`: if the pump is that far behind, the
+/// snapshot is not arriving in time anyway.
+const PENDING_BATCH_LIMIT: usize = 1024;
+
+// Constructed by the peer sweep, which lands next.
+#[allow(dead_code)]
+/// Control-plane messages for the pump task.
+///
+/// Tree mutation MUST stay on the single writer (see the single-writer property
+/// in [`super::tree`]), so the bootstrap task never touches the tree itself —
+/// it fetches and vets a snapshot, then hands it to the pump through this
+/// channel.
+#[derive(Debug)]
+enum PumpControl {
+    /// Graft a vetted snapshot, seed cursors, then release each rank's held
+    /// batches.
+    ///
+    /// `obligations` is the set this message discharges: every rank named here
+    /// leaves `Pending` when this is handled, whether or not the snapshot covered
+    /// it. Deriving the set from the snapshot instead would leave a rank the peer
+    /// never mentioned buffering forever.
+    ///
+    /// Each entry carries the incarnation it was registered under, so a task
+    /// still in flight for a worker that has since been removed and re-added
+    /// cannot graft onto the new incarnation.
+    ApplySnapshot {
+        obligations: Vec<(KvWorkerId, u64)>,
+        vetted: Box<VettedSnapshot>,
+    },
+    /// Stop holding batches for `ranks`: release what is buffered and mark
+    /// them [`BootstrapState::Failed`]. Sent when no peer could supply a
+    /// snapshot, or when the bootstrap deadline fires.
+    AbandonBootstrap { obligations: Vec<(KvWorkerId, u64)> },
+    /// A worker was removed: drop everything the pump keeps for these ranks —
+    /// held batches, pending splice proofs, tree carriers and cursors — so a
+    /// re-added worker's fresh publisher inherits none of it.
+    ///
+    /// `done` fires once teardown has run, so nothing of these ranks survives
+    /// `remove_worker`.
+    ForgetRanks {
+        ranks: Vec<KvWorkerId>,
+        done: Option<oneshot::Sender<()>>,
+    },
+}
 
 /// Per-worker bookkeeping kept inside [`KvEventIndex`] so `remove_worker`
 /// knows which DP ranks were actually subscribed (not the advertised
@@ -131,8 +189,13 @@ pub struct KvEventIndex {
     /// Applied events by kind and storage medium, for the `/metrics` scrape.
     /// Written only by the pump.
     tally: Arc<EventTally>,
+    /// Per-rank bootstrap progress; also what `/readyz` consults.
+    bootstrap: Arc<BootstrapTracker>,
     /// Sibling replicas a snapshot may be pulled from. See [`PeerRegistry`].
     peers: Arc<PeerRegistry>,
+    /// Control channel into the pump, so snapshot grafting happens on the
+    /// single writer rather than in the bootstrap task.
+    ctrl_tx: mpsc::Sender<PumpControl>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -168,7 +231,21 @@ impl KvEventIndex {
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, true)
+        Self::new_with_mode(
+            http,
+            block_size_oracle,
+            Arc::new(BootstrapTracker::disabled()),
+            true,
+        )
+    }
+
+    /// Constructor that enables peer bootstrap with the supplied tracker.
+    pub fn new_with_bootstrap(
+        http: reqwest::Client,
+        block_size_oracle: Arc<BlockSizeOracle>,
+        bootstrap: Arc<BootstrapTracker>,
+    ) -> Arc<Self> {
+        Self::new_with_mode(http, block_size_oracle, bootstrap, true)
     }
 
     /// Discovers worker hash metadata only: seeds the shared [`BlockSizeOracle`]
@@ -178,31 +255,43 @@ impl KvEventIndex {
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
-        Self::new_with_mode(http, block_size_oracle, false)
+        Self::new_with_mode(
+            http,
+            block_size_oracle,
+            Arc::new(BootstrapTracker::disabled()),
+            false,
+        )
     }
 
     fn new_with_mode(
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
+        bootstrap: Arc<BootstrapTracker>,
         maintain_tree: bool,
     ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
         let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
         let engine_reported_load = EngineReportedLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
+        let peers = Arc::new(PeerRegistry::new());
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
-            tree.clone(),
-            engine_reported_load.clone(),
-            cursors.clone(),
-            live_workers.clone(),
-            Arc::clone(&tally),
+            PumpDeps {
+                tally: Arc::clone(&tally),
+                tree: tree.clone(),
+                engine_reported_load: engine_reported_load.clone(),
+                cursors: cursors.clone(),
+                live_workers: live_workers.clone(),
+                bootstrap: Arc::clone(&bootstrap),
+            },
             pump_cancel.clone(),
             rx,
+            ctrl_rx,
         ));
         Arc::new(Self {
             tree,
@@ -211,16 +300,25 @@ impl KvEventIndex {
             load_subscribers,
             engine_reported_load,
             pump: Mutex::new(Some(pump)),
-            pump_cancel,
+            pump_cancel: pump_cancel.clone(),
             workers: Mutex::new(HashMap::new()),
             http,
             live_workers,
             cursors,
             tally,
-            peers: Arc::new(PeerRegistry::new()),
+            bootstrap,
+            peers,
+            ctrl_tx,
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
         })
+    }
+
+    /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
+    /// whether initial bootstrap has settled; the metrics surface reads it for
+    /// the per-rank state gauge.
+    pub fn bootstrap(&self) -> Arc<BootstrapTracker> {
+        Arc::clone(&self.bootstrap)
     }
 
     /// Shared accessor for the per-process block-size oracle.
@@ -380,6 +478,25 @@ impl KvEventIndex {
                 });
             }
         }
+        // Register for bootstrap BEFORE the subscriber starts too, so the very
+        // first batch is held back rather than applied ahead of the snapshot.
+        // Ordering matters in the other direction as well: the subscription
+        // must be live before the snapshot is fetched, so no delta can fall
+        // into the gap between the peer's export and our first received batch.
+        //
+        // KV ranks only. A load-only rank publishes no KV stream, so there is
+        // nothing to hold and no watermark to splice against; registering it
+        // would leave an obligation no snapshot can ever discharge.
+        let bootstrap_ranks: Vec<KvWorkerId> = kv_dp_ranks
+            .iter()
+            .map(|&rank| KvWorkerId::new(worker_url.to_string(), rank))
+            .collect();
+        let bootstrap_obligations: Vec<(KvWorkerId, u64)> =
+            if self.peer_bootstrap_enabled() && !bootstrap_ranks.is_empty() {
+                self.bootstrap.register(&bootstrap_ranks)
+            } else {
+                Vec::new()
+            };
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerEntry {
@@ -389,6 +506,10 @@ impl KvEventIndex {
         if self.maintain_tree && !kv_dp_ranks.is_empty() {
             self.subscribers.add_worker(worker_url, &cfg).await;
         }
+        // Registered ranks hold their batches until an `ApplySnapshot` or
+        // `AbandonBootstrap` names them. Every production constructor passes a
+        // disabled tracker, which registers nothing.
+        drop(bootstrap_obligations);
         // Mark only the ranks that have an actual SUB socket. `EngineReportedLoadTable`
         // then rejects missing or stale advertised ranks as a whole worker.
         if !load_dp_ranks.is_empty() {
@@ -398,6 +519,13 @@ impl KvEventIndex {
             }
             self.load_subscribers.add_worker(worker_url, &cfg).await;
         }
+    }
+
+    /// Whether this worker's ranks enter the bootstrap state machine. Keyed on
+    /// configured, not settled, so a late worker still gets an obligation; and
+    /// independent of visible peers, because registering arms the deadline.
+    fn peer_bootstrap_enabled(&self) -> bool {
+        self.bootstrap.enabled()
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -430,14 +558,40 @@ impl KvEventIndex {
         //    further events for these ranks will be queued after this returns.
         self.subscribers.remove_worker(worker_url).await;
         self.load_subscribers.remove_worker(worker_url).await;
-        // 3. Drop each rank's tree state and cursor, and the worker's engine
-        //    load. Any event already in the mpsc buffer at this point will be
+        // 3. Drop the worker's engine load and each rank's bootstrap state, so
+        //    a rank that never finished cannot hold the readiness gate open.
+        //    Any event already in the mpsc buffer at this point will be
         //    filtered by the live-set check inside the pump.
         self.engine_reported_load.forget_worker(worker_url);
-        let mut cursors = self.cursors.lock();
-        for id in &ids {
-            self.tree.clear_worker(id);
-            cursors.remove(id);
+        self.bootstrap.forget(&ids);
+        // 4. Hand the per-rank teardown to the pump: `held`,
+        //    `awaiting_splice_proof`, the tree carriers, and the cursor. Doing
+        //    the tree/cursor half here would race a graft already past its
+        //    gates (see the `ForgetRanks` arm).
+        //
+        //    `bootstrap.forget` above must precede this send: it is what makes
+        //    an in-flight ApplySnapshot for these ranks a no-op.
+        let (done_tx, done_rx) = oneshot::channel();
+        let queued = self
+            .ctrl_tx
+            .send(PumpControl::ForgetRanks {
+                ranks: ids.clone(),
+                done: Some(done_tx),
+            })
+            .await
+            .is_ok();
+        // Wait, so a worker that flaps straight back cannot have its fresh
+        // state wiped by this forget.
+        if !queued || done_rx.await.is_err() {
+            // Only reachable once the pump has exited, i.e. during shutdown.
+            // Clean up inline so the state does not outlive the worker in that
+            // case; there is no writer left to race.
+            debug!("kv-events: pump is gone; tearing down worker state inline");
+            let mut cursors = self.cursors.lock();
+            for id in &ids {
+                self.tree.clear_worker(id);
+                cursors.remove(id);
+            }
         }
     }
 
@@ -471,26 +625,119 @@ impl KvEventIndex {
     }
 }
 
+/// Shared state the pump task reads and writes.
+struct PumpDeps {
+    tally: Arc<EventTally>,
+    tree: Arc<HashTree>,
+    engine_reported_load: Arc<EngineReportedLoadTable>,
+    cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+    live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    bootstrap: Arc<BootstrapTracker>,
+}
+
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
 /// with no seq. `PublisherReset` events clear the cursor so a publisher
 /// restarting from seq=1 (after sending END_SEQ) is not filtered.
+///
+/// Also the sole writer of tree state, including snapshot grafts arriving as
+/// [`PumpControl`]; see the single-writer property in [`super::tree`].
 async fn pump_loop(
-    tree: Arc<HashTree>,
-    engine_reported_load: Arc<EngineReportedLoadTable>,
-    cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
-    live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
-    tally: Arc<EventTally>,
+    deps: PumpDeps,
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<WorkerEvent>,
+    mut ctrl_rx: mpsc::Receiver<PumpControl>,
 ) {
+    let PumpDeps {
+        tally,
+        tree,
+        engine_reported_load,
+        cursors,
+        live_workers,
+        bootstrap,
+    } = deps;
+    let pump_state = PumpState {
+        tree: &tree,
+        cursors: &cursors,
+        tally: &tally,
+        bootstrap: &bootstrap,
+        live_workers: &live_workers,
+    };
+
+    // Batches held back while their rank is `Pending`. Pump-local: the pump is
+    // the only task that touches it, so no lock is needed.
+    let mut held: HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>> = HashMap::new();
+    // Ranks grafted from a snapshot whose continuity with the live stream is
+    // not yet provable, mapped to the watermark the first arriving batch must
+    // not exceed by more than one.
+    //
+    // WHY deferred: a snapshot can be grafted before the rank's first live
+    // batch has even arrived, so there is nothing to compare the watermark
+    // against yet. The check runs on whichever batch turns up first — held or
+    // live — and the entry is consumed by that one check.
+    let mut awaiting_splice_proof: HashMap<KvWorkerId, i64> = HashMap::new();
+    // Once the control channel closes its `recv()` resolves immediately and
+    // forever, so it must be dropped from the select or the loop spins hot.
+    let mut ctrl_open = true;
+
     loop {
         let ev = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 info!("kv-events pump: shutdown requested; exiting");
                 return;
+            }
+            // Control first: releasing held batches unblocks readiness, and the
+            // channel is near-empty in steady state.
+            ctrl = ctrl_rx.recv(), if ctrl_open => {
+                match ctrl {
+                    Some(PumpControl::ApplySnapshot {
+                        obligations,
+                        vetted,
+                    }) => {
+                        apply_snapshot(
+                            &pump_state,
+                            &mut held,
+                            &mut awaiting_splice_proof,
+                            &obligations,
+                            *vetted,
+                        );
+                    }
+                    Some(PumpControl::ForgetRanks { ranks, done }) => {
+                        for rank in ranks {
+                            held.remove(&rank);
+                            awaiting_splice_proof.remove(&rank);
+                            // On the single writer so it is strictly ordered with
+                            // any graft: a graft queued before this is undone here;
+                            // one queued after fails its gates.
+                            tree.clear_worker(&rank);
+                            cursors.lock().remove(&rank);
+                        }
+                        if let Some(done) = done {
+                            let _ = done.send(());
+                        }
+                    }
+                    Some(PumpControl::AbandonBootstrap { obligations }) => {
+                        for (rank, epoch) in obligations {
+                            if !still_owed(&pump_state, &rank, epoch) {
+                                continue;
+                            }
+                            fail_rank(
+                                &pump_state,
+                                &mut held,
+                                &rank,
+                                false,
+                                RankOutcome::Abandoned,
+                            );
+                        }
+                    }
+                    None => {
+                        debug!("kv-events pump: control channel closed");
+                        ctrl_open = false;
+                    }
+                }
+                continue;
             }
             recv = rx.recv() => match recv {
                 Some(ev) => ev,
@@ -521,6 +768,35 @@ async fn pump_loop(
                 engine_reported_load.set(&worker.url, worker.dp_rank, load, Instant::now());
             }
             WorkerEvent::PublisherReset { worker } => {
+                // A reset means the engine restarted with an empty cache and
+                // renumbers from 1: any splice proof, grafted state or held
+                // batch describes a cache that no longer exists, so drop all of
+                // it and relearn from the new stream.
+                if awaiting_splice_proof.remove(&worker).is_some() {
+                    bootstrap.record_rank_outcome(RankOutcome::PublisherReset);
+                }
+                let state = bootstrap.state_of(&worker);
+                tree.clear_worker(&worker);
+                match state {
+                    Some(BootstrapState::Recovered) => {
+                        bootstrap.set(&worker, BootstrapState::Failed);
+                    }
+                    Some(BootstrapState::Pending) => {
+                        warn!(
+                            worker = ?worker,
+                            "kv-bootstrap: publisher reset while awaiting a snapshot; \
+                             abandoning bootstrap for this rank",
+                        );
+                        fail_rank(
+                            &pump_state,
+                            &mut held,
+                            &worker,
+                            true,
+                            RankOutcome::PublisherReset,
+                        );
+                    }
+                    _ => {}
+                }
                 if cursors.lock().remove(&worker).is_some() {
                     info!(
                         worker = ?worker,
@@ -528,77 +804,182 @@ async fn pump_loop(
                     );
                 }
             }
-            WorkerEvent::Batch { worker, seq, batch } => {
-                let prev = cursors.lock().get(&worker).copied();
-                if let Some(p) = prev {
-                    if seq <= p {
-                        debug!(
-                            worker = ?worker,
-                            seq,
-                            last_applied = p,
-                            "kv-events pump: out-of-order batch; skipping",
-                        );
-                        continue;
-                    }
-                    // The publisher's seq is dense, so a jump is exactly the
-                    // batches ZMQ dropped at its high-water mark. This became
-                    // worth counting with tier-tagged removals: a removal now
-                    // clears only its own tier, so losing the batch carrying a
-                    // block's LAST removal leaves the worker owning it until
-                    // the next AllBlocksCleared or teardown. The tree cannot
-                    // see that happened — only the sequence can. The
-                    // operator-visible signature is tree coverage above 1.
-                    let lost = (seq - p - 1) as u64;
-                    if lost > 0 {
-                        tally.record_lost_batches(lost);
+            WorkerEvent::Batch {
+                worker,
+                seq,
+                mut batch,
+            } => {
+                // A rank still awaiting its snapshot holds its batches: applying
+                // them first would put live deltas *under* the snapshot, where a
+                // stale `BlockStored` from the peer could resurrect a block this
+                // rank has already evicted.
+                if bootstrap.enabled()
+                    && bootstrap.state_of(&worker) == Some(BootstrapState::Pending)
+                {
+                    if held.get(&worker).map_or(0, VecDeque::len) >= PENDING_BATCH_LIMIT {
+                        // Dropping from the middle of the stream would leave a
+                        // hole the snapshot cannot be spliced across, so give up
+                        // on bootstrapping this rank and let it run live. The
+                        // queue itself is intact (nothing was dropped to reach
+                        // the cap), so it is replayed rather than discarded.
                         warn!(
                             worker = ?worker,
-                            seq,
-                            last_applied = p,
-                            lost,
-                            "kv-events pump: sequence gap; batches were dropped in transit and the tree may hold stale tiers for this worker",
+                            limit = PENDING_BATCH_LIMIT,
+                            "kv-bootstrap: held-batch limit reached before a snapshot arrived; \
+                             abandoning bootstrap for this rank",
                         );
+                        fail_rank(
+                            &pump_state,
+                            &mut held,
+                            &worker,
+                            false,
+                            RankOutcome::Overflow,
+                        );
+                    } else {
+                        // The cap counts batches, not bytes, and `token_ids` is
+                        // the unbounded part of a batch (one entry per prompt
+                        // token) that `apply_batch` never reads. Shed it so a
+                        // long-context fleet cannot hold gigabytes at boot.
+                        for event in &mut batch.events {
+                            if let KvCacheEvent::BlockStored(b) = event {
+                                b.token_ids = Vec::new();
+                            }
+                        }
+                        if let Some(queue) = held.get_mut(&worker) {
+                            queue.push_back((seq, batch));
+                        } else {
+                            held.entry(worker.clone())
+                                .or_default()
+                                .push_back((seq, batch));
+                        }
+                        continue;
+                    }
+                    // Falls through: the rank is no longer Pending, so this
+                    // batch is applied directly below.
+                }
+                // First batch after a graft proves — or disproves — that the
+                // snapshot joins up with this rank's live stream.
+                let watermark = if awaiting_splice_proof.is_empty() {
+                    None
+                } else {
+                    awaiting_splice_proof.remove(&worker)
+                };
+                if let Some(watermark) = watermark {
+                    if leaves_gap(seq, watermark) {
+                        warn!(
+                            worker = ?worker,
+                            peer_cursor = watermark,
+                            first_live_seq = seq,
+                            "kv-bootstrap: sequence gap between snapshot and live stream; \
+                             discarding snapshot state for this rank to avoid stale cache entries",
+                        );
+                        discard_graft(&pump_state, &worker, RankOutcome::Gap);
+                    } else {
+                        // The deferred check passed: this rank's grafted state is
+                        // now proven continuous with its live stream, which is the
+                        // point at which it counts as warm.
+                        bootstrap.record_rank_outcome(RankOutcome::Warm);
                     }
                 }
-                for event in &batch.events {
-                    // The `medium` tag decides which tier a store lands on and
-                    // which tier a removal clears, so a device eviction leaves
-                    // a worker that still holds the block on host as an owner
-                    // — see the tree's "Storage tiers" docs.
-                    match event {
-                        KvCacheEvent::BlockStored(b) => {
-                            tally.record(
-                                EventKind::BlockStored,
-                                b.medium.as_deref(),
-                                b.block_hashes.len(),
-                            );
-                            tree.insert_tiered(
-                                &worker,
-                                b.parent_block_hash,
-                                &b.block_hashes,
-                                Tiers::for_store(b.medium.as_deref()),
-                            );
-                        }
-                        KvCacheEvent::BlockRemoved(b) => {
-                            tally.record(
-                                EventKind::BlockRemoved,
-                                b.medium.as_deref(),
-                                b.block_hashes.len(),
-                            );
-                            tree.remove_tiered(
-                                &worker,
-                                &b.block_hashes,
-                                Tiers::for_remove(b.medium.as_deref()),
-                            );
-                        }
-                        KvCacheEvent::AllBlocksCleared => {
-                            tally.record(EventKind::AllBlocksCleared, None, 0);
-                            tree.clear_worker(&worker);
-                        }
-                    }
-                }
-                cursors.lock().insert(worker, seq);
+                apply_batch(&tree, &cursors, &tally, &worker, seq, &batch);
             }
         }
+    }
+}
+
+/// The pump-owned handles the bootstrap helpers share.
+struct PumpState<'a> {
+    tree: &'a HashTree,
+    cursors: &'a Mutex<HashMap<KvWorkerId, i64>>,
+    tally: &'a EventTally,
+    bootstrap: &'a BootstrapTracker,
+    live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+}
+
+/// Apply one batch, honouring the cursor's out-of-order filter.
+///
+/// This is the single place tree deltas are written, whether the batch came
+/// straight off the wire or out of a bootstrap hold-back queue — which is what
+/// makes cursor seeding sufficient to reconcile a snapshot with the live stream.
+fn apply_batch(
+    tree: &HashTree,
+    cursors: &Mutex<HashMap<KvWorkerId, i64>>,
+    tally: &EventTally,
+    worker: &KvWorkerId,
+    seq: i64,
+    batch: &KvEventBatch,
+) {
+    // Bound on its own line: an `if let` scrutinee would keep the guard alive
+    // through the logging below.
+    let prev = cursors.lock().get(worker).copied();
+    if let Some(p) = prev {
+        if seq <= p {
+            debug!(
+                worker = ?worker,
+                seq,
+                last_applied = p,
+                "kv-events pump: out-of-order batch; skipping",
+            );
+            return;
+        }
+        // The publisher's seq is dense, so a jump is exactly the batches ZMQ
+        // dropped at its high-water mark. A removal clears only its own tier,
+        // so losing a block's last removal leaves the worker owning it until
+        // the next AllBlocksCleared or teardown; only the sequence shows that
+        // happened. The operator-visible signature is tree coverage above 1.
+        let lost = (seq - p - 1) as u64;
+        if lost > 0 {
+            tally.record_lost_batches(lost);
+            warn!(
+                worker = ?worker,
+                seq,
+                last_applied = p,
+                lost,
+                "kv-events pump: sequence gap; batches were dropped in transit and the tree may hold stale tiers for this worker",
+            );
+        }
+    }
+    for event in &batch.events {
+        match event {
+            // The `medium` tag decides which tier a store lands on and which
+            // tier a removal clears, so a device eviction leaves a worker that
+            // still holds the block on host as an owner — see the tree's
+            // "Storage tiers" docs.
+            KvCacheEvent::BlockStored(b) => {
+                tally.record(
+                    EventKind::BlockStored,
+                    b.medium.as_deref(),
+                    b.block_hashes.len(),
+                );
+                tree.insert_tiered(
+                    worker,
+                    b.parent_block_hash,
+                    &b.block_hashes,
+                    Tiers::for_store(b.medium.as_deref()),
+                );
+            }
+            KvCacheEvent::BlockRemoved(b) => {
+                tally.record(
+                    EventKind::BlockRemoved,
+                    b.medium.as_deref(),
+                    b.block_hashes.len(),
+                );
+                tree.remove_tiered(
+                    worker,
+                    &b.block_hashes,
+                    Tiers::for_remove(b.medium.as_deref()),
+                );
+            }
+            KvCacheEvent::AllBlocksCleared => {
+                tally.record(EventKind::AllBlocksCleared, None, 0);
+                tree.clear_worker(worker);
+            }
+        }
+    }
+    let mut guard = cursors.lock();
+    if let Some(cursor) = guard.get_mut(worker) {
+        *cursor = seq;
+    } else {
+        guard.insert(worker.clone(), seq);
     }
 }

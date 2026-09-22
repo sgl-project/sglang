@@ -180,7 +180,8 @@ pub enum RankOutcome {
     Uncovered,
     /// No peer supplied a usable snapshot.
     Abandoned,
-    /// The held batches overflowed before a snapshot arrived.
+    /// Held batches hit their cap before a snapshot arrived; bootstrap was
+    /// abandoned and they were replayed as live deltas.
     Overflow,
     /// The publisher restarted mid-bootstrap.
     PublisherReset,
@@ -233,8 +234,9 @@ pub struct PeerSnapshot {
     pub block_size: u32,
     /// Producer's hashing mode (EAGLE-family workers hash token bigrams).
     pub is_bigram: bool,
-    /// True when the producer's hash config is established and its tree holds
-    /// nodes, so a cold or half-configured replica is never copied.
+    /// True when the producer's own bootstrap has settled, its hash config is
+    /// established, and its tree holds nodes, so a cold, still-bootstrapping
+    /// or half-configured replica is never copied.
     pub producer_ready: bool,
     /// Worker table; node carrier lists index into this.
     pub workers: Vec<WireWorker>,
