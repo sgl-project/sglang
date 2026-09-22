@@ -76,3 +76,9 @@ def test_mxfp4_marlin_inplace_reload_matches_initial_repack():
         assert id(actual) == parameter_ids[name]
         assert actual.untyped_storage().data_ptr() == storage_ptrs[name]
         assert torch.equal(actual, expected_tensor)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    raise SystemExit(pytest.main([__file__, "-x"]))
