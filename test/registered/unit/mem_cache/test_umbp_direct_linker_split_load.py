@@ -2,6 +2,7 @@
 
 import ctypes
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from types import SimpleNamespace
@@ -431,7 +432,11 @@ def test_failure_reaches_every_rank_before_allgather(factory, monkeypatch, failu
             _finish(linker)
 
     collectives.run(linkers, fail)
-    assert not any(kind == "gather" for kind, _, _ in collectives.calls)
+    # The status vote is now read at the end of the batch, so a locally failed
+    # rank can no longer skip the allgather: it must enter it, or its peers are
+    # stranded. `_Collectives` makes every collective a barrier with a timeout,
+    # so a stranded rank fails this test instead of hanging quietly.
+    assert any(kind == "gather" for kind, _, _ in collectives.calls)
 
 
 def test_capacity_fallback_and_reset(factory):
@@ -531,3 +536,78 @@ def test_unsupported_topology_is_rejected_before_group_creation(
     linker.pool_group = SimpleNamespace(rank_replicated=True)
     with pytest.raises(ValueError, match="requires rank-replicated"):
         linker._init_split(None, 0)
+
+
+def test_restore_rate_gate_is_inert_unless_asked_for(factory, monkeypatch):
+    """Unset means unchanged behaviour, and `split_rate_milli` stays 0.
+
+    That counter is how a run tells "the gate never armed" from "the gate armed
+    and chose not to fire"; writing to it by default would erase the
+    distinction. The delenv matters when this suite runs inside a server
+    container that already sets the variable.
+    """
+    monkeypatch.delenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", raising=False)
+    monkeypatch.delenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", raising=False)
+    linkers, collectives = factory()
+    for linker in linkers:
+        assert linker._split_min_rate == 0.0
+        _queue(linker, [0, 1])
+        linker._split_rate_start = time.monotonic() - 3600.0
+        linker._split_loads_seen = 0  # as quiet as a tier gets
+    shares = collectives.run(linkers, lambda linker: linker._prepare_split_share())
+    assert all(share is not None for share in shares)
+    assert all(linker._stats["split_rate_gated"] == 0 for linker in linkers)
+    assert all(linker._stats["split_rate_milli"] == 0 for linker in linkers)
+
+
+@pytest.mark.parametrize(
+    "elapsed, seen, gated",
+    [
+        (600.0, 6, True),  # 0.010/s, well below the threshold
+        (600.0, 600, False),  # 1.000/s, well above it
+        (10.0, 0, False),  # inside the calibration window: do not judge yet
+    ],
+)
+def test_restore_rate_gate_vetoes_only_a_quiet_tier(
+    factory, monkeypatch, elapsed, seen, gated
+):
+    monkeypatch.setenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0.3")
+    monkeypatch.setenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
+    linkers, collectives = factory()
+    for linker in linkers:
+        _queue(linker, [0, 1])
+        # After queueing: load() increments the counter the gate reads.
+        linker._split_rate_start = time.monotonic() - elapsed
+        linker._split_loads_seen = seen
+
+    shares = collectives.run(linkers, lambda linker: linker._prepare_split_share())
+
+    if gated:
+        assert shares == [None] * 3
+        # Expressed through the existing agreement, so it costs one collective
+        # and skips the page-mask reduce, exactly like a capacity veto.
+        assert collectives.calls == [
+            ("reduce", "cpu", 1 + 4 * linkers[0]._split_max_rids)
+        ]
+        assert all(linker._stats["split_rate_gated"] == 1 for linker in linkers)
+        assert all(linker._stats["split_skipped_batches"] == 1 for linker in linkers)
+        # The clock moves between setup and call, so 0.010/s can truncate to 9.
+        assert all(9 <= linker._stats["split_rate_milli"] <= 10 for linker in linkers)
+    else:
+        assert all(share is not None for share in shares)
+        assert len(collectives.calls) == 2
+        assert all(linker._stats["split_rate_gated"] == 0 for linker in linkers)
+        assert all(linker._stats["split_skipped_batches"] == 0 for linker in linkers)
+
+
+def test_restore_rate_is_not_judged_before_the_window_closes(factory, monkeypatch):
+    monkeypatch.setenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0.3")
+    monkeypatch.setenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
+    linkers, _ = factory()
+    linker = linkers[0]
+    linker._split_rate_start = time.monotonic() - 299.0
+    linker._split_loads_seen = 0
+    assert linker._restore_rate() == float("inf")
+    linker._split_rate_start = time.monotonic() - 301.0
+    linker._split_loads_seen = 301
+    assert linker._restore_rate() == pytest.approx(1.0, abs=0.01)
