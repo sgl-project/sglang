@@ -472,8 +472,12 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
     else:
         position = position % block_size
     for tap in range(1, taps):
+        # Taps that would reach into the previous block (another request) must be
+        # exact zeros. Multiplying by a 0/1 mask is not enough: NaN or Inf in the
+        # previous request's last rows would become NaN here (NaN * 0 = NaN).
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+        shifted = torch.where((position >= tap).view(-1, 1, 1), shifted, 0)
+        out = out + coefficients[:, tap] * shifted
     return out.flatten(-2)
 
 
