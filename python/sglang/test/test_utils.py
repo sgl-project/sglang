@@ -2056,19 +2056,10 @@ def maybe_stub_sgl_kernel():
 
 @contextlib.contextmanager
 def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
-    """Publish a record describing the parallel topology a test wants.
+    """Publish a test topology, defaulting to WORLD rank zero.
 
-    Replaces standing a per-process parallel record into the object under
-    test. The widths arrive the way production gets them -- from published
-    configuration -- and the per-process ranks the way a spawned process gets
-    them, so a rank read is answered without building a process group. Stating
-    the topology through the same door production uses also keeps the derived
-    widths honest: a hand-built double can claim an `attn_tp_size` the
-    configuration would never produce.
-
-    `ranks` overrides the spawn identities; by default this process is rank
-    zero of the world, which fixes every other rank. The context is reset on exit, including when the
-    test fails.
+    ``ranks`` overrides the launcher placement. Reset the context before
+    publication and on exit, including when the test fails.
     """
     from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
     from sglang.srt.server_args import ServerArgs
@@ -2082,6 +2073,32 @@ def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
         yield server_args
     finally:
         reset_context()
+
+
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """Publish the topology for a subsequent ``initialize_model_parallel`` call.
+
+    Preserve an existing WORLD group across the context reset. The caller is
+    responsible for tearing down groups and resetting the context afterward.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Restore the existing WORLD handle after resetting the context.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
 
 
 _GPU_IDLE_TIMEOUT_SECS = 30.0

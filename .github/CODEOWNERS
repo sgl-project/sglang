@@ -18,6 +18,7 @@
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
 /python/sglang/srt/disaggregation/encoder @ShangmingCai @liusy58 @ZhengWG @gty111
 /python/sglang/srt/disaggregation/mori @Duyi-Wang @kkHuang-amd @HaiShaw @Lzy17 @billishyahao
+/python/sglang/srt/disaggregation/nixl @iyastreb @ovidiusm @lluki
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
 /python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616 @rwang5203
@@ -55,6 +56,7 @@
 /python/sglang/srt/mem_cache/allocator @hnyls2002 @hzh0425 @xiezhq-hermann @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/mem_cache/rust_tree_core @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store @huangtingwei9988 @stmatengss
+/python/sglang/srt/mem_cache/storage/nixl @iyastreb @ovidiusm @lluki
 /python/sglang/srt/mem_cache/embedding_*.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
