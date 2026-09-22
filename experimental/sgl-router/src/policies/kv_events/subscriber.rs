@@ -722,6 +722,26 @@ mod tests {
             buf
         }
 
+        /// Like `encode_all_blocks_cleared_batch`, but the inner event is
+        /// the tagged-map shape emitted by engines at/after
+        /// sgl-project/sglang#37482 (`{"type": "AllBlocksCleared"}`).
+        pub fn encode_all_blocks_cleared_batch_map(ts: f64, attn_dp_rank: Option<u32>) -> Vec<u8> {
+            let mut buf = Vec::new();
+            mp::write_array_len(&mut buf, 3).unwrap();
+            mp::write_f64(&mut buf, ts).unwrap();
+            mp::write_array_len(&mut buf, 1).unwrap();
+            mp::write_map_len(&mut buf, 1).unwrap();
+            mp::write_str(&mut buf, "type").unwrap();
+            mp::write_str(&mut buf, "AllBlocksCleared").unwrap();
+            match attn_dp_rank {
+                Some(v) => {
+                    mp::write_uint(&mut buf, v as u64).unwrap();
+                }
+                None => mp::write_nil(&mut buf).unwrap(),
+            }
+            buf
+        }
+
         /// Encode a LoadStat batch `[ts, [["LoadStat", running, waiting,
         /// num_tokens, max_total]], dp_rank?]` in msgspec's array layout.
         /// Encode a bare LoadStat msgpack array `["LoadStat", running, waiting,
@@ -810,6 +830,42 @@ mod tests {
         assert_eq!(seq, 7);
         assert_eq!(worker.dp_rank, 0);
         assert_eq!(worker.url, "http://127.0.0.1:30000");
+        assert_eq!(batch.events.len(), 1);
+        assert!(matches!(batch.events[0], KvCacheEvent::AllBlocksCleared));
+
+        let shutdown_done = timeout(Duration::from_millis(500), registry.shutdown()).await;
+        assert!(shutdown_done.is_ok(), "shutdown should return promptly");
+    }
+
+    /// Post-#37482 engines encode each inner event as a tagged map instead
+    /// of a tagged array; the subscriber pump must decode both.
+    #[tokio::test]
+    async fn single_subscriber_receives_map_encoded_event() {
+        let (mut pub_sock, port) = helpers::make_pub_bound().await;
+
+        let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
+        let registry = KvEventSubscriberRegistry::new(tx);
+
+        registry
+            .add_worker(
+                "http://127.0.0.1:30000",
+                &helpers::cfg_for("http://127.0.0.1:30000", port, 1),
+            )
+            .await;
+        helpers::settle().await;
+
+        let payload = helpers::encode_all_blocks_cleared_batch_map(1.0, Some(0));
+        let msg = helpers::build_multipart(7, payload);
+        pub_sock.send(msg).await.expect("send");
+
+        let event = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("channel closed");
+        let (worker, seq, batch) = helpers::expect_batch(event);
+
+        assert_eq!(seq, 7);
+        assert_eq!(worker.dp_rank, 0);
         assert_eq!(batch.events.len(), 1);
         assert!(matches!(batch.events[0], KvCacheEvent::AllBlocksCleared));
 
