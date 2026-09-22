@@ -131,6 +131,48 @@ class _ModalityTable(dict):
 _MODALITIES = _ModalityTable()
 
 
+class MmTransportStats:
+    """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
+
+    A feature tensor crosses in one of two shapes: ``inline`` — a numpy array
+    that owns the Rust vector, viewed by ``torch.from_numpy`` — or ``shm`` — a
+    POSIX segment the worker wrote, named in the request so every TP rank maps
+    it after the broadcast."""
+
+    __slots__ = (
+        "inline_features",
+        "inline_bytes",
+        "shm_features",
+        "shm_bytes",
+        "copies",
+    )
+
+    def __init__(self) -> None:
+        self.inline_features = 0
+        self.inline_bytes = 0
+        self.shm_features = 0
+        self.shm_bytes = 0
+        self.copies = 0
+
+    def record_inline(self, array, tensor) -> None:
+        self.inline_features += 1
+        self.inline_bytes += array.nbytes
+        if array.flags["OWNDATA"] or tensor.data_ptr() != array.ctypes.data:
+            self.copies += 1
+
+    def record_shm(self, stub) -> None:
+        import numpy as np
+
+        self.shm_features += 1
+        self.shm_bytes += int(np.prod(stub.shape)) * np.dtype(stub.dtype).itemsize
+
+    def snapshot(self) -> Dict[str, int]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+MM_TRANSPORT_STATS = MmTransportStats()
+
+
 class RustMmProcessor:
     """Builds and validates the Rust MM pipeline for one model.
 
@@ -302,8 +344,11 @@ class RustMmProcessor:
         for index, item in enumerate(meta["items"]):
             feature = buffers[f"mm.feature.{index}"]
             if isinstance(feature, np.ndarray):
-                feature = torch.from_numpy(feature)
+                array = feature
+                feature = torch.from_numpy(array)
+                MM_TRANSPORT_STATS.record_inline(array=array, tensor=feature)
             else:
+                MM_TRANSPORT_STATS.record_shm(stub=feature)
                 # The worker placed this item's buffer in a named POSIX segment
                 # (see `_use_feature_shm`). Build the stub in its
                 # post-`__setstate__` form: rank 0 never pickle-roundtrips its

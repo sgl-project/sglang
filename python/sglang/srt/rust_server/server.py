@@ -15,7 +15,7 @@ import os
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
 
@@ -26,6 +26,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
+    MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
@@ -195,6 +196,12 @@ class RustServer:
         item layout; the buffer names are the contract (see ``wrap_encoded``)."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def mm_transport_stats(self) -> Dict[str, int]:
+        """Snapshot of the zero-copy accounting at the multimodal hand-off
+        (see :class:`~sglang.srt.rust_server.multimodal.MmTransportStats`);
+        surfaced on ``/server_info`` as ``rust_mm_transport``."""
+        return MM_TRANSPORT_STATS.snapshot()
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
