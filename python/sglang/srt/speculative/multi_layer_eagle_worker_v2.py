@@ -1004,7 +1004,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
             (f"draft_step_{i}", r)
-            for i, r in enumerate(self.draft_worker.draft_runner_list)
+            for i, r in enumerate(self.draft_worker.draft_runners)
         ]
 
     def __init__(

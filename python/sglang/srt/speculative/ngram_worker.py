@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -41,9 +41,6 @@ if is_cuda():
 else:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
 logger = logging.getLogger(__name__)
 
 
@@ -79,10 +76,6 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
-    def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        # the n-gram corpus is a CPU structure; no draft weights
-        return []
-
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (

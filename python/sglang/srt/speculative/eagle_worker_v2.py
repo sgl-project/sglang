@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -135,9 +135,6 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -1286,9 +1283,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
-    def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
-        return [("draft", self.draft_worker.draft_runner)]
-
     def __init__(
         self,
         server_args: ServerArgs,

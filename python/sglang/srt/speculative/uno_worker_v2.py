@@ -4,7 +4,7 @@ import contextlib
 import copy
 import logging
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -48,7 +48,6 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
 
@@ -57,10 +56,6 @@ logger = logging.getLogger(__name__)
 
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
-
-    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
-        # UNO drafts through the target runner's LoRA -- no independent draft weights.
-        return []
 
     def __init__(
         self,
@@ -798,10 +793,6 @@ class UnoWorkerV2(BaseSpecWorker):
     def update_weights_from_ipc(self, recv_req):
         # The scheduler updates the target worker before calling the spec worker.
         return True, "UNO has no separate draft weights."
-
-    def update_weights_from_tensor(self, recv_req):
-        # This update route selects the spec worker instead of updating both.
-        return self.target_worker.update_weights_from_tensor(recv_req)
 
     @contextlib.contextmanager
     def _bind_uno_draft_runtime(self):
