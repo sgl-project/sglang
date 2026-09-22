@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -151,6 +152,11 @@ class _SplitLoad:
     plans: dict[PoolName, _PoolRangePlan]
     exchanged: int = -1
     failure: BaseException | None = None
+    # Batch-level agreement, accumulated on device and read once, at the last
+    # layer group. Reading it per group blocks the forward thread behind every
+    # kernel already queued on the stream, which costs far more than the
+    # exchange itself.
+    status: torch.Tensor | None = None
     rows: dict[tuple[PoolName, int], torch.Tensor] = field(default_factory=dict)
 
 
@@ -410,6 +416,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
+        # 0 disables the gate. A positive value vetoes split batches while the
+        # tier is too idle for the split to pay for itself; the opening minutes
+        # are ignored because warmup is not the steady state it calibrates to.
+        self._split_min_rate = float(os.getenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0"))
+        self._split_rate_min_seconds = float(
+            os.getenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
+        )
+        self._split_rate_start = time.monotonic()
+        self._split_loads_seen = 0
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
         self._load_queue: Queue[
@@ -432,6 +447,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 split_skipped_batches=0,
                 split_divergent_pages=0,
                 split_local_pages=0,
+                # Kept apart from split_skipped_batches so a deliberate veto
+                # never reads as a failure.
+                split_rate_gated=0,
+                split_rate_milli=0,
             )
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
@@ -637,6 +656,23 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         return valid_pages
 
+    def _restore_rate(self) -> float:
+        """Cumulative restores per second, the signal behind the split gate.
+
+        Not the load wait: splitting is what shortens the wait, so gating on it
+        would oscillate. The restore rate is invariant to the split yet still
+        separates the working points where splitting pays from those where it
+        does not.
+
+        Cumulative rather than trailing, because this is reached only while
+        loads are pending: a trailing window would sample the bursts and never
+        the quiet stretches between them.
+        """
+        elapsed = time.monotonic() - self._split_rate_start
+        if elapsed < self._split_rate_min_seconds:
+            return float("inf")  # too early to judge
+        return self._split_loads_seen / elapsed
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates
         # resident pages. The remaining transfer can therefore contain only a
@@ -650,6 +686,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise RuntimeError(f"UMBP load for rid={rid} is already queued.")
         self._pending[rid] = expanded
         if self._split_load:
+            self._split_loads_seen += 1
             self._pending_pages[rid] = self._lookup_pages.pop(rid, None)
         return True
 
@@ -695,6 +732,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         try:
             if not 0 < len(self._pending) <= self._split_max_rids:
                 raise ValueError("empty or oversized split batch")
+            # Rank-local, but it feeds the existing agreement, so one rank's
+            # veto makes every rank skip: no protocol change, no new collective.
+            if self._split_min_rate > 0:
+                rate = self._restore_rate()
+                # Recorded so a run shows what the gate saw, not just what it did.
+                self._stats["split_rate_milli"] = int(min(rate, 1e6) * 1000)
+                if rate < self._split_min_rate:
+                    self._stats["split_rate_gated"] += 1
+                    raise ValueError("restore rate below the split gate")
             total = 0
             for index, (rid, transfers) in enumerate(self._pending.items()):
                 lookup_keys = self._pending_pages[rid]
@@ -1192,24 +1238,32 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             while state.exchanged < target:
                 self._exchange_group(state, groups[state.exchanged + 1])
                 state.exchanged += 1
+            if target == len(groups) - 1 and state.status is not None:
+                # The one host read per batch. A rank that failed at group k is
+                # reported here rather than at k, so a few more layers run
+                # against KV that is discarded anyway; nothing can hang,
+                # because the allgather is issued unconditionally.
+                if not state.status.item():
+                    raise RuntimeError(
+                        "UMBP split load failed on at least one rank."
+                    ) from state.failure
         finally:
             if target == len(groups) - 1:
                 self._split_state.pop(counter_index, None)
 
     def _exchange_group(self, state: _SplitLoad, group: list[int]) -> None:
         failure = state.failure
-        layout, slot_bytes = [], 0
+        # Deliberately outside the failure guard: `pages` comes from the plan
+        # agreed at prepare time, so every rank derives the same layout whether
+        # or not its own load succeeded. A rank returning early here would
+        # strand its peers in the allgather below. Anything raised here is
+        # symmetric, so it still propagates before any collective.
+        if self._split_recv.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("UMBP split load cannot run inside CUDA graph capture.")
+        pages = len(next(iter(state.plans.values())).all_locations)
+        layout, slot_bytes = self._split_layout(pages, group)
         if failure is None:
             try:
-                if (
-                    self._split_recv.is_cuda
-                    and torch.cuda.is_current_stream_capturing()
-                ):
-                    raise RuntimeError(
-                        "UMBP split load cannot run inside CUDA graph capture."
-                    )
-                pages = len(next(iter(state.plans.values())).all_locations)
-                layout, slot_bytes = self._split_layout(pages, group)
                 # Prepare *all* ranks' scatter indices before voting. Nothing
                 # that can fail locally may strand peers in the allgather.
                 for name, tensor, span, _ in layout:
@@ -1230,14 +1284,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             except BaseException as error:
                 failure = error
 
+        # The vote still runs every group -- it is what keeps a locally failed
+        # rank from stranding its peers -- but its result is read once, at the
+        # end of the batch, instead of draining the stream per group.
         self._split_status.fill_(int(failure is None))
         torch.distributed.all_reduce(
             self._split_status, op=torch.distributed.ReduceOp.MIN, group=self._split_pg
         )
-        if not self._split_status.item():
-            raise RuntimeError(
-                "UMBP split load failed on at least one rank."
-            ) from failure
+        if state.status is None:
+            state.status = self._split_status.clone()
+        else:
+            torch.minimum(state.status, self._split_status, out=state.status)
+        if failure is not None and state.failure is None:
+            # Keep the first local cause so the deferred raise can report it.
+            state.failure = failure
         if not layout:
             return
         base = self._split_rank * slot_bytes
@@ -1246,6 +1306,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self._split_recv[base : base + slot_bytes],
             group=self._split_pg,
         )
+        if failure is not None:
+            # Our rows are untrustworthy; the deferred check fails the batch.
+            return
         for rank in range(self._split_world):
             if rank == self._split_rank:
                 continue
