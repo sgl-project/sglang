@@ -6,7 +6,6 @@ from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -25,6 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -50,7 +50,6 @@ def gegelu(input, limit: Optional[float] = None):
 
 
 class Phi3SmallMLP(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -59,9 +58,9 @@ class Phi3SmallMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        assert (
-            self.config.hidden_act == "gegelu"
-        ), "Only `gegelu` is supported for the 4.7 series of models .."
+        assert self.config.hidden_act == "gegelu", (
+            "Only `gegelu` is supported for the 4.7 series of models .."
+        )
         self.hidden_size = config.hidden_size
         self.gegelu_limit = config.gegelu_limit
         self.intermediate_size = config.intermediate_size
@@ -89,7 +88,6 @@ class Phi3SmallMLP(nn.Module):
 
 
 class Phi3SmallSelfAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -114,7 +112,7 @@ class Phi3SmallSelfAttention(nn.Module):
         self.num_heads = config.num_attention_heads
 
         self.head_dim = self.hidden_size // self.num_heads
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         # Number of total Key Value Heads before tensor parallel
         self.num_key_value_heads = config.num_key_value_heads
         self.num_q_per_kv = self.num_heads // self.num_key_value_heads
@@ -232,7 +230,6 @@ class Phi3SmallSelfAttention(nn.Module):
 
 
 class Phi3SmallDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -285,7 +282,6 @@ class Phi3SmallDecoderLayer(nn.Module):
 
 
 class Phi3SmallModel(nn.Module):
-
     def __init__(
         self,
         config: Phi3Config,
@@ -296,7 +292,7 @@ class Phi3SmallModel(nn.Module):
 
         self.config = config
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -387,7 +383,7 @@ class Phi3SmallForCausalLM(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
         )
-        if self.config.tie_word_embeddings:
+        if getattr(self.config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -465,7 +461,10 @@ class Phi3SmallForCausalLM(nn.Module):
                 continue
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if (
+                getattr(self.config, "tie_word_embeddings", True)
+                and "lm_head.weight" in name
+            ):
                 continue
 
             param = params_dict[name]

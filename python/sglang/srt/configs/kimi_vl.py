@@ -18,7 +18,7 @@ class KimiVLConfig(PretrainedConfig):
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
-        **kwargs
+        **kwargs,
     ):
         if vision_config is None:
             vision_config = MoonViTConfig()

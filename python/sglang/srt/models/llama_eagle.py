@@ -25,7 +25,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -34,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.runtime_context import get_parallel
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -44,13 +44,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config, prefix)
+        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
 
         # Skip the input_layernorm
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x: x)
+            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
 
 
 class LlamaModel(nn.Module):
@@ -120,7 +120,7 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )

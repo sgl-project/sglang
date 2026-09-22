@@ -31,11 +31,6 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
-    "hunyuan3d": "Hunyuan3D2Pipeline",
-    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
-}
-
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
@@ -72,14 +67,6 @@ def has_diffusion_overlay_registry_match(
         return False
     base_name = os.path.basename(os.path.normpath(model_path))
     return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
-
-
-def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
 
 
 def execute_once(func):
@@ -426,13 +413,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))

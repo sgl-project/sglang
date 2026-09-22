@@ -24,6 +24,7 @@ from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -37,12 +38,15 @@ class TestInputFormatDetection(unittest.TestCase):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.network.get_zmq_socket"
-        ), patch(
-            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
-        ) as mock_tokenizer:
+        with (
+            patch("zmq.asyncio.Context"),
+            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+            ) as mock_tokenizer,
+        ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
+            publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
 
     def test_detect_single_string(self):
@@ -133,12 +137,15 @@ class TestTokenizerInputPreparation(unittest.TestCase):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.network.get_zmq_socket"
-        ), patch(
-            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
-        ) as mock_tokenizer:
+        with (
+            patch("zmq.asyncio.Context"),
+            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+            ) as mock_tokenizer,
+        ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
+            publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
 
     def test_prepare_single_string_input(self):
@@ -191,12 +198,15 @@ class TestTokenizerResultExtraction(unittest.TestCase):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.network.get_zmq_socket"
-        ), patch(
-            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
-        ) as mock_tokenizer:
+        with (
+            patch("zmq.asyncio.Context"),
+            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+            ) as mock_tokenizer,
+        ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
+            publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
 
     def test_extract_single_string_results(self):
@@ -313,12 +323,15 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
             self.port_args = PortArgs.init_new(self.server_args)
 
-        with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.network.get_zmq_socket"
-        ), patch(
-            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
-        ) as mock_tokenizer:
+        with (
+            patch("zmq.asyncio.Context"),
+            patch("sglang.srt.utils.network.get_zmq_socket"),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+            ) as mock_tokenizer,
+        ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
+            publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
 
     def test_full_workflow_single_string(self):

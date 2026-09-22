@@ -35,7 +35,12 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import get_device, is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+from sglang.test.test_utils import (
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+    calculate_rouge_l,
+    collect_process_tree_pids,
+    wait_for_gpu_release,
+)
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -235,12 +240,12 @@ class HFRunner:
         **kwargs,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.model.model.embed_tokens(input_ids)
+            inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.model.visual.get_dtype())
-                image_embeds = self.model.visual(
+                pixel_values = pixel_values.type(self.model.model.visual.get_dtype())
+                image_embeds = self.model.model.visual(
                     pixel_values, grid_thw=image_grid_thw
-                ).to(inputs_embeds.device)
+                ).pooler_output.to(inputs_embeds.device)
                 image_mask = input_ids == self.model.config.image_token_id
                 inputs_embeds[image_mask] = image_embeds
             if attention_mask is not None:
@@ -255,6 +260,7 @@ class HFRunner:
             return_dict=True,
             inputs_embeds=inputs_embeds,
             image_grid_thw=image_grid_thw,
+            **kwargs,
         )
 
         embeddings = outputs.hidden_states[-1][:, -1]
@@ -423,16 +429,27 @@ class HFRunner:
                         f"before producing output"
                     )
 
-    def terminate(self):
+    def _stop_model_proc(self):
+        # Fire-and-forget terminate() leaves the child holding the accelerator
+        # during teardown; a follow-on SRTRunner on the same device can then
+        # deadlock in driver init (observed on Intel XPU B580).
+        pid = self.model_proc.pid
         self.model_proc.terminate()
+        self.model_proc.join(timeout=30)
+        if self.model_proc.is_alive():
+            self.model_proc.kill()
+            self.model_proc.join()
         self.in_queue = self.out_queue = None
+        wait_for_gpu_release([pid])
+
+    def terminate(self):
+        self._stop_model_proc()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.model_proc.terminate()
-        self.in_queue = self.out_queue = None
+        self._stop_model_proc()
 
     @staticmethod
     def forward_generation_raw(
@@ -576,8 +593,7 @@ class SRTRunner:
         speculative_num_draft_tokens: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
-        torchao_config: Optional[str] = None,
-        cuda_graph_max_bs: int = 4,
+        cuda_graph_max_bs_decode: int = 4,
         sleep_on_idle=False,
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
@@ -587,6 +603,7 @@ class SRTRunner:
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
+        lora_drain_wait_threshold: float = 0.0,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -613,7 +630,6 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
-            torchao_config=torchao_config,
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,
@@ -633,7 +649,7 @@ class SRTRunner:
             dp_size=dp_size,
             tokenizer_path=tokenizer_path,
             disable_overlap_schedule=disable_overlap_schedule,
-            cuda_graph_max_bs=cuda_graph_max_bs,
+            cuda_graph_max_bs_decode=cuda_graph_max_bs_decode,
             disable_custom_all_reduce=disable_custom_all_reduce,
             sleep_on_idle=sleep_on_idle,
             max_lora_rank=max_lora_rank,
@@ -648,6 +664,7 @@ class SRTRunner:
             ),
             lora_eviction_policy=lora_eviction_policy,
             enable_deterministic_inference=enable_deterministic_inference,
+            lora_drain_wait_threshold=lora_drain_wait_threshold,
             **spec_kwargs,
         )
 
@@ -741,8 +758,13 @@ class SRTRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # Wait only on the pids this shutdown actually killed;
+        # a nested HFRunner or SRTRunner is deliberately still alive.
+        before = collect_process_tree_pids(os.getpid(), include_parent=False)
         self.engine.shutdown()
         del self.engine
+        alive = set(collect_process_tree_pids(os.getpid(), include_parent=False))
+        wait_for_gpu_release([pid for pid in before if pid not in alive])
 
     @staticmethod
     def forward_generation_raw(
@@ -925,9 +947,9 @@ def check_close_model_outputs(
     print(f"{srt_outputs.output_strs=}")
     rouge_l_scores = calculate_rouge_l(hf_outputs.output_strs, srt_outputs.output_strs)
     print(f"{rouge_l_scores=}")
-    assert all(
-        score >= rouge_l_tolerance for score in rouge_l_scores
-    ), f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    assert all(score >= rouge_l_tolerance for score in rouge_l_scores), (
+        f"Not all ROUGE-L scores are greater than rouge_l_tolerance={rouge_l_tolerance}"
+    )
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):

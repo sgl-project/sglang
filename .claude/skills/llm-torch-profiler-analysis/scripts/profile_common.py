@@ -5,10 +5,12 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import shutil
 import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -20,6 +22,7 @@ FRAMEWORK_LABELS = {
     "sglang": "SGLang",
     "vllm": "vLLM",
     "trtllm": "TensorRT-LLM",
+    "tokenspeed": "TokenSpeed",
 }
 TRACE_FILE_PATTERNS = (
     "*.trace.json",
@@ -42,6 +45,21 @@ TRACE_METADATA_NAMES = {
 }
 NON_KERNEL_TRACE_CATEGORIES = ("python_function", "cpu_op", "trace")
 PYTHON_SCOPE_NAME_PREFIXES = ("python/", "nn.module:")
+PROFILE_WORKLOAD_CHOICES = ("legacy", "prefill", "decode", "both")
+DEFAULT_PREFILL_INPUT_LEN = 4090
+DEFAULT_PREFILL_OUTPUT_LEN = 1
+DEFAULT_DECODE_INPUT_LEN = 1
+DEFAULT_DECODE_OUTPUT_LEN = 2048
+DEFAULT_WARMUP_STEPS = 10
+
+
+@dataclass(frozen=True)
+class ProbePlan:
+    prompt: str
+    capture_max_new_tokens: int
+    capture_requests: int
+    warmup_max_new_tokens: int
+    warmup_requests: int
 
 
 @lru_cache(maxsize=65536)
@@ -72,6 +90,9 @@ def canonicalize_framework(value: object) -> str:
         "trtllm": "trtllm",
         "tensorrt-llm": "trtllm",
         "tensorrtllm": "trtllm",
+        "tokenspeed": "tokenspeed",
+        "token-speed": "tokenspeed",
+        "ts": "tokenspeed",
     }
     return aliases.get(lowered, "auto")
 
@@ -88,6 +109,8 @@ def _normalize_repo_relative_path_cached(text: str) -> str:
         ("python/sglang/", "python/sglang/"),
         ("sgl_kernel/", "sgl_kernel/"),
         ("vllm/", "vllm/"),
+        ("python/tokenspeed/", "python/tokenspeed/"),
+        ("tokenspeed/", "tokenspeed/"),
         ("tensorrt_llm/", "tensorrt_llm/"),
         ("tensorrt-llm/", "tensorrt_llm/"),
     ):
@@ -295,6 +318,8 @@ def detect_framework_from_text(text: object) -> Optional[str]:
     lowered = normalize_text(text).lower()
     if not lowered:
         return None
+    if any(token in lowered for token in ("tokenspeed", "token-speed", "/ts/")):
+        return "tokenspeed"
     if any(
         token in lowered
         for token in (
@@ -316,6 +341,22 @@ def detect_framework_from_server_args(server_args: Optional[dict]) -> Optional[s
     if not isinstance(server_args, dict) or not server_args:
         return None
     lowered_keys = {normalize_text(key).lower() for key in server_args}
+    text = json.dumps(server_args, sort_keys=True)
+    if any(token in text.lower() for token in ("tokenspeed", "token-speed")):
+        return "tokenspeed"
+    if lowered_keys & {
+        "attn_tp_size",
+        "dense_tp_size",
+        "moe_tp_size",
+        "enable_mla_l1_5_cache",
+        "mla_chunk_multiplier",
+        "comm_fusion_max_num_tokens",
+        "enable_allreduce_fusion",
+    }:
+        return "tokenspeed"
+    text_hint = detect_framework_from_text(text)
+    if text_hint:
+        return text_hint
     if lowered_keys & {
         "attention_backend",
         "sampling_backend",
@@ -325,7 +366,7 @@ def detect_framework_from_server_args(server_args: Optional[dict]) -> Optional[s
         "schedule_policy",
     }:
         return "sglang"
-    return detect_framework_from_text(json.dumps(server_args, sort_keys=True))
+    return None
 
 
 def detect_framework_from_trace(trace: object) -> Optional[str]:
@@ -385,6 +426,9 @@ def detect_framework_from_url(
         or "decode" in server_info
     ):
         return "sglang"
+    readiness = try_get_json(url.rstrip("/") + "/readiness", timeout=5.0)
+    if readiness is not None:
+        return "tokenspeed"
     models = try_get_json(url.rstrip("/") + "/v1/models")
     if isinstance(models, dict) and isinstance(models.get("data"), list):
         return "vllm"
@@ -416,10 +460,16 @@ def resolve_framework(
 
 
 def parse_stage(path: Path) -> str:
-    name = path.name.lower()
-    if "-extend" in name or "-prefill" in name:
+    parts = [part.lower() for part in path.parts[-6:]]
+    name = " ".join(parts)
+    segment_path = "/" + "/".join(parts) + "/"
+    if any(marker in name for marker in ("-extend", "-prefill", "_extend", "_prefill")):
         return "extend"
-    if "-decode" in name:
+    if any(f"/{segment}/" in segment_path for segment in ("extend", "prefill")):
+        return "extend"
+    if any(marker in name for marker in ("-decode", "_decode")):
+        return "decode"
+    if "/decode/" in segment_path:
         return "decode"
     return "all"
 
@@ -514,8 +564,19 @@ def discover_trace_targets(
     if path.is_file():
         return [path], load_server_args(path)
 
-    trace_dir = newest_trace_dir(path)
-    traces = discover_trace_files(trace_dir, recursive=False)
+    direct_traces = discover_trace_files(path, recursive=False)
+    recursive_traces = discover_trace_files(path, recursive=True)
+    recursive_stages = {parse_stage(trace) for trace in recursive_traces}
+    if (
+        not direct_traces
+        and recursive_traces
+        and any(stage != "all" for stage in recursive_stages)
+    ):
+        traces = recursive_traces
+        trace_dir = path
+    else:
+        trace_dir = newest_trace_dir(path)
+        traces = discover_trace_files(trace_dir, recursive=False)
     if not traces:
         raise FileNotFoundError(f"No trace files found under {trace_dir}")
 
@@ -606,6 +667,109 @@ def send_probe_request(
         )
 
 
+def unique_probe_prompt(prompt: str, probe_index: int) -> str:
+    marker = f"profile_probe_{max(0, int(probe_index))}"
+    parts = prompt.split(maxsplit=1)
+    suffix = parts[1] if len(parts) == 2 else prompt
+    return f"{marker} {suffix}".strip()
+
+
+def send_probe_requests(
+    *,
+    url: str,
+    prompt: str,
+    max_new_tokens: int,
+    request_count: int,
+    framework: str,
+    model: Optional[str] = None,
+    sampling_seed_offset: int = 0,
+) -> None:
+    request_count = max(0, int(request_count))
+    seed_offset = max(0, int(sampling_seed_offset))
+    for request_idx in range(request_count):
+        probe_index = seed_offset + request_idx
+        send_probe_request(
+            url=url,
+            prompt=unique_probe_prompt(prompt, probe_index),
+            max_new_tokens=max_new_tokens,
+            sampling_seed=probe_index,
+            framework=framework,
+            model=model,
+        )
+
+
+def synthetic_prompt(input_len: int) -> str:
+    token_count = max(1, int(input_len))
+    return " ".join(["profile"] * token_count)
+
+
+def workload_probe(
+    stage: str,
+    *,
+    prefill_input_len: int,
+    prefill_output_len: int,
+    decode_input_len: int,
+    decode_output_len: int,
+) -> Tuple[str, int]:
+    if stage == "prefill":
+        return synthetic_prompt(prefill_input_len), max(1, int(prefill_output_len))
+    if stage == "decode":
+        return synthetic_prompt(decode_input_len), max(1, int(decode_output_len))
+    raise ValueError(f"unknown profile workload stage: {stage}")
+
+
+def build_probe_plan(
+    stage: str,
+    *,
+    prompt: str,
+    max_new_tokens: int,
+    num_steps: int,
+    probe_requests: int,
+    warmup_steps: int,
+) -> ProbePlan:
+    active_steps = max(1, int(num_steps))
+    requested_probes = max(1, int(probe_requests))
+    warmup_steps = max(0, int(warmup_steps))
+    max_new_tokens = max(1, int(max_new_tokens))
+
+    if stage == "prefill":
+        return ProbePlan(
+            prompt=prompt,
+            capture_max_new_tokens=max_new_tokens,
+            capture_requests=max(requested_probes, active_steps),
+            warmup_max_new_tokens=max_new_tokens,
+            warmup_requests=warmup_steps,
+        )
+    if stage == "decode":
+        return ProbePlan(
+            prompt=prompt,
+            capture_max_new_tokens=max_new_tokens,
+            capture_requests=requested_probes,
+            warmup_max_new_tokens=max(1, warmup_steps),
+            warmup_requests=1 if warmup_steps else 0,
+        )
+    return ProbePlan(
+        prompt=prompt,
+        capture_max_new_tokens=max_new_tokens,
+        capture_requests=requested_probes,
+        warmup_max_new_tokens=max_new_tokens,
+        warmup_requests=warmup_steps,
+    )
+
+
+def expand_profile_workload(profile_workload: str) -> List[str]:
+    workload = normalize_text(profile_workload).lower()
+    if workload not in PROFILE_WORKLOAD_CHOICES:
+        raise ValueError(
+            f"--profile-workload must be one of {', '.join(PROFILE_WORKLOAD_CHOICES)}"
+        )
+    if workload == "both":
+        return ["prefill", "decode"]
+    if workload == "legacy":
+        return ["legacy"]
+    return [workload]
+
+
 def discover_openai_model(url: str) -> str:
     payload = try_get_json(url.rstrip("/") + "/v1/models", timeout=60.0)
     if not isinstance(payload, dict):
@@ -657,9 +821,11 @@ def wait_for_profiler_artifact(path: Path, timeout_s: float = 60.0) -> Path:
     return path
 
 
-def start_remote_profiler(url: str, framework: str) -> None:
+def start_remote_profiler(
+    url: str, framework: str, payload: Optional[dict] = None
+) -> None:
     try:
-        post_json(url.rstrip("/") + "/start_profile", timeout=60.0)
+        post_json(url.rstrip("/") + "/start_profile", payload=payload, timeout=60.0)
     except Exception as exc:
         if framework == "vllm":
             raise RuntimeError(
@@ -671,9 +837,38 @@ def start_remote_profiler(url: str, framework: str) -> None:
             raise RuntimeError(
                 "TensorRT-LLM live torch profiling requires "
                 "a server build that exposes POST /start_profile plus the env vars "
-                "TLLM_PROFILE_START_STOP=1 and TLLM_TORCH_PROFILE_TRACE=/shared/path."
+                "TLLM_PROFILE_START_STOP=<start>-<stop> and "
+                "TLLM_TORCH_PROFILE_TRACE=/shared/path."
+            ) from exc
+        if framework == "tokenspeed":
+            raise RuntimeError(
+                "TokenSpeed live torch profiling requires a server build that "
+                "exposes POST /start_profile and POST /stop_profile. The helper "
+                "passes output_dir, activities, and profile_id in the start payload."
             ) from exc
         raise
+
+
+def build_remote_profiler_start_payload(
+    framework: str,
+    output_path: Path,
+    profile_prefix: Optional[str],
+    stage: Optional[str],
+) -> Optional[dict]:
+    if framework != "tokenspeed":
+        return None
+
+    profile_id = profile_prefix or "triage-trace"
+    if stage:
+        profile_id = f"{profile_id}-{stage}"
+
+    return {
+        "output_dir": str(output_path),
+        "activities": ["CPU", "GPU"],
+        "with_stack": True,
+        "record_shapes": False,
+        "profile_id": profile_id,
+    }
 
 
 def stop_remote_profiler(url: str, framework: str) -> None:
@@ -690,35 +885,60 @@ def run_remote_profiler(
     url: str,
     output_dir: Optional[str],
     framework: str,
-    probe_requests: int,
-    probe_prompt: str,
-    probe_max_new_tokens: Optional[int],
+    probe_plan: ProbePlan,
     probe_delay: float,
-    num_steps: int,
+    profile_prefix: Optional[str] = None,
+    stage: Optional[str] = None,
 ) -> Path:
     framework = canonicalize_framework(framework)
     output_path = ensure_remote_profiler_output_path(output_dir, framework)
-    start_remote_profiler(url, framework)
+    if stage and output_path.is_file():
+        raise ValueError(
+            "--profile-workload both requires a directory output path for "
+            f"{framework_display_name(framework)} so each stage trace can be labeled."
+        )
+    before_traces = (
+        set(discover_trace_files(output_path, recursive=True))
+        if output_path.exists()
+        else set()
+    )
+    model = (
+        discover_openai_model(url)
+        if framework in {"vllm", "trtllm", "tokenspeed"}
+        else None
+    )
+    if probe_plan.warmup_requests > 0:
+        send_probe_requests(
+            url=url,
+            prompt=probe_plan.prompt,
+            max_new_tokens=probe_plan.warmup_max_new_tokens,
+            request_count=probe_plan.warmup_requests,
+            framework=framework,
+            model=model,
+        )
+
+    start_payload = build_remote_profiler_start_payload(
+        framework=framework,
+        output_path=output_path,
+        profile_prefix=profile_prefix,
+        stage=stage,
+    )
+    start_remote_profiler(url, framework, payload=start_payload)
     stop_error: Optional[BaseException] = None
     try:
-        if probe_requests > 0:
-            # Some profiler endpoints need a brief setup window after
-            # POST /start_profile. A very short delay can send probes too early
-            # and miss the profiling window entirely.
+        if probe_plan.capture_requests > 0:
+            # Server-side profilers may do setup work after POST /start_profile.
+            # A very short delay can send probes too early and miss the window.
             time.sleep(max(5.0, probe_delay))
-            effective_max_new_tokens = probe_max_new_tokens or max(64, num_steps * 8)
-            model = (
-                discover_openai_model(url) if framework in {"vllm", "trtllm"} else None
+            send_probe_requests(
+                url=url,
+                prompt=probe_plan.prompt,
+                max_new_tokens=probe_plan.capture_max_new_tokens,
+                request_count=probe_plan.capture_requests,
+                framework=framework,
+                model=model,
+                sampling_seed_offset=probe_plan.warmup_requests,
             )
-            for request_idx in range(probe_requests):
-                send_probe_request(
-                    url=url,
-                    prompt=probe_prompt,
-                    max_new_tokens=effective_max_new_tokens,
-                    sampling_seed=request_idx,
-                    framework=framework,
-                    model=model,
-                )
     finally:
         try:
             stop_remote_profiler(url, framework)
@@ -726,7 +946,22 @@ def run_remote_profiler(
             stop_error = exc
     if stop_error is not None:
         raise stop_error
-    return wait_for_profiler_artifact(output_path)
+    artifact = wait_for_profiler_artifact(output_path)
+    if stage and output_path.is_dir():
+        after_traces = set(discover_trace_files(output_path, recursive=True))
+        new_traces = sorted(after_traces - before_traces, key=lambda item: item.name)
+        if new_traces:
+            stage_dir = output_path / stage
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            for trace in new_traces:
+                if stage_dir in trace.parents:
+                    continue
+                target = stage_dir / trace.name
+                if target.exists():
+                    target = stage_dir / f"{time.time_ns()}-{trace.name}"
+                shutil.move(str(trace), str(target))
+            return stage_dir
+    return artifact
 
 
 def run_sglang_profiler(
@@ -736,9 +971,7 @@ def run_sglang_profiler(
     profile_by_stage: bool,
     merge_profiles: bool,
     profile_prefix: Optional[str],
-    probe_requests: int,
-    probe_prompt: str,
-    probe_max_new_tokens: Optional[int],
+    probe_plan: ProbePlan,
     probe_delay: float,
     start_step: Optional[int] = None,
 ) -> Path:
@@ -765,6 +998,15 @@ def run_sglang_profiler(
     if start_step is not None:
         payload["start_step"] = str(start_step)
 
+    if probe_plan.warmup_requests > 0:
+        send_probe_requests(
+            url=url,
+            prompt=probe_plan.prompt,
+            max_new_tokens=probe_plan.warmup_max_new_tokens,
+            request_count=probe_plan.warmup_requests,
+            framework="sglang",
+        )
+
     req = request.Request(
         url.rstrip("/") + "/start_profile",
         data=json.dumps(payload).encode("utf-8"),
@@ -773,17 +1015,20 @@ def run_sglang_profiler(
     with request.urlopen(req, timeout=300.0):
         pass
 
-    if probe_requests > 0:
+    if probe_plan.capture_requests > 0:
         time.sleep(max(0.0, probe_delay))
-        effective_max_new_tokens = probe_max_new_tokens or max(64, num_steps * 8)
-        for request_idx in range(probe_requests):
-            send_probe_request(
-                url=url,
-                prompt=probe_prompt,
-                max_new_tokens=effective_max_new_tokens,
-                sampling_seed=request_idx,
-                framework="sglang",
-            )
+        send_probe_requests(
+            url=url,
+            prompt=probe_plan.prompt,
+            max_new_tokens=probe_plan.capture_max_new_tokens,
+            request_count=probe_plan.capture_requests,
+            framework="sglang",
+            sampling_seed_offset=probe_plan.warmup_requests,
+        )
+        try:
+            stop_remote_profiler(url, "sglang")
+        except RuntimeError:
+            pass
 
     return wait_for_profiler_artifact(output_path, timeout_s=180.0)
 
@@ -799,9 +1044,15 @@ def run_profiler(
     probe_prompt: str,
     probe_max_new_tokens: Optional[int],
     probe_delay: float,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
     start_step: Optional[int] = None,
     framework: str = "auto",
     framework_hint_path: Optional[str] = None,
+    profile_workload: str = "both",
+    prefill_input_len: int = DEFAULT_PREFILL_INPUT_LEN,
+    prefill_output_len: int = DEFAULT_PREFILL_OUTPUT_LEN,
+    decode_input_len: int = DEFAULT_DECODE_INPUT_LEN,
+    decode_output_len: int = DEFAULT_DECODE_OUTPUT_LEN,
 ) -> Path:
     resolved_framework = resolve_framework(
         framework,
@@ -813,6 +1064,58 @@ def run_profiler(
         ),
     )
     if resolved_framework == "sglang":
+        stages = expand_profile_workload(profile_workload)
+        if stages != ["legacy"]:
+            output_root = (
+                Path(output_dir).expanduser().resolve()
+                if output_dir
+                else Path(tempfile.mkdtemp(prefix="sglang-torch-profile-"))
+            )
+            output_root.mkdir(parents=True, exist_ok=True)
+            for stage in stages:
+                prompt, max_new_tokens = workload_probe(
+                    stage,
+                    prefill_input_len=prefill_input_len,
+                    prefill_output_len=prefill_output_len,
+                    decode_input_len=decode_input_len,
+                    decode_output_len=decode_output_len,
+                )
+                probe_plan = build_probe_plan(
+                    stage,
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    num_steps=num_steps,
+                    probe_requests=probe_requests,
+                    warmup_steps=warmup_steps,
+                )
+                # SGLang increments `forward_ct` before checking whether the
+                # profiler reached its target. Ask for one extra step so the
+                # requested stage forward is captured instead of stopping just
+                # before it runs.
+                stage_num_steps = max(1, int(num_steps)) + 1
+                run_sglang_profiler(
+                    url=url,
+                    output_dir=str(output_root / stage),
+                    num_steps=stage_num_steps,
+                    profile_by_stage=False,
+                    merge_profiles=merge_profiles,
+                    profile_prefix=(
+                        f"{profile_prefix}-{stage}" if profile_prefix else stage
+                    ),
+                    probe_plan=probe_plan,
+                    probe_delay=probe_delay,
+                    start_step=start_step,
+                )
+            return output_root
+        legacy_max_new_tokens = probe_max_new_tokens or max(64, num_steps * 8)
+        legacy_plan = build_probe_plan(
+            "legacy",
+            prompt=probe_prompt,
+            max_new_tokens=legacy_max_new_tokens,
+            num_steps=num_steps,
+            probe_requests=probe_requests,
+            warmup_steps=warmup_steps,
+        )
         return run_sglang_profiler(
             url=url,
             output_dir=output_dir,
@@ -820,9 +1123,7 @@ def run_profiler(
             profile_by_stage=profile_by_stage,
             merge_profiles=merge_profiles,
             profile_prefix=profile_prefix,
-            probe_requests=probe_requests,
-            probe_prompt=probe_prompt,
-            probe_max_new_tokens=probe_max_new_tokens,
+            probe_plan=legacy_plan,
             probe_delay=probe_delay,
             start_step=start_step,
         )
@@ -831,29 +1132,63 @@ def run_profiler(
     if profile_by_stage:
         raise ValueError(
             "--profile-by-stage is only supported for SGLang live capture. "
-            "Disable it when profiling vLLM or TensorRT-LLM."
+            "Disable it when profiling vLLM, TensorRT-LLM, or TokenSpeed."
         )
     if merge_profiles:
         raise ValueError(
             "--merge-profiles is only supported for SGLang live capture. "
-            "Disable it when profiling vLLM or TensorRT-LLM."
+            "Disable it when profiling vLLM, TensorRT-LLM, or TokenSpeed."
         )
-    if profile_prefix:
+    if profile_prefix and resolved_framework in {"vllm", "trtllm"}:
         print(
             f"Note: {framework_display_name(resolved_framework)} ignores "
             "--profile-prefix on the HTTP profiler control path.",
             file=sys.stderr,
         )
-    return run_remote_profiler(
-        url=url,
-        output_dir=output_dir,
-        framework=resolved_framework,
-        probe_requests=probe_requests,
-        probe_prompt=probe_prompt,
-        probe_max_new_tokens=probe_max_new_tokens,
-        probe_delay=probe_delay,
-        num_steps=num_steps,
-    )
+    stages = expand_profile_workload(profile_workload)
+    if stages == ["legacy"]:
+        legacy_max_new_tokens = probe_max_new_tokens or max(64, num_steps * 8)
+        return run_remote_profiler(
+            url=url,
+            output_dir=output_dir,
+            framework=resolved_framework,
+            probe_plan=build_probe_plan(
+                "legacy",
+                prompt=probe_prompt,
+                max_new_tokens=legacy_max_new_tokens,
+                num_steps=num_steps,
+                probe_requests=probe_requests,
+                warmup_steps=warmup_steps,
+            ),
+            probe_delay=probe_delay,
+            profile_prefix=profile_prefix,
+        )
+    output_root = ensure_remote_profiler_output_path(output_dir, resolved_framework)
+    for stage in stages:
+        prompt, max_new_tokens = workload_probe(
+            stage,
+            prefill_input_len=prefill_input_len,
+            prefill_output_len=prefill_output_len,
+            decode_input_len=decode_input_len,
+            decode_output_len=decode_output_len,
+        )
+        run_remote_profiler(
+            url=url,
+            output_dir=str(output_root),
+            framework=resolved_framework,
+            probe_plan=build_probe_plan(
+                stage,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                num_steps=num_steps,
+                probe_requests=probe_requests,
+                warmup_steps=warmup_steps,
+            ),
+            probe_delay=probe_delay,
+            profile_prefix=profile_prefix,
+            stage=stage,
+        )
+    return output_root
 
 
 def select_heaviest_pid(

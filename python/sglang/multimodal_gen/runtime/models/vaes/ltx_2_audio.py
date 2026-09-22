@@ -851,6 +851,19 @@ class AutoencoderKLLTX2Audio(ParallelTiledVAE):
         # TODO: confirm whether the mel compression ratio below is correct
         self.mel_compression_ratio = LATENT_DOWNSAMPLE_FACTOR
         self.use_slicing = False
+        # stage containers are not called directly, so hooks attach to called lists
+        self.layer_names = [
+            layer_name
+            for prefix, num_resolutions in (
+                ("encoder.down", self.encoder.num_resolutions),
+                ("decoder.up", self.decoder.num_resolutions),
+            )
+            for level in range(num_resolutions)
+            for layer_name in (
+                f"{prefix}.{level}.block",
+                f"{prefix}.{level}.attn",
+            )
+        ]
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)

@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_text
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -35,8 +38,9 @@ class MOVAPipelineConfig(PipelineConfig):
 
     # Video VAE (Wan) + Audio VAE (DAC)
     vae_config: WanVAEConfig = field(default_factory=WanVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: DacVAEConfig = field(default_factory=DacVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     # Text encoder (UMT5 compatible)
     text_encoder_configs: tuple = field(default_factory=lambda: (T5Config(),))
@@ -51,6 +55,13 @@ class MOVAPipelineConfig(PipelineConfig):
     # temporal alignment: MOVA expects (num_frames - 1) % 4 == 0
     time_division_factor: int = 4
     time_division_remainder: int = 1
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            keep_resident_min_available_gb=130,
+            keep_resident_components=("dit", "vae"),
+        )
 
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int
@@ -101,7 +112,7 @@ class MOVAPipelineConfig(PipelineConfig):
         )
         return image
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         if num_frames is None:
             return num_frames
         if num_frames % self.time_division_factor != self.time_division_remainder:
@@ -111,12 +122,13 @@ class MOVAPipelineConfig(PipelineConfig):
                 * self.time_division_factor
                 + self.time_division_remainder
             )
-            logger.warning(
-                "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
-                "Rounding to %s.",
-                num_frames,
-                adjusted,
-            )
+            if log_adjustment:
+                logger.warning(
+                    "`num_frames` (%s) is not compatible with MOVA temporal constraints. "
+                    "Rounding to %s.",
+                    num_frames,
+                    adjusted,
+                )
             return adjusted
         return num_frames
 

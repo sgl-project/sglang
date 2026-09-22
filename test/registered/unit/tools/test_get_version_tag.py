@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
-VERSION_HELPER_PATH = REPO_ROOT / "python" / "tools" / "get_version_tag.py"
+VERSION_HELPER_PATH = REPO_ROOT / "scripts" / "release" / "get_version_tag.py"
 PYPROJECT_PATHS = [
     REPO_ROOT / "python" / "pyproject.toml",
     REPO_ROOT / "python" / "pyproject_cpu.toml",
@@ -16,10 +16,10 @@ PYPROJECT_PATHS = [
     REPO_ROOT / "3rdparty" / "amd" / "wheel" / "sglang" / "pyproject.toml",
 ]
 DESCRIBE_COMMAND = (
-    'git_describe_command = ["python3", "python/tools/get_version_tag.py"]'
+    'git_describe_command = ["python3", "scripts/release/get_version_tag.py"]'
 )
 TAG_ONLY_DESCRIBE_COMMAND = (
-    'git_describe_command = ["python3", "python/tools/get_version_tag.py", '
+    'git_describe_command = ["python3", "scripts/release/get_version_tag.py", '
     '"--tag-only"]'
 )
 FALLBACK_VERSION = 'fallback_version = "0.0.0.dev0"'
@@ -33,7 +33,7 @@ def _load_module(name, path):
 
 
 register_cpu_ci = _load_module("ci_register", CI_REGISTER_PATH).register_cpu_ci
-register_cpu_ci(est_time=0, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=0, suite="base-a-test-cpu")
 
 
 class TestGetVersionTag(unittest.TestCase):
@@ -50,11 +50,14 @@ class TestGetVersionTag(unittest.TestCase):
         )
 
     def test_exact_version_tag_takes_precedence_over_latest_tag(self):
-        with patch.object(
-            self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag_describe"
-        ) as latest_describe:
+        with (
+            patch.object(
+                self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
+            ),
+            patch.object(
+                self.version_helper, "get_latest_version_tag_describe"
+            ) as latest_describe,
+        ):
             self.assertEqual(self.version_helper.get_version_describe(), "v0.5.9")
 
         latest_describe.assert_not_called()
@@ -68,15 +71,16 @@ class TestGetVersionTag(unittest.TestCase):
                 self.assertIn(FALLBACK_VERSION, content)
 
     def test_tag_only_cli_mode_remains_available_for_callers_that_need_latest_tag(self):
-        with patch.object(
-            sys, "argv", ["get_version_tag.py", "--tag-only"]
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
-        ), patch.object(
-            self.version_helper, "get_version_describe"
-        ) as version_describe, patch(
-            "builtins.print"
-        ) as print_mock:
+        with (
+            patch.object(sys, "argv", ["get_version_tag.py", "--tag-only"]),
+            patch.object(
+                self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
+            ),
+            patch.object(
+                self.version_helper, "get_version_describe"
+            ) as version_describe,
+            patch("builtins.print") as print_mock,
+        ):
             self.version_helper.main()
 
         version_describe.assert_not_called()

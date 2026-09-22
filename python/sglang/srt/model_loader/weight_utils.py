@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
@@ -11,10 +13,12 @@ import itertools
 import json
 import logging
 import os
+import re
+import struct
 import tempfile
-from collections import defaultdict
+import threading
+from pathlib import Path
 from typing import (
-    Any,
     Callable,
     Dict,
     Generator,
@@ -35,27 +39,30 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_world_group,
+from sglang.srt.configs.model_config import (
+    REQUANTIZATION_METHODS,
+    ModelConfig,
+    is_qwen3_5_mtp_draft,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
     is_cpu,
+    is_hip,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -64,13 +71,72 @@ from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError as e:
+except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
 
+RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
+
+# Matches routed-expert weight keys in both HF-style layouts
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
+# excluded because the index segment requires a digit after ``.experts.``.
+_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
+
+
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
+_PREFETCH_STOP_TIMEOUT_SECONDS = 60.0
+CAPTURE_SAFE_WEIGHT_SENTINEL = 1e-3
 
 
 def _get_prefetch_block_size() -> int:
@@ -103,57 +169,6 @@ def get_lock(
     return lock
 
 
-def _shared_pointers(tensors):
-    ptrs = defaultdict(list)
-    for k, v in tensors.items():
-        ptrs[v.data_ptr()].append(k)
-    failing = []
-    for _, names in ptrs.items():
-        if len(names) > 1:
-            failing.append(names)
-    return failing
-
-
-def convert_bin_to_safetensor_file(
-    pt_filename: str,
-    sf_filename: str,
-) -> None:
-    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
-    if "state_dict" in loaded:
-        loaded = loaded["state_dict"]
-    shared = _shared_pointers(loaded)
-    for shared_weights in shared:
-        for name in shared_weights[1:]:
-            loaded.pop(name)
-
-    # For tensors to be contiguous
-    loaded = {k: v.contiguous() for k, v in loaded.items()}
-
-    dirname = os.path.dirname(sf_filename)
-    os.makedirs(dirname, exist_ok=True)
-
-    from safetensors.torch import save_file
-
-    save_file(loaded, sf_filename, metadata={"format": "pt"})
-
-    # check file size
-    sf_size = os.stat(sf_filename).st_size
-    pt_size = os.stat(pt_filename).st_size
-    if (sf_size - pt_size) / pt_size > 0.01:
-        raise RuntimeError(f"""The file size different is more than 1%:
-         - {sf_filename}: {sf_size}
-         - {pt_filename}: {pt_size}
-         """)
-
-    # check if the tensors are the same
-    reloaded = safetensors.torch.load_file(sf_filename)
-    for k in loaded:
-        pt_tensor = loaded[k]
-        sf_tensor = reloaded[k]
-        if not torch.equal(pt_tensor, sf_tensor):
-            raise RuntimeError(f"The output tensors do not match for key {k}")
-
-
 def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
     for prefix, new_prefix in prefix_mapping.items():
         if key.startswith(prefix):
@@ -174,6 +189,75 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def _resolve_explicit_draft_quant_config(
+    model_config: ModelConfig,
+    quant_config: QuantizationConfig,
+) -> QuantizationConfig:
+    if not (
+        model_config.is_draft_model and model_config.is_draft_quantization_explicit
+    ):
+        return quant_config
+
+    if model_config.quantization == "modelopt_fp4" and (
+        isinstance(quant_config, ModelOptFp4Config)
+        and quant_config.is_checkpoint_nvfp4_serialized
+        and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
+    ):
+        return ModelOptFp4Config.for_online_weight_quantization(
+            quant_config.packed_modules_mapping
+        )
+
+    return quant_config
+
+
+def _quark_draft_online_quant_config(
+    model_config: ModelConfig, hf_quant_config: dict
+) -> Optional[QuantizationConfig]:
+    """Explicit ``--speculative-draft-model-quantization quark_mxfp4`` on a Quark
+    checkpoint whose MTP/NextN draft experts were exported in bf16 (listed under
+    ``exclude``): quantize the draft's routed experts online to MXFP4 instead of
+    running them through the bf16 MoE path. Only the draft model is affected; the
+    target model keeps its serialized Quark scheme."""
+    if not (
+        model_config.is_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "quark_mxfp4"
+        and hf_quant_config.get("quant_method") == "quark"
+        # ROCm + Qwen3.5 MTP draft only (validated combination); anything else is
+        # left exactly as before.
+        and is_hip()
+        and is_qwen3_5_mtp_draft(model_config.hf_config)
+    ):
+        return None
+    excluded = hf_quant_config.get("exclude") or []
+    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+        return None
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    logger.info(
+        "Draft MTP experts are unquantized in the Quark checkpoint; "
+        "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
+    )
+    return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
+def _modelopt_quant_section(config: dict) -> dict:
+    """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
+
+    Nested LLM format::
+
+        {"quantization": {"quant_algo": "FP8", "exclude_modules": [...]}}
+
+    Flat format (``config.json`` ``quantization_config`` / Cosmos3-style exports)::
+
+        {"quant_algo": "FP8", "ignore": [...], "quant_method": "modelopt", ...}
+    """
+    quantization = config.get("quantization")
+    if isinstance(quantization, dict):
+        return quantization
+    return config
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -187,20 +271,38 @@ def get_quant_config(
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
 
-    # Read the quantization config from the HF model config, if available.
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
-    # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
-    if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
-    if hf_quant_config is not None:
-        if not isinstance(hf_quant_config, dict):
-            hf_quant_config = hf_quant_config.to_dict()
-        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(hf_quant_config)
+    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if checkpoint_quant_spec is not None:
+        hf_quant_config = checkpoint_quant_spec.config
+        # For modelopt_mixed, config.json's quantization_config may not
+        # contain all runtime metadata. Fall through to the file-based
+        # hf_quant_config.json path when the per-layer map or KV-cache
+        # quantization metadata is missing.
+        modelopt_mixed_config_incomplete = (
+            model_config.quantization == "modelopt_mixed"
+            and (
+                "quantized_layers" not in hf_quant_config
+                or (
+                    "kv_cache_quant_algo" not in hf_quant_config
+                    and "kv_cache_scheme" not in hf_quant_config
+                )
+            )
+        )
+        if not modelopt_mixed_config_incomplete:
+            hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+            hf_quant_config["hf_config"] = model_config.hf_config
+
+            # This is only used by quantization methods that support requantization (e.g. from nvfp4/fp8 to mxfp4).
+            if model_config.quantization in REQUANTIZATION_METHODS:
+                hf_quant_config["requantization_method"] = model_config.quantization
+            draft_online = _quark_draft_online_quant_config(
+                model_config, hf_quant_config
+            )
+            if draft_online is not None:
+                return draft_online
+            return _resolve_explicit_draft_quant_config(
+                model_config, quant_cls.from_config(hf_quant_config)
+            )
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -233,9 +335,36 @@ def get_quant_config(
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
+    # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
-            return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+            if not issubclass(quant_cls, Fp8Config):
+                quant_cls = Fp8Config
+            return quant_cls(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "quark_mxfp4":
+            # Some ModelOpt NVFP4 checkpoints store quant metadata only in
+            # hf_quant_config.json; others duplicate it in config.json. Read
+            # hf_quant_config.json first when present and FP4-typed.
+            modelopt_quant_path = os.path.join(hf_folder, "hf_quant_config.json")
+            if os.path.isfile(modelopt_quant_path):
+                with open(modelopt_quant_path) as f:
+                    raw_quant_config = json.load(f)
+                source_quant = raw_quant_config.get("quantization", raw_quant_config)
+                if "FP4" in (source_quant.get("quant_algo") or "").upper():
+                    flat_quant_config = dict(source_quant)
+                    flat_quant_config["quant_method"] = (
+                        raw_quant_config.get("producer", {}).get("name") or "modelopt"
+                    )
+                    flat_quant_config["requantization_method"] = (
+                        model_config.quantization
+                    )
+                    flat_quant_config["packed_modules_mapping"] = packed_modules_mapping
+                    flat_quant_config["hf_config"] = model_config.hf_config
+                    return quant_cls.from_config(flat_quant_config)
+            return quant_cls(
+                online_scheme=model_config.quantization,
+                hf_config=model_config.hf_config,
+            )
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
@@ -244,6 +373,12 @@ def get_quant_config(
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
+        if model_config.quantization == "modelopt_fp4":
+            # Without serialized metadata, quantize MoE expert weights online;
+            # leave dense layers in source precision.
+            if not issubclass(quant_cls, ModelOptFp4Config):
+                quant_cls = ModelOptFp4Config
+            return quant_cls.for_online_weight_quantization(packed_modules_mapping)
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
@@ -254,12 +389,17 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        quant_section = _modelopt_quant_section(config)
         if remap_prefix is not None:
-            exclude_modules = [
-                replace_prefix(key, remap_prefix)
-                for key in config["quantization"]["exclude_modules"]
-            ]
-            config["quantization"]["exclude_modules"] = exclude_modules
+            # Nested configs use ``exclude_modules``; flat ModelOpt exports use ``ignore``.
+            exclude_key = (
+                "exclude_modules" if "exclude_modules" in quant_section else "ignore"
+            )
+            if exclude_key in quant_section:
+                quant_section[exclude_key] = [
+                    replace_prefix(key, remap_prefix)
+                    for key in quant_section[exclude_key]
+                ]
         config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
@@ -267,7 +407,7 @@ def get_quant_config(
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
-            quant_algo = config["quantization"]["quant_algo"]
+            quant_algo = quant_section.get("quant_algo")
             if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
                 if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
@@ -277,21 +417,33 @@ def get_quant_config(
                     )
                 return None
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
-                return ModelOptFp8Config.from_config(config)
+                if not issubclass(quant_cls, ModelOptFp8Config):
+                    quant_cls = ModelOptFp8Config
+                return quant_cls.from_config(config)
             elif "FP4" in quant_algo:
-                return ModelOptFp4Config.from_config(config)
-        return quant_cls.from_config(config)
+                if not issubclass(quant_cls, ModelOptFp4Config):
+                    quant_cls = ModelOptFp4Config
+                return _resolve_explicit_draft_quant_config(
+                    model_config, quant_cls.from_config(config)
+                )
+        return _resolve_explicit_draft_quant_config(
+            model_config, quant_cls.from_config(config)
+        )
 
 
-def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+def _check_index_files_exist(
+    snapshot_dir: str, allow_patterns: Optional[List[str]] = None
+) -> Tuple[bool, Optional[str]]:
     """
-    Check if all files listed in safetensors index files actually exist on disk.
+    Check if files listed in safetensors index files actually exist on disk.
 
     This catches cases where the snapshot directory exists but files are missing
-    (e.g., due to incomplete downloads or corrupted cache).
+    (e.g., due to incomplete downloads or corrupted cache). If allow_patterns is
+    provided, only indexed files matching those patterns are validated.
 
     Args:
         snapshot_dir: Path to the model snapshot directory
+        allow_patterns: Optional source patterns to scope validation.
 
     Returns:
         Tuple of (all_exist, error_message)
@@ -313,6 +465,15 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
             if not weight_map:
                 continue
             required_files = set(weight_map.values())
+            if allow_patterns is not None:
+                required_files = {
+                    fn
+                    for fn in required_files
+                    if any(
+                        fnmatch.fnmatch(fn.replace(os.sep, "/"), pattern)
+                        for pattern in allow_patterns
+                    )
+                }
             missing_files = [
                 fn
                 for fn in required_files
@@ -415,7 +576,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check for missing files from index (lightweight, for all users)
     # This catches incomplete downloads before they cause cryptic load errors
     if local_weight_files:
-        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        is_complete, error_msg = _check_index_files_exist(
+            found_local_snapshot_dir, allow_patterns
+        )
         if not is_complete:
             log_info_on_rank0(
                 logger,
@@ -575,7 +738,10 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    allow_patterns: Optional[List[str]] = None,
 ) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -598,6 +764,28 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # Fail fast if the index references shard files that are not on disk (e.g. an
+    # incomplete or interrupted download). For subfolder-scoped loads, only
+    # validate the indexed shards that match the requested source patterns.
+    if allow_patterns is None:
+        files_to_validate = weight_files_in_index
+    else:
+        files_to_validate = set()
+        for f in weight_files_in_index:
+            rel_path = os.path.relpath(f, hf_folder).replace(os.sep, "/")
+            if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
+                files_to_validate.add(f)
+
+    if "://" in hf_folder:
+        missing_files = sorted(files_to_validate.difference(hf_weights_files))
+    else:
+        missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
+    if missing_files:
+        raise RuntimeError(
+            f"{index_file} references {len(missing_files)} shard file(s) missing "
+            f"from {hf_folder} (incomplete download?): "
+            f"{[os.path.basename(f) for f in missing_files]}"
+        )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
@@ -624,14 +812,29 @@ def maybe_add_mtp_safetensors(
         getattr(hf_config, "num_nextn_predict_layers", 0),
     )
     if not (
-        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        arch
+        in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeForCausalLMNextN",
+            "Glm4MoeLiteForCausalLM",
+            "Glm4MoeLiteForCausalLMNextN",
+        ]
         and num_nextn_layers > 0
     ):
         return hf_weights_files
 
     # Check if mtp.safetensors exists and is not already in the file list
     mtp_path = os.path.join(hf_folder, "mtp.safetensors")
-    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+    if mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+    if is_runai_obj_uri(hf_folder):
+        mtp_exists = mtp_path in list_safetensors(hf_folder)
+    else:
+        mtp_exists = os.path.isfile(mtp_path)
+    if not mtp_exists:
         return hf_weights_files
 
     # mtp.safetensors exists but not in index - this is a bug
@@ -713,21 +916,72 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def _prefetch_checkpoint_file(file_path: str) -> None:
+def _prefetch_checkpoint_file(
+    file_path: str,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
     Reads the file sequentially in 16 MB blocks so the kernel caches its pages
     before workers load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while f.read(_get_prefetch_block_size()):
-            pass
+        while cancel_event is None or not cancel_event.is_set():
+            if not f.read(_get_prefetch_block_size()):
+                break
+
+
+class CheckpointFilePrefetchHandle:
+    """Lifecycle handle for background checkpoint page-cache prefetching."""
+
+    def __init__(
+        self,
+        *,
+        thread: threading.Thread,
+        cancel_event: threading.Event,
+        succeeded_event: threading.Event,
+        errors: List[Tuple[str, Exception]],
+    ) -> None:
+        self._thread = thread
+        self._cancel_event = cancel_event
+        self._succeeded_event = succeeded_event
+        self._errors = errors
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+    def cancel(self) -> None:
+        """Stop scheduling shards and interrupt reads at the next block."""
+        self._cancel_event.set()
+
+    def stop(self, timeout: Optional[float] = _PREFETCH_STOP_TIMEOUT_SECONDS) -> None:
+        """Cancel prefetching and wait for the background worker to finish."""
+        self.cancel()
+        self.wait(timeout)
+
+    @property
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    @property
+    def failed(self) -> bool:
+        return bool(self._errors) or (self.done and not self._succeeded_event.is_set())
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    @property
+    def errors(self) -> Tuple[Tuple[str, Exception], ...]:
+        return tuple(self._errors)
 
 
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
-) -> None:
+) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
     When multiple ranks on the same node load the same checkpoint (e.g.
@@ -743,25 +997,29 @@ def _prefetch_all_checkpoints(
     naturally adapts to any RAM size — even if the full checkpoint does
     not fit in page cache, the prefetch thread stays ahead of the loader.
     """
-    import asyncio
-    import threading
     import time
+
+    if num_threads < 1:
+        raise ValueError("weight loader prefetch num_threads must be >= 1")
 
     # Use node-local rank so that each node independently prefetches the
     # full checkpoint into its own page cache. Global rank would split files
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
+        local_world_size = world_group.local_size or get_parallel().launch_world_size
     else:
         local_rank = 0
         local_world_size = 1
 
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
+    cancel_event = threading.Event()
+    succeeded_event = threading.Event()
+    errors: List[Tuple[str, Exception]] = []
 
-    logger.info(
+    logger.debug(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
         "(background, %d local ranks sharing the work, %d threads per rank)...",
         local_rank,
@@ -771,49 +1029,101 @@ def _prefetch_all_checkpoints(
         num_threads,
     )
 
-    async def _prefetch_all() -> None:
-        semaphore = asyncio.Semaphore(num_threads)
+    def _prefetch_all() -> None:
         completed = 0
         next_log_pct = 10
 
-        async def prefetch_one(path: str) -> None:
+        def record_complete() -> None:
             nonlocal completed, next_log_pct
-            try:
-                async with semaphore:
-                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
-                completed += 1
-                if total_for_rank > 0 and next_log_pct <= 100:
-                    pct = 100 * completed / total_for_rank
-                    if pct >= next_log_pct:
-                        logger.info(
-                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
-                            local_rank,
-                            next_log_pct,
-                            completed,
-                            total_for_rank,
-                        )
-                        next_log_pct += 10
-            except Exception:
-                logger.warning(
-                    "Failed to prefetch checkpoint file %r.",
-                    path,
-                    exc_info=True,
-                )
 
-        await asyncio.gather(*(prefetch_one(p) for p in my_files))
+            completed += 1
+            if total_for_rank > 0 and next_log_pct <= 100:
+                pct = 100 * completed / total_for_rank
+                while pct >= next_log_pct and next_log_pct <= 100:
+                    logger.debug(
+                        "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                        local_rank,
+                        next_log_pct,
+                        completed,
+                        total_for_rank,
+                    )
+                    next_log_pct += 10
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            file_iter = iter(my_files)
+            pending: Dict[concurrent.futures.Future, str] = {}
+
+            for path in itertools.islice(file_iter, num_threads):
+                if cancel_event.is_set():
+                    break
+                pending[
+                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
+                ] = path
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    path = pending.pop(future)
+                    exc = future.exception()
+                    if exc is not None:
+                        errors.append((path, exc))
+                        logger.warning(
+                            "Failed to prefetch checkpoint file %r: %s",
+                            path,
+                            exc,
+                        )
+                    record_complete()
+
+                    next_path = None if cancel_event.is_set() else next(file_iter, None)
+                    if next_path is not None:
+                        pending[
+                            executor.submit(
+                                _prefetch_checkpoint_file,
+                                next_path,
+                                cancel_event,
+                            )
+                        ] = next_path
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
-        asyncio.run(_prefetch_all())
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "Rank %d: prefetching checkpoint files into page cache "
-            "finished in %.2fs",
+        _prefetch_all()
+        succeeded_event.set()
+        logger.debug(
+            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
             local_rank,
-            elapsed,
+            time.perf_counter() - start,
         )
 
-    threading.Thread(target=_run_prefetch, daemon=True).start()
+    thread = threading.Thread(target=_run_prefetch, daemon=True)
+    handle = CheckpointFilePrefetchHandle(
+        thread=thread,
+        cancel_event=cancel_event,
+        succeeded_event=succeeded_event,
+        errors=errors,
+    )
+    thread.start()
+    return handle
+
+
+def _drop_file_cache_after_load(path: str) -> None:
+    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError as e:
+        logger.debug("Failed to drop file cache for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def safetensors_weights_iterator(
@@ -821,19 +1131,20 @@ def safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    sorted_files = sorted(hf_weights_files)
-
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
 
     for st_file in tqdm(
-        sorted_files,
+        hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -848,10 +1159,14 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+        if drop_cache_after_load:
+            _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    enable_gds: bool = True,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -889,56 +1204,20 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
-            try:
-                keys = list(fb.key_to_rank_lidx.keys())
-                for k in keys:
-                    t = fb.get_tensor(k)
-                    yield k, t
-            finally:
-                pass
+            keys = list(fb.key_to_rank_lidx.keys())
+            for k in keys:
+                t = fb.get_tensor(k)
+                yield k, t
         finally:
             loader.close()
-
-
-def multi_thread_safetensors_weights_iterator(
-    hf_weights_files: List[str],
-    max_workers: int,
-    disable_mmap: bool = False,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files."""
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-
-    def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                return safetensors.torch.load(f.read())
-        return safetensors.torch.load_file(st_file, device="cpu")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
-
-        if enable_tqdm:
-            futures_iter = tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(hf_weights_files),
-                desc="Multi-thread loading shards",
-                disable=not enable_tqdm,
-                bar_format=BAR_FORMAT,
-            )
-        else:
-            futures_iter = concurrent.futures.as_completed(futures)
-
-        for future in futures_iter:
-            state_dict = future.result()
-            for name, param in state_dict.items():
-                yield name, param
+        if drop_cache_after_load:
+            for loaded_file in rank_file_map.get(rank, []):
+                _drop_file_cache_after_load(loaded_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -947,6 +1226,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -954,9 +1234,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
-    sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -974,12 +1255,12 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(sorted_files)
+        file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.
         for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append(executor.submit(_load_file, st_file))
+            pending.append((st_file, executor.submit(_load_file, st_file)))
 
         with tqdm(
             total=len(hf_weights_files),
@@ -989,18 +1270,22 @@ def buffered_multi_thread_safetensors_weights_iterator(
             position=tqdm._get_free_pos(),
         ) as pbar:
             while pending:
-                future = pending.popleft()
+                st_file, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish: submit the next file to keep the buffer full.
                 next_file = next(file_iter, None)
                 if next_file is not None:
-                    pending.append(executor.submit(_load_file, next_file))
+                    pending.append((next_file, executor.submit(_load_file, next_file)))
 
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
                 del state_dict
+                if drop_cache_after_load:
+                    # DONTNEED reduces page-cache pressure after copying weights,
+                    # but later mmap-backed tensor access may fault pages again.
+                    _drop_file_cache_after_load(st_file)
                 pbar.update(1)
 
 
@@ -1183,65 +1468,36 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
-def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
-    """convert PySafeSlice object from safetensors to torch.Tensor
-
-    PySafeSlice object supports indexing, which is done before loading the
-    actual tensor and can reduce the amount of memory being read into the
-    memory. However, it does not support more advanced functionalities
-    like `.view()` or `.t()`. Therefore, if we need to modify the loaded
-    tensor with these more complicated operators, we need to convert to
-    tensor first.
-    """
-    if not isinstance(x, torch.Tensor):
-        x = x[:]
-    return x
-
-
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
-
-
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """Load weights that are row-parallelized."""
-    tp_rank = get_tensor_model_parallel_rank()
-    shard_dim = 0 if param.dim() != 1 else None
-
-    if shard_dim is not None:
-        shard_size = param.data.shape[shard_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-
-    return default_weight_loader(param, loaded_weight)
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        assert param.size() == loaded_weight.size(), (
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
+        param.data.copy_(loaded_weight)
 
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_attention_tp_rank()
+        tp_rank = (
+            tp_rank_getter()
+            if tp_rank_getter is not None
+            else get_parallel().attn_tp_rank
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -1249,9 +1505,8 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
-                or loaded_weight.size(0)
-                < get_tensor_model_parallel_world_size() * shard_size
+                loaded_weight.size(0) % get_parallel().tp_size != 0
+                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):
@@ -1297,7 +1552,6 @@ def runai_safetensors_weights_iterator(
     device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-
         streamer.stream_files(
             hf_weights_files,
             device=device,
@@ -1317,7 +1571,9 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        for name, tensor in tensor_iter:
+            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
@@ -1344,6 +1600,21 @@ def set_runai_streamer_env(load_config: LoadConfig):
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
 
+@torch.no_grad()
+def initialize_capture_safe_weights(
+    model: torch.nn.Module,
+    value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
+) -> None:
+    """Fill floating-point parameters with finite values for graph warmup.
+
+    Persistent buffers are intentionally left intact: unlike parameters, they
+    are not guaranteed to be replaced by ``model.load_weights()``.
+    """
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            param.fill_(value)
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -1362,11 +1633,17 @@ def initialize_dummy_weights(
     is fixed, the random values generated by this function only depends on
     the parameter's number of elements and its data type.
     """
-    for param in model.state_dict().values():
+    for name, param in model.state_dict().items():
         if torch.is_floating_point(param):
+            if name.endswith("weight_scale_inv"):
+                param.fill_(1.0)
+                continue
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
-            if torch.finfo(param.data.dtype).bits < 16:
+            # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw
+            # storage dtype through `.data`, but their wrapper `uniform_` also
+            # updates side tensors such as block scales.
+            if torch.finfo(param.dtype).bits < 16:
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
                 dtype = param.data.dtype
                 tmp_param = param.data.to(torch.float16)
@@ -1491,9 +1768,9 @@ class KVCacheQuantSchema(BaseModel):
                     f"{len(layer_maps)}."
                 )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                assert i in self.scaling_factor, (
+                    f"KV cache scales map for TP rank {i} not found."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1641,9 +1918,9 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             int(output_size / total_output_size * raw_output_size)
             for output_size in output_sizes
         ]
-        assert (
-            sum(weight_split_size) == raw_output_size
-        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        assert sum(weight_split_size) == raw_output_size, (
+            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+        )
 
         split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
         for i, output_size in enumerate(output_sizes):

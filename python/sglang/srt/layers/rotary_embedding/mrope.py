@@ -7,29 +7,45 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.layers.rotary_embedding.triton_kernels import (
+from sglang.kernels.ops.attention.rotary_triton import (
     triton_ernie45_rope_fused_inplace,
     triton_mrope_fused,
 )
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
+from sglang.srt.runtime_context import attention_backends
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    support_triton,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
+
+if _is_xpu:
+    try:
+        from sgl_kernel import multimodal_rotary_embedding
+    except ImportError:
+        multimodal_rotary_embedding = None
+
+from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -88,39 +104,41 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-        # MRoPE axis_map interleaving pattern depends on mrope_section sizes.
-        # The algorithm cycles through axes [0(T), 1(H), 2(W)] round-robin,
-        # skipping any axis that has exhausted its allocated pairs.
-        #
-        # For GLM-V (mrope_section=[8,12,12]):
-        #   T(8) < H(12) = W(12), so T exhausts first at pair 24.
-        #   Result: [0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 1,1,2, 1,1,2, 2,2]
-        #   After T runs out, only H and W fill the remaining slots.
-        #
-        # For Qwen3-VL (mrope_section=[24,20,20]):
-        #   T(24) > H(20) = W(20), so H and W exhaust first near the tail.
-        #   Result: [0,1,2, 0,1,2, ...repeated evenly..., 0,1, 0,1, 0,0]
-        #   After H/W run out, T fills the remaining slots.
-
-        if self.mrope_interleaved_glm:
-            num_pairs = rotary_dim // 2
-            axis_map = torch.empty(num_pairs, dtype=torch.long)
-            assert sum(self.mrope_section) == num_pairs
-            counts = [0, 0, 0]
-            current_ax = 0
-
-            for i in range(num_pairs):
-                current_ax = i % 3
-                while counts[current_ax] >= self.mrope_section[current_ax]:
-                    current_ax = (current_ax + 1) % 3
-
-                axis_map[i] = current_ax
-                counts[current_ax] += 1
-            self.register_buffer("axis_map", axis_map, persistent=False)
-        else:
-            self.axis_map = None
-        if get_global_server_args().rl_on_policy_target is not None:
+        self.register_buffer("axis_map", self._build_axis_map(), persistent=False)
+        if self._force_native:
             self._forward_method = self.forward_native
+
+    def _build_axis_map(self) -> Optional[torch.Tensor]:
+        """Which of the temporal, height and width axes owns each rotary lane."""
+        if not self.mrope_section:
+            return None
+        section = self.mrope_section
+        num_pairs = self.rotary_dim // 2
+        assert len(section) == 3 and sum(section) == num_pairs, (
+            f"mrope_section {section} must be three axes summing to {num_pairs}"
+        )
+        if self.mrope_interleaved_glm:
+            axes = []
+            spent = [0, 0, 0]
+            for lane in range(num_pairs):
+                axis = lane % 3
+                while spent[axis] >= section[axis]:
+                    axis = (axis + 1) % 3
+                spent[axis] += 1
+                axes.append(axis)
+        elif self.mrope_interleaved:
+            axes = [0] * num_pairs
+            for axis in (1, 2):
+                for lane in range(axis, min(3 * section[axis], num_pairs), 3):
+                    axes[lane] = axis
+        else:
+            axes = [axis for axis, size in enumerate(section) for _ in range(size)]
+        return torch.tensor(axes, dtype=torch.long, device=self.cos_sin_cache.device)
+
+    @property
+    def _legacy_axis_map(self) -> Optional[torch.Tensor]:
+        """The map only where the older rope kernels read it; one is out of tree."""
+        return self.axis_map if self.mrope_interleaved_glm else None
 
     def get_cos_sin_with_position(self, positions):
         if positions.ndim == 1:
@@ -131,8 +149,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            cos = apply_interleaved_rope(cos, self.mrope_section)
-            sin = apply_interleaved_rope(sin, self.mrope_section)
+            # Runs in prefill and decode: both halves must support triton.
+            prefill_backend, decode_backend = attention_backends()
+            if support_triton(prefill_backend) and support_triton(decode_backend):
+                cos = apply_interleaved_rope_triton(cos, self.mrope_section)
+                sin = apply_interleaved_rope_triton(sin, self.mrope_section)
+            else:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
         else:
             cos = torch.cat(
                 [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
@@ -159,9 +183,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
+        assert fused_set_kv_buffer_arg is None, (
+            "save kv cache is not supported for MRotaryEmbedding."
+        )
         assert positions.ndim == 1 or positions.ndim == 2
 
         cos_sin = self.cos_sin_cache[positions]
@@ -206,7 +230,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+            torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                 positions,
                 query,
                 key,
@@ -216,6 +240,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.mrope_interleaved,
                 self.is_neox_style,
             )
+            return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_cuda(
@@ -226,6 +251,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
+        self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
@@ -249,7 +277,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.mrope_interleaved,
             self.mrope_interleaved_glm,
             self.is_neox_style,
-            self.axis_map,
+            self._legacy_axis_map,
         )
         return query, key
 
@@ -260,9 +288,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for npu implementation"
+        )
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
@@ -277,6 +305,36 @@ class MRotaryEmbedding(RotaryEmbedding):
             rotary_mode=rotary_mode,
         )
         return query_out, key_out
+
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert positions.ndim in (1, 2)
+        self._match_cos_sin_cache_dtype(query)
+        if (
+            multimodal_rotary_embedding is not None
+            and positions.ndim == 2
+            and self.mrope_section
+        ):
+            multimodal_rotary_embedding(
+                query,
+                key,
+                self.cos_sin_cache,
+                positions,
+                self.mrope_section,
+                self.head_size,
+                self.rotary_dim,
+                self.mrope_interleaved,
+                self.mrope_interleaved_glm,
+                self.is_neox_style,
+                self._legacy_axis_map,
+            )
+            return query, key
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     @staticmethod
     def get_rope_index(
@@ -431,6 +489,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         )
         return inv_freq
 
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
+
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
@@ -468,6 +534,10 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
             mrope_interleaved=mrope_interleaved,
         )
         self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(apply_rotary_emb)
+
+    def _build_axis_map(self) -> Optional[torch.Tensor]:
+        """No map: the shared builder reads mrope_section as t, h, w, Ernie as h, w, t."""
+        return None
 
     def forward_native(
         self,
@@ -558,6 +628,32 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
 
         return self.forward_native(positions, query, key)
 
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor = None,
+    ):
+        assert key is not None
+        assert positions.ndim in (1, 2)
+        self._match_cos_sin_cache_dtype(query)
+
+        if positions.ndim == 2:
+            assert self.mrope_section is not None
+            triton_ernie45_rope_fused_inplace(
+                q=query,
+                k=key,
+                cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                mrope_section=self.mrope_section,
+                head_size=self.head_size,
+                rotary_dim=self.rotary_dim,
+                is_neox_style=self.is_neox_style,
+            )
+            return query, key
+
+        return self.forward_native(positions, query, key)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -566,4 +662,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if _is_xpu:
+            return self.forward_xpu(positions, query, key)
         return self.forward_cuda(positions, query, key)

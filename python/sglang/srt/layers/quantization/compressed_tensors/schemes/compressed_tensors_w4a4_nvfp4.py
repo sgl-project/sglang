@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 from collections.abc import Callable
 from typing import Optional
@@ -150,10 +151,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         w = layer.weight_packed
         w_blockscale = layer.weight_scale
-        if (
-            enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
-        ):
+        if enable_flashinfer_fp4_gemm:
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T
 

@@ -29,6 +29,17 @@ def _is_kimi_tiktoken_tokenizer(tokenizer):
     return class_name == "TikTokenTokenizer" and "tokenization_kimi" in module_name
 
 
+def decode_without_hf_kwargs(tokenizer, token_ids, skip_special_tokens):
+    if skip_special_tokens:
+        special_ids = getattr(tokenizer, "all_special_ids_set", None)
+        if special_ids is None:
+            special_ids = getattr(tokenizer, "all_special_ids", None)
+        if special_ids is not None:
+            special_ids_set = set(special_ids)
+            token_ids = [tid for tid in token_ids if tid not in special_ids_set]
+    return tokenizer.decode(token_ids)
+
+
 class _SpecialTokensCachePatcher:
     _PATCHED_FLAG = "_sglang_special_tokens_patched"
     _CACHED_TOKENS_ATTR = "_sglang_cached_special_tokens"
@@ -56,14 +67,14 @@ class _SpecialTokensCachePatcher:
         )
 
         def patched_add_special_tokens(self, *args, **kwargs):
-            assert (
-                False
-            ), "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+            assert False, (
+                "Cannot modify special tokens after patch. Call unpatch_tokenizer first."
+            )
 
         def patched_add_tokens(self, new_tokens, special_tokens=False):
-            assert (
-                not special_tokens
-            ), "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            assert not special_tokens, (
+                "Cannot add special tokens after patch. Call unpatch_tokenizer first."
+            )
             return tokenizer_cls._original_add_tokens(
                 self, new_tokens, special_tokens=False
             )
