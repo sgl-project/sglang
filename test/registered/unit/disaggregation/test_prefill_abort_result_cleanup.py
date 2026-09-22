@@ -4,9 +4,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -15,7 +17,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -266,6 +269,93 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     )
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     scheduler.send_kv_chunk.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["x" * 8192, object()], ids=["overflow", "encoding"])
+@patch("sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group")
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache")
+def test_customized_info_failure_is_request_local(release_kv_cache, poll, value):
+    scheduler = _Scheduler()
+    scheduler.scheduler_stage_metrics = None
+    scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
+    scheduler.metrics_reporter.enable_metrics = False
+    scheduler._release_aborted_request = Mock()
+    scheduler.enable_staging = False
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        page_size=1, translate_kv_indices_for_transfer=lambda indices: indices
+    )
+    scheduler.req_to_token_pool = SimpleNamespace(req_to_token=torch.tensor([[0]]))
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+    )
+    scheduler.disagg_metadata_buffers = MetadataBuffers(
+        size=1,
+        hidden_size=1,
+        hidden_states_dtype=torch.float32,
+        max_sampling_mask_tokens=1,
+    )
+    release_kv_cache.side_effect = lambda req, cache: _free_req(
+        req, cache, is_insert=False
+    )
+    poll.return_value = [KVPoll.Failed]
+
+    for index, payload in enumerate((value, 0.5)):
+        req = Req(f"customized-info-{index}", "", [1], SamplingParams())
+        req.kv = ReqKvInfo(req_pool_idx=0, kv_allocated_len=1)
+        req.metadata_buffer_index = 0
+        req.extend_range = SimpleNamespace(end=1)
+        req.output_ids.append(2)
+        req.customized_info = {"scores": [payload]}
+        req.disagg_kv_sender = Mock()
+        req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
+        req.time_stats = Mock()
+        scheduler.disagg_prefill_inflight_queue.append(req)
+        scheduler.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+        scheduler._send_kv_chunk(req, last_chunk=True)
+
+        if index == 0:
+            assert isinstance(req.finished_reason, FINISH_ABORT)
+            assert req.finished_reason.status_code == 500
+            assert "customized_info" in req.finished_reason.message
+            finish_reason = req.finished_reason
+            req.disagg_kv_sender.abort.assert_called_once_with()
+            req.disagg_kv_sender.send.assert_not_called()
+            release_kv_cache.assert_not_called()
+            assert scheduler.disagg_prefill_inflight_queue == [req]
+            with get_parallel().override(tp_rank=0):
+                assert scheduler.process_disagg_prefill_inflight_queue() == [req]
+            assert scheduler.process_disagg_prefill_inflight_queue() == []
+            assert req.finished_reason is finish_reason
+            scheduler._release_aborted_request.assert_called_once_with(req)
+            release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
+            scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(
+                0
+            )
+            scheduler.output_streamer.stream_output.assert_called_once_with(
+                [req], False, None
+            )
+            assert not req.kv.holds_kv
+            assert req.metadata_buffer_index == -1
+        else:
+            assert not req.finished()
+            req.disagg_kv_sender.abort.assert_not_called()
+            req.disagg_kv_sender.send.assert_called_once()
+            assert (
+                scheduler.disagg_metadata_buffers.get_customized_info(0)
+                == req.customized_info
+            )
+        assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
+
+    with (
+        patch.object(
+            scheduler.disagg_metadata_buffers,
+            "set_buf",
+            side_effect=RuntimeError("device failure"),
+        ),
+        pytest.raises(RuntimeError, match="device failure"),
+    ):
+        scheduler._send_kv_chunk(req, last_chunk=True)
 
 
 if __name__ == "__main__":

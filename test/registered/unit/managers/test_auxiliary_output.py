@@ -589,6 +589,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
         snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
+        _maybe_collect_customized_info=Mock(),
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
