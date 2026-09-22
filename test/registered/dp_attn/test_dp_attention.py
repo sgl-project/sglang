@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=443, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -50,6 +50,8 @@ class TestDPAttentionDP2TP2(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--constrained-json-max-whitespace-cnt",
+                "4",
                 "--tp",
                 "2",
                 "--enable-dp-attention",

@@ -564,7 +564,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_is_not_loaded_by_default(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 
@@ -578,7 +578,7 @@ class TestLTX25OptionalDecoderLoading(unittest.TestCase):
 
     def test_decoder_load_is_explicit_and_validated(self):
         from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import LTX2Pipeline
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
             LoRAPipeline,
         )
 

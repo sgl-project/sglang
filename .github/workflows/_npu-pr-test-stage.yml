@@ -1,5 +1,7 @@
 name: PR Test Stage for NPU
-# Reusable workflow for one CUDA test stage. Caller pr-test-npu.yml forwards
+# Reusable workflow for one NPU test stage. Caller pr-test-npu.yml forwards
+# job parameters (runner, image, partitions) and optionally delegates test
+# execution to the coverage runner (use_coverage_runner=true).
 
 on:
   workflow_call:
@@ -33,15 +35,23 @@ on:
         type: string
         default: '{"size":1,"arr":[0]}'
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
         type: string
         default: ''
       skip_pr_test_health_check:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Set to true to skip the PR test health check (fail-fast gate).'
         type: string
         default: 'false'
       is_nightly_pipeline_job:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
+        type: boolean
+        default: false
+      use_coverage_runner:
+        description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
+        type: boolean
+        default: false
+      upload_test_logs:
+        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
         type: boolean
         default: false
       github-token:
@@ -72,140 +82,50 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
 
-      - name: Check PR test health
-        uses: actions/github-script@v8
-        env:
-          SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
-        with:
-          github-token: ${{ inputs.github-token || github.token }}
-          script: |
-            core.notice(`[health-check] START — event=${context.eventName}, runId=${context.runId}`);
-
-            // Skip when explicitly requested via env var (e.g. release branch cut)
-            if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
-              core.notice('[health-check] SKIP: SKIP_PR_TEST_HEALTH_CHECK=true');
-              return;
-            }
-
-            // Skip for scheduled runs — they should collect all failures, not fast-fail
-            if (context.eventName === 'schedule') {
-              core.notice('[health-check] SKIP: scheduled run');
-              return;
-            }
-
-            // Check lint status from the separate Lint workflow (lint.yml).
-            // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
-            // checks.listForRef which queries by commit SHA across ALL workflows.
-            const ref = context.payload.pull_request?.head?.sha || context.sha;
-            core.info(`[health-check] Checking lint for ref=${ref}`);
-            const { data } = await github.rest.checks.listForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: ref,
-              check_name: 'lint',
-            });
-            const lintRun = data.check_runs.find(
-              cr => cr.app?.slug === 'github-actions'
-            );
-            core.info(`[health-check] Lint check: status=${lintRun?.status}, conclusion=${lintRun?.conclusion}`);
-            if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
-              core.setFailed('Fast-fail: lint check failed');
-              return;
-            }
-
-            // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
-            // Lint check above still runs.
-            let labels = [];
-            if (context.payload.pull_request?.labels) {
-              labels = context.payload.pull_request.labels.map(l => l.name);
-            } else {
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: ref,
-              });
-              if (prs.length > 0) {
-                labels = prs[0].labels.map(l => l.name);
-              }
-            }
-            core.info(`[health-check] PR labels: [${labels.join(', ')}]`);
-            if (labels.includes('bypass-fastfail')) {
-              core.notice('[health-check] SKIP jobs-failed check: bypass-fastfail label present');
-              return;
-            }
-
-            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId,
-              per_page: 100,
-            });
-            core.info(`[health-check] Total jobs in run: ${jobs.length}`);
-            const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
-            core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
-
-            // Find jobs that failed from a real error, not from fast-fail cascade
-            const rootCauseFailures = jobs.filter(j => {
-              if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
-              // h20 runners are flaky (dirty GPU state from prior runs); their failures
-              // should not cascade fast-fail to other stages. j.name shape from
-              // listJobsForWorkflowRun: "<job-key>" + optional " / <reusable-job>"
-              // + optional " (<matrix>)". Split off the base job key before exact
-              // match so we cover both inline + reusable forms without confusing
-              // 'h20' with the 'h200' prefix.
-              const baseName = j.name.split(/[ /]/)[0];
-              if (baseName === 'base-c-test-8-gpu-h20') {
-                core.info(`[health-check] Filtered out h20 job: ${j.name}`);
-                return false;
-              }
-              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
-              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
-                core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
-                return false;
-              }
-              // If the failing step is the health check, it's a cascade — skip it
-              const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
-              if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
-                core.info(`[health-check] Filtered out cascade failure: ${j.name} (failed step: ${failedStep.name})`);
-                return false;
-              }
-              return true;
-            });
-            core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
-
-            if (rootCauseFailures.length > 0) {
-              core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
-            } else {
-              core.notice('[health-check] PASS: no root cause failures detected');
-            }
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
-        # Only PR jobs install dependencies
-        if: ${{ inputs.is_nightly_pipeline_job != true }}
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
           RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        shell: bash
         run: |
-          # speed up by using infra cache services
+          set -euo pipefail
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
-          # copy required file from our daily cache
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy gsm8k dataset
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+          if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
+
+          else
+            sglang_pkg_path=/sgl-workspace/sglang/python
+            ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+            mkdir -p ${ascend_test_util_path}
+            mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
+            cp -r $(pwd)/python/sglang/test/ascend ${ascend_test_util_path}
+
+            pip install sentence_transformers zss "wandb>=0.16.0" tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+            pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
+            pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
+
+            hf download MMMU/MMMU --repo-type dataset
+          fi
 
           # install sglang_router
           apt-get install -y libssl-dev
@@ -215,10 +135,12 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          TEST_LOG_DIR: /tmp/test-logs
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
+          mkdir -p "${TEST_LOG_DIR}"
 
           # Install missing python deps (skip if already importable).
           PYTHON_FOR_SGLANG="python"
@@ -242,6 +164,12 @@ jobs:
             install_pkg "${pkg}"
           done
 
+          # Fallback for images that predate the pin in pyproject_npu.toml. Checking
+          # the version, not the command, so a stale wheel is replaced rather than kept.
+          SGL_EVAL_VERSION=0.1.2
+          ${PYTHON_FOR_SGLANG} -c "import sgl_eval, sys; sys.exit(sgl_eval.__version__ != '${SGL_EVAL_VERSION}')" 2>/dev/null \
+            || install_pkg "sgl-eval==${SGL_EVAL_VERSION}"
+
           cd test
           # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
@@ -250,8 +178,38 @@ jobs:
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
+
+          # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
+          # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
+          # selected test files; the original run_suite.py execution below is preserved
+          # unchanged for the default (false) path.
+          LOG_FILE="${TEST_LOG_DIR}/${{ inputs.self_name }}-part${{ matrix.partition }}.log"
+
+          if [[ "${{ inputs.use_coverage_runner }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite ${{ inputs.self_name }} \
+              --auto-partition-id ${{ matrix.partition }} \
+              --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
+              -o /tmp/selected_tests.txt
+            echo "Selected test files:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+            fi
+            exit 0
+          fi
+
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG
+            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs
+        if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}
+          path: /tmp/test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

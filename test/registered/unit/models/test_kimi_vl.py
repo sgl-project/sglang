@@ -20,7 +20,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class _VisionTower:
@@ -78,9 +78,12 @@ def _image_item(feature, grid_hws):
 
 class TestKimiVLEncoderParallelism(CustomTestCase):
     def test_moonvit_uses_tensor_parallel_layers(self):
-        with get_parallel().override(
-            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-        ), get_context().override_server_args():
+        with (
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+            ),
+            get_context().override_server_args(),
+        ):
             layer = MoonVitEncoderLayer(
                 num_heads=2,
                 hidden_dim=8,
