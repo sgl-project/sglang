@@ -12,7 +12,11 @@ use sgl_router::{
         PolicyRegistry,
     },
     proxy::Proxy,
-    server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
+    server::{
+        app::build_router,
+        app_context::{AppContext, ChatRouting},
+        shutdown::drain_for_termination,
+    },
     state::{
         kv_events::{BlockSizeOracle, KvEventIndex},
         load_monitor::router_inflight_load::{
@@ -69,15 +73,39 @@ async fn main() -> Result<()> {
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
-    // Build the policies that choose which workers receive each request.
-    let routing_policies = Arc::new(
+    // The reorg path owns its policies and shares the live engine monitor.
+    let (chat_routing, reorg_cleanup) = match &config.model.reorg {
+        Some(reorg) => {
+            let (resolver, cleanup) = sgl_router::policies_reorg::factory::build_resolver(
+                reorg,
+                &engine_state,
+                external_kv_indexer_client.clone(),
+            )
+            .context("build reorg bucket resolver")?;
+            (
+                ChatRouting::Reorg(
+                    [(
+                        sgl_router::discovery::ModelId(config.model.id.clone()),
+                        resolver,
+                    )]
+                    .into(),
+                ),
+                cleanup,
+            )
+        }
+        None => (ChatRouting::Legacy, None),
+    };
+    // Do not construct unused legacy policies or their background tasks.
+    let routing_policies = Arc::new(if config.model.reorg.is_some() {
+        PolicyRegistry::default()
+    } else {
         build_policy_registry(
             &config,
             engine_state.tree(),
             engine_state.block_size_oracle(),
         )
-        .context("build policy registry")?,
-    );
+        .context("build policy registry")?
+    });
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -93,7 +121,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
-    let app_context = build_app_context(
+    let mut app_context = build_app_context(
         &config,
         tokenizers,
         worker_registry,
@@ -102,6 +130,8 @@ async fn main() -> Result<()> {
         &engine_state,
         external_kv_indexer_client,
     )?;
+    app_context.chat_routing = chat_routing;
+    let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -116,6 +146,9 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
+    if let Some(cleanup) = reorg_cleanup {
+        cleanup.shutdown().await;
+    }
     log_shutdown(&outcome.result, outcome.inflight_drain_secs);
     outcome.result
 }
@@ -169,6 +202,7 @@ fn log_startup(config: &Config) {
     }
 
     tracing::info!(
+        selection_engine = if config.model.reorg.is_some() { "reorg" } else { "legacy" },
         configured_decode_policy = ?config.model.decode_policy,
         "sgl-router {} starting on {}:{}",
         env!("CARGO_PKG_VERSION"),
@@ -178,6 +212,21 @@ fn log_startup(config: &Config) {
 }
 
 fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
+    if let Some(reorg) = &config.model.reorg {
+        return reorg
+            .kv_indexer
+            .as_ref()
+            .map(|endpoint| {
+                GrpcPrefixIndex::new(PrefixIndexConfig {
+                    endpoint: endpoint.url.clone(),
+                    query_deadline: Duration::from_millis(endpoint.query_timeout_ms),
+                    max_inflight: endpoint.query_max_inflight,
+                })
+                .map(|index| Arc::new(index) as Arc<dyn PrefixIndex>)
+                .context("configure reorg KV Indexer client")
+            })
+            .transpose();
+    }
     let endpoint = config
         .model
         .cache_aware
@@ -258,7 +307,7 @@ fn build_app_context(
     local_inflight_requests: Arc<RouterInflightLoadRegistry>,
     engine_state: &KvEventIndex,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
-) -> Result<Arc<AppContext>> {
+) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
@@ -285,7 +334,7 @@ fn build_app_context(
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
-    Ok(Arc::new(app_context))
+    Ok(app_context)
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped
@@ -469,6 +518,39 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
+    }
+
+    #[tokio::test]
+    async fn reorg_remote_indexer_keeps_only_metadata_and_engine_load() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serde_json::json!({
+            "buckets": [{"id": "cache", "groups": {"mode": "plain", "plain": {"policy": "cache_aware"}}}],
+            "kv_indexer": {"url": "http://127.0.0.1:50051", "query_timeout_ms": 25, "query_max_inflight": 17}
+        }).to_string()).unwrap();
+        let config = Cli::try_parse_from([
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+            "--reorg-config",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        let index = create_external_kv_indexer_client(&config).unwrap();
+        assert!(index.is_some());
+        let state = start_engine_state_monitor(index.is_some());
+        assert!(state.metrics_source().is_none());
+        let (resolver, cleanup) = sgl_router::policies_reorg::factory::build_resolver(
+            config.model.reorg.as_ref().unwrap(),
+            &state,
+            index,
+        )
+        .unwrap();
+        assert_eq!(resolver.buckets.len(), 1);
+        assert!(cleanup.is_none());
     }
 
     #[tokio::test]

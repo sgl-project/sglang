@@ -621,13 +621,17 @@ Implemented here:
   The caller owns expiry and sweeper lifecycle. A binding may remain after a
   later PD group fails, because it records placement rather than dispatch.
 
-Follow-up work includes remaining selection policies and production configuration.
+Launch the implemented policies with `--reorg-config PATH`; the JSON schema and
+plain/PD examples are documented in [README.md](README.md#launch-the-reorg-policy-engine).
+The factory shares live load and prefix state and owns a session eviction task
+until shutdown. Legacy routing remains the default.
+
+Follow-up work includes remaining selection policies and cache tuning configuration.
 
 Not yet implemented in the reorg path:
 
 - Other concrete selection policies.
-- CLI/configuration parsing, validation, and model-specific construction.
-  The YAML above is illustrative; reorg resolvers are installed in code.
+- The full illustrative YAML schema above; the supported launch format is JSON.
 - Global session modes and sticky routing-key affinity.
 - Power-of-k cache-miss fallback configuration and cache decision metrics.
 - Shared load interpretation, dispatch correction, and policy-specific

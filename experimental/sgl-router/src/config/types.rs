@@ -306,6 +306,8 @@ pub struct ModelConfig {
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
     pub policy: PolicyKind,
+    /// Opt-in bucket-engine configuration loaded by --reorg-config.
+    pub reorg: Option<super::reorg::ReorgConfig>,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
     /// Optional static bucket configuration. `None` uses the global domain.

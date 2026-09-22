@@ -5,34 +5,30 @@ use super::*;
 
 #[tokio::test]
 async fn session_aware_reuses_custom_header_binding_after_load_changes() {
-    use sgl_router::config::AffinityConfig;
-    use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
-    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
-    use sgl_router::state::AffinityStore;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     let primary = MockWorker::start(vec![]).await;
     let other = MockWorker::start(vec![]).await;
-    let store = AffinityStore::new(Duration::from_secs(60));
-    let policy = Arc::new(SessionAwarePolicy::new(
-        store.clone(),
-        EngineReportedLoadTable::new(),
-    ));
     let mut ctx = context(
         &[
             ("primary", Stage::Plain, &primary),
             ("other", Stage::Plain, &other),
         ],
-        vec![Bucket::new(
-            "session",
-            BucketGroups::Plain(EngineGroup::new(policy)),
-        )],
+        vec![],
     );
-    Arc::get_mut(&mut ctx).unwrap().config.model.affinity = Some(AffinityConfig {
-        session_id_header: "x-test-session".into(),
-        ..Default::default()
-    });
+    let config = serde_json::from_value(serde_json::json!({
+        "session": {"header": "x-test-session"},
+        "buckets": [{"id": "session", "groups": {"mode": "plain", "plain": {
+            "policy": "session_aware"
+        }}}]
+    }))
+    .unwrap();
+    let state = sgl_router::state::kv_events::KvEventIndex::new();
+    let (resolver, cleanup) =
+        sgl_router::policies_reorg::factory::build_resolver(&config, &state, None).unwrap();
+    let mutable = Arc::get_mut(&mut ctx).unwrap();
+    mutable.config.model.reorg = Some(config);
+    mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let primary_worker = ctx.registry.get(&WorkerId("primary".into())).unwrap();
     let other_worker = ctx.registry.get(&WorkerId("other".into())).unwrap();
     other_worker.active_requests.store(10, Ordering::Relaxed);
@@ -49,7 +45,7 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
         primary_worker.active_requests.store(100, Ordering::Relaxed);
         other_worker.active_requests.store(0, Ordering::Relaxed);
     }
-    assert_eq!(store.len(), 1);
+    cleanup.unwrap().shutdown().await;
 }
 
 #[tokio::test]

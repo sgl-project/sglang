@@ -164,6 +164,13 @@ pub struct DiscoveryArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct RoutingArgs {
+    /// Launch the bucket engine using a JSON configuration file (see README).
+    #[arg(long, value_name = "PATH", conflicts_with_all = [
+        "policy", "decode_policy", "bucket_config", "fuse", "filter",
+        "max_in_flight", "prefix_cache_min_share", "CacheArgs", "AffinityArgs"
+    ])]
+    pub reorg_config: Option<String>,
+
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -333,6 +340,21 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
+        let reorg = self
+            .routing
+            .reorg_config
+            .as_deref()
+            .map(|path| {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|error| anyhow!("--reorg-config cannot read {path:?}: {error}"))?;
+                let config: crate::config::reorg::ReorgConfig = serde_json::from_str(&raw)
+                    .map_err(|error| {
+                        anyhow!("--reorg-config {path:?} is not valid JSON: {error}")
+                    })?;
+                config.validate()?;
+                Ok::<_, anyhow::Error>(config)
+            })
+            .transpose()?;
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -380,6 +402,7 @@ impl Cli {
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
+                reorg,
                 decode_policy: self.routing.decode_policy,
                 bucket_config,
                 circuit_breaker,

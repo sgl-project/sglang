@@ -83,9 +83,17 @@ pub(super) async fn chat_completions(
         session_key: ctx
             .config
             .model
-            .affinity
+            .reorg
             .as_ref()
-            .and_then(|config| nonempty_header(&headers, &config.session_id_header)),
+            .map(|config| config.session.header.as_str())
+            .or_else(|| {
+                ctx.config
+                    .model
+                    .affinity
+                    .as_ref()
+                    .map(|config| config.session_id_header.as_str())
+            })
+            .and_then(|header| nonempty_header(&headers, header)),
         routing_key: ctx
             .config
             .model

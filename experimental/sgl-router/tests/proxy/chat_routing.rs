@@ -42,6 +42,7 @@ fn config_for(_worker_url: &str) -> Config {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
+            reorg: None,
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,

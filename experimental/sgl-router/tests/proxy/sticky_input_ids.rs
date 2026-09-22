@@ -56,6 +56,7 @@ fn config() -> Config {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             disable_input_ids_forwarding: false,
             policy: PolicyKind::Sticky,
+            reorg: None,
             decode_policy: Default::default(),
             bucket_config: None,
             circuit_breaker: None,
