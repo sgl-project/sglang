@@ -1789,6 +1789,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             destination=KVTransferDestination.HOST,
         )
         decode_req.host_staged = True
+        if self.scheduler.metrics_reporter.current_scheduler_metrics_enabled:
+            self.scheduler.metrics_collector.increment_decode_host_receive_reqs()
         return True
 
     def allocate_host_staged(self, decode_req: DecodeRequest) -> bool:

@@ -315,6 +315,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 enable_decode_hicache=False,
                 enable_lora=False,
                 enable_priority_scheduling=False,
+                metrics_reporter=SimpleNamespace(
+                    current_scheduler_metrics_enabled=False
+                ),
                 tp_worker=SimpleNamespace(
                     is_hybrid_swa=False,
                     model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16"),
@@ -355,6 +358,13 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     host_receive_threshold=threshold,
                 )
                 queue, _ = self._receive_queue(env)
+                host_admissions = []
+                queue.scheduler.metrics_reporter.current_scheduler_metrics_enabled = (
+                    True
+                )
+                queue.scheduler.metrics_collector = SimpleNamespace(
+                    increment_decode_host_receive_reqs=lambda: host_admissions.append(1)
+                )
                 pressure = env.allocator.alloc(used_tokens)
                 req = Req(
                     rid="threshold",
@@ -369,6 +379,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue.queue = [decode_req]
                 self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
                 self.assertEqual(decode_req.host_staged, host_staged)
+                self.assertEqual(len(host_admissions), int(host_staged))
                 self.assertEqual(req.kv.req_pool_idx is None, host_staged)
                 self.assertEqual(
                     env.allocator.available_size(),
