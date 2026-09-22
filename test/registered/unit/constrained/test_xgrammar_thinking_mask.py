@@ -1,4 +1,5 @@
 import sys
+from threading import Lock
 
 import pytest
 import torch
@@ -32,6 +33,8 @@ def grammars():
     backend.grammar_compiler = xgr.GrammarCompiler(
         backend.tokenizer_info, max_threads=1
     )
+    backend._thinking_metadata = None
+    backend._thinking_metadata_lock = Lock()
     key = FunctionCallParser([], "glm47").get_structure_constraint(
         "none", thinking_mode=True
     )
@@ -137,6 +140,33 @@ def test_noncanonical_full_assistant_grammar_keeps_original_matcher(grammars):
     )
     grammar = backend.dispatch_ebnf(altered)
     assert backend.wrap_full_assistant_grammar(grammar, altered) is grammar
+
+
+def test_thinking_metadata_shared_without_sharing_generation_constraints(grammars):
+    backend, template, _ = grammars
+    originals, optimized = [], []
+    for suffix in ("Hello", "Bye"):
+        key = "\n".join(
+            f'text_block ::= "{suffix}"' if line.startswith("text_block ::=") else line
+            for line in template.key_string.splitlines()
+        )
+        original = backend.dispatch_ebnf(key)
+        originals.append(original)
+        optimized.append(backend.wrap_full_assistant_grammar(original.copy(), key))
+
+    a, b = optimized
+    assert a.thinking_mask is b.thinking_mask
+    assert a.safe_tokens is b.safe_tokens
+    for original, grammar in zip(originals, optimized):
+        assert_same_mask(original, grammar.copy())
+        original.accept_token(256)
+        grammar.accept_token(256)
+        assert_same_mask(original, grammar)
+    a.accept_token(ord("H"))
+    b.accept_token(ord("B"))
+    for original, grammar, token in zip(originals, optimized, (ord("H"), ord("B"))):
+        original.accept_token(token)
+        assert_same_mask(original, grammar)
 
 
 if __name__ == "__main__":
