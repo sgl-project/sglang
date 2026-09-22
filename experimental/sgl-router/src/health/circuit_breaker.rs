@@ -49,6 +49,7 @@ enum State {
 struct Inner {
     state: State,
     consecutive_failures: u32,
+    probe_generation: u64,
 }
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ impl CircuitBreaker {
             inner: Mutex::new(Inner {
                 state: State::Closed,
                 consecutive_failures: 0,
+                probe_generation: 0,
             }),
             config,
         }
@@ -119,33 +121,34 @@ impl CircuitBreaker {
         CircuitSnapshot { admit, state_code }
     }
 
-    /// True if a request may proceed. Mutates state when transitioning
-    /// from Open → HalfOpen.
+    /// Admit a caller that will explicitly record its outcome.
     pub fn allow(&self) -> bool {
+        self.acquire().map(|permit| permit.disarm()).is_some()
+    }
+
+    /// Claim admission, releasing an unfinished recovery probe on cancellation.
+    pub fn acquire(&self) -> Option<CircuitPermit<'_>> {
         let mut g = self.inner.lock().unwrap();
-        match g.state {
-            State::Closed => true,
-            State::Open { opened_at } => {
-                if opened_at.elapsed() >= self.config.cool_down {
-                    g.state = State::HalfOpen {
-                        probe_in_flight: true,
-                    };
-                    true
-                } else {
-                    false
-                }
+        let generation = match g.state {
+            State::Closed => None,
+            State::Open { opened_at } if opened_at.elapsed() < self.config.cool_down => {
+                return None;
             }
-            State::HalfOpen { probe_in_flight } => {
-                if probe_in_flight {
-                    false
-                } else {
-                    g.state = State::HalfOpen {
-                        probe_in_flight: true,
-                    };
-                    true
-                }
+            State::HalfOpen {
+                probe_in_flight: true,
+            } => return None,
+            _ => {
+                g.probe_generation = g.probe_generation.wrapping_add(1);
+                g.state = State::HalfOpen {
+                    probe_in_flight: true,
+                };
+                Some(g.probe_generation)
             }
-        }
+        };
+        Some(CircuitPermit {
+            breaker: self,
+            generation,
+        })
     }
 
     pub fn record_success(&self) {
@@ -203,6 +206,33 @@ impl CircuitBreaker {
     }
 }
 
+/// Releases only the recovery probe claimed by this admission.
+pub struct CircuitPermit<'a> {
+    breaker: &'a CircuitBreaker,
+    generation: Option<u64>,
+}
+
+impl CircuitPermit<'_> {
+    /// Leave outcome accounting to the caller or streaming completion hook.
+    pub fn disarm(mut self) {
+        self.generation = None;
+    }
+}
+
+impl Drop for CircuitPermit<'_> {
+    fn drop(&mut self) {
+        let Some(generation) = self.generation else {
+            return;
+        };
+        let mut g = self.breaker.inner.lock().unwrap();
+        if g.probe_generation == generation {
+            if let State::HalfOpen { probe_in_flight } = &mut g.state {
+                *probe_in_flight = false;
+            }
+        }
+    }
+}
+
 impl Default for CircuitBreaker {
     fn default() -> Self {
         Self::new()
@@ -218,6 +248,22 @@ mod tests {
             threshold: NonZeroU32::new(threshold).unwrap(),
             cool_down: Duration::from_secs(cool_down_secs),
         })
+    }
+
+    #[test]
+    fn cancelled_permits_release_only_their_own_probe() {
+        let b = cb(1, 0);
+        let closed = b.acquire().unwrap();
+        b.record_failure();
+        let old_probe = b.acquire().unwrap();
+        b.record_success();
+        b.record_failure();
+        let current_probe = b.acquire().unwrap();
+        drop((closed, old_probe));
+        assert!(!b.would_allow());
+        drop(current_probe);
+        assert!(b.would_allow());
+        assert_eq!(b.snapshot().state_code, 2);
     }
 
     #[test]
