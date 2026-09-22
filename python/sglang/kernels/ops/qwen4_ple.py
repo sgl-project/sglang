@@ -593,7 +593,11 @@ def can_fuse_qwen4_ple(
 ):
     if width not in (1, 4) or not key.is_cuda or key.dtype != torch.bfloat16:
         return False
-    if key.ndim != 2 or key.shape[1] != 10240 or not 0 < key.shape[0] <= 32:
+    if (
+        key.ndim != 2
+        or key.shape[1] != 10240
+        or not 0 < key.shape[0] <= (2**31 - 1) // 10240
+    ):
         return False
     tokens = key.shape[0]
     if indices.ndim != 1 or indices.numel() * width != tokens:
