@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 class ModelOutputTrace:
-    """Output-only decoded-text deltas, before reasoning/tool parsing."""
+    """解析前原始输出，仅在 SGLANG_ENABLE_MODEL_OUTPUT_LOGGING=1 时记录。
+
+    内容包含 reasoning 和工具参数，并非脱敏日志；输出目录由
+    SGLANG_MODEL_OUTPUT_TRACE_DIR 配置。普通请求日志沿用原有开关。
+    """
 
     def __init__(self, targets: List[logging.Logger], model: str):
         self.targets = targets
@@ -39,6 +43,8 @@ class ModelOutputTrace:
         self.sequences: Dict[Tuple[str, int], int] = {}
 
     def record(self, out: dict, index: int = 0) -> None:
+        if not envs.SGLANG_ENABLE_MODEL_OUTPUT_LOGGING.get():
+            return
         text = out.get("text")
         if not isinstance(text, str):
             logger.warning("Model output trace skipped a non-text generation result")
@@ -105,7 +111,7 @@ class RequestLogger:
             create_log_targets(
                 targets=[output_trace_dir], name_prefix=__name__ + ".model_output"
             )
-            if output_trace_dir
+            if envs.SGLANG_ENABLE_MODEL_OUTPUT_LOGGING.get() and output_trace_dir
             else []
         )
 
@@ -117,7 +123,10 @@ class RequestLogger:
         )
 
     def start_model_output_trace(self, model: str) -> Optional[ModelOutputTrace]:
-        if not self.output_trace_targets:
+        if (
+            not envs.SGLANG_ENABLE_MODEL_OUTPUT_LOGGING.get()
+            or not self.output_trace_targets
+        ):
             return None
         return ModelOutputTrace(self.output_trace_targets, model)
 
