@@ -228,7 +228,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             lora_manager=None,
-            ps=SimpleNamespace(attn_dcp_size=1),
+            attn_dcp_size=1,
             attn_backend=SimpleNamespace(
                 get_cpu_graph_seq_len_fill_value=lambda: 1,
                 get_cuda_graph_seq_len_fill_value=lambda: 1,
