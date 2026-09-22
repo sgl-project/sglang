@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from functools import partial
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -38,6 +39,10 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.evict_policy import (
+    StorageWriteBack,
+    proactive_write_back_budget,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -264,6 +269,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
+        self.storage_write_back = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -378,6 +384,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if getattr(self, "ongoing_write_through", None):
+            self.writing_check(write_back=True)
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -404,6 +412,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
+
+        if self.storage_write_back is not None:
+            self.storage_write_back.reset()
 
         self.tree_core.kv_events.record_all_cleared()
 
@@ -502,6 +513,35 @@ class UnifiedRadixCache(BasePrefixCache):
         # State initialization
         self.write_through_threshold = (
             1 if get_memory().hicache_write_policy == "write_through" else 2
+        )
+        self.write_back_threshold = get_memory().hicache_write_back_threshold
+        self.storage_write_back = (
+            StorageWriteBack(
+                self.write_back_threshold,
+                self.page_size,
+                sum(
+                    entry.host_pool.logical_size // entry.host_pool.page_size
+                    for entry in self.host_pool_group.entries
+                )
+                * self.page_size,
+                describe=self._describe_storage_write_back,
+                pools=[
+                    (
+                        name,
+                        self.host_pool_group.get_pool(name),
+                        partial(self.evict_host, component_type=ct),
+                    )
+                    for ct, name in (
+                        (ComponentType.FULL, PoolName.KV),
+                        (ComponentType.SWA, PoolName.SWA),
+                        (ComponentType.MAMBA, PoolName.MAMBA),
+                    )
+                    if ct in self.tree_components
+                    and name in self.host_pool_group.entry_map
+                ],
+            )
+            if self.write_back_threshold < 1 and self.host_memory_mode == "cache"
+            else None
         )
         self.is_write_back = (
             self.cache_controller is not None
@@ -715,6 +755,14 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
+        # Proactive backups hold locks until their DMA is complete. Release
+        # those locks before an allocation-pressure walk chooses its victims.
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+            and self.ongoing_write_through
+        ):
+            self.writing_check(write_back=True)
         self._evict_components(
             request_by_type,
             tracker,
@@ -795,7 +843,18 @@ class UnifiedRadixCache(BasePrefixCache):
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
-        result = self.tree_core.drop_subtree_no_host(node_id)
+        policy = getattr(self, "storage_write_back", None)
+        guard = None
+        if (
+            self.enable_storage
+            and policy is not None
+            and self.cache_controller.write_policy == "write_back"
+        ):
+            policy.bind(self.cache_controller.storage_backend)
+            guard = policy.ready
+        result = self.tree_core.drop_subtree_no_host(
+            node_id, **({"can_evict_host": guard} if guard is not None else {})
+        )
         self._free_values(result.device_frees, result.host_frees)
         if result.is_dropped:
             self._record_dropped_tokens(
@@ -1320,14 +1379,49 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[ct].free_host_values(host_frees.pop(ct))
 
     def evict_host(
-        self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
+        self,
+        num_tokens: int,
+        component_type: ComponentType = BASE_COMPONENT_TYPE,
+        *,
+        blocking=True,
+        write_back_only=False,
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         if self.host_memory_mode == "buffer_only":
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
-        result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        policy = getattr(self, "storage_write_back", None)
+        if (
+            self.enable_storage
+            and policy is not None
+            and self.cache_controller.write_policy == "write_back"
+        ):
+            policy.bind(self.cache_controller.storage_backend)
+            if blocking and policy.deferred_counts:
+                policy.sync_poll(self, torch.empty(0, dtype=torch.int64))
+            return policy.evict(
+                num_tokens,
+                lambda count, guard: self._evict_host(count, component_type, guard),
+                lambda node: self.write_backup_storage(node.id),
+                self._drain_storage_writes,
+                blocking=blocking,
+                write_back_only=write_back_only,
+                pool={
+                    ComponentType.FULL: PoolName.KV,
+                    ComponentType.SWA: PoolName.SWA,
+                    ComponentType.MAMBA: PoolName.MAMBA,
+                }[component_type],
+            )
+        return self._evict_host(num_tokens, component_type)
+
+    def _evict_host(self, num_tokens, component_type, prepare=None):
+        if prepare is None:
+            result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        else:
+            result = self.tree_core.drive_host_write_back(
+                component_type, num_tokens, prepare
+            )
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
@@ -1559,7 +1653,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
+                node_id,
+                device_value,
+                comp_xfers,
+                sidecar_xfers,
+                **(
+                    {"blocking": write_back}
+                    if getattr(self, "storage_write_back", None) is not None
+                    else {}
+                ),
             )
             if host_indices is None:
                 return 0
@@ -1594,13 +1696,15 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _execute_kv_backup(
+        self, node_id, device_value, comp_xfers, sidecar_xfers, *, blocking=True
+    ):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
+            if self.evict_host(needed, blocking=blocking) < needed:
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1659,7 +1763,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        if self.enable_storage and (
+            self.storage_write_back is None
+            or self.cache_controller.write_policy != "write_back"
+        ):
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
@@ -1835,7 +1942,22 @@ class UnifiedRadixCache(BasePrefixCache):
         return transfers
 
     @rank_consensus
-    def write_backup_storage(self, node_id: NodeId) -> None:
+    def _describe_storage_write_back(self, node):
+        spec = self.tree_core.build_storage_backup_spec(node.id, False)
+        if spec is None:
+            return {}
+        kv = PoolTransfer(
+            name=PoolName.KV, host_indices=spec.host_value, keys=spec.hash_value
+        )
+        return StorageWriteBack.describe_transfers(
+            [kv]
+            + [x for transfers in spec.comp_xfers.values() for x in transfers]
+            + self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, kv, spec.comp_xfers
+            )
+        )
+
+    def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
         if not self.enable_storage or self.cache_controller is None:
             return
         spec = self.tree_core.build_storage_backup_spec(
@@ -1866,6 +1988,7 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        return operation_id
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2239,6 +2362,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
+
+        policy = getattr(self, "storage_write_back", None)
+        if policy is not None:
+            policy.record_prefetch(self, operation, completed_tokens)
 
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
@@ -2759,6 +2886,7 @@ class UnifiedRadixCache(BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
+        defer_backup_confirmation: bool = False,
     ) -> None:
         cc = self.cache_controller
 
@@ -2993,7 +3121,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            operations = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            policy = getattr(self, "storage_write_back", None)
+            if policy is not None:
+                policy.finish_acks(
+                    self,
+                    operations,
+                    synchronized=n_backup is not None,
+                    defer=defer_backup_confirmation,
+                )
+            for operation in operations:
                 drained += 1
                 if buffer_mode:
                     # Storage write acked: free the staging.
@@ -3043,9 +3180,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
+        # Consume the agreed backup count before prefetch allocation can
+        # reclaim auxiliary pools and recursively drain newer backup acks.
+        _drain_backup()
         _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
-        _drain_backup()
         _drain_release()
         _drain_extra_release()
 
@@ -3067,7 +3206,11 @@ class UnifiedRadixCache(BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
+        policy = getattr(self, "storage_write_back", None)
+        if policy is not None:
+            policy.sync_poll(self, qsizes)
+        else:
+            self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
@@ -3081,6 +3224,7 @@ class UnifiedRadixCache(BasePrefixCache):
             n_release=n_release,
             extra_release_counts=extra_release_counts,
             log_metrics=True,
+            defer_backup_confirmation=True,
         )
 
     def drain_storage_control_queues_local(self) -> None:
@@ -3136,7 +3280,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Detach (disable) the HiCache storage backend at runtime."""
         if self._storage_attachment is None:
             return False, "HiCache storage backend is not initialized."
-        return self._storage_attachment.detach()
+        result = self._storage_attachment.detach()
+        if result[0] and self.storage_write_back is not None:
+            self.storage_write_back.reset()
+        return result
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
@@ -3144,6 +3291,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_attachment.shutdown()
 
     def clear_storage_backend(self) -> bool:
+        policy = getattr(self, "storage_write_back", None)
+        if policy is not None and policy.pending:
+            return False  # A late write ack must not repopulate cleared L3 beliefs.
         if self._storage_attachment is None:
             return False
         ok = self._storage_attachment.clear()
@@ -3151,6 +3301,8 @@ class UnifiedRadixCache(BasePrefixCache):
             # L3 is empty now: every storage-presence belief is stale, and a
             # retained positive would skip that page's backup forever.
             self.storage_existence_cache.clear()
+            if self.storage_write_back is not None:
+                self.storage_write_back.clear_confirmed()
         return ok
 
     # ---- HiCache: Async Event Management ----
@@ -3196,6 +3348,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
+        policy = getattr(self, "storage_write_back", None)
+        budgets = [self._write_back_budget()]
+        if policy is not None:
+            budgets.extend(policy.budgets(self))
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3203,16 +3359,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 *storage_queue_sizes,
                 digest,
                 -digest,
+                *budgets,
             ],
             dtype=torch.int64,
             device="cpu",
         )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+        if policy is not None:
+            policy.sync_poll(self, ready_counts)
+        elif self.host_memory_mode == "buffer_only" and self.pp_size > 1:
             self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
         else:
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        self._proactive_write_back_budgets = count_values[-len(budgets) :]
+        count_values = count_values[: -len(budgets)]
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
@@ -3336,6 +3497,43 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    def _drain_storage_writes(self, count):
+        self._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_ack_prefetch=0,
+            n_backup=count,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=True,
+        )
+
+    def _write_back_budget(self) -> int:
+        threshold = getattr(self, "write_back_threshold", 1.0)
+        if (
+            threshold >= 1
+            or self.disable
+            or self.cache_controller is None
+            or self.cache_controller.write_policy != "write_back"
+        ):
+            return 0
+        pending = sum(ack.num_tokens for ack in self.cache_controller.ack_write_queue)
+        return proactive_write_back_budget(
+            self.token_to_kv_pool_allocator.size_full,
+            self._component_available_size(ComponentType.FULL),
+            pending,
+            threshold,
+            self.page_size,
+        )
+
+    def _write_back_proactively(self, budget: int) -> None:
+        if budget <= 0:
+            return
+
+        self.tree_core.prepare_device_write_back(
+            budget,
+            lambda action: self._execute_and_commit_kv_backup(action, write_back=False),
+        )
+
     @rank_consensus(same_params=["params.host_hit_length"])
     def init_load_back(
         self,
@@ -3435,9 +3633,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 n_release=n_release,
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
+                defer_backup_confirmation=True,
             )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
+        budgets = self._proactive_write_back_budgets
+        self._write_back_proactively(budgets[0])
+        policy = getattr(self, "storage_write_back", None)
+        if policy is not None:
+            policy.poll(self, budgets[1:])
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:

@@ -311,7 +311,9 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
-    def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
+    def drop_subtree_no_host(
+        self, node_id: NodeId, can_evict_host=None
+    ) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
@@ -454,6 +456,18 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
+
+    def prepare_device_write_back(self, num_tokens: int, write) -> None:
+        """Prepare cold device copies while retaining all source slots."""
+        raise NotImplementedError(
+            "This tree core does not support proactive write-back"
+        )
+
+    def drive_host_write_back(
+        self, component_type: ComponentType, num_tokens: int, prepare
+    ) -> DriveHostEvictionResult:
+        """Storage-write-back walk; prepare returns (release_source, stop_walk)."""
+        raise NotImplementedError("This tree core does not support storage write-back")
 
     @abstractmethod
     def evict_excess_path_states(

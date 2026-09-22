@@ -65,7 +65,7 @@ def handle_hicache(server_args: Any):
 
 
 def handle_hicache_ratio_default(server_args: Any):
-    """Default the host/device ratio per host memory mode.
+    """Validate the write-back watermark and default the host/device ratio.
 
     Runs before the dummy-model boundary: direct HostKVCache consumers
     (unit fixtures, dummy-model launches) must never see a None ratio.
@@ -79,6 +79,8 @@ def handle_hicache_ratio_default(server_args: Any):
     resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    if not 0 < cfg.hicache_write_back_threshold <= 1:
+        raise ValueError("--hicache-write-back-threshold must be in (0, 1].")
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:
         raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")

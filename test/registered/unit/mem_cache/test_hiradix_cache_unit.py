@@ -8,7 +8,11 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -117,6 +121,50 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(len(stored_cpu[0].block_hashes), 2)
+
+    def test_proactive_write_back_preserves_kv_on_gpu_round_trip(self):
+        cache, allocator = self._build_cache()
+        cache.cache_controller.write_policy = "write_back"
+        cache.write_back_threshold = 0.7
+        nodes = []
+        for branch in range(6):
+            tokens = list(range(1000 * branch, 1000 * branch + 32))
+            self._insert(cache, allocator, tokens)
+            node = self._leaf_for(cache, tokens)
+            nodes.append(node)
+            for layer in range(4):
+                cache.kv_cache.get_key_buffer(layer)[node.value] = branch + layer + 1
+                cache.kv_cache.get_value_buffer(layer)[node.value] = branch + layer + 10
+
+        self.assertEqual(allocator.available_size(), 64)
+        cache._write_back_proactively(cache._write_back_budget())
+        self.assertTrue(cache.ongoing_write_through)
+        self.assertEqual(allocator.available_size(), 64)
+        self.assertTrue(all(not node.evicted for node in nodes))
+        torch.cuda.synchronize()
+        cache.check_hicache_events()
+        self.assertTrue(all(not node.evicted for node in nodes))
+        self.assertEqual(allocator.available_size(), 64)
+        cache.evict(EvictParams(num_tokens=32))
+        evicted = [(i, node) for i, node in enumerate(nodes) if node.evicted]
+        self.assertTrue(evicted)
+        self.assertGreater(allocator.available_size(), 64)
+
+        branch, node = evicted[0]
+        restored = cache.load_back(node)
+        self.assertIsNotNone(restored)
+        cache.ready_to_load_host_cache()
+        torch.cuda.synchronize()
+        cache.loading_check()
+        for layer in range(4):
+            actual_k = cache.kv_cache.get_key_buffer(layer)[restored]
+            actual_v = cache.kv_cache.get_value_buffer(layer)[restored]
+            torch.testing.assert_close(
+                actual_k, torch.full_like(actual_k, branch + layer + 1)
+            )
+            torch.testing.assert_close(
+                actual_v, torch.full_like(actual_v, branch + layer + 10)
+            )
 
 
 if __name__ == "__main__":
