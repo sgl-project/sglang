@@ -340,13 +340,27 @@ class SchedulerDllmMixin:
     def process_dllm_staging_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
-        """Process staging DLLM requests with resource allocation."""
+        """Process staging DLLM requests with resource allocation.
+
+        NO_TOKEN is a per-row refusal, not batch exhaustion: the refused row
+        is simply not admitted this round (it stays staged and is retried next
+        round), while rows behind it — e.g. retained-KV reuse rows that
+        allocate zero fresh tokens — must still get their own admission check.
+        Returning on the first NO_TOKEN would let one fresh-needing row at the
+        head starve every zero-cost row behind it. NO_TOKEN from the
+        post-admission recheck in `add_dllm_staging_req` leaves that row
+        admitted (already in can_run_list), so continuing is correct there
+        too. Still report NO_TOKEN if any row was refused, so incoming reqs
+        don't jump ahead of starved staging rows (`_process_batch_by_phase`).
+        """
+        result = AddReqResult.CONTINUE
         for req in reqs:
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
-                return res
+                result = res
+                continue
 
-        return AddReqResult.CONTINUE
+        return result
 
 
 class DllmManager:

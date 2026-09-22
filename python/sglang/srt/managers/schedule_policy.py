@@ -942,14 +942,63 @@ class PrefillAdder:
             reason=reason,
         )
 
-    def _get_dllm_remain_tokens(self) -> int:
+    def _get_dllm_remain_tokens(
+        self, needs_fresh_kv: bool = True, fresh_extra_charge: int = 0
+    ) -> int:
+        if not needs_fresh_kv:
+            # A retained-KV reuse row allocates zero fresh tokens, so neither
+            # rem_total_tokens (upfront max_new_tokens accounting) nor
+            # cur_rem_tokens (real pool headroom) applies — only the dLLM
+            # concurrency budget does. Branching here also keeps the grant
+            # monotone in the budgets: routing reuse rows through the paths
+            # below refused them at a small-positive rem_total_tokens
+            # (sub-block rounds to 0) yet admitted them at a negative one.
+            return (
+                self.dllm_block_size
+                if self.rem_dllm_tokens >= self.dllm_block_size
+                else 0
+            )
+
         _rem_tokens = min(
             self.rem_dllm_tokens,
             self.dllm_block_size,
             int(self.rem_total_tokens),
         )
         if _rem_tokens <= 0:
-            _rem_tokens = self.rem_dllm_tokens
+            # rem_total_tokens charges max_new_tokens upfront per staging row,
+            # so it goes negative long before the KV pool is full. Grant one
+            # whole block or nothing: the denoise algorithms reshape with
+            # view(B, block_size), which admits neither a larger nor a ragged row.
+            #
+            # But only override rem_total_tokens, not real pool exhaustion:
+            # the row must fit the full admission charge
+            # (`_update_prefill_budget` debits ceil_paged(extend) + one
+            # page_size of alloc_extend overhead + any mamba gap reserve,
+            # passed here as `fresh_extra_charge`) in cur_rem_tokens, or
+            # `alloc_for_extend` fails loudly downstream.
+            block_charge = (
+                self.ceil_paged_tokens(self.dllm_block_size)
+                + self.page_size
+                + fresh_extra_charge
+            )
+            pool_fits = int(self.cur_rem_tokens) >= block_charge
+            _rem_tokens = (
+                self.dllm_block_size
+                if pool_fits and self.rem_dllm_tokens >= self.dllm_block_size
+                else 0
+            )
+        else:
+            # A positive sub-block budget rounds down to 0, it does NOT take
+            # the whole-block fallback: the fallback only overrides a
+            # rem_total_tokens driven negative by the upfront max_new_tokens
+            # charge, while a small positive budget is genuine and a full
+            # block would overshoot it. The min above caps at block_size, so
+            # this yields exactly one block or nothing. No cur_rem_tokens gate
+            # here: the memory_budget's total_offset accrues everything its
+            # current_offset does plus max_new_tokens and the running-batch
+            # reservation (both >= 0), so cur_rem_tokens >= rem_total_tokens > 0
+            # on this path.
+            _rem_tokens = _rem_tokens // self.dllm_block_size * self.dllm_block_size
 
         return _rem_tokens
 
@@ -982,7 +1031,15 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        # Retained incomplete-block rows take the reuse_kv path in
+        # alloc_for_extend and allocate no fresh tokens. Mirror that path's
+        # predicate exactly (mem_cache/allocation.py `reuse_kv`, the source of
+        # truth): a row with incomplete_ids but a freed req slot
+        # (kv.holds_kv False) re-allocates a full fresh block.
+        _rem_tokens = self._get_dllm_remain_tokens(
+            needs_fresh_kv=not (req.kv.holds_kv and bool(req.dllm_incomplete_ids)),
+            fresh_extra_charge=self._mamba_gap_budget_for_req(req),
+        )
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
