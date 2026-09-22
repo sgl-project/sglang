@@ -943,6 +943,10 @@ class Envs:
     SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
     SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
     SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
+    # Split the fused MoE front so the 3584x7168 latent down-projection
+    # runs as PTPC FP8 while the router head stays BF16.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_MOE_LATENT_FP8_MIN_TOKENS = EnvInt(8)
     # Quantize the linears an unquantized K3 checkpoint leaves dense to
     # per-output-channel FP8 after load, so the PTPC GEMMs can serve them.
     # Official BF16 weights; this does not require a Quark checkpoint.
