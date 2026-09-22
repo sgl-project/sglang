@@ -19,7 +19,9 @@ from transformers.image_processing_utils import BaseImageProcessor
 import sglang.srt.utils.hf_transformers.config as config_utils
 import sglang.srt.utils.hf_transformers.processor as processor_utils
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
-from sglang.srt.configs.speculators import normalize_speculators_dspark_config
+from sglang.srt.configs.speculators import (
+    normalize_speculators_qwen3_dense_dspark_config,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
     resolve_runtime_config,
@@ -157,7 +159,7 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
                 raw = self._raw_config()
                 raw.update(override)
                 with self.assertRaises(ValueError):
-                    normalize_speculators_dspark_config(raw)
+                    normalize_speculators_qwen3_dense_dspark_config(raw)
 
     def test_normalization_preserves_source_and_does_not_shift_ids_twice(self):
         """Retained canonical IDs must not trigger another -1 on reload, and
@@ -169,9 +171,9 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
         raw["target_hidden_size"] = 32
         original = copy.deepcopy(raw)
 
-        normalized = normalize_speculators_dspark_config(raw)
+        normalized = normalize_speculators_qwen3_dense_dspark_config(raw)
         self.assertEqual(normalized["target_layer_ids"], [1, 4])
-        self.assertIsNone(normalize_speculators_dspark_config(normalized))
+        self.assertIsNone(normalize_speculators_qwen3_dense_dspark_config(normalized))
         self.assertEqual(raw, original)
 
         normalized["layer_types"][0] = "changed"
@@ -194,7 +196,7 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
                 raw[section] = {name: None}
                 original = copy.deepcopy(raw)
 
-                normalized = normalize_speculators_dspark_config(raw)
+                normalized = normalize_speculators_qwen3_dense_dspark_config(raw)
                 self.assertNotIn(name, normalized[section])
                 self.assertEqual(raw, original)
 
@@ -228,7 +230,7 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
         for raw in (native, flat):
             with self.subTest(architecture=raw["architectures"]):
                 original = copy.deepcopy(raw)
-                self.assertIsNone(normalize_speculators_dspark_config(raw))
+                self.assertIsNone(normalize_speculators_qwen3_dense_dspark_config(raw))
                 self.assertEqual(raw, original)
                 config = self._load_local_config(raw)
                 self.assertEqual(config.architectures, raw["architectures"])
@@ -260,7 +262,9 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
                         speculators_model_type="other",
                     )
                     original = copy.deepcopy(raw)
-                    self.assertIsNone(normalize_speculators_dspark_config(raw))
+                    self.assertIsNone(
+                        normalize_speculators_qwen3_dense_dspark_config(raw)
+                    )
                     self.assertEqual(raw, original)
 
                     with tempfile.TemporaryDirectory() as model_dir:

@@ -17,7 +17,7 @@ def _check_alias(config: dict, name: str, expected: Any, source: str) -> None:
         raise ValueError(f"Speculators DSpark {name} conflicts with {source}.")
 
 
-def normalize_speculators_dspark_config(config: dict) -> Optional[dict]:
+def normalize_speculators_qwen3_dense_dspark_config(config: dict) -> Optional[dict]:
     """Return a non-mutating translation, or None for an existing HF layout.
 
     Speculators stores the decoder under ``transformer_layer_config`` and

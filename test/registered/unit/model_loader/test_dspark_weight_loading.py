@@ -227,9 +227,11 @@ class TestDSparkWeightLoading(CustomTestCase):
     def test_native_config_packed_weights_and_backbone_aliases(self):
         # Exercise the existing flat HF export, fused projections, backbone
         # model prefix, and encoder aliases through the production loader.
-        from sglang.srt.configs.speculators import normalize_speculators_dspark_config
+        from sglang.srt.configs.speculators import (
+            normalize_speculators_qwen3_dense_dspark_config,
+        )
 
-        self.config = normalize_speculators_dspark_config(self.config)
+        self.config = normalize_speculators_qwen3_dense_dspark_config(self.config)
         packed_expected = {}
         for index in range(5):
             for packed, sources in (
