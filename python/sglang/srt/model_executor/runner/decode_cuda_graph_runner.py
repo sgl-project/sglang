@@ -26,7 +26,6 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import inspect
 import logging
 import os
@@ -53,7 +52,6 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
     create_attention_graph_variants,
-    create_dsv41_candidate_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
@@ -199,7 +197,6 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-        max_seq_len_override=forward_batch.max_seq_len_override,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
@@ -255,6 +252,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
+        if self.use_ngram_embedding:
+            hf_config = model_runner.model_config.hf_config
+            self.ngram_embedding_n = hf_config.ngram_embedding_n
+            self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
@@ -302,9 +303,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             create_attention_graph_variants(model_runner.model_config.hf_config)
-            or create_dsv41_candidate_graph_variants(
-                model_runner, self.capture_forward_mode, self.captured_req_width
-            )
         )
 
         # --- bucket sizes ---------------------------------------------
@@ -385,16 +383,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
         # --- buffers ---------------------------------------------------
-        logits_buffer_rows = self._next_token_logits_buffer_capacity_rows(
-            self.max_num_token
-        )
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
+                self.model_runner.model_config.vocab_size, rows=self.max_num_token
             ),
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
@@ -417,9 +412,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
-            ),
-            pp_proxy_dspark_hidden_size=(
-                self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
         )
         self.buffers.share_buffers()
@@ -474,10 +466,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
-
-    def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
-        """Rows reserved for the largest shared logits output."""
-        return max_num_tokens
 
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
@@ -788,7 +776,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if variant_label is not None:
             parts.append(variant_label)
         if stream_idx is not None:
-            parts.append(f"stream{stream_idx}")
+            parts.append(f"stream_{stream_idx}")
         self._profile_trace_tag = "_".join(parts)
 
     def _init_profile_context_and_memory_record(self):
@@ -805,6 +793,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             def on_trace_ready(prof):
                 tag = self._profile_trace_tag
+                if tag is None:
+                    # Reachable only if a subclass overrides _capture_one_stream
+                    # without tagging; exporting would collide every flush on
+                    # one name.
+                    logger.warning(
+                        "%s: capture trace flushed with no shape tag; skipping "
+                        "export. A subclass likely overrides _capture_one_stream "
+                        "without calling _set_profile_trace_tag.",
+                        runner_name,
+                    )
+                    return
                 trace_file = os.path.join(
                     trace_dir, f"{runner_name}_{tag}_rank{rank}.json.gz"
                 )
@@ -910,15 +909,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
-        if buffers.num_token_non_padded is not None:
-            buffers.num_token_non_padded[...] = num_tokens
-            if not self.enable_prefill_cp and attn_tp_sharded:
-                local = compute_local_num_token_non_padded(
-                    global_num_token_non_padded=buffers.num_token_non_padded,
-                    num_tokens_per_dp=num_tokens,
-                    sharded=True,
-                )
-                buffers.num_token_non_padded.copy_(local)
+        buffers.num_token_non_padded[...] = num_tokens
+        if (
+            enable_num_token_non_padded()
+            and not self.enable_prefill_cp
+            and attn_tp_sharded
+        ):
+            local = compute_local_num_token_non_padded(
+                global_num_token_non_padded=buffers.num_token_non_padded,
+                num_tokens_per_dp=num_tokens,
+                sharded=True,
+            )
+            buffers.num_token_non_padded.copy_(local)
 
         pp_proxy_tensors = None
         # pipeline parallelism
@@ -999,11 +1001,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            # Maintained only under expert parallelism; None elsewhere so routing
-            # does not mask every row against a never-filled zero count.
-            num_token_non_padded=(
-                buffers.num_token_non_padded if enable_num_token_non_padded() else None
-            ),
+            num_token_non_padded=buffers.num_token_non_padded,
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
@@ -1125,8 +1123,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
-                    # Tagged here, not in capture_one_shape: subclasses override
-                    # that but inherit this loop.
                     self._set_profile_trace_tag(
                         bs, stream_idx, variant_label, attention_variant
                     )
@@ -1300,19 +1296,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                pp_proxy_tensors is not None
-                and self.buffers.pp_proxy_tensors is not None
-            ):
-                # PP + spec verify: the pre-planned load ran without the proxy
-                # (eagle_prepare_for_verify has no access to it), so the
-                # graph's proxy input buffers must be refreshed here -- the
-                # captured graph reads these rows (mirrors fill_from's
-                # side-slot copy).
-                for k, v in pp_proxy_tensors.tensors.items():
-                    buf = self.buffers.pp_proxy_tensors.get(k)
-                    if buf is not None:  # skip markers like __msg_type__
-                        buf[: v.shape[0]].copy_(v)
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1492,8 +1475,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self._process_output_after_replay(output, forward_batch)
-
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -1510,9 +1491,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
-            # Preserve extension fields produced by the eager output processor.
-            return dataclasses.replace(
-                output,
+            return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -1520,22 +1499,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            # Slice in token rows, not request rows: under speculative verify
-            # each request carries captured_req_width tokens (identical for
-            # plain decode, where captured_req_width == 1).
-            return PPProxyTensors(
-                {
-                    k: v[: self.bs * self.captured_req_width]
-                    for k, v in output.tensors.items()
-                }
-            )
-
-    def _process_output_after_replay(self, output, forward_batch: ForwardBatch):
-        """Optional eager tail executed after graph replay and inside its timer."""
-        return output
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

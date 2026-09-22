@@ -266,6 +266,15 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 self._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 6)
 
+    def test_unset_tag_skips_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[8], rank=0, tmp=tmp
+            )
+            prof = mock.Mock()
+            on_trace_ready(prof)  # tag never set by the capture loop
+            prof.export_chrome_trace.assert_not_called()
+
     def test_rank_in_trace_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_self, on_trace_ready = self._build_on_trace_ready(
@@ -293,7 +302,7 @@ class TestProfileTraceTag(CustomTestCase):
     def test_appends_attention_lora_and_stream(self):
         fake_self = _make_fake_self([1])
         fake_self._set_profile_trace_tag(8, 1, "nolora", "sparse")
-        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream1")
+        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream_1")
 
     def test_noop_without_scheduled_profiler(self):
         fake_self = _make_fake_self([1])
