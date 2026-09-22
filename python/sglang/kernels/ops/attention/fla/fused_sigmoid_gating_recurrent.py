@@ -5,6 +5,33 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
+_is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
+
+
+def _select_recurrent_launch_config(
+    n: int,
+    h: int,
+    hv: int,
+    k: int,
+    v: int,
+    is_kda: bool,
+) -> tuple[int, int]:
+    """Select the value tile and warp count for recurrent GDN."""
+    if (
+        _is_hip
+        and _is_gfx95
+        and not is_kda
+        and 0 < n <= 32
+        and h == 4
+        and hv == 16
+        and k == 128
+        and v == 128
+    ):
+        return (8, 4) if n == 1 else (16, 2)
+    return min(triton.next_power_of_2(v), 32), 1
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -69,11 +96,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    if SPLIT_N_HV_GRID:
+        i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        # The GPU wrapper asserts NK == 1. Keep N and HV on independent grid
+        # axes so large GLM5 decode batches do not exceed CUDA's grid limit.
+        i_k = 0
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_n, i_hv = i_nh // HV, i_nh % HV
     # PDL: overlap this kernel's prologue with the producer (the KDA/GDN
     # conv1d_update). All global loads below happen after the wait, so
     # numerics are unchanged. The immediate trigger releases the LAUNCH of
@@ -83,8 +119,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
@@ -360,9 +394,7 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
-    cache_steps: Optional[
-        int
-    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
+    cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
     # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
     # stores pre-norm k / raw v / gate / beta into these per-slot rings,
@@ -396,11 +428,11 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BV, num_warps = _select_recurrent_launch_config(N, H, HV, K, V, is_kda)
+    BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -419,15 +451,17 @@ def fused_sigmoid_gating_delta_rule_update(
 
     NP2_T = triton.next_power_of_2(T)
 
-    grid = (NK, NV, N * HV)
+    split_n_hv_grid = q.device.type == "cuda"
+    grid = (NV, N, HV) if split_n_hv_grid else (NK, NV, N * HV)
 
-    # Per-req stride must match the buffer's allocated dim, not runtime steps
-    # (they can differ under --speculative-adaptive).
-    cache_stride_steps = (
-        intermediate_states_buffer.shape[1]
-        if intermediate_states_buffer is not None
-        else 0
-    )
+    # Adaptive spec changes the runtime draft count without changing the
+    # allocated per-request pitch, which is preserved in stride(0).
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif cache_steps is not None and cache_steps > 0:
+        cache_stride_steps = cache_steps
+    else:
+        cache_stride_steps = 0
 
     # ring strides (per-slot rings are contiguous [num_slots, heads, L, dim];
     # the kernel offsets within a slot with MAX_CACHE_LEN and the dim extents).
@@ -516,6 +550,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        SPLIT_N_HV_GRID=split_n_hv_grid,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

@@ -341,111 +341,6 @@ def _get_padded_input_buffers(
     return e
 
 
-# Multi-seq varlen repack cache for the Phase 2.2 path. Keyed by id(cu_seqlens).
-# Stores: (orig_seq_lens, padded_seq_lens, new_cu_seqlens_tensor,
-#          new_chunk_indices_tensor, new_T_total, padded_input_buffers).
-# All tensors are GPU-side and pre-allocated at cache build time. Per-call the
-# kernel reads from / writes to these buffers; we copy caller's input slices in
-# and output slices back (only the valid prefix of each seq).
-_multiseq_repack_cache = {}
-
-_caller_layout_O_cache = {}
-
-
-def _get_caller_layout_O_buffer(multiseq_info, dtype, V_dim, device):
-    """Per-shape cached output buffer at caller's contiguous layout (sum of
-    seq_lens, no padding gaps). Filled by per-seq copies from K4's padded O."""
-    caller_T = multiseq_info["caller_T"]
-    H_x_V = multiseq_info.get("_H_V")  # not strictly needed since we fix B=1 H known
-    key = (caller_T, V_dim, dtype, device.index if device.index is not None else 0)
-    e = _caller_layout_O_cache.get(key)
-    if e is None:
-        # B=1 enforced upstream when multiseq_info is built.
-        e = torch.empty(
-            1,
-            caller_T,
-            multiseq_info["q_pad"].shape[2],
-            V_dim,
-            dtype=dtype,
-            device=device,
-        )
-        _caller_layout_O_cache[key] = e
-    return e
-
-
-def _get_multiseq_repack_info(cu_seqlens, q, k, v, g, beta, BT, device):
-    """Build (and cache) the padded layout for multi-seq varlen with non-aligned
-    seqs. Returns None if all seqs are already 64-aligned (caller can use the
-    existing varlen_pure path)."""
-    import weakref
-
-    key = id(cu_seqlens)
-    cached = _multiseq_repack_cache.get(key)
-    if cached is not None:
-        wref, e = cached
-        if wref() is cu_seqlens:
-            return e
-        # id collision after GC: rebuild
-        del _multiseq_repack_cache[key]
-    cu_cpu = cu_seqlens.cpu().tolist()
-    seq_lens = [cu_cpu[i + 1] - cu_cpu[i] for i in range(len(cu_cpu) - 1)]
-    if all(sl % BT == 0 for sl in seq_lens):
-        _multiseq_repack_cache[key] = (weakref.ref(cu_seqlens), None)
-        return None
-    padded_lens = [((sl + BT - 1) // BT) * BT for sl in seq_lens]
-    new_cu = [0]
-    for pl in padded_lens:
-        new_cu.append(new_cu[-1] + pl)
-    new_T_total = new_cu[-1]
-    B = q.shape[0]
-    H = q.shape[2]
-    K = q.shape[3]
-    # Pre-allocated padded input buffers. q/k/v/beta tail = 0 (zero MMA), g
-    # tail = -1e3 sentinel (zero gate activation). The PER-SEQ tail regions
-    # are between (new_cu[i] + seq_lens[i], new_cu[i+1]) — pre-fill once.
-    q_pad = torch.zeros(B, new_T_total, H, K, dtype=q.dtype, device=device)
-    k_pad = torch.zeros_like(q_pad)
-    v_pad = torch.zeros(B, new_T_total, H, v.shape[3], dtype=v.dtype, device=device)
-    beta_pad = torch.zeros(B, new_T_total, H, dtype=beta.dtype, device=device)
-    g_pad = torch.zeros(B, new_T_total, H, K, dtype=g.dtype, device=device)
-    for i, (sl, pl) in enumerate(zip(seq_lens, padded_lens)):
-        if sl < pl:
-            tail_start = new_cu[i] + sl
-            tail_end = new_cu[i + 1]
-            g_pad[:, tail_start:tail_end] = -1000.0
-    new_cu_tensor = torch.tensor(new_cu, dtype=cu_seqlens.dtype, device=device)
-    new_chunk_indices = prepare_chunk_indices(new_cu_tensor, BT)
-    # Build index map: dst_indices[i] = position in padded layout where orig
-    # row i lives. Used by index_copy_ to do the scatter in one op (instead of
-    # N_seqs × 5 separate slice copies, which cost ~5us each in Python).
-    T_total_orig = cu_cpu[-1]
-    dst_indices_list = []
-    for i, sl in enumerate(seq_lens):
-        for j in range(sl):
-            dst_indices_list.append(new_cu[i] + j)
-    dst_indices = torch.tensor(dst_indices_list, dtype=torch.long, device=device)
-    # Mark this cu_seqlens as VARLEN_PURE eligible — every seq in the new
-    # layout is 64-aligned by construction.
-    _varlen_pure_cache[id(new_cu_tensor)] = True
-    e = {
-        "seq_lens": seq_lens,
-        "padded_lens": padded_lens,
-        "new_cu": new_cu,
-        "new_T_total": new_T_total,
-        "new_cu_tensor": new_cu_tensor,
-        "new_chunk_indices": new_chunk_indices,
-        "q_pad": q_pad,
-        "k_pad": k_pad,
-        "v_pad": v_pad,
-        "g_pad": g_pad,
-        "beta_pad": beta_pad,
-        "dst_indices": dst_indices,
-        "T_total_orig": T_total_orig,
-    }
-    _multiseq_repack_cache[key] = (weakref.ref(cu_seqlens), e)
-    return e
-
-
 def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
     """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
     key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs)
@@ -922,8 +817,7 @@ def chunk_kda_fwd(
     if needs_eqlen_pad:
         if B != 1 and T % BT != 0:
             raise NotImplementedError(
-                f"eqlen with B>1 and T % {BT} != 0 not supported "
-                f"(got B={B}, T={T})."
+                f"eqlen with B>1 and T % {BT} != 0 not supported (got B={B}, T={T})."
             )
         T_padded = ((T + CPB_BT - 1) // CPB_BT) * CPB_BT
         # Pre-allocated padded scratch buffers (per (B,T_padded,H,K,dtype) cache

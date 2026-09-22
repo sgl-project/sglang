@@ -18,7 +18,7 @@ COMMON_ARGS = [
     "--enable-flashinfer-allreduce-fusion",
     "--attention-backend=trtllm_mha",
     "--mem-fraction-static=0.8",
-    "--mamba-scheduler-strategy=extra_buffer",
+    "--mamba-radix-cache-strategy=extra_buffer",
     "--enable-multimodal",
     "--enable-metrics",
     "--nccl-port",

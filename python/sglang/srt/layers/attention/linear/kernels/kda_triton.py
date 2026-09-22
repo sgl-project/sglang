@@ -28,6 +28,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
+    supports_track_state_snapshot: bool = True
 
     def packed_decode(
         self,
@@ -171,7 +172,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
@@ -229,6 +230,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -245,5 +247,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
         )

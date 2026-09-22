@@ -128,12 +128,12 @@ def bench_fused_scale_residual_norm_scale_shift(
 
 
 if __name__ == "__main__":
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("Benchmark: fused_norm_scale_shift")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
     bench_fused_norm_scale_shift.run(print_data=True)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("Benchmark: fused_scale_residual_norm_scale_shift")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
     bench_fused_scale_residual_norm_scale_shift.run(print_data=True)
