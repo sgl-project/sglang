@@ -25,7 +25,7 @@
 
 use futures::future::join_all;
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -69,7 +69,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -554,7 +554,7 @@ async fn wait_for_inflight_http(ctx: &Arc<AppContext>, want: usize) {
 /// response BODY finishing, not the handler returning. A streaming completion
 /// hands back its headers immediately, so a count released at handler exit
 /// would read 0 for the entire window the heartbeat exists to explain — the
-/// same blind spot `active_load.inflight_count()` has, reproduced in the
+/// same blind spot `router_inflight_load.inflight_count()` has, reproduced in the
 /// replacement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inflight_http_counts_a_streaming_response_until_its_body_finishes() {
@@ -623,7 +623,7 @@ async fn inflight_http_counts_a_streaming_response_until_its_body_finishes() {
 
 /// Every route is instrumented, not only the proxied ones. `/metrics`,
 /// `/readyz` and a 404 are exchanges axum's drain waits on too, and they are
-/// exactly the traffic `active_load` cannot see — so a guard that leaked on a
+/// exactly the traffic `router_inflight_load` cannot see — so a guard that leaked on a
 /// non-proxied route would leave the heartbeat permanently busy and turn the
 /// drain report back into noise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

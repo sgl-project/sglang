@@ -1191,7 +1191,11 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
-    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+    layer_names = [
+        *TextEncoder.layer_names,
+        "model.visual.blocks",
+        "model.visual.deepstack_merger_list",
+    ]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",
@@ -1216,8 +1220,11 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
 
     def __init__(self, config):
         super().__init__(config)
+        quant_config = config.quant_config
         config = config.arch_config
-        self.model = Qwen3VLModel(config)
+        self.model = Qwen3VLModel(
+            config, quant_config=quant_config, use_tensor_parallel=True, prefix="model"
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
