@@ -4693,10 +4693,13 @@ class DeepseekV4Model(nn.Module):
             next_input = []
             # The next layer can consume a collapsed input only if no Engram
             # or row selection changes the residual between the two layers.
+            # The HIP fused boundary carries the residual in pending_post and
+            # leaves hidden_states None; it never consumes a collapsed input.
             next_combined = (
                 []
                 if (
-                    self.config.model_type == "deepseek_v41"
+                    hidden_states is not None
+                    and self.config.model_type == "deepseek_v41"
                     and (
                         128 <= hidden_states.shape[0] <= 384
                         or (
@@ -4757,6 +4760,8 @@ class DeepseekV4Model(nn.Module):
                             capture_dspark=capture_dspark,
                         )
                     )
+                    # the fused boundary never publishes a collapsed input for the next layer
+                    precomputed_attn = combined_attn = normalized_attn = None
                     continue
                 hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
