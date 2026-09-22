@@ -375,9 +375,9 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
-# ============================ DeepSelect SM90 ============================= #
-# Keep this target isolated: DeepSelect relies on C++20, sm_90a-only code and
-# non-flushed FP32 subnormals for its integer-count simulation.
+# ============================ DeepSelect ============================= #
+# Keep this target isolated: DeepSelect relies on C++20 and non-flushed FP32
+# subnormals for its integer-count simulation.
 if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
     set(DEEPSELECT_SOURCES
         "csrc/deepselect/api.cpp"
@@ -385,6 +385,22 @@ if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
         "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_1024_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu"
         "csrc/deepselect/cuda_kernels/v3_fp32/instantiations/value_fp32_outidx_i32_sv0_si0_rv1_maxtopk_4096_numthreads_256_occupancy_1_b_4096_b2_4096_tma_3.cu"
     )
+    set(DEEPSELECT_CUDA_ARCH_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
+    set(DEEPSELECT_COMPILED_ARCH_DEFINITIONS
+        DEEPSELECT_HAS_SM90=1
+    )
+    if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.9")
+        list(APPEND DEEPSELECT_CUDA_ARCH_FLAGS
+            "-gencode=arch=compute_100a,code=sm_100a"
+            "-gencode=arch=compute_103a,code=sm_103a"
+        )
+        list(APPEND DEEPSELECT_COMPILED_ARCH_DEFINITIONS
+            DEEPSELECT_HAS_SM100=1
+            DEEPSELECT_HAS_SM103=1
+        )
+    endif()
 
     Python_add_library(deepselect_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPSELECT_SOURCES})
     set_target_properties(deepselect_ops PROPERTIES
@@ -396,7 +412,6 @@ if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
         $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wno-deprecated-declarations>
         $<$<COMPILE_LANGUAGE:CUDA>:
             -O3
-            -gencode=arch=compute_90a,code=sm_90a
             --expt-relaxed-constexpr
             --expt-extended-lambda
             --use_fast_math
@@ -408,6 +423,12 @@ if ("${CUDAToolkit_VERSION}" VERSION_GREATER_EQUAL "12.0")
             -Wno-deprecated-declarations
             --threads=${SGL_KERNEL_COMPILE_THREADS}>
     )
+    foreach(DEEPSELECT_CUDA_ARCH_FLAG IN LISTS DEEPSELECT_CUDA_ARCH_FLAGS)
+        target_compile_options(deepselect_ops PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:${DEEPSELECT_CUDA_ARCH_FLAG}>
+        )
+    endforeach()
+    target_compile_definitions(deepselect_ops PRIVATE ${DEEPSELECT_COMPILED_ARCH_DEFINITIONS})
     target_include_directories(deepselect_ops PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/csrc/deepselect
         ${CMAKE_CURRENT_LIST_DIR}/csrc/deepselect/3rdparty/kerutils/include

@@ -1,22 +1,42 @@
-"""Correctness tests for the SM90 DeepSelect AOT operator."""
+"""Correctness tests for the DeepSelect FP32 AOT operator."""
 
 import pytest
 import torch
 
 
-def _has_deepselect_sm90() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+def _has_deepselect() -> bool:
+    if not torch.cuda.is_available():
         return False
     try:
-        from sgl_kernel import deepselect_topk_fp32  # noqa: F401
+        from sgl_kernel import is_deepselect_supported
     except ImportError:
         return False
-    return True
+    return is_deepselect_supported()
 
 
 pytestmark = pytest.mark.skipif(
-    not _has_deepselect_sm90(), reason="requires an sgl-kernel SM90 build"
+    not _has_deepselect(), reason="requires a compatible sgl-kernel DeepSelect build"
 )
+
+
+def test_deepselect_reports_current_architecture():
+    from sgl_kernel import (
+        get_deepselect_supported_architectures,
+        is_deepselect_supported,
+    )
+
+    major, minor = torch.cuda.get_device_capability()
+    assert major * 10 + minor in get_deepselect_supported_architectures()
+    assert is_deepselect_supported()
+
+
+def test_deepselect_rejects_uncompiled_architecture(monkeypatch):
+    from sgl_kernel import is_deepselect_supported
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: (12, 0)
+    )
+    assert not is_deepselect_supported()
 
 
 @pytest.mark.parametrize(

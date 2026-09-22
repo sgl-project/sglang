@@ -1,4 +1,4 @@
-"""AOT FP32 DeepSelect Top-K for NVIDIA Hopper (SM90)."""
+"""AOT FP32 DeepSelect Top-K for supported NVIDIA CUDA architectures."""
 
 from __future__ import annotations
 
@@ -8,6 +8,22 @@ from . import deepselect_ops as _deepselect_ops  # noqa: F401
 
 _INPUT_ALIGNMENT_BYTES = 1024
 _OUTPUT_ALIGNMENT_BYTES = 32
+
+
+def get_deepselect_supported_architectures() -> tuple[int, ...]:
+    """Return CUDA compute capabilities compiled into the AOT extension."""
+    return tuple(_deepselect_ops.get_supported_architectures())
+
+
+def is_deepselect_supported(device=None) -> bool:
+    """Return whether the AOT extension contains code for a CUDA device."""
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except (AssertionError, RuntimeError, ValueError):
+        return False
+    return major * 10 + minor in get_deepselect_supported_architectures()
 
 
 def _aligned_empty(rows: int, cols: int, alignment_bytes: int, dtype, device):
@@ -24,6 +40,12 @@ def deepselect_topk_fp32(
         raise ValueError("input must be a 2D float32 tensor")
     if not input.is_cuda:
         raise ValueError("input must be a CUDA tensor")
+    if not is_deepselect_supported(input.device):
+        major, minor = torch.cuda.get_device_capability(input.device)
+        raise RuntimeError(
+            f"deepselect_topk_fp32 was not compiled for SM{major}{minor}; "
+            f"compiled architectures: {get_deepselect_supported_architectures()}"
+        )
     if not 0 < topk <= min(4096, input.shape[1]):
         raise ValueError("topk must be in [1, min(4096, input.shape[1])]")
 

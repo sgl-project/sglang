@@ -11,7 +11,6 @@ else:
     import torch
     from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
     from sgl_kernel.load_utils import (
-        _get_compute_capability,
         _load_architecture_specific_ops,
         _preload_cuda_library,
     )
@@ -136,10 +135,14 @@ else:
         from sgl_kernel.elementwise import gelu_quick
         from sgl_kernel.top_k import deepseek_v4_topk_transform_512
 
-    if torch.version.cuda is not None and _get_compute_capability() == 90:
+    if torch.version.cuda is not None:
         try:
-            from sgl_kernel.deepselect import deepselect_topk_fp32
-        except ImportError:
+            from sgl_kernel.deepselect import (
+                deepselect_topk_fp32,
+                get_deepselect_supported_architectures,
+                is_deepselect_supported,
+            )
+        except (ImportError, OSError):
             pass
 
     if hasattr(torch.version, "musa") and torch.version.musa is not None:

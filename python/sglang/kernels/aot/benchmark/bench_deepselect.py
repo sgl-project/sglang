@@ -1,12 +1,14 @@
-"""Benchmark SM90 DeepSelect FP32 Top-K against torch.topk."""
+"""Benchmark DeepSelect FP32 AOT Top-K against torch.topk."""
 
 import itertools
 
 import torch
 import triton.testing
 
-from sgl_kernel import deepselect_topk_fp32
-
+from sgl_kernel import (
+    deepselect_topk_fp32,
+    is_deepselect_supported,
+)
 
 configs = list(
     itertools.product([1, 6, 32], [16384, 32768, 65536, 131072], [512, 2048])
@@ -46,6 +48,8 @@ def benchmark(rows, width, topk, provider):
 
 
 if __name__ == "__main__":
-    if torch.cuda.get_device_capability() != (9, 0):
-        raise RuntimeError("This benchmark requires an SM90 GPU")
+    if not is_deepselect_supported():
+        raise RuntimeError(
+            "This benchmark requires a CUDA architecture compiled into deepselect_ops"
+        )
     benchmark.run(print_data=True)
