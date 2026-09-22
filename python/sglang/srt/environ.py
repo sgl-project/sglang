@@ -1658,6 +1658,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in GLM-5.2 TP4/gfx950 target-attention projection specializations.
+    # The M=4 path fuses QKV-A with both latent RMSNorms and uses tuned BF16
+    # GEMMs for Q-B and O; all other shapes/configurations stay native.
+    SGLANG_ROCM_FUSED_TARGET_ATTN_PROJECTIONS = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

@@ -395,19 +395,30 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
+        fused_k_pe = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
+            fused_qkv_a = self.try_rocm_target_qkv_a_norm(hidden_states, forward_batch)
+            if fused_qkv_a is None:
+                q, latent_cache = (
+                    get_attn_tp_context()
+                    .fetch_qkv_latent()
+                    .split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ],
+                        dim=-1,
+                    )
                 )
-            )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
+                k_nope = latent_cache[..., : self.kv_lora_rank]
+            else:
+                q, k_nope, fused_k_pe = fused_qkv_a
+                latent_cache = None
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if fused_qkv_a is not None:
+                pass
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -487,7 +498,7 @@ class DeepseekMLARocmForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, forward_batch)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -512,7 +523,7 @@ class DeepseekMLARocmForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q, forward_batch)
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -544,7 +555,13 @@ class DeepseekMLARocmForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+        if fused_k_pe is None:
+            q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+        else:
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_pe = fused_k_pe.unsqueeze(1)
 
         if q_replicate_active:
             q_nope_out = (
@@ -932,7 +949,7 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        output = self.o_proj_forward(attn_bmm_output, forward_batch)
 
         if self.next_skip_topk is None:
             return output

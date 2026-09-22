@@ -2174,6 +2174,40 @@ class DeepseekV2AttentionMLA(
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 
+        self._use_rocm_target_attn_projection_fusion = False
+        if (
+            envs.SGLANG_ROCM_FUSED_TARGET_ATTN_PROJECTIONS.get()
+            and _is_hip
+            and _is_gfx95_supported
+            and getattr(config, "model_type", None) == "glm5_next_text"
+            and not is_nextn
+            and self.use_dsa
+            and get_parallel().tp_size == 4
+            and attn_tp_size == 4
+            and not get_parallel().dcp_enabled
+            and alt_stream is None
+            and hidden_size == 6144
+            and self.num_local_heads == 16
+            and q_lora_rank == 2048
+            and kv_lora_rank == 512
+            and self.qk_head_dim == 256
+            and tuple(self.fused_qkv_a_proj_with_mqa.weight.shape) == (2624, 6144)
+            and tuple(self.q_b_proj.weight.shape) == (4096, 2048)
+            and tuple(self.o_proj.weight.shape) == (6144, 4096)
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+            and self.q_b_proj.weight.dtype == torch.bfloat16
+            and self.o_proj.weight.dtype == torch.bfloat16
+            and not self.o_proj.reduce_results
+            and self.o_proj.input_is_parallel
+        ):
+            from sglang.kernels.ops.attention.mla.hip_gfx950 import (
+                is_target_projection_fusion_available,
+            )
+
+            self._use_rocm_target_attn_projection_fusion = (
+                is_target_projection_fusion_available()
+            )
+
         self.init_mha_forward()
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
@@ -2454,7 +2488,52 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
-    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+    def _can_use_rocm_target_projection_fusion(
+        self, forward_batch: Optional[ForwardBatch]
+    ) -> bool:
+        return (
+            self._use_rocm_target_attn_projection_fusion
+            and forward_batch is not None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and not get_attn_tp_context().input_scattered
+            and not get_parallel().dcp_enabled
+        )
+
+    def try_rocm_target_qkv_a_norm(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self._can_use_rocm_target_projection_fusion(forward_batch) or getattr(
+            self.fused_qkv_a_proj_with_mqa, "set_lora", False
+        ):
+            return None
+
+        from sglang.kernels.ops.attention.mla.hip_gfx950 import target_qkv_a_norm
+
+        return target_qkv_a_norm(
+            hidden_states,
+            self.fused_qkv_a_proj_with_mqa.weight,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            eps=self.q_a_layernorm.variance_epsilon,
+        )
+
+    def q_b_proj_forward(
+        self,
+        q_lora: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        if self._can_use_rocm_target_projection_fusion(forward_batch) and not getattr(
+            self.q_b_proj, "set_lora", False
+        ):
+            from sglang.kernels.ops.attention.mla.hip_gfx950 import target_q_b_proj
+
+            q = target_q_b_proj(q_lora, self.q_b_proj.weight)
+            if q is not None:
+                return q.view(-1, self.num_local_heads, self.qk_head_dim)
+
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
@@ -2467,6 +2546,21 @@ class DeepseekV2AttentionMLA(
         else:
             q = self.q_b_proj(q_lora)[0]
         return q.view(-1, self.num_local_heads, self.qk_head_dim)
+
+    def o_proj_forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        if self._can_use_rocm_target_projection_fusion(forward_batch) and not getattr(
+            self.o_proj, "set_lora", False
+        ):
+            from sglang.kernels.ops.attention.mla.hip_gfx950 import target_o_proj
+
+            output = target_o_proj(hidden_states, self.o_proj.weight)
+            if output is not None:
+                return output
+        return self.o_proj(hidden_states)[0]
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
