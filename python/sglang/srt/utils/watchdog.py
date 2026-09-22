@@ -10,8 +10,7 @@ from contextlib import contextmanager
 from multiprocessing import Process
 from typing import Callable, List, Optional
 
-import psutil
-
+from sglang.srt.utils.common import get_parent_process
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
@@ -117,7 +116,7 @@ class WatchdogRaw:
         self.soft = soft
         self.dump_info = dump_info
 
-        self.parent_process = psutil.Process().parent()
+        self.parent_process = get_parent_process()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 

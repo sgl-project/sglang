@@ -12,6 +12,7 @@ from sglang.cli.serve_backends import (
     ServeRequest,
 )
 from sglang.cli.utils import get_is_diffusion_model, get_model_path, try_get_model_path
+from sglang.srt.entrypoints import early_forkserver
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
 
@@ -206,6 +207,9 @@ def serve(args, extra_argv):
         if registered.backend.requires_model_path and request.model_path is None:
             get_model_path(request.argv)  # Raise the existing actionable CLI error.
 
+        if registered.name != "llm":
+            # The preloaded forkserver serves the LLM engine's workers only.
+            early_forkserver.stop()
         registered.backend.run(request)
     finally:
         kill_process_tree(os.getpid(), include_parent=False)

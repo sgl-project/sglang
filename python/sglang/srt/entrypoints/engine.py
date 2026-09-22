@@ -57,6 +57,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
+from sglang.srt.entrypoints import early_forkserver
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
 )
@@ -1871,7 +1872,10 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    mp.set_start_method(
+        early_forkserver.start_method(enable_memory_saver=cfg.enable_memory_saver),
+        force=True,
+    )
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:

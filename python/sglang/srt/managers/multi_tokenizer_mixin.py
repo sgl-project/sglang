@@ -31,7 +31,6 @@ import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
-import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -67,6 +66,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_parent_process,
     kill_itself_when_parent_died,
     kill_process_tree,
 )
@@ -641,7 +641,7 @@ def run_multi_detokenizer_router_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)
-    parent_process = psutil.Process().parent()
+    parent_process = get_parent_process()
 
     router = None
     try:
