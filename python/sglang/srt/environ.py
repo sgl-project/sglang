@@ -654,6 +654,9 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Run PP tensor communication on a dedicated stream so asynchronous sends
+    # do not fence the next forward through the scheduler stream.
+    SGLANG_PP_COMM_OVERLAP = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================
@@ -675,9 +678,6 @@ class Envs:
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
-    # TODO(DSV4): @ispobock this has bug on main branch when retract
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
-    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================
@@ -750,6 +750,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # HiCache host<->device transfers use the TMA staging kernel when the GPU
+    # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
+    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1075,6 +1078,9 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
+    # layout. The scheduler continues to allocate 256-token logical pages.
+    SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1554,6 +1560,10 @@ class Envs:
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
+    # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
+    # Emits MXFP8 when wo_b supports it, otherwise BF16.
+    SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.

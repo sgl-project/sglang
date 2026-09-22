@@ -75,6 +75,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
     tool_calls_block_name = "function_calls"
     invoke_tag_name = "invoke"
     parameter_tag_name = "parameter"
+    strip_string_param_value: bool = True
 
     def __init__(self):
         super().__init__()
@@ -168,7 +169,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             last_match_end = match.end()
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters[param_name] = param_value.strip()
+                parameters[param_name] = (
+                    param_value.strip()
+                    if self.strip_string_param_value
+                    else param_value
+                )
             else:
                 # Try to parse as JSON for other types
                 try:

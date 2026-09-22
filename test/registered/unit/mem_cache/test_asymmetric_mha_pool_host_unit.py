@@ -84,7 +84,14 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         host = _make_host("page_first")
         host.page_num = 4
         host.v_head_dim = 8
-        host.device_pool = SimpleNamespace(device="cuda")
+        host.device_pool = SimpleNamespace(
+            device="cuda",
+            head_num=host.head_num,
+            head_dim=host.head_dim,
+            v_head_dim=host.v_head_dim,
+            store_dtype=host.dtype,
+            hicache_write_back_staging=None,
+        )
         cpu_empty = torch.empty
 
         def _cpu_empty(shape, *, dtype, device):

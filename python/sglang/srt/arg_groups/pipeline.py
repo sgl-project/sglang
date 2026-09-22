@@ -163,6 +163,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
+        handle_nvfp4_prefill_kv_dequant_dtype,
         handle_page_major_kv_layout,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
@@ -258,6 +259,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_deterministic_inference, server_args)
+    run_hook(handle_nvfp4_prefill_kv_dequant_dtype, server_args)
     run_hook(handle_attention_backend_compatibility, server_args)
     # Must run after the attention backend is resolved so the trtllm_mla
     # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
@@ -334,6 +336,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     run_hook(validate_cutedsl_a2a_token_budget, server_args)
+
+    from sglang.srt.arg_groups.mega_moe_hook import (
+        validate_mega_moe_token_budget_for_model,
+    )
+
+    run_hook(validate_mega_moe_token_budget_for_model, server_args)
 
     # Handle model loading format.
     run_hook(handle_load_format, server_args)

@@ -220,7 +220,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size == 0
             and mambaish is not None
             and bool(mambaish.full_attention_layer_ids)
-            and kvc.ps.pp_size > 1
+            and kvc.pp_size > 1
         )
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
@@ -410,14 +410,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                k = model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
+                from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                    get_kv_cache_quant_method,
+                    resolve_kv_cache_quant,
                 )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+
+                quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
+                if quant_name is None:
+                    raise ValueError(
+                        "FP4 storage dtype requires an explicit KV recipe name."
+                    )
+                quant_method = get_kv_cache_quant_method(
+                    quant_name,
+                    num_layers=effective_num_layers,
+                    device=kvc.device,
+                    page_size=kvc.page_size,
+                )
+                quant_method.configure_attention_backends_from_server_args(
+                    kvc.server_args
+                )
+                cell_size = quant_method.compute_cell_size(
+                    n,
+                    model_config.head_dim,
+                    effective_num_layers,
+                    kv_size,
+                )
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (
@@ -860,7 +877,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self._swa_cap = compute_swa_request_cap(
             page_size=kvc.page_size,
             window=kvc.sliding_window_size,
-            attn_dp_size=kvc.ps.attn_dp_size,
+            attn_dp_size=kvc.attn_dp_size,
         )
 
     @staticmethod
@@ -951,6 +968,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     is the request-scoped fixed pools that do not scale with full_token.
     """
 
+    # object.__new__ stubs (SWA floor tests) skip __init__
+    _dspark_draft_on_bf16 = False
+
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
@@ -969,6 +989,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
+        # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
+        # under-count that ring (640 vs 1024). MTP keeps the old inflation.
+        self._dspark_draft_on_bf16 = bool(
+            self._unified_fp8 and kvc.spec_algorithm.is_dspark()
+        )
         # Row width across both unified pools: 1024 B bf16, 640 B fp8.
         self._unified_row_bytes = dsv4_unified_row_bytes(
             self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
@@ -990,7 +1015,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
         ]
-        if kvc.ps.pp_size > 1:
+        if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
@@ -1007,9 +1032,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
-        self.attn_dp_size = kvc.ps.attn_dp_size
+        self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            get_schedule().max_running_requests // kvc.attn_dp_size
             if get_schedule().max_running_requests is not None
             else None
         )
@@ -1079,8 +1104,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self._assert_ring_serves_draft_tokens(
                 max_speculative_num_draft_tokens() or 0
             )
-
-        from sglang.srt.runtime_context import get_exec
 
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
@@ -1380,20 +1403,32 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
         """Unified_kv SWA is a fixed per-request ring, sized by concurrency
-        (num_req_slots) rather than by full_token. Return its byte footprint
-        across all full layers, inflated for the draft worker the same way as the
-        per-token coeff. Returns 0 on the non-unified path (where SWA is already
-        accounted per-token)."""
+        (num_req_slots) rather than by full_token. MTP inflates the target ring
+        by _spec_infl; DSpark+fp8 adds a bf16 draft ring instead (640 vs 1024).
+        Returns 0 on the non-unified path (SWA already counted per-token)."""
         if not self._unified:
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
-        ring_bytes = (
+        target_ring = (
             num_req_slots
             * self._swa_ring_size
             * self._unified_row_bytes
             * self.num_layers_total
         )
-        return int(ring_bytes * self._spec_infl)
+        if self._dspark_draft_on_bf16:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                dsv4_unified_row_bytes,
+            )
+
+            draft_row = dsv4_unified_row_bytes(
+                self.qk_nope_head_dim, self.qk_rope_head_dim, fp8=False
+            )
+            # 1 layer is what the shipped DSpark drafts allocate. A multi-stage
+            # draft would under-count by ~9 MB/layer (128-wide window, ~65 req
+            # slots), which the (T+1)/T on bytes_per_full_token already covers.
+            draft_ring = num_req_slots * self._swa_ring_size * draft_row
+            return int(target_ring + draft_ring)
+        return int(target_ring * self._spec_infl)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -1471,6 +1506,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         logger.info(
             f"DSV4 memory calculation: unified={self._unified}, "
             f"unified_fp8={self._unified_fp8}, "
+            f"dspark_draft_bf16={self._dspark_draft_on_bf16}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
