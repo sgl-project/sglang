@@ -170,7 +170,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        self.state_item_lens_sums = [sum(lens) for lens in args.state_item_lens]
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -696,6 +696,16 @@ class CommonKVManager(BaseKVManager):
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
         self._deferred_ack_targets[room] = (decode_ip, decode_port)
+
+    def get_state_transfer_bytes(self, component: int, indices) -> int:
+        row_bytes = self.state_item_lens_sums[component]
+        if self.kv_args.state_types[component] == StateType.DSA_TAIL:
+            # indices = [req_pool_idx, start, first_n, 0, second_n, tail_size];
+            # only the live slots of the one ring row move.
+            if len(indices) == 0:
+                return 0
+            return (indices[2] + indices[4]) * row_bytes // indices[5]
+        return len(indices) * row_bytes
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1585,10 +1595,9 @@ class CommonKVSender(BaseKVSender):
         if state_indices:
             for component, component_indices in enumerate(state_indices):
                 if component_indices is not None:
-                    # Each component has its own slot size (e.g. Mamba vs
-                    # DFlash ring). Mixing counts and sizes creates cross-products.
-                    self._transfer_state_bytes += len(component_indices) * sum(
-                        self.kv_mgr.kv_args.state_item_lens[component]
+                    # Slot sizes differ per component (a Mamba slot vs an SWA page).
+                    self._transfer_state_bytes += self.kv_mgr.get_state_transfer_bytes(
+                        component, component_indices
                     )
 
     def _prepare_send_indices(
