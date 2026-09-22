@@ -33,12 +33,14 @@ from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
     cp_shard_hidden_states,
     cp_split_before_forward,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -112,12 +114,25 @@ class PrefillCPBCGInput:
     input_embeds: torch.Tensor
     positions: torch.Tensor
     input_ids: Optional[torch.Tensor] = None
+    global_input_ids: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
+        strategy = get_cp_strategy()
+        global_id_capacity = 0
+        if (
+            isinstance(strategy, InterleaveCPStrategy)
+            and get_moe_a2a_backend().is_none()
+        ):
+            align = get_cp_padding_align_size()
+            local_capacity = (
+                runner.max_num_tokens + strategy.cp_size - 1
+            ) // strategy.cp_size
+            local_capacity = (local_capacity + align - 1) // align * align
+            global_id_capacity = strategy.cp_size * local_capacity
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -132,6 +147,11 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
                 input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                global_input_ids=(
+                    torch.zeros((global_id_capacity,), dtype=torch.int64)
+                    if global_id_capacity
+                    else None
+                ),
                 num_token_non_padded=torch.zeros((), dtype=torch.int32),
             )
 
@@ -288,10 +308,17 @@ class PrefillCPBCGInput:
         forward_batch.input_embeds = input_embeds
         forward_batch._cp_positions = positions
         # Keep the global input_ids field intact: the runner uses its length to
-        # select the global capture bucket. The DSV4 body consumes this fixed,
-        # rank-local view for hash routing and MegaMoE.
+        # select the global capture bucket. MegaMoE routes local rows, whereas
+        # TP-MoE all-gathers hidden rows in CP rank order before routing.
         forward_batch._cp_input_ids = input_ids
-        forward_batch.input_ids_global = input_ids
+        if self.global_input_ids is not None:
+            global_ids = cp_interleave_input_ids(global_input_ids, forward_batch)
+            if global_ids.numel() > self.global_input_ids.numel():
+                raise RuntimeError("CP global token IDs exceed the capture buffer")
+            forward_batch.input_ids_global = self.global_input_ids[: global_ids.numel()]
+            forward_batch.input_ids_global.copy_(global_ids)
+        else:
+            forward_batch.input_ids_global = input_ids
         if forward_batch.num_token_non_padded is not None:
             assert self.num_token_non_padded is not None
             metadata = forward_batch.attn_cp_metadata

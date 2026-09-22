@@ -7,10 +7,19 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-from sglang.srt.models.deepseek_v4 import MM_PAD_SHIFT_VALUE, DeepseekV4ForCausalLM
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
+from sglang.srt.models.deepseek_v4 import (
+    MM_PAD_SHIFT_VALUE,
+    DeepseekV4ForCausalLM,
+    _v41_vision_a2a_supported,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_cp_test_utils import cp_context, simulated_collective
 from sglang.test.test_utils import CustomTestCase
@@ -21,9 +30,115 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 MODEL = "sglang.srt.models.deepseek_v4"
 RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 IMAGE_ID = 129264
+BCG = "sglang.srt.layers.cp.bcg"
+PREFILL_GRAPH = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
 
 
 class TestDSV41MultimodalCP(CustomTestCase):
+    def test_cp_bcg_defers_image_batches_to_eager_vision_path(self):
+        runner = NS(
+            max_context_size=None,
+            enable_lora=False,
+            enable_cp_bcg_capture=True,
+            model_runner=NS(model=NS(vision=object())),
+            can_replay_locally=Mock(return_value=True),
+            _has_inactive_dp_rank=Mock(return_value=False),
+            prefill_cp_bcg_input=NS(select_replay_bucket_for_batch=lambda **_: 8),
+            capture_num_tokens=[8],
+            _backend_can_run_prefill_cuda_graph=None,
+        )
+        batch = NS(
+            global_num_tokens_cpu=None,
+            batch_size=1,
+            input_ids=torch.arange(8),
+            input_embeds=None,
+            replace_embeds=None,
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[8],
+            forward_mode=ForwardMode.EXTEND,
+            global_forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=None,
+            return_logprob=False,
+            mm_inputs=[MultimodalInputs(mm_items=[])],
+        )
+        with patch(PREFILL_GRAPH + ".is_cp_active", return_value=True):
+            self.assertFalse(PrefillCudaGraphRunner.can_run_graph(runner, batch))
+            batch.mm_inputs = [None]
+            self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, batch))
+
+    def test_vision_megamoe_prefill_is_admitted(self):
+        for backend_name, expected in (
+            ("none", True),
+            ("megamoe", True),
+            ("deepep", False),
+        ):
+            with self.subTest(backend=backend_name):
+                backend = NS(
+                    is_none=lambda: backend_name == "none",
+                    is_megamoe=lambda: backend_name == "megamoe",
+                )
+                with patch(MODEL + ".get_moe_a2a_backend", return_value=backend):
+                    self.assertEqual(_v41_vision_a2a_supported(), expected)
+
+    def test_bcg_router_ids_follow_moe_row_layout_across_replays(self):
+        for backend_name in ("none", "megamoe"):
+            with (
+                self.subTest(backend=backend_name),
+                cp_context(2, 1) as (
+                    strategy,
+                    batch,
+                ),
+            ):
+                backend = NS(is_none=lambda: backend_name == "none")
+                model = NS(
+                    get_input_embeddings=lambda: lambda ids: ids[:, None].float()
+                )
+                runner = NS(
+                    max_num_tokens=16,
+                    device="cpu",
+                    model_runner=NS(
+                        model=model,
+                        model_config=NS(hidden_size=1),
+                        dtype=torch.float32,
+                    ),
+                )
+
+                def prepare_metadata(fb):
+                    fb.attn_cp_metadata = strategy.build_metadata(
+                        len(fb.input_ids), None, fb.extend_seq_lens_cpu
+                    )
+                    pad_logical_token_to_physical(fb.attn_cp_metadata)
+
+                batch.extend_num_tokens = len(batch.input_ids)
+                batch.num_token_non_padded = None
+                with (
+                    patch(BCG + ".get_cp_strategy", return_value=strategy),
+                    patch(BCG + ".get_moe_a2a_backend", return_value=backend),
+                    patch(BCG + ".prepare_cp_forward", side_effect=prepare_metadata),
+                ):
+                    cp_input = PrefillCPBCGInput.create(runner)
+                    cp_input.prepare(runner, batch, static_num_tokens=9, capture=True)
+                    captured_ids = batch.input_ids_global
+                    self.assertEqual(
+                        captured_ids.shape[0], 12 if backend_name == "none" else 6
+                    )
+
+                    batch.input_ids = torch.tensor([7, IMAGE_ID, 9, 10, 11, 12, 13])
+                    batch.positions = torch.arange(7)
+                    batch.extend_seq_lens_cpu = [3, 4]
+                    batch.extend_num_tokens = 7
+                    cp_input.prepare(runner, batch, static_num_tokens=9, capture=False)
+                    self.assertEqual(
+                        batch.input_ids_global.data_ptr(), captured_ids.data_ptr()
+                    )
+                    if backend_name == "none":
+                        expected = torch.tensor(
+                            [7, 9, 11, 13, 0, 0, IMAGE_ID, 10, 12, 0, 0, 0]
+                        )
+                    else:
+                        expected = torch.tensor([IMAGE_ID, 10, 12, 0, 0, 0])
+                    torch.testing.assert_close(batch.input_ids_global, expected)
+
     def test_image_spans_cross_ranks_before_shard_and_gather(self):
         # Two image spans with distinct cache hashes; first request is text-only.
         original = torch.tensor(

@@ -1332,6 +1332,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if getattr(self, "enable_cp_bcg_capture", False):
             if not is_cp_active(forward_batch):
                 return False
+            # CP BCG embeds tokens before replay. Image spans need the vision
+            # encoder and ID normalization performed by the eager CP runner.
+            if (
+                getattr(self.model_runner.model, "vision", None) is not None
+                and forward_batch.mm_inputs is not None
+                and any(item is not None for item in forward_batch.mm_inputs)
+            ):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
