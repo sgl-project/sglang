@@ -1,8 +1,9 @@
-// Ascend reference recipes; verification status is recorded per cell.
+// A3 measured recipes and A2 validation candidates; status is recorded per cell.
 export const config = {
   "modelName": "Qwen3 on Ascend",
   "supportedHardware": [
-    "a3"
+    "a3",
+    "a2"
   ],
   "groupHardware": false,
   "matchDims": [
@@ -342,7 +343,7 @@ export const config = {
     },
     {
       "match": {
-        "hw": "a3",
+        "hw": "a2",
         "variant": "32b",
         "quant": "bf16",
         "strategy": "low-latency",
@@ -350,45 +351,35 @@ export const config = {
       },
       "verified": false,
       "verificationStatus": "unverified",
-      "warn": "Requires 8 A3 physical cards on one node; uses 16 logical NPU devices (TP=16). See [Ascend reference workloads](#ascend-reference-workloads). Runtime validation of this Cookbook recipe is pending.",
+      "warn": "A2 validation candidate: 4 cards with 64 GB each on one node (TP=4). Starts with one concurrent request, chunked prefill, and no EAGLE3 or graph capture. Runtime, accuracy, and performance validation are pending; the A3 low-latency target does not apply.",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
-        "HCCL_OP_EXPANSION_MODE=AIV",
         "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",
-        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600",
-        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1"
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
       ],
       "flags": [
         "--model-path \"{{MODEL_PATH}}\"",
         "--trust-remote-code",
         "--attention-backend ascend",
         "--device npu",
-        "--max-running-requests 1",
-        "--disable-radix-cache",
-        "--speculative-draft-model-quantization unquant",
-        "--chunked-prefill-size -1",
-        "--max-prefill-tokens 65536",
-        "--speculative-algorithm EAGLE3",
-        "--speculative-draft-model-path \"{{DRAFT_MODEL_PATH}}\"",
-        "--speculative-num-steps 4",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 5",
-        "--tp-size 16",
-        "--mem-fraction-static 0.72",
-        "--cuda-graph-bs-decode 1",
         "--dtype bfloat16",
+        "--tp-size 4",
+        "--context-length 32768",
+        "--max-running-requests 1",
+        "--chunked-prefill-size 4096",
+        "--mem-fraction-static 0.85",
+        "--disable-radix-cache",
+        "--disable-cuda-graph",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen",
-        "--prefill-delayer-max-delay-passes 200",
-        "--enable-prefill-delayer",
         "--host {{HOST_IP}}",
         "--port {{PORT}}"
       ]
     },
     {
       "match": {
-        "hw": "a3",
+        "hw": "a2",
         "variant": "32b",
         "quant": "w8a8",
         "strategy": "high-throughput",
@@ -396,7 +387,7 @@ export const config = {
       },
       "verified": false,
       "verificationStatus": "unverified",
-      "warn": "Requires 2 A3 physical cards on one node; uses 4 logical NPU devices (TP=4). See [Ascend reference workloads](#ascend-reference-workloads). Runtime validation of this Cookbook recipe is pending.",
+      "warn": "Requires 4 A2 cards with 64 GB each on one node (4 logical NPU devices, TP=4). This follows the A2 reference command, whose two-card heading conflicts with its TP4 setting; use four devices. See [Ascend reference workloads](#ascend-reference-workloads). Runtime, accuracy, and performance validation are pending.",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_OP_EXPANSION_MODE=AIV",
@@ -435,53 +426,7 @@ export const config = {
     },
     {
       "match": {
-        "hw": "a3",
-        "variant": "235b-a22b",
-        "quant": "bf16",
-        "strategy": "low-latency",
-        "nodes": "single"
-      },
-      "verified": false,
-      "verificationStatus": "unverified",
-      "warn": "Requires 8 A3 physical cards on one node; uses 16 logical NPU devices (TP=16). See [Ascend reference workloads](#ascend-reference-workloads). Runtime validation of this Cookbook recipe is pending.",
-      "env": [
-        "DEEPEP_HCCL_BUFFSIZE=1600",
-        "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
-        "HCCL_OP_EXPANSION_MODE=AIV",
-        "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",
-        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600",
-        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1"
-      ],
-      "flags": [
-        "--model-path \"{{MODEL_PATH}}\"",
-        "--trust-remote-code",
-        "--attention-backend ascend",
-        "--device npu",
-        "--max-running-requests 1",
-        "--dtype bfloat16",
-        "--chunked-prefill-size -1",
-        "--max-prefill-tokens 16384",
-        "--speculative-draft-model-quantization unquant",
-        "--speculative-algorithm EAGLE3",
-        "--speculative-draft-model-path \"{{DRAFT_MODEL_PATH}}\"",
-        "--speculative-num-steps 4",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 5",
-        "--disable-radix-cache",
-        "--enable-dp-lm-head",
-        "--tp 16",
-        "--mem-fraction-static 0.78",
-        "--cuda-graph-bs-decode 1",
-        "--reasoning-parser qwen3",
-        "--tool-call-parser qwen",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}"
-      ]
-    },
-    {
-      "match": {
-        "hw": "a3",
+        "hw": "a2",
         "variant": "235b-a22b",
         "quant": "w8a8",
         "strategy": "high-throughput",
@@ -489,16 +434,12 @@ export const config = {
       },
       "verified": false,
       "verificationStatus": "unverified",
-      "warn": "Requires 8 A3 physical cards on one node; uses 16 logical NPU devices (TP=16). See [Ascend reference workloads](#ascend-reference-workloads). Runtime validation of this Cookbook recipe is pending.",
+      "warn": "A2 validation candidate: 8 cards with 64 GB each on one node (TP=8). Uses the tutorial's recommended W8A8 device count, pure tensor parallelism, eight concurrent requests, and no EAGLE3 or graph capture. This is an untuned starting point; runtime, accuracy, and performance validation are pending. BF16 needs separate two-node resource validation and is not offered by this single-node selector.",
       "env": [
-        "DEEPEP_HCCL_BUFFSIZE=570",
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
-        "HCCL_OP_EXPANSION_MODE=AIV",
         "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",
-        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416",
-        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600",
-        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1"
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
       ],
       "flags": [
         "--model-path \"{{MODEL_PATH}}\"",
@@ -506,35 +447,28 @@ export const config = {
         "--attention-backend ascend",
         "--device npu",
         "--quantization modelslim",
-        "--max-running-requests 432",
-        "--context-length 8192",
         "--dtype bfloat16",
-        "--chunked-prefill-size 94208",
-        "--max-prefill-tokens 458880",
-        "--sampling-backend ascend",
-        "--ep-dispatch-algorithm static",
+        "--tp-size 8",
+        "--context-length 8192",
+        "--max-running-requests 8",
+        "--chunked-prefill-size 4096",
+        "--mem-fraction-static 0.90",
         "--disable-radix-cache",
-        "--moe-a2a-backend ascend_fuseep",
-        "--speculative-algorithm EAGLE3",
-        "--speculative-draft-model-path \"{{DRAFT_MODEL_PATH}}\"",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--speculative-draft-model-quantization unquant",
-        "--tp 16",
-        "--dp-size 16",
-        "--enable-dp-attention",
-        "--enable-dp-lm-head",
-        "--mem-fraction-static 0.8",
-        "--cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27",
+        "--disable-cuda-graph",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen",
-        "--fuseep-mode 2",
-        "--prefill-delayer-max-delay-passes 100",
-        "--enable-prefill-delayer",
         "--host {{HOST_IP}}",
         "--port {{PORT}}"
       ]
+    }
+  ],
+  "hardware": [
+    {
+      "id": "a2",
+      "label": "A2 Series",
+      "vram": "64GB/device",
+      "vendor": "npu",
+      "npuDevices": 8
     }
   ]
 };
