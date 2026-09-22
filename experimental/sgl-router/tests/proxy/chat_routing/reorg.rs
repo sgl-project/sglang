@@ -14,6 +14,7 @@ use sgl_router::server::app_context::ChatRouting;
 use std::sync::Mutex;
 
 mod session_aware;
+mod slo;
 
 type PickCall = (String, Stage, u64, Option<u64>);
 

@@ -1924,6 +1924,15 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    # Optional translation from controller IDs to this pool's buffer indices.
+    # L2TransferEngine resolves it on the transfer stream; move gates prevent
+    # relocation until the transfer is acknowledged.
+    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Token capacity for host sizing; `size` may count rows in per-layer views.
+    host_capacity_tokens: Optional[int] = None
+    # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
+    host_capacity_bytes: Optional[int] = None
+
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -1958,6 +1967,8 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
+    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
     def __init__(
         self,
         size: int,
@@ -3650,20 +3661,28 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
             return
 
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if get_is_capture_mode() and self.alt_stream is not None:
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[idx][loc] = cache_k
-            self._write_scales(idx, loc, k_scale, v_scale)
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[idx][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[idx][loc] = cache_k
-            self.v_buffer[idx][loc] = cache_v
-            self._write_scales(idx, loc, k_scale, v_scale)
+        # store_cache and store_sf_interleaved skip the reserved CUDA-graph
+        # padding slot 0 in-kernel, matching the bf16 pool.
+        row_bytes = self.head_num * self.head_dim * self.store_dtype.itemsize
+        v_row_bytes = self.head_num * self.v_head_dim * self.store_dtype.itemsize
+        assert _is_cuda and can_use_store_cache(row_bytes, v_row_bytes), (
+            f"MXFP8 KV cache requires CUDA and store_cache-compatible rows, "
+            f"got _is_cuda={_is_cuda}, {row_bytes=}, {v_row_bytes=}"
+        )
+        assert self.mxfp8_sf_interleaved, (
+            "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        )
+        store_cache(
+            cache_k.reshape(loc.shape[0], -1),
+            cache_v.reshape(loc.shape[0], -1),
+            self.k_buffer[idx].view(-1, row_bytes // self.store_dtype.itemsize),
+            self.v_buffer[idx].view(-1, v_row_bytes // self.store_dtype.itemsize),
+            loc,
+            row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
+            size_limit=self.size + self.page_size,
+        )
+        self._write_scales(idx, loc, k_scale, v_scale)
 
     def _write_scales(self, idx, loc, k_scale, v_scale):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
