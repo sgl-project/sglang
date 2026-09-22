@@ -36,7 +36,6 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
-    enable_unified_cache_external_linker=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
@@ -54,17 +53,11 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
-        enable_unified_cache_external_linker=enable_unified_cache_external_linker,
+        enable_unified_cache_external_linker=False,
     )
-    params = MagicMock()
-    params.is_eagle = False
-    params.mtp_draft_device_pools = ()
-    # A plain object accurately models a request pool without an optional
-    # C128 sidecar; MagicMock would make every hasattr() probe succeed.
-    params.req_to_token_pool = object()
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=params,
+        params=MagicMock(),
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
