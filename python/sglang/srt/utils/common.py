@@ -608,6 +608,17 @@ def device_stream_context(stream):
     return torch.get_device_module(stream.device).stream(stream)
 
 
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
+
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
@@ -1268,6 +1279,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
