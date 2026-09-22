@@ -4,7 +4,6 @@ import unittest
 
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
