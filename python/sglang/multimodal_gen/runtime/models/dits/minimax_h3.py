@@ -370,9 +370,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
-        linear
-    )
+    quant_method = getattr(linear, "quant_method", None)
+    if quant_method is None and hasattr(linear, "base_layer"):
+        # LoRA wrapper: recurse into the wrapped base linear
+        return _accepts_mxfp8_input(linear.base_layer)
+    return quant_method is not None and quant_method.accepts_mxfp8_input(linear)
 
 
 def _modulate_scale_shift(
