@@ -727,7 +727,7 @@ class MarkovCandidateSampler:
             self.target_vocab_size,
             self.topk + self.bias_topk,
             triton.next_power_of_2(self.topk + self.bias_topk),
-            num_warps=4,
+            num_warps=1,
         )
         _candidate_walk[(bs,)](
             base_logits,
