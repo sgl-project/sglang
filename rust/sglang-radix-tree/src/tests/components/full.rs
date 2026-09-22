@@ -72,8 +72,10 @@ fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
 }
@@ -473,8 +475,10 @@ fn host_drive_is_a_noop_without_host_leaves() {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
@@ -2826,7 +2830,7 @@ fn build_hicache_transfers_returns_none_for_non_load_back_phases() {
             .build_hicache_transfers(
                 &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
                 /* token_ids = */ None, /* prefetch_tokens = */ 0,
-                /* last_hash = */ None,
+                /* staging_tokens = */ 0, /* last_hash = */ None,
             )
             .unwrap();
         assert!(transfers.is_none());
@@ -2846,6 +2850,7 @@ fn load_back_build_collects_the_evicted_suffix_ancestors_first() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -2880,6 +2885,7 @@ fn load_back_build_returns_an_empty_cpu_transfer_for_a_device_backed_node() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -2913,6 +2919,7 @@ fn load_back_build_panics_on_an_evicted_unbacked_node() {
         /* host_indices = */ None,
         /* token_ids = */ None,
         /* prefetch_tokens = */ 0,
+        /* staging_tokens = */ 0,
         /* last_hash = */ None,
     );
 }
