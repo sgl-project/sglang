@@ -5,7 +5,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_gfx95_supported, is_hip, is_xpu
 
 if is_xpu():
     from sgl_kernel import (
@@ -74,12 +74,14 @@ def resolve_shared_index_layers(
     hf_text_config,
     pp_size: int,
     is_speculative: bool,
+    allow_synchronous_shared: bool = False,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
 
     Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
     index_topk_freq / cli_factor); None when the model has no sharing or the
-    prefetch cannot run (PP, speculative decoding, kill-switch).
+    sharing cannot run (PP or speculative decoding). The prefetch kill-switch
+    also drops the pattern unless synchronous shared-plan copies are supported.
     """
     if not is_deepseek_dsa(hf_text_config):
         return None
@@ -98,7 +100,7 @@ def resolve_shared_index_layers(
             "swap-in."
         )
         return None
-    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get() and not allow_synchronous_shared:
         logger.info(
             "HiSparse shared-index prefetch disabled via "
             "SGLANG_DISABLE_HISPARSE_PREFETCH; using synchronous swap-in."
@@ -219,6 +221,17 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        self._separate_copy = (
+            _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and is_gfx95_supported()
+            and not self.is_dsv4_hisparse
+        )
+        if self._separate_copy and self.skip_io:
+            raise ValueError(
+                "HiSparse planned copies on ROCm gfx95 with AITER require real KV IO; "
+                "disable SGLANG_DEBUG_HISPARSE_SKIP_IO."
+            )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -320,9 +333,11 @@ class HiSparseCoordinator:
         layer_num: int,
         max_num_req_slots: int,
     ) -> None:
-        """Set up the plan-then-IO prefetch for shared-index (IndexShare) models:
-        the anchor's kernel records its miss plan and skip layers replay it on
-        `prefetch_stream`, overlapping their IO with the intervening compute."""
+        """Allocate miss plans and, when enabled, the shared-index prefetch stream.
+
+        ROCm gfx95/AITER synchronous copies use the same plan without a side stream.
+        Models without index sharing record and copy a fresh plan per layer.
+        """
         if shared_index_layers is not None and len(shared_index_layers) != layer_num:
             # Attention-layer count differs from num_hidden_layers (e.g. Longcat
             # doubles it): pattern would be misindexed, fall back to synchronous.
@@ -340,22 +355,33 @@ class HiSparseCoordinator:
             )
             shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
-        self.enable_prefetch = any(self._is_shared_index_layer)
+        separate_copy = self._separate_copy
+        has_shared_indices = any(self._is_shared_index_layer)
+        self.enable_prefetch = has_shared_indices and not (
+            separate_copy and envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get()
+        )
+        self._sync_shared = (
+            separate_copy and has_shared_indices and not self.enable_prefetch
+        )
         self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
             self._is_shared_index_layer
         )
-        if not self.enable_prefetch:
+        if not (self.enable_prefetch or separate_copy):
             return
 
         # Small fixed grid for the copy-only kernel: low SM footprint so the
         # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
-        max_group_size = max(len(g) for g in self._prefetch_groups.values())
-        self.prefetch_stream = device_module.Stream()
-        self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+        self._prefetch_copy_blocks = 16 if separate_copy else 4
+        if self.enable_prefetch:
+            max_group_size = max(len(g) for g in self._prefetch_groups.values())
+            self.prefetch_stream = device_module.Stream()
+            self._prefetch_events = [
+                device_module.Event() for _ in range(max_group_size)
+            ]
         # Plan recorded by the current anchor, replayed by its skip layers. One
         # buffer set suffices: the last skip layer's event wait orders the next
-        # anchor's writes after this group's copies.
+        # anchor's writes after this group's copies. Synchronous shared-plan
+        # copies instead finish on the current stream before its next anchor.
         self._miss_src = torch.zeros(
             (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
         )
@@ -366,8 +392,10 @@ class HiSparseCoordinator:
             (max_num_req_slots,), dtype=torch.int32, device=self.device
         )
         logger.info(
-            "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
+            "HiSparse: planned copies (prefetch=%s, synchronous_shared=%s); %d anchor "
             "group(s), %d skip layer(s) of %d total.",
+            self.enable_prefetch,
+            self._sync_shared,
             len(self._prefetch_groups),
             sum(self._is_shared_index_layer),
             layer_num,
@@ -1001,13 +1029,15 @@ class HiSparseCoordinator:
         layer_id: int,
         record_plan: bool = False,
     ) -> torch.Tensor:
-        """Run the full plan+IO swap-in kernel for one layer; return its slot table.
+        """Plan and copy one layer's misses; return its device slot table.
 
         record_plan (set on the anchor of a shared-index group) also records the
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
+        The ROCm gfx95/AITER path separates planning and copying into ordered kernels.
         """
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs, : self.top_k]
+        separate_copy = self._separate_copy
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
@@ -1019,10 +1049,12 @@ class HiSparseCoordinator:
                 miss_dst=self._miss_dst[:num_reqs],
                 miss_count=self._miss_count[:num_reqs],
             )
-            if record_plan
+            if record_plan or separate_copy
             else {}
         )
-        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        skip_io_kwargs = (
+            {} if _is_xpu else dict(skip_io=self.skip_io or separate_copy)
+        )
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1043,6 +1075,11 @@ class HiSparseCoordinator:
             **skip_io_kwargs,
             **plan,
         )
+        if separate_copy:
+            # Only this kernel omits IO while producing the plan. The copy
+            # immediately follows on the same stream before attention can read
+            # the cache; never toggle the coordinator's debug skip_io flag.
+            self._run_copy_only_kernel(num_reqs, layer_id)
         return top_k_indices
 
     def swap_in_selected_blocks(
@@ -1114,6 +1151,12 @@ class HiSparseCoordinator:
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
         if not self.enable_prefetch:
+            if self._sync_shared and self._is_shared_index_layer[layer_id]:
+                # Shared-index layers use their anchor's slots and miss plan.
+                # The same-stream copy replaces a fork/event wait, not the IO.
+                num_reqs = req_pool_indices.size(0)
+                self._run_copy_only_kernel(num_reqs, layer_id)
+                return self.top_k_device_locs_buffer[:num_reqs]
             return self._run_swap_in_kernel(
                 req_pool_indices,
                 compressed_seq_lens,

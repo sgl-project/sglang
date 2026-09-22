@@ -92,6 +92,9 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             )
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
+    def translate_write_locations(self, locations: torch.Tensor) -> torch.Tensor:
+        return self.translate_loc_to_hisparse_device(locations)
+
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
