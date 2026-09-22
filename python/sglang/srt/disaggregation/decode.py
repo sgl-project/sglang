@@ -667,15 +667,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "Host pool must hold a retraction and a receive page; "
                     "increase --hicache-size or --hicache-ratio"
                 )
-            device_buffers, host_buffers = group.get_contiguous_buf_infos()
-            if device_buffers != (
-                kv_args.kv_data_ptrs,
-                kv_args.kv_data_lens,
-                kv_args.kv_item_lens,
-            ):
-                raise ValueError(
-                    "Host pool group must match the transferred target and draft KV"
-                )
+            _, host_buffers = group.get_contiguous_buf_infos()
             (
                 kv_args.host_kv_data_ptrs,
                 kv_args.host_kv_data_lens,
