@@ -1364,14 +1364,23 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     # Equal scores do not define a block order; all four complete blocks survive.
     assert sorted(selected[0, :16].tolist()) == list(range(16))
     assert torch.all(selected[0, 16:] == -1)
-    qsa_mqa_decode(q, torch.ones(1, 16, 1, 128, dtype=q.dtype), starts[:, None], lengths, 16)
+    qsa_mqa_decode(
+        q, torch.ones(1, 16, 1, 128, dtype=q.dtype), starts[:, None], lengths, 16
+    )
     assert mqa_calls == ["packed", "paged"]
 
 
-@pytest.mark.parametrize("device,columns,topk", [
-    ("cpu", 12, 8), ("cpu", 900, 512), ("cpu", 0, 8),
-    ("npu", 12, 512), ("npu", 900, 512), ("npu", 0, 2048),
-])
+@pytest.mark.parametrize(
+    "device,columns,topk",
+    [
+        ("cpu", 12, 8),
+        ("cpu", 900, 512),
+        ("cpu", 0, 8),
+        ("npu", 12, 512),
+        ("npu", 900, 512),
+        ("npu", 0, 2048),
+    ],
+)
 def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
     if device == "npu" and not qsa_kernel_module._is_npu:
         pytest.skip("NPU is not available")
@@ -1392,7 +1401,9 @@ def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
     if device == "npu":
         # contiguous() can be a no-op on an empty stride-2 view. Allocate
         # the GPU-like column stride explicitly, including M=0.
-        logits = torch.empty(logits.shape, dtype=logits.dtype, device=device).copy_(logits)
+        logits = torch.empty(logits.shape, dtype=logits.dtype, device=device).copy_(
+            logits
+        )
     starts = torch.tensor([0, min(4, columns), 0], dtype=torch.int32, device=device)
     ends = torch.tensor([columns, min(7, columns), 0], dtype=torch.int32, device=device)
     actual = qsa_fast_topk(logits, starts, ends, topk).cpu()

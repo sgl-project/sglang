@@ -1,4 +1,5 @@
 """Model-contract expansion dispatch and real QSA metadata/graph integration."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -35,10 +36,12 @@ def _assert_topk(logits, starts, lengths, blocks):
     """Test-only exact selection oracle; ties do not require equal indices."""
     assert logits.dtype == torch.float32 and logits.stride(1) == 1
     assert starts.is_contiguous() and lengths.is_contiguous()
-    scores, begin, counts, indices = (x.cpu() for x in (logits, starts, lengths, blocks))
+    scores, begin, counts, indices = (
+        x.cpu() for x in (logits, starts, lengths, blocks)
+    )
     width = indices.shape[1]
     for row, (start, length) in enumerate(zip(begin.tolist(), counts.tolist())):
-        valid_scores = scores[row, start:start + length]
+        valid_scores = scores[row, start : start + length]
         assert torch.isfinite(valid_scores).all()
         count = min(width, length)
         chosen = indices[row, :count].long()
@@ -48,9 +51,12 @@ def _assert_topk(logits, starts, lengths, blocks):
         if length <= width:
             assert torch.equal(chosen, torch.arange(length))
         else:
-            torch.testing.assert_close(valid_scores[chosen].sort().values,
-                                       valid_scores.topk(width).values.sort().values,
-                                       atol=0, rtol=0)
+            torch.testing.assert_close(
+                valid_scores[chosen].sort().values,
+                valid_scores.topk(width).values.sort().values,
+                atol=0,
+                rtol=0,
+            )
 
 
 @pytest.mark.parametrize("rows", [0, 1, 127, 128, 129])
@@ -66,22 +72,36 @@ def test_dispatch_model_contract(rows, block_topk, monkeypatch):
         raise AssertionError("NPU production must not use the generic reference")
 
     monkeypatch.setattr(kernel, "torch_expand_qsa_block_indices", forbidden)
-    actual = kernel.expand_qsa_block_indices(blocks, positions, lengths, 4, block_topk * 4)
+    actual = kernel.expand_qsa_block_indices(
+        blocks, positions, lengths, 4, block_topk * 4
+    )
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
     assert actual.is_contiguous() and actual.dtype == torch.int32
 
 
-@pytest.mark.parametrize("kind", ["budget", "ratio", "block_topk", "cpu", "rank", "dtype"])
+@pytest.mark.parametrize(
+    "kind", ["budget", "ratio", "block_topk", "cpu", "rank", "dtype"]
+)
 def test_unsupported_metadata_raises_without_reference(kind, monkeypatch):
-    args = [torch.zeros((2, 512), dtype=torch.int32, device="npu"),
-            torch.full((2,), 15, dtype=torch.int64, device="npu"),
-            torch.full((2,), 16, dtype=torch.int32, device="npu"), 4, 2048]
-    if kind == "budget": args[4] = 2047
-    elif kind == "ratio": args[3], args[4] = 1, 512
-    elif kind == "block_topk": args[0], args[4] = args[0][:, :256], 1024
-    elif kind == "cpu": args[2] = args[2].cpu()
-    elif kind == "rank": args[1] = args[1].reshape(1, 2)
-    elif kind == "dtype": args[0] = args[0].float()
+    args = [
+        torch.zeros((2, 512), dtype=torch.int32, device="npu"),
+        torch.full((2,), 15, dtype=torch.int64, device="npu"),
+        torch.full((2,), 16, dtype=torch.int32, device="npu"),
+        4,
+        2048,
+    ]
+    if kind == "budget":
+        args[4] = 2047
+    elif kind == "ratio":
+        args[3], args[4] = 1, 512
+    elif kind == "block_topk":
+        args[0], args[4] = args[0][:, :256], 1024
+    elif kind == "cpu":
+        args[2] = args[2].cpu()
+    elif kind == "rank":
+        args[1] = args[1].reshape(1, 2)
+    elif kind == "dtype":
+        args[0] = args[0].float()
 
     def forbidden(*args, **kwargs):
         raise AssertionError("unsupported metadata must not fall back")
@@ -106,10 +126,12 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
         logits = mqa.qsa_mqa_prefill(q, keys, starts, ends)
         blocks = kernel.qsa_fast_topk(logits, starts, ends, block_topk)
         tokens = kernel.expand_qsa_block_indices(
-            blocks, positions, sequence_lengths[ids.long()], 4, block_topk * 4)
+            blocks, positions, sequence_lengths[ids.long()], 4, block_topk * 4
+        )
         return blocks, tokens, logits, starts, ends - starts
 
-    for _ in range(2): forward()
+    for _ in range(2):
+        forward()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         captured_blocks, captured_tokens, scores, starts, lengths = forward()
@@ -138,13 +160,17 @@ def test_packed_mqa_current_topk_expansion_graph(rows, block_topk):
         _assert_topk(scores, starts, lengths, captured_blocks)
         expected = _expected(captured_blocks, positions, row_lengths, 4, block_topk * 4)
         torch.testing.assert_close(captured_tokens.cpu(), expected, atol=0, rtol=0)
-        eager_blocks, eager_tokens, eager_scores, eager_starts, eager_lengths = forward()
+        eager_blocks, eager_tokens, eager_scores, eager_starts, eager_lengths = (
+            forward()
+        )
         _assert_topk(eager_scores, eager_starts, eager_lengths, eager_blocks)
         torch.testing.assert_close(captured_blocks, eager_blocks, atol=0, rtol=0)
         torch.testing.assert_close(captured_tokens, eager_tokens, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2])
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2]
+)
 @pytest.mark.parametrize("batch_size", [2, 32])
 def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
     # Real backend methods/persistent buffers; synthetic pool and Q/K.
@@ -154,16 +180,24 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
     requests = batch_size + 1
     cache = torch.randn(requests * 1024, 1, 128, device="npu", dtype=torch.bfloat16)
     attention_q = torch.randn(rows, 3, 256, device="npu", dtype=torch.bfloat16)
-    attention_k = torch.randn(requests * raw_width, 1, 256, device="npu", dtype=torch.bfloat16)
+    attention_k = torch.randn(
+        requests * raw_width, 1, 256, device="npu", dtype=torch.bfloat16
+    )
     attention_v = torch.randn_like(attention_k)
     pool = SimpleNamespace(
-        qsa_compress_ratio=4, qsa_block_topk=512,
-        qsa_index_kv_heads=1, qsa_index_head_dim=128, qsa_compressed_page_size=16,
+        qsa_compress_ratio=4,
+        qsa_block_topk=512,
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=128,
+        qsa_compressed_page_size=16,
         get_qsa_compressed_k_buffer=lambda layer_id: cache,
         get_key_buffer=lambda layer_id: attention_k.reshape(-1, 64, 1, 256),
-        get_value_buffer=lambda layer_id: attention_v.reshape(-1, 64, 1, 256))
+        get_value_buffer=lambda layer_id: attention_v.reshape(-1, 64, 1, 256),
+    )
     layer = SimpleNamespace(layer_id=0, scaling=1 / 16)
-    req_to_token = torch.arange(requests * raw_width, device="npu", dtype=torch.int32).reshape(requests, raw_width)
+    req_to_token = torch.arange(
+        requests * raw_width, device="npu", dtype=torch.int32
+    ).reshape(requests, raw_width)
     backend = QwenSparseAttnBackend()
     backend.device = torch.device("npu")
     backend.token_to_kv_pool, backend.req_to_token = pool, req_to_token
@@ -172,22 +206,35 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
     q = torch.randn(rows, 4, 128, device="npu", dtype=torch.bfloat16)
     lengths_cpu = torch.full((batch_size,), 2405, dtype=torch.int32, device="cpu")
     request_ids = torch.arange(1, requests, device="npu", dtype=torch.int32)
-    spec = SimpleNamespace(topk=1, draft_token_num=4, extend_seq_lens_cpu=[4] * batch_size)
+    spec = SimpleNamespace(
+        topk=1, draft_token_num=4, extend_seq_lens_cpu=[4] * batch_size
+    )
     batch = SimpleNamespace(
-        forward_mode=mode, batch_size=batch_size,
+        forward_mode=mode,
+        batch_size=batch_size,
         input_ids=torch.zeros(rows, dtype=torch.int64, device="npu"),
-        req_pool_indices=request_ids, seq_lens=lengths_cpu.to("npu"),
-        seq_lens_cpu=lengths_cpu, spec_info=spec, num_padding=0)
+        req_pool_indices=request_ids,
+        seq_lens=lengths_cpu.to("npu"),
+        seq_lens_cpu=lengths_cpu,
+        spec_info=spec,
+        num_padding=0,
+    )
     backend.init_forward_metadata_out_graph(batch, in_capture=True)
     backend.init_forward_metadata_out_graph(batch, in_capture=False)
     metadata = backend.forward_metadata
     indexer = metadata.indexer_metadata
 
     def pointers():
-        return [x.data_ptr() for x in (
-            metadata.sequence_lengths, metadata.row_req_pool_indices,
-            indexer.decode_logical_positions, indexer.graph_compressed_page_table,
-            indexer.graph_compressed_lengths)]
+        return [
+            x.data_ptr()
+            for x in (
+                metadata.sequence_lengths,
+                metadata.row_req_pool_indices,
+                indexer.decode_logical_positions,
+                indexer.graph_compressed_page_table,
+                indexer.graph_compressed_lengths,
+            )
+        ]
 
     addresses = pointers()
 
@@ -196,12 +243,14 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         logits = mqa.qsa_mqa_decode(q, paged_cache, table, lengths, width)
         blocks = kernel.qsa_fast_topk(logits, torch.zeros_like(lengths), lengths, 512)
         tokens = kernel.expand_qsa_block_indices(
-            blocks, indexer.decode_logical_positions, indexer.sequence_lengths, 4, 2048)
+            blocks, indexer.decode_logical_positions, indexer.sequence_lengths, 4, 2048
+        )
         slots = backend._logical_to_physical(tokens, metadata)
         output = backend._forward_paged_attention(attention_q, layer, batch, tokens)
         return blocks, tokens, slots, logits, lengths, output
 
-    for _ in range(2): forward()
+    for _ in range(2):
+        forward()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         outputs = forward()
@@ -232,10 +281,15 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
         torch.npu.synchronize()
         blocks, tokens, slots, logits, lengths, output = outputs
         reference_output = kernel.qsa_sparse_attention_reference(
-            attention_q.cpu(), attention_k.cpu(), attention_v.cpu(), slots.cpu(), 1 / 16)
-        torch.testing.assert_close(output.cpu(), reference_output.flatten(1), atol=0.02, rtol=0.02)
+            attention_q.cpu(), attention_k.cpu(), attention_v.cpu(), slots.cpu(), 1 / 16
+        )
+        torch.testing.assert_close(
+            output.cpu(), reference_output.flatten(1), atol=0.02, rtol=0.02
+        )
         paged_cache, page_table, valid_lengths, width = indexer.get_decode_mqa_inputs(0)
-        reference_scores = mqa.torch_qsa_mqa_decode(q, paged_cache, page_table, valid_lengths, width)
+        reference_scores = mqa.torch_qsa_mqa_decode(
+            q, paged_cache, page_table, valid_lengths, width
+        )
         torch.testing.assert_close(logits, reference_scores, atol=2e-5, rtol=2e-5)
         assert torch.equal(torch.isneginf(logits), torch.isneginf(reference_scores))
         _assert_topk(logits, torch.zeros_like(lengths), lengths, blocks)
@@ -253,10 +307,15 @@ def test_backend_graph_metadata_current_topk_expansion(mode, batch_size):
 
 
 @pytest.mark.parametrize("k", [512, 2048])
-@pytest.mark.parametrize("rows,width,path", [
-    (4, 256, "shortcut"), (4, 8193, "tiled"),
-    (4, 262145, "hybrid"), (129, 262145, "hybrid"),
-])
+@pytest.mark.parametrize(
+    "rows,width,path",
+    [
+        (4, 256, "shortcut"),
+        (4, 8193, "tiled"),
+        (4, 262145, "hybrid"),
+        (129, 262145, "hybrid"),
+    ],
+)
 def test_final_topk_expansion_all_paths_graph(k, rows, width, path):
     from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import select_implementation
 
@@ -269,15 +328,21 @@ def test_final_topk_expansion_all_paths_graph(k, rows, width, path):
 
     def forward():
         blocks = kernel.qsa_fast_topk(logits, starts, starts + lengths, k)
-        tokens = kernel.expand_qsa_block_indices(blocks, positions, sequence_lengths, 4, k * 4)
+        tokens = kernel.expand_qsa_block_indices(
+            blocks, positions, sequence_lengths, 4, k * 4
+        )
         return blocks, tokens
 
     def check(outputs):
         blocks, tokens = outputs
         _assert_topk(logits, starts, lengths, blocks)
         _assert_prefix(blocks, positions, sequence_lengths, 4)
-        torch.testing.assert_close(tokens.cpu(), _expected(blocks, positions, sequence_lengths, 4, k * 4),
-                                   atol=0, rtol=0)
+        torch.testing.assert_close(
+            tokens.cpu(),
+            _expected(blocks, positions, sequence_lengths, 4, k * 4),
+            atol=0,
+            rtol=0,
+        )
 
     for _ in range(2):
         check(forward())

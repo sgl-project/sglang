@@ -3,6 +3,7 @@
 Legacy generic inputs are now rejection cases, not a reference fallback.
 The kernel package carries independent FP64 and larger-shape regressions.
 """
+
 import pytest
 import torch
 from sgl_kernel_npu.qwen3_8_flash_next import mqa as npu_mqa
@@ -18,7 +19,9 @@ pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 def make_inputs(kind):
     torch.manual_seed(73)
     q = torch.randn(8, 4, 128, device="npu", dtype=torch.bfloat16)
-    lengths = torch.tensor([0, 1, 15, 16, 17, 31, 128, 144], device="npu", dtype=torch.int32)
+    lengths = torch.tensor(
+        [0, 1, 15, 16, 17, 31, 128, 144], device="npu", dtype=torch.int32
+    )
     if kind == "packed":
         k = torch.randn(160, 1, 128, device="npu", dtype=q.dtype)
         starts = torch.arange(8, device="npu", dtype=torch.int32)
@@ -49,8 +52,12 @@ def test_mqa_dispatch_and_graph_updates(kind, monkeypatch):
         raise AssertionError("NPU MQA must not call Torch reference or TileLang")
 
     monkeypatch.setattr(npu_mqa, kind, traced)
-    for name in ("torch_qsa_mqa_prefill", "torch_qsa_mqa_decode",
-                 "tilelang_qsa_mqa_prefill", "tilelang_qsa_mqa_decode"):
+    for name in (
+        "torch_qsa_mqa_prefill",
+        "torch_qsa_mqa_decode",
+        "tilelang_qsa_mqa_prefill",
+        "tilelang_qsa_mqa_decode",
+    ):
         monkeypatch.setattr(mqa, name, forbidden)
 
     def check(out):
@@ -94,7 +101,20 @@ def test_mqa_dispatch_and_graph_updates(kind, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["packed", "paged"])
-@pytest.mark.parametrize("case", ["fp16", "fp32", "heads", "dimension", "stride", "int64", "cpu", "shape", "storage"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "fp16",
+        "fp32",
+        "heads",
+        "dimension",
+        "stride",
+        "int64",
+        "cpu",
+        "shape",
+        "storage",
+    ],
+)
 def test_mqa_metadata_errors_do_not_fall_back(kind, case, monkeypatch):
     fn, _ = functions(kind)
     args = list(make_inputs(kind))
@@ -104,7 +124,10 @@ def test_mqa_metadata_errors_do_not_fall_back(kind, case, monkeypatch):
     elif case == "heads":
         args[0] = args[0][:, :3].contiguous()
     elif case == "dimension":
-        args[0], args[1] = args[0][..., :64].contiguous(), args[1][..., :64].contiguous()
+        args[0], args[1] = (
+            args[0][..., :64].contiguous(),
+            args[1][..., :64].contiguous(),
+        )
     elif case == "stride":
         args[0] = args[0].transpose(0, 1).contiguous().transpose(0, 1)
     elif case == "int64":

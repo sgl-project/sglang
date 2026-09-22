@@ -73,7 +73,9 @@ def _make_case(
     forward_batch = SimpleNamespace(
         mamba_track_indices=torch.tensor([3, 4], device=device),
         mamba_track_mask=torch.tensor([True, False], device=device),
-        mamba_track_aligned_lens=lambda: torch.tensor([max(0, width - 1), 0], device=device),
+        mamba_track_aligned_lens=lambda: torch.tensor(
+            [max(0, width - 1), 0], device=device
+        ),
     )
     return SimpleNamespace(
         layer=layer,
@@ -95,13 +97,24 @@ def _run(case, monkeypatch, *, npu):
 
 @pytest.mark.parametrize(
     "execution,kernel_size,dilation,channels",
-    [("cpu", 1, 1, 16), ("cpu", 4, 3, 16),
-     ("npu", 4, 3, 10240), ("npu_graph", 4, 3, 10240)],
+    [
+        ("cpu", 1, 1, 16),
+        ("cpu", 4, 3, 16),
+        ("npu", 4, 3, 10240),
+        ("npu_graph", 4, 3, 10240),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "mode,width", [("decode_fast", 1), ("decode", 1), ("verify", 2),
-                   ("verify", 3), ("verify", 4), ("prefill", 4)],
+    "mode,width",
+    [
+        ("decode_fast", 1),
+        ("decode", 1),
+        ("verify", 2),
+        ("verify", 3),
+        ("verify", 4),
+        ("prefill", 4),
+    ],
 )
 def test_ple_short_conv_npu(
     monkeypatch, execution, dtype, kernel_size, dilation, channels, mode, width
@@ -115,12 +128,21 @@ def test_ple_short_conv_npu(
         qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
     )
     device = "cpu" if execution == "cpu" else "npu"
-    case = _make_case(device, dtype, mode, kernel_size, dilation,
-                      width=width, channels=channels)
+    case = _make_case(
+        device, dtype, mode, kernel_size, dilation, width=width, channels=channels
+    )
     # On NPU compare the whole model operation against actual native F.conv1d,
     # including its output rounding before SiLU. CPU keeps generic coverage.
-    reference = _make_case(device, dtype, mode, kernel_size, dilation,
-                           width=width, channels=channels, reference=execution == "cpu")
+    reference = _make_case(
+        device,
+        dtype,
+        mode,
+        kernel_size,
+        dilation,
+        width=width,
+        channels=channels,
+        reference=execution == "cpu",
+    )
     graph = None
     if execution == "npu_graph":
         for _ in range(2):
@@ -172,7 +194,10 @@ def test_ple_short_conv_npu(
             case.state.float().cpu(), reference.state.float().cpu(), rtol=0, atol=0
         )
         torch.testing.assert_close(
-            case.intermediate.float().cpu(), reference.intermediate.float().cpu(), rtol=0, atol=0
+            case.intermediate.float().cpu(),
+            reference.intermediate.float().cpu(),
+            rtol=0,
+            atol=0,
         )
 
 

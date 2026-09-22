@@ -1,4 +1,5 @@
 """Production HC routing and full module graph integration (not model accuracy)."""
+
 import pytest
 import torch
 from sgl_kernel_npu.qwen3_8_flash_next import hc
@@ -15,8 +16,10 @@ def make_module(monkeypatch, *, model=True, per_branch=True, use_combine=True):
     monkeypatch.setattr(hyperconnection, "_is_npu", True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("npu"))
     cfg = hyperconnection.HyperConnectionConfig(
-        hidden_size=2560 if model else 128, hc_count=4,
-        hc_lowrank=320 if model else 32, hc_per_branch_norm=per_branch
+        hidden_size=2560 if model else 128,
+        hc_count=4,
+        hc_lowrank=320 if model else 32,
+        hc_per_branch_norm=per_branch,
     )
     return hyperconnection.GatedResidual(cfg, use_combine=use_combine).to(
         device="npu", dtype=torch.bfloat16
@@ -31,16 +34,20 @@ def test_model_public_routing(monkeypatch, rows):
     calls = []
     for name in ("grouped_norm", "mix", "combine"):
         original = getattr(hc, name)
+
         def counted(*args, _name=name, _fn=original):
             calls.append(_name)
             return _fn(*args)
+
         monkeypatch.setattr(hc, name, counted)
     # This GPU path must remain disabled even with transfer_to_npu's is_cuda shim.
     assert not hyperconnection.fused_hc_mix_supported(
         x, module.input_mix_weight_down.weight, module.input_mix_weight_up.weight
     )
+
     def unexpected(*args, **kwargs):
         raise AssertionError("NPU reached a GPU eligibility check or Torch fallback")
+
     monkeypatch.setattr(module, "_mix_compute", unexpected)
     monkeypatch.setattr(module, "_combine_compute", unexpected)
     monkeypatch.setattr(hyperconnection, "fused_hc_mix_supported", unexpected)
@@ -61,8 +68,10 @@ def test_model_public_routing(monkeypatch, rows):
 def test_kernel_errors_are_not_swallowed(monkeypatch, op):
     module = make_module(monkeypatch)
     x = torch.ones(1, 10240, device="npu", dtype=torch.bfloat16)
+
     def fail(*args):
         raise ValueError("HC test sentinel")
+
     monkeypatch.setattr(hc, op, fail)
     with pytest.raises(ValueError, match="HC test sentinel"):
         mixed, residuals = module.mix(x)
@@ -101,8 +110,13 @@ def test_final_mixer_without_combine(monkeypatch):
     module = make_module(monkeypatch, use_combine=False)
     x = torch.randn(33, 10240, device="npu", dtype=torch.bfloat16)
     actual, residuals = module.mix(x)
-    expected = hc.mix(hc.grouped_norm(x, module.hc_norm.weight, 2560, 1e-6),
-                      module.input_mix_weight_down.weight, module.input_mix_weight_up.weight, 4, 2560)
+    expected = hc.mix(
+        hc.grouped_norm(x, module.hc_norm.weight, 2560, 1e-6),
+        module.input_mix_weight_down.weight,
+        module.input_mix_weight_up.weight,
+        4,
+        2560,
+    )
     assert residuals[0] is x
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -115,9 +129,11 @@ def test_module_graph_updates(monkeypatch, rows):
     block = torch.randn(rows, 2560, device="npu", dtype=torch.bfloat16)
     tensors = [x, block, *module.parameters()]
     pointers = [v.data_ptr() for v in tensors]
+
     def run():
         mixed, residuals = module.mix(x)
         return mixed, module.combine(block, residuals)
+
     for _ in range(3):
         run()
     graph = torch.npu.NPUGraph()
