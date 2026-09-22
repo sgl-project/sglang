@@ -486,38 +486,39 @@ def _apply_wo_a_bf16_matmul(
             is_batch_invariant_mode_enabled()
             or get_exec().deterministic.enable_deterministic_inference
         )
+    # The ROCm branches carry their own gfx950 / env / shape gates and do not
+    # depend on the caller's model-type ``fast_path`` flag.
     if (
-        fast_path
-        and (
-            (
-                _is_cuda
-                and (
-                    (
-                        is_decode
-                        and o.shape[0] == 1
-                        and (get_platform().is_blackwell or get_platform().is_sm90)
-                    )
-                    or (
-                        is_target_verify
-                        and 0 < o.shape[0] <= 384
-                        and get_platform().is_blackwell
-                    )
-                    or (
-                        is_prefill
-                        and 4096 <= o.shape[0] <= 65536
-                        and get_platform().is_blackwell
-                    )
+        (
+            fast_path
+            and _is_cuda
+            and (
+                (
+                    is_decode
+                    and o.shape[0] == 1
+                    and (get_platform().is_blackwell or get_platform().is_sm90)
+                )
+                or (
+                    is_target_verify
+                    and 0 < o.shape[0] <= 384
+                    and get_platform().is_blackwell
+                )
+                or (
+                    is_prefill
+                    and 4096 <= o.shape[0] <= 65536
+                    and get_platform().is_blackwell
                 )
             )
-            or hip_decode_verify
-            or (
-                _is_hip
-                and _is_gfx95_supported
-                and is_prefill
-                and 4096 <= o.shape[0] <= 65536
-            )
         )
-        and o.shape[1:] == (2, 4096)
+        or hip_decode_verify
+        or (
+            _is_hip
+            and _is_gfx95_supported
+            and is_prefill
+            and 4096 <= o.shape[0] <= 65536
+        )
+    ) and (
+        o.shape[1:] == (2, 4096)
         and wo_a.shape == (2, 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1

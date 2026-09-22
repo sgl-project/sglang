@@ -98,7 +98,9 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             kv_cache_dtype_str="fp8_e4m3",
             model_config=cfg,
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            # main (#40707): the parallel widths live on the KV-cache config itself.
+            pp_size=1,
+            attn_dp_size=1,
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,

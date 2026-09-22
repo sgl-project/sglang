@@ -69,6 +69,8 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     backend.needs_cpu_seq_lens = False
     backend._fp4_graph_row_limit = None
     backend.is_draft_worker = is_dspark_draft
+    # main (#40205): compressed-KV metadata is built only on the target worker.
+    backend.need_compress = not is_dspark_draft
     backend.is_dspark_draft = is_dspark_draft
     # The draft verifies gamma rows, the target gamma + 1 (bonus included).
     backend.target_verify_num_draft_tokens = (
