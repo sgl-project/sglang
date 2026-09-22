@@ -100,55 +100,6 @@ class TestGroupEligibility(CustomTestCase):
                         )
                     )
 
-    def test_symmetric_memory_wins_when_both_are_enabled(self):
-        """Two independent opt-in flags; the pre-existing one keeps the path.
-
-        Left undecided, eager execution returns through symmetric memory's NCCL
-        branch before the dispatch reaches this backend while compiled
-        execution selects IPC, so the same config behaves differently per mode.
-        """
-        with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
-            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=True):
-                with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
-                    pcie_ipc_ar._warn_symm_mem_wins.cache_clear()
-                    self.assertFalse(
-                        pcie_ipc_ar.eligible_group(
-                            group_name="tp", world_size=4, deterministic=False
-                        )
-                    )
-                self.assertIn("--enable-symm-mem", "\n".join(logs.output))
-            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
-                self.assertTrue(
-                    pcie_ipc_ar.eligible_group(
-                        group_name="tp", world_size=4, deterministic=False
-                    )
-                )
-
-    def test_symm_mem_probe_reads_the_real_flag(self):
-        """Exercise the probe itself: a patched stand-in cannot catch a rename."""
-        for flag in (True, False):
-            with self.subTest(flag=flag):
-                mod = MagicMock(is_symmetric_memory_enabled=lambda: flag)
-                with patch.dict(
-                    "sys.modules",
-                    {
-                        "sglang.srt.distributed.device_communicators."
-                        "pynccl_allocator": mod
-                    },
-                ):
-                    self.assertIs(pcie_ipc_ar._symm_mem_enabled(), flag)
-
-    def test_the_symm_mem_probe_target_still_exists(self):
-        """Pin the real symbol: the probe swallows exceptions by design.
-
-        Embedded use has no runtime context, so the probe has to tolerate a
-        failed read -- which means a renamed symbol would silently report "symm
-        mem off" and let this backend take a path it should have left alone.
-        """
-        from sglang.srt.distributed.device_communicators import pynccl_allocator
-
-        self.assertTrue(hasattr(pynccl_allocator, "is_symmetric_memory_enabled"))
-
     def test_deterministic_inference_keeps_the_backend_off(self):
         """Deterministic inference forbids a shape-dependent reduction order.
 
@@ -158,15 +109,14 @@ class TestGroupEligibility(CustomTestCase):
         FlashInfer's seed policy is per-shape as well.
         """
         with envs.SGLANG_ENABLE_PCIE_IPC_ALLREDUCE.override(True):
-            with patch.object(pcie_ipc_ar, "_symm_mem_enabled", return_value=False):
-                with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
-                    pcie_ipc_ar._warn_deterministic_wins.cache_clear()
-                    self.assertFalse(
-                        pcie_ipc_ar.eligible_group(
-                            group_name="tp", world_size=4, deterministic=True
-                        )
+            with self.assertLogs(pcie_ipc_ar.logger, level="WARNING") as logs:
+                pcie_ipc_ar._warn_deterministic_wins.cache_clear()
+                self.assertFalse(
+                    pcie_ipc_ar.eligible_group(
+                        group_name="tp", world_size=4, deterministic=True
                     )
-                self.assertIn("Deterministic inference", "\n".join(logs.output))
+                )
+            self.assertIn("Deterministic inference", "\n".join(logs.output))
 
     def test_the_deterministic_predicate_still_exists(self):
         """The caller supplies this flag, so a mock cannot catch a rename.

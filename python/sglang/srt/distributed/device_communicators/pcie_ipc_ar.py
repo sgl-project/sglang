@@ -87,25 +87,6 @@ _FALLBACK_DECODE_WIDTH = 64
 _ELIGIBLE_GROUP_NAMES = frozenset({"tp"})
 
 
-def _symm_mem_enabled() -> bool:
-    try:
-        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-            is_symmetric_memory_enabled,
-        )
-
-        return bool(is_symmetric_memory_enabled())
-    except Exception:
-        return False
-
-
-@functools.lru_cache(maxsize=None)
-def _warn_symm_mem_wins() -> None:
-    logger.warning(
-        "Both --enable-symm-mem and SGLANG_ENABLE_PCIE_IPC_ALLREDUCE are set; "
-        "keeping symmetric memory and leaving PCIe-IPC off. Unset one to choose."
-    )
-
-
 @functools.lru_cache(maxsize=None)
 def _warn_deterministic_wins() -> None:
     logger.warning(
@@ -130,12 +111,6 @@ def eligible_group(
     # would not help, since the seed policy is per-shape too.
     if deterministic:
         _warn_deterministic_wins()
-        return False
-    # Symmetric memory wins: it is the pre-existing feature, and its eager
-    # branch returns through NCCL before the dispatch reaches this backend, so
-    # deciding here keeps eager and compiled execution consistent.
-    if _symm_mem_enabled():
-        _warn_symm_mem_wins()
         return False
     return True
 
