@@ -639,6 +639,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.AMX_ATTN,
     }
     param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
