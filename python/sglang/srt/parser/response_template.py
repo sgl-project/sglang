@@ -31,6 +31,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
@@ -186,10 +187,17 @@ class ResponseTemplateStreamAdapter:
                 return [event] if event["type"] == "region_open" else []
         return []
 
-    @staticmethod
-    def _tool_name(value: Any) -> str | None:
-        function = value.get("function") if isinstance(value, dict) else None
-        name = function.get("name") if isinstance(function, dict) else None
+    def _open_tool_name(self, captures: dict | None) -> str | None:
+        """Name already fixed by the opener, before the region body exists."""
+        field = self._parser_template.fields.get(_TOOL_FIELD)
+        transform = None if field is None or field.transform_each else field.transform
+        function = transform.get("function") if isinstance(transform, dict) else None
+        if not isinstance(function, dict):
+            return None
+        try:
+            name = _apply_transform(function.get("name"), captures or {})
+        except (KeyError, ValueError):
+            return None
         return name if isinstance(name, str) else None
 
     def _generated_text(
@@ -280,8 +288,9 @@ class ResponseTemplateStreamAdapter:
                 normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
                 if etype == "region_malformed":
-                    start = event["end"] - len(event["raw_close"])
-                    normal_parts.append(self._generated_text(event, start=start))
+                    normal_parts.append(
+                        self._generated_text(event, start=event["close_start"])
+                    )
                 elif etype in {"region_open", "region_chunk", "region_close"}:
                     normal_parts.append(
                         event["text"]
@@ -313,7 +322,7 @@ class ResponseTemplateStreamAdapter:
                 if etype == "region_open":
                     self._pending_tool_start = event["start"]
                     self._pending_tool_body_start = event["end"]
-                    name = self._tool_name(event.get("provisional_value"))
+                    name = self._open_tool_name(event.get("captures"))
                     self._pending_tool_streamed = bool(
                         event["start"] not in malformed_starts
                         and name is not None
@@ -322,13 +331,16 @@ class ResponseTemplateStreamAdapter:
                     )
                 elif etype == "region_malformed":
                     if on_tool_malformed is not None:
-                        body_start = event["start"] + len(event["raw_open"])
-                        body_end = event["end"] - len(event["raw_close"])
+                        body_start = (
+                            self._pending_tool_body_start
+                            if self._pending_tool_body_start is not None
+                            else event["start"]
+                        )
                         on_tool_malformed(
                             self._generated_text(
                                 event,
                                 start=body_start,
-                                end=body_end,
+                                end=event["close_start"],
                             ),
                             event["closed"],
                         )
