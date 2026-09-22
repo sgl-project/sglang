@@ -26,19 +26,37 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
-REGISTERED_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 SERVER_LOAD_TIME_MS = 44977.73
 
-# every registered diffusion test that overrides test_diffusion_generation
+# both trees that can subclass DiffusionServerBase
+SEARCH_ROOTS = ("test/registered", "python/sglang/multimodal_gen/test")
+
+# DiffusionServerBase itself: its call site defines the contract, not a drift from it
+BASE_CLASS_FILE = "python/sglang/multimodal_gen/test/server/test_server_common.py"
+
+# every diffusion test that overrides test_diffusion_generation
 OVERRIDING_TESTS = (
-    ("amd/test_zimage_turbo.py", "TestZImageTurboAMD", "AMD_ZIMAGE_CASES"),
-    ("xpu/test_xpu_zimage_turbo.py", "TestZImageTurboXPU", "XPU_ZIMAGE_CASES"),
-    ("xpu/test_xpu_flux2_dev.py", "TestFlux2DevXPU", "XPU_FLUX2_CASES"),
+    (
+        "test/registered/amd/test_zimage_turbo.py",
+        "TestZImageTurboAMD",
+        "AMD_ZIMAGE_CASES",
+    ),
+    (
+        "test/registered/xpu/test_xpu_zimage_turbo.py",
+        "TestZImageTurboXPU",
+        "XPU_ZIMAGE_CASES",
+    ),
+    (
+        "test/registered/xpu/test_xpu_flux2_dev.py",
+        "TestFlux2DevXPU",
+        "XPU_FLUX2_CASES",
+    ),
 )
 
 
 def _load_module(relative_path: str):
-    path = REGISTERED_DIR / relative_path
+    path = REPO_ROOT / relative_path
     spec = importlib.util.spec_from_file_location(f"load_time_guard_{path.stem}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -74,11 +92,13 @@ class TestDiffusionServerLoadTimeRecording(CustomTestCase):
     def test_every_override_is_covered(self):
         """A new override must join OVERRIDING_TESTS instead of going unguarded."""
         found = {
-            str(path.relative_to(REGISTERED_DIR))
-            for path in REGISTERED_DIR.rglob("test_*.py")
+            path.relative_to(REPO_ROOT).as_posix()
+            for root in SEARCH_ROOTS
+            for path in (REPO_ROOT / root).rglob("test_*.py")
             if _calls_validate_and_record(path)
         }
-        self.assertEqual(found, {entry[0] for entry in OVERRIDING_TESTS})
+        self.assertEqual(found - {BASE_CLASS_FILE}, {e[0] for e in OVERRIDING_TESTS})
+        self.assertIn(BASE_CLASS_FILE, found, "base class call site went missing")
 
     def test_overriding_tests_record_the_measured_load_time(self):
         """Each override must reach _record_performance_result with the server's load time."""
