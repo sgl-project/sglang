@@ -8,7 +8,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
@@ -80,6 +80,20 @@ def resolve_dflash_draft_transfer(
             draft_worker.draft_model_runner.model_config.hf_config
         ),
     )
+
+
+def lists_draft_as_kv_entries(
+    *,
+    mode: DisaggregationMode,
+    dflash_draft_transfer: Optional[DFlashDraftTransfer],
+) -> bool:
+    """Whether this side registers the draft pool among its KV entries.
+
+    Neither side knows the peer's DCP size when it registers, so decode keeps
+    the entries for a DCP=1 prefill's relayout path and also registers
+    DFLASH_KV for a same-DCP prefill, which sends only the latter.
+    """
+    return mode == DisaggregationMode.DECODE or dflash_draft_transfer is None
 
 
 def draft_transfer_window(draft_hf_config) -> Optional[int]:

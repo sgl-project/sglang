@@ -42,7 +42,10 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
-from sglang.srt.disaggregation.dflash_kv import resolve_dflash_draft_transfer
+from sglang.srt.disaggregation.dflash_kv import (
+    lists_draft_as_kv_entries,
+    resolve_dflash_draft_transfer,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -282,7 +285,10 @@ class PrefillBootstrapQueue:
         dflash_draft_transfer = (
             self.dflash_draft_transfer if transfer_draft_cache else None
         )
-        if dflash_draft_transfer is not None:
+        if not lists_draft_as_kv_entries(
+            mode=DisaggregationMode.PREFILL,
+            dflash_draft_transfer=dflash_draft_transfer,
+        ):
             draft_kv_pool = None
         if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred

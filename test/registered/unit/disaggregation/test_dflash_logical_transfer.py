@@ -10,10 +10,16 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.dflash_kv import (
     DFlashDraftTransfer,
     draft_transfer_window,
+    lists_draft_as_kv_entries,
     resolve_dflash_draft_transfer,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
-from sglang.srt.disaggregation.utils import TransferBackend, setup_state_kv_args
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    TransferBackend,
+    resolve_dcp_dst_entry_indices,
+    setup_state_kv_args,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
@@ -22,6 +28,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 WIRE_PAGE = 64
 TOKEN_BYTES = 512
+TARGET_TOKEN_BYTES = 576
 
 
 def make_draft_pool(dcp_size):
@@ -49,6 +56,11 @@ def make_draft_worker(layer_types, sliding_window=4096):
 class RecordingAgent:
     def __init__(self):
         self.descs = []
+        self.registered = []
+
+    def register_memory(self, addrs, mem_kind):
+        self.registered += [addr[0] for addr in addrs]
+        return True
 
     def get_xfer_descs(self, reqs, mem_kind):
         self.descs.append(np.asarray(reqs))
@@ -102,6 +114,76 @@ class TestDFlashDraftTransfer(CustomTestCase):
                     self.assertEqual(
                         kv_args.state_item_lens, [[WIRE_PAGE * TOKEN_BYTES] * 2]
                     )
+
+    def side_kv_args(self, *, mode, dcp_size):
+        """KV entries and state components one PD side registers."""
+        transfer = self.resolve(dcp_size=dcp_size)
+        draft = make_draft_pool(dcp_size)
+        kv_ptrs, kv_lens, kv_items = [100], [1 << 20], [WIRE_PAGE * TARGET_TOKEN_BYTES]
+        num_draft = 0
+        if lists_draft_as_kv_entries(mode=mode, dflash_draft_transfer=transfer):
+            ptrs, lens, items = draft.get_contiguous_buf_infos()
+            kv_ptrs, kv_lens, kv_items = (
+                kv_ptrs + ptrs,
+                kv_lens + lens,
+                kv_items + items,
+            )
+            num_draft = len(ptrs)
+        kv_args = SimpleNamespace(
+            page_size=WIRE_PAGE,
+            kv_data_ptrs=kv_ptrs,
+            kv_data_lens=kv_lens,
+            kv_data_mem_kinds=["VRAM"] * len(kv_ptrs),
+            kv_item_lens=kv_items,
+            num_draft_entries=num_draft,
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            gpu_id=0,
+        )
+        setup_state_kv_args(kv_args, SimpleNamespace(), dflash_draft_transfer=transfer)
+        return kv_args
+
+    def test_prefill_and_decode_layouts_agree_across_dcp_topologies(self):
+        """Neither side knows the peer's DCP size when it registers, so each
+        layout must serve every topology the handshake admits."""
+        for prefill_dcp, decode_dcp in ((1, 8), (8, 8), (1, 1)):
+            with self.subTest(prefill_dcp=prefill_dcp, decode_dcp=decode_dcp):
+                decode = self.side_kv_args(
+                    mode=DisaggregationMode.DECODE, dcp_size=decode_dcp
+                )
+                prefill = self.side_kv_args(
+                    mode=DisaggregationMode.PREFILL, dcp_size=prefill_dcp
+                )
+                manager = NixlKVManager.__new__(NixlKVManager)
+                manager.kv_args = prefill
+                manager.dcp_size, manager.dcp_rank = prefill_dcp, 0
+                manager.is_mla_backend, manager.is_hybrid_mla_backend = True, False
+                n_src, n_dst = len(prefill.kv_item_lens), len(decode.kv_item_lens)
+                # The handshake rejects a decode with fewer KV regions.
+                self.assertGreaterEqual(n_dst, n_src)
+                # Prefill sends its own state list; decode may hold a trailing extra.
+                self.assertEqual(
+                    decode.state_types[: len(prefill.state_types)],
+                    prefill.state_types,
+                )
+                if manager.requires_dcp_relayout(decode_dcp, 0):
+                    # P1 -> D>1: the draft travels in the relayout plan.
+                    dst = resolve_dcp_dst_entry_indices([], [], n_src, n_dst)
+                    manager.prepare_dcp_token_item_lens(
+                        [decode.kv_item_lens[j] for j in dst], decode_dcp
+                    )
+                    self.assertEqual(prefill.num_draft_entries, 2)
+                else:
+                    uses_state = StateType.DFLASH_KV in prefill.state_types
+                    self.assertEqual(uses_state, prefill_dcp > 1)
+                    self.assertEqual(prefill.num_draft_entries, 0 if uses_state else 2)
+
+                decode_manager = NixlKVManager.__new__(NixlKVManager)
+                decode_manager.kv_args = decode
+                decode_manager.agent = RecordingAgent()
+                decode_manager.register_buffer_to_engine()
+                registered = decode_manager.agent.registered
+                self.assertEqual(len(registered), len(set(registered)))
 
     def test_window_tail_only_when_every_draft_layer_slides(self):
         """A full-attention draft layer reads the whole prompt; HF windows

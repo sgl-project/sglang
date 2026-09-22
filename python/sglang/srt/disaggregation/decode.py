@@ -51,7 +51,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.dflash_kv import resolve_dflash_draft_transfer
+from sglang.srt.disaggregation.dflash_kv import (
+    lists_draft_as_kv_entries,
+    resolve_dflash_draft_transfer,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -603,7 +606,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
         draft_kv_pool = (
-            self.draft_token_to_kv_pool if self.dflash_draft_transfer is None else None
+            self.draft_token_to_kv_pool
+            if lists_draft_as_kv_entries(
+                mode=DisaggregationMode.DECODE,
+                dflash_draft_transfer=self.dflash_draft_transfer,
+            )
+            else None
         )
         if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred

@@ -1579,6 +1579,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
+        # Decode lists DFlash draft buffers both as KV entries and as DFLASH_KV
+        # state; register each buffer once.
+        kv_regions = set(zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens))
         state_addrs = []
         for comp_ptrs, comp_lens in zip(
             self.kv_args.state_data_ptrs or [],
@@ -1586,6 +1589,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ):
             for state_data_ptr, state_data_len in zip(comp_ptrs, comp_lens):
                 if state_data_ptr == 0 or state_data_len == 0:
+                    continue
+                if (state_data_ptr, state_data_len) in kv_regions:
                     continue
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
