@@ -12,8 +12,10 @@ Usage:
 import json
 import os
 import subprocess
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -35,6 +37,12 @@ DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
+UMBP_SERVER_LAUNCH_TIMEOUT = 60
+UMBP_SERVER_READY_MARKER = (
+    "[StandaloneServer] data plane: serialized reads (SSD medium)"
+)
+UMBP_STORAGE_PAGE_SIZE = 2 * 1024 * 1024
+UMBP_SSD_CAPACITY = 20 * 1024 * 1024 * 1024
 PAGE_SIZE = 256
 TP_SIZE = 8
 
@@ -46,7 +54,7 @@ TP_SIZE = 8
     "UMBP HiCache E2E only runs in the unified_kv_triton DSV4 nightly leg.",
 )
 class TestHiCacheStorageUMBPBackend(CustomTestCase):
-    """DeepSeek-V4 hybrid HostPoolGroup round trip through local UMBP L3."""
+    """DeepSeek-V4 hybrid HostPoolGroup round trip through UMBP SSD."""
 
     input_ids = list(range(4000, 5024))
 
@@ -55,10 +63,14 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         cls.model = DEEPSEEK_V4_FLASH_FP8_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = None
+        cls.umbp_process = None
+        cls.umbp_temp_dir = None
+        cls.umbp_log_handle = None
 
         try:
+            cls._launch_umbp_server()
             cls._launch_server()
-        except Exception:
+        except BaseException:
             cls._stop_server()
             raise
 
@@ -67,12 +79,105 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         cls._stop_server()
 
     @classmethod
+    def _launch_umbp_server(cls):
+        # Importing the package resolves the standalone binary built alongside
+        # the Python extension and publishes it via UMBP_STANDALONE_BIN.
+        import mori.umbp  # noqa: F401
+
+        server_bin = os.environ.get("UMBP_STANDALONE_BIN", "")
+        if not server_bin or not os.access(server_bin, os.X_OK):
+            raise RuntimeError(
+                f"UMBP_STANDALONE_BIN is unset or not executable: {server_bin!r}"
+            )
+
+        # Keep the UDS path short: AF_UNIX paths are limited to 108 bytes.
+        cls.umbp_temp_dir = tempfile.TemporaryDirectory(
+            prefix="sglang-umbp-", dir="/tmp"
+        )
+        root = Path(cls.umbp_temp_dir.name)
+        cls.umbp_ssd_dir = root / "ssd"
+        cls.umbp_ssd_dir.mkdir()
+        cls.umbp_address = f"unix://{root}/node.grpc.sock"
+        cls.umbp_log_path = root / "umbp-server.log"
+
+        server_env = os.environ.copy()
+        for name in (
+            "UMBP_MASTER_ADDRESS",
+            "UMBP_NODE_ADDRESS",
+            "UMBP_NODE_ID",
+            "UMBP_IO_ENGINE_HOST",
+            "UMBP_IO_ENGINE_PORT",
+            "UMBP_PEER_SERVICE_PORT",
+            "UMBP_BACKEND_POLICY",
+            "UMBP_STANDALONE_ADDRESS",
+            "UMBP_STANDALONE_AUTO_START",
+        ):
+            server_env.pop(name, None)
+        server_env.update(
+            {
+                "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
+                "UMBP_ROLE": "standalone",
+                "UMBP_DISTRIBUTED_MEDIUM": "SSD",
+                "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE": str(UMBP_STORAGE_PAGE_SIZE),
+                "UMBP_SSD_ENABLED": "1",
+                "UMBP_SSD_BACKEND": "file",
+                "UMBP_SSD_DIR": str(cls.umbp_ssd_dir),
+                "UMBP_SSD_CAPACITY": str(UMBP_SSD_CAPACITY),
+                "UMBP_DRAM_USE_HUGEPAGES": "0",
+                "UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES": "0",
+                "MORI_UMBP_LOG_LEVEL": "info",
+                "MORI_GLOBAL_LOG_LEVEL": "info",
+            }
+        )
+
+        cls.umbp_log_handle = cls.umbp_log_path.open("w", encoding="utf-8")
+        cls.umbp_process = subprocess.Popen(
+            [server_bin, cls.umbp_address],
+            env=server_env,
+            stdout=cls.umbp_log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        cls._wait_for_umbp_server()
+
+    @classmethod
+    def _wait_for_umbp_server(cls):
+        deadline = time.monotonic() + UMBP_SERVER_LAUNCH_TIMEOUT
+        while time.monotonic() < deadline:
+            if cls.umbp_process.poll() is not None:
+                raise RuntimeError(
+                    "umbp_standalone_server exited before becoming ready "
+                    f"(return code {cls.umbp_process.returncode}):\n"
+                    f"{cls._umbp_log_tail()}"
+                )
+            if UMBP_SERVER_READY_MARKER in cls.umbp_log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ):
+                return
+            time.sleep(0.1)
+
+        raise RuntimeError(
+            "umbp_standalone_server did not become ready within "
+            f"{UMBP_SERVER_LAUNCH_TIMEOUT}s:\n{cls._umbp_log_tail()}"
+        )
+
+    @classmethod
+    def _umbp_log_tail(cls, line_count=50):
+        try:
+            lines = cls.umbp_log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError as error:
+            return f"(could not read UMBP log: {error})"
+        return "\n".join(lines[-line_count:])
+
+    @classmethod
     def _launch_server(cls):
         storage_config = {
             "dram_capacity_bytes": 1 * 1024 * 1024 * 1024,
             "ssd_enabled": True,
-            "ssd_storage_dir": "/tmp/umbp_dsv4_local",
-            "ssd_capacity_bytes": 20 * 1024 * 1024 * 1024,
+            "ssd_storage_dir": str(cls.umbp_ssd_dir),
+            "ssd_capacity_bytes": UMBP_SSD_CAPACITY,
         }
         other_args = [
             "--trust-remote-code",
@@ -118,12 +223,22 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
         ]
 
         env = os.environ.copy()
-        # An absent master address keeps every TP rank in standalone local mode,
-        # so this E2E does not require an RDMA-capable CI runner.
-        env.pop("UMBP_MASTER_ADDRESS", None)
-        env.pop("UMBP_STANDALONE_ADDRESS", None)
+        # All TP ranks connect to the same out-of-process SSD backend. This is
+        # masterless and does not require an RDMA-capable CI runner. Empty
+        # values mask stale parent settings when popen_launch_server merges
+        # os.environ into this mapping again.
         env.update(
             {
+                "UMBP_MASTER_ADDRESS": "",
+                "UMBP_NODE_ADDRESS": "",
+                "UMBP_NODE_ID": "",
+                "UMBP_IO_ENGINE_HOST": "",
+                "UMBP_BACKEND_POLICY": "",
+                "UMBP_DISTRIBUTED_MEDIUM": "",
+                "UMBP_ROLE": "",
+                "UMBP_STANDALONE_ADDRESS": cls.umbp_address,
+                "UMBP_STANDALONE_AUTO_START": "0",
+                "UMBP_STANDALONE_STARTUP_TIMEOUT_MS": "60000",
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
@@ -148,17 +263,39 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
     @classmethod
     def _stop_server(cls):
         process = getattr(cls, "process", None)
-        if process is None:
-            return
-        if process.poll() is None:
-            # Give UMBP clients a chance to close their local tiers before the
-            # process tree is force-killed.
-            process.terminate()
-            try:
-                process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                kill_process_tree(process.pid)
-        cls.process = None
+        try:
+            if process is not None and process.poll() is None:
+                # Stop SGLang first so every TP client can deregister its shared
+                # memory before the standalone server exits.
+                process.terminate()
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    kill_process_tree(process.pid)
+        finally:
+            cls.process = None
+            cls._stop_umbp_server()
+
+    @classmethod
+    def _stop_umbp_server(cls):
+        process = getattr(cls, "umbp_process", None)
+        try:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    kill_process_tree(process.pid, wait_timeout=10)
+        finally:
+            cls.umbp_process = None
+            log_handle = getattr(cls, "umbp_log_handle", None)
+            if log_handle is not None:
+                log_handle.close()
+                cls.umbp_log_handle = None
+            temp_dir = getattr(cls, "umbp_temp_dir", None)
+            if temp_dir is not None:
+                temp_dir.cleanup()
+                cls.umbp_temp_dir = None
 
     def _flush_device_and_host_cache(self):
         response = requests.post(
