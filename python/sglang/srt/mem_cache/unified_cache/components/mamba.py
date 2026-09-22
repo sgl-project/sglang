@@ -406,7 +406,7 @@ class MambaComponent(TreeComponent):
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
         # write_back: demote the state to host before the internal tombstone.
-        self._demote_state_before_tombstone(x)
+        self._maybe_backup_node_before_state_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -421,7 +421,7 @@ class MambaComponent(TreeComponent):
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
-    def _demote_state_before_tombstone(self, node: UnifiedTreeNode) -> None:
+    def _maybe_backup_node_before_state_tombstone(self, node: UnifiedTreeNode) -> None:
         """Demote an internal node's mamba state to host before its tombstone
         (write_back only), mirroring the leaf deferred-demote path.
 
