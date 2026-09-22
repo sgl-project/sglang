@@ -3,7 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 
 use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, SessionAffinityMode};
@@ -58,12 +58,13 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
+/// Build the default plain and PD buckets. Callers run [`validate`] first;
+/// `Cli::into_config` does so before startup reaches this point.
 pub fn build_resolver(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
 ) -> Result<(BucketResolver, Option<JanitorHandle>)> {
-    validate(model)?;
     let admission = Arc::new(AdmissionLimits {
         max_inflight_requests: model
             .eligibility
@@ -103,21 +104,22 @@ pub fn build_resolver(
             policy.admission = admission;
             Arc::new(policy)
         }
-        _ => unreachable!("validated reorg policy"),
+        other => bail!("reorg routing does not implement --policy {other:?}"),
     };
-    // Discovery determines which serving mode has candidates.
+    // Discovery determines which serving mode has candidates. Rank the plain
+    // bucket first so plain deployments do not scan for prefill engines on
+    // every request; buckets otherwise tie and would sort by ID ("pd" first).
+    let mut pd = Bucket::new(
+        "pd",
+        BucketGroups::Pd {
+            prefill: EngineGroup::new(policy.clone()),
+            decode: EngineGroup::new(decode),
+        },
+    );
+    pd.rank = 1;
     let resolver = BucketResolver::new(vec![
-        Bucket::new(
-            "plain",
-            BucketGroups::Plain(EngineGroup::new(policy.clone())),
-        ),
-        Bucket::new(
-            "pd",
-            BucketGroups::Pd {
-                prefill: EngineGroup::new(policy),
-                decode: EngineGroup::new(decode),
-            },
-        ),
+        Bucket::new("plain", BucketGroups::Plain(EngineGroup::new(policy))),
+        pd,
     ])?;
     Ok((resolver, cleanup))
 }

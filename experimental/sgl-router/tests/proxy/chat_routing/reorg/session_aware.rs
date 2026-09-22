@@ -44,6 +44,14 @@ async fn session_aware_reuses_custom_header_binding_after_load_changes() {
         primary_worker.active_requests.store(100, Ordering::Relaxed);
         other_worker.active_requests.store(0, Ordering::Relaxed);
     }
+    // The binding is keyed by session: a new session follows load instead.
+    let mut req = request(body("hello"));
+    req.headers_mut()
+        .insert("x-test-session", "new-session".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert!(other.captured.lock().unwrap().last_body.is_some());
     cleanup.unwrap().shutdown().await;
 }
 
