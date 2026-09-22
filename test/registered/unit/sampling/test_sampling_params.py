@@ -449,6 +449,24 @@ class TestSamplingParamsNormalize(CustomTestCase):
             f"{MAX_STOP_REGEX_LEN}-byte limit",
         )
 
+    def test_invalid_stop_regex_raises_value_error(self):
+        """A malformed pattern must raise ValueError (mapped to HTTP 400), not re.error."""
+        tokenizer = self._mock_tokenizer()
+        for pattern in ["(", "[a-", "*abc", "(?P<x>a)(?P=y)"]:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(ValueError) as cm:
+                    SamplingParams(stop_regex=pattern).normalize(tokenizer)
+                self.assertIn(
+                    f"stop_regex {pattern!r} is not a valid regular expression",
+                    str(cm.exception),
+                )
+                self.assertIsInstance(cm.exception.__cause__, re.error)
+
+        # a valid pattern in the same list is still accepted
+        sp = SamplingParams(stop_regex=[r"\d+", "end"])
+        sp.normalize(tokenizer)
+        self.assertEqual(sp.stop_regex_max_len, MAX_LEN)
+
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
     def test_rust_sampling_schema_stays_in_lockstep(self):

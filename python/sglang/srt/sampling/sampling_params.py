@@ -15,6 +15,7 @@
 
 import logging
 import math
+import re
 from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
@@ -333,9 +334,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"stop_regex is {stop_regex_len} bytes, over the "
                         f"{MAX_STOP_REGEX_LEN}-byte limit"
                     )
-                stop_regex_max_len = max(
-                    stop_regex_max_len, get_max_seq_length(stop_regex)
-                )
+                try:
+                    stop_regex_seq_len = get_max_seq_length(stop_regex)
+                except re.error as e:
+                    raise ValueError(
+                        f"stop_regex {stop_regex!r} is not a valid regular expression: {e}"
+                    ) from e
+                stop_regex_max_len = max(stop_regex_max_len, stop_regex_seq_len)
 
             self.stop_regex_max_len = stop_regex_max_len
 
