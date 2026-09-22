@@ -10,6 +10,9 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
+from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+    refresh_dsv4_decode_metadata,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
@@ -1356,6 +1359,18 @@ class DeepseekV4AscendAttnBackend(
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
 
+        if (
+            forward_mode.is_decode()
+            and metadata.start_pos.device.type == "npu"
+            and envs.SGLANG_NPU_DSV4_FUSED_DECODE_METADATA.get()
+        ):
+            # Warm this bucket before capture. Reading the still-zero start_pos
+            # as lengths leaves all initial metadata zero, as before. Real loc
+            # counts stay dynamic, including the first C128 boundary.
+            self._refresh_graph_decode_compress_1d_fused(
+                metadata.start_pos, metadata, None
+            )
+
         metadata.kernel_metadata = {
             "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
             "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
@@ -1622,6 +1637,12 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
+        if (
+            ctx.live_seq_lens.device.type == "npu"
+            and envs.SGLANG_NPU_DSV4_FUSED_DECODE_METADATA.get()
+        ):
+            self._refresh_graph_decode_compress_1d_fused(ctx.live_seq_lens, fm, bundle)
+            return
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
@@ -1644,6 +1665,21 @@ class DeepseekV4AscendAttnBackend(
             )
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
+
+    def _refresh_graph_decode_compress_1d_fused(self, seq_lens, fm, bundle) -> None:
+        refresh_dsv4_decode_metadata(
+            seq_lens,
+            c4_src=bundle.out_c4_loc if bundle is not None else None,
+            c128_src=bundle.out_c128_loc if bundle is not None else None,
+            c4_loc=fm.c4_loc,
+            c128_loc=fm.c128_loc,
+            c4_positions=fm.positions_cmp_padding_c4,
+            c128_positions=fm.positions_cmp_padding_c128,
+            start_pos=fm.start_pos,
+            seqused=fm.seqused,
+            has_c4=self._dsv4_has_c4,
+            has_c128=self._dsv4_has_c128,
+        )
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
