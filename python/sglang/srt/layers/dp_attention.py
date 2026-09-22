@@ -907,9 +907,8 @@ def can_use_dp_reduce_scatter() -> bool:
     if not world_dp_gather_enabled():
         return True
 
-    return get_tensor_model_parallel_world_size() == (
-        get_attention_dp_size() * get_attn_tensor_model_parallel_world_size()
-    )
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.dp_size * parallel.attn_tp_size
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
