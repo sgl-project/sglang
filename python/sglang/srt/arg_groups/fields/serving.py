@@ -30,6 +30,12 @@ class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    enable_response_store: A[
+        bool,
+        "Enable in-memory Responses storage for retrieval, chaining, and background "
+        "requests. Disabled by default; unsupported with prefill-decode "
+        "disaggregation. Storage has no TTL or size limit.",
+    ] = False
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,
@@ -275,6 +281,10 @@ class Serving(msgspec.Struct):
         bool,
         "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
+    constrained_json_max_whitespace_cnt: A[
+        Optional[int],
+        "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer

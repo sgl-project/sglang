@@ -802,12 +802,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
+        fp8_block_config: Fp8Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
+        self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
 
@@ -864,6 +866,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
 
+        # ModelOpt emits `ignore: []` or omits it; is_layer_skipped iterates it.
+        exclude_modules = list(exclude_modules or [])
+
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
                 "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
@@ -904,6 +909,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # ModelOpt FP8_BLOCK_SCALES: 128x128 block fp8 with weight_scale_inv.
+        fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -928,6 +940,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
+            fp8_block_config=fp8_block_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -986,8 +999,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+            candidates.append("model." + prefix[len("model.language_model.") :])
+        elif prefix.startswith("model."):
+            # VL models such as Qwen4-Exp name the text stack `model.layers.*`
+            # while ModelOpt keys it `model.language_model.layers.*`.
+            candidates.append("model.language_model." + prefix[len("model.") :])
 
         return tuple(dict.fromkeys(candidates))
+
+    def resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        return self._resolve_quant_algo(prefix)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -1010,6 +1031,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "FP8_PB_WO":
                 return Fp8LinearMethod(self.fp8_pb_wo_config)
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
@@ -1039,6 +1062,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
+            if quant_algo == "FP8_BLOCK_SCALES":
+                return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -1471,6 +1496,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
+
+    def can_fuse_shared_expert(self) -> bool:
+        # A shared-expert body kept BF16 via exclude_modules cannot share the packed
+        # FP4 FusedMoE buffers. The shared_expert_gate is a separate linear (kept
+        # BF16 by e.g. Qwen3-Next NVFP4 checkpoints) and must not veto fusion.
+        return not any(
+            "shared_expert" in name and "shared_expert_gate" not in name
+            for name in self.exclude_modules
+        )
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -2514,6 +2548,59 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
+        # Activations are quantized per token at dispatch, so w13_input_scale
+        # is not used.
+        import deep_gemm
+        from deep_gemm.utils.math import transform_ue4m3_sf_into_required_layout
+
+        from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+        assert layer.moe_runner_config.is_gated, "MegaMoE NVFP4 needs a gated MLP"
+        n1 = layer.w13_weight.shape[1]
+        n2 = layer.w2_weight.shape[1]
+        check_mega_moe_shapes(
+            hidden=layer.w13_weight.shape[2] * 2,
+            intermediate=n1 // 2,
+            mma_type="nvfp4xnvfp4",
+        )
+        w13_sf = transform_ue4m3_sf_into_required_layout(
+            layer.w13_weight_scale.data.view(torch.float8_e4m3fn), n1
+        )
+        w2_sf = transform_ue4m3_sf_into_required_layout(
+            layer.w2_weight_scale.data.view(torch.float8_e4m3fn), n2
+        )
+        l1_pair, l2_pair = deep_gemm.transform_weights_for_mega_moe(
+            (layer.w13_weight.data.view(torch.int8), w13_sf),
+            (layer.w2_weight.data.view(torch.int8), w2_sf),
+            mma_type="nvfp4xnvfp4",
+        )
+
+        num_local = layer.num_local_experts
+        ones = torch.ones(num_local, dtype=torch.float32, device=l1_pair[0].device)
+        g1_gate, g1_up = _compute_gemm1_alphas(layer.w13_weight_scale_2, ones, True)
+        l1_alphas = torch.stack([g1_gate, g1_up], dim=1).contiguous()
+        w2_input_scale = _input_scale_to_local_experts(
+            layer.w2_input_scale, num_local, layer.num_experts, layer.moe_ep_rank
+        )
+        l2_act_scales = (1.0 / w2_input_scale).contiguous()
+        l2_alphas = (
+            w2_input_scale * layer.w2_weight_scale_2.to(torch.float32)
+        ).contiguous()
+
+        layer.mega_l1_weights = l1_pair
+        layer.mega_l2_weights = l2_pair
+        layer.mega_l1_alphas = l1_alphas
+        layer.mega_l2_alphas = l2_alphas
+        layer.mega_l2_act_scales = l2_act_scales
+        # Free the checkpoint layout.
+        layer.w13_weight.data = l1_pair[0]
+        layer.w13_weight_scale.data = l1_pair[1]
+        layer.w2_weight.data = l2_pair[0]
+        layer.w2_weight_scale.data = l2_pair[1]
+        layer._mega_moe_nvfp4 = True
+        layer._mega_moe_weights_built = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2527,6 +2614,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale.data, up_first=up_first
             )
             layer._w13_deinterleaved = True
+
+        if get_moe_a2a_backend().is_megamoe():
+            self._build_mega_moe_weights(layer)
+            return
 
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
@@ -2897,6 +2988,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         self._moe_runner_backend = moe_runner_backend
 
+        if get_moe_a2a_backend().is_megamoe():
+            # FusedMoE.forward is never reached under megamoe.
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
@@ -2947,11 +3043,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if layer._mega_moe_nvfp4:
+            raise RuntimeError(
+                "NVFP4 MegaMoE experts cannot fall back to the fused MoE path; "
+                "the model block must route every forward through "
+                "run_mega_routed_experts (check the MegaMoE token budget)."
+            )
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
+        # Use the cached backend: the global differs under speculative decoding.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
@@ -2959,7 +3062,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert activation in _SUPPORTED_ACT_STRS or (
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
-        moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
@@ -2984,8 +3086,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
-        # FlashInfer TRTLLM FP4 path
-        if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
+        # FlashInfer TRTLLM FP4 path (routed shares the weight prep and the runner)
+        if (
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
@@ -3021,7 +3126,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return self.runner.run(dispatch_output, quant_info)
 
-        if self.enable_flashinfer_cutedsl_moe:
+        if moe_runner_backend.is_flashinfer_cutedsl():
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                 CuteDslFp4MoeQuantInfo,
                 ensure_cutedsl_wrapper,
@@ -3077,14 +3182,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             return self.runner.run(dispatch_output, quant_info)
 
-        if self.enable_flashinfer_cutlass_moe:
+        if moe_runner_backend.is_flashinfer_cutlass():
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
