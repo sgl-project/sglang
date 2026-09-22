@@ -192,7 +192,7 @@ Notes on launch behavior:
 
 - **Default endpoint** is `127.0.0.1:30000` (`--host` / `--port` override).
 - **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
-- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default realtime request uses `guidance_scale=1.0`, while CFG parallel requires active cond/uncond branches.
+- **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default request uses `guidance_scale=1.0`, so the extra CFG ranks only recompute the same branch.
 - **FSDP.** Use `--use-fsdp-inference` only when you specifically need weight sharding for memory. For the low-latency realtime profile, prefer keeping components resident and using SP first.
 - **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No explicit `--warmup-mode` setting is needed.
 
@@ -487,3 +487,9 @@ At WebSocket `init` the realtime adapter fills SANA-WM defaults that differ from
 <Note>
 `guidance_scale` applies to the dense path (§4) only; the distilled streaming path uses `streaming_cfg_scale` (default `1.0`, i.e. no CFG) so a `guidance_scale` override never accidentally enables CFG on the streaming stage. `denoising_step_list = (1000, 960, 889, 727, 0)` is the official 4-step streaming schedule (it must end in 0).
 </Note>
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />
