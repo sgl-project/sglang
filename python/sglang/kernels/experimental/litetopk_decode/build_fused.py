@@ -1,10 +1,10 @@
 """AOT-build the opt-in 1024-bin selector pair for the SGL main Q1 scorer.
 
-This separate entry preserves the legacy builder and its B1/B2/B4/B8/B16 defaults.
 Generate and verify sources without CUDA: ``python build_fused.py --check-sources``.
 Build with CUDA_VISIBLE_DEVICES='', MAX_JOBS=1, CUTE_DSL_ARCH=sm_100a.
-The artifact manifest records exact qualified source hashes; rebuilding a binary
-does not itself qualify it numerically on a new toolchain or GPU.
+The checked-in selector is the final large variant; the small variant changes
+only route ownership and histogram scanning. Trimmed sources have new hashes.
+Compare rebuilt binary hashes with the measured references before qualification.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +24,10 @@ HERE = Path(__file__).resolve().parent
 REFERENCE_LIBRARIES = {
     "small": "015c4f33e3f1fc0fb1aa8f1ae16d7fe79aef9b58bc9cf1bd5d34317c2f515018",
     "large": "a38033a368911ef2beaa00bfdb297b027430fea865aaa6afdd080f4e0374ecb2",
+}
+REFERENCE_SOURCES = {
+    "small": "0574e383697ccdec76f6a3c18fc4e6e060a73c8955c1736da4ffeba99898d561",
+    "large": "f200bdabf3aea42dfc4d031a7637de3e45b8662c524f65ce42b11792c8c7737c",
 }
 WORKSPACE_TAIL_OFFSET = 20_973_568
 WORKSPACE_BYTES = WORKSPACE_TAIL_OFFSET + 128 * 8
@@ -43,12 +48,18 @@ def sha(path):
 
 
 def generate_sources():
-    legacy = load("_litetopk_fused_legacy_build", HERE / "build.py")
     transform = load("_litetopk_fused_source", HERE / "selectors/fused_source.py")
-    base = legacy._selector_source(1024)
-    vendor = (HERE / "vendor/gvr2_topk_decode.py").read_text()
-    texts = {route: transform.source(base, vendor, route) for route in ("small", "large")}
-    return legacy, texts
+    if sha(HERE / "vendor/gvr2_topk_decode.py") != transform.VENDOR_SHA256:
+        raise ValueError("selector helper source drift")
+    base = (HERE / "selectors/selector.py").read_text()
+    return {route: transform.source(base, route) for route in ("small", "large")}
+
+
+def require_build_environment():
+    expected = dict(CUDA_VISIBLE_DEVICES="", MAX_JOBS="1", CUTE_DSL_ARCH="sm_100a")
+    actual = {name: os.environ.get(name) for name in expected}
+    if actual != expected:
+        raise RuntimeError(f"required build environment: {expected}; got {actual}")
 
 
 def prepare_output_directory(directory):
@@ -61,7 +72,7 @@ def prepare_output_directory(directory):
     directory.mkdir(parents=True, exist_ok=True)
 
 
-def build_one(directory, route, text, legacy):
+def build_one(directory, route, text):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute import runtime
@@ -76,12 +87,12 @@ def build_one(directory, route, text, legacy):
     module = load(f"_dynamic128v6_{route}", generated)
 
     def fake(dtype, rank, align=16):
-        return legacy._selector_tensor(runtime, cute, dtype, rank, align)
+        return runtime.make_fake_compact_tensor(
+            dtype, tuple(cute.sym_int() for _ in range(rank)),
+            stride_order=tuple(reversed(range(rank))), assumed_align=align,
+        )
 
-    kernel = module.SplitQAcqRelHistogramPrologueGvrKernel(
-        threads, unroll, 1, 256, 2, True,
-        varlen=True, next_n=1, cr_shift=0, r_const=1,
-    )
+    kernel = module.SplitQAcqRelHistogramPrologueGvrKernel(threads, unroll)
     compiled = cute.compile(
         kernel,
         fake(cutlass.Float32, 2),
@@ -117,6 +128,7 @@ def build_one(directory, route, text, legacy):
         workspace_bytes=WORKSPACE_BYTES, adaptive=False,
         certificate_miss="exact_fallback", sampling=True,
         source=f"{route}/generated.py", source_sha256=sha(generated),
+        reference_source_sha256=REFERENCE_SOURCES[route],
         library=f"{route}/select.so", library_sha256=sha(library),
         reference_library_sha256=REFERENCE_LIBRARIES[route],
         matches_reference_binary=sha(library) == REFERENCE_LIBRARIES[route],
@@ -129,23 +141,23 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=HERE / "build/fused")
     parser.add_argument("--check-sources", action="store_true")
     args = parser.parse_args()
-    sources = (HERE / "build.py", HERE / "build_fused.py", HERE / "selectors/selector.py",
+    sources = (HERE / "build_fused.py", HERE / "selectors/selector.py",
                HERE / "selectors/fused_source.py", HERE / "vendor/gvr2_topk_decode.py")
     hashes = {str(path.relative_to(HERE)): sha(path) for path in sources}
-    legacy, texts = generate_sources()
+    texts = generate_sources()
     source_hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
     if args.check_sources:
-        print(json.dumps(dict(status="ok", qualified_source_hashes=source_hashes,
+        print(json.dumps(dict(status="ok", source_hashes=source_hashes,
                               source_dependencies=hashes), indent=2))
         return
-    legacy._require_build_environment()
+    require_build_environment()
     import torch
 
     if torch.cuda.is_initialized():
         raise RuntimeError("build must start before CUDA initialization")
     directory = args.output_dir.resolve()
     prepare_output_directory(directory)
-    records = {route: build_one(directory, route, text, legacy) for route, text in texts.items()}
+    records = {route: build_one(directory, route, text) for route, text in texts.items()}
     if any(sha(HERE / name) != digest for name, digest in hashes.items()):
         raise RuntimeError("source changed during the build")
     manifest = dict(
@@ -157,7 +169,7 @@ def main():
         source_dependencies=hashes, torch=torch.__version__, torch_cuda=torch.version.cuda,
         versions={name: importlib.metadata.version(name) for name in
                   ("nvidia-cutlass-dsl", "apache-tvm-ffi", "cuda-python")},
-        qualified_source_provenance="Byte-identical V6 pair used by 80 SGL main 1853080c matrix observations; exact fallback and physical page mapping retained.",
+        source_provenance="Specialized V6 decode selector; unsupported compile-time branches removed, exact fallback and physical mapping retained. Source hashes differ from the measured snapshot; reference binary hashes are recorded separately.",
         binary_validation="Compare source/library hashes and qualify rebuilt artifacts before claiming new-toolchain performance.",
         **records,
     )
