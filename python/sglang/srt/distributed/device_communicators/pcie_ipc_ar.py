@@ -126,11 +126,11 @@ def _warn_untuned_dtype(dtype: torch.dtype) -> None:
 
 def _autotune_disabled() -> bool:
     """Whether the operator asked for no FlashInfer autotuning."""
-    try:
-        from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_exec
 
+    try:
         return bool(get_exec().kernel.disable_flashinfer_autotune)
-    except Exception:
+    except ValueError:
         return False
 
 
@@ -143,31 +143,25 @@ def _decode_width() -> Optional[int]:
     ``max_bs * draft tokens``, as in
     ``runtime_context.cutedsl_moe_max_num_tokens``.
     """
-    try:
-        from sglang.srt.runtime_context import get_exec, get_spec
+    from sglang.srt.runtime_context import get_exec, get_spec
 
+    try:
         cg_config = get_exec().graph.cuda_graph_config
-        if cg_config is None:
-            return None
-        max_bs = cg_config.decode.max_bs
-        if not max_bs:
-            return None
         spec = get_spec()
-        rows_per_req = (
-            (spec.speculative_num_draft_tokens or 1)
-            if spec.speculative_algorithm
-            else 1
-        )
-        return max_bs * rows_per_req
-    except Exception as e:
+    except ValueError:
         # Embedded and unit-test use have no runtime context; the caller then
         # sizes from a fixed width that ignores the server args, so say so.
         logger.warning(
-            "FlashInfer PCIe-IPC could not read the resolved decode width (%s); "
-            "falling back to a fixed bound.",
-            e,
+            "FlashInfer PCIe-IPC has no runtime context to read the decode "
+            "width from; falling back to a fixed bound."
         )
         return None
+    if cg_config is None or not cg_config.decode.max_bs:
+        return None
+    rows_per_req = (
+        (spec.speculative_num_draft_tokens or 1) if spec.speculative_algorithm else 1
+    )
+    return cg_config.decode.max_bs * rows_per_req
 
 
 def _tune_cache_path(world_size: int) -> Optional[str]:
