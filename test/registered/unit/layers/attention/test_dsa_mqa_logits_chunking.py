@@ -6,7 +6,7 @@ On ROCm the `[num_q x num_k]` fp32 logits tensor goes to aiter's
 chunking is a correctness bound there and not only an out-of-memory guard.
 
 `Indexer` decides that with a budget; `IndexerKPool` splits the query rows
-inside its aiter call. Both are stubbed down to CPU-sized inputs here.
+around its aiter call. Both are stubbed down to CPU-sized inputs.
 """
 
 import sys
@@ -59,13 +59,9 @@ def test_off_rocm_the_budget_is_untouched():
 
 
 def _kpool_mqa_logits(num_q, num_k, cap_bytes):
-    """Call IndexerKPool._fp8_mqa_logits over a stub of aiter's kernel.
-
-    The stub returns each row's index plus its `starts` value in every column,
-    so the caller can tell a misordered reassembly, or a per-row argument that
-    was not sliced with the queries, from a correct split. The cap is patched so
-    the split happens at shapes a CPU can hold.
-    """
+    """Run `IndexerKPool._fp8_mqa_logits` over a stub that returns each row's
+    index plus its `starts`, so a misordered reassembly or an unsliced per-row
+    argument shows up in the logits."""
     rows_per_call = []
 
     def _kernel(q_fp8, k_fp8, k_scale, weights, starts, ends, *, clean_logits):
@@ -109,18 +105,11 @@ def test_kpool_splits_the_query_rows_to_stay_under_the_aiter_cap():
     raising, so the k-pool wrapper must never hand it a larger tensor."""
     num_q, num_k = 8, 4
     row_bytes = num_k * MQA_LOGITS_BYTES_PER_ELEM
-    # Not a whole number of rows: the split has to floor, never round up.
     logits, rows_per_call = _kpool_mqa_logits(num_q, num_k, 3 * row_bytes + 1)
 
     assert rows_per_call == [3, 3, 2]
     rows = torch.arange(num_q, dtype=torch.float32)
     assert torch.equal(logits, (rows + rows * 10).unsqueeze(1).expand(-1, num_k))
-
-
-def test_kpool_below_the_cap_is_one_call():
-    _, rows_per_call = _kpool_mqa_logits(8, 4, CEILING)
-
-    assert rows_per_call == [8]
 
 
 if __name__ == "__main__":

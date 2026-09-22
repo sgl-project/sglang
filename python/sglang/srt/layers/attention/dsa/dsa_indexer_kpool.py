@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -120,9 +121,7 @@ class IndexerKPool(MultiPlatformOp):
             f"index_kpool ({self.index_kpool}) must divide page_size (64)"
         )
 
-        # Resolved the same way as the non-pooled indexer rather than branching on
-        # is_hip() directly, so --dsa-paged-mqa-logits-backend reaches this path too.
-        # resolve() already pins ROCm to AITER and rejects the CUDA-only choices.
+        # resolve() pins ROCm to AITER and lets --dsa-paged-mqa-logits-backend reach this path
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
@@ -836,45 +835,43 @@ class IndexerKPool(MultiPlatformOp):
         *,
         clean_logits: bool,
     ) -> torch.Tensor:
-        """Ragged MQA logits, the prefill counterpart of the paged kernel.
-
-        DeepGEMM has no ROCm build, so HIP goes to AITER's Triton kernel. It
-        takes the fp8 values and their scales as separate arguments where
-        DeepGEMM takes a tuple.
-        """
+        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
-            # AITER's fp8_mqa_logits stores through buffer_store below 2 GiB of
-            # fp32 logits; above it takes a gl.store that fails to compile and
-            # abort()s the process. Drop once ROCm/aiter#5114 ships.
+            # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
+            # process (ROCm/aiter#5114); rows are independent, so block the queries
             num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
-            rows_per_call = max(
-                1,
-                MQA_LOGITS_MAX_BYTES_ROCM // max(num_k * MQA_LOGITS_BYTES_PER_ELEM, 1),
+            rows_per_call = mqa_logits_rows_per_chunk(
+                num_rows=num_q,
+                row_bytes=num_k * MQA_LOGITS_BYTES_PER_ELEM,
+                budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
             )
-            if num_q > rows_per_call:
-                # Row i of the logits depends only on q_fp8[i], weights[i],
-                # starts[i] and ends[i], so blocking the query rows is exact.
-                logits = torch.empty(
-                    (num_q, num_k), dtype=torch.float32, device=q_fp8.device
+            if rows_per_call is None:
+                return fp8_mqa_logits(
+                    q_fp8,
+                    k_fp8,
+                    k_scale,
+                    weights,
+                    starts,
+                    ends,
+                    clean_logits=clean_logits,
                 )
-                for i in range(0, num_q, rows_per_call):
-                    rows = slice(i, i + rows_per_call)
-                    logits[rows] = fp8_mqa_logits(
-                        q_fp8[rows],
-                        k_fp8,
-                        k_scale,
-                        weights[rows],
-                        starts[rows],
-                        ends[rows],
-                        clean_logits=clean_logits,
-                    )
-                return logits
-
-            return fp8_mqa_logits(
-                q_fp8, k_fp8, k_scale, weights, starts, ends, clean_logits=clean_logits
+            logits = torch.empty(
+                (num_q, num_k), dtype=torch.float32, device=q_fp8.device
             )
+            for i in range(0, num_q, rows_per_call):
+                rows = slice(i, i + rows_per_call)
+                logits[rows] = fp8_mqa_logits(
+                    q_fp8[rows],
+                    k_fp8,
+                    k_scale,
+                    weights[rows],
+                    starts[rows],
+                    ends[rows],
+                    clean_logits=clean_logits,
+                )
+            return logits
 
         return deep_gemm.fp8_mqa_logits(
             q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
@@ -882,7 +879,7 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
-        # q_fp8 is [tokens, heads, dim] here; the caller no longer pre-inserts next_n.
+        # q_fp8 is [tokens, heads, dim], without the next_n dim
         if not is_cuda():
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
@@ -923,9 +920,7 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
-        # q_fp8 stays [tokens, heads, dim] through the dispatch below. next_n is 1
-        # here, but the backends disagree on who adds that dim: aiter_paged_mqa_logits
-        # unsqueezes internally, the others want it already there.
+        # aiter_paged_mqa_logits adds the next_n dim itself; the other two want it already there
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -954,10 +949,7 @@ class IndexerKPool(MultiPlatformOp):
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_aiter_paged_mqa:
-            # The preshuffled cache layout is not optional: kpool_fp8_index writes
-            # the index-K rows in AITER's tile order whenever the kernel is
-            # available, so falling back to a non-preshuffle reader here would
-            # misread the buffer rather than merely run slower.
+            # kpool_fp8_index writes in AITER's tile order, so a row-major reader would misread the cache
             if not aiter_can_use_preshuffle_paged_mqa():
                 raise RuntimeError(
                     "The ROCm k-pool indexer needs AITER's preshuffle paged-MQA "

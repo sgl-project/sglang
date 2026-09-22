@@ -30,17 +30,8 @@ def _kpool_cache_k_offsets(
     HEAD_DIM: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
 ):
-    """Offsets of one pooled token's index-K row inside the paged buffer.
-
-    With PRESHUFFLE_TILE set the row is scattered into TILE x TILE tiles, which
-    is what aiter's preshuffle paged-MQA kernel reads. The layout mirrors
-    _set_k_and_s_triton_kernel in kernels/ops/attention/dsa/index_buf_accessor.py,
-    which already writes the non-pooled indexer cache this way; the two must
-    agree because both are consumed by the same aiter kernel.
-
-    Factored out rather than inlined because the k-pool path writes this buffer
-    from four kernels and reads it back from a fifth.
-    """
+    """Offsets of one pooled token's index-K row; must match `_set_k_and_s_triton_kernel`,
+    which lays out the non-pooled cache for the same aiter kernel."""
     if PRESHUFFLE_TILE:
         tile = PRESHUFFLE_TILE
         token_tile_id = slot // tile
