@@ -2,16 +2,7 @@
 
 Each case pins a conclusion that had to be established against a real driver
 rather than read off a spec, and that a driver or torch upgrade could silently
-take away:
-
-  - the reservations live in the backend's own context, so torch must still see
-    them and its allocator must not hand back a reserved range;
-  - one VA range can hold several distinct physical objects and a kernel reading
-    across a seam must get the same answer as a contiguous copy;
-  - a physical object survives an export/import round trip and re-maps at a
-    caller-chosen offset, which is what makes peer weight prefetch work;
-  - the memory these reservations hold is visible to SGLang's free-memory query,
-    which torch's allocator alone cannot report.
+take away; its own docstring says which.
 
 CUDA and Intel XPU run the same cases through ``get_vmm_backend``. Where the two
 drivers genuinely differ the case asks the backend -- ``owns_exported_fds`` for
@@ -24,7 +15,6 @@ cross-process cases).
 
 from __future__ import annotations
 
-import atexit
 import os
 
 import pytest
@@ -34,8 +24,13 @@ import torch.distributed as dist
 from sglang.srt.utils import get_device, get_device_module, is_cuda, is_xpu
 from sglang.srt.utils.common import get_available_gpu_memory
 from sglang.srt.utils.vmm_backend import get_vmm_backend
+from sglang.srt.utils.vmm_common import exchange_posix_fds
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
-from sglang.test.kernels.utils import multigpu_pytest_main
+from sglang.test.kernels.utils import (
+    gloo_group,
+    local_device_id,
+    multigpu_pytest_main,
+)
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="2-gpu-large")
 register_xpu_ci(est_time=30, suite="nightly-xpu-2-gpu", nightly=True)
@@ -48,26 +43,12 @@ pytestmark = pytest.mark.skipif(
 _NUM_OBJECTS = 8
 
 
-def _local_device_id() -> int:
-    device_id = int(os.environ.get("LOCAL_RANK", 0))
-    get_device_module().set_device(device_id)
-    return device_id
-
-
-def _gloo_group() -> dist.ProcessGroup:
-    if not dist.is_initialized():
-        _local_device_id()
-        dist.init_process_group(backend="gloo")
-        atexit.register(dist.destroy_process_group)
-    return dist.group.WORLD
-
-
 def test_an_odd_multiple_of_the_granularity_can_be_created_and_mapped() -> None:
     """DWDP sizes each physical object from the expert bytes it holds, so the
     object is an arbitrary multiple of the granularity rather than a round one.
     Level Zero rejected such a size outright when the granularity was queried
     below its own step, with UNSUPPORTED_SIZE from zePhysicalMemCreate."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     backend = get_vmm_backend(device_id)
     granularity = backend.granularity
     assert granularity & (granularity - 1) == 0, f"{granularity} is not a power of two"
@@ -91,7 +72,7 @@ def test_level_zero_granularity_covers_every_allocation_size() -> None:
     the coarse page, not whatever the smallest query returns."""
     from sglang.srt.utils.xpu_vmm_utils import get_device_granularity, query_page_size
 
-    device_id = _local_device_id()
+    device_id = local_device_id()
     granularity = get_device_granularity(device_id)
     for multiplier in (1, 2, 3, 33, 512):
         size = multiplier * granularity
@@ -106,7 +87,7 @@ def test_reserved_va_is_invisible_to_the_torch_allocator() -> None:
     Torch must still read the mapping, and its allocator must never hand back a
     range we reserved -- otherwise a DWDP weight and a live activation would
     occupy the same pages."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device = get_device(device_id)
     backend = get_vmm_backend(device_id)
     before = [torch.randn(1 << 20, device=device) for _ in range(4)]
@@ -143,7 +124,7 @@ def test_gemm_across_composite_va_seams_matches_contiguous() -> None:
     """A composite VA is only useful if a kernel cannot tell it from one
     allocation. Reading B across 7 physical-object boundaries must be bit-exact
     against the same weights in a normal tensor."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device = get_device(device_id)
     backend = get_vmm_backend(device_id)
     page = backend.granularity
@@ -176,7 +157,7 @@ def test_prefetch_event_protocol_orders_copy_before_compute() -> None:
     """DWDP overlaps the peer-weight copy with compute on a second stream and
     orders them with events only. A stream/event regression would surface as
     torn weights rather than a failure, so pin the ordering."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device = get_device(device_id)
     device_module = get_device_module()
     backend = get_vmm_backend(device_id)
@@ -212,10 +193,10 @@ def test_export_import_round_trip_on_one_device() -> None:
     at a caller-chosen VA offset. Level Zero's zeMemGetIpcHandle cannot do this
     (it rejects physical-memory handles), so the export path is load-bearing on
     both drivers even within one process."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device = get_device(device_id)
     backend = get_vmm_backend(device_id)
-    group = _gloo_group()
+    group = gloo_group()
     rank = dist.get_rank()
     size = 4 * backend.granularity
 
@@ -265,7 +246,7 @@ def test_memory_accounting_sees_vmm_allocations() -> None:
     resident. Sizing the KV pool against that figure made all four ranks die with
     OutOfMemoryError while reporting 23.91 GiB of 23.91 GiB free -- on XPU the
     driver query that looks like cuMemGetInfo is a stub, and torch forwards it."""
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device_module = get_device_module()
     backend = get_vmm_backend(device_id)
     size = 512 * backend.granularity
@@ -294,12 +275,12 @@ def test_cross_rank_peer_weight_alias() -> None:
     """The DWDP transport itself: every rank exports its shard, every peer
     imports it, maps it into its own address space, and reads the peer's data off
     a different device."""
-    group = _gloo_group()
+    group = gloo_group()
     world_size = dist.get_world_size()
     if world_size < 2:
         pytest.skip("needs at least 2 ranks")
     rank = dist.get_rank()
-    device_id = _local_device_id()
+    device_id = local_device_id()
     device = get_device(device_id)
     backend = get_vmm_backend(device_id)
     size = 2 * backend.granularity
@@ -320,7 +301,7 @@ def test_cross_rank_peer_weight_alias() -> None:
         all_fabric = [None] * world_size
         dist.all_gather_object(all_fabric, fabric_handles, group=group)
     else:
-        peer_fds = backend.exchange_fds(group, rank, world_size, fds, [1] * world_size)
+        peer_fds = exchange_posix_fds(group, rank, world_size, fds, [1] * world_size)
 
     imported = []
     peer_reservations = []

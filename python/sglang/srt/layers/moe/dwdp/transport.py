@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.dwdp.layout import (
     MnnvlHandleSet,
 )
 from sglang.srt.utils.vmm_backend import VmmBackend, get_vmm_backend
-from sglang.srt.utils.vmm_common import align_down, align_up
+from sglang.srt.utils.vmm_common import align_down, align_up, exchange_posix_fds
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ class DWDPTransport:
             dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
         else:
             all_fabric = None
-            peer_fds = self._backend.exchange_fds(
+            peer_fds = exchange_posix_fds(
                 cpu_group,
                 layout.dwdp_rank,
                 layout.dwdp_size,

@@ -10,7 +10,11 @@ import unittest
 
 from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
-from sglang.test.dwdp_test_utils import assert_gsm8k_accuracy, launch_dwdp_server
+from sglang.test.dwdp_test_utils import (
+    GPT_OSS_20B_GSM8K_FLOOR,
+    assert_gsm8k_accuracy,
+    launch_dwdp_server,
+)
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 register_xpu_ci(est_time=600, suite="nightly-xpu-2-gpu", nightly=True)
@@ -18,11 +22,6 @@ register_cuda_ci(est_time=600, stage="extra-b", runner_config="2-gpu-large")
 
 MODEL = "openai/gpt-oss-20b"
 TP_SIZE = 2
-
-# Measured 0.890 (n=100) on 2x Arc Pro B60; the floor sits ~1.4 sigma below that
-# (score:std 0.313, so SE 0.031). The DWDP file must assert the same number.
-GSM8K_BASELINE_ACCURACY = 0.85
-
 LAUNCH_TIMEOUT = 1800
 
 
@@ -51,7 +50,7 @@ class TestDwdpGptOss20BTpControl(CustomTestCase):
             self,
             model=MODEL,
             base_url=self.base_url,
-            accuracy=GSM8K_BASELINE_ACCURACY,
+            accuracy=GPT_OSS_20B_GSM8K_FLOOR,
             num_examples=100,
             num_threads=8,
         )

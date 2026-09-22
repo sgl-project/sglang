@@ -9,13 +9,12 @@ importing a driver module.
 from __future__ import annotations
 
 from functools import cache
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils.common import is_xpu
-from sglang.srt.utils.vmm_common import exchange_posix_fds
 
 
 class VmmBackend:
@@ -89,19 +88,6 @@ class VmmBackend:
         does not carry it, CUDA's shareable handles do.
         """
         raise NotImplementedError
-
-    def exchange_fds(
-        self,
-        group: ProcessGroup,
-        rank: int,
-        world_size: int,
-        local_fds: List[int],
-        peer_handle_counts: List[int],
-    ) -> Dict[Tuple[int, int], int]:
-        """Send local fds to every peer over SCM_RIGHTS and collect theirs."""
-        return exchange_posix_fds(
-            group, rank, world_size, local_fds, peer_handle_counts
-        )
 
     def owns_exported_fds(self) -> bool:
         """Whether the caller must close the fds from ``export_handles``.

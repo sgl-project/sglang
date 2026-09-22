@@ -33,10 +33,10 @@ _CUDA_SERVER_ARGS = [
     "--disable-flashinfer-autotune",
 ]
 
-
-def dwdp_server_args() -> List[str]:
-    """Backend flags a DWDP model test needs ahead of its own arguments."""
-    return list(_XPU_SERVER_ARGS if is_xpu() else _CUDA_SERVER_ARGS)
+# Measured 0.890 (n=100) at TP=2 and 0.910 under DWDP on 2x Arc Pro B60; the floor
+# sits ~1.4 sigma below the control (score:std 0.313, so SE 0.031). The DWDP arm
+# and its TP control assert the same number, which is the point of the pair.
+GPT_OSS_20B_GSM8K_FLOOR = 0.85
 
 
 def launch_dwdp_server(
@@ -47,7 +47,8 @@ def launch_dwdp_server(
     timeout: float,
     tp_size: Optional[int] = None,
 ):
-    other_args = dwdp_server_args() + list(extra_args)
+    backend_args = _XPU_SERVER_ARGS if is_xpu() else _CUDA_SERVER_ARGS
+    other_args = list(backend_args) + list(extra_args)
     if tp_size is not None:
         other_args += ["--tp-size", str(tp_size)]
     try:

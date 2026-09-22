@@ -455,10 +455,6 @@ def release_physical_mem(handle: int, device_id: int) -> None:
     )
 
 
-def empty_cache() -> None:
-    torch.xpu.empty_cache()
-
-
 class VmmReservation:
     """Own a VA reservation, its mappings, and their teardown order."""
 

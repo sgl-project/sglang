@@ -101,7 +101,6 @@ class TestXpuMoeLdPadding(CustomTestCase):
         # argument, so the gate reads the ambient device context. Padding a
         # non-XPU weight would make it non-contiguous for no benefit.
         self._publish(dwdp_size=1)
-        build = self._build_weights
 
         with (
             unittest.mock.patch(
@@ -113,15 +112,15 @@ class TestXpuMoeLdPadding(CustomTestCase):
             ),
         ):
             # Backend on but building for CPU -> must stay contiguous.
-            w13_cpu, w2_cpu = build("cpu")
+            w13_cpu, w2_cpu = self._build_weights("cpu")
             self.assertTrue(w13_cpu.is_contiguous())
             self.assertTrue(w2_cpu.is_contiguous())
 
             if torch.xpu.is_available():
-                w13_xpu, _ = build("xpu")
+                w13_xpu, _ = self._build_weights("xpu")
                 self.assertFalse(w13_xpu.is_contiguous())
                 # The Triton path stores B transposed and ignores row stride.
-                w13_triton, _ = build("xpu", use_triton_kernels=True)
+                w13_triton, _ = self._build_weights("xpu", use_triton_kernels=True)
                 self.assertTrue(w13_triton.is_contiguous())
 
         # Backend forced to Triton -> never padded, even on XPU.
@@ -135,7 +134,7 @@ class TestXpuMoeLdPadding(CustomTestCase):
             ),
         ):
             device = "xpu" if torch.xpu.is_available() else "cpu"
-            w13, w2 = build(device)
+            w13, w2 = self._build_weights(device)
             self.assertTrue(w13.is_contiguous())
             self.assertTrue(w2.is_contiguous())
 

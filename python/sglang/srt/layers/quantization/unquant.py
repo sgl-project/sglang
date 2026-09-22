@@ -588,6 +588,9 @@ def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     DWDP is excluded too: it addresses experts inside a composite virtual address
     space by their logical byte size, so a padded row stride would put them at
     the wrong offsets. build_layer_weight_specs re-checks contiguity.
+
+    is_xpu() only says the machine has an XPU; create_weights takes no device
+    argument, so the ambient default device decides where the weight lands.
     """
     return (
         is_xpu()

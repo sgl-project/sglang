@@ -17,7 +17,11 @@ import unittest
 
 from sglang.srt.utils import is_cuda, is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
-from sglang.test.dwdp_test_utils import assert_gsm8k_accuracy, launch_dwdp_server
+from sglang.test.dwdp_test_utils import (
+    GPT_OSS_20B_GSM8K_FLOOR,
+    assert_gsm8k_accuracy,
+    launch_dwdp_server,
+)
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 register_xpu_ci(est_time=1800, suite="nightly-xpu-2-gpu", nightly=True)
@@ -25,11 +29,6 @@ register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
 
 MODEL = "openai/gpt-oss-20b"
 DWDP_SIZE = 2
-
-# Must stay equal to the control's floor in test_dwdp_gpt_oss_20b_tp_control.py;
-# the two files cannot share it because test/registered is not importable.
-GSM8K_BASELINE_ACCURACY = 0.85
-
 LAUNCH_TIMEOUT = 1800
 
 
@@ -61,14 +60,13 @@ class TestDwdpGptOss20B(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        # Measured 0.910 (n=100) against the control's 0.890 on 2x Arc Pro B60, a
-        # 0.5-sigma gap. Both arms assert the same floor: the claim under test is
-        # that prefetching experts does not change what the model answers.
+        # Both arms assert the same floor: the claim under test is that prefetching
+        # experts does not change what the model answers.
         assert_gsm8k_accuracy(
             self,
             model=MODEL,
             base_url=self.base_url,
-            accuracy=GSM8K_BASELINE_ACCURACY,
+            accuracy=GPT_OSS_20B_GSM8K_FLOOR,
             num_examples=100,
             num_threads=8,
         )

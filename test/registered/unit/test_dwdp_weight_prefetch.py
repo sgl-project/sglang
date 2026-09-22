@@ -6,25 +6,15 @@ so a backend whose granularity or handle semantics differ fails here rather than
 as drifted logits in a model test.
 
 Drives the real transport / weight buffer / weight manager over synthetic expert
-weights, so the pieces a model test cannot isolate are pinned here:
-
-  - the local shard must land at the layout's offset inside the composite VA,
-    which depends on the allocation granularity the backend reports;
-  - every peer expert must arrive byte-exact, including the two experts whose
-    bytes straddle the local handle's edge pages and are seeded once instead of
-    prefetched into pool pages;
-  - reading a layer must be safe while the layer two ahead is already being
-    prefetched into the same double-buffer slot.
-
-Expert sizes are deliberately not a page multiple; a page-multiple shape hides
-every edge case above.
+weights, so the pieces a model test cannot isolate are pinned here; each case
+says which. Expert sizes are deliberately not a page multiple, since a
+page-multiple shape hides every edge case they cover.
 
 Run with ``python test_dwdp_weight_prefetch.py`` (relaunches under torchrun).
 """
 
 from __future__ import annotations
 
-import atexit
 import os
 from types import SimpleNamespace
 from typing import Dict, Tuple
@@ -42,7 +32,11 @@ from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_exp
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.utils import get_device, get_device_module, is_cuda, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
-from sglang.test.kernels.utils import multigpu_pytest_main
+from sglang.test.kernels.utils import (
+    gloo_group,
+    local_device_id,
+    multigpu_pytest_main,
+)
 
 register_xpu_ci(est_time=60, suite="nightly-xpu-4-gpu", nightly=True)
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-h100")
@@ -69,20 +63,6 @@ _WEIGHT_NAMES = ("w13_weight", "w2_weight")
 WeightKey = Tuple[int, str]
 
 
-def _local_device_id() -> int:
-    device_id = int(os.environ.get("LOCAL_RANK", 0))
-    get_device_module().set_device(device_id)
-    return device_id
-
-
-def _gloo_group() -> dist.ProcessGroup:
-    if not dist.is_initialized():
-        _local_device_id()
-        dist.init_process_group(backend="gloo")
-        atexit.register(dist.destroy_process_group)
-    return dist.group.WORLD
-
-
 def _expert_shape(name: str) -> Tuple[int, ...]:
     if name == "w13_weight":
         return (2 * _INTERMEDIATE, _HIDDEN)
@@ -103,10 +83,10 @@ class _DwdpFixture:
     """The transport/buffer/manager stack one rank would build during setup()."""
 
     def __init__(self) -> None:
-        group = _gloo_group()
+        group = gloo_group()
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.device_id = _local_device_id()
+        self.device_id = local_device_id()
         device = torch.device(get_device(), self.device_id)
 
         self.layout = DwdpExpertLayout(
@@ -176,7 +156,7 @@ def dwdp():
         yield fixture
     finally:
         fixture.release()
-        dist.barrier(group=_gloo_group())
+        dist.barrier(group=gloo_group())
 
 
 def test_local_shard_lands_at_the_layout_offset(dwdp: _DwdpFixture) -> None:

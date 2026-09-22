@@ -241,6 +241,9 @@ class WeightBuffer:
     def device(self) -> torch.device:
         return self._backend.torch_device
 
+    def synchronize(self) -> None:
+        self._backend.synchronize()
+
     def weight_names(self, layer_idx: int) -> List[str]:
         return list(self._layer_weight_specs[layer_idx].keys())
 
@@ -279,7 +282,6 @@ def fill_edge_experts(
     Page alignment puts bytes of the experts just outside [local_start, local_end)
     on those pages, where no prefetch ever writes them; seed them from the owner.
     """
-    device_module = torch.get_device_module(weight_buffer.device)
     for li in weight_buffer.layer_indices:
         for name in weight_buffer.weight_names(li):
             edge = weight_buffer.get_edge_info(li, name)
@@ -308,6 +310,6 @@ def fill_edge_experts(
         if weight_buffer.rebinds_pool_pages:
             # the next layer takes these pool pages back, and unmapping does not
             # wait for the copies above
-            device_module.synchronize(weight_buffer.device_id)
+            weight_buffer.synchronize()
 
-    device_module.synchronize(weight_buffer.device_id)
+    weight_buffer.synchronize()
