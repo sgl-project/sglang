@@ -7,13 +7,13 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.choices import W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
     record_foreign_defaults,
     resolving_view,
 )
-from sglang.srt.arg_groups.choices import W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
@@ -41,9 +41,7 @@ def handle_npu_backends(server_args: Any):
 
         if cfg.online_quantization == "w4a4_int":
             architectures = model_config_of(server_args).hf_config.architectures
-            if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(
-                architectures
-            ):
+            if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(architectures):
                 raise ValueError(
                     "--online-quantization w4a4_int is disabled for dense models "
                     "because dense W4A4 is inaccurate; it is currently MoE-only. "

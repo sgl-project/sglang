@@ -128,7 +128,7 @@ def npu_format_online_dense_weight(
 def _encode_online_int4_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype != torch.float32:
         raise TypeError(
-            "Ascend INT4 matmul requires FP32 source scales, got " f"{scale.dtype}."
+            f"Ascend INT4 matmul requires FP32 source scales, got {scale.dtype}."
         )
 
     # QuantMatmul and GMM consume each FP32 bit pattern in the low half of an
