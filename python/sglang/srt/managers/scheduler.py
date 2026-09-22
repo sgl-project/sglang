@@ -3496,6 +3496,13 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _clear_dllm_block_tokens(self, req: Req) -> None:
+        # The req slot is recycled. A row left from the previous request is
+        # gathered into the next request's first block and poisons the radix.
+        buf = self.future_map.dllm_block_tokens_buf
+        if buf is not None and req.kv.req_pool_idx is not None:
+            buf[req.kv.req_pool_idx] = -1
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -3621,9 +3628,7 @@ class Scheduler(
                     # Until then the slot and its KV stay, including the overlap
                     # iter where dllm_incomplete_ids has not been written yet.
                     if req.dllm_block_done:
-                        buf = self.future_map.dllm_block_tokens_buf
-                        if buf is not None and req.kv.req_pool_idx is not None:
-                            buf[req.kv.req_pool_idx] = -1
+                        self._clear_dllm_block_tokens(req)
                         self.stash_chunked_request(req)
                         self.req_to_token_pool.free(req)
                 else:

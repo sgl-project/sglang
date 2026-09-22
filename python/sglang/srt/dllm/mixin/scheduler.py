@@ -167,6 +167,7 @@ class SchedulerDllmMixin:
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
+                    self._clear_dllm_block_tokens(req)
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
@@ -465,9 +466,10 @@ class DllmManager:
             and self.dllm_config.first_done_first_out_mode
         )
         for req in self.staging_queue:
-            # Marker unset: this block is still open. Do not append the next mask
-            # block; the next forward takes tokens from FutureMap.
-            if fdfo and not req.dllm_block_done:
+            # Incomplete ids are this block's denoised tokens. init writes them
+            # back and does not append a mask block. Skip only while overlap has
+            # not processed the step yet, so an empty open block is not extended.
+            if fdfo and not req.dllm_block_done and not req.dllm_incomplete_ids:
                 continue
             req.init_next_round_input()
         self.staging_queue = []

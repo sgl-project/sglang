@@ -3762,6 +3762,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            dllm_config=self.dllm_config,
         )
 
     def maybe_evict_swa(self):

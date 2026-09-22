@@ -113,26 +113,31 @@ class TestFdfoLowConfidenceOverlap(unittest.TestCase):
         future_map.resolve_dllm_block_tokens(batch)
         self.assertEqual(batch.input_ids.tolist(), [0, 0, 0, 0, 1, 1, 1, 1])
 
-    def test_init_next_round_keeps_geometry_until_block_done(self):
+    def test_init_next_round_writes_back_open_block_tokens(self):
         manager = DllmManager(
             SimpleNamespace(max_running_requests=2, first_done_first_out_mode=True)
         )
 
         class _Req:
-            def __init__(self, done):
+            def __init__(self, done, incomplete):
                 self.dllm_block_done = done
-                self.dllm_incomplete_ids = array("q", [1, 2, 3, 4])
+                self.dllm_incomplete_ids = incomplete
                 self.inited = 0
 
             def init_next_round_input(self):
                 self.inited += 1
 
-        open_req = _Req(False)
-        done_req = _Req(True)
-        manager.staging_queue = [open_req, done_req]
+        # Overlap has not processed this step: keep the current block geometry.
+        pending = _Req(False, array("q"))
+        # Process already stored this block's tokens; write them back.
+        open_req = _Req(False, array("q", [1, 2, 3, 4]))
+        done_req = _Req(True, array("q"))
+        manager.staging_queue = [pending, open_req, done_req]
         manager.init_next_round()
 
-        self.assertEqual(open_req.inited, 0)
+        self.assertEqual(pending.inited, 0)
+        self.assertFalse(pending.dllm_block_done)
+        self.assertEqual(open_req.inited, 1)
         self.assertFalse(open_req.dllm_block_done)
         self.assertEqual(done_req.inited, 1)
         # Marker stays set so an in-flight extra step can skip a second emit.
