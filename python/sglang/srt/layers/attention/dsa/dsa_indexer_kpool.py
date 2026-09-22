@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -62,6 +61,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
@@ -1025,9 +1025,11 @@ class IndexerKPool(MultiPlatformOp):
         mem_fraction_static accounts for, so at long context it dwarfs the
         remaining headroom (a 917K-token prefill chunk reaches ~14 GiB here).
         """
-        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
-            # mem_get_info would sync the host mid-capture, and captured shapes
-            # are fixed anyway.
+        # Only real capture must keep a fixed launch count and avoid the
+        # mem_get_info host sync. get_is_capture_mode() is also true throughout
+        # breakable-graph replay, whose eager breaks run this path with live
+        # request metadata and need the budget, so it is not the right guard.
+        if capture_mode.is_capture_mode or torch.cuda.is_current_stream_capturing():
             return None
         device_index = device.index if device.index is not None else 0
         need_chunk, budget_bytes = mqa_logits_should_chunk(
@@ -1153,6 +1155,14 @@ class IndexerKPool(MultiPlatformOp):
         def _rows(tensor: Optional[torch.Tensor], start: int, end: int):
             return None if tensor is None else tensor[start:end]
 
+        # page_table_all is req_to_token, indexed by request-pool ID, not by
+        # query row: page_table_row_index carries the absolute request ID per
+        # row. Slicing the table would shift its base while those IDs keep
+        # pointing at the original rows, so a later chunk would read another
+        # request's KV. Only the query-indexed row_index is sliced. When there
+        # is no row_index the table is per-query and slices with the rest.
+        page_table_is_request_indexed = page_table_row_index_all is not None
+
         topk_result = None
         for start, end in row_chunks:
             logits_chunk = self._fp8_mqa_logits(
@@ -1167,7 +1177,11 @@ class IndexerKPool(MultiPlatformOp):
                 logits_chunk,
                 pool_lens[start:end],
                 seq_lens=_rows(seq_lens_expanded, start, end),
-                page_table=_rows(page_table_all, start, end),
+                page_table=(
+                    page_table_all
+                    if page_table_is_request_indexed
+                    else _rows(page_table_all, start, end)
+                ),
                 topk_offsets=_rows(topk_offsets_all, start, end),
                 row_starts=ks_per_q[start:end],
                 page_table_row_index=_rows(page_table_row_index_all, start, end),
