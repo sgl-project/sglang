@@ -375,13 +375,12 @@ class TestIdleMetrics(CustomTestCase):
 
     def test_host_receive_metrics_survive_queue_drain(self):
         registry = prometheus_client.CollectorRegistry()
-        labels = {"model_name": "test", "priority": ""}
+        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
+        sample_labels = {key: str(value) for key, value in labels.items()}
         with patch.multiple(
-            SchedulerMetricsCollector,
+            prometheus_client,
             **{
-                f"_{kind.lower()}_cls": partial(
-                    getattr(prometheus_client, kind), registry=registry
-                )
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
                 for kind in ("Counter", "Gauge", "Histogram", "Summary")
             },
         ):
@@ -418,13 +417,13 @@ class TestIdleMetrics(CustomTestCase):
                     self.assertEqual(
                         registry.get_sample_value(
                             "sglang:num_decode_host_receive_queue_reqs",
-                            {**labels, "priority": priority},
+                            {**sample_labels, "priority": priority},
                         ),
                         expected if waiting else 0,
                     )
                 self.assertEqual(
                     registry.get_sample_value(
-                        "sglang:num_decode_host_receive_reqs_total", labels
+                        "sglang:num_decode_host_receive_reqs_total", sample_labels
                     ),
                     2,
                 )
