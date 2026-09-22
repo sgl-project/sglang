@@ -198,8 +198,6 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             send(Arc::clone(&ctx), request.clone()).await,
             StatusCode::OK
         );
-        // The abort-on-disconnect path mints a `rid` into every plain-mode
-        // body; everything else must be forwarded untouched.
         let mut forwarded = captured(&mock);
         let rid = forwarded
             .as_object_mut()

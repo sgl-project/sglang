@@ -26,11 +26,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
-    /// Did the caller file this request under its own `rid`? Opts the request
-    /// out of abort-on-disconnect — see [`resolve_engine_rid`].
     caller_set_rid: bool,
-    /// Will the engine fan this request out into several samples (`n > 1`)?
-    /// Also an abort-on-disconnect opt-out — see [`resolve_engine_rid`].
     fans_out: bool,
     can_forward_input_ids: bool,
     parsed_body: Option<Value>,
@@ -83,16 +79,14 @@ impl PreparedChatRequest {
         })
     }
 
-    /// The engine-facing request id this dispatch will be aborted by if the
-    /// client disconnects, or `None` when the request opts out — see
-    /// [`resolve_engine_rid`].
     pub(super) fn engine_rid(&self, pd_mode: bool) -> Option<String> {
-        resolve_engine_rid(self.caller_set_rid, self.fans_out, pd_mode)
+        // Caller IDs are unsafe for prefix aborts; fan-out regenerates IDs; PD must finish KV transfer.
+        if self.caller_set_rid || self.fans_out || pd_mode {
+            return None;
+        }
+        Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
-    /// `engine_rid` is the router-minted request id to file this request under
-    /// on the engine, or `None` to leave the body's `rid` alone (PD mode, or a
-    /// caller that set its own) — see [`resolve_engine_rid`].
     pub(super) fn into_outgoing_body(
         self,
         ctx: &AppContext,
@@ -136,13 +130,7 @@ pub(super) struct RoutingFields {
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
-    /// Presence only, for [`resolve_engine_rid`]: did the caller file this
-    /// request under its own `rid`? The value is deliberately not retained —
-    /// SGLang accepts `rid` as a string *or* a list of strings
-    /// (`ChatCompletionRequest.rid` in
-    /// `python/sglang/srt/entrypoints/openai/protocol.py`), so typing it as
-    /// `Option<String>` would turn a body the engine accepts today into a
-    /// router-side 400.
+    // Preserve both string and list IDs without retaining their contents.
     caller_set_rid: bool,
 }
 
@@ -276,9 +264,6 @@ impl RoutingKey {
 enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
-    /// The caller's own `rid`. Presence-only, and deliberately NOT a
-    /// [`RoutingKey`]: the router does not route on it, so a repeat is
-    /// last-wins like the engine's own `json.loads` rather than a 400.
     Rid,
     Other,
 }
@@ -358,9 +343,6 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     };
                 }
                 RequestKey::Rid => {
-                    // Presence only — see `resolve_engine_rid`. An explicit
-                    // `null` reads as absent, matching the engine, which mints
-                    // its own rid for it.
                     fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
                 }
                 RequestKey::Other => {
@@ -413,13 +395,7 @@ fn should_tokenize_request(
     can_forward_input_ids || policy_needs_request_tokens || bucket_routing_enabled
 }
 
-/// Whether the engine will fan this request out into several samples, which
-/// makes it unabortable by a router-minted rid — see [`resolve_engine_rid`].
-///
-/// Counts the value the ENGINE will see: the caller's `n`, or the configured
-/// default injected for it when the caller omitted one. A value the probe could
-/// not read counts as fan-out — opting out costs one abort, while guessing wrong
-/// costs a futile POST on every disconnect.
+// Use the effective n, including injected defaults; unreadable values opt out.
 fn requests_multiple_samples(
     fields: &RoutingFields,
     sampling_defaults: &[(SamplingField, Number)],
@@ -452,7 +428,6 @@ pub(super) struct BootstrapFields {
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
-/// Declines an `rid` that would need JSON escaping; the parse path handles it.
 fn append_top_level_fields(
     body: &Bytes,
     sampling_defaults: &[(SamplingField, Number)],
@@ -460,10 +435,6 @@ fn append_top_level_fields(
 ) -> Option<Bytes> {
     use std::io::Write as _;
 
-    let rid = match rid {
-        Some(rid) if !rid_is_splice_safe(rid) => return None,
-        other => other,
-    };
     let open = body.iter().position(|&b| b == b'{')?;
     let close = body.iter().rposition(|&b| b == b'}')?;
     if close <= open {
@@ -487,74 +458,14 @@ fn append_top_level_fields(
         if wrote_any {
             output.push(b',');
         }
-        // `rid_is_splice_safe` above proved this needs no string escaping.
-        write!(output, "\"rid\":\"{rid}\"").ok()?;
+        output.extend_from_slice(b"\"rid\":");
+        serde_json::to_writer(&mut output, rid).ok()?;
     }
     output.extend_from_slice(&body[close..]);
     Some(Bytes::from(output))
 }
 
-/// Whether `rid` can be written into a JSON string literal verbatim. A minted
-/// rid always can; checking keeps [`append_top_level_fields`] correct on its
-/// own terms rather than by appeal to a caller two functions away.
-fn rid_is_splice_safe(rid: &str) -> bool {
-    rid.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
-}
-
-/// Resolve the engine-facing request id this request will be aborted by if the
-/// client disconnects, or `None` to leave the body's `rid` alone and skip the
-/// abort entirely.
-///
-/// The minted rid is a bare `uuid4` hex — deliberately the SAME shape the engine
-/// mints for itself (`GenerateReqInput._normalize_single_inputs`). SGLang reports
-/// a request's `rid` as `meta_info["id"]`, which is what the OpenAI response `id`
-/// carries, so injecting one REPLACES the id the caller used to see. Minting a
-/// distinguishable rid (a `router-` prefix, the caller's `x-request-id` folded in)
-/// would make that a breaking change for anything pattern-matching or
-/// length-checking the id, and buy nothing: nothing here routes, aborts or
-/// branches on the rid's shape — the abort sends the full string, and it is the
-/// uuid, not any prefix, that makes it unguessable. Correlation lives in the
-/// router's own access log instead, which already records `x-request-id` and now
-/// records this rid beside it (see `RequestLogContext`).
-///
-/// `None`, preserving today's behavior exactly, in three cases:
-///
-/// * **PD-disaggregated mode.** Prefill is deliberately detached so it outlives
-///   the client for KV-transfer correctness; aborting only the decode half
-///   mid-transfer is a riskier change, out of scope here.
-/// * **The caller set its own `rid`.** The engine adopts a body `rid` verbatim,
-///   and its scheduler aborts every in-flight request whose rid *starts with* the
-///   one it is handed (`scheduler.py`'s `req.rid.startswith(recv_req.rid)`), so
-///   honouring a caller-chosen abort key would let a one-character `rid` cancel
-///   half a worker's population on disconnect. Overwriting the caller's `rid` is
-///   not an option either — it is the handle they asked the engine to file the
-///   request under.
-/// * **A request that fans out (`n > 1`).** SGLang converts one to a batch
-///   (`GenerateReqInput._handle_parallel_sampling`), and the batch path calls
-///   `regenerate_rid()` on every sample — a fresh id that is not derived from the
-///   injected one. So the minted rid is discarded before the request is
-///   abortable: an abort by it would match nothing. Minting one anyway would buy
-///   nothing and cost a futile `/abort_request` on every disconnect. Conservative
-///   in one direction: a beam-search request keeps its rid (beam width means
-///   "sequences returned", not fan-out), so opting out there loses an abort that
-///   would have worked.
-///
-/// A caller cannot steer an abort onto another request: reaching one would mean
-/// supplying a `rid` that extends a minted uuid it was never told.
-fn resolve_engine_rid(caller_set_rid: bool, fans_out: bool, pd_mode: bool) -> Option<String> {
-    if caller_set_rid || fans_out || pd_mode {
-        return None;
-    }
-    Some(uuid::Uuid::new_v4().simple().to_string())
-}
-
 /// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
-///
-/// Only `input_ids` and bootstrap injection may have to OVERWRITE a key the
-/// client sent, so only those need the parse path. Sampling defaults cover keys
-/// the request omitted, and a minted `rid` exists only when the caller set
-/// none, so both are appended straight into the raw bytes.
 fn build_outgoing_body(
     body: &Bytes,
     parsed_body: Option<Value>,
@@ -584,9 +495,6 @@ fn build_outgoing_body(
         }
     };
     if let Some(rid) = rid {
-        // The engine adopts a provided `rid` verbatim, so this is the key the
-        // router later aborts by. Never overwrites a caller's own rid — the
-        // caller passes `Some` only for a router-minted one.
         body_fields.insert("rid".into(), Value::String(rid.to_owned()));
     }
     for (field, default) in sampling_defaults {
@@ -1610,119 +1518,34 @@ mod tests {
         );
     }
 
-    /// The minted rid is deliberately indistinguishable from one the engine
-    /// mints for itself: a bare 32-char uuid hex. That is what keeps injecting
-    /// one from changing the shape of the client-visible response `id`.
     #[test]
-    fn resolve_engine_rid_mints_an_engine_shaped_uuid() {
-        let rid = resolve_engine_rid(false, false, false).expect("plain mode mints");
-        assert_eq!(
-            rid.len(),
-            32,
-            "a minted rid must match `uuid4().hex`, the engine's own format; got {rid}",
-        );
-        assert!(
-            rid.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-            "and its alphabet too; got {rid}",
-        );
-        assert!(
-            rid_is_splice_safe(&rid),
-            "a minted rid must always take the splice path; got {rid}",
-        );
-    }
-
-    /// Every request gets a distinct rid, and none is a prefix of another. This
-    /// is the property that makes the engine's prefix-abort safe — it comes from
-    /// the uuid, not from any decoration around it.
-    #[test]
-    fn resolve_engine_rid_is_unique_and_never_a_prefix_of_another() {
-        let a = resolve_engine_rid(false, false, false).unwrap();
-        let b = resolve_engine_rid(false, false, false).unwrap();
-        assert_ne!(a, b);
-        assert!(
-            !b.starts_with(&a) && !a.starts_with(&b),
-            "neither minted rid may be a prefix of the other ({a} / {b})",
-        );
-    }
-
-    /// The three opt-outs, each preserving today's behavior exactly: PD mode
-    /// (prefill is detached to outlive the client), a caller-supplied `rid` (the
-    /// engine aborts by rid PREFIX, so honouring a caller-chosen key would let a
-    /// one-character `rid` cancel half a worker's population), and a fan-out
-    /// request (the engine regenerates every rid, discarding ours).
-    #[test]
-    fn resolve_engine_rid_opts_out_of_pd_fan_out_and_caller_supplied_rids() {
-        for (caller_set_rid, fans_out, pd_mode, why) in [
-            (false, false, true, "PD mode"),
-            (true, false, false, "a caller-supplied rid"),
-            (false, true, false, "a fan-out request"),
-        ] {
-            assert!(
-                resolve_engine_rid(caller_set_rid, fans_out, pd_mode).is_none(),
-                "{why} must not be minted an abort rid",
-            );
+    fn abort_opt_outs_follow_caller_rid_and_effective_sample_count() {
+        for raw in [r#"{"rid":"abc"}"#, r#"{"rid":["a","b"]}"#] {
+            assert!(fields_of(raw).caller_set_rid);
         }
-        assert!(
-            resolve_engine_rid(false, false, false).is_some(),
-            "a plain single-sample request must still mint one",
-        );
-    }
-
-    /// `n` is read as the ENGINE will see it: the caller's value, or the default
-    /// the operator configured for a request that omits it. A value the probe
-    /// could not read counts as fan-out, so the router never mints a rid it
-    /// cannot abort by.
-    #[test]
-    fn fan_out_is_judged_on_the_n_the_engine_will_see() {
-        for (body, want, why) in [
-            (r#"{"model":"x"}"#, false, "no n is one sample"),
-            (r#"{"model":"x","n":1}"#, false, "n=1 is one sample"),
-            (r#"{"model":"x","n":2}"#, true, "n>1 fans out"),
-            (
-                r#"{"model":"x","n":"3"}"#,
-                true,
-                "the engine coerces numeric strings",
-            ),
-            (
-                r#"{"model":"x","n":[2]}"#,
-                true,
-                "an unreadable n counts as fan-out",
-            ),
+        assert!(!fields_of(r#"{"rid":null}"#).caller_set_rid);
+        for (raw, fan_out) in [
+            (r#"{}"#, false),
+            (r#"{"n":1}"#, false),
+            (r#"{"n":2}"#, true),
+            (r#"{"n":"3"}"#, true),
+            (r#"{"n":[2]}"#, true),
         ] {
             assert_eq!(
-                requests_multiple_samples(&fields_of(body), &[]),
-                want,
-                "{why}: {body}"
+                requests_multiple_samples(&fields_of(raw), &[]),
+                fan_out,
+                "{raw}"
             );
         }
-
-        // A configured `n` default reaches the engine for a request that omits
-        // one, so it decides fan-out just as a caller-supplied value would.
-        let fields = fields_of(r#"{"model":"x"}"#);
-        for (config, want) in [(r#"{"n": 1}"#, false), (r#"{"n": 4}"#, true)] {
+        for (config, fan_out) in [(r#"{"n":1}"#, false), (r#"{"n":4}"#, true)] {
+            let fields = fields_of("{}");
             let defaults = resolve_sampling_defaults(
                 &overrides_of(ConflictPolicy::Reject, config),
                 &fields,
                 &metrics(),
             )
             .unwrap();
-            assert_eq!(
-                requests_multiple_samples(&fields, &defaults),
-                want,
-                "configured default {config}"
-            );
+            assert_eq!(requests_multiple_samples(&fields, &defaults), fan_out);
         }
-    }
-
-    /// SGLang accepts a list-valued `rid` (the batch form). Probing it as a
-    /// presence-only flag keeps such a body routable — retaining it as a `String`
-    /// would turn it into a router-side 400. An explicit null is "no rid".
-    #[test]
-    fn routing_fields_probe_rid_by_presence_only() {
-        assert!(fields_of(r#"{"model":"tiny","rid":["a","b"]}"#).caller_set_rid);
-        assert!(fields_of(r#"{"model":"tiny","rid":"abc"}"#).caller_set_rid);
-        assert!(!fields_of(r#"{"model":"tiny"}"#).caller_set_rid);
-        assert!(!fields_of(r#"{"model":"tiny","rid":null}"#).caller_set_rid);
     }
 }

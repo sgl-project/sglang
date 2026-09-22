@@ -472,11 +472,6 @@ mod tests {
             logs.contains("worker=\"http://worker-a:30000\"") && logs.contains("model=\"tiny\""),
             "a routed request must be logged with its worker and model; captured:\n{logs}",
         );
-        // The rid the router filed this request under on the engine lands on the
-        // SAME line as the caller's `x-request-id`. That join is what replaces
-        // embedding the header in the rid itself: the rid stays engine-shaped, so
-        // it does not change the client-visible response `id`, and an operator
-        // still gets from an engine log line back to the caller's request.
         assert!(
             logs.contains("engine_rid=\"1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3\"")
                 && logs.contains("request_id="),

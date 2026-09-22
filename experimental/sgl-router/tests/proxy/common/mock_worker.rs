@@ -39,19 +39,11 @@ pub struct MockWorker {
     // Used in header_forwarding_test; not every test file reads captured headers.
     #[allow(dead_code)]
     pub captured: Arc<Mutex<CapturedHeaders>>,
-    /// Every `/abort_request` POST this worker received, in arrival order.
-    /// Populated by every axum-based `start_*` variant; not every test file
-    /// reads it. `start_returning_partial_body` (raw TCP, no path routing)
-    /// never populates it.
     #[allow(dead_code)]
     pub abort_log: Arc<Mutex<Vec<Value>>>,
     _shutdown: oneshot::Sender<()>,
 }
 
-/// `/abort_request` route shared by every axum-based `MockWorker::start_*`
-/// variant: appends the POSTed JSON body to `log` and answers 200 OK. Generic
-/// over `S` (the per-variant axum state type) because the handler closure
-/// extracts no `State<S>` — the same shape as `serve_tiny_server_info` below.
 #[allow(dead_code)] // shared across all axum variants
 fn abort_request_route<S>(log: Arc<Mutex<Vec<Value>>>) -> axum::routing::MethodRouter<S>
 where

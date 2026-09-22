@@ -229,7 +229,19 @@ async fn length_selects_plain_bucket_before_engine_selection() {
     let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let _ = response.into_body().collect().await.unwrap();
-    assert!(short_worker.captured.lock().unwrap().last_body.is_some());
+    let forwarded: serde_json::Value = serde_json::from_slice(
+        short_worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(crate::common::is_engine_shaped_rid(
+        forwarded["rid"].as_str().unwrap()
+    ));
     assert!(long_worker.captured.lock().unwrap().last_body.is_none());
 
     let response = app
@@ -292,6 +304,7 @@ async fn pd_picks_both_groups_from_selected_bucket_and_shares_bootstrap() {
     let d: serde_json::Value =
         serde_json::from_slice(decode.captured.lock().unwrap().last_body.as_ref().unwrap())
             .unwrap();
+    assert!(p.get("rid").is_none() && d.get("rid").is_none());
     assert!(p["bootstrap_room"].is_number());
     assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
     let calls = policy.calls.lock().unwrap();
@@ -663,76 +676,4 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     assert!(rejected.captured.lock().unwrap().last_body.is_none());
     assert!(cold.captured.lock().unwrap().last_body.is_none());
     assert!(owner.captured.lock().unwrap().last_body.is_some());
-}
-
-/// The reorg route shares `forward_chat_request` with the legacy one, so it
-/// inherits abort-on-disconnect: a plain dispatch mints a `router-` rid into the
-/// forwarded body, and a PD dispatch mints none for either worker (prefill is
-/// detached to outlive the client, so neither half is abortable).
-#[tokio::test]
-async fn reorg_route_mints_an_abort_rid_for_plain_but_not_for_pd() {
-    let plain_worker = MockWorker::start(vec![]).await;
-    let policy = Arc::new(FirstPolicy::default());
-    let plain = Bucket::new("plain", BucketGroups::Plain(group("plain", policy.clone())));
-    let ctx = context(&[("plain", Stage::Plain, &plain_worker)], vec![plain]);
-    let response = build_router(ctx)
-        .oneshot(request(body("hi")))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.into_body().collect().await.unwrap();
-    let forwarded = plain_worker.captured.lock().unwrap().last_body.clone();
-    let forwarded: serde_json::Value =
-        serde_json::from_slice(&forwarded.expect("plain worker must have seen a body")).unwrap();
-    let rid = forwarded.get("rid").and_then(|v| v.as_str());
-    assert!(
-        rid.is_some_and(crate::common::is_engine_shaped_rid),
-        "the reorg plain route must mint an abort rid; got {rid:?}",
-    );
-
-    let prefill = MockWorker::start(vec![]).await;
-    let decode = MockWorker::start(vec![]).await;
-    let pd = Bucket::new(
-        "pd",
-        BucketGroups::Pd {
-            prefill: group("p", policy.clone()),
-            decode: group("d", policy.clone()),
-        },
-    );
-    let ctx = context(
-        &[
-            ("p", Stage::Prefill, &prefill),
-            ("d", Stage::Decode, &decode),
-        ],
-        vec![pd],
-    );
-    let response = build_router(ctx)
-        .oneshot(request(body("hi")))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.into_body().collect().await.unwrap();
-    for (label, worker) in [("prefill", &prefill), ("decode", &decode)] {
-        let forwarded = await_body(worker, Duration::from_secs(2), label).await;
-        assert!(
-            forwarded.get("rid").is_none(),
-            "PD mode must not inject a rid into the {label} body",
-        );
-    }
-}
-
-/// Prefill is dispatched on a detached task, so its body can land after the
-/// client response; poll rather than assume it is already captured.
-async fn await_body(worker: &MockWorker, timeout: Duration, label: &str) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(raw) = worker.captured.lock().unwrap().last_body.clone() {
-            return serde_json::from_slice(&raw).unwrap();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{label} worker never received a body"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }

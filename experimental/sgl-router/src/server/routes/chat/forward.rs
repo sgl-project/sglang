@@ -81,9 +81,6 @@ pub(super) async fn forward_chat_request(
         };
         (decode, bootstrap)
     });
-    // The id the engine will know this request by, so the router can tell it to
-    // stop generating when the client goes away. `None` leaves the body's `rid`
-    // alone and disables the abort — see `resolve_engine_rid`.
     let engine_rid = request.engine_rid(pd.is_some());
     let body = request.into_outgoing_body(
         ctx,
@@ -115,28 +112,14 @@ pub(super) async fn forward_chat_request(
     // In PD mode, prefill can finish before decode. Watch the registration
     // held by the response so expiration remains live for its full lifetime.
     let expiration_token = response_load_guards.1.cancel_token().clone();
-    // Abort-on-disconnect, armed across the dispatch. A streaming forward hands
-    // the decision to the SSE pump's completion report once it has a response,
-    // but that report only exists after one arrives: this guard covers the
-    // window before it, and the whole forward in the non-streaming case. If the
-    // handler future is dropped (client disconnect) or the expiration token
-    // fires, it drops armed and tells the engine to stop.
-    let mut abort_guard = engine_rid.as_deref().and_then(|rid| {
-        ctx.proxy.abort_guard_for(
-            &response_worker.url,
-            response_worker.protocol(),
-            rid,
-            &headers,
-        )
-    });
     let response_future = forward_to_response_worker(
         ctx,
         &response_worker,
         &headers,
         body,
+        engine_rid.as_deref(),
         response_load_guards,
         &metrics,
-        engine_rid.as_deref(),
         expiration_token.clone(),
     );
     // A ready response wins if request expiration fires in the same poll.
@@ -147,11 +130,6 @@ pub(super) async fn forward_chat_request(
             model: metrics.model.clone(),
         }),
     };
-    if abort_would_be_pointless(&result) {
-        if let Some(guard) = abort_guard.as_mut() {
-            guard.disarm();
-        }
-    }
     let log_context = metrics.record_dispatch_result(&result, engine_rid);
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
@@ -165,26 +143,6 @@ pub(super) async fn forward_chat_request(
     };
     response.extensions_mut().insert(log_context);
     Ok(response)
-}
-
-/// Whether an `AbortOnDrop` covering this dispatch should stand down.
-///
-/// * `Ok(_)` — a response was received. The engine is either done (non-streaming)
-///   or the streaming guard inside `Proxy::forward_streaming_to` has taken over.
-/// * A **pre-dispatch** error — the request never went out, so the engine has no
-///   such rid. Aborting anyway would POST at a worker whose breaker the router
-///   just found open, adding load to the one node it decided to stop using.
-///
-/// Every other error keeps the guard armed: a transport failure or a timeout can
-/// mean the request reached the engine and it is still generating.
-fn abort_would_be_pointless<T>(result: &Result<T, ApiError>) -> bool {
-    match result {
-        Ok(_) => true,
-        Err(error) => matches!(
-            error,
-            ApiError::BreakerOpen { .. } | ApiError::WorkerMisconfigured { .. }
-        ),
-    }
 }
 
 fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
@@ -219,6 +177,7 @@ fn spawn_prefill_request(
                 CHAT_PATH,
                 &headers,
                 body,
+                None,
             )
             .await
         {
@@ -236,19 +195,15 @@ fn spawn_prefill_request(
     });
 }
 
-// Every parameter is a distinct, required input to a single forward: where to
-// send it, what to send, the guards and metrics that outlive it, and the two
-// request-lifetime handles (abort rid, expiration). Bundling them into a struct
-// purely to satisfy the arg-count heuristic would add indirection, not clarity.
 #[allow(clippy::too_many_arguments)]
 async fn forward_to_response_worker(
     ctx: &AppContext,
     worker: &Worker,
     headers: &HeaderMap,
     body: Bytes,
+    engine_rid: Option<&str>,
     load_guards: LoadGuards,
     metrics: &DispatchMetrics,
-    engine_rid: Option<&str>,
     expiration: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
@@ -263,12 +218,10 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
                 Some(stream_guards),
                 Some(metrics.first_byte_callback()),
                 Some(metrics.stream_end_callback(worker.url.clone())),
-                // Abort the engine if the client disconnects before it finishes
-                // streaming; the pump's completion report decides.
-                engine_rid,
                 Some(expiration),
             )
             .await
@@ -283,6 +236,7 @@ async fn forward_to_response_worker(
                 CHAT_PATH,
                 headers,
                 body,
+                engine_rid,
             )
             .await
     }
@@ -400,54 +354,5 @@ impl Drop for StreamDurationGuard {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.request_started_at.elapsed().as_secs_f64());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A dispatch that never left the router leaves nothing to abort. Pinning
-    /// this keeps the guard from POSTing `/abort_request` at a worker whose
-    /// breaker the router just found open — piling load onto the one node it
-    /// decided to stop using.
-    #[test]
-    fn abort_is_pointless_for_a_dispatch_that_never_reached_the_engine() {
-        let received: Result<(), ApiError> = Ok(());
-        assert!(abort_would_be_pointless(&received), "a response means done");
-        for error in [
-            ApiError::BreakerOpen {
-                worker: "http://w".into(),
-            },
-            ApiError::WorkerMisconfigured {
-                worker: "http://w".into(),
-                source: anyhow::anyhow!("bad url"),
-            },
-        ] {
-            assert!(abort_would_be_pointless(&Err::<(), _>(error)));
-        }
-    }
-
-    /// The converse: an error that can mean "the request reached the engine and
-    /// it is still generating" must keep the guard armed.
-    #[test]
-    fn abort_stays_armed_when_the_engine_may_still_be_generating() {
-        for error in [
-            ApiError::UpstreamTimeout {
-                worker: reqwest::Url::parse("http://w").unwrap(),
-            },
-            ApiError::UpstreamUnreachable {
-                worker: reqwest::Url::parse("http://w").unwrap(),
-                source: anyhow::anyhow!("reset"),
-            },
-            ApiError::StaleRequestExpired {
-                model: "tiny".into(),
-            },
-        ] {
-            assert!(
-                !abort_would_be_pointless(&Err::<(), _>(error)),
-                "an error that may leave the engine generating must keep the abort armed",
-            );
-        }
     }
 }

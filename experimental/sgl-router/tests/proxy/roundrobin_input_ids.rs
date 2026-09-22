@@ -106,10 +106,6 @@ fn without_forwarding(mut cfg: Config, policy: PolicyKind) -> Config {
     cfg
 }
 
-/// Strip the router-minted `rid` the abort-on-disconnect path injects into
-/// every plain-mode body, so the assertion stays about what these tests are
-/// actually pinning: that no `input_ids` were added and `messages` survived.
-/// The rid's own shape is covered in `chat_routing.rs`.
 fn without_minted_rid(mut body: Value) -> Value {
     let rid = body
         .as_object_mut()

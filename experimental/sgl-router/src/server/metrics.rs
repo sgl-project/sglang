@@ -223,11 +223,7 @@ pub struct RequestLogContext {
     /// line and `worker_requests_total` cannot disagree — the middleware can
     /// only see the status, which cannot express a router-side cancellation.
     pub outcome: RequestOutcome,
-    /// The `rid` the router filed this request under on the engine, when it
-    /// minted one. Logged beside the caller's `x-request-id` so an operator can
-    /// take a rid out of an engine log line and find the caller's own request —
-    /// the reason the rid itself need not (and does not) embed that header.
-    /// `None` whenever the request opted out of abort-on-disconnect.
+    /// Router-minted engine ID, logged beside the caller's correlation ID.
     pub engine_rid: Option<String>,
 }
 
