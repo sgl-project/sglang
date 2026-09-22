@@ -1314,11 +1314,13 @@ class Qwen4ExpLayerExtensionMixin:
             hc_config,
             use_mix=True,
             use_combine=True,
+            packed_weights=True,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            packed_weights=True,
         )
 
     def _prepare_qwen4_exp_attn(
@@ -1329,12 +1331,18 @@ class Qwen4ExpLayerExtensionMixin:
         *,
         ple_batch: Optional[_PLEBatch],
     ):
+        from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState
+
+        hc_state = hidden_states if isinstance(hidden_states, HCSumState) else None
+        if hc_state is not None:
+            hidden_states = hc_state.residual
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
             hidden_states = torch.cat(
                 [hidden_states for _ in range(self.hc_count)], dim=-1
             )
+            hc_state = None
 
         if self.ple is not None:
             if ple_batch is None:
@@ -1350,8 +1358,13 @@ class Qwen4ExpLayerExtensionMixin:
                 hidden_states = hidden_states + self.ple(
                     ple_query, forward_batch, ple_batch
                 )
+                # PLE changed residual values after the previous Apply. Its
+                # incoming statistics no longer describe this tensor.
+                hc_state = None
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hc_state if hc_state is not None else hidden_states, use_sum_state=True
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1711,7 +1724,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         _commit_ple_batch(ple_batch, forward_batch)
 
-        hc_hidden_states = hidden_states
+        from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState
+
+        hc_hidden_states = (
+            hidden_states.residual
+            if isinstance(hidden_states, HCSumState)
+            else hidden_states
+        )
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
@@ -2186,6 +2205,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+            elif isinstance(module, GatedResidual):
+                module.prepare_sum_state_weights()
 
         return loaded_params
 

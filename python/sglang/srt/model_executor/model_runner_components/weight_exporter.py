@@ -7,6 +7,9 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    broadcast_weights,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.utils.common import is_npu
@@ -105,12 +108,12 @@ class WeightExporter:
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
-            for _, weights in self.get_model().named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
-                )
+            broadcast_weights(
+                self.get_model(),
+                group=send_group,
+                device=torch.device("npu" if is_npu() else "cuda", self.gpu_id),
+                is_src=True,
+            )
             success = True
             message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:

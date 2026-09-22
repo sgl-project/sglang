@@ -91,19 +91,43 @@ class WeightCacheTransportBackend(ABC):
 class TorchIpcTransportBackend(WeightCacheTransportBackend):
     name = TORCH_IPC_BACKEND
 
+    def __init__(self):
+        # Keep exported CPU shared storage alive for every subsequent client.
+        self._cpu_storages = {}
+
     def prepare_export(
         self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
         entries: Dict[str, Dict[str, Any]] = {}
+        cpu_storages = {}
+        storage_indices = {}
         for name, (tensor, is_param) in state_tensors.items():
-            entries[name] = {
-                "handle": MultiprocessingSerializer.serialize(
-                    tensor.data, output_str=True
-                ),
+            entry = {
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype).replace("torch.", ""),
                 "is_param": is_param,
             }
+            if tensor.device.type == "cpu":
+                # DupFd from ForkingPickler is authenticated and single-use.
+                # The daemon serves independent, potentially repeated clients;
+                # pass a fresh FD over its existing Unix socket instead.
+                storage = tensor.untyped_storage()
+                key = storage_indices.setdefault(storage._cdata, len(storage_indices))
+                cpu_storages[key] = storage
+                if storage.nbytes():
+                    storage._share_fd_cpu_()
+                entry.update(
+                    cpu_storage=key,
+                    storage_nbytes=storage.nbytes(),
+                    storage_offset=tensor.storage_offset(),
+                    stride=list(tensor.stride()),
+                )
+            else:
+                entry["handle"] = MultiprocessingSerializer.serialize(
+                    tensor.data, output_str=True
+                )
+            entries[name] = entry
+        self._cpu_storages = cpu_storages
         return entries
 
     def send_fetch_state_response(
@@ -126,13 +150,48 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "preloaded_weights_bytes": preloaded_weights_bytes,
             },
         )
+        sent = set()
+        for entry in entries.values():
+            key = entry.get("cpu_storage")
+            if key is not None and key not in sent:
+                sent.add(key)
+                storage = self._cpu_storages[key]
+                if storage.nbytes():
+                    fd, _ = storage._share_fd_cpu_()
+                    _send_fd(conn, fd, key)
 
     def recv_fetch_state_response(
         self, sock: socket.socket, result: Dict[str, Any]
     ) -> Dict[str, Any]:
+        storages = {}
+        for entry in result["entries"].values():
+            key = entry.get("cpu_storage")
+            if key is None:
+                continue
+            if key not in storages:
+                size = entry["storage_nbytes"]
+                if size:
+                    received_key, fd = _recv_fd(sock)
+                    try:
+                        if received_key != key:
+                            raise RuntimeError("CPU weight storage FD order mismatch")
+                        storages[key] = torch.UntypedStorage._new_shared_fd_cpu(
+                            fd, size
+                        )
+                    finally:
+                        os.close(fd)
+                else:
+                    storages[key] = torch.UntypedStorage(0, device="cpu")
+            entry["cpu_tensor"] = torch.empty(
+                0, dtype=getattr(torch, entry["dtype"]), device="cpu"
+            ).set_(
+                storages[key], entry["storage_offset"], entry["shape"], entry["stride"]
+            )
         return result
 
     def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
+        if "cpu_storage" in entry:
+            return entry["cpu_tensor"]
         return MultiprocessingSerializer.deserialize(entry["handle"])
 
 
