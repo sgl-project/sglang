@@ -92,8 +92,7 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
         if full_key not in dflash_cfg:
             raise ValueError(
                 f"DFLASH dflash_config.{full_key} is required to rebuild the LiLiCorr "
-                "head. The checkpoint does not carry it, so the head this would "
-                "construct is not the head that was trained."
+                "head, and the checkpoint does not carry it."
             )
         try:
             value = cast(dflash_cfg[full_key])
@@ -109,15 +108,13 @@ def _parse_lilicorr_config(dflash_cfg: dict) -> Optional[LiLiCorrConfig]:
     if candidate_topk & (candidate_topk - 1):
         raise ValueError(
             f"dflash_config.lilicorr_candidate_topk must be a power of two, got "
-            f"{candidate_topk}. The tiled candidate top-k selects its tiles inside a "
-            "single Triton lane group, and tl.arange requires a power-of-two extent."
+            f"{candidate_topk}: tl.arange requires a power-of-two extent."
         )
     if candidate_topk > MAX_FUSED_CANDIDATE_TOPK:
-        # A wider pool serves correctly, but off the fused commit onto the torch path.
         raise ValueError(
             f"dflash_config.lilicorr_candidate_topk={candidate_topk} exceeds the fused "
-            f"greedy commit's width of {MAX_FUSED_CANDIDATE_TOPK}, which is one Triton "
-            "lane group. A wider head would serve on the reference path."
+            f"greedy commit's width of {MAX_FUSED_CANDIDATE_TOPK}, one Triton lane "
+            "group; a wider head would serve on the reference path."
         )
 
     return LiLiCorrConfig(
@@ -136,9 +133,9 @@ def parse_lilicorr_draft_config(*, draft_hf_config: Any) -> LiLiCorrConfig:
     config = _parse_lilicorr_config(_get_dflash_config(draft_hf_config))
     if config is None:
         raise ValueError(
-            "LiLiCorr requires the lilicorr_* geometry fields in dflash_config. "
-            'A checkpoint declaring architectures=["LiLiCorrDraftModel"] without them '
-            "cannot be rebuilt into the head that was trained."
+            "LiLiCorr requires the lilicorr_* geometry fields in dflash_config; a "
+            'checkpoint declaring architectures=["LiLiCorrDraftModel"] without them '
+            "cannot be rebuilt."
         )
     return config
 
@@ -153,8 +150,8 @@ def resolve_vocab_shard(lm_head) -> Tuple[int, int]:
     shard = lm_head.shard_indices
     if int(shard.num_added_elements) != 0:
         raise NotImplementedError(
-            "LiLiCorr's candidate head does not support added vocabulary: the added rows "
-            "sit past the padded base shard, so a single contiguous top-k would skip them."
+            "LiLiCorr's candidate head does not support added vocabulary: those rows "
+            "sit past the padded base shard, so a contiguous top-k would skip them."
         )
     return int(shard.num_org_elements), int(shard.org_vocab_start_index)
 
@@ -594,10 +591,12 @@ def build_lilicorr_draft_sampler(
     """
 
     def eager(reason: str) -> None:
+        # "kept eager (reason=...)" is the string that diagnosed a -17% third-party
+        # reproduction; the reason is what names the cause, so keep both.
         logger.warning(
-            "LiLiCorr head kept eager (reason=%s). This is a bring-up path, not a serving "
-            "configuration: expect a large throughput regression and numbers that are not "
-            "comparable to any published row.",
+            "LiLiCorr head kept eager (reason=%s): a bring-up path, not a serving "
+            "configuration. Expect a large throughput regression and numbers that are "
+            "not comparable to any published row.",
             reason,
         )
         return None
@@ -629,12 +628,11 @@ def build_lilicorr_draft_sampler(
         sampling_enabled=sampling_enabled,
     )
     logger.info(
-        "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d K=%d "
-        "anchor_features=%d, logits buffer %.1f MiB.",
+        "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d K=%d, "
+        "logits buffer %.1f MiB.",
         max_bs,
         int(block_size),
         sampler.topk,
-        int(draft_model.fc.out_features),
         sampler.logits.numel() * sampler.logits.element_size() / 2**20,
     )
     return sampler

@@ -264,9 +264,8 @@ class LiLiCorrHead(nn.Module):
     def _require_materialized(self) -> None:
         if self._attn_bias is None:
             raise RuntimeError(
-                "LiLiCorr head scored before materialize_inference_buffers(). Its cached "
-                "attention bias and fused edge heads are unbuilt, so the scores would be "
-                "meaningless rather than wrong-looking."
+                "LiLiCorr head scored before materialize_inference_buffers(): its "
+                "attention bias and fused edge heads are unbuilt."
             )
 
     def _project_anchor(
@@ -302,9 +301,8 @@ class LiLiCorrHead(nn.Module):
         bsz, n_blocks, n_slots, topk = candidate_log_probs.shape
         if topk != self.candidate_topk:
             raise ValueError(
-                f"LiLiCorr was built for candidate_topk={self.candidate_topk} but "
-                f"the lattice carries {topk}. The rank embedding and the cached "
-                "attention bias are both sized for the trained width."
+                f"LiLiCorr was built for candidate_topk={self.candidate_topk} but the "
+                f"lattice carries {topk}; both are sized for the trained width."
             )
 
         # The candidate embeddings come from the target's table, in the target's dtype.
@@ -493,16 +491,14 @@ def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
     if missing:
         raise ValueError(
             f"LiLiCorr checkpoint is missing {len(missing)} head parameters "
-            f"(e.g. {missing[:5]}). Refusing to serve a partially initialized "
-            "head. A checkpoint without a LiLiCorr head should declare "
+            f"(e.g. {missing[:5]}); a draft with no LiLiCorr head should declare "
             'architectures=["DFlashDraftModel"].'
         )
     unexpected = sorted(seen - expected)
     if unexpected:
         raise ValueError(
             f"LiLiCorr checkpoint carries {len(unexpected)} head tensors this head "
-            f"has no parameter for (e.g. {unexpected[:5]}). They would be dropped "
-            "in silence, so the served head would not be the trained one. Check "
+            f"has no parameter for (e.g. {unexpected[:5]}). Check "
             "lilicorr_hidden_size, lilicorr_num_layers and lilicorr_factor_dim in "
             "dflash_config against the checkpoint."
         )
@@ -526,20 +522,15 @@ def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
     if seen and not expected:
         raise ValueError(
             f"Draft checkpoint carries {len(seen)} grouped-convolution tensors "
-            f"(e.g. {sorted(seen)[:3]}) but this draft built no convolution modules, "
-            "so every one of them would be dropped in silence and the draft would "
-            "serve as its conv-free parent at a believable but wrong acceptance "
-            "length. dflash_config is missing conv_kernel_size / conv_group_size: "
-            "both default to 0, and the loader cannot infer them from the tensors. "
-            "Re-export with the geometry, or add both keys to config.json."
+            f"(e.g. {sorted(seen)[:3]}) but this draft built no convolution modules: "
+            "dflash_config is missing conv_kernel_size / conv_group_size, which both "
+            "default to 0 and cannot be inferred from the tensors."
         )
     if expected and not seen:
         raise ValueError(
             f"This draft built {len(expected)} grouped-convolution parameters from "
             "dflash_config, but the checkpoint carries none, so kernel_projection "
-            "would serve at its random initialization. Either the config declares a "
-            "convolution the trained draft does not have, or the checkpoint is the "
-            "wrong one."
+            "would serve at its random initialization."
         )
 
     missing = sorted(expected - seen)
@@ -549,8 +540,7 @@ def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
             "Draft checkpoint's grouped-convolution tensors do not correspond to the "
             f"built ones: {len(missing)} missing (e.g. {missing[:3]}), "
             f"{len(unexpected)} unexpected (e.g. {unexpected[:3]}). Check "
-            "conv_kernel_size, conv_group_size and num_hidden_layers in dflash_config "
-            "against the checkpoint."
+            "conv_kernel_size, conv_group_size and num_hidden_layers in dflash_config."
         )
 
     if expected:
@@ -579,12 +569,10 @@ class LiLiCorrDraftModel(DFlashDraftModel):
         super().set_block_size(block_size)
         if int(block_size) != int(self.lilicorr.block_size):
             raise ValueError(
-                "LiLiCorr cannot follow a block size the head was not built for: "
-                f"the worker resolved block_size={int(block_size)} but the head's "
+                f"The worker resolved block_size={int(block_size)} but the head's "
                 f"relative-slot bias and slot embedding are sized for "
                 f"{int(self.lilicorr.block_size)}. Drop "
-                "--speculative-num-draft-tokens, or serve a head trained at that "
-                "block size."
+                "--speculative-num-draft-tokens, or serve a head trained at that size."
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
