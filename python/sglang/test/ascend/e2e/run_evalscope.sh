@@ -3,6 +3,7 @@
 set -e
 
 PYTHON_ENV_FOR_EVALSCOPE=test_env_evalscope
+PYTHON_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/python
 PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
 EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope
 pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
@@ -18,13 +19,29 @@ EVALSCOPE_CONSTRAINTS=(
 # whole job.
 EVALSCOPE_INSTALL_TIMEOUT=1200
 
-if [ -d "${PYTHON_ENV_FOR_EVALSCOPE}" ]; then
-    echo "Virtual env ${PYTHON_ENV_FOR_EVALSCOPE} already exists, skip installation."
+# Highest priority: reuse a system-wide evalscope (e.g. pre-installed in the
+# image). The test suite always runs ${PYTHON_FOR_EVALSCOPE}/bin/python, so make
+# sure the virtual env exists and can see the system site-packages, then skip the
+# installation.
+if python -c "import evalscope" >/dev/null 2>&1; then
+    echo "evalscope found in the system python, reuse it instead of installing."
+    if ! ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
+        python -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
+    fi
     exit 0
 fi
 
-echo "===== Install evalscope in virtual env - Begin ====="
+# Otherwise reuse the virtual env when it already provides evalscope.
+# Importability is validated instead of the bare directory existence, so a broken
+# or partially populated env still gets installed.
+if [ -x "${PYTHON_FOR_EVALSCOPE}" ] && ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
+    echo "evalscope already exists in ${PYTHON_ENV_FOR_EVALSCOPE}, skip installation."
+    exit 0
+fi
+
 python -m venv ${PYTHON_ENV_FOR_EVALSCOPE}
+
+echo "===== Install evalscope in virtual env - Begin ====="
 
 if [ ! -d "${EVALSCOPE_SOURCE_PATH}" ]; then
     echo "The evalscope source does not exist: ${EVALSCOPE_SOURCE_PATH}."
