@@ -2404,6 +2404,30 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
 
+    def test_nonstrm_preserves_text_after_tool_call(self):
+        """Non-streaming must keep visible text after </tool_call> (issue #40739)."""
+        text = (
+            "before<tool_call>"
+            "<function=get_current_weather>"
+            "<parameter=location>Paris</parameter>"
+            "</function></tool_call>after"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "beforeafter")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters)["location"], "Paris")
+
+        # Streaming of the same complete text should agree on visible content.
+        stream_detector = Qwen3CoderDetector()
+        streamed = ""
+        for ch in text:
+            streamed += stream_detector.parse_streaming_increment(
+                ch, self.tools
+            ).normal_text
+        self.assertEqual(streamed, "beforeafter")
+
     def test_multiple_tool_calls(self):
         """
         Test parsing of multiple consecutive tool calls.
