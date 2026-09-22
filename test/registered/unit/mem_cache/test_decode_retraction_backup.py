@@ -9,11 +9,14 @@ import torch
 
 from sglang.srt.arg_groups.hicache_hook import handle_hicache
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
-from sglang.srt.disaggregation.base.conn import KVTransferDestination
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -106,6 +109,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         io_backend="kernel",
         draft_mode=None,
         radix_cache=False,
+        host_receive_threshold=0.5,
     ):
         """Bring up a UnifiedRadixCache over fresh pools, optionally with draft KV."""
         server_args = ServerArgs(
@@ -117,7 +121,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
             disable_radix_cache=not radix_cache,
             hicache_write_policy="write_back",
             disaggregation_mode="decode" if shared_receive else "null",
-            disaggregation_decode_enable_host_receive=shared_receive,
+            disaggregation_decode_host_receive_threshold=(
+                host_receive_threshold if shared_receive else 0.0
+            ),
             disaggregation_decode_enable_radix_cache=radix_cache,
         )
         if shared_receive:
@@ -284,11 +290,16 @@ class TestDecodeRetractionBackup(CustomTestCase):
             metadata_buffers=SimpleNamespace(get_buf_infos=lambda: ([], [], [])),
             tp_rank=0,
             pp_rank=0,
+            pp_size=1,
+            gloo_group=None,
             transfer_backend=TransferBackend.FAKE,
             is_mla_backend=False,
             enable_staging=False,
             transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
+            queue=[],
+            pending_reqs=[],
             retracted_queue=[],
+            _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
             scheduler=SimpleNamespace(
@@ -302,6 +313,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 last_batch=None,
                 enable_hisparse=False,
                 enable_decode_hicache=False,
+                enable_lora=False,
+                enable_priority_scheduling=False,
                 tp_worker=SimpleNamespace(
                     is_hybrid_swa=False,
                     model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16"),
@@ -310,9 +323,66 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
         with patch.object(FakeKVManager, "supports_host_destination", True):
             queue.kv_manager = queue._init_kv_manager()
+        queue.scheduler.pool_stats_observer = SchedulerPoolStatsObserver(
+            tree_cache=env.cache,
+            token_to_kv_pool_allocator=env.allocator,
+            req_to_token_pool=env.req_to_token_pool,
+            session_controller=None,
+            hisparse_coordinator=None,
+            is_hybrid_swa=False,
+            is_hybrid_ssm=False,
+            enable_hisparse=False,
+            full_tokens_per_layer=self.pool_size,
+            swa_tokens_per_layer=None,
+            max_total_num_tokens=self.pool_size,
+            get_last_batch=lambda: queue.scheduler.last_batch,
+            get_running_batch=lambda: queue.scheduler.running_batch,
+        )
         return queue, queue.kv_manager.kv_args
 
-    def test_host_receive_restores_target_and_draft_kv(self):
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_host_receive_threshold_controls_device_allocation(self, _world_size):
+        """Transfers at the threshold leave device KV free; zero disables staging."""
+        for threshold, used_tokens, host_staged in (
+            (0.0, 16, False),
+            (0.5, 15, False),
+            (0.5, 16, True),
+        ):
+            with self.subTest(threshold=threshold, used_tokens=used_tokens):
+                env = self._build_cache(
+                    hicache_ratio=2.0,
+                    shared_receive=True,
+                    host_receive_threshold=threshold,
+                )
+                queue, _ = self._receive_queue(env)
+                pressure = env.allocator.alloc(used_tokens)
+                req = Req(
+                    rid="threshold",
+                    origin_input_text="",
+                    bootstrap_host="localhost",
+                    origin_input_ids=array("q", [1]),
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                )
+                receiver = Mock(supports_host_destination=True)
+                receiver.poll.return_value = KVPoll.WaitingForInput
+                decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                queue.queue = [decode_req]
+                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(decode_req.host_staged, host_staged)
+                self.assertEqual(req.kv.req_pool_idx is None, host_staged)
+                self.assertEqual(
+                    env.allocator.available_size(),
+                    self.pool_size - used_tokens - (0 if host_staged else 1),
+                )
+                if host_staged:
+                    env.cache.discard_kv_cache_backup(req.kv.retraction_backup)
+                else:
+                    release_kv_cache(req, env.cache, is_insert=False)
+                env.allocator.free(pressure)
+                self.assertEqual(env.allocator.available_size(), self.pool_size)
+
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_host_receive_restores_target_and_draft_kv(self, _world_size):
         """Wire-order writes must restore both pools, including packed MHA K/V.
 
         Sidecar KV must follow the primary host indices through restore and
@@ -343,15 +413,25 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     sampling_params=SamplingParams(max_new_tokens=1),
                 )
                 receiver = Mock(supports_host_destination=False)
+                receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+                queue.queue = [decode_req]
                 host_free_before = cache.host_pool_group.available_size()
-                self.assertFalse(queue._pre_alloc_host(decode_req))
+                blocker = env.allocator.alloc(self.pool_size)
+                self.assertEqual(queue.pop_preallocated(), ([], []))
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
                 )
+                env.allocator.free(blocker)
+                pressure = env.allocator.alloc(num_slots)
                 receiver.supports_host_destination = True
-                self.assertTrue(queue._pre_alloc_host(decode_req))
+                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertIsNone(req.kv.req_pool_idx)
+                self.assertEqual(
+                    env.allocator.available_size(), self.pool_size - num_slots
+                )
+                self.assertTrue(decode_req.host_staged)
                 backup = req.kv.retraction_backup
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before - num_slots
@@ -397,11 +477,22 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 # Incoming KV and retraction must coexist even with the host pool full.
                 group = cache.host_pool_group
                 blockers = group.alloc(group.available_size() - num_slots)
-                pending_req = SimpleNamespace(**vars(req))
-                pending_req.kv = ReqKvInfo()
+                pending_req = Req(
+                    rid="pending",
+                    origin_input_text="",
+                    bootstrap_host="localhost",
+                    origin_input_ids=array("q", [1] * num_tokens),
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                )
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
-                self.assertFalse(queue._pre_alloc_host(pending))
+                queue.queue = [pending]
+                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(queue.queue, [pending])
+                self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)
+                self.assertEqual(
+                    env.allocator.available_size(), self.pool_size - num_slots
+                )
                 self.assertEqual(group.available_size(), num_slots)
                 retracted, source_indices = self._admit_req(env, num_slots)
                 for index, buffer in enumerate(device_buffers):
@@ -419,7 +510,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.req_to_token_pool.free(retracted)
 
                 # Device slots are assigned only after the host transfer.
-                blocker = env.allocator.alloc(self.pool_size)
+                blocker = env.allocator.alloc(num_slots)
                 self.assertFalse(queue.allocate_host_staged(decode_req))
                 self.assertIsNone(req.kv.req_pool_idx)
                 self.assertIs(req.kv.retraction_backup, backup)
@@ -439,16 +530,18 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 # Abort cleanup uses the same descriptor, including sidecars.
-                self.assertTrue(queue._pre_alloc_host(pending))
+                self.assertEqual(queue.pop_preallocated(), ([pending], []))
                 cache.discard_kv_cache_backup(pending_req.kv.retraction_backup)
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 env.allocator.free(received_indices)
                 env.req_to_token_pool.free(req)
+                env.allocator.free(pressure)
 
-    def test_host_receive_merges_existing_radix_prefix_after_restore(self):
-        """A host fallback must neither retain a released lock nor leak duplicate KV."""
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_host_receive_merges_existing_radix_prefix_after_restore(self, _world_size):
+        """Receiving a cached prefix must not lock it or leak duplicate KV."""
         env = self._build_cache(
             hicache_ratio=2.0, shared_receive=True, radix_cache=True
         )
@@ -471,16 +564,18 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self._seed_pool(env.target_pool, cached_indices, base=500)
         cached_values = self._snapshot_pool(env.target_pool, cached_indices)
         cache.cache_unfinished_req(cached)
+        pressure = env.allocator.alloc(self.pool_size // 2 - 4)
 
         req = make_req("receiving", 8)
-        match = queue._match_prefix_and_lock(req)
-        self.assertEqual(match.l1_prefix_len, 4)
-        queue._release_matched_prefix_lock(req)
-        decode_req = DecodeRequest(
-            req=req, kv_receiver=Mock(supports_host_destination=True)
-        )
+        receiver = Mock(supports_host_destination=True)
+        receiver.poll.return_value = KVPoll.WaitingForInput
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        queue.queue = [decode_req]
         host_free_before = cache.host_pool_group.available_size()
-        self.assertTrue(queue._pre_alloc_host(decode_req))
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertEqual(cache.protected_size(), 4)
+        env.allocator.free(pressure)
         backup = req.kv.retraction_backup
         for buffer in queue.host_pool.host_kv_data_refs:
             buffer[backup.host_indices] = 7

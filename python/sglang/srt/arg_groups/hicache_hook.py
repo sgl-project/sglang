@@ -54,7 +54,7 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
-    if cfg.disaggregation_decode_enable_host_receive:
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
         # The shared host pool must match KV transfer's per-layer buffers.
         declare_resolution(
             server_args, "handle_hicache", hicache_mem_layout="layer_first"
@@ -66,7 +66,7 @@ def handle_hicache(server_args: Any):
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
     if (
-        cfg.disaggregation_decode_enable_host_receive
+        cfg.disaggregation_decode_host_receive_threshold > 0
         and cfg.hicache_mem_layout != "layer_first"
     ):
         raise ValueError(

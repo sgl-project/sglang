@@ -648,7 +648,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
-        if get_disagg().disaggregation_decode_enable_host_receive:
+        if get_disagg().disaggregation_decode_host_receive_threshold > 0:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
             if kv_args.state_types or any(
@@ -684,7 +684,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.is_mla_backend,
         )
         if (
-            get_disagg().disaggregation_decode_enable_host_receive
+            get_disagg().disaggregation_decode_host_receive_threshold > 0
             and not kv_manager.supports_host_destination
         ):
             raise ValueError(
@@ -1344,13 +1344,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 continue
 
+            if (
+                get_disagg().disaggregation_decode_host_receive_threshold > 0
+                and not decode_req.is_rebootstrap
+                and not _is_fake_transfer(decode_req.req)
+                and decode_req.kv_receiver.supports_host_destination
+                and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
+                >= get_disagg().disaggregation_decode_host_receive_threshold
+            ):
+                if not self._pre_alloc_host(decode_req):
+                    break
+                preallocated_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                if self.scheduler.enable_lora:
+                    running_loras.add(decode_req.req.lora_id)
+                continue
+
             if self.req_to_token_pool.available_size() <= 0:
-                if self._pre_alloc_host(decode_req):
-                    preallocated_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    if self.scheduler.enable_lora:
-                        running_loras.add(decode_req.req.lora_id)
-                    continue
                 break
 
             # Hybrid models (e.g. K3 with KDA): guard against prealloc
@@ -1469,12 +1479,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
-                if self._pre_alloc_host(decode_req):
-                    preallocated_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    if self.scheduler.enable_lora:
-                        running_loras.add(decode_req.req.lora_id)
-                    continue
                 break
 
             if swa_allocatable_tokens is not None:
@@ -1737,14 +1741,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
-        if (
-            not get_disagg().disaggregation_decode_enable_host_receive
-            or decode_req.is_rebootstrap
-            or _is_fake_transfer(decode_req.req)
-        ):
-            return False
-        if not decode_req.kv_receiver.supports_host_destination:
-            return False
         num_tokens = ceil_align(
             len(decode_req.req.origin_input_ids), self.host_pool.page_size
         )
@@ -1776,9 +1772,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             or None,
         )
         if get_disagg().disaggregation_decode_enable_radix_cache:
-            # A rejected device admission released its prefix lock. Receive the
-            # complete prompt into fresh slots, as for retraction, and let the
-            # normal post-restore cache insertion merge any duplicate prefix.
             req = decode_req.req
             req.prefix_indices = torch.empty((0,), dtype=torch.int64)
             req.last_node = self.tree_cache.root_node_handle(req.extra_key)
@@ -2345,7 +2338,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.enable_host_receive = (
-            get_disagg().disaggregation_decode_enable_host_receive
+            get_disagg().disaggregation_decode_host_receive_threshold > 0
         )
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
@@ -3108,7 +3101,7 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        if get_disagg().disaggregation_decode_enable_host_receive:
+        if get_disagg().disaggregation_decode_host_receive_threshold > 0:
             for req in new_batch.reqs:
                 if req.kv.retraction_backup is not None:
                     restore_kv_cache(
@@ -3146,7 +3139,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if not get_disagg().disaggregation_decode_enable_host_receive:
+            if get_disagg().disaggregation_decode_host_receive_threshold == 0:
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
@@ -3157,7 +3150,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
-            if get_disagg().disaggregation_decode_enable_host_receive:
+            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)

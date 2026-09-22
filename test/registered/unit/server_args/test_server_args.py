@@ -2001,7 +2001,7 @@ class TestHiCacheArgs(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 args = self._make_args(
                     disaggregation_mode="decode",
-                    disaggregation_decode_enable_host_receive=True,
+                    disaggregation_decode_host_receive_threshold=0.8,
                     speculative_algorithm=algorithm,
                 )
                 handle_pd_disaggregation(args)
@@ -2013,6 +2013,14 @@ class TestHiCacheArgs(CustomTestCase):
                 self.assertEqual(
                     resolution_result(args, "hicache_mem_layout"), "layer_first"
                 )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
 
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
