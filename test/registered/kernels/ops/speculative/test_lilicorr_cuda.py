@@ -1,10 +1,11 @@
 """GPU parity tests for the LiLiCorr Triton kernels.
 
-Both kernel entry points return a value-identical torch implementation for
-non-CUDA input, so on a CPU runner test_lilicorr.py only ever exercises the
-reference path and the Triton code is never compiled. These tests pin the two
-against each other on device, which is the only place "value-identical" is
-actually checked.
+Both entry points return a value-identical torch implementation for non-CUDA
+input, so on a CPU runner test_lilicorr.py only ever exercises the reference
+path and the Triton code is never compiled. These tests pin the two against
+each other on device, which is the only place "value-identical" is actually
+checked — and for the walk that is also the only place the reuse of DFlash2's
+selector_walk_triton is checked against the head's own factor layout.
 """
 
 import sys
@@ -13,8 +14,8 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.lilicorr import (
-    _greedy_path_torch,
-    _sample_path_torch,
+    _lattice_scores,
+    _selector_walk_torch,
     _topk_lse_torch,
     lilicorr_greedy_path,
     lilicorr_sample_path,
@@ -122,12 +123,37 @@ def test_a_vocabulary_narrower_than_k_tiles_takes_the_exact_reference_path():
     torch.testing.assert_close(lse.cpu(), ref_lse)
 
 
-# --- the fused greedy commit ------------------------------------------------
+# --- the selector walk ------------------------------------------------------
 
 
-# 16 is the widest pool the fused commit holds in one lane group.
+def _walk_reference(
+    log_start, log_pair, candidate_tokens, uniforms, temperatures, greedy_mask
+):
+    return _selector_walk_torch(
+        candidate_ids=candidate_tokens.cpu(),
+        scores=_lattice_scores(log_start.cpu(), log_pair.cpu()),
+        uniforms=uniforms.cpu(),
+        temperatures=temperatures.cpu(),
+        greedy_mask=greedy_mask.cpu(),
+    )
+
+
+def _greedy_reference(log_start, log_pair, candidate_tokens):
+    bs, slots, _ = candidate_tokens.shape
+    tokens, _ = _walk_reference(
+        log_start,
+        log_pair,
+        candidate_tokens,
+        uniforms=torch.zeros(bs, slots),
+        temperatures=torch.ones(bs),
+        greedy_mask=torch.ones(bs, dtype=torch.bool),
+    )
+    return tokens
+
+
+# 16 is the widest pool the selector walk holds in one lane group.
 @pytest.mark.parametrize("topk", [1, 8, 16])
-def test_fused_greedy_path_matches_the_reference(topk):
+def test_greedy_path_matches_the_reference(topk):
     torch.manual_seed(4)
     bs, slots = 5, 15
     log_start = torch.randn(bs, topk, device="cuda")
@@ -135,29 +161,29 @@ def test_fused_greedy_path_matches_the_reference(topk):
     tokens = torch.randint(0, 151936, (bs, slots, topk), device="cuda")
 
     actual = lilicorr_greedy_path(log_start, log_pair, tokens)
-    expected = _greedy_path_torch(log_start.cpu(), log_pair.cpu(), tokens.cpu())
+    expected = _greedy_reference(log_start, log_pair, tokens)
 
     torch.testing.assert_close(actual.cpu(), expected)
 
 
-def test_fused_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
-    """tl.argmax and Tensor.argmax must agree on ties, or the two paths commit
-    different tokens on exactly the inputs where the head is least certain."""
+def test_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
+    """The selector's max-then-lowest-index pick and Tensor.argmax must agree on ties, or
+    the two paths commit different tokens on exactly the inputs where the head is least
+    certain."""
     log_start = torch.zeros(2, 8, device="cuda")
     log_pair = torch.zeros(2, 14, 8, 8, device="cuda")
     tokens = torch.arange(2 * 15 * 8, device="cuda").view(2, 15, 8)
 
     actual = lilicorr_greedy_path(log_start, log_pair, tokens)
-    expected = _greedy_path_torch(log_start.cpu(), log_pair.cpu(), tokens.cpu())
+    expected = _greedy_reference(log_start, log_pair, tokens)
 
     torch.testing.assert_close(actual.cpu(), expected)
     assert actual[:, 0].cpu().equal(tokens[:, 0, 0].cpu())
 
 
-def test_fused_greedy_path_accepts_a_non_unit_stride_last_dim():
-    """The kernel reads the candidate dim contiguously and takes every other dim through a
-    passed stride, so a factor tensor whose last dim is not unit-stride has to be copied
-    first.
+def test_greedy_path_accepts_a_non_unit_stride_factor_view():
+    """The selector reads one dense [bs, slots, K, K] score tensor, so a factor tensor
+    whose last dim is not unit-stride has to be packed rather than passed through.
     """
     torch.manual_seed(5)
     bs, slots, topk = 3, 15, 8
@@ -169,9 +195,7 @@ def test_fused_greedy_path_accepts_a_non_unit_stride_last_dim():
     assert transposed.stride(-1) != 1, "the view under test must be non-contiguous"
 
     actual = lilicorr_greedy_path(log_start, transposed, tokens)
-    expected = _greedy_path_torch(
-        log_start.cpu(), transposed.cpu().contiguous(), tokens.cpu()
-    )
+    expected = _greedy_reference(log_start, transposed.contiguous(), tokens)
     torch.testing.assert_close(actual.cpu(), expected)
 
 
@@ -194,7 +218,7 @@ def test_sampled_path_commits_the_same_ids_as_the_reference():
     """
     a = _sampled_inputs(6, 5, 8, seed=0)
     tokens, q = lilicorr_sample_path(**a)
-    ref_tokens, ref_q = _sample_path_torch(**{k: v.cpu() for k, v in a.items()})
+    ref_tokens, ref_q = _walk_reference(**a)
 
     assert torch.equal(tokens.cpu(), ref_tokens)
     torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
@@ -206,7 +230,7 @@ def test_sampled_path_matches_the_reference_at_the_lane_group_edges(k):
     where an off-by-one in the cumulative-sum draw would show up."""
     a = _sampled_inputs(4, 4, k, seed=k)
     tokens, q = lilicorr_sample_path(**a)
-    ref_tokens, ref_q = _sample_path_torch(**{key: v.cpu() for key, v in a.items()})
+    ref_tokens, ref_q = _walk_reference(**a)
 
     assert torch.equal(tokens.cpu(), ref_tokens)
     torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)

@@ -1,12 +1,13 @@
 """Triton kernels for the LiLiCorr candidate-lattice reranker.
 
 lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits and
-the full-vocab log-partition from one pass over [n, V]. lilicorr_greedy_path folds the
-whole left-to-right commit into one launch; lilicorr_sample_path is that same walk with
-a sampled commit, emitting the per-slot proposal verify needs to accept it by rejection
-sampling.
+the full-vocab log-partition from one pass over [n, V].
 
-All three dispatch to a value-identical torch implementation off CUDA.
+lilicorr_sample_path commits one path through the candidate lattice and emits the
+per-slot proposal verify needs to accept it by rejection sampling; lilicorr_greedy_path
+is that walk with every row greedy. Both adapt the head's factors to
+selector_walk_triton, DFlash2's candidate selector, and dispatch to a value-identical
+torch implementation off CUDA.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+
 # Tile width for the scan, and tiles per program (TILE * TPP is the load block).
 # TILE is the contiguous dimension, so a wide TILE is what turns the scan into
 # long coalesced loads; 1024 x 8 = 8192 elements per program. These are launch
@@ -26,11 +29,10 @@ _TILE = 1024
 _TILES_PER_PROGRAM = 8
 _NUM_WARPS = 4
 
-# Widest candidate pool the fused greedy commit holds in one lane group. Exported
-# because the config refuses a head wider than this rather than serving it on the
-# torch path; the two must not drift.
+# Widest candidate pool the selector walk holds in one lane group. Exported because the
+# config refuses a head wider than this rather than serving it on the torch path; the
+# two must not drift.
 MAX_FUSED_CANDIDATE_TOPK = 16
-_GREEDY_MAX_K = MAX_FUSED_CANDIDATE_TOPK
 
 _NEG = -3.0e38
 
@@ -113,52 +115,6 @@ def _tiled_select(
         tl.store(ov + row * stride_ov_n + j, mv)
         tl.store(oi + row * stride_oi_n + j, mid)
         x = tl.where(lane == mp, neg, x)
-
-
-@triton.jit
-def _greedy_path_kernel(
-    ls_ptr,
-    lp_ptr,
-    ids_ptr,
-    out_ptr,
-    ls_sb,
-    lp_sb,
-    lp_ss,
-    lp_sp,
-    ids_sb,
-    ids_ss,
-    out_sb,
-    S: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """The whole greedy path for one batch row, tokens included.
-
-    c_0 = argmax(log_start), then c_s = argmax_c pair[s-1, c_{s-1}, c]. tl.argmax breaks
-    ties toward the lower index as Tensor.argmax does, so the committed path matches the
-    torch reference. pair layout: dim -2 ("from") has stride lp_sp, dim -1 ("to") is
-    unit-stride.
-    """
-    b = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
-    neg = -3.0e38
-    node = tl.load(ls_ptr + b * ls_sb + offs, mask=mask, other=neg)
-    node = tl.where(mask, node, neg)
-    cur = tl.argmax(node, axis=0).to(tl.int32)
-    tl.store(out_ptr + b * out_sb, tl.load(ids_ptr + b * ids_sb + cur))
-    for s in range(1, S):
-        trans = tl.load(
-            lp_ptr + b * lp_sb + (s - 1) * lp_ss + cur * lp_sp + offs,
-            mask=mask,
-            other=neg,
-        )
-        node = tl.where(mask, trans, neg)
-        cur = tl.argmax(node, axis=0).to(tl.int32)
-        tl.store(
-            out_ptr + b * out_sb + s,
-            tl.load(ids_ptr + b * ids_sb + s * ids_ss + cur),
-        )
 
 
 def _combine_lse(pm: torch.Tensor, ps: torch.Tensor) -> torch.Tensor:
@@ -255,184 +211,39 @@ def lilicorr_topk_lse(
     return ov, oi, _combine_lse(pm, ps)
 
 
-def _greedy_path_torch(
-    log_start: torch.Tensor,
-    log_pair: torch.Tensor,
-    candidate_tokens: torch.Tensor,
-) -> torch.Tensor:
-    num_slots = int(candidate_tokens.shape[1])
+def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
+    """Pack the head's factors into the selector's [bs, slots, K, K] layout.
+
+    log_start [bs, K] is slot 0 and log_pair [bs, slots-1, K, K] is every slot after it.
+    Slot 0 has no predecessor, so the walk only reads scores[:, 0, 0, :] there and the
+    broadcast over the "from" axis is sound. fp32 because the commit's argmax runs on
+    these values.
+    """
     topk = int(log_start.shape[-1])
-    cur = log_start.argmax(dim=-1)
-    cols = [cur]
-    for slot in range(1, num_slots):
-        trans = torch.gather(
-            log_pair[:, slot - 1, :, :],
-            1,
-            cur.view(-1, 1, 1).expand(-1, 1, topk),
-        ).squeeze(1)
-        cur = trans.argmax(dim=-1)
-        cols.append(cur)
-    path = torch.stack(cols, dim=-1)
-    return torch.gather(candidate_tokens, 2, path.unsqueeze(-1)).squeeze(-1)
+    start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
+    return torch.cat([start, log_pair.float()], dim=1)
 
 
-def _as_fp32_unit_last(t: torch.Tensor) -> torch.Tensor:
-    # The kernel reads the candidate (last) dim contiguously and every other dim
-    # through a passed stride, so a unit-stride last dim is all it needs.
-    if t.dtype != torch.float32:
-        t = t.float()
-    if t.stride(-1) != 1:
-        t = t.contiguous()
-    return t
-
-
-def lilicorr_greedy_path(
-    log_start: torch.Tensor,
-    log_pair: torch.Tensor,
-    candidate_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """Locally-optimal left-to-right decode of the candidate lattice.
-
-    Shapes (single block): log_start [bs, k], log_pair [bs, slots-1, k, k],
-    candidate_tokens [bs, slots, k]. Returns the selected tokens [bs, slots].
-
-    Commits the argmax candidate at each slot conditioned on the previously committed
-    pick. Fixed trip count and no host syncs, so it is CUDA-graph safe.
-    """
-    if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
-        return _greedy_path_torch(log_start, log_pair, candidate_tokens)
-
-    bsz, num_slots, k = candidate_tokens.shape
-    ls = _as_fp32_unit_last(log_start)
-    lp = _as_fp32_unit_last(log_pair)
-    ids = candidate_tokens
-    if ids.stride(-1) != 1:
-        ids = ids.contiguous()
-    out = torch.empty(bsz, num_slots, dtype=ids.dtype, device=ls.device)
-    _greedy_path_kernel[(bsz,)](
-        ls,
-        lp,
-        ids,
-        out,
-        ls.stride(0),
-        lp.stride(0),
-        lp.stride(1),
-        lp.stride(2),
-        ids.stride(0),
-        ids.stride(1),
-        out.stride(0),
-        S=num_slots,
-        K=k,
-        BLOCK_K=max(_GREEDY_MAX_K, triton.next_power_of_2(k)),
-    )
-    return out
-
-
-@triton.jit
-def _sample_path_kernel(
-    ls_ptr,
-    lp_ptr,
-    ids_ptr,
-    u_ptr,
-    temp_ptr,
-    greedy_ptr,
-    out_ptr,
-    q_ptr,
-    ls_sb,
-    lp_sb,
-    lp_ss,
-    lp_sp,
-    ids_sb,
-    ids_ss,
-    u_sb,
-    out_sb,
-    q_sb,
-    q_ss,
-    S: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """_greedy_path_kernel plus the proposal it sampled from.
-
-    Same recurrence and the same loads, plus the per-slot draw and the q row verify needs
-    for rejection sampling. A row with greedy_mask set takes tl.argmax on the same fp32
-    node values as the greedy kernel, so one captured graph serves both and the greedy
-    rows walk a bit-identical path.
-
-    q for a greedy row is the point mass at its pick, not the temperature softmax: that
-    token was chosen deterministically, so anything else makes min(1, p/q) the wrong
-    acceptance test for it.
-    """
-    b = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
-    neg = -3.0e38
-    temperature = tl.load(temp_ptr + b)
-    greedy = tl.load(greedy_ptr + b) != 0
-
-    node = tl.load(ls_ptr + b * ls_sb + offs, mask=mask, other=neg)
-    node = tl.where(mask, node, neg)
-    if greedy:
-        cur = tl.argmax(node, axis=0).to(tl.int32)
-        probs = tl.where(offs == cur, 1.0, 0.0)
-    else:
-        scaled = node / temperature
-        expo = tl.exp(scaled - tl.max(scaled, axis=0))
-        probs = expo / tl.sum(expo, axis=0)
-        uniform = tl.load(u_ptr + b * u_sb)
-        cur = tl.sum(tl.where(uniform >= tl.cumsum(probs, axis=0), 1, 0), axis=0)
-        cur = tl.minimum(cur, K - 1).to(tl.int32)
-    tl.store(q_ptr + b * q_sb + offs, probs, mask=mask)
-    tl.store(out_ptr + b * out_sb, tl.load(ids_ptr + b * ids_sb + cur))
-
-    for s in range(1, S):
-        node = tl.load(
-            lp_ptr + b * lp_sb + (s - 1) * lp_ss + cur * lp_sp + offs,
-            mask=mask,
-            other=neg,
-        )
-        node = tl.where(mask, node, neg)
-        if greedy:
-            cur = tl.argmax(node, axis=0).to(tl.int32)
-            probs = tl.where(offs == cur, 1.0, 0.0)
-        else:
-            scaled = node / temperature
-            expo = tl.exp(scaled - tl.max(scaled, axis=0))
-            probs = expo / tl.sum(expo, axis=0)
-            uniform = tl.load(u_ptr + b * u_sb + s)
-            cur = tl.sum(tl.where(uniform >= tl.cumsum(probs, axis=0), 1, 0), axis=0)
-            cur = tl.minimum(cur, K - 1).to(tl.int32)
-        tl.store(q_ptr + b * q_sb + s * q_ss + offs, probs, mask=mask)
-        tl.store(
-            out_ptr + b * out_sb + s,
-            tl.load(ids_ptr + b * ids_sb + s * ids_ss + cur),
-        )
-
-
-def _sample_path_torch(
-    log_start: torch.Tensor,
-    log_pair: torch.Tensor,
-    candidate_tokens: torch.Tensor,
+def _selector_walk_torch(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
     uniforms: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Value-identical reference for the fused walk, and the fallback off CUDA. The
-    # greedy and sampling picks are computed for every row and selected, rather than
-    # branched on, because the rows of one batch disagree.
-    num_slots = int(candidate_tokens.shape[1])
-    topk = int(log_start.shape[-1])
+    # Value-identical reference for selector_walk_triton, and the arm off CUDA. Both
+    # picks are computed for every row and selected rather than branched on, because the
+    # rows of one batch disagree.
+    _, num_slots, topk = candidate_ids.shape
     temps = temperatures.view(-1, 1).to(torch.float32)
     greedy = greedy_mask.view(-1)
-    idx_cols, q_cols = [], []
-    node = log_start.float()
+    previous = torch.zeros(greedy.shape[0], dtype=torch.int64, device=scores.device)
+    tokens, q_rows = [], []
     for slot in range(num_slots):
-        if slot > 0:
-            node = torch.gather(
-                log_pair[:, slot - 1, :, :].float(),
-                1,
-                idx_cols[-1].view(-1, 1, 1).expand(-1, 1, topk),
-            ).squeeze(1)
+        node = torch.gather(
+            scores[:, slot].float(), 1, previous.view(-1, 1, 1).expand(-1, 1, topk)
+        ).squeeze(1)
         probs = torch.softmax(node / temps, dim=-1)
         sampled = (
             uniforms[:, slot : slot + 1]
@@ -440,19 +251,19 @@ def _sample_path_torch(
             .sum(dim=-1)
             .clamp_max(topk - 1)
         )
-        picked = node.argmax(dim=-1)
-        index = torch.where(greedy, picked, sampled)
-        idx_cols.append(index)
-        q_cols.append(
+        previous = torch.where(greedy, node.argmax(dim=-1), sampled)
+        q_rows.append(
             torch.where(
                 greedy.unsqueeze(-1),
-                F.one_hot(index, topk).to(torch.float32),
+                F.one_hot(previous, topk).to(torch.float32),
                 probs,
             )
         )
-    path = torch.stack(idx_cols, dim=-1)
-    tokens = torch.gather(candidate_tokens, 2, path.unsqueeze(-1)).squeeze(-1)
-    return tokens, torch.stack(q_cols, dim=1)
+        tokens.append(
+            torch.gather(candidate_ids[:, slot], 1, previous.view(-1, 1)).squeeze(1)
+        )
+    # int64 tokens, because that is selector_walk_triton's output contract.
+    return torch.stack(tokens, dim=-1).to(torch.int64), torch.stack(q_rows, dim=1)
 
 
 def lilicorr_sample_path(
@@ -463,11 +274,13 @@ def lilicorr_sample_path(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """lilicorr_greedy_path with a sampled commit, plus the proposal it used.
+    """Left-to-right commit over the candidate lattice, plus the proposal it used.
 
-    Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32). q_rows[b, s] is the
-    distribution slot s was drawn from, over that slot's k candidates and zero elsewhere;
-    the caller scatters it into the dense q the verify kernel reads.
+    Shapes (single block): log_start [bs, k], log_pair [bs, slots-1, k, k],
+    candidate_tokens [bs, slots, k], uniforms [bs, slots], temperatures [bs] and
+    greedy_mask [bs]. Returns (tokens [bs, slots], q_rows [bs, slots, k] fp32).
+    q_rows[b, s] is the distribution slot s was drawn from, over that slot's k candidates
+    and zero elsewhere; the caller scatters it into the dense q the verify kernel reads.
 
     The proposal is softmax(psi_s / T), psi_s being the head's own log-factor row: the
     start factor at slot 0 and the transition row out of the committed predecessor after
@@ -476,45 +289,41 @@ def lilicorr_sample_path(
 
     Rows with greedy_mask set take the argmax and report a point mass, so a mixed batch
     is one launch and the greedy rows are unchanged.
-    """
-    if not (log_start.is_cuda and log_start.shape[-1] <= _GREEDY_MAX_K):
-        return _sample_path_torch(
-            log_start, log_pair, candidate_tokens, uniforms, temperatures, greedy_mask
-        )
 
-    bsz, num_slots, k = candidate_tokens.shape
-    ls = _as_fp32_unit_last(log_start)
-    lp = _as_fp32_unit_last(log_pair)
-    u = _as_fp32_unit_last(uniforms)
-    temps = temperatures.reshape(-1).to(torch.float32).contiguous()
-    greedy = greedy_mask.reshape(-1).contiguous()
-    ids = candidate_tokens
-    if ids.stride(-1) != 1:
-        ids = ids.contiguous()
-    out = torch.empty(bsz, num_slots, dtype=ids.dtype, device=ls.device)
-    q_rows = torch.empty(bsz, num_slots, k, dtype=torch.float32, device=ls.device)
-    _sample_path_kernel[(bsz,)](
-        ls,
-        lp,
-        ids,
-        u,
-        temps,
-        greedy,
-        out,
-        q_rows,
-        ls.stride(0),
-        lp.stride(0),
-        lp.stride(1),
-        lp.stride(2),
-        ids.stride(0),
-        ids.stride(1),
-        u.stride(0),
-        out.stride(0),
-        q_rows.stride(0),
-        q_rows.stride(1),
-        S=num_slots,
-        K=k,
-        BLOCK_K=max(_GREEDY_MAX_K, triton.next_power_of_2(k)),
-        num_warps=1,
+    The walk itself is DFlash2's candidate selector: same recurrence, same lower-index
+    tie break, same inverse-CDF draw. Fixed trip count and no host syncs, so the draft
+    CUDA graph can capture it.
+    """
+    scores = _lattice_scores(log_start, log_pair)
+    walk = selector_walk_triton if scores.is_cuda else _selector_walk_torch
+    return walk(
+        candidate_ids=candidate_tokens,
+        scores=scores,
+        uniforms=uniforms,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
     )
-    return out, q_rows
+
+
+def lilicorr_greedy_path(
+    log_start: torch.Tensor,
+    log_pair: torch.Tensor,
+    candidate_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """lilicorr_sample_path with every row greedy, for a batch carrying no sampling state.
+
+    Commits the argmax candidate at each slot conditioned on the previously committed
+    pick, and returns the selected tokens [bs, slots]. Shares the walk, so the commit is
+    bit-identical to the greedy rows of a mixed sampled batch.
+    """
+    bsz, num_slots, _ = candidate_tokens.shape
+    device = log_start.device
+    tokens, _ = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        candidate_tokens,
+        uniforms=torch.zeros(bsz, num_slots, dtype=torch.float32, device=device),
+        temperatures=torch.ones(bsz, dtype=torch.float32, device=device),
+        greedy_mask=torch.ones(bsz, dtype=torch.bool, device=device),
+    )
+    return tokens
