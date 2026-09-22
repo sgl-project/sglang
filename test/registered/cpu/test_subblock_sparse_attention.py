@@ -311,7 +311,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 return_value=DeviceCapability(9, 0),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
@@ -321,7 +321,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 loader,
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ),
         ):
@@ -340,7 +340,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 return_value=DeviceCapability(9, 0),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
@@ -350,7 +350,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 side_effect=ImportError("Install SpargeAttention"),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ) as get_backend,
             self.assertRaisesRegex(ImportError, "Install SpargeAttention"),
@@ -371,7 +371,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 return_value=DeviceCapability(12, 0),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
@@ -381,7 +381,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 loader,
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ),
         ):
@@ -400,7 +400,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 return_value=DeviceCapability(12, 0),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
@@ -410,7 +410,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 side_effect=ImportError("FlashInfer SM120 Sage backend is unavailable"),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ) as get_backend,
             self.assertRaisesRegex(
