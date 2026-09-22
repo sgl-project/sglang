@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
@@ -177,6 +176,7 @@ class TinyMLAModelConfig:
         self.scaling = self.head_dim**-0.5
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -246,7 +246,6 @@ class MockMLAModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)

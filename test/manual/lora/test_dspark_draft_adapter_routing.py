@@ -248,7 +248,7 @@ class TestDraftAdapterWorkerDispatch(unittest.TestCase):
             for n in worker.body
             if isinstance(n, ast.FunctionDef) and n.name == "forward_batch_generation"
         )
-        namespace = {}
+        namespace = {"CaptureHiddenMode": NS(FULL="full")}
         exec(
             compile(
                 "from __future__ import annotations\n" + ast.unparse(method),
@@ -263,6 +263,7 @@ class TestDraftAdapterWorkerDispatch(unittest.TestCase):
         for extend in (True, False):
             events = []
             worker = NS(
+                _hosts_draft=True,
                 _draft_adapter_bank=NS(
                     activate=lambda name: events.append(("activate", name))
                 ),
@@ -285,7 +286,10 @@ class TestDraftAdapterWorkerDispatch(unittest.TestCase):
 
     def test_mixed_batch_fails_before_any_model_work(self):
         events = []
-        worker = NS(_draft_adapter_bank=NS(activate=lambda name: events.append(name)))
+        worker = NS(
+            _hosts_draft=True,
+            _draft_adapter_bank=NS(activate=lambda name: events.append(name)),
+        )
         batch = NS(reqs=[NS(draft_adapter=None), NS(draft_adapter="rust")])
         with (
             patch.dict(sys.modules, {ROUTING_NAME: routing}),
@@ -296,10 +300,38 @@ class TestDraftAdapterWorkerDispatch(unittest.TestCase):
 
     def test_feature_disabled_does_not_require_request_adapter_metadata(self):
         worker = NS(
-            _draft_adapter_bank=None, _forward_decode=lambda *args: "ordinary-decode"
+            _hosts_draft=True,
+            _draft_adapter_bank=None,
+            _forward_decode=lambda *args: "ordinary-decode",
         )
         batch = NS(forward_mode=NS(is_extend=lambda: False), is_extend_in_batch=False)
         self.assertEqual(self.forward(worker, batch), "ordinary-decode")
+
+    def test_non_draft_pipeline_stage_preserves_target_dispatch(self):
+        events = []
+        output = NS()
+        proxy = object()
+        batch = NS(seq_lens=[3, 5])
+
+        def forward_target(received_batch, **kwargs):
+            events.append((received_batch, kwargs))
+            return output
+
+        worker = NS(
+            _hosts_draft=False,
+            target_worker=NS(forward_batch_generation=forward_target),
+        )
+        published = []
+        result = self.forward(
+            worker, batch, on_publish=published.append, pp_proxy_tensors=proxy
+        )
+        self.assertIs(result, output)
+        self.assertEqual(output.new_seq_lens, batch.seq_lens)
+        self.assertEqual(published, [batch.seq_lens])
+        self.assertEqual(
+            events,
+            [(batch, {"pp_proxy_tensors": proxy, "capture_hidden_mode": "full"})],
+        )
 
 
 class TestDraftAdapterEngineDispatch(unittest.TestCase):
