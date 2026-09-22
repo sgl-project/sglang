@@ -167,6 +167,7 @@ class Memory(msgspec.Struct):
                 "simm",
                 "mori",
                 "shm",
+                "radixshmem",
             ],
         ),
     ] = None

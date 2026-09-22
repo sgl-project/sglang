@@ -601,6 +601,7 @@ class HiCacheController:
                     "nixl",
                     "simm",
                     "mori",
+                    "radixshmem",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
