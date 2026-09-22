@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    fp4_index_logits_decode,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -36,6 +37,133 @@ SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
 SCALE_BYTES = 4
 PAGE_SIZE = 64
 E2M1_MAX = 6.0
+
+
+def _make_decode_case(heads, capacity, page_size):
+    torch.manual_seed(123)
+    # Dyadic inputs make the FP64 reference exact before each BF16 rounding point.
+    q = torch.randint(-8, 9, (6, heads, HEAD_DIM * 2), device="cuda").to(
+        torch.bfloat16
+    )[..., ::2]
+    q.mul_(0.5)
+    weights = torch.randint(-8, 9, (6, heads * 2), device="cuda").float()[:, ::2]
+    # Non-BF16-exact weights also exercise the wrapper's BF16 conversion.
+    weights.mul_(0.125).add_(0.003)
+    slots = torch.randint(0, 4 * page_size, (6, capacity * 2), device="cuda")[:, ::2]
+    table = torch.randint(
+        0,
+        256,
+        (4, page_size * (FP4_DIM + SCALE_BYTES) + 16),
+        device="cuda",
+        dtype=torch.uint8,
+    )[:, : page_size * (FP4_DIM + SCALE_BYTES)]
+    table[:, page_size * FP4_DIM :] = torch.randint(
+        124, 130, (4, page_size * SCALE_BYTES), device="cuda", dtype=torch.uint8
+    )
+    lens = torch.zeros(12, device="cuda", dtype=torch.int32)[::2]
+    return q, weights, slots, lens, table, page_size
+
+
+def _ref_decode_logits(q, weights, slots, lens, table, page_size):
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device=q.device,
+        dtype=torch.float64,
+    )
+    payload = table[:, : page_size * FP4_DIM].reshape(-1, FP4_DIM)
+    codes = torch.stack((payload & 15, payload >> 4), dim=-1).flatten(-2)
+    scales = table[:, page_size * FP4_DIM :].reshape(-1, SCALE_BYTES)
+    keys = lut[codes.long()] * torch.exp2(scales.double() - 127).repeat_interleave(
+        GROUP_SIZE, dim=-1
+    )
+    out = torch.full(slots.shape, -torch.inf, device=q.device, dtype=torch.float32)
+    for row, length in enumerate(lens.tolist()):
+        length = min(max(length, 0), slots.shape[1])
+        if length:
+            k = keys[slots[row, :length]]
+            scores = (q[row].double() @ k.T).to(torch.bfloat16).float().relu()
+            scores = (scores * weights[row].bfloat16().float()[:, None]).bfloat16()
+            out[row, :length] = scores.float().sum(dim=0).bfloat16().float()
+    return out
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FP4 decode logits use the CUDA Triton path",
+)
+@pytest.mark.parametrize(
+    "heads,capacity,page_size",
+    [
+        (32, 0, 64),
+        (32, 1, 64),
+        (32, 63, 64),
+        (32, 64, 64),
+        (32, 65, 64),
+        (32, 130, 64),
+        (64, 4097, 128),
+    ],
+)
+def test_decode_partial_tiles_and_paged_layout(heads, capacity, page_size):
+    """A partially visible tile must score its prefix and clear its tail."""
+    args = _make_decode_case(heads, capacity, page_size)
+    lens = args[3]
+    lens.copy_(lens.new_tensor([0, 1, 63, 64, 65, capacity]))
+    torch.testing.assert_close(
+        fp4_index_logits_decode(*args), _ref_decode_logits(*args), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FP4 decode logits use the CUDA Triton path",
+)
+@pytest.mark.parametrize("heads,page_size", [(32, 64), (64, 128)])
+def test_decode_invisible_slots_and_clamped_lengths(heads, page_size):
+    """Inactive slots may be invalid, even in the last partially visible tile."""
+    args = _make_decode_case(heads=heads, capacity=130, page_size=page_size)
+    slots, lens = args[2:4]
+    lens.copy_(lens.new_tensor([-1, 0, 1, 63, 65, 147]))
+    invisible = (
+        torch.arange(slots.shape[1], device=slots.device)[None, :] >= lens[:, None]
+    )
+    slots.masked_fill_(invisible, torch.iinfo(slots.dtype).max)
+    torch.testing.assert_close(
+        fp4_index_logits_decode(*args), _ref_decode_logits(*args), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FP4 decode logits use the CUDA Triton path",
+)
+@pytest.mark.parametrize("contiguous_lengths", [False, True])
+def test_decode_graph_replay_changes_visibility(contiguous_lengths):
+    """Growing and shrinking device lengths must not reuse captured visibility or scores."""
+    args = _make_decode_case(heads=32, capacity=65541, page_size=64)
+    if contiguous_lengths:
+        args = (*args[:3], args[3].to(torch.int64).contiguous(), *args[4:])
+    q, weights, slots, lens, table, page_size = args
+    for _ in range(3):
+        fp4_index_logits_decode(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_decode(*args)
+    for lengths in (
+        [1, 63, 64, 65, 4097, 8193],
+        [8193, 4097, 65, 64, 63, 1],
+        [65541, 65536, 65537, 65, 1, 0],
+        [65536, 65537, 0, 65541, 0, 1],
+        [0, 0, 0, 0, 0, 0],
+        [65, 64, 63, 1, 0, 4097],
+    ):
+        lens.copy_(lens.new_tensor(lengths))
+        q.neg_()
+        slots.add_(1).remainder_(table.shape[0] * page_size)
+        # Poison every output, so an unwritten inactive tile always fails.
+        actual.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(actual, _ref_decode_logits(*args), rtol=0, atol=0)
 
 
 def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
