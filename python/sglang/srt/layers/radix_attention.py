@@ -234,12 +234,13 @@ class RadixAttention(nn.Module):
                     "q_descale",
                     "k_descale",
                     "v_descale",
+                    "mxfp8_norm_rope_positions",
                 )
             ):
-                # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
-                # tensors can't cross the unified_attention_with_output custom-op
-                # schema; route this backend's extend attention through the plain
-                # eager path.
+                # A score_mod callable, aux_tensors, rel_bias, mxfp8 descale
+                # tensors, or the mxfp8 deferred norm/RoPE operands can't cross
+                # the unified_attention_with_output custom-op schema; route this
+                # backend's extend attention through the plain eager path.
                 if is_in_breakable_cuda_graph():
                     lse = breakable_attention_with_output_extra_kwargs(
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
@@ -312,8 +313,9 @@ def _unified_attention_with_output_impl(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
-    # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
+    # they must appear in the schema when --cuda-graph-backend-prefill=tc_piecewise is on.
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -323,7 +325,7 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_query_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent
     # of the suffix queries, so its caller must preserve that separate extent.
@@ -364,6 +366,8 @@ def _unified_attention_with_output_impl(
         kwargs["k_rope"] = k_rope[:key_value_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if attn_sink is not None:
+        kwargs["attn_sink"] = attn_sink
     if cos_sin_cache is not None:
         kwargs["cos_sin_cache"] = cos_sin_cache
     if is_neox is not None:
@@ -438,6 +442,7 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -456,6 +461,7 @@ def unified_attention_with_output(
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,
+        attn_sink=attn_sink,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
@@ -486,6 +492,7 @@ def unified_attention_with_output_and_lse(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
@@ -504,6 +511,7 @@ def unified_attention_with_output_and_lse(
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,
+        attn_sink=attn_sink,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
@@ -531,7 +539,7 @@ def unified_sparse_attention_with_output(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(attn_out, idx_out)
@@ -594,7 +602,8 @@ def attention_with_output_extra_kwargs(
     """Breakable/tc_piecewise attention for backends whose forward needs kwargs
     that cannot cross the ``unified_attention_with_output`` custom-op schema --
     a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
-    fa4 attention). Plain (not a custom op) so the callable passes through; still
+    fa4 attention), or the per-token mxfp8 deferred norm/RoPE operands. Plain
+    (not a custom op) so the callable passes through; still
     runs eagerly between graph segments under BCG via the wrapper below. Mirrors
     the real-token narrowing + padded-output write of
     ``unified_attention_with_output``, and narrows per-token ``aux_tensors`` too.
@@ -602,7 +611,7 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(output)
@@ -618,7 +627,14 @@ def attention_with_output_extra_kwargs(
     aux_tensors = kwargs.get("aux_tensors")
     if aux_tensors is not None:
         kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
-    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+    for per_token_key in (
+        "rel_bias",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+        "mxfp8_norm_rope_positions",
+        "mxfp8_norm_rope_temp_scale",
+    ):
         t = kwargs.get(per_token_key)
         if t is not None:
             kwargs[per_token_key] = t[:real_num_tokens]

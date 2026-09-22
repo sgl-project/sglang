@@ -42,7 +42,6 @@ register_amd_ci(
 
 
 class TestLoRATP(CustomTestCase):
-
     def _run_tp_on_model_cases(
         self,
         model_cases: List[LoRAModelCase],

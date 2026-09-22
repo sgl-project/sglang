@@ -282,10 +282,13 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
@@ -336,9 +339,9 @@ def pre_permute_standard_to_aiter(
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
-        assert (
-            topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
-        ), "apply_router_weight_on_input requires topk=1"
+        assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1, (
+            "apply_router_weight_on_input requires topk=1"
+        )
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 

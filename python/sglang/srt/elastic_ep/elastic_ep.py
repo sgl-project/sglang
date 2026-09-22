@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
 
-from sglang.srt.distributed import get_world_group, parallel_state
+from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.runtime_context import (
@@ -92,7 +92,7 @@ class ElasticEPStateManager:
 
         if get_exec().moe.elastic_ep_backend is not None:
             world_size = torch.distributed.get_world_size()
-            active_rank_capacity = get_parallel().max_ep_size or world_size
+            active_rank_capacity = get_parallel().max_world_size
             assert active_rank_capacity >= world_size, (
                 f"--max-ep-size ({active_rank_capacity}) must be >= "
                 f"world_size ({world_size})."
@@ -110,7 +110,7 @@ class ElasticEPStateManager:
                 cls._on_scale = cls._on_scale_nixl
 
             inst.ep_join_rank_offset = get_parallel().ep_join_rank_offset
-            if server_args.is_ep_joiner:
+            if get_exec().moe.is_ep_joiner:
                 cls._init_joiner_state(inst)
 
             cls._instance = inst
@@ -446,7 +446,7 @@ def join_process_groups() -> None:
 def get_healthy_expert_location_src_rank(
     *, invoked_in_elastic_ep_rejoin_path: bool
 ) -> int:
-    world_group = get_world_group()
+    world_group = get_parallel().world_group
     # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
     # A rank that was started as a rejoin rank may later act as a healthy
     # rank in a subsequent recovery cycle.

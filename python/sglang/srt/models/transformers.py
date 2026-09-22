@@ -34,7 +34,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
     get_pp_indices,
     tensor_model_parallel_all_reduce,
 )
@@ -576,7 +575,7 @@ class TransformersBase(nn.Module):
         self.config = config
         self.text_config = get_hf_text_config(config)
         self.weight_mapper = self.hf_to_sglang_mapper
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Weight loading attrs
         self.skip_prefixes: list[str] = []
@@ -1077,9 +1076,9 @@ class TransformersBase(nn.Module):
             )
 
         if get_embedding:
-            assert (
-                self.pooler is not None
-            ), "pooling is not enabled for this model class"
+            assert self.pooler is not None, (
+                "pooling is not enabled for this model class"
+            )
             return self.pooler(hidden_states, forward_batch)
 
         assert self.logits_processor is not None and self.lm_head is not None
@@ -1100,7 +1099,6 @@ class TransformersBase(nn.Module):
 
 
 class CausalMixin:
-
     def __init__(self, *args, prefix: str = "", **kwargs):
         super().__init__(*args, prefix=prefix, **kwargs)
 
@@ -1128,7 +1126,6 @@ class CausalMixin:
 
 
 class EmbeddingMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ignore_unexpected_prefixes.append("lm_head.")
@@ -1141,7 +1138,6 @@ class EmbeddingMixin:
 
 
 class MoEMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

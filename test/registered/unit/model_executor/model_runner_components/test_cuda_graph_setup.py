@@ -12,7 +12,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
@@ -46,6 +46,25 @@ def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
     assert attention[24] is layer24
     assert companions[23] is None
     assert companions[24] is companion24
+
+
+def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
+    looped = SimpleNamespace(layer_id=1)
+    companion = object()
+    attention_in = [SimpleNamespace(layer_id=0), looped, looped]
+    companions_in = [None, companion, companion]
+
+    attention, companions = index_attention_layers_by_global_id(
+        attention_in, companions_in
+    )
+
+    assert attention is attention_in
+    assert companions is companions_in
+
+    with pytest.raises(ValueError, match="duplicate attention layer_id: 2"):
+        index_attention_layers_by_global_id(
+            [SimpleNamespace(layer_id=2), SimpleNamespace(layer_id=2)], [None, None]
+        )
 
 
 def test_model_runner_can_override_decode_graph_runner(monkeypatch):

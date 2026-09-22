@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 B, T = 3, 4
 H, HV = 4, 8
@@ -136,6 +136,42 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
                 inputs, self.gating, state.clone(), self.slots, rings=_make_rings()
             )
             self.assertTrue(torch.equal(out_plain, out_ring), f"{dtype=}")
+
+    def test_ring_write_accepts_strided_qkv_views(self):
+        inputs = _make_window(12)
+        packed_qkv = torch.cat(
+            [inputs[name].reshape(B * T, -1) for name in ("q", "k", "v")],
+            dim=-1,
+        )
+        q, k, v = packed_qkv.split([H * K, H * K, HV * V], dim=-1)
+        strided_qkv = {
+            "q": q.view(1, B * T, H, K),
+            "k": k.view(1, B * T, H, K),
+            "v": v.view(1, B * T, HV, V),
+        }
+        self.assertTrue(
+            all(not tensor.is_contiguous() for tensor in strided_qkv.values())
+        )
+
+        def run(qkv):
+            state = self._state(torch.float32).unsqueeze(0).contiguous()
+            rings = _make_rings()
+            output = _run_verify(
+                {**inputs, **qkv},
+                self.gating,
+                state[0],
+                self.slots,
+                rings=rings,
+            )
+            _fold(state, rings, self.slots, self.accept_lens)
+            return {"output": output, "state": state, **rings}
+
+        contiguous = run(
+            {name: tensor.contiguous() for name, tensor in strided_qkv.items()}
+        )
+        strided = run(strided_qkv)
+        for name in contiguous:
+            self.assertTrue(torch.equal(contiguous[name], strided[name]), name)
 
     def test_fold_matches_snapshot_baseline(self):
         for dtype in (torch.float32, torch.bfloat16):

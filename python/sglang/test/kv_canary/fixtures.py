@@ -15,8 +15,14 @@ from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import get_device
 
-DEFAULT_DEVICE: torch.device = torch.device("cuda")
+# Resolve the active accelerator (cuda/xpu/...) instead of hardcoding cuda: a torch
+# build without CUDA cannot allocate cuda tensors or call torch.cuda.*. Tests that
+# need the runtime API (synchronize, streams, ...) go through DEFAULT_DEVICE_MODULE
+# rather than torch.cuda.
+DEFAULT_DEVICE: torch.device = torch.device(get_device())
+DEFAULT_DEVICE_MODULE = torch.get_device_module(DEFAULT_DEVICE)
 
 
 @dataclass
@@ -175,7 +181,7 @@ def make_forward_batch(
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
-    num_token_non_padded_cpu: Optional[int] = None,
+    global_num_token_non_padded_cpu: Optional[int] = None,
 ) -> SimpleNamespace:
     seq_lens_default = list(seq_lens_list[:bs])
     if req_pool_indices is None:
@@ -216,7 +222,7 @@ def make_forward_batch(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        num_token_non_padded_cpu=num_token_non_padded_cpu,
+        global_num_token_non_padded_cpu=global_num_token_non_padded_cpu,
         req_all_ids_flat=None,
         req_all_ids_lens=None,
     )
