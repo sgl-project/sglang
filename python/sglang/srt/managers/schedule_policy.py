@@ -248,8 +248,7 @@ class SchedulePolicy:
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
         *,
-        enable_prefill_interleaving: bool = False,
-        disable_prefill_interleaving: bool = False,
+        prefill_interleaving: Optional[bool] = None,
         prefill_interleaving_min_continuation_tokens: Optional[int] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
@@ -259,9 +258,14 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
-        self.prefill_interleaving = not disable_prefill_interleaving and (
-            enable_prefill_interleaving
-            or self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        if prefill_interleaving is None:
+            prefill_interleaving = (
+                self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            )
+        # Keyed on the adjusted policy: HRRN runs as FCFS without a tree cache.
+        self.prefill_interleaving = prefill_interleaving and self.policy in (
+            CacheAwarePolicy.HRRN,
+            CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
         )
         self.prefill_interleaving_min_continuation_tokens = (
             prefill_interleaving_min_continuation_tokens
@@ -463,9 +467,16 @@ class SchedulePolicy:
         )
 
     def prefill_interleaving_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        max_reqs: int,
     ) -> Optional[int]:
-        """Reserve whole waiting prefills and put selected HRRN requests first."""
+        """Reserve whole waiting prefills, at most ``max_reqs``, and put selected
+        HRRN requests first."""
         shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         minimum = self.prefill_interleaving_min_continuation_tokens
         if minimum is None:
@@ -474,7 +485,11 @@ class SchedulePolicy:
                 if shortest_first
                 else max(page_size, _ceil_div(budget, 2 * page_size) * page_size)
             )
-        if not self.prefill_interleaving or budget < minimum + page_size:
+        if (
+            not self.prefill_interleaving
+            or max_reqs <= 0
+            or budget < minimum + page_size
+        ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
@@ -483,6 +498,8 @@ class SchedulePolicy:
         selected = []
         skipped = []
         for req in waiting_queue[:_PREFILL_INTERLEAVING_SCAN_LIMIT]:
+            if len(selected) == max_reqs:
+                break
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if (shortest_first and work >= remaining) or (
@@ -1425,10 +1442,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (has_chunked_req or self.new_chunked_req is not None) and (
-                self.prefill_interleaving
-                or get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
+            if (
+                has_chunked_req or self.new_chunked_req is not None
+            ) and self.prefill_interleaving:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:

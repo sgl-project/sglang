@@ -42,11 +42,10 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
 
 
 def check_prefill_interleaving(cfg: Any) -> None:
-    if cfg.enable_prefill_interleaving and cfg.disable_prefill_interleaving:
-        raise ValueError("Cannot both enable and disable prefill interleaving.")
-    enabled = not cfg.disable_prefill_interleaving and (
-        cfg.enable_prefill_interleaving
-        or cfg.schedule_policy == "shortest-prefill-first"
+    enabled = (
+        cfg.schedule_policy == "shortest-prefill-first"
+        if cfg.prefill_interleaving is None
+        else cfg.prefill_interleaving
     )
     minimum = cfg.prefill_interleaving_min_continuation_tokens
     if minimum is not None:
@@ -58,7 +57,7 @@ def check_prefill_interleaving(cfg: Any) -> None:
             raise ValueError(
                 "--prefill-interleaving-min-continuation-tokens must be a positive multiple of page_size."
             )
-    if cfg.enable_prefill_interleaving or minimum is not None:
+    if cfg.prefill_interleaving or minimum is not None:
         if cfg.schedule_policy not in ("hrrn", "shortest-prefill-first"):
             raise ValueError(
                 "Prefill interleaving requires hrrn or shortest-prefill-first."

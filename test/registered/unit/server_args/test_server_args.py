@@ -3378,7 +3378,7 @@ class TestPrefillInterleavingArgs(CustomTestCase):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         for policy, flags in (
-            ("hrrn", ["--enable-prefill-interleaving"]),
+            ("hrrn", ["--prefill-interleaving"]),
             ("shortest-prefill-first", []),
         ):
             with self.subTest(policy=policy):
@@ -3402,23 +3402,24 @@ class TestPrefillInterleavingArgs(CustomTestCase):
                 self.assertEqual(
                     args.prefill_interleaving_min_continuation_tokens, 1024
                 )
-                self.assertEqual(args.enable_prefill_interleaving, policy == "hrrn")
+                self.assertEqual(
+                    args.prefill_interleaving, True if policy == "hrrn" else None
+                )
         parsed = parser.parse_args(
             [
                 "--model-path",
                 "dummy",
                 "--schedule-policy",
                 "shortest-prefill-first",
-                "--disable-prefill-interleaving",
+                "--no-prefill-interleaving",
             ]
         )
         args = ServerArgs.from_cli_args(parsed)
         check_prefill_interleaving(args)
-        self.assertTrue(args.disable_prefill_interleaving)
+        self.assertIs(args.prefill_interleaving, False)
 
     def test_rejects_incompatible_controls(self):
         for overrides, message in (
-            ({"disable_prefill_interleaving": True}, "both enable and disable"),
             ({"schedule_policy": "fcfs"}, "requires hrrn or shortest"),
             ({"chunked_prefill_size": -1}, "requires chunked prefill"),
             ({"disable_radix_cache": True}, "requires radix caching"),
@@ -3431,7 +3432,7 @@ class TestPrefillInterleavingArgs(CustomTestCase):
             ({"prefill_interleaving_min_continuation_tokens": 4096}, "less than"),
             (
                 {
-                    "enable_prefill_interleaving": False,
+                    "prefill_interleaving": False,
                     "prefill_interleaving_min_continuation_tokens": 1024,
                 },
                 "requires prefill interleaving",
@@ -3440,7 +3441,7 @@ class TestPrefillInterleavingArgs(CustomTestCase):
             with self.subTest(overrides=overrides):
                 values = dict(
                     schedule_policy="hrrn",
-                    enable_prefill_interleaving=True,
+                    prefill_interleaving=True,
                     chunked_prefill_size=4096,
                     page_size=256,
                 )
