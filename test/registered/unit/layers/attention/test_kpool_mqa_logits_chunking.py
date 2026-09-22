@@ -1,17 +1,13 @@
 """CPU coverage for the kpool indexer's MQA-logits row chunking.
 
-The kpool indexer scores query rows against pooled positions into one fp32
-matrix that no pool sized by mem_fraction_static accounts for, so long-context
-prefill chunks it by query rows under a free-memory budget. Two things must
-hold for that loop to stay correct:
-
-* the request-indexed page table is passed whole to every chunk, because
-  `page_table_row_index` addresses it by absolute request-pool ID, and
-* the budget still applies during breakable-graph replay, whose eager breaks
-  run this path with live request metadata.
+Long-context prefill scores query rows in chunks under a free-memory budget.
+Chunking must not change the result: every row lands where the single call
+puts it, padding rows stay -1, and the request-indexed page table is passed
+whole because page_table_row_index addresses it by request-pool ID.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,95 +21,157 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 _KPOOL = "sglang.srt.layers.attention.dsa.dsa_indexer_kpool"
+# Over the 8M-element skip threshold, so the budget decides.
+_LARGE_ROWS, _LARGE_COLS = 16384, 229376
 
 
-def _planner():
-    """An IndexerKPool shell; __new__ skips an __init__ needing a device."""
-    return IndexerKPool.__new__(IndexerKPool)
-
-
-def _chunks(num_rows, num_cols, budget_bytes, capturing=False, capture_mode=False):
+def _plan_chunks(num_rows, num_cols, budget_bytes, *, capture_mode=False):
+    """Run the real chunk planner; returns (chunks, budget_query_mock)."""
+    planner = IndexerKPool.__new__(IndexerKPool)
     with (
-        patch(f"{_KPOOL}.mqa_logits_budget_bytes", return_value=budget_bytes),
+        patch(f"{_KPOOL}.mqa_logits_budget_bytes", return_value=budget_bytes) as budget,
         patch(f"{_KPOOL}.is_hip", return_value=False),
-        patch(
-            "torch.cuda.is_current_stream_capturing",
-            return_value=capturing,
-        ),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
         patch(f"{_KPOOL}.capture_mode.is_capture_mode", capture_mode),
     ):
-        return _planner()._mqa_logits_row_chunks(
-            num_rows, num_cols, torch.device("cuda", 0)
+        chunks = planner._mqa_logits_row_chunks(
+            num_rows=num_rows, num_cols=num_cols, device=torch.device("cuda", 0)
         )
+    return chunks, budget
 
 
 class TestKPoolMqaLogitsRowChunks(CustomTestCase):
-    def test_small_matrices_run_in_one_call(self):
-        # Below the 8M-element skip threshold: never worth a budget query.
-        self.assertIsNone(_chunks(64, 1024, 1 << 20))
+    def test_small_matrices_skip_the_budget_query(self):
+        chunks, budget = _plan_chunks(64, 1024, 1 << 20)
+        self.assertEqual(chunks, [(0, 64)])
+        budget.assert_not_called()
 
     def test_chunks_cover_every_row_once_and_fit_the_budget(self):
-        # 16384 rows x 229376 pooled cols fp32 is the 14 GiB GLM-5.3-Flash
-        # shape at a 917504-token prefill; 6 GiB is this host's real budget.
-        num_rows, num_cols = 16384, 229376
-        budget = 6 << 30
-        chunks = _chunks(num_rows, num_cols, budget)
-        self.assertIsNotNone(chunks)
+        budget_bytes = 6 << 30
+        chunks, _ = _plan_chunks(_LARGE_ROWS, _LARGE_COLS, budget_bytes)
         self.assertGreater(len(chunks), 1)
-        # Contiguous, non-overlapping, exact cover.
         self.assertEqual(chunks[0][0], 0)
-        self.assertEqual(chunks[-1][1], num_rows)
+        self.assertEqual(chunks[-1][1], _LARGE_ROWS)
         for (_, prev_end), (next_start, _) in zip(chunks, chunks[1:]):
             self.assertEqual(prev_end, next_start)
-        row_bytes = num_cols * 4
         for start, end in chunks:
             self.assertGreater(end, start)
-            self.assertLessEqual((end - start) * row_bytes, budget)
+            self.assertLessEqual((end - start) * _LARGE_COLS * 4, budget_bytes)
 
-    def test_a_budget_the_matrix_already_fits_runs_in_one_call(self):
-        self.assertIsNone(_chunks(16384, 229376, 64 << 30))
+    def test_a_matrix_within_budget_runs_in_one_call(self):
+        chunks, _ = _plan_chunks(_LARGE_ROWS, _LARGE_COLS, 64 << 30)
+        self.assertEqual(chunks, [(0, _LARGE_ROWS)])
 
-    def test_real_capture_keeps_a_single_fixed_call(self):
-        # Capture needs a fixed launch count, and mem_get_info would sync.
-        self.assertIsNone(_chunks(16384, 229376, 6 << 30, capture_mode=True))
-        self.assertIsNone(_chunks(16384, 229376, 6 << 30, capturing=True))
+    def test_real_capture_keeps_one_call_without_a_budget_query(self):
+        chunks, budget = _plan_chunks(
+            _LARGE_ROWS, _LARGE_COLS, 6 << 30, capture_mode=True
+        )
+        self.assertEqual(chunks, [(0, _LARGE_ROWS)])
+        budget.assert_not_called()
 
     def test_breakable_graph_replay_still_chunks(self):
         """get_is_capture_mode() is true throughout breakable-graph replay, but
-        its eager breaks execute this path for real and must stay budgeted.
-
-        capture_mode resolves is_in_breakable_cuda_graph in its own namespace,
-        so that is where the replay flag has to be patched.
-        """
+        its eager breaks run this path for real and must stay budgeted."""
+        # capture_mode resolves the flag in its own namespace.
         with patch(
             "sglang.srt.model_executor.runner_utils.capture_mode."
             "is_in_breakable_cuda_graph",
             return_value=True,
         ):
-            # Guard against a guard that ignores the flag entirely.
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
             self.assertTrue(get_is_capture_mode())
-            chunks = _chunks(16384, 229376, 6 << 30)
-        self.assertIsNotNone(chunks)
+            chunks, _ = _plan_chunks(_LARGE_ROWS, _LARGE_COLS, 6 << 30)
         self.assertGreater(len(chunks), 1)
 
 
-class TestKPoolChunkedPageTable(CustomTestCase):
-    """The paged plan hands the indexer req_to_token itself plus one absolute
-    request-pool ID per query row. Slicing that table would shift its base
-    while the IDs keep addressing the original rows, so a later chunk would
-    score another request's KV. This drives the real chunk loop."""
+def _row_chunks(rows_per_chunk, *, num_rows, **_):
+    if rows_per_chunk is None:
+        return [(0, num_rows)]
+    return [
+        (s, min(s + rows_per_chunk, num_rows))
+        for s in range(0, num_rows, rows_per_chunk)
+    ]
+
+
+def _fake_deep_gemm():
+    # Logits carry each row's weight, so a mis-offset q/weights slice shows up.
+    return SimpleNamespace(
+        fp8_mqa_logits=lambda q, kv, w, ks, ke, clean_logits: (
+            w[:, :1].expand(q.shape[0], kv[0].shape[0]).clone()
+        )
+    )
+
+
+def _encoding_topk(width, calls):
+    """A _topk_from_kpool_logits stand-in whose rows identify their inputs.
+
+    Each output row encodes the scored weight, pooled length and whichever
+    request/offset index it was given, and out_rows pads with -1 like the
+    real kernel wrapper.
+    """
+
+    def topk(logits, pool_lens, **kwargs):
+        calls.append(kwargs)
+        index = kwargs.get("page_table_row_index")
+        if index is None:
+            index = kwargs.get("topk_offsets")
+        if index is None:
+            index = torch.zeros_like(pool_lens)
+        row_ids = (
+            logits[:, 0].to(torch.int32) * 1_000_000
+            + pool_lens.to(torch.int32) * 1_000
+            + index.to(torch.int32)
+        )
+        result = row_ids.unsqueeze(1).expand(-1, width).contiguous()
+        out_rows = kwargs.get("out_rows")
+        if out_rows is not None and out_rows > result.shape[0]:
+            padded = torch.full((out_rows, width), -1, dtype=torch.int32)
+            padded[: result.shape[0]] = result
+            result = padded
+        return result
+
+    return topk
+
+
+def _expected_rows(*, pool_lens, index, width, pad_rows=0):
+    """What _encoding_topk returns when row r is scored with its own inputs:
+    weight r + 1 (see _fake_deep_gemm), pool_lens[r] and index[r]."""
+    weight_ids = torch.arange(1, pool_lens.shape[0] + 1, dtype=torch.int32)
+    row_ids = weight_ids * 1_000_000 + pool_lens * 1_000 + index
+    rows = row_ids.to(torch.int32).unsqueeze(1).expand(-1, width)
+    padding = torch.full((pad_rows, width), -1, dtype=torch.int32)
+    return torch.cat([rows, padding])
+
+
+def _backend(*, topk, rows_per_chunk, index_topk=4, index_kpool=4):
+    backend = SimpleNamespace(
+        index_topk=index_topk,
+        index_kpool=index_kpool,
+        alt_stream=None,
+        _topk_from_kpool_logits=topk,
+        _mqa_logits_row_chunks=partial(_row_chunks, rows_per_chunk),
+        _get_index_k_read_buffer=lambda pool, layer_id: None,
+        _fp8_mqa_logits=IndexerKPool._fp8_mqa_logits,
+    )
+    backend._kpool_topk_by_row_chunks = partial(
+        IndexerKPool._kpool_topk_by_row_chunks, backend
+    )
+    return backend
+
+
+def _fp8_zeros(*shape):
+    return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+
+class TestKPoolPlanChunking(CustomTestCase):
+    """The batched plan path: many requests' query rows in one scoring pass."""
 
     NUM_REQ_SLOTS = 64
     TOPK = 4
+    PAD_ROWS = 5
 
     def _drive(self, *, req_ids, rows_per_chunk, topk_method):
-        """Run _get_topk_ragged_kpool_plan, recording each chunk's arguments.
-
-        rows_per_chunk=None exercises the unchunked call, which is the
-        reference the chunked loop must reproduce.
-        """
         n_real = len(req_ids)
         total_k_rows = 16
         page_table = torch.arange(self.NUM_REQ_SLOTS * 8, dtype=torch.int32).reshape(
@@ -131,43 +189,25 @@ class TestKPoolChunkedPageTable(CustomTestCase):
             ragged_paged_page_table=page_table,
             ragged_paged_page_table_row_index=torch.tensor(req_ids, dtype=torch.int32),
         )
-        topk_offsets = torch.arange(n_real, dtype=torch.int32) * self.TOPK
+        # Padded batch: q_fp8 has rows past the plan's real ones.
+        total_q = n_real + self.PAD_ROWS
         metadata = SimpleNamespace(
             attn_metadata=SimpleNamespace(
-                kpool_extend_plan=plan, topk_indices_offset=topk_offsets
+                kpool_extend_plan=plan,
+                topk_indices_offset=torch.arange(total_q, dtype=torch.int32) + 100,
             ),
             topk_transform_method=topk_method,
         )
-
+        weights = torch.arange(1, total_q + 1, dtype=torch.float32).reshape(
+            total_q, 1, 1
+        )
         calls = []
-
-        def record(logits, pool_lens, **kwargs):
-            calls.append({"pool_lens": pool_lens, **kwargs})
-            return torch.zeros((logits.shape[0], self.TOPK), dtype=torch.int32)
-
-        chunks = (
-            None
-            if rows_per_chunk is None
-            else [
-                (s, min(s + rows_per_chunk, n_real))
-                for s in range(0, n_real, rows_per_chunk)
-            ]
-        )
-        backend = SimpleNamespace(
-            _topk_from_kpool_logits=record,
-            _mqa_logits_row_chunks=lambda *a, **k: chunks,
-            _get_index_k_read_buffer=lambda pool, layer_id: None,
-            _fp8_mqa_logits=IndexerKPool._fp8_mqa_logits,
-        )
-        deep_gemm = SimpleNamespace(
-            fp8_mqa_logits=lambda q, kv, w, ks, ke, clean_logits: torch.zeros(
-                (q.shape[0], total_k_rows), dtype=torch.float32
-            )
+        backend = _backend(
+            topk=_encoding_topk(self.TOPK, calls), rows_per_chunk=rows_per_chunk
         )
         with (
-            # deep_gemm is bound only under `if is_cuda()`, so on a CPU CI
-            # worker the attribute does not exist yet.
-            patch(f"{_KPOOL}.deep_gemm", deep_gemm, create=True),
+            # deep_gemm is bound only under `if is_cuda()`.
+            patch(f"{_KPOOL}.deep_gemm", _fake_deep_gemm(), create=True),
             patch(f"{_KPOOL}.get_token_to_kv_pool", return_value=object()),
             patch(f"{_KPOOL}._should_fuse_kpool_topk", return_value=True),
             patch(
@@ -180,72 +220,145 @@ class TestKPoolChunkedPageTable(CustomTestCase):
                 backend,
                 forward_batch=None,
                 layer_id=0,
-                q_fp8=torch.zeros((n_real, 4), dtype=torch.uint8).view(
-                    torch.float8_e4m3fn
-                ),
-                weights=torch.zeros((n_real, 1, 1), dtype=torch.float32),
+                q_fp8=_fp8_zeros(total_q, 4),
+                weights=weights,
                 metadata=metadata,
             )
         return result, calls, page_table
 
     def test_every_chunk_gets_the_whole_request_indexed_table(self):
-        # Noncontiguous, out-of-order slots: the failure mode is a chunk
-        # resolving request 1 to row 17 after a 16-row base shift.
+        # Noncontiguous, out-of-order slots: a sliced table resolves request 1
+        # to row 17 once a 16-row chunk shifts its base.
         req_ids = [1, 9, 2, 40, 7, 3, 63, 0] * 4
         _, calls, page_table = self._drive(
             req_ids=req_ids, rows_per_chunk=16, topk_method=TopkTransformMethod.PAGED
         )
         self.assertEqual(len(calls), 2)
         for chunk_idx, call in enumerate(calls):
-            # Never sliced: the same full pool object each chunk.
             self.assertIs(call["page_table"], page_table)
-            self.assertEqual(call["page_table"].shape[0], self.NUM_REQ_SLOTS)
             start = chunk_idx * 16
             torch.testing.assert_close(
                 call["page_table_row_index"],
                 torch.tensor(req_ids[start : start + 16], dtype=torch.int32),
             )
 
-    def test_chunked_row_ids_match_the_unchunked_call(self):
-        req_ids = [5, 11, 2, 60] * 8
-        _, one_call, _ = self._drive(
-            req_ids=req_ids, rows_per_chunk=None, topk_method=TopkTransformMethod.PAGED
+    def test_chunked_rows_match_the_single_call_including_padding(self):
+        req_ids = [5, 11, 2, 60, 9, 33, 1] * 4
+        for method in (TopkTransformMethod.PAGED, TopkTransformMethod.RAGGED):
+            with self.subTest(method=method):
+                expected, one_call, _ = self._drive(
+                    req_ids=req_ids, rows_per_chunk=None, topk_method=method
+                )
+                actual, chunked, _ = self._drive(
+                    req_ids=req_ids, rows_per_chunk=5, topk_method=method
+                )
+                self.assertEqual(len(one_call), 1)
+                self.assertGreater(len(chunked), 1)
+                n_real = len(req_ids)
+                index = (
+                    torch.tensor(req_ids, dtype=torch.int32)
+                    if method == TopkTransformMethod.PAGED
+                    else torch.arange(n_real, dtype=torch.int32) + 100
+                )
+                # Every real row scored with its own inputs, then -1 padding.
+                reference = _expected_rows(
+                    pool_lens=torch.arange(1, n_real + 1, dtype=torch.int32),
+                    index=index,
+                    width=self.TOPK,
+                    pad_rows=self.PAD_ROWS,
+                )
+                torch.testing.assert_close(expected, reference, rtol=0, atol=0)
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def _causal_seq_lens(q_lens, seq_lens):
+    # Extend row j of a request attends to its prefix plus rows 0..j.
+    return torch.cat(
+        [
+            torch.arange(s - q + 1, s + 1, dtype=torch.int32)
+            for q, s in zip(q_lens, seq_lens)
+        ]
+    )
+
+
+class TestKPoolPerRequestChunking(CustomTestCase):
+    """The per-request path chunks one request's rows at a q_slice offset."""
+
+    TOPK = 4
+    POOL = 4
+
+    def _drive(self, *, q_lens, seq_lens, rows_per_chunk):
+        token_nums = sum(q_lens)
+        width = self.TOPK + self.POOL - 1
+        forward_batch = SimpleNamespace(
+            batch_size=len(q_lens),
+            extend_seq_lens_cpu=list(q_lens),
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+            req_pool_indices=torch.tensor([7, 3][: len(q_lens)], dtype=torch.int64),
         )
-        _, chunked, _ = self._drive(
-            req_ids=req_ids, rows_per_chunk=7, topk_method=TopkTransformMethod.PAGED
+        seqlens_expanded = _causal_seq_lens(q_lens, seq_lens)
+        metadata = SimpleNamespace(
+            get_page_table_64=lambda: torch.zeros((len(q_lens), 1), dtype=torch.int32),
+            get_seqlens_expanded=lambda: seqlens_expanded,
+            topk_transform_method=TopkTransformMethod.RAGGED,
+            attn_metadata=SimpleNamespace(
+                topk_indices_offset=torch.arange(token_nums, dtype=torch.int32) + 100,
+            ),
         )
-        self.assertEqual(len(one_call), 1)
-        self.assertGreater(len(chunked), 1)
-        for key in ("page_table_row_index", "pool_lens", "seq_lens", "row_starts"):
-            torch.testing.assert_close(
-                torch.cat([c[key] for c in chunked]), one_call[0][key]
+        # Fully cached current K: the path scores it without a pool gather.
+        cache = [
+            (0, _fp8_zeros(s // self.POOL, 4), torch.zeros(s // self.POOL))
+            for s in seq_lens
+        ]
+        weights = torch.arange(1, token_nums + 1, dtype=torch.float32).reshape(
+            token_nums, 1
+        )
+        calls = []
+        backend = _backend(
+            topk=_encoding_topk(width, calls),
+            rows_per_chunk=rows_per_chunk,
+            index_topk=self.TOPK,
+            index_kpool=self.POOL,
+        )
+        with (
+            patch(f"{_KPOOL}.deep_gemm", _fake_deep_gemm(), create=True),
+            patch(
+                f"{_KPOOL}.get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(f"{_KPOOL}._should_fuse_kpool_topk", return_value=True),
+        ):
+            result = IndexerKPool._get_topk_ragged_kpool(
+                backend,
+                forward_batch=forward_batch,
+                layer_id=0,
+                q_fp8=_fp8_zeros(token_nums, 4),
+                weights=weights,
+                metadata=metadata,
+                extend_pooled_cache=cache,
             )
-        # Separate _drive calls build separate tables, so compare by value:
-        # every chunk must still receive the whole pool, not a sliced view.
-        for call in chunked:
-            torch.testing.assert_close(call["page_table"], one_call[0]["page_table"])
-            self.assertEqual(call["page_table"].shape[0], self.NUM_REQ_SLOTS)
+        return result, calls
 
-    def test_query_indexed_offsets_are_sliced_per_chunk(self):
-        """Without a row index the RAGGED path's tensors are per-query, so
-        they must be sliced, unlike the request-indexed table."""
-        req_ids = [0] * 16
-        _, calls, _ = self._drive(
-            req_ids=req_ids, rows_per_chunk=5, topk_method=TopkTransformMethod.RAGGED
+    def test_a_long_request_after_another_matches_the_single_call(self):
+        # The second request starts at q offset 5, so its chunks must slice
+        # relative to that request, not to the batch.
+        kwargs = dict(q_lens=[5, 19], seq_lens=[40, 96])
+        expected, one_call = self._drive(rows_per_chunk=None, **kwargs)
+        actual, chunked = self._drive(rows_per_chunk=4, **kwargs)
+        self.assertEqual(len(one_call), 2)
+        self.assertGreater(len(chunked), len(one_call))
+        pool_lens = torch.div(
+            _causal_seq_lens(kwargs["q_lens"], kwargs["seq_lens"]),
+            self.POOL,
+            rounding_mode="floor",
         )
-        self.assertGreater(len(calls), 1)
-        self.assertTrue(all(c["page_table"] is None for c in calls))
-        torch.testing.assert_close(
-            torch.cat([c["topk_offsets"] for c in calls]),
-            torch.arange(16, dtype=torch.int32) * self.TOPK,
+        reference = _expected_rows(
+            pool_lens=pool_lens,
+            index=torch.arange(pool_lens.shape[0], dtype=torch.int32) + 100,
+            width=self.TOPK + self.POOL - 1,
         )
-
-    def test_chunked_result_has_one_row_per_query(self):
-        req_ids = [3, 8, 1, 55] * 4
-        result, _, _ = self._drive(
-            req_ids=req_ids, rows_per_chunk=6, topk_method=TopkTransformMethod.PAGED
-        )
-        self.assertEqual(result.shape, (len(req_ids), self.TOPK))
+        torch.testing.assert_close(expected, reference, rtol=0, atol=0)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
