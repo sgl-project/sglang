@@ -545,8 +545,7 @@ export const Qwen35Deployment = () => {
         "NCCL_MNNVL_ENABLE=1 \\\n" +
         "NCCL_CUMEM_ENABLE=1 \\\n" +
         "MC_FORCE_MNNVL=1 \\\n" +
-        "NVSHMEM_REMOTE_TRANSPORT=none \\\n" +
-        "SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH=1 \\\n";
+        "NVSHMEM_REMOTE_TRANSPORT=none \\\n";
       cmd = gbEnv + cmd;
     }
 
