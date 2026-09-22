@@ -487,6 +487,9 @@ pub struct ComponentState {
     /// leaf may be freed: the leaf's parent for Full, the LRU predecessor for
     /// SWA and Mamba.
     pub(crate) evict_device_cursor: Option<NodeIdx_>,
+    /// Internal Mamba victim waiting for the controller's host backup attempt.
+    /// A generation-checked handle survives host eviction during that I/O.
+    pub(crate) evict_device_pending_node: Option<NodeId>,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
 }
@@ -548,6 +551,8 @@ pub struct EvictionStepResult {
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
     /// Full device tokens freed without a host copy during this device step.
     pub unbacked_tokens: usize,
+    /// Back up this internal Mamba state before resuming its device tombstone.
+    pub mamba_backup_node_id: Option<NodeId>,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -703,6 +708,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
         state.evict_device_cursor = None;
+        state.evict_device_pending_node = None;
     }
 
     /// Finish the component's device-eviction bookkeeping; panics if no walk
@@ -715,6 +721,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = false;
         state.evict_device_cursor = None;
+        state.evict_device_pending_node = None;
     }
 
     /// Add newly evictable device tokens to the component's evictable size.
@@ -2244,6 +2251,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         baseline: &HashMap<ComponentType, usize>,
     ) -> (Option<NodeId>, EvictionStepResult) {
+        assert!(
+            self.component_state(component_type)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal Mamba eviction before advancing"
+        );
         let mut tracker = baseline.clone();
         // The walk gates on the walked component's entry, so seed it.
         tracker.entry(component_type).or_insert(0);
@@ -2259,6 +2272,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.host_frees,
             );
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
+        result.mamba_backup_node_id = self
+            .component_state(component_type)
+            .evict_device_pending_node;
         for (ct, total) in tracker {
             let delta = total - baseline.get(&ct).copied().unwrap_or(0);
             if delta > 0 {
@@ -2266,6 +2282,64 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
         (node_id.map(|idx| self.arena.node(idx).id), result)
+    }
+
+    /// Finish an internal Mamba eviction after the controller has attempted
+    /// and acknowledged its host backup. A failed backup still drops the
+    /// state so an imminent device allocation can make progress.
+    pub fn finish_mamba_state_eviction(&mut self, node_id: NodeId) -> EvictionStepResult {
+        let state = self.component_state_mut(MAMBA);
+        assert!(
+            state.is_evict_device_ongoing,
+            "Mamba device eviction not started"
+        );
+        assert_eq!(
+            state.evict_device_pending_node,
+            Some(node_id),
+            "no matching pending internal Mamba eviction"
+        );
+        state.evict_device_pending_node = None;
+        let mut result = EvictionStepResult::default();
+        // Host eviction or a caller's intervening mutation may have removed
+        // the node, pinned its state, or changed the component's LRU.
+        let Ok(node_idx) = self.arena.resolve(node_id) else {
+            return result;
+        };
+        let node = self.arena.node(node_idx);
+        if !node.has_device_value(MAMBA)
+            || self.arena.device_lock_ref(node_idx, MAMBA) > 0
+            || node.is_load_back_pending()
+            || node.write_through_pending_id.is_some()
+            || !self.device_lru_list(MAMBA).in_list(Some(node_idx))
+        {
+            return result;
+        }
+        if self.evictable_device_leaves.contains(node_idx) || !node.has_device_value(FULL) {
+            // Re-select through the ordinary walk if the victim's shape has
+            // changed; an internal-state finish must never demote Full KV.
+            self.component_state_mut(MAMBA).evict_device_cursor = Some(node_idx);
+            return result;
+        }
+        assert!(self.tracked_unbacked_tokens.is_none());
+        self.tracked_unbacked_tokens = Some(0);
+        self.evict_component_and_detach_lru_(
+            node_idx,
+            MAMBA,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            EvictLayer::Device,
+            Some(&mut result.tracker),
+        );
+        self.cascade_evict_(
+            node_idx,
+            MAMBA,
+            &mut result.tracker,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            EvictLayer::Device,
+        );
+        result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
+        result
     }
 
     /// Finish a component's device-eviction walk.

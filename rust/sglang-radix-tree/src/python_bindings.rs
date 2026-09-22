@@ -779,6 +779,7 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
+    mamba_backup_node_id: Option<NodeId>,
     made_progress: bool,
     unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
@@ -1318,9 +1319,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
-    /// Advance one component eviction step. A missing node with
-    /// `made_progress` set means an internal tombstone completed the step;
-    /// otherwise a missing node means the walk is exhausted.
+    /// Advance one component eviction step. Progress without a leaf can be
+    /// an internal tombstone or a Mamba backup request awaiting its finish;
+    /// no progress means the walk is exhausted.
     fn evict_device_next_node(
         &self,
         py: Python<'_>,
@@ -1331,10 +1332,33 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let baseline = tracker_from_py(tracker)?;
         let (node_id, result) =
             py.allow_threads(move || self.core().evict_device_next_node(ct, &baseline));
-        let made_progress = node_id.is_some() || !result.tracker.is_empty();
+        let made_progress = node_id.is_some()
+            || result.mamba_backup_node_id.is_some()
+            || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
+            mamba_backup_node_id: result.mamba_backup_node_id,
             made_progress,
+            unbacked_tokens: result.unbacked_tokens,
+            tracker: tracker_to_py(result.tracker),
+            new_device_frees: frees_to_py(py, result.device_frees)?,
+            new_host_frees: frees_to_py(py, result.host_frees)?,
+        })
+    }
+
+    /// Resume a pending internal Mamba tombstone after the host backup attempt.
+    fn finish_mamba_state_eviction(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+        let result = py.allow_threads(move || self.core().finish_mamba_state_eviction(node_id));
+        Ok(EvictDeviceNextNodeResultBinding {
+            node_id: None,
+            mamba_backup_node_id: None,
+            // Consuming the pending request advances the finite walk even
+            // when intervening I/O pinned or removed this particular node.
+            made_progress: true,
             unbacked_tokens: result.unbacked_tokens,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -2710,6 +2734,15 @@ macro_rules! tree_core_binding {
             ) -> PyResult<EvictDeviceNextNodeResultBinding> {
                 self.inner
                     .evict_device_next_node(py, component_type, tracker)
+            }
+
+            /// Finish an internal Mamba eviction after its host backup attempt.
+            fn finish_mamba_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                self.inner.finish_mamba_state_eviction(py, node_id)
             }
 
             /// Evict one device leaf; an unbacked write-back leaf returns its backup

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tch::Tensor;
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, MAMBA};
+use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -350,6 +350,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.component_state(MAMBA).is_evict_device_ongoing,
             "Mamba device eviction not started"
         );
+        assert!(
+            tree_core
+                .component_state(MAMBA)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal Mamba eviction before advancing"
+        );
         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -376,13 +383,30 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .device_lru_list(MAMBA)
                 .get_prev_no_lock(x, &tree_core.arena);
             // A load-back pin means an in-flight DMA targets this node's slices.
-            if tree_core.arena.node(x).is_load_back_pending() {
+            if tree_core.arena.node(x).is_load_back_pending()
+                || tree_core.arena.node(x).write_through_pending_id.is_some()
+            {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(x) {
                 break Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
+            let node = tree_core.arena.node(x);
+            if tree_core.enable_hicache
+                && tree_core.is_write_back
+                && !node.has_host_value(MAMBA)
+                && !node.backuped()
+                && node.has_device_value(FULL)
+            {
+                // Keep the state live until the controller finishes D->H I/O.
+                // Native code never calls Python while holding the tree lock.
+                let node_id = node.id;
+                tree_core
+                    .component_state_mut(MAMBA)
+                    .evict_device_pending_node = Some(node_id);
+                break None;
+            }
+            // Other policies and already-backed states need no I/O.
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,

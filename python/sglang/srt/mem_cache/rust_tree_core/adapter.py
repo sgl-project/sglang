@@ -505,15 +505,25 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
             unbacked_tokens=binding_result.unbacked_tokens,
+            mamba_backup_node_id=binding_result.mamba_backup_node_id,
+        )
+        return _fill_evict_result(binding_result, result)
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        binding_result = self._binding.finish_mamba_state_eviction(node_id)
+        result = EvictDeviceNextNodeResult(
+            node_id=binding_result.node_id,
+            made_progress=binding_result.made_progress,
+            unbacked_tokens=binding_result.unbacked_tokens,
         )
         return _fill_evict_result(binding_result, result)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
-        # The binding reads is_write_back from the core's construction config.
+        # The binding reads is_write_back from the core's current config.
         assert is_write_back == self.is_write_back, (
-            "is_write_back must match the core's construction config"
+            "is_write_back must match the core's current config"
         )
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv

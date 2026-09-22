@@ -2202,6 +2202,148 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     core.sanity_check([], [])
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "backup", ["success", "host_pressure", "failed", "raised", "ack_raised"]
+)
+def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
+    from collections import defaultdict
+
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    # Real components, tree, backup planner/commit and controller eviction. Only
+    # allocation and DMA completion are simulated so this also runs on CPU.
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.enable_session_radix_cache = False
+    cache.token_to_kv_pool_allocator = None
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=Mock(spec=HybridReqToTokenPool),
+        token_to_kv_pool_allocator=None,
+        page_size=1,
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
+    with get_context().override_server_args(
+        _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+    ):
+        cache.components = {
+            ComponentType.FULL: FullComponent(cache, params),
+            ComponentType.MAMBA: MambaComponent(cache, params),
+        }
+        core = (
+            RustUnifiedTreeCore(params)
+            if backend == "rust"
+            else UnifiedTreeCore(params, cache.components)
+        )
+    cache.tree_core = core
+    for component in cache.components.values():
+        component.tree_core = core
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    cache.host_memory_mode = "cache"
+    cache.buffer_pipeline = None
+    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache.ongoing_write_through = {}
+    cache._build_backup_sidecar = Mock(return_value=[])
+    host_pool = Mock()
+    host_pool.available_size.return_value = 0 if backup == "host_pressure" else 1
+    cache.components[ComponentType.MAMBA]._mamba_pool_host = host_pool
+    cache.host_pool_group = Mock()
+    cache.host_pool_group.get_pool.return_value = host_pool
+    _mamba_insert(core, [1], [10], 7)
+    node = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+    _mamba_insert(core, [1, 2], [10, 11], 8)
+    events = []
+
+    def assert_state_resident():
+        assert core.get_component_device_value(node, ComponentType.MAMBA).tolist() == [
+            7
+        ]
+        assert core.get_component_device_value(node, ComponentType.FULL).tolist() == [
+            10
+        ]
+
+    def evict_host(count, component):
+        assert (count, component) == (1, ComponentType.MAMBA)
+        assert_state_resident()
+        events.append("host_evict")
+        host_pool.available_size.return_value = 1
+        return 1
+
+    def write(node_id, values, transfers, sidecars):
+        assert node_id == node and values.tolist() == [10] and sidecars == []
+        assert_state_resident()
+        events.append("write")
+        if backup == "raised":
+            raise RuntimeError("DMA submission failed")
+        if backup == "failed":
+            return None
+        (state,) = transfers[ComponentType.MAMBA]
+        assert state.device_indices.tolist() == [7]
+        state.host_indices = torch.tensor([70], dtype=torch.int64)
+        return torch.tensor([100], dtype=torch.int64)
+
+    def acknowledge(write_back):
+        assert write_back
+        assert_state_resident()
+        assert node in cache.ongoing_write_through
+        events.append("ack")
+        if backup == "ack_raised":
+            raise RuntimeError("DMA completion failed")
+        core.finish_write_through([node], ack_id=node)
+        cache.ongoing_write_through.clear()
+
+    def free_values(device_frees, host_frees):
+        assert not host_frees
+        assert [t.tolist() for t in device_frees.pop(ComponentType.MAMBA)] == [[7]]
+        assert not device_frees
+        events.append("free")
+
+    cache.evict_host = evict_host
+    cache._execute_kv_backup = write
+    cache.writing_check = acknowledge
+    cache._free_values = free_values
+    tracker = defaultdict(int)
+    core.evict_device_start(ComponentType.MAMBA, 1)
+    try:
+        if backup in ("raised", "ack_raised"):
+            with pytest.raises(RuntimeError, match="DMA .* failed"):
+                cache._evict_device_next_node(ComponentType.MAMBA, tracker)
+            assert events == (["write"] if backup == "raised" else ["write", "ack"])
+            assert not tracker[ComponentType.MAMBA]
+            assert_state_resident()
+            return
+        assert cache._evict_device_next_node(ComponentType.MAMBA, tracker) == (
+            None,
+            True,
+        )
+    finally:
+        core.evict_device_end(ComponentType.MAMBA)
+    assert tracker[ComponentType.MAMBA] == 1 and tracker[ComponentType.FULL] == 0
+    assert core.get_component_device_value(node, ComponentType.FULL).tolist() == [10]
+    assert core.get_component_device_value(node, ComponentType.MAMBA) is None
+    if backup == "failed":
+        assert events == ["write", "free"]
+        assert not core.component_has_host_value_only(node, ComponentType.MAMBA)
+    else:
+        expected = ["write", "ack", "free"]
+        assert events == (
+            ["host_evict"] + expected if backup == "host_pressure" else expected
+        )
+        matched = core.match_prefix(MatchPrefixParams(key=_key([1])))
+        assert matched.best_match_node == node and matched.mamba_host_hit_length == 1
+        (state,) = core.build_hicache_transfers(
+            ComponentType.MAMBA, node, CacheTransferPhase.LOAD_BACK
+        )
+        assert state.host_indices.tolist() == [70] and state.nodes_to_load == [node]
+    core.sanity_check([], [])
+
+
 def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     from collections import defaultdict
 

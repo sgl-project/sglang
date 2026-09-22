@@ -6174,10 +6174,6 @@ class UnifiedRadixCacheSuite:
             self.skipTest("requires Mamba component")
         if self.cfg.has_swa:
             self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
-        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
-        # its eviction walk still tombstones the state without a host backup.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node state demote is Python-core only")
         cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
             "write_back"
         )

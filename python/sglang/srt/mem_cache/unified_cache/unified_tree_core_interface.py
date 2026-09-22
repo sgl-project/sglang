@@ -45,12 +45,14 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` pauses an internal
+    state eviction until the Controller finishes its best-effort host backup.
     """
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -318,6 +320,13 @@ class UnifiedTreeCoreInterface(ABC):
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
         ...
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume a requested internal-state eviction after backup completion.
+
+        Cores that back up inline never return ``mamba_backup_node_id``.
+        """
+        raise NotImplementedError("this tree core does not defer Mamba state eviction")
 
     @abstractmethod
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:

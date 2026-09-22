@@ -883,6 +883,206 @@ fn device_walk_skips_locked_nodes() {
     tc.evict_device_end(MAMBA);
 }
 
+fn internal_write_back_fixture() -> (UnifiedTreeCore<Vec<i64>>, NodeId, NodeId) {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    tc.is_write_back = true;
+    tc.insert(&insert_params_mamba(&vec![1], &[10], Some(7)));
+    tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(8)));
+    let parent = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+    (tc, parent, leaf)
+}
+
+fn request_internal_mamba_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, parent: NodeId) {
+    tc.evict_device_start(MAMBA, 2);
+    let (leaf, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    assert_eq!(leaf, None);
+    assert_eq!(step.mamba_backup_node_id, Some(parent));
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    let node = tc.arena.node(tc.arena.resolve(parent).unwrap());
+    assert!(node.device_value(FULL).equal(&Tensor::from_slice(&[10i64])));
+    assert!(node.device_value(MAMBA).equal(&Tensor::from_slice(&[7i64])));
+    assert_eq!(tc.mamba_evictable_size(), 2);
+}
+
+fn commit_internal_mamba_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, parent: NodeId) {
+    let (full, mut transfers) = tc.build_backup_spec(parent).unwrap();
+    assert!(full.equal(&Tensor::from_slice(&[10i64])));
+    transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[70i64]));
+    tc.commit_backup(parent, Tensor::from_slice(&[100i64]), transfers)
+        .unwrap();
+}
+
+#[test]
+fn internal_write_back_defers_mamba_free_until_backup_then_keeps_full_and_host_state() {
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    commit_internal_mamba_backup(&mut tc, parent);
+    let step = tc.finish_mamba_state_eviction(parent);
+    assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+    assert_eq!(step.device_frees.len(), 1);
+    assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[7i64])));
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    let node = tc.arena.node(tc.arena.resolve(parent).unwrap());
+    assert!(node.device_value(FULL).equal(&Tensor::from_slice(&[10i64])));
+    assert!(node.host_value(FULL).equal(&Tensor::from_slice(&[100i64])));
+    assert!(node.host_value(MAMBA).equal(&Tensor::from_slice(&[70i64])));
+    assert!(!node.has_device_value(MAMBA));
+    let matched = tc.match_prefix(&match_params(&vec![1]));
+    assert_eq!(matched.best_match_node_id, parent);
+    assert_eq!(matched.mamba_host_hit_length, 1);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::from([(MAMBA, 1)]));
+    assert_eq!(next, Some(leaf));
+    assert!(step.mamba_backup_node_id.is_none());
+    tc.evict_device_end(MAMBA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_write_back_failed_backup_drops_only_mamba_and_advances() {
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    let step = tc.finish_mamba_state_eviction(parent);
+    assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+    assert_eq!(step.device_frees.len(), 1);
+    let node = tc.arena.node(tc.arena.resolve(parent).unwrap());
+    assert!(node.has_device_value(FULL));
+    assert!(!node.has_device_value(MAMBA));
+    assert!(!node.has_host_value(MAMBA));
+    let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::from([(MAMBA, 1)]));
+    assert_eq!(next, Some(leaf));
+    tc.evict_device_end(MAMBA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_mamba_backup_is_limited_to_unbacked_hicache_write_back() {
+    for mode in ["write_through", "no_hicache", "already_backed"] {
+        let (mut tc, parent, _) = internal_write_back_fixture();
+        match mode {
+            "write_through" => tc.is_write_back = false,
+            "no_hicache" => tc.enable_hicache = false,
+            "already_backed" => commit_internal_mamba_backup(&mut tc, parent),
+            _ => unreachable!(),
+        }
+        tc.evict_device_start(MAMBA, 1);
+        let (leaf, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(leaf, None);
+        assert_eq!(step.mamba_backup_node_id, None);
+        assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+        let node = tc.arena.node(tc.arena.resolve(parent).unwrap());
+        assert!(node.has_device_value(FULL));
+        assert!(!node.has_device_value(MAMBA));
+        tc.evict_device_end(MAMBA);
+    }
+}
+
+#[test]
+fn internal_mamba_resume_preserves_a_new_lock_or_inflight_transfer() {
+    for guard in ["lock", "load_back", "backup"] {
+        let (mut tc, parent, leaf) = internal_write_back_fixture();
+        request_internal_mamba_backup(&mut tc, parent);
+        let idx = tc.arena.resolve(parent).unwrap();
+        match guard {
+            "lock" => {
+                mamba_component().acquire_component_lock(
+                    &mut tc,
+                    idx,
+                    IncLockRefResult::default(),
+                    false,
+                );
+            }
+            "load_back" => tc.arena.node_mut(idx).load_back_pending_id = Some(parent),
+            "backup" => tc.arena.node_mut(idx).write_through_pending_id = Some(1),
+            _ => unreachable!(),
+        }
+        let step = tc.finish_mamba_state_eviction(parent);
+        assert!(step.tracker.is_empty());
+        assert!(step.device_frees.is_empty());
+        assert!(tc.arena.has_device_value(idx, MAMBA));
+        assert!(tc.arena.has_device_value(idx, FULL));
+        let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+        assert_eq!(next, Some(leaf));
+        tc.evict_device_end(MAMBA);
+    }
+}
+
+#[test]
+fn internal_mamba_abandonment_and_repeated_calls_never_free_twice() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.evict_device_next_node(MAMBA, &HashMap::new());
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.finish_mamba_state_eviction(leaf);
+        }))
+        .is_err()
+    );
+    tc.evict_device_end(MAMBA);
+    assert!(
+        tc.arena
+            .has_device_value(tc.arena.resolve(parent).unwrap(), MAMBA)
+    );
+    request_internal_mamba_backup(&mut tc, parent);
+    assert_eq!(tc.finish_mamba_state_eviction(parent).tracker[&MAMBA], 1);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.finish_mamba_state_eviction(parent);
+        }))
+        .is_err()
+    );
+    tc.evict_device_end(MAMBA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_mamba_resume_reselects_a_node_that_became_a_leaf() {
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    tc.evict_device_leaf(leaf, false).unwrap();
+    let step = tc.finish_mamba_state_eviction(parent);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    assert_eq!(next, Some(parent));
+    assert!(
+        tc.arena
+            .has_device_value(tc.arena.resolve(parent).unwrap(), FULL)
+    );
+    tc.evict_device_end(MAMBA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_mamba_resume_ignores_a_removed_node_and_repairs_the_cursor() {
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    tc.evict_device_leaf(leaf, false).unwrap();
+    tc.evict_device_leaf(parent, false).unwrap();
+    let step = tc.finish_mamba_state_eviction(parent);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    assert_eq!(next, None);
+    assert!(step.tracker.is_empty());
+    tc.evict_device_end(MAMBA);
+    tc.sanity_check(&[], &[]);
+}
+
 #[test]
 #[should_panic(expected = "Mamba device eviction not started")]
 fn device_walk_requires_a_start() {
