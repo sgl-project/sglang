@@ -469,6 +469,11 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
+        self._front_head = None
+        self._front_down_fp8_w = None
+        self._front_down_fp8_s = None
+        self._front_down_fp8_n = 0
+        self._front_down_fp8_min_tokens = 0
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
@@ -1363,14 +1368,32 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        front_down_fp8 = None
+        if _is_hip and self._front_down_fp8_w is not None:
+            from sglang.srt.models.kimi_k3_rocm_quant import (
+                k3_run_front_down_fp8,
+                k3_use_front_down_fp8,
+            )
+
+            if k3_use_front_down_fp8(self, num_tokens):
+                front_down_fp8 = k3_run_front_down_fp8(self, hidden_states)
+        if front_down_fp8 is not None:
+            head = _k3_bf16_gemm(
+                hidden_states,
+                self._front_head,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits = torch.split(head, self._front_sizes[:2], dim=-1)
+            routed_input = front_down_fp8
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -3664,6 +3687,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                if _is_hip:
+                    from sglang.srt.models.kimi_k3_rocm_quant import (
+                        k3_prepare_front_down_fp8,
+                    )
+
+                    k3_prepare_front_down_fp8(layer.mlp)
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.
