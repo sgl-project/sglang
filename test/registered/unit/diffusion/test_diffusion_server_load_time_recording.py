@@ -26,7 +26,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
 SERVER_LOAD_TIME_MS = 44977.73
 
 # both trees that can subclass DiffusionServerBase
@@ -53,6 +52,17 @@ OVERRIDING_TESTS = (
         "XPU_FLUX2_CASES",
     ),
 )
+
+
+def _repo_root() -> Path:
+    """Anchor on the trees themselves so relocating this file stays correct."""
+    for parent in Path(__file__).resolve().parents:
+        if all((parent / root).is_dir() for root in SEARCH_ROOTS):
+            return parent
+    raise RuntimeError(f"no ancestor of {__file__} contains {SEARCH_ROOTS}")
+
+
+REPO_ROOT = _repo_root()
 
 
 def _load_module(relative_path: str):
