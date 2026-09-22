@@ -199,11 +199,10 @@ impl Runnable for TokenizerWorker {
             // The tokenizer pool only ever receives generate requests. Encode,
             // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating,
             // or → Encoding for a multimodal prompt; the state's `then` says which).
-            let event = {
-                let RequestKind::Generate(g) = &mut req.kind else {
-                    tracing::error!("tokenizer pool received a non-generate request");
-                    continue;
-                };
+            // A request is never dropped here: a kind this pool cannot serve
+            // goes back as `Failed`, so intake rejects it and releases its
+            // tracking entry instead of leaving the client hung.
+            let event = if let RequestKind::Generate(g) = &mut req.kind {
                 // Size the scheduler's stop-match window in TOKENS, as Python's
                 // `normalize(tokenizer)` does.
                 let stop_tokens = g
@@ -229,6 +228,11 @@ impl Runnable for TokenizerWorker {
                     }
                     Err(err) => Event::Error(err),
                 }
+            } else {
+                tracing::error!(rid = %req.rid, "tokenizer pool received a non-generate request");
+                Event::Error(Error::Internal(
+                    "non-generate request in the tokenizer pool".into(),
+                ))
             };
             let _ = req.state.apply(event);
             if self.tm.send(TmEvent::Tokenized(req)).is_err() {
@@ -304,6 +308,40 @@ mod tests {
         assert_eq!(
             g.sampling_params.stop_str_max_len, 3,
             "must be the max TOKEN count (3), not the byte count (8)"
+        );
+    }
+
+    /// A kind the pool cannot serve is returned `Failed`, never dropped:
+    /// intake still holds its sink registration and pool-tracking entry.
+    #[test]
+    fn non_generate_request_is_returned_failed_not_dropped() {
+        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let (sink_tx, _sink_rx) = mpsc::channel(4);
+        req_tx
+            .send(Request {
+                rid: "2".into(),
+                state: RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
+                sink: ResponseSink::Local(sink_tx),
+                kind: RequestKind::Detokenize {
+                    token_ids: vec![1, 2],
+                },
+            })
+            .expect("send");
+        drop(req_tx);
+
+        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+
+        let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned, not dropped") else {
+            panic!("expected Tokenized");
+        };
+        assert_eq!(req.rid.as_str(), "2");
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Internal(_))),
+            "{:?}",
+            req.state
         );
     }
 

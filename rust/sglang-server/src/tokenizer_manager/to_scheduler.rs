@@ -1,6 +1,9 @@
 //! TokenizerManager — to_scheduler side.
 
+use std::collections::HashMap;
+
 use crate::message::detok::DetokMsg;
+use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
@@ -32,6 +35,8 @@ pub struct Intake {
     to_scheduler_tx: ToSchedulerTx,
     limits: Limits,
     mm: MmDispatch,
+    /// Track request states when intake does not hold it.
+    request_states: HashMap<Rid, RequestState>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -52,6 +57,7 @@ impl Intake {
             to_scheduler_tx,
             limits,
             mm,
+            request_states: HashMap::new(),
             shutdown,
         }
     }
@@ -123,11 +129,24 @@ impl Intake {
     /// Each arm acts and advances the FSM; the loop re-dispatches. The arms
     /// are the design table's states, `Failed` the single reject path.
     fn drive(&mut self, mut req: Request) {
+        // A pool return whose client left while it was out: the sink is already
+        // deregistered and the scheduler never saw the rid, so nothing is
+        // pushed or failed. Dropping the request releases any shm it carries.
+        if matches!(
+            self.request_states.remove(&req.rid),
+            Some(RequestState::Aborted)
+        ) {
+            tracing::debug!(rid = %req.rid, "dropping request aborted");
+            return;
+        }
         // Flipped once `register_detok` succeeds; `fail` must not deregister before
         // that (see `fail`). A pool return re-enters `drive` already registered.
         let mut registered = !matches!(req.state, RequestState::Received);
         loop {
-            match req.state.clone() {
+            // One clone per pass: the hand-off arms store it as the state the
+            // request leaves in.
+            let state = req.state.clone();
+            match state {
                 // Validate, then register the sink before the request leaves Rust.
                 // Failures move to `Failed` and fall through to the reject arm.
                 RequestState::Received => {
@@ -205,23 +224,27 @@ impl Intake {
                 }
                 // Hand off to the MM worker pool, which returns the request as
                 // an `Encoded` event (PreSendValidating with the expanded ids and
-                // feature buffers set — or Failed on error). Doesn't loop. Like
-                // the tokenizer hop, the request is out of reach while there: an
-                // abort in that window deregisters and tells the scheduler, and
-                // the request is still pushed when it returns (wasted work, not
-                // misdelivery — the chunks land on a deregistered rid).
+                // feature buffers set — or Failed on error). Doesn't loop. The
+                // request is out of reach while there; an abort in that window
+                // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
+                    let rid = req.rid.clone();
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
-                    if let Err(e) = self.mm.tx.try_send(req) {
-                        let (err, mut req) = match e {
-                            flume::TrySendError::Full(req) => (Error::QueueFull, req),
-                            flume::TrySendError::Disconnected(req) => {
-                                (Error::Internal("mm worker pool gone".into()), req)
-                            }
-                        };
-                        self.fail(&mut req, err, registered);
+                    match self.mm.tx.try_send(req) {
+                        Ok(()) => {
+                            self.request_states.insert(rid, state);
+                        }
+                        Err(e) => {
+                            let (err, mut req) = match e {
+                                flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                                flume::TrySendError::Disconnected(req) => {
+                                    (Error::Internal("mm worker pool gone".into()), req)
+                                }
+                            };
+                            self.fail(&mut req, err, registered);
+                        }
                     }
                     return;
                 }
@@ -238,15 +261,21 @@ impl Intake {
                         let _ = req.state.apply(Event::TokenizeDone);
                         continue;
                     }
-                    if let Err(err) = self.senders.tokenizer_tx.send(req) {
-                        // Pool gone (workers exited); flume hands the request back.
-                        let mut req = err.into_inner();
-                        // Past `Received`, so registration happened.
-                        self.fail(
-                            &mut req,
-                            Error::Internal("tokenizer pool gone".into()),
-                            true,
-                        );
+                    let rid = req.rid.clone();
+                    match self.senders.tokenizer_tx.send(req) {
+                        Ok(()) => {
+                            self.request_states.insert(rid, state);
+                        }
+                        Err(err) => {
+                            // Pool gone (workers exited); flume hands the request back.
+                            let mut req = err.into_inner();
+                            // Past `Received`, so registration happened.
+                            self.fail(
+                                &mut req,
+                                Error::Internal("tokenizer pool gone".into()),
+                                true,
+                            );
+                        }
                     }
                     return;
                 }
@@ -382,15 +411,21 @@ impl Intake {
     /// chunks arrive for a rid no longer in the detok table, where they are dropped.
     /// That wastes GPU work until the request finishes on its own, but it cannot be
     /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it. The same
-    /// holds for a request that is out in a pool when the abort lands: it is
-    /// pushed on return and finishes on its own.
+    /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    ///
+    /// A request out in a pool never reached the scheduler, so there is nothing to
+    /// abort there yet: it is marked `Aborted` and dropped when it returns.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
         let _ = self
             .senders
             .detok_for(&rid)
             .send(DetokMsg::Deregister { rid: rid.clone() });
+        if let Some(state) = self.request_states.get_mut(&rid) {
+            *state = RequestState::Aborted;
+            tracing::debug!(rid = %rid, "abort recorded for request");
+            return;
+        }
 
         // The channel is BOUNDED and drops pushes under exactly the load this matters
         // for, so report the miss rather than assuming the scheduler was told.

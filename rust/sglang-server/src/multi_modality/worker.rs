@@ -280,11 +280,10 @@ impl Runnable for MmWorker {
     /// 400), and return the request as `Encoded`.
     fn run(self) {
         while let Ok(mut req) = self.mm_rx.recv() {
-            let event = {
-                let RequestKind::Generate(g) = &mut req.kind else {
-                    tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
-                    continue;
-                };
+            // A request is never dropped here: a kind this pool cannot serve
+            // goes back as `Failed`, so intake rejects it and releases its
+            // tracking entry instead of leaving the client hung.
+            let event = if let RequestKind::Generate(g) = &mut req.kind {
                 // Move the processor's inputs out: the unexpanded ids (always
                 // present by `Encoding`; the expanded ids replace them) and the
                 // media, so the processor owns the bytes without a copy. `text`
@@ -303,6 +302,11 @@ impl Runnable for MmWorker {
                         Event::Error(Error::Encode(message))
                     }
                 }
+            } else {
+                tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
+                Event::Error(Error::Internal(
+                    "non-generate request in the mm pool".into(),
+                ))
             };
             let _ = req.state.apply(event);
             if self.tm_tx.send(TmEvent::Encoded(req)).is_err() {
@@ -620,6 +624,46 @@ mod tests {
         };
         assert!(
             matches!(req.state, RequestState::Failed(Error::Encode(_))),
+            "{:?}",
+            req.state
+        );
+    }
+
+    /// A kind the pool cannot serve is returned `Failed`, never dropped:
+    /// intake still holds its sink registration and pool-tracking entry.
+    #[test]
+    fn non_generate_request_is_returned_failed_not_dropped() {
+        use crate::message::response::ResponseSink;
+        use crate::utils::fsm::RequestState;
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        ));
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(4);
+        mm_tx
+            .send(Request {
+                rid: "detok".to_string().into(),
+                state: RequestState::Encoding,
+                sink: ResponseSink::Local(sink_tx),
+                kind: RequestKind::Detokenize {
+                    token_ids: vec![1, 2],
+                },
+            })
+            .unwrap();
+        drop(mm_tx);
+        MmWorker::new(mm_rx, tm_tx, ctx).run();
+
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned, not dropped") else {
+            panic!("expected Encoded");
+        };
+        assert_eq!(req.rid.as_str(), "detok");
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Internal(_))),
             "{:?}",
             req.state
         );

@@ -875,15 +875,18 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
     req.state.apply(Event::EncodeDone).unwrap();
 }
 
-/// An abort while the request is out in the mm pool cannot cancel it — the
-/// same window the tokenizer pool has. The abort still deregisters the sink and
-/// tells the scheduler; the returning request is pushed (with its buffers, so
-/// Python unlinks any shm), generates on its own, and its chunks land on a
-/// deregistered rid. Wasted work, never misdelivery.
+/// An abort while the request is out in the mm pool cancels it: the sink is
+/// deregistered at once, no AbortReq is sent (the scheduler never saw the
+/// rid), and the returning request is dropped instead of pushed — releasing
+/// the shm its buffers carry — so no GPU time or KV memory goes to a client
+/// that left.
 #[test]
-fn abort_while_in_mm_pool_pushes_on_return() {
+fn abort_while_in_mm_pool_drops_on_return() {
     let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
-    intake.drive(mm_pretokenized_req("mm-gone"));
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-gone");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
 
@@ -891,10 +894,12 @@ fn abort_while_in_mm_pool_pushes_on_return() {
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "mm-gone")
     );
-    assert_eq!(consumer.drain(16).len(), 1, "only the AbortReq");
+    assert!(
+        consumer.drain(16).is_empty(),
+        "no AbortReq: the scheduler never saw this request"
+    );
 
-    // The worker's result carries a shm segment, as it would under TP; it
-    // rides the ring with the request rather than being dropped here.
+    // The worker's result carries a shm segment, as it would under TP.
     let segment = unique_name("test");
     let buffers = vec![
         Buffer::shm(
@@ -907,16 +912,56 @@ fn abort_while_in_mm_pool_pushes_on_return() {
     ];
     encode_like_worker(&mut req, vec![5, 6], buffers);
     intake.drive(req);
-    let batch = consumer.drain(16);
-    assert_eq!(batch.len(), 1, "pushed on return");
-    assert!(
-        shm_path(&segment).exists(),
-        "segment travels with the request"
-    );
-    drop(batch);
+    assert!(consumer.drain(16).is_empty(), "cancelled: never submitted");
     assert!(
         !shm_path(&segment).exists(),
-        "released with the pushed request"
+        "dropped result released its shm"
+    );
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+    assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+}
+
+/// The same for the tokenizer stage: an abort while the request is in the
+/// tokenizer pool drops it on return, before any scheduler submission.
+#[test]
+fn abort_while_in_tokenizer_pool_drops_on_return() {
+    let (mut intake, tok_rx, _mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(true);
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = generate_req(77, SamplingParams::default());
+    req.sink = ResponseSink::Local(tx);
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = None;
+        g.text = Some("hi".into());
+    }
+    intake.drive(req);
+    let mut req = tok_rx.try_recv().expect("sent to the tokenizer pool");
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+
+    intake.on_abort(AbortSource::Guard("77".to_string().into()));
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+    assert!(
+        consumer.drain(16).is_empty(),
+        "no AbortReq for an unsubmitted rid"
+    );
+
+    // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = Some(vec![7, 1, 8]);
+    }
+    req.state.apply(Event::TokenizeDone).unwrap();
+    intake.drive(req);
+    assert!(consumer.drain(16).is_empty(), "cancelled: never submitted");
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+
+    // The entry left with the return: a later request is unaffected.
+    intake.drive(generate_req(78, SamplingParams::default()));
+    assert_eq!(
+        consumer.drain(16).len(),
+        1,
+        "an uncancelled request still queues"
     );
 }
 
