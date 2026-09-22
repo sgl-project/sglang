@@ -1518,7 +1518,6 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        # Keep captured broadcasts on the current stream, as with other collectives.
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             self.pynccl_comm.broadcast(input_, src=src)
         else:
