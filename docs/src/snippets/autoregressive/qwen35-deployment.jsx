@@ -386,6 +386,11 @@ export const Qwen35Deployment = () => {
     const memFraction = hwConfig.mem;
     const isMultinode = !!hwConfig.multinode;
     const nnodes = hwConfig.nnodes || 1;
+    const gbHw = hardware === 'gb200' || hardware === 'gb300';
+    // GB200/GB300 FP8 MTP is tuned to a longer draft window (validated on GB300);
+    // every other hardware keeps the shared default.
+    const specNumSteps = (gbHw && quantization === 'fp8') ? 6 : 3;
+    const specDraftTokens = (gbHw && quantization === 'fp8') ? 7 : 4;
 
     // Initialize the base command
     let cmd = `sglang serve --model-path ${modelName}`;
@@ -428,7 +433,7 @@ export const Qwen35Deployment = () => {
     const commandRules = {
       reasoning: (value) => value === 'enabled' ? '--reasoning-parser qwen3' : null,
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
-      speculative: (value) => value === 'enabled' ? '--speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
+      speculative: (value) => value === 'enabled' ? `--speculative-algorithm NEXTN \\\n  --speculative-num-steps ${specNumSteps} \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens ${specDraftTokens}` : null,
       mambaCache: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
     };
 
@@ -467,7 +472,6 @@ export const Qwen35Deployment = () => {
     // benchmark only enables this for TP>=8). AMD MI GPUs use the AITER allreduce
     // fusion flag instead, handled in the AMD backend block below.
     const amdGpu = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    const gbHw = hardware === 'gb200' || hardware === 'gb300';
     if (quantization !== 'fp4' && hardware !== 'xeon' && hardware !== 'arc_b' && !amdGpu) {
       cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
     }
@@ -509,10 +513,13 @@ export const Qwen35Deployment = () => {
       cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
     }
 
-    // GB200/GB300 (Grace-Blackwell superchip, MNNVL-connected) FP8 MoE tuning.
-    if (gbHw && quantization === 'fp8' && MOE_MODELS.has(model)) {
-      cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
-      cmd += ` \\\n  --disable-shared-experts-fusion`;
+    // GB200/GB300 (Grace-Blackwell superchip, MNNVL-connected) FP8 tuning.
+    if (gbHw && quantization === 'fp8') {
+      cmd += ` \\\n  --kv-cache-dtype fp8_e4m3`;
+      if (MOE_MODELS.has(model)) {
+        cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
+        cmd += ` \\\n  --disable-shared-experts-fusion`;
+      }
     }
 
     // Append AMD GPU-specific backend configurations.
