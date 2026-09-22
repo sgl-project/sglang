@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner as mod
@@ -86,3 +87,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     )
     torch.testing.assert_close(output.next_token_logits, torch.tensor([[0.0], [1.0]]))
     torch.testing.assert_close(output.hidden_states, torch.tensor([[0.0], [1.0]]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
