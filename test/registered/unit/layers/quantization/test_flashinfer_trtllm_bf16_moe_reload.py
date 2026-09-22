@@ -389,7 +389,10 @@ class TestRepackRunsOnFailedUpdate(CustomTestCase):
                 lambda m: repacked.append(m),
             ),
             patch.object(
-                weight_updater, "_unsupported_derived_weight_cache_error", lambda: None
+                weight_updater,
+                "_unsupported_derived_weight_cache_error",
+                autospec=True,
+                return_value=None,
             ),
             patch.object(weight_updater, "monkey_patch_torch_reductions", lambda: None),
         ):
