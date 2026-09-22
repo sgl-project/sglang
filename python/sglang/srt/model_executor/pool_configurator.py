@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -117,6 +117,11 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _draft_swa_cell_size(kvc: KVCacheConfigurator) -> int:
+    """Bytes/token of the draft KV pool at ``draft_kv_ratio`` slots per target token."""
+    return max(1, int(_dflash_draft_cell_size(kvc) * kvc.draft_kv_ratio))
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -285,12 +290,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size = _dflash_draft_cell_size(kvc) or None
+                if draft_cell_size is not None and kvc.draft_kv_ratio < 1:
+                    draft_cell_size = _draft_swa_cell_size(kvc)
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    draft_cell_size_per_token=draft_cell_size,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -947,6 +955,93 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         )
 
 
+class DFlashDraftSWAPoolConfigurator(DefaultPoolConfigurator):
+    """Sizes the draft KV pool at ``draft_kv_ratio`` slots per target token."""
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        super().__init__(kvc)
+        self._draft_kv_ratio = kvc.draft_kv_ratio
+        self._page_size = kvc.page_size
+        self._window = get_spec().speculative_draft_window_size
+        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        if self._draft_cell_size <= 0:
+            # The layer-count fallback prices the draft at one slot per target token.
+            raise ValueError(
+                "--speculative-draft-kv-ratio below 1 needs the "
+                "DFLASH draft's KV bytes/token, which could not be resolved "
+                "from the draft config (see the earlier warning)."
+            )
+        self._target_cell_size = self._cell_size - _draft_swa_cell_size(kvc)
+        self._draft_cap = compute_swa_request_cap(
+            page_size=kvc.page_size,
+            window=self._window,
+            attn_dp_size=kvc.attn_dp_size,
+        )
+        # On a mamba target a hit resumes at the last tracked state, so a cached
+        # prefix keeps its window back from there.
+        self._cached_prefix_cost = self._window + kvc.page_size
+        if mambaish_config(kvc.model_config) is not None:
+            self._cached_prefix_cost += get_exec().mamba.mamba_track_interval
+
+    def _with_draft_pool(
+        self, config: MemoryPoolConfig, min_ratio: float
+    ) -> MemoryPoolConfig:
+        target_tokens = config.max_total_num_tokens
+        draft_tokens = (
+            int(target_tokens * self._draft_kv_ratio) // self._page_size
+        ) * self._page_size
+        if draft_tokens < self._draft_cap:
+            raise RuntimeError(
+                f"--speculative-draft-kv-ratio {self._draft_kv_ratio} gives the "
+                f"draft {draft_tokens} slots, below the {self._draft_cap} its "
+                f"running requests need. Use at least {min_ratio}, or lower "
+                f"--max-running-requests or SGLANG_SWA_EVICTION_INTERVAL."
+            )
+        logger.info(
+            f"DFLASH draft KV pool: window={self._window}, "
+            f"ratio={self._draft_kv_ratio}, tokens={draft_tokens} "
+            f"(request cap {self._draft_cap}, "
+            f"{(draft_tokens - self._draft_cap) // self._cached_prefix_cost} "
+            f"cached prefixes at max concurrency)"
+        )
+        return replace(
+            config,
+            full_max_total_num_tokens=target_tokens,
+            swa_max_total_num_tokens=draft_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        config = super().calculate_pool_sizes(available_bytes, page_size)
+        # budget = target_tokens * (target_cell + ratio * draft_cell), so the
+        # smallest ratio covering the cap is
+        # cap * target_cell / (budget - cap * draft_cell).
+        budget = config.max_total_num_tokens * self._cell_size
+        return self._with_draft_pool(
+            config,
+            ceil_div(
+                self._draft_cap * self._target_cell_size * 1000,
+                max(1, budget - self._draft_cap * self._draft_cell_size),
+            )
+            / 1000,
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        config = super().calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        # --max-total-tokens fixes the target pool, so the smallest ratio
+        # covering the cap is cap / target_tokens.
+        return self._with_draft_pool(
+            config,
+            ceil_div(self._draft_cap * 1000, max(1, config.max_total_num_tokens))
+            / 1000,
+        )
+
+
 # Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
@@ -1549,5 +1644,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if kvc.draft_kv_ratio < 1:
+        return DFlashDraftSWAPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

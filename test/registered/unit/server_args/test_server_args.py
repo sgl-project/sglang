@@ -1030,6 +1030,24 @@ class TestKV4Compatibility(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, algorithm):
                     handle_kv4_compatibility(args)
 
+    def test_draft_kv_ratio_range(self):
+        """The draft pool is indexed by target slot, so a ratio above 1 would
+        hold slots the target cannot address."""
+        from sglang.srt.arg_groups.speculative_hook import _handle_dflash
+
+        for ratio in (0, -0.5, 1.5):
+            with self.subTest(ratio=ratio):
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="cuda",
+                    speculative_algorithm="DFLASH",
+                    speculative_draft_model_path="dummy-draft",
+                    speculative_num_draft_tokens=8,
+                    speculative_draft_kv_ratio=ratio,
+                )
+                with self.assertRaisesRegex(ValueError, r"must be in \(0, 1\]"):
+                    _handle_dflash(args)
+
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_sm120_xqa_keeps_existing_speculative_support(self):
         args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
