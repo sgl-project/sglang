@@ -595,6 +595,12 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                if self.enable_unified_memory:
+                    # Keep device rows stable until host transfers are acknowledged.
+                    # Queue reads and relocation both run on the scheduler thread.
+                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
+                        lambda c=cache_controller: not c.has_inflight_device_transfers()
+                    )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
