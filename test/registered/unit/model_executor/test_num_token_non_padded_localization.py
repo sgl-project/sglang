@@ -10,16 +10,11 @@ identical whether the MoE runs TP or EP -- it is an attention-side quantity both
 backends consume. This table locks the exact per-rank counts and that the GPU
 tensor and host-int twin agree, so a change to the sharding math fails loudly.
 
-``ForwardBatch.moe_num_token_non_padded()`` decides whether that LOCAL count may
-bound a sparse MoE's input at all: it may only while the input is this rank's
-own shard, which the layer communicator's scatter mode for a sparse MLP states.
-SCATTERED hands the MoE the local shard; FULL and MOE_FULL hand it a buffer
-gathered from every source rank's padded slot, where the real rows are not a
-prefix and the dispatcher masks the padding instead. Masking a gathered buffer
-with the local count truncates every peer rank's rows -- with
-``--moe-a2a-backend none`` each rank then sums a truncated partial output, which
-collapsed gsm8k accuracy under DP attention. The second table locks that
-mode x layout x CP decision.
+``ForwardBatch.moe_num_token_non_padded()`` decides whether that count may bound
+a sparse MoE's input at all. Masking a gathered buffer with it truncates every
+peer rank's rows, which collapsed gsm8k accuracy under DP attention with
+``--moe-a2a-backend none``, where each rank sums its own partial output. The
+second table locks that scatter mode x layout x CP decision.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -120,15 +115,9 @@ def _value(batch: ForwardBatch):
 
 
 class TestMoeNumTokenNonPaddedTable(CustomTestCase):
-    # (label, mode, sharded, attn_dp_size, expected)
-    #
-    # The MoE input is the local shard only under SCATTERED, or under FULL with
-    # a single attention-DP group -- FULL all-reduces across attn-TP there
-    # instead of gathering, so a sharded forward is bounded by the GLOBAL count
-    # and a replicated one by the LOCAL count (they are equal). These are decode
-    # forwards, which is why the MOE_FULL rows follow the FULL layout: that
-    # config all-gathers over the MoE-CP group on a context-parallel extend
-    # only (the case below).
+    # (label, mode, sharded, attn_dp_size, expected). Decode forwards, so the
+    # MOE_FULL rows follow the FULL layout: that config all-gathers over the
+    # MoE-CP group on a context-parallel extend only, which is the case below.
     _TABLE = [
         ("scattered.replicated", ScatterMode.SCATTERED, False, 1, LOCAL),
         ("scattered.sharded", ScatterMode.SCATTERED, True, 1, LOCAL),
@@ -152,8 +141,8 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                 self.assertEqual(_value(_forward_batch(sharded=sharded)), expected)
 
     def test_cp_gathered_full_is_unmasked(self):
-        """DSA / MLA CP fall back to FULL but still all-gather across CP, and
-        those rows are zigzag-permuted rather than a prefix."""
+        """A CP prefill must route every row: DSA / MLA CP take the FULL mode
+        but all-gather across CP, which zigzag-permutes the real rows."""
         for sharded in (False, True):
             for dsa_cp, mla_cp in ((True, False), (False, True)):
                 with (
@@ -174,12 +163,10 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                     self.assertIsNone(_value(_forward_batch(sharded=sharded)))
 
     def test_moe_full_gathers_only_on_a_context_parallel_extend(self):
-        """MOE_FULL's all-gather over the MoE-CP group runs on a CP extend and
-        is skipped on every other forward, so only the extend loses its bound.
-
-        ``get_moe_cp_size`` reads a live process group, so this stubs that one
-        accessor rather than publishing a topology with no distributed init.
-        """
+        """A moe-cp config keeps its bound on every forward but the CP extend,
+        which is the only one that all-gathers over the MoE-CP group."""
+        # get_moe_cp_size reads a live process group, so it is stubbed rather
+        # than reached through a topology published without distributed init.
         for label, forward_mode, metadata, expected in [
             ("cp_extend", ForwardMode.EXTEND, object(), None),
             ("extend_without_cp_metadata", ForwardMode.EXTEND, None, LOCAL),
@@ -211,8 +198,7 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
 
     def test_graph_replay_without_global_count_skips_masking(self):
         """A captured batch carries the LOCAL buffer alone, so the attn-TP
-        sharded FULL case has no bound to mask with and must not use the local
-        one."""
+        sharded FULL case has no bound to mask with and must not use it."""
         with (
             get_parallel().override(attn_dp_size=1, attn_cp_size=1),
             patch.object(
@@ -222,8 +208,8 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
             self.assertIsNone(_value(_forward_batch(sharded=True, glob=None)))
 
     def test_absent_local_count_stays_absent(self):
-        """Without expert parallelism the count is never filled; routing must
-        not mask every row against it."""
+        """Without expert parallelism the count is never filled, and routing
+        must not mask every row against the unfilled buffer."""
         for mode in (ScatterMode.SCATTERED, ScatterMode.FULL, ScatterMode.MOE_FULL):
             with (
                 self.subTest(mode=mode),

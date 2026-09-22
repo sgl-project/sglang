@@ -395,11 +395,8 @@ class _LayerModeComputationContext:
 
 
 def sparse_mlp_scatter_mode() -> ScatterMode:
-    """Scatter mode a sparse (MoE) layer's MLP input arrives in.
-
-    SCATTERED means the MoE sees this rank's own token shard; FULL / MOE_FULL
-    mean it sees a buffer gathered over the attn-TP or the MoE-DP (CP) group.
-    """
+    """SCATTERED hands a sparse MLP this rank's own token shard; FULL and
+    MOE_FULL hand it a buffer gathered over the attn-TP or MoE-CP group."""
     if (
         # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
         not get_moe_a2a_backend().is_none()

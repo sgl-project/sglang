@@ -3852,9 +3852,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
-        # The MoE sees DP-gathered rows under _use_tp_moe_gather, so this rank's
-        # local count cannot mask them; ForwardBatch.moe_num_token_non_padded()
-        # drops it for every gathered buffer, so nothing is nulled here.
         with (
             get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
             gathered_rows,
