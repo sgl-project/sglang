@@ -331,10 +331,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph_key = self._make_graph_key(self.bs)
 
         hf_config = self.model_runner.model_config.hf_config
-        # Qwen4 QSA reads device tensors, not CPU attention inputs to update.
+        # Skip replay_with_input_update for the following model configurations.
         if not (
+            # Despite its name, this helper also matches supported non-DeepSeek
+            # architectures (e.g. GLM, Mistral and LongCat) with index_topk set.
             is_deepseek_dsa(hf_config)
             or is_deepseek_v4(hf_config)
+            # Qwen4 QSA reads sequence lengths from device tensors and does not
+            # require updating the CPU-side actual_seq_lengths_kv attribute.
             or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
         ):
             if forward_batch.forward_mode.is_target_verify():

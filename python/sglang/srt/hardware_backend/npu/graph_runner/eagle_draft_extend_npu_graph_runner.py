@@ -41,7 +41,9 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        # Qwen4 QSA reads device tensors, not CPU attention inputs to update.
+        # Skip replay_with_input_update for the following model configurations.
+        # See the detailed comments above the same skip condition in
+        # NPUGraphRunner.execute in npu_graph_runner.py.
         if not (
             is_deepseek_dsa(hf_config)
             or is_deepseek_v4(hf_config)
