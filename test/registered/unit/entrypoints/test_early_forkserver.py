@@ -10,8 +10,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
+import ast
 import json
 import os
+import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,8 +22,9 @@ import textwrap
 import unittest
 from unittest import mock
 
+import sglang
 from sglang.srt.entrypoints import early_forkserver
-from sglang.srt.entrypoints.early_forkserver import merge_env
+from sglang.srt.entrypoints.early_forkserver import PRELOAD, merge_env
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
@@ -146,6 +150,101 @@ class TestNvmlStandIn(CustomTestCase):
         with self.assertRaises(AttributeError) as ctx:
             props.__deepcopy__
         self.assertNotIn("NVML", str(ctx.exception))
+
+
+class TestPreloadEnvSnapshots(CustomTestCase):
+    """The forkserver imports the preload list at CLI entry, before the
+    arguments are resolved, so a module-level constant read from an env var
+    that argument resolution writes (moe_hook, a model override) freezes at
+    its pre-resolution value in every worker. The variable itself is correct
+    in the worker; only the value derived from it at import is stale."""
+
+    # compile_deep_gemm.py sets this in its own process and starts the server
+    # directly, so no forkserver has imported the reader.
+    ALLOWED = {"SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE"}
+
+    ROOT = pathlib.Path(sglang.__file__).resolve().parent
+    # Vendor variables written raw (NCCL_*, CUDA_*), and module-level reads of them.
+    RAW_WRITE = r"os\.environ(?:\[|\.setdefault\()['\"]([A-Z0-9_]+)['\"]"
+    RAW_READ = r"(?:os\.getenv|os\.environ\.get|get_bool_env_var|get_int_env_var)\(['\"]([A-Z0-9_]+)['\"]"
+
+    @classmethod
+    def _path(cls, module):
+        rel = module.split(".", 1)[1].replace(".", "/") if "." in module else ""
+        for candidate in (cls.ROOT / f"{rel}.py", cls.ROOT / rel / "__init__.py"):
+            if candidate.exists():
+                return candidate
+        return None
+
+    @classmethod
+    def _module_level(cls, body):
+        """Statements an import executes: inside if/try/with too, not inside
+        a def or class."""
+        for node in body:
+            yield node
+            if isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                inner = list(node.body) + list(getattr(node, "orelse", []))
+                inner += list(getattr(node, "finalbody", []))
+                for handler in getattr(node, "handlers", []):
+                    inner += handler.body
+                yield from cls._module_level(inner)
+
+    @classmethod
+    def _imports(cls, module, tree):
+        """sglang modules a module's import brings in, including relative ones."""
+        is_package = cls._path(module).name == "__init__.py"
+        package = module if is_package else module.rsplit(".", 1)[0]
+        for node in cls._module_level(tree.body):
+            if isinstance(node, ast.Import):
+                yield from (a.name for a in node.names if a.name.startswith("sglang"))
+            elif isinstance(node, ast.ImportFrom):
+                base = package
+                for _ in range(max(node.level - 1, 0)):
+                    base = base.rsplit(".", 1)[0]
+                if node.level and node.module:
+                    name = f"{base}.{node.module}"
+                elif node.level:
+                    name = base
+                else:
+                    name = node.module or ""
+                if name.startswith("sglang"):
+                    yield name
+                    yield from (f"{name}.{a.name}" for a in node.names)
+
+    def test_no_preloaded_module_freezes_a_variable_sglang_writes(self):
+        written = set()
+        for path in self.ROOT.rglob("*.py"):
+            if path.is_relative_to(self.ROOT / "test"):
+                continue  # fixtures write before launching a server: set at CLI entry
+            text = path.read_text(errors="ignore")
+            written |= set(re.findall(r"envs\.([A-Z0-9_]+)\.set\(", text))
+            written |= set(re.findall(self.RAW_WRITE, text))
+        written -= self.ALLOWED
+
+        frozen, seen, stack = {}, set(), list(PRELOAD)
+        while stack:
+            module = stack.pop()
+            path = self._path(module)
+            if module in seen or path is None:
+                continue
+            seen.add(module)
+            tree = ast.parse(path.read_text(errors="ignore"))
+            stack.extend(self._imports(module, tree))
+            for node in self._module_level(tree.body):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    src = ast.unparse(node)
+                    read = re.findall(r"envs\.([A-Z0-9_]+)\.get\(", src)
+                    read += re.findall(self.RAW_READ, src)
+                    for var in read:
+                        if var in written:
+                            frozen.setdefault(var, []).append(module)
+
+        self.assertEqual(
+            frozen,
+            {},
+            "these preloaded modules snapshot an env var that sglang writes "
+            "while resolving the arguments; read it where it is used instead",
+        )
 
 
 # The launcher of the end-to-end case. Runs as a script, not `-c`: forked
