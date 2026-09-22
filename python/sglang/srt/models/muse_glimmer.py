@@ -65,6 +65,15 @@ _is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+elif _is_cpu:
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
+        _fused_sigmoid_mul_cpu(x, gate)
+        return x
+
 
 logger = logging.getLogger(__name__)
 
@@ -303,12 +312,8 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.use_output_gate:
             gate, _ = self.output_gate_proj(hidden_states)
-            if _is_cuda:
+            if _is_cuda or _is_cpu:
                 attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
-            elif _is_cpu:
-                attn_out = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(
-                    attn_out, gate, inplace=True
-                )
             else:
                 attn_out = torch.sigmoid(gate) * attn_out
 
