@@ -323,6 +323,7 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
         be = AiterAttnBackend.__new__(AiterAttnBackend)
         be.use_mla_dcp_asm = True
+        be.dcp_world_size = 8
         be.input_dtype = torch.bfloat16
         be.max_split_per_batch = 64
         be.forward_metadata = mock.Mock(
@@ -381,10 +382,15 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
     def test_dcp_asm_uses_fast_persistent_metadata(self):
         be = self._make_backend()
-        self.assertTrue(be._use_mla_decode_persist_metadata(planned_dcp_size=8))
-        self.assertEqual(
-            be._mla_decode_metadata_modes(planned_dcp_size=8), (True, False)
-        )
+        self.assertTrue(be._use_mla_decode_persist_metadata())
+        self.assertEqual(be._mla_decode_metadata_modes(), (True, False))
+
+    def test_default_gluon_dcp_skips_persist_like_main(self):
+        """DCP>1 without ASM must not allocate persist metadata (main default)."""
+        be = self._make_backend()
+        be.use_mla_dcp_asm = False
+        be.dcp_world_size = 8
+        self.assertFalse(be._use_mla_decode_persist_metadata())
 
 
 if __name__ == "__main__":

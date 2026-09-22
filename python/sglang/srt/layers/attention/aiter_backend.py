@@ -588,13 +588,18 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
-    def _use_mla_decode_persist_metadata(self, planned_dcp_size: int) -> bool:
-        return (_use_mla_ps_kernel and planned_dcp_size == 1) or (
-            self.use_mla_dcp_asm and planned_dcp_size > 1
+    def _use_mla_decode_persist_metadata(self) -> bool:
+        """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
+
+        Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
+        is off. DCP ASM needs the same buffers with fast_mode scheduling.
+        """
+        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+            self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
 
-    def _mla_decode_metadata_modes(self, planned_dcp_size: int) -> tuple[bool, bool]:
-        if self.use_mla_dcp_asm and planned_dcp_size > 1:
+    def _mla_decode_metadata_modes(self) -> tuple[bool, bool]:
+        if self.use_mla_dcp_asm and self.dcp_world_size > 1:
             # Match the AITER/vLLM DCP path: persistent scheduling with the
             # gathered-head tensor folded internally to qh16.
             return True, False
@@ -1634,9 +1639,9 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata(planned_dcp_size):
+                if self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
-                        self._mla_decode_metadata_modes(planned_dcp_size)
+                        self._mla_decode_metadata_modes()
                     )
                     (
                         work_metadata,
@@ -2470,9 +2475,9 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata(planned_dcp_size):
+                if self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
-                        self._mla_decode_metadata_modes(planned_dcp_size)
+                        self._mla_decode_metadata_modes()
                     )
                     num_kv_splits = self.max_split_per_batch
 
