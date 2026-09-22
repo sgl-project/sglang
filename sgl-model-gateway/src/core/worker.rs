@@ -697,6 +697,99 @@ impl BasicWorker {
         }
     }
 
+    fn health_check_url(&self, dp_rank: Option<usize>) -> WorkerResult<String> {
+        let base_url = self.normalised_url()?;
+        let raw_url = format!("{}{}", base_url, self.metadata.health_config.endpoint);
+        let mut health_url =
+            url::Url::parse(&raw_url).map_err(|_| WorkerError::InvalidUrl { url: raw_url })?;
+
+        if let Some(dp_rank) = dp_rank {
+            health_url
+                .query_pairs_mut()
+                .append_pair("dp_rank", &dp_rank.to_string());
+        }
+
+        Ok(health_url.to_string())
+    }
+
+    async fn http_health_check_for_dp_rank(&self, dp_rank: Option<usize>) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let health_url = self.health_check_url(dp_rank)?;
+
+        let mut req = WORKER_CLIENT.get(&health_url).timeout(timeout);
+        if let Some(api_key) = &self.metadata.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        "HTTP health check returned non-success status for {}: {}",
+                        health_url,
+                        status
+                    );
+                    Ok(false)
+                }
+            }
+            Err(err) => {
+                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn check_health_async_for_dp_rank(&self, dp_rank: Option<usize>) -> WorkerResult<()> {
+        if self.metadata.health_config.disable_health_check {
+            if !self.is_healthy() {
+                self.set_healthy(true);
+            }
+            return Ok(());
+        }
+
+        let health_result = match &self.metadata.connection_mode {
+            ConnectionMode::Http => self.http_health_check_for_dp_rank(dp_rank).await?,
+            ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
+        };
+
+        let worker_type_str = self.metadata.worker_type.as_metric_label();
+
+        if health_result {
+            self.consecutive_failures.store(0, Ordering::Release);
+            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
+
+            if !self.is_healthy()
+                && successes >= self.metadata.health_config.success_threshold as usize
+            {
+                self.set_healthy(true);
+                self.consecutive_successes.store(0, Ordering::Release);
+            }
+            Ok(())
+        } else {
+            self.consecutive_successes.store(0, Ordering::Release);
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
+
+            if self.is_healthy()
+                && failures >= self.metadata.health_config.failure_threshold as usize
+            {
+                self.set_healthy(false);
+                self.consecutive_failures.store(0, Ordering::Release);
+            }
+
+            Err(WorkerError::HealthCheckFailed {
+                url: self.metadata.url.clone(),
+                reason: format!("Health check failed (consecutive failures: {})", failures),
+            })
+        }
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
@@ -731,54 +824,7 @@ impl Worker for BasicWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        if self.metadata.health_config.disable_health_check {
-            if !self.is_healthy() {
-                self.set_healthy(true);
-            }
-            return Ok(());
-        }
-
-        let health_result = match &self.metadata.connection_mode {
-            ConnectionMode::Http => self.http_health_check().await?,
-            ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
-        };
-
-        // Get worker type label for metrics
-        let worker_type_str = self.metadata.worker_type.as_metric_label();
-
-        if health_result {
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Record health check success metric
-            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
-
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Record health check failure metric
-            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
-
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
-                self.consecutive_failures.store(0, Ordering::Release);
-            }
-
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
-        }
+        self.check_health_async_for_dp_rank(None).await
     }
 
     fn load(&self) -> usize {
@@ -950,35 +996,7 @@ impl Worker for BasicWorker {
     }
 
     async fn http_health_check(&self) -> WorkerResult<bool> {
-        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-        let url = self.normalised_url()?;
-        let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-
-        let mut req = WORKER_CLIENT.get(&health_url).timeout(timeout);
-        if let Some(api_key) = &self.metadata.api_key {
-            req = req.bearer_auth(api_key);
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    Ok(true)
-                } else {
-                    tracing::warn!(
-                        "HTTP health check returned non-success status for {}: {}",
-                        health_url,
-                        status
-                    );
-                    Ok(false)
-                }
-            }
-            Err(err) => {
-                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
-                Ok(false)
-            }
-        }
+        self.http_health_check_for_dp_rank(None).await
     }
 }
 
@@ -1048,7 +1066,9 @@ impl Worker for DPAwareWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        self.base_worker.check_health_async().await
+        self.base_worker
+            .check_health_async_for_dp_rank(Some(self.dp_rank))
+            .await
     }
 
     fn load(&self) -> usize {
@@ -1134,7 +1154,9 @@ impl Worker for DPAwareWorker {
     }
 
     async fn http_health_check(&self) -> WorkerResult<bool> {
-        self.base_worker.http_health_check().await
+        self.base_worker
+            .http_health_check_for_dp_rank(Some(self.dp_rank))
+            .await
     }
 }
 
@@ -1309,8 +1331,9 @@ mod tests {
     use super::*;
     use crate::core::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        DPAwareWorkerBuilder,
+        BasicWorkerBuilder, DPAwareWorkerBuilder,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_parse_bootstrap_host_strips_dp_rank_suffix() {
@@ -1326,6 +1349,81 @@ mod tests {
             parse_bootstrap_host_from_url("localhost:8080@2"),
             "localhost"
         );
+    }
+
+    #[test]
+    fn test_dp_health_check_url_targets_rank() {
+        let worker = DPAwareWorkerBuilder::new("http://worker1:8080", 2, 4)
+            .health_config(HealthConfig {
+                endpoint: "/health_generate?source=gateway".to_string(),
+                ..HealthConfig::default()
+            })
+            .build();
+
+        assert_eq!(
+            worker
+                .base_worker
+                .health_check_url(worker.dp_rank())
+                .unwrap(),
+            "http://worker1:8080/health_generate?source=gateway&dp_rank=2"
+        );
+    }
+
+    #[test]
+    fn test_regular_health_check_url_has_no_dp_rank() {
+        let worker = BasicWorkerBuilder::new("http://worker1:8080")
+            .health_config(HealthConfig {
+                endpoint: "/health_generate".to_string(),
+                ..HealthConfig::default()
+            })
+            .build();
+
+        assert_eq!(
+            worker.health_check_url(None).unwrap(),
+            "http://worker1:8080/health_generate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dp_check_health_targets_rank() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let size = time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..size]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let worker = DPAwareWorkerBuilder::new(format!("http://{address}"), 2, 4)
+            .health_config(HealthConfig {
+                endpoint: "/health".to_string(),
+                timeout_secs: 5,
+                ..HealthConfig::default()
+            })
+            .build();
+
+        worker.check_health_async().await.unwrap();
+        let request = time::timeout(Duration::from_secs(5), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            request.starts_with("GET /health?dp_rank=2 HTTP/1.1"),
+            "unexpected request line: {request:?}"
+        );
+        server.await.unwrap();
     }
 
     #[test]
