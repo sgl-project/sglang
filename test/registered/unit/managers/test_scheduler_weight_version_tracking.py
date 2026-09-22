@@ -101,12 +101,16 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         self, target_result, draft_result=None, method="update_weights_from_disk"
     ):
         self.recorded = []
+
+        def runners(role, result):
+            updater = SimpleNamespace(**{method: lambda *args, **kwargs: result})
+            runner = SimpleNamespace(weight_updater=updater)
+            return SimpleNamespace(weight_update_runners=lambda: [(role, runner)])
+
         return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(**{method: lambda recv_req: target_result}),
+            tp_worker=runners("target", target_result),
             draft_worker=(
-                None
-                if draft_result is None
-                else SimpleNamespace(**{method: lambda recv_req: draft_result})
+                None if draft_result is None else runners("draft", draft_result)
             ),
             tp_cpu_group=None,
             memory_saver_adapter=None,
@@ -119,11 +123,14 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             ),
         )
 
-    def _request(self, **fields):
+    def _request(self, load_format=None, **fields):
         return SimpleNamespace(
             weight_version="v2",
             flush_cache=True,
             torch_empty_cache=False,
+            model_path="m",
+            recapture_cuda_graph=False,
+            load_format=load_format,
             **fields,
         )
 
@@ -170,7 +177,6 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             dtypes=[],
             shapes=[],
             group_name="g",
-            load_format=None,
             serialized_named_tensors=[b""],
             **fields,
         )

@@ -126,11 +126,19 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
-            success, message = self.tp_worker.update_weights_from_disk(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
+            success, message = True, "Succeeded to update model weights."
+            target_updated = False
+            for role, runner in self._select_runners():
+                success, message = runner.weight_updater.update_weights_from_disk(
+                    recv_req.model_path,
+                    recv_req.load_format,
+                    recapture_cuda_graph=recv_req.recapture_cuda_graph,
+                )
+                if not success:
+                    break
+                target_updated |= role == "target"
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
                 self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
@@ -229,11 +237,17 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
-            success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_ipc(recv_req)
-            if tp_success:
+            success, message = True, "Succeeded to update model weights."
+            target_updated = False
+            for role, runner in self._select_runners():
+                success, message = runner.weight_updater.update_weights_from_ipc(
+                    recv_req
+                )
+                if not success:
+                    break
+                target_updated |= role == "target"
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
                 self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
