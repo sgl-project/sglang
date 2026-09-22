@@ -279,7 +279,9 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
         for manager in module.layerwise_offload_managers:
-            manager.release_all()
+            # Not release_all: this is a use ending, not a reset. The default
+            # still drops the resident set, so behaviour is unchanged here.
+            manager.release_after_use()
         # The layers are gone; the rest of this component is dead weight on the
         # device until it is used again, and the stage that follows may be the
         # one that needs the room.
