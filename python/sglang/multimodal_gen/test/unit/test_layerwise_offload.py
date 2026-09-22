@@ -1,4 +1,5 @@
 import gc
+import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -1057,6 +1058,81 @@ def test_prepare_for_next_req_repins_residents(monkeypatch):
     assert {0, 1, 2} <= manager._gpu_layers
 
 
+def test_release_after_use_defaults_to_the_old_release_all(monkeypatch):
+    """The rename must not move anything: `release_after_use()` == the previous call.
+
+    `finish_use` used to call `release_all()` unconditionally. It now says
+    `release_after_use()`, and with the default argument that has to clear exactly the
+    same layers, or this refactor is a behaviour change wearing a new name.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_all_still_drops_everything(monkeypatch):
+    """`release_all` keeps its literal contract for the full-reset callers.
+
+    `enable_offload` syncs to CPU and expects nothing left on the device; it
+    must not inherit the resident-set exemption.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_all()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_after_use_can_keep_the_resident_set(monkeypatch):
+    """`keep_resident` is the whole point of naming the two calls apart.
+
+    A component whose use is one forward pass has its resident set prefetched
+    at the start of the use and dropped at the end, so `resident_layers` buys
+    it nothing. Measured on Qwen-Image-2.1 / RTX 5090:
+    `--layerwise-resident-layers text_encoder=0.8` logs `resident=53/66` and
+    moves neither memory nor latency.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_after_use(keep_resident=True)
+    assert set(manager._gpu_layers) == set(manager._retained_set)
+    # Those layers never left the device, so the next use must not re-do the
+    # sequential first pass that exists for evicted pages.
+    assert manager._first_pass is False
+
+
+def test_release_after_use_keeps_nothing_when_no_residents_are_configured(monkeypatch):
+    """`keep_resident` with an empty resident set is still a full release."""
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=0
+    )
+    manager.prefetch_layer(0, non_blocking=False)
+    manager.prefetch_layer(1, non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use(keep_resident=True)
+    assert not manager._gpu_layers
+
+
 def _record_prepare(manager, monkeypatch):
     """Log the order of prefetches and stream waits inside prepare_for_next_req.
 
@@ -1166,9 +1242,11 @@ def test_configure_logs_component_start_and_completion(monkeypatch):
         "Configuring layerwise offload for transformer (_ResidentComponent): "
         "blocks (8 layers)"
     )
+    # "(per request)" is the point of this line: the set is re-established every
+    # request, not pinned for the server's lifetime.
     assert logs[-1] == (
         "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
-        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
+        "groups=1, layers=8, prefetch/group=2, resident=3/8 (per request), policy=leading"
     )
 
 
@@ -1303,6 +1381,60 @@ def test_disable_offload_short_circuits_residency_release(monkeypatch):
     model.prepare_for_next_req()
     for name, param in model.named_parameters():
         assert tuple(param.shape) != (1,), name
+
+
+def test_finish_use_drops_residents_unless_the_use_says_otherwise(monkeypatch):
+    """`retain_resident_layers` defaults off, so finish_use behaves as before.
+
+    Every existing pipeline builds its uses without the flag, so this is the
+    path they all take and it must keep releasing the resident set.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(stage_name="test", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is False for keep in released)
+    assert parked == [True]
+
+
+def test_finish_use_keeps_residents_when_the_use_declares_it(monkeypatch):
+    """The declaration reaches the manager, and parking is skipped with it.
+
+    Parking pushes the component's non-layer weights to host; doing that right
+    after deciding the room is available would undo the transfer being kept.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(
+            stage_name="test",
+            component_name="transformer",
+            retain_resident_layers=True,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is True for keep in released)
+    assert parked == []
 
 
 def test_enable_offload_rearms_after_disable(monkeypatch):
@@ -2266,3 +2398,187 @@ def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
             on_gpu = idx in manager._gpu_layers
             assert _layer_weight_ok(model.blocks[idx]) is on_gpu, (kind, idx)
         manager.prepare_for_next_req(non_blocking=False)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+
+    # the page cache cannot hold the mapping: it is re-read from the drive every pass
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._ensure_mapped_courier().direct_read
+
+    # the same mapping on a host that can cache it keeps the page-cache path
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: False
+    )
+    manager._mapped_courier = None
+    assert not manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_sees_the_pages_the_cache_holds(tmp_path):
+    path = tmp_path / "cached.bin"
+    path.write_bytes(b"\x01" * (16 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=16 << 20, dtype=torch.uint8)
+    mapped.sum()  # touch every page
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr(), mapped.numel()
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # the page cache holds the layer: shipping it is a memcpy, not a drive read
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers
+    assert courier.stats["cached_layers"] >= 1
+    assert courier.stats["direct_read_bytes"] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_blocking_loads_of_cold_mapped_layers_go_through_the_courier(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 0.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    # a blocking load (how a resident set is armed) is shipped by the courier too
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert courier.stats["layers"] == 1
+    assert torch.equal(manager.model.blocks[0].weight.detach().cpu(), torch.zeros(8, 8))
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_a_fully_resident_small_component_may_still_read_directly(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # far below the size floor, but every layer is resident: it is armed once
+    # per request, so there is no re-streamed pass for the floor to protect
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 1 << 20
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=2)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+        resident_layers=2,
+    )
+    assert manager._mapped_cpu_weights[0] and not manager._streamed_order
+    assert manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_samples_a_large_mapping_at_page_aligned_offsets(tmp_path):
+    # large enough that the sampling stride exceeds one window: every window
+    # must start on a page boundary or mincore rejects it and the answer is -1
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"\x01" * (96 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=96 << 20, dtype=torch.uint8)
+    mapped.sum()
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr() + 1000, (96 << 20) - 1000
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_large_pinned_stores_are_registered_in_place_at_exact_size(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    nbytes = layerwise_offload_mod._REGISTER_MIN_BYTES + 4096
+    tensor = layerwise_offload_mod._pinned_empty(nbytes, dtype=torch.uint8)
+    # locked where it was allocated: pinned, no pool block, no rounding
+    assert tensor.is_pinned()
+    assert tensor.untyped_storage().nbytes() == nbytes
+    assert pooled == []
+    del tensor
+    gc.collect()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
+    pooled = []
+    empty = torch.empty
+
+    def record_pool_use(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            pooled.append(kwargs)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_pool_use)
+    tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
+    assert tensor.is_pinned()
+    assert len(pooled) == 1
