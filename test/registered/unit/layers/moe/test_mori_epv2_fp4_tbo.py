@@ -118,7 +118,8 @@ def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
 @pytest.mark.parametrize("rows,expected", [(0, 32), (35, 64), (448, 512), (8192, 8192)])
 def test_optional_recv_bound_does_not_import_an_unavailable_dispatcher(rows, expected):
     dispatcher = SimpleNamespace(
-        op=SimpleNamespace(cfg=SimpleNamespace(effective_max_recv=65536))
+        op=SimpleNamespace(cfg=SimpleNamespace(effective_max_recv=65536)),
+        _trim_recv=True,
     )
     assert MoriEPv2Dispatcher._select_recv_cap(dispatcher, rows) == expected
 

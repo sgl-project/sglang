@@ -272,7 +272,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         tbo_enabled = is_tbo_enabled()
         # Receive trimming falls back when sender metadata is unavailable,
         # including TBO children without per-rank token counts.
-        self._trim_recv = get_bool_env_var("SGLANG_MORI_EPV2_TRIM_RECV", "true")
+        self._trim_recv = envs.SGLANG_MORI_RECV_BOUND.get()
         # Disable direct output for TBO to preserve buffer/stream ownership.
         self._direct_output = not tbo_enabled and get_bool_env_var(
             "SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT", "true"
@@ -347,6 +347,9 @@ class MoriEPv2Dispatcher(BaseDispatcher):
         return self._op
 
     def _select_recv_cap(self, eager_cluster_rows: Optional[int] = None):
+        if not self._trim_recv:
+            return self.op.cfg.effective_max_recv
+
         if eager_cluster_rows is not None:
             # Keep the optional MORI API independent from the separate FlyDSL
             # dispatcher, which is not part of this SGLang source tree.
@@ -361,18 +364,22 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             )
             if not eager_cap & (eager_cap - 1):
                 return eager_cap
-        if not self._trim_recv:
+        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+        per_rank_tokens = get_dp_global_num_tokens()
+        if (
+            self._num_tokens <= 0
+            or not per_rank_tokens
+            or any(rows != self._num_tokens for rows in per_rank_tokens)
+        ):
             return self.op.cfg.effective_max_recv
-        # Reuse the MORI EP/AITER receive bound for EPv2's token-major layout.
-        # EPv2 can also pass this bound to MORI builds with a native recv_cap API.
+
         from sglang.srt.layers.moe.moe_runner.aiter import _mori_decode_recv_bound
 
         return (
             _mori_decode_recv_bound(
                 self.op.cfg.effective_max_recv,
                 self.router_topk,
-                local_rows=self._num_tokens,
-                is_epv2=True,
             )
             or self.op.cfg.effective_max_recv
         )
