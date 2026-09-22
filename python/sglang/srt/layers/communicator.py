@@ -394,6 +394,27 @@ class _LayerModeComputationContext:
         )
 
 
+def sparse_mlp_scatter_mode() -> ScatterMode:
+    """Scatter mode a sparse (MoE) layer's MLP input arrives in.
+
+    SCATTERED means the MoE sees this rank's own token shard; FULL / MOE_FULL
+    mean it sees a buffer gathered over the attn-TP or the MoE-DP (CP) group.
+    """
+    if (
+        # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or enable_dwdp()
+    ):
+        return ScatterMode.SCATTERED
+    # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
+    if is_enable_moe_cp_allgather() and not (
+        is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
+    ):
+        return ScatterMode.MOE_FULL
+    return ScatterMode.FULL
+
+
 @dataclass
 class LayerScatterModes:
     layer_input_mode: ScatterMode
@@ -423,19 +444,7 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
-            if (
-                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                not get_moe_a2a_backend().is_none()
-                or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                or enable_dwdp()
-            ):
-                return ScatterMode.SCATTERED
-            # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
-            if is_enable_moe_cp_allgather() and not (
-                is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
-            ):
-                return ScatterMode.MOE_FULL
-            return ScatterMode.FULL
+            return sparse_mlp_scatter_mode()
         else:
             if enable_moe_dense_fully_dp():
                 return ScatterMode.SCATTERED
