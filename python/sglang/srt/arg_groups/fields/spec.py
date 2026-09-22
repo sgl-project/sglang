@@ -39,6 +39,19 @@ class Spec(msgspec.Struct):
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
+    speculative_dspark_lora_path: A[
+        Optional[str],
+        "DSPARK only. Local PEFT LoRA directory to merge into the unquantized dense "
+        "draft at startup. One adapter per deployment; independent of target LoRA. "
+        "Requires adapter_config.json and adapter_model.safetensors. No runtime switching.",
+    ] = None
+    speculative_dspark_lora_paths: A[
+        Optional[str],
+        "DSPARK only. JSON object mapping request draft_adapter names to local PEFT "
+        "directories. Preloads merged draft weight variants; extra GPU memory is "
+        "proportional to modified dense weights. Requires TP=1, eager non-overlap "
+        "execution, FCFS, and disabled radix cache. Independent of target LoRA.",
+    ] = None
     speculative_draft_model_path: A[
         Optional[str],
         Arg(

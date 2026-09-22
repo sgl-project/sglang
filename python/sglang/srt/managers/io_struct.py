@@ -266,6 +266,10 @@ class GenerateReqInput:
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
 
+    # Name in the immutable DSpark draft adapter registry; None uses base draft.
+    # This namespace is independent of target lora_path/lora_id.
+    draft_adapter: Optional[Union[List[Optional[str]], str]] = None
+
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
@@ -404,7 +408,19 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+            normalize_draft_adapter,
+        )
+
+        # Validate against the original input count, before n-way expansion.
+        original_single = self.is_single
         self._handle_parallel_sampling()
+        self.draft_adapter = normalize_draft_adapter(
+            self.draft_adapter,
+            batch_size=self.batch_size,
+            parallel_samples=self.parallel_sample_num,
+            single=original_single,
+        )
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -929,6 +945,9 @@ class GenerateReqInput:
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+            draft_adapter=(
+                self.draft_adapter[i] if self.draft_adapter is not None else None
+            ),
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -1022,6 +1041,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    draft_adapter: Optional[str] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py

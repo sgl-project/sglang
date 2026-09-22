@@ -992,6 +992,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
+        draft_adapter: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -1101,6 +1102,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
+        self.draft_adapter = draft_adapter
         self.routing_key = routing_key
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at

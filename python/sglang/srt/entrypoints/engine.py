@@ -432,6 +432,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        draft_adapter: Optional[Union[List[Optional[str]], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -456,6 +457,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            draft_adapter=draft_adapter,
             custom_logit_processor=custom_logit_processor,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
@@ -545,6 +547,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        draft_adapter: Optional[Union[List[Optional[str]], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -569,6 +572,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            draft_adapter=draft_adapter,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,

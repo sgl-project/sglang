@@ -2807,6 +2807,7 @@ class Scheduler(
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                draft_adapter=recv_req.draft_adapter,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -3949,8 +3950,27 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        draft_cohort = None
+        if get_spec().speculative_dspark_lora_paths is not None:
+            from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+                DraftAdapterCohort,
+            )
+
+            draft_cohort = DraftAdapterCohort(
+                [req.draft_adapter for req in running_batch.reqs if not req.finished()]
+                + [req.draft_adapter for req in adder.can_run_list]
+                + (
+                    [self.chunked_req.draft_adapter]
+                    if self.chunked_req is not None
+                    else []
+                )
+            )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if draft_cohort is not None and not draft_cohort.admit(req.draft_adapter):
+                # Do not skip the first foreign adapter: drain the active cohort
+                # so a stream of same-adapter arrivals cannot starve it.
+                break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 

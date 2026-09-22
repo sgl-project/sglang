@@ -854,6 +854,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if isinstance(obj, GenerateReqInput):
+            from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+                parse_draft_adapters,
+                validate_draft_adapter_request,
+            )
+
+            validate_draft_adapter_request(
+                obj,
+                parse_draft_adapters(get_spec().speculative_dspark_lora_paths),
+            )
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1502,6 +1512,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                draft_adapter=obj.draft_adapter,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,

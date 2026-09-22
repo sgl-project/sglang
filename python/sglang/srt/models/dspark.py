@@ -482,6 +482,24 @@ class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        from sglang.srt.runtime_context import get_spec
+
+        self._dspark_lora_path = get_spec().speculative_dspark_lora_path
+        self._dspark_lora_loaded = False
+        self._dspark_lora_paths = get_spec().speculative_dspark_lora_paths
+        self.draft_adapter_bank = None
+        if self._dspark_lora_paths is not None and (
+            type(self).__name__ != "Qwen3DSparkModel"
+            or quant_config is not None
+            or getattr(config, "quantization_config", None)
+        ):
+            raise ValueError(
+                "Per-request draft adapters require an unquantized Qwen3DSparkModel."
+            )
+        if self._dspark_lora_path and (
+            quant_config is not None or getattr(config, "quantization_config", None)
+        ):
+            raise ValueError("Static DSpark draft LoRA requires an unquantized draft.")
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
@@ -548,6 +566,23 @@ class DSparkDraftMixin:
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if self._dspark_lora_path:
+            from sglang.srt.speculative.dspark_components.dspark_lora import (
+                merge_dspark_lora_weights,
+            )
+
+            # Merge the unsharded checkpoint before DFlash packs Q/K/V and
+            # gate/up projections and dispatches TP-aware weight loaders.
+            # Materialize first so missing/invalid adapter weights fail before
+            # any model parameters are loaded. Shared target modules have not
+            # been attached yet and are never valid adapter targets.
+            weights = list(
+                merge_dspark_lora_weights(
+                    weights,
+                    self._dspark_lora_path,
+                    model_parameter_names=dict(self.named_parameters()),
+                )
+            )
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
@@ -586,6 +621,25 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        self._dspark_lora_loaded = bool(self._dspark_lora_path)
+        if self._dspark_lora_paths is not None:
+            from sglang.srt.speculative.dspark_components.dspark_lora import (
+                DSparkDraftAdapterBank,
+            )
+            from sglang.srt.speculative.dspark_components.dspark_lora_routing import (
+                parse_draft_adapters,
+            )
+
+            # Allocate variants during weight loading, before KV pool profiling.
+            self.draft_adapter_bank = DSparkDraftAdapterBank(
+                self, parse_draft_adapters(self._dspark_lora_paths)
+            )
+            logger.info(
+                "Loaded %d DSpark draft adapter variants; %.3f GiB additional "
+                "resident weights. Requests are served in homogeneous cohorts.",
+                len(self.draft_adapter_bank.variants),
+                self.draft_adapter_bank.resident_bytes / (1024**3),
+            )
 
     def _load_confidence_weights(
         self,
