@@ -449,9 +449,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            self.model_runner.effective_logical_max_total_num_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -575,17 +573,13 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            self.model_runner.effective_logical_max_total_num_tokens - 1,
         )
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (
-            self.model_runner.req_to_token_pool.schedulable_token_capacity(
-                self.model_runner.max_total_num_tokens
-            ),
+            self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
