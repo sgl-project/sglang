@@ -7,13 +7,13 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     aiter_fused_fp8_qk_write,
+    aiter_fused_fp8_writer_available,
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, stage="base-a", runner_config="cpu")
 register_amd_ci(est_time=2, suite="stage-a-test-cpu-amd")
 
 
@@ -23,6 +23,16 @@ class TestFusedFp8WriterHip(CustomTestCase):
         self.assertFalse(fused_fp8_writer_geometry_supported(64, 64, 128))
         self.assertFalse(fused_fp8_writer_geometry_supported(128, 32, 128))
         self.assertFalse(fused_fp8_writer_geometry_supported(128, 64, 64))
+
+    def test_available_rejects_mi300(self):
+        props = MagicMock()
+        props.gcnArchName = "gfx942"
+        with (
+            patch("torch.version.hip", "6.4.0"),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_properties", return_value=props),
+        ):
+            self.assertFalse(aiter_fused_fp8_writer_available())
 
     def test_prepare_aiter_rope_caches_squeezes_cpu_tables(self):
         cos = torch.randn(128, 1, 1, 32, dtype=torch.float32)

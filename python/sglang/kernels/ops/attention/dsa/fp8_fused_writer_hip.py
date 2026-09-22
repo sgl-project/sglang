@@ -22,7 +22,19 @@ def fused_fp8_writer_geometry_supported(
     )
 
 
+def _is_gfx95() -> bool:
+    # AITER's fused indexer writer is gfx950-only. gfx942 (MI300) may still
+    # import the Python symbol and then fault in the kernel.
+    if not getattr(torch.version, "hip", None):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return "gfx95" in str(torch.cuda.get_device_properties(0).gcnArchName)
+
+
 def aiter_fused_fp8_writer_available() -> bool:
+    if not _is_gfx95():
+        return False
     try:
         from aiter.ops.cache import indexer_qk_rope_quant_and_cache  # noqa: F401
     except (ImportError, AttributeError):
