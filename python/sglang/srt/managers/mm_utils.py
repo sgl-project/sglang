@@ -725,16 +725,14 @@ def general_mm_embed_routine(
             # best-effort, offloading to CPU ensures we have a reliable fallback
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
-            if mm_inputs_list:
+            if mm_inputs_list and input_embeds.is_cuda:
                 language_only = get_disagg().language_only
-                stream = None
+                stream = torch.cuda.current_stream(input_embeds.device)
                 offloaded = False
                 for mm_input_obj in mm_inputs_list:
                     for mm_item in mm_input_obj.mm_items:
                         feature = mm_item.feature
                         if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                            if stream is None:
-                                stream = torch.cuda.current_stream()
                             # The transport reconstructed this block on the scheduler stream
                             # and nothing else pins it to ours: without record_stream the
                             # allocator recycles it into the next scheduler allocation while
@@ -749,8 +747,6 @@ def general_mm_embed_routine(
                                 and precomputed.is_cuda
                                 and not mm_item.keep_device_embedding
                             ):
-                                if stream is None:
-                                    stream = torch.cuda.current_stream()
                                 precomputed.record_stream(stream)
                                 mm_item.precomputed_embeddings = precomputed.to(
                                     "cpu", non_blocking=True
