@@ -686,7 +686,7 @@ class MambaPool:
             and cache_params.is_kda
             and speculative_eagle_topk is not None
             and speculative_eagle_topk > 1
-            and speculative_num_draft_tokens in (31, 33, 49, 65)
+            and speculative_num_draft_tokens in (17, 31, 33, 49, 65)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
