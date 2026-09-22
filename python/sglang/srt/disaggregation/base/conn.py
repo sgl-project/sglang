@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
+    DFLASH_KV = "dflash_kv"
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"

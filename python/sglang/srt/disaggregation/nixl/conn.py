@@ -2590,6 +2590,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
+            if (
+                st == StateType.DFLASH_KV
+                and self.pp_size is not None
+                and self.pp_size > 1
+            ):
+                raise RuntimeError("Logical DFlash KV transfer requires PP=1")
+
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
                     if 0 in src_dims:
@@ -2660,13 +2667,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif st in (
+                StateType.DFLASH_KV,
                 StateType.SWA,
                 StateType.QSA_PENDING,
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
-                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                if (
+                    not self.is_mla_backend or st == StateType.DFLASH_KV
+                ) and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -2691,7 +2701,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
-                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    force_flat=st
+                    in (
+                        StateType.DFLASH_KV,
+                        StateType.QSA_PENDING,
+                        StateType.QSA_COMPRESSED,
+                    ),
                     src_layer_ids=src_lids,
                     dst_layer_ids=dst_lids,
                     dst_item_lens=dst_lens,
