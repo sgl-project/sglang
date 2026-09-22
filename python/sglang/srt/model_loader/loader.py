@@ -331,13 +331,13 @@ def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) ->
                 getattr(quant_method, hook_name)(module)
 
 
-def restore_weight(model: nn.Module, target_device) -> None:
+def restore_weights_before_loading(model: nn.Module, target_device) -> None:
     """Undo in-place quant packing so fresh weights can be loaded
     (no-op for schemes that don't repack, e.g. plain fp8)."""
     _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
 
 
-def postprocess_weight(model: nn.Module, target_device) -> None:
+def process_weights_after_loading(model: nn.Module, target_device) -> None:
     """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant,
     transpose, ...)."""
     _apply_quant_method_hook(model, target_device, "process_weights_after_loading")

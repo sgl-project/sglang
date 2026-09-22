@@ -170,13 +170,13 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
 
     runner = SimpleNamespace(model=object(), device="cpu")
 
-    with patch.object(mr, "restore_weight") as restore:
+    with patch.object(mr, "restore_weights_before_loading") as restore:
         mr.ModelRunner.begin_weight_update(runner)
     restore.assert_called_once()
 
     with (
         patch.object(mr, "post_load_weights") as post_load,
-        patch.object(mr, "postprocess_weight") as postprocess,
+        patch.object(mr, "process_weights_after_loading") as postprocess,
     ):
         mr.ModelRunner.end_weight_update(runner, run_post_load=True)
     post_load.assert_called_once()
@@ -184,7 +184,7 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
 
     with (
         patch.object(mr, "post_load_weights") as post_load,
-        patch.object(mr, "postprocess_weight") as postprocess,
+        patch.object(mr, "process_weights_after_loading") as postprocess,
     ):
         mr.ModelRunner.end_weight_update(runner, run_post_load=False)
     post_load.assert_not_called()

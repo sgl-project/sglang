@@ -169,8 +169,8 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.loader import (
     post_load_weights,
-    postprocess_weight,
-    restore_weight,
+    process_weights_after_loading,
+    restore_weights_before_loading,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -2048,7 +2048,7 @@ class ModelRunner:
     def begin_weight_update(self) -> None:
         """Begin a weight-update session: restore in-place-packed weights to a
         loadable state (no-op for schemes that don't repack)."""
-        restore_weight(self.model, torch.device(self.device))
+        restore_weights_before_loading(self.model, torch.device(self.device))
 
     def end_weight_update(self, run_post_load: bool) -> None:
         """End the weight-update session: optionally run model.post_load_weights
@@ -2056,7 +2056,7 @@ class ModelRunner:
         quantized weights into kernel layout."""
         if run_post_load:
             post_load_weights(self.model)
-        postprocess_weight(self.model, torch.device(self.device))
+        process_weights_after_loading(self.model, torch.device(self.device))
 
     def check_weights(
         self,
