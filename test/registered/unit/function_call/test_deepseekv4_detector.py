@@ -83,8 +83,8 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertNotIn(DSML, normal)
 
-    def test_malformed_partial_json_falls_back_to_raw_value(self):
-        """A partial non-string parameter must not escape as MalformedJSON."""
+    def test_incomplete_call_is_not_published(self):
+        """A truncated call must not publish its name or partial arguments."""
         detector = DeepSeekV4Detector()
         result = detector.parse_streaming_increment(
             f'<{DSML}tool_calls>\n<{DSML}invoke name="get_weather">\n'
@@ -92,7 +92,37 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.tools,
         )
 
-        self.assertEqual([c.name for c in result.calls if c.name], ["get_weather"])
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(detector.finish(self.tools).calls, [])
+
+    def test_complete_call_is_published_atomically(self):
+        detector = DeepSeekV4Detector()
+        text = _weather_call()
+        split = text.index("SF")
+
+        first = detector.parse_streaming_increment(text[:split], self.tools)
+        second = detector.parse_streaming_increment(text[split:], self.tools)
+
+        self.assertEqual(first.calls, [])
+        self.assertEqual(len(second.calls), 1)
+        self.assertEqual(second.calls[0].name, "get_weather")
+
+    def test_malformed_complete_dsml_does_not_leak(self):
+        text = _wrapped(_invoke("get_weather", "{bad}"))
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_partial_marker_at_end_does_not_leak(self):
+        text = f"safe text\n\n<{DSML}tool_c"
+        detector = DeepSeekV4Detector()
+
+        self.assertTrue(detector.has_tool_call(text))
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "safe text")
+        self.assertEqual(result.calls, [])
 
     def test_non_streaming_parses_every_tool_calls_section(self):
         """A turn with two tool_calls sections must yield both calls."""
@@ -102,9 +132,8 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertEqual(len(result.calls), 2)
 
-    def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must not empty the turn, and the dropped
-        buffer must not come back on the next delta."""
+    def test_parse_error_drops_protocol_without_duplication(self):
+        """An unexpected parse error must not expose the protocol buffer."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -116,7 +145,8 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.assertEqual(detector._buffer, "")
             second = detector.parse_streaming_increment(" tail", self.tools)
 
-        self.assertIn("get_weather", first.normal_text)
+        self.assertNotIn("get_weather", first.normal_text)
+        self.assertNotIn(DSML, first.normal_text)
         self.assertNotIn("get_weather", second.normal_text)
         # No half-formed call: the failure can land between a tool's name and its
         # arguments, so an argument-less named call must not reach the client.
