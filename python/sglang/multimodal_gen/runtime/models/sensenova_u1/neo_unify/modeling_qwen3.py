@@ -775,11 +775,14 @@ class Qwen3Attention(nn.Module):
             position_embeddings is None
             or position_embeddings[0][0].dtype != hidden_states.dtype
         ):
+            t_positions = position_ids_from_indexes(indexes, 0)
+            h_positions = position_ids_from_indexes(indexes, 1)
+            w_positions = position_ids_from_indexes(indexes, 2)
             # Temporal positions use `rotary_emb`; height and width use `rotary_emb_hw`.
             position_embeddings = (
-                self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
-                self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
-                self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+                self.rotary_emb(hidden_states, t_positions),
+                self.rotary_emb_hw(hidden_states, h_positions),
+                self.rotary_emb_hw(hidden_states, w_positions),
             )
         return position_embeddings
 

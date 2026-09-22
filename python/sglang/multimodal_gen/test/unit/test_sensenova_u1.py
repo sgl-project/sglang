@@ -104,13 +104,18 @@ class _FakeSenseNovaModel:
             )
         )
 
+    def _output_for_batch(self, batch_size: int) -> torch.Tensor:
+        if self._output.shape[0] == batch_size:
+            return self._output
+        return self._output.repeat(batch_size, 1, 1, 1)
+
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_count += 1
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
         self.t2i_calls.append(self.call_kwargs)
         if self._error is not None:
             raise self._error
-        return self._output.repeat(kwargs["batch_size"], 1, 1, 1)
+        return self._output_for_batch(kwargs["batch_size"])
 
     def it2i_generate(self, tokenizer, prompt, images, **kwargs):
         self.call_count += 1
@@ -123,7 +128,7 @@ class _FakeSenseNovaModel:
         self.it2i_calls.append(self.call_kwargs)
         if self._error is not None:
             raise self._error
-        return self._output.repeat(kwargs["batch_size"], 1, 1, 1)
+        return self._output_for_batch(kwargs["batch_size"])
 
 
 class _FakeTokenizer:
@@ -1056,28 +1061,15 @@ def test_sensenova_u1_batch_cost_tracks_resolution_steps_and_cfg():
     assert config.estimate_request_cost(batch) == 32 * 32 * 5 * 2
 
 
-def test_sensenova_u1_multi_output_request_is_not_dynamically_batched():
+def test_sensenova_u1_native_multi_output_request_can_batch_with_itself():
     scheduler = object.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
-    sampling = SenseNovaU1SamplingParams(
-        prompt="a mountain lake", num_outputs_per_prompt=2
-    )
-    request = SimpleNamespace(
-        is_warmup=False,
-        realtime_session_id=None,
-        session=None,
-        prompt=sampling.prompt,
-        image_path=None,
-        return_file_paths_only=False,
-        num_outputs_per_prompt=2,
-        sampling_params=sampling,
+    request = _make_sensenova_u1_scheduler_request(
+        "request-0", "a mountain lake", 42, num_outputs_per_prompt=2
     )
 
-    assert not scheduler._can_dynamic_batch(request, request)
-    assert (
-        scheduler._get_dynamic_batch_reject_reason(request, request)
-        == "sequential_multi_output"
-    )
+    assert scheduler._can_dynamic_batch(request, request)
+    assert scheduler._get_dynamic_batch_reject_reason(request, request) is None
 
 
 def test_sensenova_u1_think_mode_request_is_dispatched_without_batching():
@@ -1463,6 +1455,7 @@ def test_sensenova_u1_generation_stage_loads_image_path_rgba_with_white_backgrou
         extra=sampling.build_request_extra(),
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(7),
     )
     model = _FakeSenseNovaModel()
 
@@ -1812,6 +1805,7 @@ def test_sensenova_u1_forward_guards_on_the_request_cfg_interval(monkeypatch):
         extra={SENSENOVA_U1_REQUEST_EXTRA_KEY: {"cfg_interval": (0.2, 0.8)}},
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+        generator=torch.Generator().manual_seed(7),
     )
 
     stage.forward(batch, server_args=_cache_dit_server_args())
@@ -2050,13 +2044,32 @@ def test_sensenova_u1_real_cache_dit_wrapper_isolates_cfg_residuals():
         stage._unmount_cache_dit()
 
 
-def test_sensenova_u1_invalid_output_count_does_not_mount_cache_dit(monkeypatch):
+def test_sensenova_u1_invalid_generator_count_does_not_mount_cache_dit(monkeypatch):
     calls = _install_sensenova_cache_dit_stub(monkeypatch)
     stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
-    batch = SimpleNamespace(num_outputs_per_prompt=2)
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2304,
+        height=4096,
+        num_outputs_per_prompt=2,
+        enable_cache_dit=True,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=[42, 43],
+        num_outputs_per_prompt=2,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+        generator=[torch.Generator().manual_seed(42)],
+    )
 
-    with pytest.raises(ValueError, match="expects output expansion"):
-        stage.forward(batch, server_args=SimpleNamespace())
+    with pytest.raises(ValueError, match="Expected 2 generators, got 1"):
+        stage.forward(batch, server_args=_cache_dit_server_args())
 
     assert calls == {"enable": [], "disable": [], "refresh": []}
 
@@ -2084,6 +2097,10 @@ def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
         },
         metrics=None,
         sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+        generator=[
+            torch.Generator().manual_seed(7),
+            torch.Generator().manual_seed(19),
+        ],
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
@@ -2096,7 +2113,7 @@ def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
         "a longer second prompt",
     ]
     assert model.call_kwargs["batch_size"] == 2
-    assert model.call_kwargs["seed"] == [7, 19]
+    assert [g.initial_seed() for g in model.call_kwargs["generators"]] == [7, 19]
 
 
 def test_sensenova_u1_generation_stage_rejects_batched_think_mode():
@@ -2150,6 +2167,7 @@ def test_sensenova_u1_generation_stage_uses_native_multi_output_batch():
         extra=sampling.build_request_extra(),
         metrics=None,
         generator=[g0, g1],
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
     )
     model = _FakeSenseNovaModel(output=torch.zeros(2, 3, 64, 64))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
@@ -2180,6 +2198,7 @@ def test_sensenova_u1_rejects_generator_count_mismatch():
         extra=sampling.build_request_extra(),
         metrics=None,
         generator=[torch.Generator().manual_seed(42)],
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
     )
     stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
 
@@ -2547,6 +2566,9 @@ def test_sensenova_t2i_reuses_request_noise_embedding(
             "noise_scale_embedder": noise_embedder,
         },
         _notify_layer_offload_phase=lambda phase: None,
+        _build_cfg_schedule=lambda timesteps, cfg_interval, needs_cfg: (
+            NEOChatModel._build_cfg_schedule(timesteps, cfg_interval, needs_cfg)
+        ),
         _build_t2i_query=lambda *a, **k: "query",
         _build_t2i_text_inputs=lambda *a: (
             torch.zeros(1, 1, dtype=torch.long),
