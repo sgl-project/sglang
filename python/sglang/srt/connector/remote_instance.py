@@ -10,6 +10,7 @@ import torch.distributed as dist
 from sglang.srt.connector import BaseConnector
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ class RemoteInstanceConnector(BaseConnector):
         master_address = master.host
         master_port = master.port
         group_name = f"send_weights_{instance_ip}_{master_port}_{tp_rank}"
-        backend = "nccl"
+        backend = "nccl" if not is_npu() else "hccl"
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
