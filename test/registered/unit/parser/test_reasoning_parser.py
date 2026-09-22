@@ -20,6 +20,7 @@ from sglang.srt.parser.reasoning_parser import (
     Qwen3Detector,
     ReasoningParser,
 )
+from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1724,6 +1725,15 @@ class TestGraniteThinkingDetector(CustomTestCase):
         reasoning, normal = parser.parse_non_stream("<think>truncated")
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "truncated")
+
+
+class TestReasoningParserNames(CustomTestCase):
+    def test_matches_registry(self):
+        # `server_args` builds the --reasoning-parser choices from this list to
+        # keep the registry, and its dependencies, out of argument parsing.
+        self.assertEqual(
+            sorted(REASONING_PARSER_NAMES), sorted(ReasoningParser.DetectorMap)
+        )
 
 
 if __name__ == "__main__":

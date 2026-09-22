@@ -29,38 +29,40 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
 
     args = make_cpp_args(is_arch_support_pdl())
-    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
-    # defaults, and a 0 would size the persistent pool to an empty grid.
+    # Enable each cluster path only when its occupancy probe reports capacity.
     extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
-        try:
-            occ_8_2 = get_max_active_clusters(8, occupancy=2)
-        except Exception:
-            pass
-        else:
-            if occ_8_2 > 0:
-                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}")
-        try:
-            occ_16_1 = get_max_active_clusters(16, occupancy=1)
-        except Exception:
-            pass
-        else:
-            if occ_16_1 > 0:
-                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
+        for cluster_size, occupancy in ((8, 2), (16, 1)):
+            try:
+                max_active_clusters = get_max_active_clusters(
+                    cluster_size, occupancy=occupancy
+                )
+            except NoSchedulableClustersError:
+                max_active_clusters = 0
+            extra_cuda_cflags.append(
+                f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
+            )
     kernel = f"TopKKernel<{args}>"
+    wrappers = [
+        ("topk_transform_paged", f"{kernel}::transform_paged"),
+        ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_plan", f"{kernel}::plan"),
+    ]
+    if is_hip_runtime():
+        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
+        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
-        cuda_wrappers=[
-            ("topk_transform_paged", f"{kernel}::transform_paged"),
-            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
-            ("topk_plan", f"{kernel}::plan"),
-        ],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -214,6 +216,9 @@ def topk_transform_paged_v2(
     * Both outputs given -- ``out_page_indices`` receives the page-table
       transform and ``out_raw_indices`` receives the selected raw indices.
 
+    For the packed (DSA extend prefill) layout see
+    :func:`topk_transform_packed_v2`.
+
     NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
     A length of 0 is the valid way to express "no tokens": the row takes the
@@ -248,4 +253,51 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+    )
+
+
+def topk_transform_packed_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    *,
+    row_starts: torch.Tensor,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> None:
+    """Packed (DSA extend prefill) fused top-k + page-table transform.
+
+    Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]``
+    (``ks = row_starts[i]``) and writes the page-table transform of the selected
+    row-local positions into ``out_page_indices``, ``-1`` padded. Prefill expands
+    one request into many query-token rows, so ``row_to_batch[i]`` (optional,
+    ``(rows,)`` int32) names the ``page_tables`` row of the request row ``i``
+    belongs to; omitting it indexes the table by score row. ``row_to_batch`` is
+    not range-checked.
+
+    This is :func:`topk_transform_ragged_v2` with a page-table output instead of
+    an additive offset. Like ragged, it dispatches the implementation per row at
+    runtime, so it needs no plan and no :func:`plan_topk_v2` metadata.
+
+    NOTE: ``scores`` is MODIFIED IN PLACE -- the <= 3 columns ahead of each row's
+    window that the 16-byte-aligned read base pulls in are masked out. They are
+    invalid for that row and the buffer must have no other consumer, so do not
+    pass a view with overlapping rows.
+    ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
+
+    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
+    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
+    produces this layout today.
+    """
+    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
+    module = _jit_topk_v2_module()
+    module.topk_transform_packed(
+        scores,
+        seq_lens,
+        row_starts,
+        page_tables,
+        out_page_indices,
+        page_size,
+        row_to_batch,
     )

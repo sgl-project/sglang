@@ -127,6 +127,15 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    # Opt-in per backend: set True and implement teardown() to support runtime PD
+    # role switch (release transfer resources; the scheduler owns the KV pool).
+    supports_role_switch: bool = False
+
+    def teardown(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support PD role switch teardown"
+        )
+
 
 class BaseKVSender(ABC):
     @abstractmethod
@@ -161,6 +170,10 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        """Optional page-aligned limit for one scheduler KV send."""
+        return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
