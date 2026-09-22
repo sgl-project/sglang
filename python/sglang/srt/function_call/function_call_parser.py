@@ -220,11 +220,8 @@ class FunctionCallParser:
         Args:
             at_least_one: If True, the grammar forces at least one tool call
                 (no free text allowed). Used for required/named tool_choice.
-            named_function_name: When tool_choice names a specific function,
-                restrict the grammar to that function and enforce its
-                parameters schema even in non-strict mode, so the call is
-                guaranteed to carry valid arguments. Mirrors the json_schema
-                fallback in get_json_schema_constraint.
+            named_function_name: Restrict the grammar to this one function and
+                always enforce its parameters schema (named tool_choice).
 
         Raises:
             ValueError: If tools have conflicting $defs schemas.
@@ -249,9 +246,8 @@ class FunctionCallParser:
                 function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
             if named_function_name is not None:
-                # An explicitly named tool_choice must produce a call to this
-                # exact function with schema-valid arguments; an empty schema
-                # would let greedy decoding emit minimal JSON like `{}`.
+                # An empty schema would let greedy decoding emit `{}` with all
+                # required arguments missing.
                 schema = function.parameters or {}
             else:
                 schema = function.parameters if is_strict else {}
@@ -361,9 +357,8 @@ class FunctionCallParser:
                 if self.detector.supports_structural_tag():
                     # For "required"/named: always use structural_tag to preserve the
                     # model's native tool call format. Schema is only included when
-                    # strict=True, per OpenAI protocol semantics — except for a named
-                    # tool_choice, which pins the function and always enforces its
-                    # schema (see get_legacy_structural_tag).
+                    # strict=True, per OpenAI protocol semantics — a named
+                    # tool_choice is the exception and always enforces its schema.
                     # For "auto": only constrain when strict is enabled.
                     tag = self.get_legacy_structural_tag(
                         at_least_one=is_required,
