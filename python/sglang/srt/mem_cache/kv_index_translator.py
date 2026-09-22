@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -162,6 +163,10 @@ class KVIndexTranslator:
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
                 if isinstance(token_to_kv_pool, BaseSWAKVPool)
+                and (
+                    not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    or token_to_kv_pool.request_window is None
+                )
                 else None
             )
 
