@@ -266,8 +266,6 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
-        # store the host indices of KV cache
-        self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
@@ -281,10 +279,6 @@ class TreeNode:
     @property
     def evicted(self):
         return self.value is None
-
-    @property
-    def backuped(self):
-        return self.host_value is not None
 
     def get_last_hash_value(self) -> Optional[str]:
         """Returns the hash value of the last page in this node."""
@@ -360,7 +354,6 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
-        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
         self.evictable_size_ = 0
