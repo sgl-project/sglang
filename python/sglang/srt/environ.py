@@ -943,6 +943,12 @@ class Envs:
     SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
     SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
     SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
+    # Quantize the linears an unquantized K3 checkpoint leaves dense to
+    # per-output-channel FP8 after load, so the PTPC GEMMs can serve them.
+    # Official BF16 weights; this does not require a Quark checkpoint.
+    SGLANG_ROCM_K3_ONLINE_FP8_ATTN = EnvBool(False)
+    SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ = EnvBool(False)
+    SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

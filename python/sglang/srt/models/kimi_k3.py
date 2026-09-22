@@ -3574,6 +3574,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
+        # Post-load: quantize whatever the checkpoint left dense, first, so the
+        # kv_b absorb and the KDA merges below see the same per-channel FP8
+        # layout a Quark export ships. The transpose/bpreshuffle stays with the
+        # loader's own postprocess pass.
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_online_fp8 import (
+                maybe_quantize_bf16_linears_fp8,
+            )
+
+            maybe_quantize_bf16_linears_fp8(self)
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
             if layer_id >= len(self.model.layers):
