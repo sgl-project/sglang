@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
 
@@ -148,6 +148,20 @@ def _should_emit_normal_text_as_message(
     if any_tool_call_in_progress and not text.strip():
         return False
     return True
+
+
+async def _close_generation_with_stream(
+    events: AsyncGenerator[str, None], generation: AsyncGenerator[Any, None]
+) -> AsyncGenerator[str, None]:
+    """Close the engine generation as soon as the SSE consumer stops reading."""
+    try:
+        async for event in events:
+            yield event
+    finally:
+        try:
+            await events.aclose()
+        finally:
+            await generation.aclose()
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -627,7 +641,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if request.stream:
                 if self.use_harmony:
-                    return self.responses_stream_generator(
+                    events = self.responses_stream_generator(
                         request,
                         sampling_params,
                         result_generator,
@@ -637,14 +651,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         require_reasoning=require_reasoning,
                     )
-                return self.responses_stream_generator_non_harmony(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    require_reasoning=require_reasoning,
+                else:
+                    events = self.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        require_reasoning=require_reasoning,
+                    )
+                return _close_generation_with_stream(
+                    events=events, generation=result_generator
                 )
             try:
                 result: Union[
@@ -1662,42 +1680,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
-        """Close the engine iterator when its SSE consumer exits."""
-        formatter = self._owned_responses_stream_generator(
-            request,
-            sampling_params,
-            result_generator,
-            context,
-            model_name,
-            tokenizer,
-            request_metadata,
-            created_time,
-            require_reasoning=require_reasoning,
-        )
-        try:
-            async for event in formatter:
-                yield event
-        finally:
-            try:
-                await formatter.aclose()
-            finally:
-                close = getattr(result_generator, "aclose", None)
-                if close is not None:
-                    await close()
-
-    async def _owned_responses_stream_generator(
-        self,
-        request: ResponsesRequest,
-        sampling_params: Any,
-        result_generator: AsyncIterator[StreamingHarmonyContext],
-        context: StreamingHarmonyContext,
-        model_name: str,
-        tokenizer: Any,
-        request_metadata: RequestResponseMetadata,
-        created_time: Optional[int] = None,
-        *,
-        require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
         created_time = created_time or int(time.time())
         sequence_number = 0
         emitted_items = []
@@ -1916,40 +1898,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         yield _send_event(f"response.{final_response.status}", response=response_dict)
 
     async def responses_stream_generator_non_harmony(
-        self,
-        request: ResponsesRequest,
-        sampling_params: Any,
-        result_generator: AsyncIterator[Any],
-        model_name: str,
-        tokenizer: Any,
-        request_metadata: RequestResponseMetadata,
-        created_time: Optional[int] = None,
-        *,
-        require_reasoning: bool,
-    ) -> AsyncGenerator[str, None]:
-        """Close the engine iterator when its SSE consumer exits."""
-        formatter = self._owned_responses_stream_generator_non_harmony(
-            request,
-            sampling_params,
-            result_generator,
-            model_name,
-            tokenizer,
-            request_metadata,
-            created_time,
-            require_reasoning=require_reasoning,
-        )
-        try:
-            async for event in formatter:
-                yield event
-        finally:
-            try:
-                await formatter.aclose()
-            finally:
-                close = getattr(result_generator, "aclose", None)
-                if close is not None:
-                    await close()
-
-    async def _owned_responses_stream_generator_non_harmony(
         self,
         request: ResponsesRequest,
         sampling_params: Any,
@@ -2745,10 +2693,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 adapted_request, raw_request
             )
 
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
+            async with aclosing(generator):
+                async for res in generator:
+                    context.append_output(res)
+                    # NOTE(woosuk): The stop condition is handled by the engine.
+                    yield context
 
             if not context.need_builtin_tool_call():
                 # The model did not ask for a tool call, so we're done.

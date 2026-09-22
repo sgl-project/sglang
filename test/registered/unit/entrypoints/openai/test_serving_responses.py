@@ -1603,6 +1603,47 @@ def test_active_stream_cancel_and_final_history(response_serving):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("harmony", [False, True])
+def test_stream_close_closes_engine_generation(response_serving, harmony):
+    """Closing the SSE stream mid-generation must close the engine request
+    before aclose returns, not whenever garbage collection finalizes it."""
+    serving = response_serving(harmony=harmony)
+    engine_closed = []
+
+    async def generate(*args, **kwargs):
+        chunk = engine_chunk("Hello")
+        if harmony:
+            chunk["output_ids"] = get_encoding().render_conversation(
+                Conversation.from_messages(
+                    [
+                        Message.from_role_and_content(
+                            Role.ASSISTANT, "Hello"
+                        ).with_channel("final")
+                    ]
+                )
+            )
+        try:
+            yield chunk
+            await asyncio.Event().wait()
+        finally:
+            engine_closed.append(True)
+
+    serving.tokenizer_manager.generate_request = Mock(side_effect=generate)
+
+    async def run():
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        stream = await serving.create_responses(request)
+        async for event in stream:
+            if "event: response.output_text.delta" in event:
+                break
+        else:
+            pytest.fail("stream ended before a content event")
+        await stream.aclose()
+        assert engine_closed == [True]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_completion_preserves_cancelled_response(response_serving, stream):
     serving = response_serving(enabled=True, harmony=not stream)
