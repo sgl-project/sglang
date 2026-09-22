@@ -63,6 +63,7 @@ fn plain_spec(mock: &MockWorker) -> WorkerSpec {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        transfer_group: None,
     }
 }
 
@@ -206,6 +207,7 @@ async fn pd_mode_generate_injects_flat_bootstrap_fields() {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: Some(8997),
+                transfer_group: None,
             },
             WorkerSpec {
                 id: WorkerId("d1".into()),
@@ -213,6 +215,7 @@ async fn pd_mode_generate_injects_flat_bootstrap_fields() {
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: None,
+                transfer_group: None,
             },
         ],
         &[],

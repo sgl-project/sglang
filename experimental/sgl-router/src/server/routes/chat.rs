@@ -3406,7 +3406,10 @@ mod tests {
                 });
                 let tokens = request_tokens_for(&reg, &model_id, &value).expect("routing tokens");
                 assert!(!tokens.engine_equivalent);
-                assert!(select_forward_input_ids(true, Some(&tokens), Some(&value)).is_none());
+                assert!(
+                    select_forward_input_ids(Surface::Chat, true, Some(&tokens), Some(&value))
+                        .is_none()
+                );
             }
         }
     }
