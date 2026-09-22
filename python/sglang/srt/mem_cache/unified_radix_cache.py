@@ -1445,7 +1445,9 @@ class UnifiedRadixCache(BasePrefixCache):
         device_indices, extra_transfers = self._retraction_device_transfers(req)
         host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
+            shortfall = len(device_indices) - self.host_pool_group.available_size()
+            if shortfall > 0:
+                self._reclaim_retraction_host(shortfall)
             host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -2835,7 +2837,9 @@ class UnifiedRadixCache(BasePrefixCache):
             alloc_len = hit_tokens
             host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
-                self.evict_host(alloc_len)
+                shortfall = alloc_len - cc.mem_pool_host.available_size()
+                if shortfall > 0:
+                    self.evict_host(shortfall)
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None and not buffer_mode:
                 # Memory-pressure fallback: a shorter page-aligned prefix.

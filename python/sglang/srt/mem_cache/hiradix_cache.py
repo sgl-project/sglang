@@ -630,7 +630,9 @@ class HiRadixCache(RadixCache):
                 alloc_len = operation.storage_hit_count
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    self.evict_host(alloc_len)
+                    shortfall = alloc_len - cc.mem_pool_host.available_size()
+                    if shortfall > 0:
+                        self.evict_host(shortfall)
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
                     # Memory-pressure fallback: a shorter page-aligned prefix.
@@ -869,7 +871,11 @@ class HiRadixCache(RadixCache):
             **self._get_extra_pools(),
         )
         if host_indices is None:
-            self.evict_host(len(node.value))
+            shortfall = (
+                len(node.value) - self.cache_controller.mem_pool_host.available_size()
+            )
+            if shortfall > 0:
+                self.evict_host(shortfall)
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
@@ -1426,7 +1432,11 @@ class HiRadixCache(RadixCache):
             **self._get_extra_pools(),
         )
         if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+            shortfall = (
+                len(host_indices) - self.token_to_kv_pool_allocator.available_size()
+            )
+            if shortfall > 0:
+                self.evict(EvictParams(num_tokens=shortfall))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,

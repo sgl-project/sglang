@@ -698,7 +698,9 @@ class MambaComponent(TreeComponent):
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
         host_indices = self._mamba_pool_host.alloc(num_tokens)
         if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.MAMBA)
+            shortfall = num_tokens - self._mamba_pool_host.available_size()
+            if shortfall > 0:
+                self.cache.evict_host(shortfall, ComponentType.MAMBA)
             host_indices = self._mamba_pool_host.alloc(num_tokens)
         return host_indices
 
