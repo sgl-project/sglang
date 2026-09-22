@@ -103,7 +103,6 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
-    INSTANTTENSOR_CONFIG_KEYS,
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
@@ -344,9 +343,10 @@ class BaseModelLoader(ABC):
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
-    allowed_keys = {"enable_multithread_load", "num_threads"}
     if load_format == LoadFormat.INSTANTTENSOR:
-        allowed_keys.update(INSTANTTENSOR_CONFIG_KEYS)
+        return
+
+    allowed_keys = {"enable_multithread_load", "num_threads"}
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(

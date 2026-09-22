@@ -79,17 +79,6 @@ logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
-INSTANTTENSOR_CONFIG_KEYS = frozenset(
-    {
-        "buffer_size",
-        "chunk_size",
-        "concurrency",
-        "io_depth",
-        "max_free_mem_usage",
-        "backend",
-    }
-)
-
 
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
@@ -1187,11 +1176,7 @@ def instanttensor_weights_iterator(
             'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
         ) from e
 
-    kwargs = {
-        key: value
-        for key, value in (extra_config or {}).items()
-        if key in INSTANTTENSOR_CONFIG_KEYS
-    }
+    kwargs = dict(extra_config or {})
     backend = kwargs.get("backend")
     if backend is not None:
         names = [backend] if isinstance(backend, str) else backend
@@ -1223,6 +1208,7 @@ def instanttensor_weights_iterator(
         framework="pt",
         device=device,
         process_group=process_group,
+        copy=True,
         **kwargs,
     ) as f:
         yield from tqdm(

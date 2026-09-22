@@ -34,11 +34,9 @@ class TestInstantTensorLoader(CustomTestCase):
         configs = [
             {},
             {
-                "backend": "MMAP",
-                "chunk_size": 4 * 1024 * 1024,
-                "concurrency": 2,
-                "io_depth": 2,
-                "max_free_mem_usage": 0.25,
+                "backend": "URING",
+                "chunk_size": 8 * 1024 * 1024,
+                "io_depth": 64,
             },
         ]
         for extra_config in configs:
