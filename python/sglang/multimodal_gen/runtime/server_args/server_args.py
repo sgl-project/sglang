@@ -2544,14 +2544,15 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --dit-layerwise-offload, keep this many DiT layers "
-            "permanently resident on GPU (retained across denoise steps) and stream "
-            "the rest with --dit-offload-prefetch-size; which layers stay resident "
-            "is --dit-layerwise-residency-policy. 0.0 = off (pure "
+            help="With --dit-layerwise-offload, keep this many DiT layers on the GPU "
+            "across the denoise steps of a request and stream the rest with "
+            "--dit-offload-prefetch-size; which layers stay is "
+            "--dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
-            "once (not re-streamed every step), so this trades VRAM for lower denoise "
-            "latency when memory is available.",
+            "once per request rather than once per step, so this trades VRAM for "
+            "lower denoise latency when memory is available. They are released when "
+            "the request finishes, not kept for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-prefetch-size",
@@ -2570,11 +2571,13 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             help="Per-component override of --dit-layerwise-resident-layers, as "
             "component=value entries, e.g. --layerwise-resident-layers "
-            "text_encoder=4. Resident layers are transferred once at startup "
-            "rather than streamed, so they cut the transfer of every pass "
-            "including the first -- an auxiliary component that runs once per "
-            "request still benefits, it just recovers the VRAM once per request "
-            "instead of once per denoising step.",
+            "video_vae=36. The layers are held on the GPU while that component "
+            "does its work for a request and released when it finishes, so this "
+            "pays for a component that runs its layers many times per request -- "
+            "a DiT across the denoise steps, a video VAE across the latent chunks. "
+            "A component that runs its layers once per request, such as a text "
+            "encoder, transfers the whole set again every request, so setting "
+            "this for one has no effect.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",

@@ -377,15 +377,15 @@ Those three set the default for every streamed component. To give one component 
 sglang serve --model-path <MODEL> \
   --layerwise-offload-components dit,text_encoder \
   --layerwise-prefetch-size text_encoder=2 \
-  --layerwise-resident-layers text_encoder=4 \
+  --layerwise-resident-layers transformer=4 \
   --layerwise-residency-policy text_encoder=strided
 ```
 
 - `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
-- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Resident layers are transferred once at startup, so they are removed from every pass. Fractional values are a share of the stack.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. They are held while the component does its work for a request and released when it finishes, so they are transferred once per request rather than once per pass — not kept for the life of the server. Fractional values are a share of the stack.
 - `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
 
-A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component: a DiT earns it back once per denoising step, a text encoder or VAE once per request. Measure before raising either.
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component. Resident layers pay for a component that runs its layers many times per request — a DiT across the denoise steps, a video VAE across the latent chunks — and do nothing for one that runs them once per request, such as a text encoder, which transfers the whole set again every request. Measure before raising either.
 
 ## Serve
 

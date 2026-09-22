@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -575,8 +576,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            transfer_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            transfer_kv_pool
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -1579,6 +1580,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -1960,6 +1962,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
+        swa_pages_charged = (
+            uses_swa_tail
+            and not is_swa_req_ring(allocator)
+            and not self.scheduler.enable_hisparse
+        )
+        required_swa_tokens = (
+            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
+        )
+        if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
+            # Admission includes evictable pages; allocation needs free pages.
+            # Separate-pool resumes skip the caller's unified-only reclaim.
+            reclaim_error = self._reclaim_swa_tail_capacity(
+                swa_tail_len, req.rid, full_len=required_alloc_tokens
+            )
+            if reclaim_error is not None:
+                logger.warning("%s", reclaim_error)
+
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -2003,7 +2022,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
+            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
 
