@@ -1111,7 +1111,7 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
 
 
 @pytest.mark.parametrize(
-    "request",
+    "image_request",
     [
         ImageGenerationsRequest(
             prompt="a mountain lake",
@@ -1124,8 +1124,8 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         ),
     ],
 )
-def test_sensenova_u1_thinking_fields_remain_model_specific(request):
-    assert _image_request_model_kwargs(request, SenseNovaU1SamplingParams) == {
+def test_sensenova_u1_thinking_fields_remain_model_specific(image_request):
+    assert _image_request_model_kwargs(image_request, SenseNovaU1SamplingParams) == {
         "think_mode": True,
         "max_think_tokens": 128,
     }
