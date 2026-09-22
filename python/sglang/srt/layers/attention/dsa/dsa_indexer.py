@@ -269,9 +269,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and getattr(config, "index_k_norm_type", "layer") == "rms"
         )
         aiter_fused_fp8_requested = (
-            _is_hip
-            and _use_aiter
-            and envs.SGLANG_AITER_FUSED_FP8_DSA_INDEXER.get()
+            _is_hip and _use_aiter and envs.SGLANG_AITER_FUSED_FP8_DSA_INDEXER.get()
         )
         self.use_aiter_fused_fp8_writer = (
             aiter_fused_fp8_requested
@@ -503,9 +501,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
-        kv_cache = pool.get_index_k_with_scale_buffer(layer_id=layer_id).view(
-            -1, pool.page_size, self.head_dim + 4
-        ).view(fp8_dtype)
+        kv_cache = (
+            pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            .view(-1, pool.page_size, self.head_dim + 4)
+            .view(fp8_dtype)
+        )
 
         q_fp8 = torch.empty_like(query, dtype=fp8_dtype)
         weights = torch.empty_like(weights_raw, dtype=torch.float32)

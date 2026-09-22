@@ -26,8 +26,7 @@ def _gfx950() -> bool:
     if not torch.cuda.is_available():
         return False
     return (
-        str(torch.cuda.get_device_properties(0).gcnArchName).split(":")[0]
-        == "gfx950"
+        str(torch.cuda.get_device_properties(0).gcnArchName).split(":")[0] == "gfx950"
     )
 
 
@@ -66,9 +65,7 @@ class TestFp8FusedDsaWriter(CustomTestCase):
 
     def _inputs(self, tokens: int):
         torch.manual_seed(2026 + tokens)
-        q = torch.randn(
-            tokens, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
-        )
+        q = torch.randn(tokens, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(tokens, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         weights = torch.randn(tokens, HEADS, dtype=torch.bfloat16, device="cuda")
         positions = torch.arange(tokens, dtype=torch.int64, device="cuda")
@@ -103,10 +100,7 @@ class TestFp8FusedDsaWriter(CustomTestCase):
             preshuffle=True,
         )
         weights_out = (
-            weights.float()
-            * q_scale.squeeze(-1)
-            * (HEAD_DIM**-0.5)
-            * (HEADS**-0.5)
+            weights.float() * q_scale.squeeze(-1) * (HEAD_DIM**-0.5) * (HEADS**-0.5)
         )
         return q_fp8, weights_out
 
