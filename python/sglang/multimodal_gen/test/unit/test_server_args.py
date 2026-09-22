@@ -3414,3 +3414,37 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_resident_layer_help_describes_the_actual_scope():
+    """The two resident-layer flags used to promise something they do not do.
+
+    `--dit-layerwise-resident-layers` said the layers were "permanently resident
+    on GPU" and `--layerwise-resident-layers` said they were "transferred once at
+    startup", with an auxiliary component that runs once per request still
+    benefiting. The resident set is released when a use ends, so a component
+    whose use is one forward pass re-transfers all of it every request --
+    measured on Qwen-Image-2.1, `text_encoder=0.8` reports `resident=53/66` and
+    changes neither memory nor latency.
+
+    Pinned here because a help string is exactly the kind of claim that drifts
+    back when someone edits nearby.
+    """
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    help_by_option = {
+        action.option_strings[0]: (action.help or "")
+        for action in parser._actions
+        if action.option_strings
+    }
+
+    dit_help = help_by_option["--dit-layerwise-resident-layers"]
+    assert "permanently resident" not in dit_help
+    assert "once per request" in dit_help
+    assert "life of the server" in dit_help
+
+    per_component_help = help_by_option["--layerwise-resident-layers"]
+    assert "once at startup" not in per_component_help
+    assert "still benefits" not in per_component_help
+    assert "once per request" in per_component_help
+    assert "has no effect" in per_component_help

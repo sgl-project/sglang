@@ -110,6 +110,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -125,6 +126,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -149,6 +151,30 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
+
+
+def _use_rocm_triton_softmax_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    correction_bias: Optional[torch.Tensor],
+    num_fused_shared_experts: int,
+    packed_out: Optional[torch.Tensor],
+) -> bool:
+    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    return (
+        _use_aiter
+        and _is_gfx95
+        and hidden_states.shape[1] == 4096
+        and hidden_states.dtype == torch.bfloat16
+        and gating_output.shape[0] <= 128
+        and gating_output.shape[1] == 512
+        and gating_output.dtype == torch.bfloat16
+        and topk == 10
+        and correction_bias is None
+        and num_fused_shared_experts == 0
+        and packed_out is None
+    )
 
 
 if _is_cuda:
@@ -991,7 +1017,15 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        if _use_aiter:
+        use_rocm_triton = _use_rocm_triton_softmax_topk(
+            hidden_states,
+            gating_output,
+            topk,
+            correction_bias,
+            num_fused_shared_experts,
+            packed_out,
+        )
+        if _use_aiter and not use_rocm_triton:
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
             topk_weights, topk_ids = aiter_fused_topk(
                 hidden_states,
@@ -1018,7 +1052,7 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
-        elif _is_cuda:
+        elif _is_cuda or use_rocm_triton:
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -2437,10 +2471,14 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
+    # router returns before it in biased_grouped_topk_gpu and upcasts the bias
+    # in-register, so downcasting here would only buy it a per-call cast back.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
