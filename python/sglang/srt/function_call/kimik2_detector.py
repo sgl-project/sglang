@@ -1,7 +1,11 @@
+import copy
 import json
 import logging
 import re
 from typing import List, Literal, Optional, Union
+
+from jsonschema import Draft202012Validator
+from referencing import Registry
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import (
@@ -15,12 +19,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
-
-try:
-    from jsonschema import Draft202012Validator
-except ImportError:  # pragma: no cover - jsonschema is a hard dependency of the server
-    Draft202012Validator = None
+from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
 
@@ -138,16 +137,13 @@ class KimiK2Detector(BaseFormatDetector):
         With a single tool the answer is unambiguous. Otherwise the arguments
         must be a JSON object that exactly one tool accepts, where "accepts"
         means: the object validates against the tool's ``parameters`` schema
-        (Draft 2020-12, the same validator the request path uses), and it
-        carries no key the schema does not declare unless the schema explicitly
-        allows additional properties. The second rule is an inference policy
-        on top of JSON Schema, whose default for undeclared keys is "allowed":
-        a tool schema almost never means to accept arbitrary keys, and a model
-        that hallucinated one should not be matched to a tool on the rest.
+        with unevaluated properties forbidden unless the schema explicitly
+        allows them. This extra-property rule is an inference policy on top of
+        JSON Schema's permissive default, not a change to the supplied schema.
 
-        Zero or several candidates return ``None`` so the caller drops the
-        call instead of guessing; a wrong guess would hand the client an
-        executable call to a tool the model did not choose.
+        Zero or several candidates, or an unevaluable schema, return ``None``.
+        Without an explicit name, a wrong guess could select an executable
+        tool the model did not choose.
         """
         if not tools:
             return None
@@ -170,57 +166,46 @@ class KimiK2Detector(BaseFormatDetector):
             return None
         if not isinstance(args, dict):
             return None
-        arg_keys = set(args)
-
         candidates = []
-        for tool in tools:
-            if self._schema_accepts_arguments(tool.function.parameters, args, arg_keys):
-                candidates.append(tool.function.name)
+        try:
+            for tool in tools:
+                if self._schema_accepts_arguments(tool.function.parameters, args):
+                    candidates.append(tool.function.name)
+        except Exception:
+            # An unevaluable candidate cannot be ruled out as a second match.
+            logger.warning(
+                "Could not evaluate schema for tool %r; cannot infer a tool name",
+                tool.function.name,
+            )
+            return None
 
         if len(candidates) == 1:
             return candidates[0]
         if candidates:
-            logger.warning(
+            logger.debug(
                 "Tool name inference is ambiguous: arguments with keys %s satisfy %s",
-                sorted(arg_keys),
+                sorted(args),
                 candidates,
             )
         return None
 
     @staticmethod
-    def _schema_accepts_arguments(schema, args: dict, arg_keys: set) -> bool:
+    def _schema_accepts_arguments(schema, args: dict) -> bool:
         """Whether ``args`` is a plausible argument object for ``schema``.
 
-        Boolean schemas are legal (``true`` accepts anything, ``false``
-        nothing); a missing schema behaves like ``true``.
+        Missing and true schemas accept only an empty object under the
+        inference policy. False schemas accept nothing.
         """
         if schema is None or schema is True:
             schema = {}
         if schema is False or not isinstance(schema, dict):
             return False
 
-        if Draft202012Validator is not None:
-            try:
-                if not Draft202012Validator(schema).is_valid(args):
-                    return False
-            except Exception:  # malformed schema: fall back to the key policy
-                logger.debug(
-                    "Could not validate arguments against tool schema", exc_info=True
-                )
-
-        props = set(get_schema_properties(schema).keys())
-        required = schema.get("required")
-        required = set(required) & props if isinstance(required, list) else set()
-        if not required <= arg_keys:
-            return False
-        extra_allowed = schema.get("additionalProperties")
-        if (
-            arg_keys <= props
-            or extra_allowed is True
-            or isinstance(extra_allowed, dict)
-        ):
-            return True
-        return False
+        schema = copy.deepcopy(schema)
+        normalize_json_schema_types(schema)
+        schema.setdefault("unevaluatedProperties", False)
+        # Local references resolve normally; untrusted schemas cannot fetch URLs.
+        return Draft202012Validator(schema, registry=Registry()).is_valid(args)
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -485,13 +470,6 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name")
 
-        if function_args is not None and not self.tool_call_id_counter_regex.match(
-            function_id
-        ):
-            logger.debug(
-                "Non-standard tool_call_id %r; inferring tool name from arguments",
-                function_id,
-            )
         return self._infer_tool_name(tools, function_args)
 
     def structure_info(self) -> _GetInfoFunc:

@@ -10,6 +10,7 @@ from sglang.srt.function_call.kimik2_detector import (
 )
 from sglang.srt.parser.reasoning_parser import KimiK2Detector as KimiK2ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
@@ -23,7 +24,8 @@ def _make_tool(name, parameters=None):
             name=name,
             description=f"{name} tool",
             parameters=parameters
-            or {
+            if parameters is not None
+            else {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path"},
@@ -58,7 +60,7 @@ def _collect_streaming_tool_calls(detector, chunks, tools):
 # ============================================================
 
 
-class TestKimiK2DetectorBasic(unittest.TestCase):
+class TestKimiK2DetectorBasic(CustomTestCase):
     """Basic non-streaming parsing tests for KimiK2Detector."""
 
     def setUp(self):
@@ -166,7 +168,7 @@ class TestKimiK2DetectorBasic(unittest.TestCase):
         self.assertFalse(self.detector.has_tool_call("no markers here"))
 
 
-class TestKimiK2DetectorHyphenatedNames(unittest.TestCase):
+class TestKimiK2DetectorHyphenatedNames(CustomTestCase):
     """Test support for hyphenated function names (common in MCP tools)."""
 
     def setUp(self):
@@ -206,7 +208,7 @@ class TestKimiK2DetectorHyphenatedNames(unittest.TestCase):
         self.assertEqual(params["path"], "/home")
 
 
-class TestKimiK2DetectorStreaming(unittest.TestCase):
+class TestKimiK2DetectorStreaming(CustomTestCase):
     """Streaming incremental parsing tests for KimiK2Detector."""
 
     def test_streaming_trailing_literal_left_angle_is_not_dropped(self):
@@ -283,7 +285,7 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
         self.assertEqual(detector.current_tool_id, 1)
 
 
-class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
+class TestKimiK2DetectorSpecialTokenLeakage(CustomTestCase):
     """Verify special tokens are never leaked into normal_text output."""
 
     def setUp(self):
@@ -335,7 +337,7 @@ class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
 # ============================================================
 
 
-class TestKimiK2ReasoningDetectorNonStreaming(unittest.TestCase):
+class TestKimiK2ReasoningDetectorNonStreaming(CustomTestCase):
     """Non-streaming tests for KimiK2ReasoningDetector."""
 
     def test_normal_reasoning_with_think_end(self):
@@ -404,7 +406,7 @@ class TestKimiK2ReasoningDetectorNonStreaming(unittest.TestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestKimiK2ReasoningDetectorStreaming(unittest.TestCase):
+class TestKimiK2ReasoningDetectorStreaming(CustomTestCase):
     """Streaming tests for KimiK2ReasoningDetector."""
 
     def _run_streaming(self, chunks, **kwargs):
@@ -530,7 +532,7 @@ class TestKimiK2ReasoningDetectorStreaming(unittest.TestCase):
 # ============================================================
 
 
-class TestKimiK2EndToEnd(unittest.TestCase):
+class TestKimiK2EndToEnd(CustomTestCase):
     """
     End-to-end tests simulating the full flow:
     reasoning parser -> tool call parser.
@@ -1109,7 +1111,7 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 # ============================================================
 
 
-class TestKimiK2DetectorOpenAIIndexCompliance(unittest.TestCase):
+class TestKimiK2DetectorOpenAIIndexCompliance(CustomTestCase):
     """The detector must emit ``tool_index`` as a dense, 0-based position
     within the *current response* (per the OpenAI streaming spec), regardless
     of the value of the model's conversation-level ``:N`` counter in the
@@ -1258,7 +1260,7 @@ class TestKimiK2DetectorOpenAIIndexCompliance(unittest.TestCase):
 # ============================================================
 
 
-class TestKimiK2BareCounterParsing(unittest.TestCase):
+class TestKimiK2BareCounterParsing(CustomTestCase):
     """Tests for bare numeric tool_call_id format (e.g., '3' instead of 'functions.ReadFile:0')."""
 
     def setUp(self):
@@ -1396,7 +1398,7 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "search")
 
 
-class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
+class TestKimiK2ClientStyleIdFallback(CustomTestCase):
     """Client-style tool_call_ids: ``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs.
 
     The chat template renders history ``tool_call.id`` values verbatim, so a
@@ -1603,7 +1605,7 @@ class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
         self.assertNotIn("<|tool_call", normal)
 
 
-class TestKimiK2ToolNameInferenceStrictness(unittest.TestCase):
+class TestKimiK2ToolNameInferenceStrictness(CustomTestCase):
     """``_infer_tool_name`` returns a name only when the arguments satisfy
     exactly one tool schema (all required keys present, no undeclared keys).
 
@@ -1708,10 +1710,10 @@ class TestKimiK2ToolNameInferenceStrictness(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(self._infer(args), self._infer(args, reversed_tools))
 
-    def test_ambiguous_arguments_return_none_and_warn(self):
+    def test_ambiguous_arguments_return_none(self):
         # {"pattern", "path"} satisfies both Glob and Grep.
         with self.assertLogs(
-            "sglang.srt.function_call.kimik2_detector", level="WARNING"
+            "sglang.srt.function_call.kimik2_detector", level="DEBUG"
         ) as logs:
             self.assertIsNone(self._infer('{"pattern": "a", "path": "/x"}'))
         self.assertTrue(any("ambiguous" in line for line in logs.output))
