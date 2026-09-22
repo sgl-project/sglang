@@ -669,7 +669,9 @@ class TestPackedDraftPairing(CustomTestCase):
         no_index = _dsa_pool_stub(layer_num=1)
         no_index.index_key_cache = SimpleNamespace(buffer=[])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            validate_packed_draft_pools(target.host_pool_decls(), (no_index,))
+            validate_packed_draft_pools(
+                target_decls=target.host_pool_decls(), draft_pools=(no_index,)
+            )
 
     def test_draft_with_empty_index_layers_is_rejected(self):
         # A 0-row placeholder layer would be packed as a null device pointer.
@@ -678,18 +680,24 @@ class TestPackedDraftPairing(CustomTestCase):
         shared.skip_topk_layers = [True]
         shared.index_key_cache = SimpleNamespace(buffer=[object()])
         with self.assertRaisesRegex(ValueError, "draft counterpart"):
-            validate_packed_draft_pools(target.host_pool_decls(), (shared,))
+            validate_packed_draft_pools(
+                target_decls=target.host_pool_decls(), draft_pools=(shared,)
+            )
         partial = _dsa_pool_stub(layer_num=2)
         partial.skip_topk_layers = [False, True]
         with self.assertRaisesRegex(ValueError, "owns buffers on 1 of 2"):
-            validate_packed_draft_pools(target.host_pool_decls(), (partial,))
+            validate_packed_draft_pools(
+                target_decls=target.host_pool_decls(), draft_pools=(partial,)
+            )
 
     def test_storage_info_mismatch_is_rejected(self):
         target = _dsa_pool_stub(layer_num=2)
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
         with self.assertRaisesRegex(ValueError, "storage"):
-            validate_packed_draft_pools(target.host_pool_decls(), (wide,))
+            validate_packed_draft_pools(
+                target_decls=target.host_pool_decls(), draft_pools=(wide,)
+            )
 
     def test_pool_with_only_shared_topk_layers_declares_kv_only(self):
         pool = _dsa_pool_stub(layer_num=2)
@@ -1197,7 +1205,7 @@ class TestHostPoolPreflight(CustomTestCase):
         draft = _dsa_pool_stub(layer_num=1)
         draft.host_pool_decls = MagicMock(wraps=draft.host_pool_decls)
         decls = target.host_pool_decls()
-        drafts = validate_packed_draft_pools(decls, (draft,))
+        drafts = validate_packed_draft_pools(target_decls=decls, draft_pools=(draft,))
         configs = prepare_host_pool_configs(
             decls=decls,
             full_layer_mapping={0: 0, 4: 1, 5: 2},
@@ -1216,7 +1224,9 @@ class TestHostPoolPreflight(CustomTestCase):
         declarations = draft.host_pool_decls()
         draft.host_pool_decls = lambda: (*declarations, declarations[1])
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            validate_packed_draft_pools(target.host_pool_decls(), (draft,))
+            validate_packed_draft_pools(
+                target_decls=target.host_pool_decls(), draft_pools=(draft,)
+            )
 
     def test_transfer_range_is_not_the_number_of_entries(self):
         decls = _dsa_pool_stub(layer_num=2).host_pool_decls()
@@ -1309,7 +1319,9 @@ class TestDeclaredPoolVerification(CustomTestCase):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
             _check_declared_pools_present(
-                pool, self._result_with(PoolName.KV), _SwaStrategy()
+                kvcache=pool,
+                result=self._result_with(PoolName.KV),
+                strategy=_SwaStrategy(),
             )
         self.assertIn("indexer", logs.output[0])
 
@@ -1317,13 +1329,17 @@ class TestDeclaredPoolVerification(CustomTestCase):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
             _check_declared_pools_present(
-                pool, self._result_with(PoolName.KV), _DsaStrategy()
+                kvcache=pool,
+                result=self._result_with(PoolName.KV),
+                strategy=_DsaStrategy(),
             )
 
     def test_complete_stack_passes_silently(self):
         pool = _dsa_pool_stub(layer_num=2)
         _check_declared_pools_present(
-            pool, self._result_with(PoolName.KV, PoolName.INDEXER), _DsaStrategy()
+            kvcache=pool,
+            result=self._result_with(PoolName.KV, PoolName.INDEXER),
+            strategy=_DsaStrategy(),
         )
 
     def test_hybrid_pool_declares_through_its_sub_pool(self):
@@ -1346,7 +1362,9 @@ class TestDeclaredPoolVerification(CustomTestCase):
         pool = _qsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
             _check_declared_pools_present(
-                pool, self._result_with(PoolName.KV, PoolName.MAMBA), _MambaStrategy()
+                kvcache=pool,
+                result=self._result_with(PoolName.KV, PoolName.MAMBA),
+                strategy=_MambaStrategy(),
             )
 
 

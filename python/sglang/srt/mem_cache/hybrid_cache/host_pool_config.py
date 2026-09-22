@@ -32,7 +32,7 @@ class HostPoolBuildConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def validate_packed_draft_pools(
-    target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
+    *, target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
 ) -> tuple[tuple[HostPoolDecl, ...], ...]:
     """Collect draft declarations once and check they can be appended to target host
     pools: it declares the same pools with the same storage info and every
@@ -87,7 +87,7 @@ def layout_root(decls: tuple[HostPoolDecl, ...]) -> HostPoolDecl:
     return roots[0]
 
 
-def _find_pool_decl(decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostPoolDecl:
+def _find_pool_decl(*, decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostPoolDecl:
     return next(d for d in decls if d.pool_name == name)
 
 
@@ -183,14 +183,14 @@ def prepare_host_pool_configs(
             decl=d,
             layer_binding=LayerBinding(
                 transfer_to_device=_filter_owned_layer_mapping(
-                    full_layer_mapping,
-                    d.owned_device_layers,
-                    root.device_pool.layer_num,
+                    mapping=full_layer_mapping,
+                    owned_device_layers=d.owned_device_layers,
+                    target_layer_num=root.device_pool.layer_num,
                 ),
                 transfer_layer_id_max=transfer_layer_id_max,
             ),
             packed_draft_device_pools=tuple(
-                _find_pool_decl(decls_of_draft, d.pool_name).device_pool
+                _find_pool_decl(decls=decls_of_draft, name=d.pool_name).device_pool
                 for decls_of_draft in packed_draft_decls
             ),
         )
@@ -199,6 +199,7 @@ def prepare_host_pool_configs(
 
 
 def _filter_owned_layer_mapping(
+    *,
     mapping: dict[int, int],
     owned_device_layers: Optional[tuple[int, ...]],
     target_layer_num: int,

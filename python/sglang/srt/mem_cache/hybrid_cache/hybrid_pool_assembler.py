@@ -155,7 +155,7 @@ def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
     return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
 
 
-def _check_packed_kv_rows(kv_pool: Any, drafts: tuple[Any, ...], *, use_mla: bool):
+def _check_packed_kv_rows(*, kv_pool: Any, drafts: tuple[Any, ...], use_mla: bool):
     """Packed draft KV layers share the target's host row, so their device
     rows must have the same shape and dtype."""
     if not drafts:
@@ -186,7 +186,9 @@ def build_kv_host_pool(
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim; the
         # device pool already resolved the row width.
         override_kv_cache_dim = kv_pool.kv_cache_dim
-    _check_packed_kv_rows(kv_pool, mtp_draft_device_pools, use_mla=use_mla)
+    _check_packed_kv_rows(
+        kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
+    )
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -1042,7 +1044,9 @@ def build_hybrid_mamba_stack(
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    packed_drafts = validate_packed_draft_pools(decls, params.mtp_draft_device_pools)
+    packed_drafts = validate_packed_draft_pools(
+        target_decls=decls, draft_pools=params.mtp_draft_device_pools
+    )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -1099,24 +1103,16 @@ def build_hybrid_mamba_stack(
         )
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_declared_controller(
+        params=params,
+        host_pool_group=host_pool_group,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return HostPoolAssemblyResult(
         host_pool_group=host_pool_group,
@@ -1270,8 +1266,8 @@ def _validate_host_pool_buffers(
 
     root = _root_config(configs)
     _check_packed_kv_rows(
-        root.decl.device_pool,
-        root.packed_draft_device_pools,
+        kv_pool=root.decl.device_pool,
+        drafts=root.packed_draft_device_pools,
         use_mla=isinstance(root.decl.device_pool, MLATokenToKVPool),
     )
     for config in configs:
@@ -1281,6 +1277,39 @@ def _validate_host_pool_buffers(
                 page_size=page_size,
                 packed_draft_device_pools=config.packed_draft_device_pools,
             )
+
+
+def _build_declared_controller(
+    *,
+    params: CacheInitParams,
+    host_pool_group: HostPoolGroup,
+    load_cache_event,
+    storage_backend: Optional[str],
+    prefetch_threshold: int,
+    model_name: Optional[str],
+    storage_backend_extra_config: Optional[dict],
+    transfer_layer_id_max: int,
+    enable_storage_metrics: bool,
+) -> HybridCacheController:
+    return HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=get_memory().hicache_write_policy,
+        io_backend=get_memory().hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=get_memory().hicache_host_memory_mode,
+    )
 
 
 def _build_declared_entries(
@@ -1335,7 +1364,9 @@ def assemble_host_pools_from_decls(
     """
     kv_pool = layout_root(decls).device_pool
     transfer_layer_id_max = max(full_layer_mapping, default=-1) + 1
-    packed_drafts = validate_packed_draft_pools(decls, params.mtp_draft_device_pools)
+    packed_drafts = validate_packed_draft_pools(
+        target_decls=decls, draft_pools=params.mtp_draft_device_pools
+    )
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if packed_drafts:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -1360,24 +1391,16 @@ def assemble_host_pools_from_decls(
     )
     entries = _build_declared_entries(configs, root_host_pool=kv_host_pool)
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_declared_controller(
+        params=params,
+        host_pool_group=host_pool_group,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return HostPoolAssemblyResult(
         host_pool_group=host_pool_group,
@@ -2082,7 +2105,7 @@ _DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_PlainKvStrategy, _MambaSt
 
 
 def _check_declared_pools_present(
-    kvcache: Any, result: StackBuildResult, strategy: StackStrategy
+    *, kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
     entries = result.host_pool_group.entry_map
     decls = result.pool_declarations
@@ -2160,7 +2183,7 @@ def attach_hybrid_pool_to_unified_cache(
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
-        _check_declared_pools_present(kvcache, result, strategy)
+        _check_declared_pools_present(kvcache=kvcache, result=result, strategy=strategy)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")
