@@ -375,25 +375,28 @@ def propose_lilicorr_block(
         anchor_hidden=anchor_hidden,
         anchor_valid=anchor_valid,
     )
-    if not sampling_enabled:
-        return head.select(**common).to(torch.long), None, None
-
     device = draft_hidden.device
-    temperatures = (
-        torch.ones(bs, dtype=torch.float32, device=device)
-        if sampling_info is None
+    if sampling_enabled and sampling_info is not None:
         # Clamped as DSpark and the DFlash2 selector do: a greedy row's temperature may
         # be exactly 0, and it divides before greedy_mask discards its pick.
-        else sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
+        temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
+    else:
+        temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+    # Sampling off is an all-greedy mask, which the walk commits by argmax and whose
+    # uniforms it never reads.
+    greedy_mask = (
+        resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+        if sampling_enabled
+        else torch.ones(bs, dtype=torch.bool, device=device)
     )
     selected, q_rows = head.select_with_proposal(
         uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
         temperatures=temperatures,
-        greedy_mask=resolve_greedy_mask(
-            bs=bs, sampling_info=sampling_info, device=device
-        ),
+        greedy_mask=greedy_mask,
         **common,
     )
+    if not sampling_enabled:
+        return selected.to(torch.long), None, None
     return selected.to(torch.long), candidate_tokens, q_rows
 
 
@@ -454,8 +457,10 @@ class LiLiCorrDraftSampler:
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
+        # Defaults are the all-greedy commit, and stage_sampling_params is a no-op with
+        # sampling off, so the buffers stay valid for a run that never touches them.
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
-        self.uniforms = torch.empty(
+        self.uniforms = torch.zeros(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
         )
         self.q_out = torch.empty(
@@ -466,8 +471,6 @@ class LiLiCorrDraftSampler:
         self.candidate_out = torch.empty(
             (self.max_bs, self.slots, self.topk), dtype=torch.int64, device=device
         )
-
-        self._select = head.select_with_proposal if sampling_enabled else head.select
 
     def set_anchor(self, rows: Optional[torch.Tensor], bs: int) -> None:
         """Publish this step's anchor into the buffer the graph reads.
@@ -554,17 +557,17 @@ class LiLiCorrDraftSampler:
             already_projected=pre_projected,
         )
         if self.sampling_enabled:
-            selected, q_rows = self._select(
-                # In-graph philox draw: each replay advances the generator and redraws.
-                uniforms=self.uniforms[:bs].uniform_(),
-                temperatures=self.temperatures[:bs],
-                greedy_mask=self.greedy_mask[:bs],
-                **common,
-            )
+            # In-graph philox draw: each replay advances the generator and redraws.
+            self.uniforms[:bs].uniform_()
+        selected, q_rows = self.head.select_with_proposal(
+            uniforms=self.uniforms[:bs],
+            temperatures=self.temperatures[:bs],
+            greedy_mask=self.greedy_mask[:bs],
+            **common,
+        )
+        if self.sampling_enabled:
             self.q_out[:bs].copy_(q_rows)
             self.candidate_out[:bs].copy_(candidate_tokens)
-        else:
-            selected = self._select(**common)
         self.out[:rows].copy_(selected.reshape(-1).to(torch.int64))
 
 

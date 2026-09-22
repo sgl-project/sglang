@@ -19,10 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.lilicorr import (
-    lilicorr_greedy_path,
-    lilicorr_sample_path,
-)
+from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
@@ -389,39 +386,6 @@ class LiLiCorrHead(nn.Module):
             self.logit_scale * pair_scores.float(),
         )
 
-    def select(
-        self,
-        *,
-        token_embeddings: torch.Tensor,
-        candidate_tokens: torch.Tensor,
-        candidate_log_probs: torch.Tensor,
-        pass_hidden: torch.Tensor,
-        anchor_hidden: torch.Tensor,
-        anchor_valid: torch.Tensor,
-        already_projected: bool = False,
-    ) -> torch.Tensor:
-        """Single-block best-path selection from a precomputed lattice.
-
-        candidate_* are [bs, slots, topk], token_embeddings is [bs, slots, topk, *],
-        pass_hidden is [bs, slots, model_hidden], anchor_hidden is [bs, feat] and
-        anchor_valid is [bs]. Returns the selected tokens [bs, slots].
-
-        Static shapes, no collectives and no host syncs, so the draft CUDA graph can
-        capture it.
-        """
-        start_scores, pair_scores = self.score(
-            token_embeddings=token_embeddings.unsqueeze(1),
-            candidate_log_probs=candidate_log_probs.unsqueeze(1),
-            pass_hidden=pass_hidden.unsqueeze(1),
-            anchor_hidden=anchor_hidden.unsqueeze(1),
-            anchor_valid=anchor_valid.unsqueeze(1),
-            already_projected=already_projected,
-        )
-        log_start, log_pair = self.log_factors(start_scores, pair_scores)
-        return lilicorr_greedy_path(
-            log_start[:, 0, :], log_pair[:, 0], candidate_tokens
-        )
-
     def select_with_proposal(
         self,
         *,
@@ -436,11 +400,16 @@ class LiLiCorrHead(nn.Module):
         greedy_mask: torch.Tensor,
         already_projected: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """`select`, sampling the commit and returning the proposal it used.
+        """Single-block best-path selection, plus the proposal it committed from.
 
-        Same arguments plus the per-row sampling state, and returns (tokens [bs, slots],
-        q_rows [bs, slots, topk]). uniforms is [bs, slots], one draw per slot, and
-        temperatures / greedy_mask are [bs].
+        candidate_* are [bs, slots, topk], token_embeddings is [bs, slots, topk, *],
+        pass_hidden is [bs, slots, model_hidden], anchor_hidden is [bs, feat],
+        anchor_valid is [bs], uniforms is [bs, slots] and temperatures / greedy_mask are
+        [bs]. Returns (tokens [bs, slots], q_rows [bs, slots, topk]).
+
+        An all-greedy mask makes this the plain argmax commit, so this is the only entry
+        point. Static shapes, no collectives and no host syncs, so the draft CUDA graph
+        can capture it.
         """
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),

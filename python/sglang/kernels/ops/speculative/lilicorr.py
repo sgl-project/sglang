@@ -4,9 +4,9 @@ lilicorr_topk_lse returns an exact per-row top-k over the candidate vocab logits
 full-vocab log-partition from one pass over [n, V].
 
 lilicorr_sample_path commits one path through the candidate lattice and emits the
-per-slot proposal verify needs to accept it by rejection sampling; lilicorr_greedy_path
-is that walk with every row greedy. Both adapt the head's factors to DFlash2's
-selector_walk_triton, and dispatch to a value-identical torch implementation off CUDA.
+per-slot proposal verify needs to accept it by rejection sampling; an all-greedy mask
+makes it the plain argmax commit. It adapts the head's factors to DFlash2's
+selector_walk_triton, and dispatches to a value-identical torch implementation off CUDA.
 """
 
 from __future__ import annotations
@@ -291,26 +291,3 @@ def lilicorr_sample_path(
         temperatures=temperatures,
         greedy_mask=greedy_mask,
     )
-
-
-def lilicorr_greedy_path(
-    log_start: torch.Tensor,
-    log_pair: torch.Tensor,
-    candidate_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """lilicorr_sample_path with every row greedy, for a batch with no sampling state.
-
-    Returns the selected tokens [bs, slots]. Shares the walk, so the commit is
-    bit-identical to the greedy rows of a mixed sampled batch.
-    """
-    bsz, num_slots, _ = candidate_tokens.shape
-    device = log_start.device
-    tokens, _ = lilicorr_sample_path(
-        log_start,
-        log_pair,
-        candidate_tokens,
-        uniforms=torch.zeros(bsz, num_slots, dtype=torch.float32, device=device),
-        temperatures=torch.ones(bsz, dtype=torch.float32, device=device),
-        greedy_mask=torch.ones(bsz, dtype=torch.bool, device=device),
-    )
-    return tokens

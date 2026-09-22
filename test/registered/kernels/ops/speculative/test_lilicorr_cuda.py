@@ -17,7 +17,6 @@ from sglang.kernels.ops.speculative.lilicorr import (
     _lattice_scores,
     _selector_walk_torch,
     _topk_lse_torch,
-    lilicorr_greedy_path,
     lilicorr_sample_path,
     lilicorr_topk_lse,
 )
@@ -138,15 +137,34 @@ def _walk_reference(
     )
 
 
+def _greedy_state(bs, slots, device):
+    # An all-greedy mask is how the serving path asks for the argmax commit, so the
+    # greedy tests drive the one entry point rather than a greedy-only wrapper.
+    return dict(
+        uniforms=torch.zeros(bs, slots, device=device),
+        temperatures=torch.ones(bs, device=device),
+        greedy_mask=torch.ones(bs, dtype=torch.bool, device=device),
+    )
+
+
+def _greedy(log_start, log_pair, candidate_tokens):
+    bs, slots, _ = candidate_tokens.shape
+    tokens, _ = lilicorr_sample_path(
+        log_start,
+        log_pair,
+        candidate_tokens,
+        **_greedy_state(bs, slots, candidate_tokens.device),
+    )
+    return tokens
+
+
 def _greedy_reference(log_start, log_pair, candidate_tokens):
     bs, slots, _ = candidate_tokens.shape
     tokens, _ = _walk_reference(
         log_start,
         log_pair,
         candidate_tokens,
-        uniforms=torch.zeros(bs, slots),
-        temperatures=torch.ones(bs),
-        greedy_mask=torch.ones(bs, dtype=torch.bool),
+        **_greedy_state(bs, slots, torch.device("cpu")),
     )
     return tokens
 
@@ -160,7 +178,7 @@ def test_greedy_path_matches_the_reference(topk):
     log_pair = torch.randn(bs, slots - 1, topk, topk, device="cuda")
     tokens = torch.randint(0, 151936, (bs, slots, topk), device="cuda")
 
-    actual = lilicorr_greedy_path(log_start, log_pair, tokens)
+    actual = _greedy(log_start, log_pair, tokens)
     expected = _greedy_reference(log_start, log_pair, tokens)
 
     torch.testing.assert_close(actual.cpu(), expected)
@@ -174,7 +192,7 @@ def test_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
     log_pair = torch.zeros(2, 14, 8, 8, device="cuda")
     tokens = torch.arange(2 * 15 * 8, device="cuda").view(2, 15, 8)
 
-    actual = lilicorr_greedy_path(log_start, log_pair, tokens)
+    actual = _greedy(log_start, log_pair, tokens)
     expected = _greedy_reference(log_start, log_pair, tokens)
 
     torch.testing.assert_close(actual.cpu(), expected)
@@ -194,7 +212,7 @@ def test_greedy_path_accepts_a_non_unit_stride_factor_view():
     transposed = base.transpose(-1, -2)
     assert transposed.stride(-1) != 1, "the view under test must be non-contiguous"
 
-    actual = lilicorr_greedy_path(log_start, transposed, tokens)
+    actual = _greedy(log_start, transposed, tokens)
     expected = _greedy_reference(log_start, transposed.contiguous(), tokens)
     torch.testing.assert_close(actual.cpu(), expected)
 
