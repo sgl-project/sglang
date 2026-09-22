@@ -5,7 +5,8 @@ input across the TVM-FFI boundary (sgl-project/sglang#39684). The wrappers in
 ``sglang.srt.layers.deep_gemm_wrapper.entrypoint`` must hand back the input
 itself in that case so the caller keeps the storage alive.
 
-Requires one GPU and sgl-deep-gemm.
+Requires one CUDA GPU (SM90+) and sgl-deep-gemm. Registered as a kernel ops
+test (needs a live CUDA allocator to exercise the aliasing path).
 """
 
 import gc
@@ -16,7 +17,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 try:
     from sglang.srt.layers import deep_gemm_wrapper
