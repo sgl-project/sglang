@@ -2002,6 +2002,15 @@ class FlashInferIndicesUpdaterPrefill:
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
+            elif use_ragged:
+                # The ragged wrapper reads new K/V before they enter the cache.
+                paged_kernel_lens = prefix_lens
+                paged_kernel_lens_sum = (
+                    sum(extend_prefix_lens_cpu)
+                    if extend_prefix_lens_cpu is not None
+                    else prefix_lens.sum().item()
+                )
+                kv_start_idx = None
             else:
                 # full attention
                 paged_kernel_lens = seq_lens

@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
@@ -68,6 +68,19 @@ class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
             super().tearDownClass()
         if hasattr(cls, "checkpoint"):
             cls.checkpoint.cleanup()
+
+
+class TestBeamKLFlashInferChunked(TestBeamKL):
+    """FlashInfer prefix reuse must match fresh prefill across chunk boundaries."""
+
+    other_args = [
+        "--attention-backend",
+        "flashinfer",
+        "--chunked-prefill-size",
+        "256",
+        "--mem-fraction-static",
+        "0.3",
+    ]
 
 
 if __name__ == "__main__":
