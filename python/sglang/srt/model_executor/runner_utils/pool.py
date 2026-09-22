@@ -140,6 +140,10 @@ class GraphPoolPrecarve:
     @contextmanager
     def measure(self) -> Iterator[None]:
         """Wrap one eager warmup. the last one before ``mint`` sets the size."""
+        # Pre-carve relies on torch.cuda allocator peak reserved memory stats.
+        # On non-CUDA devices (e.g., Intel XPU, Ascend NPU), torch.cuda APIs are unavailable
+        # and allocator stats cannot reliably measure graph-pool footprints, so measurement
+        # is a safe no-op.
         if (
             self.minted
             or not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
@@ -161,6 +165,9 @@ class GraphPoolPrecarve:
 
     def mint(self) -> None:
         """Pre-allocate the space"""
+        # Pre-carve allocates a slab on device="cuda" using CUDA allocator semantics.
+        # On non-CUDA platforms (XPU, NPU), pre-carve is disabled to prevent crashes
+        # and avoid interfering with device-specific graph memory management.
         if self.minted or not is_cuda():
             return
         self.minted = True
