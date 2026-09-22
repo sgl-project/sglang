@@ -3,7 +3,9 @@
 import hashlib
 import sys
 from array import array
+from itertools import pairwise
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -1460,6 +1462,210 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
         sliding_window_size=window,
         **params_overrides,
     )
+
+
+def _swa_transfer_core(backend, unified=False):
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+        UnifiedSWAAllocatorBase,
+    )
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+    allocator = Mock(
+        spec=UnifiedSWAAllocatorBase if unified else SWATokenToKVPoolAllocator
+    )
+    allocator.device = torch.device("cpu")
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=allocator,
+        page_size=1,
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=16,
+    )
+    if backend == "rust":
+        core = RustUnifiedTreeCore(params)
+    else:
+        cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator, enable_session_radix_cache=False
+        )
+        core = UnifiedTreeCore(
+            params,
+            {
+                ComponentType.FULL: FullComponent(cache, params),
+                ComponentType.SWA: SWAComponent(cache, params),
+            },
+        )
+        cache.tree_core = core
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core, allocator
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("resident_full", [(), (0,), (0, 1, 2, 3)])
+def test_swa_load_back_preserves_full_anchors_across_holes(backend, resident_full):
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.pool_host.group import PoolEntry
+
+    core, _ = _swa_transfer_core(backend)
+    nodes = []
+    boundaries = (0, 2, 5, 6, 8)
+    for start, end in pairwise(boundaries):
+        node = _insert(
+            core, list(range(end)), list(range(10, 10 + end))
+        ).last_device_node
+        nodes.append(node)
+        core.set_component_device_value(
+            node, ComponentType.SWA, torch.arange(50 + start, 50 + end)
+        )
+        core.commit_backup(
+            node,
+            torch.arange(100 + start, 100 + end),
+            {
+                ComponentType.SWA: [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=torch.arange(300 + start, 300 + end),
+                        nodes_to_load=[node],
+                    )
+                ]
+            },
+        )
+    for node in reversed(nodes):
+        _accumulate_step(core.demote(node), {}, {}, {})
+    # SWA is resident in the three-token middle node, leaving a hole in its
+    # load list even when that node still needs a Full load.
+    core.set_component_device_value(nodes[1], ComponentType.SWA, torch.arange(52, 55))
+    for index in resident_full:
+        start, end = boundaries[index : index + 2]
+        core.commit_load_back(
+            nodes[index],
+            torch.arange(10 + start, 10 + end),
+            PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.arange(100 + start, 100 + end),
+                nodes_to_load=[nodes[index]],
+            ),
+            {},
+        )
+        core.finish_load_back(nodes[index])
+
+    kv, auxiliary = core.build_load_back_spec(nodes[-1])
+    (swa,) = auxiliary[ComponentType.SWA]
+    assert swa.nodes_to_load == [nodes[0], nodes[2], nodes[3]]
+    assert swa.host_indices.tolist() == [300, 301, 305, 306, 307]
+    expected = {
+        (): [slice(0, 2), slice(5, 6), slice(6, 8)],
+        (0,): [torch.tensor([10, 11]), slice(3, 4), slice(4, 6)],
+        (0, 1, 2, 3): [
+            torch.tensor([10, 11]),
+            torch.tensor([15]),
+            torch.tensor([16, 17]),
+        ],
+    }[resident_full]
+    assert swa.anchor_index_parts is not None
+    assert len(swa.anchor_index_parts) == len(expected)
+    for actual, wanted in zip(swa.anchor_index_parts, expected):
+        if isinstance(wanted, slice):
+            assert actual == wanted
+        else:
+            torch.testing.assert_close(actual, wanted)
+
+    # Exercise the consumer too: new Full rows and resident virtual IDs must
+    # bind the same five SWA rows, without consuming the resident-SWA hole.
+    bind = Mock(side_effect=lambda indices: indices + 1000)
+    controller = object.__new__(HybridCacheController)
+    controller.mem_pool_host = SimpleNamespace(
+        entry_map={
+            PoolName.SWA: PoolEntry(
+                name=PoolName.SWA,
+                host_pool=SimpleNamespace(),
+                device_pool=SimpleNamespace(),
+                layer_mapper=lambda i: i,
+                device_indices_from_anchor_fn=bind,
+                device_free_fn=Mock(),
+            )
+        }
+    )
+    loaded = torch.arange(200, 200 + len(kv.host_indices))
+    assert controller._resolve_device_transfers([swa], loaded) is not None
+    expected_bound = {
+        (): [1200, 1201, 1205, 1206, 1207],
+        (0,): [1010, 1011, 1203, 1204, 1205],
+        (0, 1, 2, 3): [1010, 1011, 1015, 1016, 1017],
+    }[resident_full]
+    assert swa.device_indices.tolist() == expected_bound
+    assert bind.call_count == 1
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("unified", [False, True])
+@pytest.mark.parametrize("entrypoint", ["backup_spec", "component_transfer"])
+def test_swa_backup_resolves_relocated_full_virtual_ids(backend, unified, entrypoint):
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core, allocator = _swa_transfer_core(backend, unified=unified)
+    mapping = torch.arange(64) + 100
+    allocator.translate_loc_from_full_to_swa.side_effect = lambda indices: mapping[
+        indices
+    ]
+    values = [11, 7, 20, 4, 9, 13]
+    nodes = []
+    for start, end in ((0, 2), (2, 5), (5, 6)):
+        node = _insert(core, list(range(end)), values[:end]).last_device_node
+        nodes.append(node)
+        core.set_component_device_value(
+            node, ComponentType.SWA, mapping[torch.tensor(values[start:end])].clone()
+        )
+    # A hosted middle node is excluded from the next SWA backup.
+    core.commit_backup(
+        nodes[1],
+        torch.arange(302, 305),
+        {
+            ComponentType.SWA: [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.arange(402, 405),
+                    nodes_to_load=[nodes[1]],
+                )
+            ]
+        },
+    )
+    # Relocation changes kernel-facing SWA addresses while tree-owned Full
+    # virtual IDs and cached SWA physical snapshots stay unchanged.
+    mapping[torch.tensor([11, 7, 13])] = torch.tensor([511, 407, 613])
+    allocator.translate_loc_from_full_to_swa.reset_mock()
+    if entrypoint == "backup_spec":
+        full, auxiliary = core.build_backup_spec(nodes[-1])
+        assert full.tolist() == [13]
+        (swa,) = auxiliary[ComponentType.SWA]
+    else:
+        (swa,) = core.build_hicache_transfers(
+            ComponentType.SWA, nodes[-1], CacheTransferPhase.BACKUP_HOST
+        )
+    assert swa.nodes_to_load == [nodes[0], nodes[2]]
+    assert swa.device_indices.dtype == torch.int64
+    assert swa.device_indices.tolist() == (
+        [511, 407, 613] if unified else [111, 107, 113]
+    )
+    if unified:
+        allocator.translate_loc_from_full_to_swa.assert_called_once()
+        assert allocator.translate_loc_from_full_to_swa.call_args.args[0].tolist() == [
+            11,
+            7,
+            13,
+        ]
+    else:
+        allocator.translate_loc_from_full_to_swa.assert_not_called()
+    assert core.get_component_device_value(nodes[0], ComponentType.SWA).tolist() == [
+        111,
+        107,
+    ]
 
 
 def test_swa_core_rejects_a_missing_or_non_positive_window():

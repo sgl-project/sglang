@@ -1280,6 +1280,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    /// Logical key lengths for the nodes in a load-back transfer.
+    fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+        py.allow_threads(|| self.core().get_node_key_lengths(&node_ids))
+            .map_err(node_access_error)
+    }
+
     /// A component's device value on a node, if set.
     fn get_component_device_value(
         &self,
@@ -2660,6 +2666,15 @@ macro_rules! tree_core_binding {
             ) -> PyResult<()> {
                 self.inner
                     .set_component_device_value(py, node_id, component_type, value)
+            }
+
+            /// Logical key lengths for the nodes in a load-back transfer.
+            fn get_node_key_lengths(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+            ) -> PyResult<Vec<usize>> {
+                self.inner.get_node_key_lengths(py, node_ids)
             }
 
             /// A component's device value on a node, if set.

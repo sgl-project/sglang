@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -67,7 +68,6 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 
 
@@ -345,8 +345,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
 
-        # ``device`` is derived from the construction-time allocator; the
-        # allocator/pool themselves are owned by the cache, not the tree.
+        # The cache owns allocation; keep its allocator for resolving current
+        # unified SWA addresses when building a host backup.
+        self._allocator = params.token_to_kv_pool_allocator
         if params.token_to_kv_pool_allocator:
             device = torch.device(params.token_to_kv_pool_allocator.device)
             # A bare "cuda" means the process's current device, not cuda:0.
@@ -785,7 +786,31 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        return device_value, _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        self._refresh_swa_backup_indices(comp_xfers.get(ComponentType.SWA, ()))
+        return device_value, comp_xfers
+
+    def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
+        if not transfers:
+            return
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+        )
+
+        if not isinstance(self._allocator, UnifiedSWAAllocatorBase):
+            return
+        for transfer in transfers:
+            if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
+                continue
+            # Compaction can relocate SWA rows after the tree records them.
+            # FULL virtual IDs retain their meaning across that relocation.
+            full_values = [
+                self.get_component_device_value(node_id, ComponentType.FULL)
+                for node_id in transfer.nodes_to_load
+            ]
+            transfer.device_indices = self._allocator.translate_loc_from_full_to_swa(
+                torch.cat(full_values)
+            ).to(torch.int64)
 
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -829,7 +854,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        transfers = [_transfer_from_binding(transfer) for transfer in transfers]
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            self._refresh_swa_backup_indices(transfers)
+        return transfers
 
     def build_load_back_spec(
         self, node_id: NodeId, req: Optional[Req] = None
@@ -839,7 +867,28 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )
-        return _transfer_from_binding(kv_xfer), _comp_xfers_from_binding(comp_xfers)
+        kv_xfer = _transfer_from_binding(kv_xfer)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
+        if swa_xfers:
+            full_node_ids = kv_xfer.nodes_to_load or []
+            full_load_slices = {}
+            offset = 0
+            for full_node_id, count in zip(
+                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
+            ):
+                full_load_slices[full_node_id] = slice(offset, offset + count)
+                offset += count
+            for transfer in swa_xfers:
+                # SWA may have holes between resident nodes, or reload while
+                # FULL stays resident. Preserve the SWA transfer's node order.
+                transfer.anchor_index_parts = [
+                    full_load_slices[nid]
+                    if nid in full_load_slices
+                    else self.get_component_device_value(nid, ComponentType.FULL)
+                    for nid in transfer.nodes_to_load or ()
+                ]
+        return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId

@@ -4298,6 +4298,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
+    /// Logical radix-key lengths for transfer nodes, preserving caller order.
+    pub fn get_node_key_lengths(&self, node_ids: &[NodeId]) -> Result<Vec<usize>, NodeAccessError> {
+        node_ids
+            .iter()
+            .map(|&node_id| {
+                let node_id = self.arena.resolve(node_id)?;
+                Ok(self.arena.node(node_id).key.atom_len())
+            })
+            .collect()
+    }
+
     /// The component's device value on the node, or None if evicted.
     pub fn get_component_device_value(
         &self,
