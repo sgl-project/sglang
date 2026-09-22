@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_pp_group,
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -324,7 +323,7 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -495,7 +494,7 @@ class Qwen2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2Model(
