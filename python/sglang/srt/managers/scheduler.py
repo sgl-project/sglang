@@ -517,8 +517,6 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        # The groups are the first thing that allocates, so this comes after the
-        # allocator switch above and before anything that reads a group.
         bootstrap.init_parallel_runtime(
             server_args=server_args,
             model_config=self.model_config,
@@ -597,6 +595,12 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                if self.enable_unified_memory:
+                    # Keep device rows stable until host transfers are acknowledged.
+                    # Queue reads and relocation both run on the scheduler thread.
+                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
+                        lambda c=cache_controller: not c.has_inflight_device_transfers()
+                    )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -4527,10 +4531,13 @@ class Scheduler(
                         if is_verify_round
                         else batch_result.next_draft_input
                     )
-                    if batch_result.new_seq_lens is not None:
-                        batch.seq_lens = batch_result.new_seq_lens
+                    new_seq_lens = batch_result.new_seq_lens
+                    # Extend rounds return batch.seq_lens itself; copying it back
+                    # would block the scheduler until the whole forward has run.
+                    if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
+                        batch.seq_lens = new_seq_lens
                         if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_cpu = new_seq_lens.to("cpu")
                             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     self.update_cache_from_scheduler(batch, batch_result)
@@ -5910,7 +5917,6 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
-    # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
@@ -5940,15 +5946,8 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
 
 
 def resolve_spawn_dp_rank(dp_rank: Optional[int]) -> Optional[int]:
-    """The `dp_rank` this process was spawned with, in either of its two forms.
-
-    A router does not pass it as an argument, it sets `SGLANG_DP_RANK`. Both
-    forms are the launcher naming this process's place, so both have to be in
-    hand before `publish` records the placement -- resolving one of them after
-    would leave the context answering `None` for a process that has a rank.
-    """
+    """Resolve the launcher DP rank, falling back to ``SGLANG_DP_RANK``."""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         return int(os.environ["SGLANG_DP_RANK"])
     return dp_rank
 
@@ -6034,10 +6033,6 @@ def run_scheduler_process(
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
-    # Publish before anything in this process reads configuration, with the
-    # placement the launcher decided: from here on a rank read is answered
-    # without a process group, which is what every reader needs before
-    # `init_torch_distributed` has run.
     publish(
         server_args,
         role="scheduler",

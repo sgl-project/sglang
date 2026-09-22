@@ -193,7 +193,7 @@ impl Proxy {
         }
     }
 
-    /// Breaker-gated JSON POST: checks `breaker.allow()` first, classifies the
+    /// Breaker-gated JSON POST: acquires a cancellation-safe permit first, classifies the
     /// response status through [`breaker_outcome`] (success / failure /
     /// backpressure), and returns `ApiError::BreakerOpen` immediately when the
     /// breaker is Open.
@@ -212,11 +212,9 @@ impl Proxy {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -268,6 +266,7 @@ impl Proxy {
             // worker that answers a probe with 503 isn't wedged shut.
             BreakerOutcome::Neutral => breaker.record_backpressure(),
         }
+        permit.disarm();
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -277,7 +276,7 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Breaker-gated streaming POST: checks `breaker.allow()` first, classifies
+    /// Breaker-gated streaming POST: acquires a cancellation-safe permit first, classifies
     /// the response status through [`breaker_outcome`], and returns
     /// `ApiError::BreakerOpen` when Open.
     ///
@@ -307,11 +306,9 @@ impl Proxy {
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         expiration: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
-        if !breaker.allow() {
-            return Err(ApiError::BreakerOpen {
-                worker: worker_url.to_string(),
-            });
-        }
+        let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
+            worker: worker_url.to_string(),
+        })?;
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -387,6 +384,7 @@ impl Proxy {
         } else {
             None
         };
+        permit.disarm();
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
             stream_guards,
@@ -444,6 +442,49 @@ mod tests {
             p.client_for(WireProtocol::Http1),
             p.admin_client()
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_forwards_release_half_open_probes() {
+        use futures::FutureExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let proxy = Proxy::new(Duration::from_secs(60)).unwrap();
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::ZERO,
+        }));
+        breaker.record_failure();
+        let headers = HeaderMap::new();
+        assert!(proxy
+            .forward_json_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
+        assert!(proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/chat",
+                &headers,
+                Bytes::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .now_or_never()
+            .is_none());
+        assert!(breaker.would_allow());
     }
 
     #[test]

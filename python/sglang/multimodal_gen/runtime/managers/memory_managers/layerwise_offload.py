@@ -2122,9 +2122,29 @@ class LayerwiseOffloadManager:
             torch.mps.empty_cache()
 
     @torch.compiler.disable
+    def release_after_use(self, *, keep_resident: bool = False) -> None:
+        """This component's use has ended; release what that use was streaming.
+
+        Distinct from `release_all`, which is the literal operation and stays
+        that way for a full reset. A use ending asks a narrower question: the
+        streamed window is certainly dead, but the resident set only is if
+        nothing will want it before something else needs the room.
+
+        The two were the same call, and that is why `resident_layers` does
+        nothing for any component whose use is a single forward pass rather
+        than a denoise loop -- the set is prefetched at the start of the use
+        and dropped at the end of it, every request. `keep_resident` is how a
+        caller that knows the memory picture says otherwise; it defaults to the
+        long-standing behaviour, so nothing moves until someone asks.
+        """
+        self._release_layers(drop_resident=not keep_resident)
+
+    @torch.compiler.disable
     def release_all(self) -> None:
-        """Release every layer, including the resident ones: this ends the
-        denoise stage that the resident set is scoped to."""
+        """Release every layer, resident ones included. A full reset."""
+        self._release_layers(drop_resident=True)
+
+    def _release_layers(self, *, drop_resident: bool) -> None:
         self._log_direct_read_summary()
         self._log_debug_timing()
         if self._mapped_populator is not None:
@@ -2140,10 +2160,13 @@ class LayerwiseOffloadManager:
             self._collect_mapped_layer(layer_idx)
 
         for layer_idx in list(self._gpu_layers):
-            self.release_layer(layer_idx, force=True)
+            # `force` is what overrides release_layer's own skip of the resident
+            # set, so not forcing is all it takes to leave that set alone.
+            self.release_layer(layer_idx, force=drop_resident)
         # The next use starts a new request; its first pass over the layers may
-        # find their pages evicted and is the one worth faulting in sequentially.
-        self._first_pass = True
+        # find their pages evicted and is the one worth faulting in
+        # sequentially. Layers still on the device were never evicted.
+        self._first_pass = drop_resident
 
     @torch.compiler.disable
     def load_all_layers(self) -> None:
