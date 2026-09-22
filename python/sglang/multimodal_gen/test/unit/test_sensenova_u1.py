@@ -2262,7 +2262,12 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         output_file_name="sample.png",
         trace_ctx=trace_ctx,
     )
-    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(),
+        disable_conditioning_cache=False,
+        conditioning_cache_max_size_mb=512,
+        use_fsdp_inference=False,
+    )
     pipeline = _SequentialTestPipeline(
         server_args, fail=fail, fail_request_ids=fail_request_ids
     )

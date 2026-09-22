@@ -11,6 +11,7 @@ from transformers import (
     Dinov2Model,
 )
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningEncoderMixin
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -32,7 +33,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
-class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class ImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "model.encoder.layer",
@@ -212,7 +215,9 @@ def build_image_encoder(config):
         raise ValueError(f"Unknown image encoder type: {config['type']}")
 
 
-class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class DualImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",
@@ -249,7 +254,9 @@ class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         return outputs
 
 
-class SingleImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class SingleImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",

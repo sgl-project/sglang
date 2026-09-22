@@ -13,6 +13,9 @@ from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -957,6 +960,14 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
+    def _invalidate_lora_conditioning(self):
+        # LoRA targets DiTs; unrelated text and VAE weights remain unchanged
+        invalidate_conditioning_caches(
+            module
+            for name in ("transformer", "transformer_2", "fake_score_transformer")
+            if (module := self.modules.get(name)) is not None
+        )
+
     def set_lora(
         self,
         lora_nickname: str | list[str],
@@ -976,6 +987,7 @@ class LoRAPipeline(ComposedPipelineBase):
         stop costing anonymous host memory; pass it only for the startup
         (static) adapter, where the merged combination is stable.
         """
+        self._invalidate_lora_conditioning()
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
         # Normalize inputs to lists for multi-LoRA support
@@ -1225,6 +1237,7 @@ class LoRAPipeline(ComposedPipelineBase):
         Disable LoRA for the specified target, regardless of whether weights were
         merged into the base model or are still active in the wrapped LoRA path.
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("deactivate_lora_weights: %s", error)
@@ -1264,6 +1277,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     "transformer_2", "critic".
             strength: LoRA strength for merge, default 1.0.
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("merge_lora_weights: %s", error)
@@ -1332,6 +1346,7 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to unmerge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("unmerge_lora_weights: %s", error)

@@ -589,6 +589,8 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
     enable_cache_report: bool = False
+    disable_conditioning_cache: bool = False
+    conditioning_cache_max_size_mb: float = 512.0
 
     # Tracing
     enable_trace: bool = False
@@ -1896,6 +1898,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not 0 <= self.conditioning_cache_max_size_mb < float("inf"):
+            raise ValueError(
+                "conditioning_cache_max_size_mb must be finite and nonnegative"
+            )
         if not self._explicit_arg_names:
             self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
                 self
@@ -2958,6 +2964,18 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_cache_report,
             help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
+        )
+        parser.add_argument(
+            "--disable-conditioning-cache",
+            action="store_true",
+            default=ServerArgs.disable_conditioning_cache,
+            help="Disable reuse of text/image encoder outputs and VAE posteriors between requests.",
+        )
+        parser.add_argument(
+            "--conditioning-cache-max-size-mb",
+            type=float,
+            default=ServerArgs.conditioning_cache_max_size_mb,
+            help="Per-worker CPU conditioning cache capacity in MiB (default: 512; 0 disables).",
         )
         parser.add_argument(
             "--backend",

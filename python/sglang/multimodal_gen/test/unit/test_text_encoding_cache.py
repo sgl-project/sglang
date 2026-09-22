@@ -1,8 +1,16 @@
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+from transformers import BatchEncoding
 
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache import conditioning
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -10,6 +18,129 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
 )
+
+
+class FullHiddenStateEncoder(TextEncoder):
+    uses_sglang_forward_context = False
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.weight = torch.nn.Parameter(torch.ones(()))
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        self.calls += 1
+        states = tuple(input_ids[..., None].float() + layer for layer in range(32))
+        return BaseEncoderOutput(
+            last_hidden_state=states[-1],
+            hidden_states=states,
+            pooler_output=states[-1][:, 0].clone(),
+        )
+
+
+@pytest.mark.parametrize("output_type", ["tensor", "tuple", "structured"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_cache_stores_only_consumed_text_conditioning(output_type, device, monkeypatch):
+    encoder = FullHiddenStateEncoder().to(device).eval()
+    fingerprint = conditioning._fingerprint
+
+    def fingerprint_host_inputs(value):
+        if isinstance(value, torch.Tensor):
+            assert value.device.type == "cpu", "token keys must not read GPU inputs"
+        return fingerprint(value)
+
+    monkeypatch.setattr(conditioning, "_fingerprint", fingerprint_host_inputs)
+
+    def postprocess(output, text_inputs, return_attention_mask=False):
+        embedding = output.hidden_states[9]
+        mask = text_inputs["attention_mask"].bool()
+        if output_type == "tuple":
+            return embedding, mask
+        if output_type == "structured":
+            return TextConditioningOutput(embedding, mask, [2])
+        return embedding
+
+    def tokenize(texts, _tokenizer, _kwargs):
+        return BatchEncoding(
+            {
+                "input_ids": torch.tensor([[len(text), 2] for text in texts]),
+                "attention_mask": torch.ones((len(texts), 2), dtype=torch.long),
+            }
+        )
+
+    config = SimpleNamespace(
+        text_encoder_configs=[SimpleNamespace(tokenizer_kwargs={})],
+        preprocess_text_funcs=[None],
+        postprocess_text_funcs=[postprocess],
+        text_encoder_extra_args=[],
+        is_flux_v1=lambda: False,
+        tokenize_prompt=tokenize,
+        get_text_encoder_attention_mask=lambda inputs, _: inputs["attention_mask"],
+        get_text_encoder_pooler_output=lambda outputs, _: outputs.pooler_output,
+        build_text_conditioning_mask=lambda inputs, mask, embeds, _: mask.bool(),
+        seq_lens_from_text_conditioning_mask=lambda mask: mask.sum(-1).tolist(),
+    )
+    args = make_server_args(pipeline_config=config)
+
+    def make_stage():
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+            stage = TextEncodingStage(text_encoders=[encoder], tokenizers=[object()])
+        stage._begin_text_encoder_use = MagicMock()
+        stage._text_encode_dp_group = MagicMock(return_value=None)
+        return stage
+
+    stage = make_stage()
+    cache = ConditioningCache(4096)
+    with cache.scope():
+        first = stage.encode_text(
+            "hello", args, device=device, return_attention_mask=True
+        )
+        expected = first[0][0].clone()
+        expected_pooled = first[2][0].clone()
+        first[0][0].zero_()
+        first[2][0].zero_()
+        restored = stage.encode_text(
+            "hello", args, device=device, return_attention_mask=True
+        )
+        torch.testing.assert_close(restored[0][0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(restored[2][0], expected_pooled, rtol=0, atol=0)
+        assert restored[4] == [[2]]
+        assert encoder.calls == 1
+        assert cache.stats()["entries"] == 1
+        assert cache.bytes < 32  # two embeddings, one pooled value, optional mask
+        stage.encode_text("changed", args, device=device, return_attention_mask=True)
+        assert encoder.calls == 2
+        # The same encoder can serve different pipeline postprocessing contracts.
+        make_stage().encode_text(
+            "hello", args, device=device, return_attention_mask=True
+        )
+        assert encoder.calls == 3
+
+    # exercise the real negative-stage boundary with only one entry of capacity
+    cache = ConditioningCache(cache.bytes // 3)
+    stage.encode_text = partial(stage.encode_text, device=device)
+    calls_before = encoder.calls
+    with cache.scope(refresh=True):
+        stage.encode_text("hello", args, return_attention_mask=True)
+        stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+    with cache.scope():
+        stage.encode_text("changed positive", args, return_attention_mask=True)
+        stage.get_or_compute_negative_text_embedding(make_req(), args, [0])
+    assert encoder.calls == calls_before + 3
+    assert cache.hits == 1
+    assert cache.bytes <= cache.max_bytes
 
 
 class DummyTextEncodingStage(TextEncodingStage):
@@ -60,22 +191,11 @@ def get_negative_embedding_twice(stage, server_args, first_req, second_req=None)
     )
 
 
-def test_negative_text_cache_key_tracks_encode_options():
+def test_negative_text_encoding_has_no_separate_gpu_cache():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
-
     get_negative_embedding_twice(stage, server_args, make_req())
-    assert stage.calls == 1
-
-    stage.get_or_compute_negative_text_embedding(
-        make_req(max_sequence_length=512), server_args, [0]
-    )
     assert stage.calls == 2
-
-    stage.get_or_compute_negative_text_embedding(
-        make_req(prompt_template={"template": "negative: {}"}), server_args, [0]
-    )
-    assert stage.calls == 3
 
 
 def test_component_uses_exact_encoder_precision():
@@ -97,25 +217,7 @@ def test_component_uses_exact_encoder_precision():
     ]
 
 
-def test_negative_text_cache_skips_warmup():
+def test_negative_text_encoding_warmup_does_not_seed_a_private_cache():
     stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="default negative"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
-
+    get_negative_embedding_twice(stage, make_server_args(), make_req(is_warmup=True))
     assert stage.calls == 2
-
-
-def test_negative_text_cache_keeps_default_warmup():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="bad quality"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
-
-    assert stage.calls == 1
