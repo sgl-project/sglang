@@ -1021,7 +1021,9 @@ class SWAComponent(TreeComponent):
         assert self._swa_kv_pool_host is not None
         host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
+            shortfall = num_tokens - self._swa_kv_pool_host.available_size()
+            if shortfall > 0:
+                self.cache.evict_host(shortfall, ComponentType.SWA)
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         return host_indices
 

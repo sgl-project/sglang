@@ -16,8 +16,8 @@ class PoolEntry:
     device_pool: Any
     layer_mapper: Callable[[int], int | None]
     is_primary_index_anchor: bool = False
-    # Reclaim callbacks receive the absolute allocation size n. The host
-    # callback evicts n slots; the device callback makes alloc(n) feasible.
+    # Host reclaim callbacks receive the allocation shortfall in slots.
+    # Device callbacks receive the full allocation size and make alloc(n) feasible.
     host_evict_fn: Callable[[int], Any] | None = None
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
@@ -86,7 +86,9 @@ class HostPoolGroup:
         host_pool = self.get_entry(pool).host_pool
         indices = host_pool.alloc(need_size)
         if indices is None and reclaim is not None:
-            reclaim(need_size)
+            shortfall = need_size - host_pool.available_size()
+            if shortfall > 0:
+                reclaim(shortfall)
             indices = host_pool.alloc(need_size)
         return indices
 
