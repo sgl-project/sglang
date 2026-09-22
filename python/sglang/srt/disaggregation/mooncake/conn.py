@@ -2469,9 +2469,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # first would let the worker drain+ack while the room is
                         # not yet Failed, so a newly enqueued chunk could still
                         # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
+                        # acks once its in-flight write drains.
+                        if (
+                            room_active
+                            or self._staging_outstanding.get(room_to_be_aborted, 0) > 0
+                        ):
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self.register_deferred_ack_target(
                                 room_to_be_aborted, decode_ip, decode_port
