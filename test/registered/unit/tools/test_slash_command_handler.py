@@ -3,12 +3,15 @@
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
+
+import yaml
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +33,130 @@ def _load_handler():
     with patch.dict(sys.modules, {"github": github}):
         spec.loader.exec_module(module)
     return module
+
+
+class TestMultimodalLaunchers(CustomTestCase):
+    def test_component_accuracy_uses_two_workers_and_preserves_selector(self):
+        handler = _load_handler()
+        spec = (
+            f"{handler.MULTIMODAL_TEST_DIR}/single_test_file/component_accuracy/"
+            "test_component_accuracy_2_gpu.py::TestComponentAccuracy2GPU::"
+            "test_encoder_accuracy[ltx_2_two_stage_t2v]"
+        )
+        self.assertEqual(
+            handler.build_pytest_command(spec),
+            [
+                "python3",
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node=2",
+                "-m",
+                "pytest",
+                spec,
+                "-x",
+            ],
+        )
+        with patch.object(
+            handler,
+            "resolve_test_file",
+            return_value=(spec.split("::", 1)[0], True, None),
+        ):
+            resolved = handler._resolve_test_spec(spec)[0]
+        self.assertEqual(resolved["runs_on"], "2-gpu-h100")
+        self.assertEqual(resolved["test_command"], spec)
+
+    def test_qwen_encoder_gets_two_gpu_runner_and_workers(self):
+        handler = _load_handler()
+        path = f"{handler.MULTIMODAL_TEST_DIR}/unit/test_qwen_image21_distributed.py"
+        self.assertEqual(handler.detect_multimodal_suite(path), ("2-gpu-h100", None))
+        self.assertEqual(handler.torchrun_processes(path), 2)
+
+    def test_single_gpu_and_self_spawning_tests_keep_plain_pytest(self):
+        handler = _load_handler()
+        for relative_path in (
+            "single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
+            "server/test_server_2_gpu.py",
+            "single_test_file/test_encoder_fold_srt_2_gpu.py",
+            "unit/test_component_accuracy_parallel_runtime.py",
+        ):
+            with self.subTest(path=relative_path):
+                spec = f"{handler.MULTIMODAL_TEST_DIR}/{relative_path}"
+                self.assertEqual(
+                    handler.build_pytest_command(spec),
+                    ["python3", "-m", "pytest", spec, "-x"],
+                )
+
+    def test_workflow_launches_each_spec_and_stops_on_failure(self):
+        workflow = yaml.safe_load(
+            (_REPO_ROOT / ".github/workflows/rerun-test.yml").read_text()
+        )
+        step = next(
+            step
+            for step in workflow["jobs"]["rerun-test-multimodal-gen"]["steps"]
+            if step.get("name") == "Run test"
+        )
+        self.assertEqual(step["env"]["TEST_COMMAND"], "${{ inputs.test_command }}")
+        prefix = "python/sglang/multimodal_gen/test/"
+        distributed_spec = (
+            prefix + "single_test_file/component_accuracy/"
+            "test_component_accuracy_2_gpu.py::TestComponentAccuracy2GPU::"
+            "test_encoder_accuracy[ltx_2_two_stage_t2v]"
+        )
+        server_spec = prefix + "server/test_server_2_gpu.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Replace only the launched pytest/torchrun modules; execute the
+            # real workflow shell and launcher without GPUs or model weights.
+            for package in (root / "torch", root / "torch/distributed"):
+                package.mkdir(exist_ok=True)
+                (package / "__init__.py").touch()
+            recorder = (
+                "import json, os, sys\n"
+                "with open(os.environ['LAUNCH_LOG'], 'a') as f:\n"
+                "    f.write(json.dumps(sys.argv) + '\\n')\n"
+                "sys.exit(int(os.environ['LAUNCH_EXIT_CODE']))\n"
+            )
+            (root / "torch/distributed/run.py").write_text(recorder)
+            (root / "pytest.py").write_text(recorder)
+            (root / "bin").mkdir()
+            (root / "bin/python3").symlink_to(sys.executable)
+            log = root / "launches.jsonl"
+            for exit_code in (0, 7):
+                with self.subTest(exit_code=exit_code):
+                    log.write_text("")
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", step["run"]],
+                        cwd=_REPO_ROOT,
+                        env=dict(
+                            os.environ,
+                            PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+                            PYTHONPATH=str(root),
+                            TEST_COMMAND=f"{distributed_spec}\n{server_spec}",
+                            LAUNCH_LOG=str(log),
+                            LAUNCH_EXIT_CODE=str(exit_code),
+                        ),
+                        capture_output=True,
+                        text=True,
+                    )
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual(
+                        result.returncode, 1 if exit_code else 0, result.stderr
+                    )
+                    self.assertEqual(len(calls), 1 if exit_code else 2)
+                    self.assertEqual(
+                        calls[0][1:],
+                        [
+                            "--standalone",
+                            "--nproc_per_node=2",
+                            "-m",
+                            "pytest",
+                            distributed_spec,
+                            "-x",
+                        ],
+                    )
+                    if not exit_code:
+                        self.assertEqual(calls[1][1:], [server_spec, "-x"])
 
 
 class TestConfiguredTestGroups(CustomTestCase):

@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import unicodedata
@@ -14,6 +15,10 @@ from github import Auth, Github
 # Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import runner_configs as _runner_configs  # noqa: E402
+from multimodal_test_launcher import (  # noqa: E402
+    build_pytest_command,
+    torchrun_processes,
+)
 
 # rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
 # non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
@@ -891,6 +896,9 @@ def detect_multimodal_suite(file_path):
 
     Returns (runner_label, error_message).
     """
+    num_processes = torchrun_processes(file_path)
+    if num_processes > 1:
+        return f"{num_processes}-gpu-h100", None
     # Check path components and basename for GPU count hints
     for pattern, runner in MULTIMODAL_PATH_TO_RUNNER.items():
         if pattern in file_path:
@@ -1518,7 +1526,7 @@ def handle_rerun_test(
         if dr["success"]:
             if dr["mode"] == "multimodal_gen":
                 cmds = "\n".join(
-                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
+                    shlex.join(build_pytest_command(cmd)) for cmd in dr["test_commands"]
                 )
             else:
                 cmds = "\n".join(
