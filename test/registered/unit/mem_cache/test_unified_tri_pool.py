@@ -20,7 +20,7 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -174,6 +174,85 @@ class TestUnifiedTriPool(unittest.TestCase):
         # KV pool got the allocators.
         self.assertIs(kvcache._full_allocator, fa)
         self.assertIs(kvcache._swa_allocator, sa)
+
+    def test_pd_preallocation_binds_only_swa_tail_pages(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        before = allocator.available_size()
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([12], dtype=torch.int64)
+        # With an empty prefix, ordinary allocation supplies the same virtual
+        # pages without launching the GPU extend kernel. All page binding and
+        # capacity accounting still run through the real sub-allocators.
+        full = allocator.full_attn_allocator
+        with patch.object(
+            full, "alloc_extend", side_effect=lambda *a, **kw: full.alloc(12)
+        ):
+            virtual = allocator.alloc_extend_swa_tail(
+                prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
+            )
+        self.assertIsNotNone(virtual)
+        self.assertEqual(len(virtual), 12)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 12)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 8)
+        swa_pages = allocator.swa_v2p_page_table[virtual[::4] // 4]
+        self.assertLessEqual(swa_pages[0].item(), 0)
+        self.assertTrue(torch.all(swa_pages[1:] > 0).item())
+        allocator.free(virtual)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.available_size(), before)
+
+    def test_pd_short_tail_fits_beyond_joint_capacity(self):
+        for lazy in (False, True):
+            for tail_len in (0, 5):
+                with self.subTest(lazy=lazy, tail_len=tail_len):
+                    _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
+                    full = allocator.full_attn_allocator
+                    length = allocator.available_size() + 4
+                    self.assertFalse(allocator.can_reserve(length, length))
+                    self.assertTrue(allocator.can_reserve(length, tail_len))
+                    prefix = torch.tensor([0], dtype=torch.int64)
+                    seq = torch.tensor([length], dtype=torch.int64)
+                    with patch.object(
+                        full,
+                        "alloc_extend",
+                        side_effect=lambda *a, **kw: full.alloc(length),
+                    ):
+                        virtual = allocator.alloc_extend_swa_tail(
+                            prefix,
+                            prefix,
+                            seq,
+                            seq,
+                            torch.tensor([-1]),
+                            length,
+                            tail_len,
+                        )
+                    self.assertIsNotNone(virtual)
+                    self.assertEqual(full.allocated_count(), length)
+                    self.assertEqual(
+                        allocator.swa_attn_allocator.allocated_count(),
+                        -(-tail_len // 4) * 4,
+                    )
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
+                    allocator.free(virtual)
+                    self.assertEqual(full.allocated_count(), 0)
+                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_pd_tail_rejects_full_capacity_shortfall(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        full = allocator.full_attn_allocator
+        length = full.available_size() + 4
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([length], dtype=torch.int64)
+        with patch.object(full, "alloc_extend") as extend:
+            self.assertIsNone(
+                allocator.alloc_extend_swa_tail(
+                    prefix, prefix, seq, seq, torch.tensor([-1]), length, 0
+                )
+            )
+        extend.assert_not_called()
+        self.assertEqual(full.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
     def test_empty_float_is_transparent_to_the_ends(self):
         _, allocator, _, _ = self._build()
@@ -961,11 +1040,19 @@ class TestTriFactorySizing(unittest.TestCase):
         return kw
 
     def test_budget_sizing_and_boot_signature(self):
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
         budget = 1 << 20
         bundle = init_unified_mamba_swa_pools(
             **self._factory_kwargs(unified_total_bytes=budget)
         )
         pool = bundle.unified_memory_pool
+        allocator = bundle.token_to_kv_pool_allocator
+        self.assertIsInstance(allocator, UnifiedSWAAllocatorBase)
+        self.assertNotIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
         # Buffer = budget + the state pool's bytes (budget captured AFTER the
         # state carve-out), never the token-count re-sum.
         state_bytes = 4 * pool.spec("mamba").entry_bytes()
@@ -1371,6 +1458,65 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         flt.available_size()
         flt.schedulable_available_size()
         self.assertEqual(flt._byte_accounting_violations(), [])
+
+
+class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
+    """REGRESSION: PD admission compared FULL and SWA against per-side token
+    budgets, but each side's `available_size` credits the peer's drainable
+    holes, so a pair that each side can host alone can be jointly infeasible.
+    Such a pair was admitted and then refused inside `alloc_extend_swa_tail`."""
+
+    def _build(self, **kw):
+        return TestUnifiedTriPool._build(self, **kw)
+
+    def test_a_pair_each_side_can_host_alone_is_still_refused(self):
+        # page_size 1 leaves no slack between the per-side and joint views;
+        # the double-count only has room to show on a paged grid.
+        _, allocator, _, _ = self._build(page_size=4)
+        full_demand = allocator.full_available_size()
+        swa_demand = allocator.swa_available_size()
+        self.assertGreater(min(full_demand, swa_demand), 0)
+        # Each side alone reports room for its own half ...
+        self.assertLessEqual(full_demand, allocator.full_available_size())
+        self.assertLessEqual(swa_demand, allocator.swa_available_size())
+        # ... yet the two draw on the same bytes, so the grid refuses the pair.
+        self.assertFalse(
+            allocator._fits_page_demand(
+                -(-full_demand // allocator.page_size),
+                -(-swa_demand // allocator.page_size),
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                full_demand,
+                swa_demand,
+                full_budget_tokens=full_demand,
+                swa_budget_tokens=swa_demand,
+            )
+        )
+
+    def test_the_scheduler_budget_still_binds(self):
+        _, allocator, _, _ = self._build()
+        page_size = allocator.page_size
+        self.assertTrue(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size,
+                swa_budget_tokens=page_size,
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size - 1,
+                swa_budget_tokens=page_size,
+            )
+        )
 
 
 if __name__ == "__main__":
