@@ -55,7 +55,7 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
         )
         self.assertEqual(
             get_npu_online_moe_integer_quant_spec("w2").mode,
-            "w4a4_int",
+            "w8a8_int",
         )
 
     @patch(

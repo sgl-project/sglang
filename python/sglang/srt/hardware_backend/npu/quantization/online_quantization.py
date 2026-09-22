@@ -54,7 +54,9 @@ def get_npu_online_moe_integer_quant_spec(
         raise ValueError(
             f"Expected an online MoE w13/w2 weight, got {weight_prefix!r}."
         )
-    return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int"]
+    return _ONLINE_INTEGER_QUANT_SPECS[
+        "w4a4_int" if weight_prefix == "w13" else "w8a8_int"
+    ]
 
 
 def validate_npu_online_source_dtype(params_dtype: torch.dtype) -> None:
