@@ -396,6 +396,7 @@ class TestDSATransformIndex(CustomTestCase):
                 extend_lens_cpu,
                 rows,
                 page_table_is_expanded=True,
+                topk_width=KPOOL_TOPK,
             )
             torch.testing.assert_close(result, expected, rtol=0, atol=0)
             # Keep the masked padding columns invalid after the replay.
