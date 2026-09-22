@@ -30,7 +30,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -4409,6 +4411,348 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestProcessToolCallsDsmlNotReturnedAsContent(unittest.TestCase):
+    """DSML tool markup must never be assembled into an assistant message.
+
+    Exercises _process_tool_calls with a real FunctionCallParser (not mocked):
+    when a generation carries tool markup the parser cannot convert, the reply
+    goes out as finish_reason "stop" with no tool_calls, which an
+    OpenAI-compatible client reads as a finished turn, silently dropping the
+    requested calls.
+    """
+
+    DSML = "\uff5cDSML\uff5c"
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "deepseekv4"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+    def _invoke(self):
+        return (
+            f'<{self.DSML}invoke name="get_weather">\n'
+            f'<{self.DSML}parameter name="city" string="true">SF'
+            f"</{self.DSML}parameter>\n</{self.DSML}invoke>"
+        )
+
+    def _run(self, text):
+        return self.chat._process_tool_calls(
+            text, self.tools, {"type": "stop", "matched": None}, tool_choice="auto"
+        )
+
+    def test_markup_becomes_tool_calls_not_content(self):
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "malformed sibling": (
+                f"<{self.DSML}tool_calls>\n"
+                f'<{self.DSML}invoke name="get_weather">\n{{"city": ,}}\n'
+                f"</{self.DSML}invoke>\n{invoke}\n</{self.DSML}tool_calls>"
+            ),
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                tool_calls, remaining_text, finish_reason = self._run(text)
+
+                self.assertNotIn(self.DSML, remaining_text or "")
+                self.assertEqual(finish_reason["type"], "tool_calls")
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0].function.name, "get_weather")
+                self.assertEqual(
+                    json.loads(tool_calls[0].function.arguments), {"city": "SF"}
+                )
+
+    def test_ordinary_turns_are_unaffected(self):
+        """Stripping markup must not disturb replies that carry none."""
+        for label, text in {
+            "plain prose": "Just a normal answer.",
+            "prose naming the format": "The parser looks for DSML markers.",
+        }.items():
+            with self.subTest(payload=label):
+                tool_calls, remaining_text, finish_reason = self._run(text)
+
+                self.assertIsNone(tool_calls)
+                self.assertEqual(remaining_text, text)
+                self.assertEqual(finish_reason["type"], "stop")
+
+    def test_preamble_survives_alongside_the_call(self):
+        tool_calls, remaining_text, finish_reason = self._run(
+            f"Checking the weather.\n\n<{self.DSML}tool_calls>\n"
+            f"{self._invoke()}\n</{self.DSML}tool_calls>"
+        )
+
+        self.assertIn("Checking the weather.", remaining_text)
+        self.assertNotIn(self.DSML, remaining_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(finish_reason["type"], "tool_calls")
+
+    def test_serialized_response_never_carries_markup(self):
+        """The wire payload itself, as a client parses it, must be clean.
+
+        Builds the real ChatCompletionResponse and serializes it, so the
+        assertion covers `message.content`, `tool_calls` and `finish_reason`
+        together rather than the parser's return value.
+        """
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather in SF?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, generated in cases.items():
+            with self.subTest(payload=label):
+                ret = [
+                    {
+                        "text": generated,
+                        "meta_info": {
+                            "id": "req-1",
+                            "finish_reason": {"type": "stop", "matched": None},
+                            "prompt_tokens": 10,
+                            "completion_tokens": 20,
+                            "cached_tokens": 0,
+                            "weight_version": "v1",
+                        },
+                    }
+                ]
+
+                payload = json.loads(
+                    self.chat._build_chat_response(req, ret, 0).model_dump_json()
+                )
+
+                choice = payload["choices"][0]
+                self.assertNotIn(self.DSML, json.dumps(payload))
+                self.assertEqual(choice["finish_reason"], "tool_calls")
+                self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+                self.assertEqual(
+                    json.loads(
+                        choice["message"]["tool_calls"][0]["function"]["arguments"]
+                    ),
+                    {"city": "SF"},
+                )
+
+    def test_http_response_body_is_clean(self):
+        """The raw HTTP body a client receives must never carry DSML markup.
+
+        Goes through real routing, ChatCompletionRequest validation,
+        handle_request and JSON rendering. Only the GPU boundary
+        (tokenizer_manager.generate_request) is substituted.
+        """
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        # The full server module imports hardware-specific schedulers, so mount
+        # the same route body used by http_server.py's /v1/chat/completions.
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(  # noqa: ANN202
+            request: ChatCompletionRequest, raw_request: Request
+        ):
+            serving = raw_request.app.state.openai_serving_chat
+            return await serving.handle_request(request, raw_request)
+
+        generated = {"text": ""}
+
+        async def fake_generate(adapted_request, raw_request):  # noqa: ANN202
+            yield {
+                "text": generated["text"],
+                "meta_info": {
+                    "id": "req-1",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "cached_tokens": 0,
+                    "weight_version": "v1",
+                },
+            }
+
+        self.chat.tokenizer_manager.generate_request = fake_generate
+        self.chat.template_manager.chat_template_name = "chatml"
+        app.state.openai_serving_chat = self.chat
+        client = TestClient(app)
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                generated["text"] = text
+
+                response = client.post("/v1/chat/completions", json=body)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn(self.DSML, response.text)
+                choice = response.json()["choices"][0]
+                self.assertEqual(choice["finish_reason"], "tool_calls")
+                self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+
+    def test_streaming_sse_body_is_clean(self):
+        """The SSE stream must not carry DSML either.
+
+        Covers the mangled-opener shape seen from a live server
+        (`<｜DSML｜tool_calls|`), which the streaming preamble used to emit
+        as content, alongside the well-formed shapes.
+        """
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(  # noqa: ANN202
+            request: ChatCompletionRequest, raw_request: Request
+        ):
+            serving = raw_request.app.state.openai_serving_chat
+            return await serving.handle_request(request, raw_request)
+
+        generated = {"text": ""}
+
+        async def fake_generate(adapted_request, raw_request):  # noqa: ANN202
+            """Emit cumulative text, as the scheduler does."""
+            text = generated["text"]
+            for end in range(6, len(text) + 6, 6):
+                yield {
+                    "text": text[:end],
+                    "meta_info": {
+                        "id": "req-1",
+                        "finish_reason": None,
+                        "prompt_tokens": 10,
+                        "completion_tokens": end,
+                        "cached_tokens": 0,
+                        "weight_version": "v1",
+                    },
+                }
+            yield {
+                "text": text,
+                "meta_info": {
+                    "id": "req-1",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 10,
+                    "completion_tokens": len(text),
+                    "cached_tokens": 0,
+                    "weight_version": "v1",
+                },
+            }
+
+        self.chat.tokenizer_manager.generate_request = fake_generate
+        self.chat.tokenizer_manager.create_abort_task = lambda adapted: None
+        self.chat.template_manager.chat_template_name = "chatml"
+        app.state.openai_serving_chat = self.chat
+        client = TestClient(app)
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather in SF?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "stream": True,
+        }
+        invoke = self._invoke()
+        cases = {
+            "bare invoke": f"Let me check.\n\n{invoke}",
+            "unterminated section": f"<{self.DSML}tool_calls>\n{invoke}",
+            "well formed": f"<{self.DSML}tool_calls>\n{invoke}\n</{self.DSML}tool_calls>",
+            "mangled opener": (
+                f"<{self.DSML}tool_calls|\n{invoke}\n</{self.DSML}tool_calls>"
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(payload=label):
+                generated["text"] = text
+
+                response = client.post("/v1/chat/completions", json=body)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn(self.DSML, response.text)
+
+                names, arguments, finish = [], "", None
+                for line in response.text.splitlines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[len("data: ") :].strip()
+                    if payload == "[DONE]":
+                        continue
+                    for choice in json.loads(payload).get("choices", []):
+                        delta = choice.get("delta") or {}
+                        for call in delta.get("tool_calls") or []:
+                            function = call.get("function") or {}
+                            if function.get("name"):
+                                names.append(function["name"])
+                            arguments += function.get("arguments") or ""
+                        if choice.get("finish_reason"):
+                            finish = choice["finish_reason"]
+
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(arguments), {"city": "SF"})
+                self.assertEqual(finish, "tool_calls")
 
 
 class TestNormalizeToolContent(unittest.TestCase):
