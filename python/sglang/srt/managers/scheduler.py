@@ -193,6 +193,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
+from sglang.srt.managers.mm_utils import duplicate_pad_mm_input_ids
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -1214,7 +1215,6 @@ class Scheduler(
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
-        # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -2994,8 +2994,8 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                req.origin_input_ids = duplicate_pad_mm_input_ids(
+                    req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -3468,9 +3468,8 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                # See companion call site above for the array.array wrap rationale.
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                req.origin_input_ids = duplicate_pad_mm_input_ids(
+                    req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
 
             req.extend_image_inputs(image_inputs)

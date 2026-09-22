@@ -334,6 +334,9 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=cfg.port + 10000,
         )
 
+    if cfg.grpc_response_timeout_secs <= 0:
+        raise ValueError("--grpc-response-timeout-secs must be positive")
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(
