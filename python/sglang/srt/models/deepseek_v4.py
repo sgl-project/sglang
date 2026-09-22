@@ -108,6 +108,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -2628,10 +2629,22 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=defer_all_reduce,
+        o_in = o.flatten(1) if isinstance(o, torch.Tensor) else o
+        # ROCm gfx950 TP-only: wo_b's GEMM and its all-reduce can overlap. The
+        # helper returns None whenever it does not apply -- decode, ragged
+        # chunks, no SDMA -- and disables itself for the process on any failure.
+        # A deferred all-reduce (mHC owns it) and a non-tensor operand (wo_a
+        # fused an MXFP8 quantization into its epilogue) each keep the ordinary
+        # path, which owns the collective itself.
+        fused_o = (
+            None
+            if (defer_all_reduce or not isinstance(o, torch.Tensor))
+            else fused_wo_b(self.wo_b, o_in)
         )
+        if fused_o is not None:
+            o = fused_o
+        else:
+            o, _ = self.wo_b(o_in, skip_all_reduce=defer_all_reduce)
         if defer_all_reduce:
             return mhc.AttnOutput(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
