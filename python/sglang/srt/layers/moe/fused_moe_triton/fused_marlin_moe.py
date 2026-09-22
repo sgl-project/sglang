@@ -131,7 +131,6 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
-@register_custom_op(out_shape="hidden_states")
 def is_mxfp4_marlin_weights(
     num_bits: int,
     w1_scale: torch.Tensor,
@@ -187,6 +186,7 @@ def gated_marlin_activation(
         raise ValueError(f"Unsupported gated activation: {activation=}")
 
 
+@register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
