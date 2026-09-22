@@ -2632,6 +2632,46 @@ class TestTheTopologyIdentities(CustomTestCase):
 class TestTheParallelPhase(CustomTestCase):
     """Entry points initialize parallel groups before constructing runners."""
 
+    def test_the_layer_phase_leaves_a_stated_placement_alone(self):
+        """A server that runs its own WORLD states its attention placement, and
+        the layer phase reads the model's shape only."""
+        import torch
+
+        from sglang.srt.distributed import bootstrap
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                device="cpu",
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3, dp_rank=1),
+        )
+        get_parallel().override_permanently(
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=4,
+            attn_tp_rank=3,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        )
+
+        bootstrap.init_layer_runtime(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"]),
+                hidden_size=8,
+                dtype=torch.float16,
+            )
+        )
+
+        self.assertEqual(get_parallel().attn_dp_size, 1)
+        self.assertEqual(get_parallel().attn_dp_rank, 0)
+
     def test_building_twice_is_refused(self):
         from sglang.srt.distributed import bootstrap
 
