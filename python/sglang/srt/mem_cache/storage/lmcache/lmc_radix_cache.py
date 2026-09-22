@@ -189,9 +189,10 @@ class LMCRadixCache(RadixCache):
         if self.disable or not key:
             return super().match_prefix(params)
 
-        if self.page_size != 1:
-            aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:aligned_len]
+        # Normalize like RadixCache.match_prefix: the bigram view flips the
+        # flag in place, page_aligned copies -- both must hit *this* object.
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
 
         base_res = super().match_prefix(params)
         value: torch.Tensor = base_res.device_indices
