@@ -49,16 +49,13 @@ def _dequantize_k_cache_fast_wrapped(
 
 def _dequantize_k_cache_fast(
     quant_k_cache,
+    dim_nope: int,
+    dim_rope: int,
     group_size: int = 128,
-    dim_nope: int | None = None,
-    dim_rope: int | None = None,
 ):
     num_tokens, dim_quant = quant_k_cache.shape
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    inferred_nope, inferred_rope = _infer_dsa_dims(dim_quant)
-    dim_nope = inferred_nope if dim_nope is None else dim_nope
-    dim_rope = inferred_rope if dim_rope is None else dim_rope
     num_tiles = dim_nope // group_size
     assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
 
