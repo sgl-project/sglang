@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -18,7 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
@@ -146,79 +147,41 @@ def _warn_recv_bound_unavailable() -> None:
     if not _RECV_BOUND_WARNED:
         _RECV_BOUND_WARNED = True
         logger.warning(
-            "SGLANG_MORI_RECV_BOUND is set but the per-rank DP token counts do "
-            "not cover every mori sender, so the receive fan-in is unknown; "
+            "The per-rank DP token counts do not cover every mori sender, "
+            "so the receive fan-in is unknown; "
             "leaving the receive buffer unbounded."
         )
 
 
-def _mori_decode_recv_bound(
-    recv_rows: int,
-    topk: int,
-    *,
-    local_rows: Optional[int] = None,
-    is_epv2: bool = False,
-) -> int:
-    """Live rows MORI EP's receive buffer can hold, or 0 for "do not bound".
-
-    Worst case fan-in is every rank routing all of its tokens to this one, so
-    the conservative bound is `sum(per-rank tokens) * topk`. The per-rank counts
-    come from the DP sync.
-
-    Only MORI EPv2 uses local_rows to tighten the bound: its dispatch kernel
-    guarantees one receive row per (source token, destination rank). The bound
-    becomes the sum of sender rows, rounded to its native capacity tiers, while
-    IDs and weights retain all top-k columns. This requires capture mode,
-    TP=DP=EP, and complete, uniform padded sender counts matching the local input.
-
-    The value is baked into a captured graph and has to hold for every later
-    replay, so the DP sync must give every rank the same cuda-graph bucket.
-    Missing or incomplete sender counts leave the receive buffer unbounded.
-    MORI EP retains its opt-in and prefill guard; EPv2's dispatcher owns its opt-out.
-    """
-    if is_epv2:
-        if local_rows is None:
-            return 0
-    elif not get_bool_env_var("SGLANG_MORI_RECV_BOUND", "false"):
+def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
+    """Return a conservative receive-row bound for MORI EP, or 0 to skip trimming."""
+    if not envs.SGLANG_MORI_RECV_BOUND.get():
         return 0
 
-    # EPv1 should theoretically support this deduplicated receive bound too,
-    # but its behavior still needs confirmation and validation before enabling it.
-    deduplicated = is_epv2 and local_rows is not None
-    if deduplicated:
+    is_epv2 = get_moe_a2a_backend().is_mori_epv2()
+    if not is_epv2:
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return 0
+
+    if is_epv2:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if not get_is_capture_mode():
             return 0
 
-    from sglang.srt.layers.dp_attention import (
-        get_dp_global_num_tokens,
-        get_is_extend_in_batch,
-    )
-
-    if not is_epv2 and get_is_extend_in_batch():
-        return 0
+    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 
     per_rank_tokens = get_dp_global_num_tokens()
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size
-    if deduplicated:
-        if (
-            ep_size <= 1
-            or parallel.dp_size != ep_size
-            or parallel.tp_size != ep_size
-            or per_rank_tokens is None
-            or len(per_rank_tokens) != ep_size
-            or local_rows <= 0
-            or any(rows != local_rows for rows in per_rank_tokens)
-        ):
-            return 0
-    elif not per_rank_tokens or len(per_rank_tokens) < ep_size:
+    if not per_rank_tokens or len(per_rank_tokens) < ep_size:
         _warn_recv_bound_unavailable()
         return 0
 
     max_tokens = sum(per_rank_tokens)
-    bound = max_tokens if deduplicated else max_tokens * topk
+    bound = max_tokens * topk
     if is_epv2:
         bound = max(32, 1 << (bound - 1).bit_length())
     # Never grow the tensor, and nothing to do when there is nothing to trim.
@@ -226,23 +189,21 @@ def _mori_decode_recv_bound(
         return 0
 
     backend = "mori-epv2" if is_epv2 else "mori"
-    policy = "deduplicated" if deduplicated else "conservative"
     log_rank = parallel.launch_world_rank
-    key = (f"{backend}/{policy}", bound)
+    key = (backend, bound)
     if log_rank == 0 and key not in _RECV_BOUND_LOGGED:
         first = not any(name == key[0] for name, _ in _RECV_BOUND_LOGGED)
         _RECV_BOUND_LOGGED.add(key)
         log = logger.info if first else logger.debug
         log(
             "%s recv bound active: %d rows -> %d "
-            "(dp_tokens=%d ep=%d topk=%d policy=%s); per-tier values at DEBUG",
+            "(dp_tokens=%d ep=%d topk=%d); per-tier values at DEBUG",
             backend,
             recv_rows,
             bound,
             max_tokens,
             ep_size,
             topk,
-            policy,
         )
     return bound
 
@@ -274,8 +235,6 @@ class AiterRunnerCore(MoeRunnerCore):
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
-
-        from sglang.srt.environ import envs
 
         a1_scale = (
             runner_input.a1_scale

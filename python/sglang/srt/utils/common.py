@@ -3962,9 +3962,7 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
-            "SGLANG_MORI_RECV_BOUND", "false"
-        ):
+        elif get_moe_a2a_backend().is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
             # fan-in depends on what the *peers* send. Without a DP-synchronized
