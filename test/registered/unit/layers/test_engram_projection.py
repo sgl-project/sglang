@@ -29,14 +29,16 @@ class TestEngramProjection(CustomTestCase):
 
     def test_sharded_weight_loader_reconstructs_original(self):
         full = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
-        pieces = []
-        for rank in range(8):
-            layer = self.build(tp_rank=rank)
-            layer.weight.weight_loader(layer.weight, full)
-            self.assertEqual(tuple(layer.weight.shape), (32, 64))
-            self.assertTrue(layer.gather_output)
-            pieces.append(layer.weight.detach())
-        torch.testing.assert_close(torch.cat(pieces), full, rtol=0, atol=0)
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                pieces = []
+                for rank in range(tp_size):
+                    layer = self.build(tp_rank=rank, tp_size=tp_size)
+                    layer.weight.weight_loader(layer.weight, full)
+                    self.assertEqual(tuple(layer.weight.shape), (256 // tp_size, 64))
+                    self.assertTrue(layer.gather_output)
+                    pieces.append(layer.weight.detach())
+                torch.testing.assert_close(torch.cat(pieces), full, rtol=0, atol=0)
 
     def test_disabled_keeps_full_weight(self):
         layer = self.build(enabled=False, role="decode")
@@ -50,11 +52,12 @@ class TestEngramProjection(CustomTestCase):
             dict(cp_size=2),
             dict(prefill_cp=True),
             dict(sequence_parallel=True),
-            dict(tp_size=4),
+            dict(tp_size=2),
+            dict(tp_size=16),
         ]:
             with (
                 self.subTest(change=change),
-                self.assertRaisesRegex(ValueError, "requires Prefill, TP8"),
+                self.assertRaisesRegex(ValueError, "requires Prefill, TP4/TP8"),
             ):
                 self.build(**change)
 

@@ -901,14 +901,14 @@ def build_engram_projection(
         )
     if (
         role != "prefill"
-        or tp_size != 8
+        or tp_size not in (4, 8)
         or dp_attention
         or cp_size != 1
         or prefill_cp
         or sequence_parallel
     ):
         raise ValueError(
-            "Engram projection TP requires Prefill, TP8, replicated tokens "
+            "Engram projection TP requires Prefill, TP4/TP8, replicated tokens "
             "(no DP attention, CP, or sequence parallel)"
         )
     block = getattr(quant_config, "weight_block_size", None)
