@@ -24,7 +24,6 @@ from torch import nn
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -350,7 +349,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -360,7 +359,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -369,9 +368,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
@@ -428,6 +433,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -1003,7 +1009,7 @@ class MiMoV2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
@@ -1197,7 +1203,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
@@ -1591,6 +1597,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     skipped_mtp_weights = True
                 continue
+
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:

@@ -13,7 +13,6 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -425,10 +424,10 @@ def handle_environment_variables(server_args: Any):
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
         )
-    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-    # it, mirroring the forward scale split: the ue8m0 path
-    # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-    # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
+    # run it, mirroring the forward scale split: the default sm100 UE8M0
+    # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
+    # SM120 API compatibility is centralized in deep_gemm_wrapper.configurer.
     if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
@@ -442,7 +441,7 @@ def handle_environment_variables(server_args: Any):
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and a compatible sm100/sm120 build, or explicit opt-in on sm90; "
                 "detected sm%d.",
                 sm,
             )
@@ -466,22 +465,20 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and (
-            cfg.hicache_storage_backend is not None
-            or cfg.hicache_write_policy != "write_back"
+        elif cfg.enable_hierarchical_cache and not (
+            (
+                cfg.hicache_storage_backend is None
+                and cfg.hicache_write_policy == "write_back"
+            )
+            or (
+                cfg.hicache_storage_backend is not None
+                and cfg.hicache_host_memory_mode == "buffer_only"
+                and cfg.hicache_write_policy == "write_through"
+            )
         ):
             logger.warning(
-                "Optimistic prefill only supports L2 hierarchical cache "
-                "with write-back policy"
-            )
-            declare_resolution(
-                server_args,
-                "_handle_other_validations",
-                optimistic_prefill_attempts=0,
-            )
-        elif resolved_view(server_args).uses_mamba_radix_cache:
-            logger.warning(
-                "Optimistic prefill does not support models that use mamba radix cache."
+                "Optimistic prefill supports L2 write-back or L3 buffer-only "
+                "write-through hierarchical cache"
             )
             declare_resolution(
                 server_args,
