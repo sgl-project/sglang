@@ -198,7 +198,15 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             send(Arc::clone(&ctx), request.clone()).await,
             StatusCode::OK
         );
-        assert_eq!(captured(&mock), request, "body must be forwarded untouched");
+        let mut forwarded = captured(&mock);
+        assert!(forwarded
+            .as_object_mut()
+            .unwrap()
+            .remove("rid")
+            .unwrap()
+            .as_str()
+            .is_some());
+        assert_eq!(forwarded, request, "payload must be forwarded untouched");
     }
     // Bypasses are not rendering failures.
     assert!(!ctx

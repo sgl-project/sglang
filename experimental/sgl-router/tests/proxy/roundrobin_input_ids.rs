@@ -134,7 +134,15 @@ fn captured(mock: &MockWorker) -> Value {
         .last_body
         .clone()
         .expect("worker captured a request body");
-    serde_json::from_slice(&b).expect("captured body is valid JSON")
+    let mut body: Value = serde_json::from_slice(&b).expect("captured body is valid JSON");
+    assert!(body
+        .as_object_mut()
+        .unwrap()
+        .remove("rid")
+        .unwrap()
+        .as_str()
+        .is_some());
+    body
 }
 
 /// A round-robin (load-only) policy still forwards `input_ids` on a
