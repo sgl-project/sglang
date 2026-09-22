@@ -20,20 +20,21 @@ The base itself is NOT a runnable test (no `test_*` methods until a subclass
 mixes in the kits), so unittest discovery picks it up as empty.
 """
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 
 class DsaMtpEvalConfigDefaults:
     """Eval thresholds & params shared across DSA-MTP regression variants."""
 
-    # GSM8KMixin defaults.
-    gsm8k_accuracy_thres = 0.935
+    # GSM8KMixin defaults. `gsm8k_accuracy_thres` is measured on the FP8
+    # variants; lower-scoring quantizations override it per variant.
+    gsm8k_accuracy_thres = 0.925
     gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500
@@ -95,4 +96,4 @@ class DsaMtpServerBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)

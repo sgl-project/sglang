@@ -26,14 +26,9 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.communication.all_reduce import (
-    fused_parallel_qknorm,
-    get_fused_parallel_qknorm_max_occupancy,
-)
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -80,7 +75,13 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_schedule,
+    process_model_config,
+)
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -97,6 +98,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_non_idle_and_non_empty,
     is_npu,
+    is_xpu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -107,6 +109,13 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
+
+if not _is_xpu:
+    from sglang.kernels.ops.communication.all_reduce import (
+        fused_parallel_qknorm,
+        get_fused_parallel_qknorm_max_occupancy,
+    )
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
@@ -289,15 +298,15 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         # Align with QKVParallelLinear pattern
         if self.attn_tp_size >= num_heads:
-            assert (
-                self.attn_tp_size % num_heads == 0
-            ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            assert self.attn_tp_size % num_heads == 0, (
+                f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            )
             self.num_heads = 1
             self.num_head_replicas = self.attn_tp_size // num_heads
         else:
-            assert (
-                num_heads % self.attn_tp_size == 0
-            ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            assert num_heads % self.attn_tp_size == 0, (
+                f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            )
             self.num_heads = num_heads // self.attn_tp_size
             self.num_head_replicas = 1
 
@@ -425,11 +434,10 @@ class MiniMaxM2QKRMSNorm:
 
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
-        server_args = get_server_args()
-        max_tokens = server_args.chunked_prefill_size
+        max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
-            max_tokens = server_args.model_config.context_len
-        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+            max_tokens = process_model_config().context_len
+        max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
@@ -437,6 +445,7 @@ class MiniMaxM2QKRMSNorm:
         comm = CustomAllReduceV2(
             group=get_parallel().attn_tp_group.cpu_group,
             device=device,
+            # push-only: no barrier plane and no staging buffer
             max_pull_size=0,
             max_pull_blocks=0,
             max_push_size=max_size,
@@ -477,10 +486,26 @@ class MiniMaxM2QKRMSNorm:
         return q, k
 
     def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
-        # TODO: add c++ kernel for cpu
-        q = self._q_norm(q.contiguous())
-        k = self._k_norm(k.contiguous())
-        return q, k
+        if self._world_size > 1:
+            sum_sq = torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q, k)
+            sum_sq = attn_tp_all_reduce(sum_sq)
+            return torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q,
+                k,
+                self._q_norm.weight,
+                self._k_norm.weight,
+                sum_sq,
+                self._world_size,
+                self._eps,
+            )
+
+        return torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
 
 
 class MiniMaxM2MoE(nn.Module):
@@ -513,7 +538,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -828,9 +853,9 @@ class MiniMaxM2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -847,9 +872,9 @@ class MiniMaxM2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_qk_norm:
@@ -1097,7 +1122,7 @@ class MiniMaxM2Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1226,7 +1251,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -1237,7 +1262,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -1246,7 +1271,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         return self.model.get_input_embeddings(input_ids)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        if not get_pp_group().is_last_rank:
+        if not get_parallel().pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True

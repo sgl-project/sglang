@@ -4,12 +4,9 @@ import os
 import subprocess
 from functools import lru_cache
 
-from huggingface_hub import HfApi
-
 from sglang.srt.environ import envs
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
-    is_known_non_diffusers_diffusion_model,
     load_diffusion_overlay_registry_from_env,
 )
 
@@ -25,14 +22,24 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
-def _is_registered_diffusion_model(model_path: str) -> bool:
+def _diffusion_deps_available() -> bool:
+    # Locating diffusers is cheap; importing the registry costs ~2 s and then
+    # fails anyway without it. A false positive is caught by the caller.
+    import importlib.util
+
+    return importlib.util.find_spec("diffusers") is not None
+
+
+def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    if not _diffusion_deps_available():
+        return False
     try:
-        from sglang.multimodal_gen.registry import has_registered_diffusion_model_path
+        from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
     except ImportError:
         # if diffusion dependencies are not installed
         return False
 
-    return has_registered_diffusion_model_path(model_path)
+    return is_registered_diffusion_model_path(model_path)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -50,6 +57,8 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
 def _is_gated_diffusion_repo(repo_id: str) -> bool:
     """Query HF model card metadata to check if a gated repo is a diffusers model."""
     try:
+        from huggingface_hub import HfApi  # lazy: ~0.3 s at CLI entry otherwise
+
         info = HfApi().model_info(repo_id)
         return getattr(info, "library_name", None) == "diffusers"
     except Exception:
@@ -59,8 +68,9 @@ def _is_gated_diffusion_repo(repo_id: str) -> bool:
 def get_is_diffusion_model(model_path: str) -> bool:
     """Detect whether model_path points to a diffusion model.
 
-    For local directories, checks the filesystem directly.
-    For HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For registered models, consults the diffusion registry first.
+    For other local directories, checks the filesystem directly.
+    For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
     For gated repos where file download fails, falls back to HF model card
     metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
@@ -70,16 +80,13 @@ def get_is_diffusion_model(model_path: str) -> bool:
         # short-circuit, if applicable for the overlay mechanism (diffusion-only)
         return True
 
+    # the diffusion registry is authoritative for native models, including
+    # local directories without a top-level model_index.json
+    if _is_diffusion_model_from_registry(model_path):
+        return True
+
     if os.path.isdir(model_path):
-        if _is_diffusers_model_dir(model_path):
-            return True
-        return is_known_non_diffusers_diffusion_model(model_path)
-
-    if is_known_non_diffusers_diffusion_model(model_path):
-        return True
-
-    if _is_registered_diffusion_model(model_path):
-        return True
+        return _is_diffusers_model_dir(model_path)
 
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
@@ -99,8 +106,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return False
 
 
-def get_model_path(extra_argv):
-    # Find the model_path argument
+def try_get_model_path(extra_argv) -> str | None:
+    """Return a model path from command-line arguments when one is present."""
+
     model_path = None
     for i, arg in enumerate(extra_argv):
         if arg in ("--model-path", "--model"):
@@ -110,6 +118,13 @@ def get_model_path(extra_argv):
         elif arg.startswith("--model-path=") or arg.startswith("--model="):
             model_path = arg.split("=", 1)[1]
             break
+
+    return model_path
+
+
+def get_model_path(extra_argv):
+    # Find the model_path argument
+    model_path = try_get_model_path(extra_argv)
 
     if model_path is None:
         # Fallback for --help or other cases where model-path is not provided
@@ -121,8 +136,7 @@ def get_model_path(extra_argv):
             )
         else:
             raise Exception(
-                "Error: --model-path is required. "
-                "Please provide the path to the model."
+                "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path
 

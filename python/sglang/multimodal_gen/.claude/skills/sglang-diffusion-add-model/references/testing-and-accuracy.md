@@ -33,6 +33,15 @@ B200-only groups are not currently inputs to the component-accuracy selector;
 add or identify a representative regular GPU case when that coverage is
 required.
 
+Larger-topology smoke cases need the same explicit decision even when they are
+not enrolled in component accuracy. MiniMax-H3's current
+`MINIMAX_H3_FOUR_GPU_H100_CASES` is the reference: it exercises a real FL2VA
+request with TP2 + Ulysses2, but deliberately disables component accuracy and
+pipeline consistency because its native joint video/audio components do not
+have a directly comparable Diffusers pipeline contract. Pair this GPU smoke
+case with focused unit tests for request admission, packed-sequence layout,
+denoise scheduling, media handling, and VAE parallel-mode rejection.
+
 The component-accuracy harness compares SGLang components against Diffusers/HF
 reference components. This is stricter than pipeline-level inference. New GPU
 cases commonly fail here for one of three reasons:
@@ -87,6 +96,10 @@ Tests should cover:
 - single-GPU inference producing non-noise output
 - multi-GPU inference if TP/SP is supported
 - relevant unit tests for new math, parsing, scheduling, or loader behavior
+- every generated modality and delivery contract. For a joint model such as
+  MiniMax-H3, validate the MP4 video stream, synchronized audio stream, frame
+  rate/sample rate, and multi-output grouping; a visually valid frame sequence
+  alone is not sufficient
 
 For performance data:
 

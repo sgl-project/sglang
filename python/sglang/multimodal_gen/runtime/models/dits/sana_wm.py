@@ -7,9 +7,13 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_blocks_or_transformer_blocks,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Re-exported for back-compat: callers import these names from this module path.
@@ -74,9 +78,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _UpstreamMlp,
     compute_chunk_plucker,
     process_camera_conditions_ucpe,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
-    parity_probe,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -344,16 +345,15 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Returns: ``(B, C, T, H, W)`` predicted velocity / noise.
     """
 
-    _fsdp_shard_conditions = SanaWMConfig()._fsdp_shard_conditions
-    _compile_conditions = SanaWMConfig()._compile_conditions
-    _supported_attention_backends = SanaWMConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
+    _compile_conditions = [is_blocks_or_transformer_blocks]
     param_names_mapping = SanaWMConfig().param_names_mapping
     reverse_param_names_mapping = SanaWMConfig().reverse_param_names_mapping
     lora_param_names_mapping: dict = {}
 
     def __init__(self, config: SanaWMConfig, hf_config=None, **kwargs) -> None:
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
-        arch = config.arch_config
+        arch = self.config
 
         self.patch_size = (arch.patch_size_t, arch.patch_size, arch.patch_size)
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim

@@ -2,8 +2,8 @@ name: Bot Bump Docs Version
 #
 # Bumps the "install from source" release-branch version pinned in the docs
 # (the `git clone -b v<version> ...sglang.git` line in
-# docs_new/docs/get-started/install.mdx "Method 2: From source" and
-# docs_new/docs/hardware-platforms/amd_gpu.mdx) whenever a release tag is
+# docs/docs/get-started/install.mdx "Method 2: From source" and
+# docs/docs/hardware-platforms/amd_gpu.mdx) whenever a release tag is
 # pushed, and opens a PR with the change.
 #
 # Triggers mirror release-docker.yml: a pushed `v*` tag (the release), or a

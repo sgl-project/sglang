@@ -25,7 +25,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -51,7 +50,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
 _is_cuda = is_cuda()
@@ -231,7 +230,7 @@ class MellumAttention(Qwen3MoeAttention):
         _yarn_factor = self._yarn_params["factor"]
 
         self.use_fused_qk_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
@@ -494,7 +493,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
 
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         cfg = cast(Any, config)
         self.config = cfg
         self.quant_config = quant_config
@@ -520,7 +519,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             cfg.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(cfg)
         self.capture_aux_hidden_states = False

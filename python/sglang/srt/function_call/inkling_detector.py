@@ -238,7 +238,10 @@ class InklingDetector(BaseFormatDetector):
         return info
 
     def get_auto_tool_call_structural_tag(
-        self, tools: Optional[List[Tool]] = None
+        self,
+        tools: Optional[List[Tool]] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> StructuralTag:
         """Constrain JSON after Inkling's tool-payload trigger token.
 
@@ -248,7 +251,7 @@ class InklingDetector(BaseFormatDetector):
         ``END_MESSAGE``. This mirrors the TML sampling default used by the OAI
         API and intentionally does not restrict names to the request's tools.
         """
-        del tools
+        del tools, thinking_mode, parallel_tool_calls
         return StructuralTag.model_validate(
             {
                 "type": "structural_tag",

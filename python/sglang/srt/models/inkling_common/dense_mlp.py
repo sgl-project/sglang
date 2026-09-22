@@ -18,7 +18,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ class InklingDenseMLP(LlamaMLP):
         fused = fused and not lora_compatible_layout_enabled()
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
     def forward(
         self,
@@ -217,6 +217,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             self.quant_method,
             self.moe_runner_config,
             self.moe_tp_rank,
+            self.moe_tp_size,
         )
         self.quant_method.create_weights(
             layer=self,
@@ -328,9 +329,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         """
         assert x.ndim in (2, 3), f"{x.shape=}"
         assert gammas.ndim in (2, 3), f"{gammas.shape=}"
-        assert (
-            gammas.size(-1) == self.n_shared_experts
-        ), f"{gammas.shape=} {self.n_shared_experts=}"
+        assert gammas.size(-1) == self.n_shared_experts, (
+            f"{gammas.shape=} {self.n_shared_experts=}"
+        )
         if self._fp4_strategy.serves_fp4:
             return self._forward_fp4(x, gammas, use_reduce_scatter)
 
@@ -386,9 +387,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             silu_and_mul_triton,
         )
 
-        assert (
-            self.inference_moe_w13_interleaved
-        ), "silu_and_mul_triton requires interleaved w13"
+        assert self.inference_moe_w13_interleaved, (
+            "silu_and_mul_triton requires interleaved w13"
+        )
         y_st_2f = y_st2f.view(-1, y_st2f.size(-1))
         y_st_f = silu_and_mul_triton(y_st_2f, gammas_st.reshape(-1))
         return y_st_f.view(*y_st2f.shape[:-1], y_st2f.size(-1) // 2)
@@ -484,7 +485,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         # All shared experts must share one global weight scale (reshard with
         # single_global_scale=True). ModelOpt's input_scale = amax / (6 * 448).
         flat2 = scale2.reshape(-1).float()
-        if get_server_args().load_format == "dummy" and not bool(
+        if get_model().load_format == "dummy" and not bool(
             torch.all(flat2 == flat2[0])
         ):
             # Dummy loading uses per-element noise; replace it with a valid scale.

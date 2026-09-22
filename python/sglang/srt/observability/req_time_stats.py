@@ -37,6 +37,10 @@ from sglang.srt.observability.trace import (
     TraceSliceContext,
     get_global_tracing_enabled,
 )
+from sglang.srt.observability.trace_async import (
+    TraceReqContextAsync,
+    is_async_tracing_available,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -286,13 +290,22 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
-        self.trace_ctx = TraceReqContext(
-            rid=rid,
-            bootstrap_room=bootstrap_room,
-            role=self.disagg_mode_str(),
-            module_name="request",
-            external_trace_header=external_trace_header,
-        )
+        if is_async_tracing_available():
+            self.trace_ctx = TraceReqContextAsync(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
+        else:
+            self.trace_ctx = TraceReqContext(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
 
         if not self.trace_ctx.tracing_enable:
             self.trace_ctx = TraceNullContext()
@@ -339,14 +352,18 @@ class ReqTimeStatsBase:
         trace_ctx_state = state.get("trace_ctx")
         if isinstance(trace_ctx_state, dict):
             if trace_ctx_state.get("tracing_enable"):
-                trace_ctx = object.__new__(TraceReqContext)
-                trace_ctx.__setstate__(trace_ctx_state)
+                if trace_ctx_state.get("is_async"):
+                    trace_ctx = object.__new__(TraceReqContextAsync)
+                    trace_ctx.__setstate__(trace_ctx_state)
+                else:
+                    trace_ctx = object.__new__(TraceReqContext)
+                    trace_ctx.__setstate__(trace_ctx_state)
                 state["trace_ctx"] = trace_ctx
             else:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            if key.endswith("time"):
+            if key.endswith("time") and state[key]:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
@@ -398,12 +415,18 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime_ns(ts),
             )
 
-    def set_finished_time(self, ts=None):
+    def set_finished_time(self, ts=None, span_attrs=None):
         ts = ts or time.perf_counter()
         self.finished_time = ts
 
         if self.trace_ctx.tracing_enable:
-            self.trace_ctx.trace_req_finish(convert_time_to_realtime_ns(ts))
+            # The latency attrs are derived from finished_time and the root span is
+            # closed below, so they must be merged in here rather than by the caller.
+            attrs = dict(span_attrs) if span_attrs else {}
+            attrs.update(self.convert_to_gen_ai_span_attrs())
+            self.trace_ctx.trace_req_finish(
+                convert_time_to_realtime_ns(ts), attrs=attrs
+            )
 
     def set_first_token_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -476,6 +499,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["request_received_ts"] = convert_time_to_realtime(
                 self.created_time
             )
+        if self.created_time > 0.0 and self.first_token_time > self.created_time:
+            meta_info["first_token_latency"] = self.get_first_token_latency()
         if self.api_server_dispatch_finish_time > 0.0:
             meta_info["api_server_dispatch_finish_ts"] = convert_time_to_realtime(
                 self.api_server_dispatch_finish_time
@@ -623,6 +648,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    # Seconds spent in the waiting queue over every entry (a retracted request
+    # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
+    queue_duration_s: float = 0.0
+
     has_timing_data: bool = False
 
     def __getstate__(self) -> object:
@@ -635,6 +664,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
+            "queue_duration_s": self.queue_duration_s,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -717,6 +748,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
+        self.queue_duration_s = 0.0
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -744,9 +776,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
             if self.enable_metrics:
-                self.metrics_collector.observe_queue_time(self.get_queueing_time())
+                # One sample per request: the wait before the first forward.
+                self.metrics_collector.observe_queue_time(
+                    ts - self.wait_queue_entry_time
+                )
 
             if self.enable_metrics or self.trace_ctx.tracing_enable:
                 if self.disagg_mode == DisaggregationMode.DECODE:
@@ -771,7 +807,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         convert_time_to_realtime_ns(ts),
                     )
         elif self.last_forward_entry_time == 0.0:
+            # First forward after a retraction; later prefill chunks skip this branch.
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
     def set_last_chunked_prefill_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1028,30 +1066,26 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.trace_slice(stage, self.last_forward_entry_time, ts)
 
     def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
+        return self.queue_duration_s
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time, self.forward_entry_time
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
-                assert (
-                    queue_duration >= 0 and forward_duration >= 0
-                ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                assert queue_duration >= 0 and forward_duration >= 0, (
+                    f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                )
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time, self.forward_entry_time
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
@@ -1062,7 +1096,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         bootstrap_queue_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                    ), (
+                        f"bootstrap_queue_duration={bootstrap_queue_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                    )
 
             if (
                 self.bootstrap_done_time > 0
@@ -1072,9 +1108,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
-                    assert (
-                        bootstrap_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0"
+                    assert bootstrap_duration >= 0, (
+                        f"bootstrap_duration={bootstrap_duration} < 0"
+                    )
                 bootstrap_fields = (
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                 )
@@ -1100,10 +1136,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.decode_transfer_queue_entry_time,
                 self.wait_queue_entry_time,
             )
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time,
-                self.forward_entry_time,
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time,
                 self.completion_time,
@@ -1116,7 +1149,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         and transfer_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
+                    ), (
+                        f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
+                    )
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
@@ -1127,9 +1162,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     self.bootstrap_done_time, self.decode_transfer_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
-                    assert (
-                        bootstrap_duration >= 0 and alloc_wait_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                    assert bootstrap_duration >= 0 and alloc_wait_duration >= 0, (
+                        f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
+                    )
                 prealloc_fields = (
                     f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
                     f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
@@ -1247,3 +1282,19 @@ def set_time_batch(
             method(ts)
         else:
             method(ts, attrs)
+
+
+def flush_trace_batch(reqs: List[Any]):
+    """Proactively flush buffered trace ops for a batch of requests.
+
+    Call at natural CPU/GPU overlap points (e.g., right before run_batch)
+    so the ZMQ send overlaps with GPU forward compute.
+    """
+    if reqs is None or not get_global_tracing_enabled():
+        return
+    for req in reqs:
+        time_stats = getattr(req, "time_stats", None)
+        if time_stats is not None:
+            trace_ctx = getattr(time_stats, "trace_ctx", None)
+            if trace_ctx is not None:
+                trace_ctx.flush()

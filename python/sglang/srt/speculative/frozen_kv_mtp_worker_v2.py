@@ -22,13 +22,13 @@ start of the next draft.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+import time
 from typing import Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -42,8 +42,15 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_device,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -64,13 +71,14 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
     draft_tp_context,
     fast_topk,
     get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import empty_context
+from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -92,21 +100,21 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        EagleDraftWorkerBase.__init__(self)
+
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.ps = ps
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self.target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
             "FrozenKVMTPDraftWorker should only be instantiated for "
@@ -123,18 +131,21 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            # NOTE: call TpModelWorker.__init__ explicitly -- EagleDraftWorkerBase is
-            # an ABC with no __init__, so cooperative super() would be ambiguous.
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
+            # Both base classes own initialization, so initialize TpModelWorker
+            # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
                 self,
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -149,8 +160,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.draft_owns_attention = False
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
 
         self.draft_attn_backend = None
@@ -188,7 +201,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_attention_backends(self):
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            draft_pp_context(),
+            self.draft_tp_context(
+                self.draft_model_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -198,7 +215,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def init_cuda_graphs(self):
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            draft_pp_context(),
+            self.draft_tp_context(
+                self.draft_model_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -222,23 +243,29 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         pass
 
     def _resolve_draft_backend_type(self) -> str:
-        return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
-        )
+        # The same chain as before, off the bags: the speculative override if
+        # the operator set one, else the configured decode backend (which falls
+        # back to the base one). Deliberately NOT the runner's stamp: this
+        # worker does not hand its runner a draft backend, so the stamp is the
+        # ordinary pair and reading it would drop the speculative setting --
+        # and forcing the runner onto one backend would collapse a hybrid
+        # prefill/decode config for the topk==1 path, which uses the runner's
+        # own backend.
+        return get_spec().speculative_draft_attention_backend or attention_backends()[1]
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
             return self.draft_model_runner.attn_backend
 
         backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+        if backend_type == "triton":
+            return self._init_triton_draft_attn_backend()
+        if backend_type == "trtllm_mha":
+            return self._init_trtllm_mha_draft_attn_backend()
+        raise ValueError(
+            "Frozen-KV MTP topk > 1 currently supports triton and trtllm_mha "
+            f"attention backends, got {backend_type}."
+        )
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -252,6 +279,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
+
+    def _init_trtllm_mha_draft_attn_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
 
     def _bind_kv_context(self) -> None:
         draft_model = self.draft_model_runner.model
@@ -355,7 +387,20 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
         logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._specialized_graph_memory_usage["draft_decode"] = (
+            self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_decode"] = (
+            self._specialized_graph_time_usage.get("draft_decode", 0.0)
+            + time.perf_counter()
+            - tic
+        )
         logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(
@@ -448,7 +493,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self.cuda_graph_runner.execute(forward_batch)
             )
         else:
-            forward_batch.can_run_dp_cuda_graph = False
+            forward_batch.can_run_decode_cuda_graph = False
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -649,47 +694,40 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        BaseSpecWorker.__init__(self)
+
         # NOTE: intentionally does NOT call EAGLEWorkerV2.__init__ -- that builds
         # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
         # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.ps = ps
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        # Match the draft context length to the target (assistant reads target KV).
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
-        )
-
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,
-            ps,
             nccl_port,
             target_worker,
         )
 
         # Frozen MTP does not wire the adaptive controller yet.
-        assert (
-            not server_args.speculative_adaptive
-        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        assert not get_spec().speculative_adaptive, (
+            "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        )
         self.adaptive_controller = None
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
@@ -729,7 +767,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             # Draft prefill seed (no forward).
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -751,7 +790,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 batch.spec_info = self.draft_worker._idle_seed()
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -766,7 +806,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 on_publish(batch_output.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),

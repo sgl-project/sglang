@@ -198,7 +198,7 @@ def print_suite_summary(
         )
         for standalone_file in suite_info.missing_standalone_estimates:
             print(f"    - {standalone_file}")
-    print(f"  Total estimated time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"  Total estimated time: {total_time:.1f}s ({total_time / 60:.1f} min)")
     print(f"  Selected partitions: {len(partitions)}")
     print()
 
@@ -207,7 +207,7 @@ def print_suite_summary(
         partition_time = sum(item.est_time for item in partition)
         print(f"    Partition {idx}:")
         print(
-            f"      Estimated time: {partition_time:.1f}s ({partition_time/60:.1f} min)"
+            f"      Estimated time: {partition_time:.1f}s ({partition_time / 60:.1f} min)"
         )
         for item in partition:
             fallback_suffix = (
@@ -255,6 +255,11 @@ def main():
         action="store_true",
         help="Only partition DiffusionTestCase parametrized cases.",
     )
+    parser.add_argument(
+        "--case-ids",
+        nargs="*",
+        help="Only schedule partitions containing these parametrized case IDs.",
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -285,10 +290,25 @@ def main():
     )
     validate_suite_case_coverage(suites)
 
+    requested_case_ids = set(args.case_ids or [])
+    if requested_case_ids:
+        known_case_ids = {
+            case.case_id
+            for suite_name, suite_info in suites.items()
+            if suite_name in SUITE_OUTPUT_NAMES
+            for case in suite_info.cases
+        }
+        unknown_case_ids = sorted(requested_case_ids - known_case_ids)
+        if unknown_case_ids:
+            print(f"Error: Unknown case IDs: {' '.join(unknown_case_ids)}")
+            sys.exit(1)
+
     print("=== Diffusion Partition Computation ===")
-    print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")
-    print(f"Target partition time: {args.target_time}s ({args.target_time/60:.1f} min)")
-    print(f"Max partition time: {args.max_time}s ({args.max_time/60:.1f} min)")
+    print(f"Min partition time: {args.min_time}s ({args.min_time / 60:.1f} min)")
+    print(
+        f"Target partition time: {args.target_time}s ({args.target_time / 60:.1f} min)"
+    )
+    print(f"Max partition time: {args.max_time}s ({args.max_time / 60:.1f} min)")
     print()
 
     for suite_name, suite_info in suites.items():
@@ -316,7 +336,19 @@ def main():
         )
 
         output_name = SUITE_OUTPUT_NAMES[suite_name]
-        output_github_value(f"matrix-{output_name}", build_matrix(partition_count))
+        matrix = build_matrix(partition_count)
+        if requested_case_ids:
+            matrix = {
+                "include": [
+                    {"part": idx}
+                    for idx, partition in enumerate(partitions)
+                    if any(
+                        item.kind == "case" and item.item_id in requested_case_ids
+                        for item in partition
+                    )
+                ]
+            }
+        output_github_value(f"matrix-{output_name}", matrix)
         output_github_scalar(f"partition-count-{output_name}", str(partition_count))
         output_github_value(
             f"plan-{output_name}", build_partition_plan(suite_name, partitions)
