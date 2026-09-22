@@ -19,7 +19,6 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
-    GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
@@ -77,7 +76,6 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.xpu.Stream] = None
-        self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
         self._output_buffer: Optional[torch.Tensor] = None
 
@@ -109,8 +107,7 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            with self._precarve.measure():
-                output = forward_fn()
+            output = forward_fn()
             if self._reuse_output_buffer and warmup_step == 1:
                 warmup_output = output
             del output
@@ -134,7 +131,6 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
                 xpu_graph=graph, pool=self._pool, stream=self._capture_stream
             ),
         ):
-            self._precarve.mint()
             out = forward_fn()
             if self._reuse_output_buffer:
                 output_buffer = self._output_buffer
