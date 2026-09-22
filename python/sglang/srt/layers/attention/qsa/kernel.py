@@ -30,7 +30,11 @@ def qsa_fast_topk(
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks using the platform's fixed-width Top-K."""
+    """Select compressed blocks with platform kernels or a Torch reference.
+
+    Return int32 indices of shape [rows, topk], relative to each row's start.
+    Valid indices precede any -1 padding.
+    """
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
@@ -61,13 +65,13 @@ def qsa_fast_topk(
             f"supported values are {supported_topk}"
         )
 
+    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     output = torch.full(
         (logits.shape[0], topk),
         -1,
         dtype=torch.int32,
         device=logits.device,
     )
-    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     for row in range(logits.shape[0]):
         start = int(starts[row])
         length = int(lengths[row])
