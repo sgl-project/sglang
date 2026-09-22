@@ -662,7 +662,6 @@ class Envs:
     # ===================================================================
     # Radix and sparse KV caches
     # ===================================================================
-    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
@@ -750,6 +749,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # HiCache host<->device transfers use the TMA staging kernel when the GPU
+    # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
+    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

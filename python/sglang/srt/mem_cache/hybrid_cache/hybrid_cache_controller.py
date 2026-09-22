@@ -1336,6 +1336,7 @@ class HybridCacheController(BaseHiCacheController):
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         derived_transfers: list[PoolTransfer] = []
+        anchor_transfers = []
 
         def rollback_allocated() -> None:
             for prev_pool, prev_free_fn, prev_indices in newly_allocated:
@@ -1350,6 +1351,11 @@ class HybridCacheController(BaseHiCacheController):
             if entry is None:
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
+                continue
+            if entry.device_indices_from_anchor_fn is not None:
+                # Allocate independent pools first: their allocation/eviction
+                # can compact SWA before its kernel-facing IDs are captured.
+                anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
@@ -1368,6 +1374,28 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
+
+        for pool, entry in anchor_transfers:
+            if kv_device_indices is None or not pool.anchor_index_parts:
+                rollback_allocated()
+                return None
+            anchor_indices = torch.cat(
+                [
+                    kv_device_indices[part] if isinstance(part, slice) else part
+                    for part in pool.anchor_index_parts
+                ]
+            )
+            assert len(anchor_indices) == len(pool.host_indices)
+            bind = entry.device_indices_from_anchor_fn
+            indices = bind(anchor_indices)
+            if indices is None and entry.device_evict_fn:
+                entry.device_evict_fn(len(anchor_indices))
+                indices = bind(anchor_indices)
+            if indices is None:
+                rollback_allocated()
+                return None
+            pool.device_indices = indices
+            newly_allocated.append((pool, entry.device_free_fn, anchor_indices))
 
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:
