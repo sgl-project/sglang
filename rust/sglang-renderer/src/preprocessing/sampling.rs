@@ -444,6 +444,17 @@ mod tests {
     }
 
     #[test]
+    fn unlimited_max_new_tokens_allows_large_minimum() {
+        let params = norm(SamplingParams {
+            max_new_tokens: None,
+            min_new_tokens: 4096,
+            ..Default::default()
+        });
+        assert_eq!(params.max_new_tokens, None);
+        assert_eq!(params.min_new_tokens, 4096);
+    }
+
+    #[test]
     fn verify_rejects_out_of_range() {
         for (params, want) in [
             (
@@ -532,6 +543,13 @@ mod tests {
                     ..Default::default()
                 },
                 "beam_width must be 1",
+            ),
+            (
+                SamplingParams {
+                    beam_width: Some(0),
+                    ..Default::default()
+                },
+                "beam_width must be at least 1",
             ),
         ] {
             let err = norm_err(params).to_string();
