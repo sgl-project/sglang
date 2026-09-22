@@ -8,6 +8,7 @@
 #include <torch/library.h>
 
 #include <cmath>
+#include <exception>
 #include <vector>
 
 #include "cuda_kernels/config.h"
@@ -145,12 +146,33 @@ PyObject* get_supported_architectures(PyObject*, PyObject*) {
   return result;
 }
 
+PyObject* is_supported_device(PyObject*, PyObject* args) {
+  int device_index;
+  if (!PyArg_ParseTuple(args, "i", &device_index)) {
+    return nullptr;
+  }
+  try {
+    const auto* device_prop = at::cuda::getDeviceProperties(device_index);
+    if (device_prop == nullptr) {
+      Py_RETURN_FALSE;
+    }
+    return PyBool_FromLong(deepselect_supports_device(*device_prop));
+  } catch (const std::exception& error) {
+    PyErr_SetString(PyExc_RuntimeError, error.what());
+    return nullptr;
+  }
+}
+
 PyMODINIT_FUNC PyInit_deepselect_ops() {
   static PyMethodDef methods[] = {
       {"get_supported_architectures",
        get_supported_architectures,
        METH_NOARGS,
        "Return the CUDA compute capabilities compiled into DeepSelect."},
+      {"is_supported_device",
+       is_supported_device,
+       METH_VARARGS,
+       "Return whether DeepSelect contains code for the CUDA device."},
       {nullptr, nullptr, 0, nullptr}};
   static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "deepselect_ops", nullptr, 0, methods};
   return PyModule_Create(&module);

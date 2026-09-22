@@ -25,18 +25,14 @@ def test_deepselect_reports_current_architecture():
         is_deepselect_supported,
     )
 
-    major, minor = torch.cuda.get_device_capability()
-    assert major * 10 + minor in get_deepselect_supported_architectures()
+    assert get_deepselect_supported_architectures()
     assert is_deepselect_supported()
 
 
-def test_deepselect_rejects_uncompiled_architecture(monkeypatch):
+def test_deepselect_rejects_non_cuda_device():
     from sgl_kernel import is_deepselect_supported
 
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda device=None: (12, 0)
-    )
-    assert not is_deepselect_supported()
+    assert not is_deepselect_supported(torch.device("cpu"))
 
 
 @pytest.mark.parametrize(

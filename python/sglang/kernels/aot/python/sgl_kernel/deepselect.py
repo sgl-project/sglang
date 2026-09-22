@@ -19,11 +19,28 @@ def is_deepselect_supported(device=None) -> bool:
     """Return whether the AOT extension contains code for a CUDA device."""
     if torch.version.cuda is None or not torch.cuda.is_available():
         return False
+    if isinstance(device, int):
+        device_index = device
+    else:
+        try:
+            normalized_device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if device is None
+                else torch.device(device)
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        if normalized_device.type != "cuda":
+            return False
+        device_index = (
+            torch.cuda.current_device()
+            if normalized_device.index is None
+            else normalized_device.index
+        )
     try:
-        major, minor = torch.cuda.get_device_capability(device)
-    except (AssertionError, RuntimeError, ValueError):
+        return bool(_deepselect_ops.is_supported_device(device_index))
+    except RuntimeError:
         return False
-    return major * 10 + minor in get_deepselect_supported_architectures()
 
 
 def _aligned_empty(rows: int, cols: int, alignment_bytes: int, dtype, device):
@@ -41,9 +58,8 @@ def deepselect_topk_fp32(
     if not input.is_cuda:
         raise ValueError("input must be a CUDA tensor")
     if not is_deepselect_supported(input.device):
-        major, minor = torch.cuda.get_device_capability(input.device)
         raise RuntimeError(
-            f"deepselect_topk_fp32 was not compiled for SM{major}{minor}; "
+            f"deepselect_topk_fp32 does not support CUDA device {input.device}; "
             f"compiled architectures: {get_deepselect_supported_architectures()}"
         )
     if not 0 < topk <= min(4096, input.shape[1]):
