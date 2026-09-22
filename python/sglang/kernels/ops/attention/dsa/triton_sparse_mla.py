@@ -1140,47 +1140,48 @@ def _triton_sparse_mla_fwd_splitk(
         seq, kv_splits, h_padded, d_v, dtype=torch.bfloat16, device=q_nope.device
     )
 
-    _sparse_mla_split_k_kernel[(seq, n_head_blocks, kv_splits)](
-        q_nope,
-        q_rope,
-        kv,
-        idx_flat,
-        lse_partial,
-        acc_partial,
-        qk_scale,
-        _FP8_MAX,
-        topk=topk,
-        H=H,
-        KV_DIM=kv_dim,
-        D_V=d_v,
-        D_TAIL=d_tail,
-        NUM_GROUPS=num_groups,
-        STRIDE_QN_T=stride_qn_t,
-        STRIDE_QN_H=stride_qn_h,
-        STRIDE_QR_T=stride_qr_t,
-        STRIDE_QR_H=stride_qr_h,
-        USE_FP8_DOT=use_fp8_dot,
-        KV_SPLITS=kv_splits,
-        BLOCK_H=BLOCK_H,
-        BLOCK_K=BLOCK_K,
-        num_warps=split_num_warps,
-        num_stages=2,
-    )
+    with _no_async_copy():
+        _sparse_mla_split_k_kernel[(seq, n_head_blocks, kv_splits)](
+            q_nope,
+            q_rope,
+            kv,
+            idx_flat,
+            lse_partial,
+            acc_partial,
+            qk_scale,
+            _FP8_MAX,
+            topk=topk,
+            H=H,
+            KV_DIM=kv_dim,
+            D_V=d_v,
+            D_TAIL=d_tail,
+            NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
+            USE_FP8_DOT=use_fp8_dot,
+            KV_SPLITS=kv_splits,
+            BLOCK_H=BLOCK_H,
+            BLOCK_K=BLOCK_K,
+            num_warps=split_num_warps,
+            num_stages=2,
+        )
 
-    D_CHUNK = _reduce_d_chunk(active_splits, seq * H) if optimize_gfx950_fp8 else 64
-    _sparse_mla_reduce_kernel[(seq, H, (d_v + D_CHUNK - 1) // D_CHUNK)](
-        lse_partial,
-        acc_partial,
-        out,
-        H=H,
-        D_V=d_v,
-        KV_SPLITS=kv_splits,
-        ACTIVE_SPLITS=active_splits,
-        ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
-        D_CHUNK=D_CHUNK,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
-    )
+        D_CHUNK = _reduce_d_chunk(active_splits, seq * H) if optimize_gfx950_fp8 else 64
+        _sparse_mla_reduce_kernel[(seq, H, (d_v + D_CHUNK - 1) // D_CHUNK)](
+            lse_partial,
+            acc_partial,
+            out,
+            H=H,
+            D_V=d_v,
+            KV_SPLITS=kv_splits,
+            ACTIVE_SPLITS=active_splits,
+            ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
+            D_CHUNK=D_CHUNK,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+        )
     return out.unsqueeze(0)
 
 

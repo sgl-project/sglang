@@ -544,8 +544,6 @@ def triton_sparse_mla_decode_splitk(
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
-    # The H=8 tuning is prefill-only: decode is already optimal on the
-    # established path for this shape.
     optimize_gfx950_fp8 = H == 16 and _is_gfx950_sparse_mla_fp8(
         kv.dtype, H, d_v, d_tail, kv_dim
     )

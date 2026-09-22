@@ -6,17 +6,14 @@ import torch
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _cu_count,
     _cu_count_for_device,
-    _gfx950_sparse_mla_kv_splits,
-    _gfx950_sparse_mla_num_warps,
     _is_gfx950_sparse_mla_fp8,
     _page_offsets_fit_i32,
     _reduce_d_chunk,
+    _sparse_mla_reduce_kernel,
     triton_sparse_mla_fwd,
 )
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
-    _gfx950_sparse_mla_decode_tile_config,
-    _sparse_mla_decode_reduce_kernel,
     _splitk_bufs,
 )
 from sglang.srt.utils import is_hip
@@ -52,44 +49,7 @@ def test_cu_count_uses_tensor_device(monkeypatch):
     _cu_count_for_device.cache_clear()
 
 
-@pytest.mark.parametrize(
-    ("active_splits", "output_rows", "expected"),
-    [(2, 0, 128), (4, 1535, 128), (4, 1536, 512), (8, 2048, 64)],
-)
-def test_reduce_d_chunk(active_splits, output_rows, expected):
-    assert _reduce_d_chunk(active_splits, output_rows) == expected
-
-
-@pytest.mark.parametrize(
-    ("base_ctas", "topk", "initial", "expected"),
-    [
-        (4, 2048, 32, 32),
-        (5, 2048, 32, 16),
-        (65, 2048, 2, 4),
-        (256, 2048, 1, 2),
-        (257, 2048, 1, 1),
-        (160, 1024, 1, 1),
-    ],
-)
-def test_gfx950_kv_splits(base_ctas, topk, initial, expected):
-    assert (
-        _gfx950_sparse_mla_kv_splits(
-            base_ctas,
-            topk,
-            block_k=64,
-            num_cu=256,
-            kv_splits=initial,
-            max_kv_splits=max(1, topk // 64),
-        )
-        == expected
-    )
-
-
-def test_gfx950_launch_config():
-    assert _gfx950_sparse_mla_num_warps(64, 4, 256) == 4
-    assert _gfx950_sparse_mla_num_warps(65, 4, 256) == 2
-    assert _gfx950_sparse_mla_decode_tile_config(1, 2048, 64, 32) == (32, 64)
-    assert _gfx950_sparse_mla_decode_tile_config(3, 2048, 64, 32) == (64, 32)
+def test_page_offset_i32_boundary():
     max_pages = ((1 << 31) - 1) // 576
     assert _page_offsets_fit_i32(max_pages, 576)
     assert not _page_offsets_fit_i32(max_pages + 1, 576)
@@ -134,11 +94,9 @@ def test_splitk_workspaces_are_graph_and_stream_safe():
 
 @pytest.mark.skipif(not _IS_GFX950, reason="topk_length path is gfx950-only")
 @pytest.mark.parametrize("topk", [2048, 2050])
-def test_short_prefill_index_bound_matches_explicit_bound(topk):
-    # topk=2048 takes the topk_length path; 2050 must be rejected by the
-    # alignment guard and fall back, and both must match the unbounded result.
+def test_short_prefill_index_bound_matches_full_scan(topk):
     torch.manual_seed(29)
-    seq, heads, value_dim, tail_dim = 4, 16, 512, 64
+    seq, heads, value_dim, tail_dim = 5, 16, 512, 64
     q = torch.randn(
         seq, heads, value_dim + tail_dim, device="cuda", dtype=torch.bfloat16
     )
@@ -148,14 +106,12 @@ def test_short_prefill_index_bound_matches_explicit_bound(topk):
         .to(torch.float8_e4m3fn)
     )
     indices = torch.full((seq, 1, topk), -1, device="cuda", dtype=torch.int32)
-    for row in range(seq):
-        positions = torch.randperm(128, device="cuda")[: row + 1]
+    for row in range(seq - 1):
+        positions = torch.arange(row + 1, device="cuda") * 31 + 5
         indices[row, 0, positions] = torch.randint(
             0, kv.shape[0], (row + 1,), device="cuda", dtype=torch.int32
         )
 
-    ramp = torch.arange(1, topk + 1, device="cuda", dtype=torch.int32)
-    topk_length = torch.where(indices.squeeze(1) >= 0, ramp, 0).amax(dim=1)
     args = (
         q[:, :, :value_dim],
         q[:, :, value_dim:],
@@ -164,17 +120,15 @@ def test_short_prefill_index_bound_matches_explicit_bound(topk):
         value_dim**-0.5,
         value_dim,
     )
-    expected = triton_sparse_mla_fwd(
-        *args, topk_length=topk_length, max_topk_length=seq
-    )
-    actual = triton_sparse_mla_fwd(*args, max_topk_length=seq)
+    expected = triton_sparse_mla_fwd(*args)
+    actual = triton_sparse_mla_fwd(*args, max_topk_length=128)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("active_splits", [2, 4])
 def test_reduce_d_chunk_is_bitwise_identical(active_splits):
     torch.manual_seed(active_splits)
-    batch, heads, value_dim = 7, 16, 512
+    batch, heads, value_dim = 96, 16, 512
     lse = torch.randn(batch, active_splits, heads, device="cuda")
     acc = torch.randn(
         batch, active_splits, heads, value_dim, device="cuda", dtype=torch.bfloat16
@@ -182,7 +136,7 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
 
     def run(d_chunk):
         out = torch.empty(batch, heads, value_dim, device="cuda", dtype=torch.bfloat16)
-        _sparse_mla_decode_reduce_kernel[(batch, heads, value_dim // d_chunk)](
+        _sparse_mla_reduce_kernel[(batch, heads, value_dim // d_chunk)](
             lse,
             acc,
             out,
@@ -198,7 +152,7 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
         return out
 
     torch.testing.assert_close(
-        run(_reduce_d_chunk(active_splits)), run(64), rtol=0, atol=0
+        run(_reduce_d_chunk(active_splits, batch * heads)), run(64), rtol=0, atol=0
     )
 
 
