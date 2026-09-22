@@ -165,7 +165,9 @@ class TestKPoolChunkedPageTable(CustomTestCase):
             )
         )
         with (
-            patch(f"{_KPOOL}.deep_gemm", deep_gemm),
+            # deep_gemm is bound only under `if is_cuda()`, so on a CPU CI
+            # worker the attribute does not exist yet.
+            patch(f"{_KPOOL}.deep_gemm", deep_gemm, create=True),
             patch(f"{_KPOOL}.get_token_to_kv_pool", return_value=object()),
             patch(f"{_KPOOL}._should_fuse_kpool_topk", return_value=True),
             patch(
