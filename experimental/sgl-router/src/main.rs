@@ -17,7 +17,7 @@ use sgl_router::{
     proxy::Proxy,
     server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
     state::{
-        kv_events::{BlockSizeOracle, KvEventIndex},
+        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex},
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let external_kv_indexer_client = create_external_kv_indexer_client(&config)?;
 
     // Monitor engine-reported KV-cache events and load statistics for routing.
-    let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
+    let engine_state = start_engine_state_monitor(&config, external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
     let routing_policies = Arc::new(
@@ -212,17 +212,31 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     }
 }
 
-fn start_engine_state_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
+fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Arc<KvEventIndex> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .expect("default http client builds");
     if use_external_indexer {
         // External indexing still needs worker hash metadata and engine load, but no local KV tree.
-        KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new())
-    } else {
-        KvEventIndex::new_with_http(http)
+        return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
     }
+    // Peer bootstrap is enabled only when a peer selector is configured.
+    // Without one there is nobody to pull a snapshot from, so the tracker is
+    // pre-settled and `/readyz` behaves exactly as it did before this feature
+    // existed.
+    let peer_selector = match &config.discovery {
+        DiscoveryBackend::K8s(k) => k.peer_selector.as_ref(),
+        _ => None,
+    };
+    let bootstrap = Arc::new(match (&config.model.cache_aware, peer_selector) {
+        (Some(cache), Some(_)) => BootstrapTracker::new_with_fetch_cap(
+            Duration::from_millis(cache.bootstrap_timeout_ms),
+            Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+        ),
+        _ => BootstrapTracker::disabled(),
+    });
+    KvEventIndex::new_with_bootstrap(http, BlockSizeOracle::new(), bootstrap)
 }
 
 fn start_local_inflight_tracker(

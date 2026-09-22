@@ -554,6 +554,21 @@ impl VettedSnapshot {
         self.dropped_workers
     }
 
+    /// `(carried, structure)`: nodes with at least one surviving carrier vs
+    /// carrier-less interior kept on a live path. Carried nodes are answered
+    /// by live workers whose votes selection hashes for — modulo the
+    /// vote-flip window the pump's post-restart re-introspection exists to
+    /// close, after which old-family nodes (carried or structure) linger
+    /// until evicted. Structure nodes hold no carriers, so they cannot
+    /// answer a query; a query can still bottom out on one and become a
+    /// hit-shaped miss (`matched_blocks > 0` with no owner), which is why
+    /// they are kept only on paths to a carried descendant — and why their
+    /// count is worth surfacing rather than burying inside `node_count`.
+    pub(crate) fn carrier_counts(&self) -> (usize, usize) {
+        let structure = self.nodes.iter().filter(|n| n.workers.is_empty()).count();
+        (self.nodes.len() - structure, structure)
+    }
+
     /// Whether `id` survived vetting as a carrier source.
     pub fn has_worker(&self, id: &KvWorkerId) -> bool {
         self.worker_table.contains(id)
@@ -1998,6 +2013,28 @@ mod tests {
         for (i, rec) in vetted.nodes.iter().enumerate() {
             assert!(rec.parent.is_none_or(|p| (p as usize) < i));
         }
+    }
+
+    /// The graft-observability split: carried nodes are matchable, structure
+    /// nodes are match paths only. And both accessors describe the SURVIVING
+    /// population: a carrier nobody knows is already gone from the count.
+    #[test]
+    fn carrier_counts_split_carrying_nodes_from_kept_structure() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://drained", 0)],
+            vec![
+                node(None, 1, vec![]),        // interior on a live path: kept structure
+                node(Some(0), 2, vec![0, 1]), // carried (by both)
+                node(Some(1), 3, vec![1]),    // carried only by the drained worker
+            ],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        // The drained carrier leaves the worker table; its exclusive node is
+        // pruned as a carrier-less leaf, and the shared node keeps the live
+        // worker as its only carrier.
+        assert_eq!(vetted.worker_count(), 1);
+        assert_eq!(vetted.dropped_workers(), 1);
+        assert_eq!(vetted.carrier_counts(), (1, 1));
     }
 
     /// Pruning must remap parent indices, not just drop entries.
