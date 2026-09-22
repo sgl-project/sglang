@@ -185,7 +185,9 @@ def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
 
 
 # Cross-check the per-batch fast indices against the generic gather (syncs).
-_GFX_ASM_CTX_GATHER_CHECK = os.environ.get("SGLANG_ASM_CTX_GATHER_CHECK", "0") == "1"
+_GFX_ASM_CTX_GATHER_CHECK = (
+    os.environ.get("SGLANG_GFX_ASM_CTX_GATHER_CHECK", "0") == "1"
+)
 
 
 def _asm_context_prefill_gather_indices(
