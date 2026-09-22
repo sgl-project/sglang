@@ -1411,18 +1411,19 @@ class ModelRunner:
 
     @property
     def logical_max_total_num_tokens(self):
-        """Request-token capacity; the DCP allocator already accounts for sharding."""
-        capacity = self.max_total_num_tokens
-        if get_parallel().attn_dcp_size > 1 and not self.is_hybrid_swa:
-            capacity = self.token_to_kv_pool_allocator.size
-        return self.req_to_token_pool.schedulable_token_capacity(capacity)
+        """Request-token capacity in logical tokens, not per-rank DCP rows."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.kv_cache_configurator.logical_token_capacity(
+                max_total_num_tokens=self.max_total_num_tokens
+            )
+        )
 
     @property
     def effective_logical_max_total_num_tokens(self):
         """Logical request limit, preserving hybrid SWA's separate pool bounds."""
-        if get_parallel().attn_dcp_size > 1 and not self.is_hybrid_swa:
-            return self.logical_max_total_num_tokens
-        return self.effective_max_total_num_tokens
+        if self.is_hybrid_swa:
+            return self.effective_max_total_num_tokens
+        return self.logical_max_total_num_tokens
 
     @property
     def effective_max_total_num_tokens(self):
