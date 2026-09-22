@@ -1,12 +1,16 @@
 import concurrent.futures
+import ctypes
 import unittest
+from threading import Event
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -128,6 +132,61 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestMiniMaxStateTransfer(CustomTestCase):
+    def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
+        """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
+
+        def copy_bytes(session, sources, destinations, lengths):
+            for src, dst, length in zip(sources, destinations, lengths, strict=True):
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        for state in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+            for src_pages, dst_pages in (([1], [0]), ([1, 2], [0]), ([1], [0, 2])):
+                with self.subTest(state=state, src=src_pages, dst=dst_pages):
+                    src = np.arange(3, dtype=np.int32)
+                    dst = np.full(3, -1, dtype=np.int32)
+                    manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                    manager.kv_args = SimpleNamespace(
+                        state_types=[state],
+                        state_data_ptrs=[[src.ctypes.data]],
+                        state_item_lens=[[src.itemsize]],
+                        state_dim_per_tensor=[[]],
+                        state_layer_ids=[[]],
+                    )
+                    manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
+                    manager.pp_size = manager.attn_tp_size = 1
+                    manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    peer = SimpleNamespace(
+                        dst_state_data_ptrs=[[dst.ctypes.data]],
+                        dst_state_item_lens=[[dst.itemsize]],
+                        dst_state_dim_per_tensor=[[]],
+                        dst_state_layer_ids=[[]],
+                        dst_attn_tp_size=1,
+                    )
+                    kwargs = dict(
+                        req=SimpleNamespace(
+                            mooncake_session_id="cpu", dst_state_indices=[dst_pages]
+                        ),
+                        prefill_state_indices=[src_pages],
+                        executor=None,
+                        target_rank_registration_info=peer,
+                    )
+                    if state == StateType.MINIMAX_DENSE_KV and len(src_pages) != len(
+                        dst_pages
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "state index length mismatch"
+                        ):
+                            manager.maybe_send_extra(**kwargs)
+                        np.testing.assert_array_equal(dst, [-1, -1, -1])
+                    else:
+                        self.assertEqual(manager.maybe_send_extra(**kwargs), 0)
+                        np.testing.assert_array_equal(dst, [1, -1, -1])
 
 
 class TestDcpDraftHeadTransfer(unittest.TestCase):
@@ -284,6 +343,68 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                 np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)[owned],
             )
             self.assertFalse(dst_buffers[1000000].any())
+
+
+class TestDcpPackLifetime(CustomTestCase):
+    def test_failed_transfer_drains_before_pack_buffer_reuse(self):
+        """A failed layer must not release the pack buffer while another transfer reads it."""
+        manager = TestMooncakeTransferBatching._make_manager(
+            enable_custom_mem_pool=True
+        )
+        manager.kv_args = SimpleNamespace(
+            page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
+        )
+        source = np.array([11], dtype=np.uint8)
+        observed = []
+        running, release = Event(), Event()
+
+        def transfer(session, blocks):
+            if blocks[0][0] == 1000:
+                self.assertTrue(running.wait(10))
+                return 17
+            running.set()
+            self.assertTrue(release.wait(10))
+            observed.append(int(source[0]))
+            return 0
+
+        def send(executor):
+            result = MooncakeKVManager.send_kvcache_dcp(
+                manager,
+                "session",
+                np.array([0, 1], dtype=np.int32),
+                [5000, 6000],
+                np.array([0], dtype=np.int32),
+                dcp_token_item_lens=[1, 1],
+                dst_dcp_size=2,
+                dst_dcp_rank=0,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=2,
+                executor=executor,
+                dst_layer_ids=[],
+                pack_buffer=object(),
+            )
+            source[0] = 22
+            return result
+
+        manager._transfer_data = transfer
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+                return_value=([1000, 2000], np.array([0], dtype=np.int64)),
+            ),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as transfers,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker,
+        ):
+            future = worker.submit(send, transfers)
+            try:
+                self.assertTrue(running.wait(10))
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    future.result(timeout=1)
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=10), 17)
+        self.assertEqual(observed, [11])
 
 
 if __name__ == "__main__":
