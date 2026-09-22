@@ -18,6 +18,10 @@ pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
+pub use template::{
+    LegacyFormatter, LegacySpec, TemplateError, builtin_template,
+    infer_legacy_template_from_model_path, parse_legacy_template,
+};
 #[cfg(test)]
 pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
     template::load_chat_formatter(None, None, Some(name)).unwrap()
