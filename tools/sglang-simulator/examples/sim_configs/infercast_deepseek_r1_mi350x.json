@@ -12,9 +12,12 @@
     "model_id": "deepseek-ai/DeepSeek-R1",
     "systems_root": "/path/to/perfdb",
     "database_mode": "SILICON",
+    "contract_version": 2,
+    "reduction_policy": "exact_tokens_ragged_v2",
     "attn_kernel_impl": "cuda_graph",
     "attn_dtype": "bfloat16",
-    "kv_cache_dtype": "bfloat16",
+    "kv_cache_dtype": "fp8",
+    "model_revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
     "provider_revision": "<full InferCast commit>"
   },
   "scheduler": {
@@ -24,7 +27,7 @@
     "pp_size": 1,
     "cp_size": 1,
     "data_type": "BF16",
-    "kv_cache_data_type": "BF16",
+    "kv_cache_data_type": "FP8",
     "backend_name": "sglang",
     "backend_version": "0.5.17",
     "max_total_tokens": 65536

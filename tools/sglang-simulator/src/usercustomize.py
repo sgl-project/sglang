@@ -21,6 +21,19 @@ def apply_cpu_simulation_compat() -> None:
     torch.cuda.get_device_capability = lambda *_args, **_kwargs: (10, 0)
     torch.version.hip = None
 
+    # SGLang's helper first gates on ``is_available`` and otherwise returns
+    # ``(None, None)``. Some quantization modules compare that tuple during
+    # import even for a CPU dummy load, so patch both the defining module and
+    # the compatibility re-export before those modules are imported.
+    from sglang.srt import utils as sglang_utils
+    from sglang.srt.utils import common as sglang_common
+
+    def simulated_capability(*_args, **_kwargs):
+        return (10, 0)
+
+    sglang_common.get_device_capability = simulated_capability
+    sglang_utils.get_device_capability = simulated_capability
+
     # SGLang's serving benchmark imports model configuration helpers even
     # though the simulator client never loads a model.  On ROCm images those
     # helpers can eagerly import AITER and probe the host with ``rocminfo``.

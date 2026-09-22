@@ -15,6 +15,7 @@
     "attn_kernel_impl": "cuda_graph",
     "attn_dtype": "bfloat16",
     "kv_cache_dtype": "fp8",
+    "model_revision": "<full model commit>",
     "provider_revision": "<full InferCast commit>"
   },
   "scheduler": {

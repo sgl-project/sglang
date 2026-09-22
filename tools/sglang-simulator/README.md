@@ -226,16 +226,55 @@ Environment variables in paths use `${NAME}` syntax.
 
 ### InferCast predictor
 
-Install the exact InferCast revision paired with the selected FIDB slice, then
+Install the exact InferCast revision paired with the selected FIDB slice and
+configure the immutable model commit as `model_revision`, then
 start from [`examples/sim_configs/infercast_silicon.json`](examples/sim_configs/infercast_silicon.json).
 The adapter makes one UMD per-forward call for each `EXTEND`, `MIXED`, or
-`DECODE` iteration and records the provider revision and FIDB stack digest.
+`DECODE` iteration and records the verified provider revision, model revision,
+and FIDB stack digest. Production initialization fails if the installed
+InferCast package cannot prove the configured source revision.
 Model/GEMM quantization comes from the pinned `model_id`; attention and KV-cache
 dtypes remain explicit predictor inputs.
 
 Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values.
-InferCast currently predicts only reduced `P == 0`; non-zero `P` reaches the
-extend API and fails explicitly without fallback latency or time advancement.
+Provider contract v1 keeps the frozen mean-shape reduction. Contract v2 passes
+the ordered request vector to InferCast with `exact_tokens_ragged_v2`; bounded
+DeepSeek-R1 signatures use exact MI350X eager or CUDA-graph rows and fail closed
+when the signature, execution mode, or runtime identity is unavailable.
+
+Contract v3 uses `exact_request_vector_v3` and requires an `execution_profile`
+object in predictor configuration. The profile is passed separately from the
+ordered workload and binds the prefill/decode graph backends, capture policy,
+KV page size, and runtime-compatibility ID. InferCast owns profile validation,
+the homogeneous/ragged residual composition, short CUDA-graph regime, and
+calibration domain. The simulator continues to own cache hits, chunking, and
+scheduling and does not duplicate those formulas. V1/v2 remain unchanged.
+
+Contract v4 uses `realization_aware_request_vector_v4`. Its schema-v2 execution
+profile additionally binds the prefill compiler, complete graph-capture token
+set, whole-forward realization, component realization, and canonical runtime
+manifest digest. InferCast selects only an exact token/capture-stratum anchor;
+it never substitutes a neighboring shape or the other execution mode. The
+simulator still makes exactly one provider call and advances simulated time only
+after that call succeeds. V1-v3 remain byte-compatible.
+
+Contract v5 keeps the v4 context-forward behavior and adds a separate
+`decode_execution_profile`. `DECODE` passes the complete ordered vector of
+visible history lengths to `estimate_profiled_decode_forward_ms`; InferCast
+selects an exact whole-forward anchor by topology, decode realization, and batch
+stratum, then applies its bounded MLA history contrast. Missing anchors,
+uncaptured graph batches, out-of-domain histories, and eager/CUDA-graph component
+substitution fail closed. The legacy scalar decode estimator remains the v1-v4
+compatibility path.
+
+Attention execution mode is phase-specific. `attn_kernel_impl` selects context
+forwards. For contracts v1/v2, optional `decode_attn_kernel_impl` selects decode
+and defaults to the context value for compatibility. Contracts v3/v4 derive the
+decode value from `execution_profile.decode_graph_backend`; an explicit value
+must match that profile. A prefill `tc_piecewise` profile with decode graphs
+disabled therefore sends `eager`, not `cuda_graph`, to the decode estimator.
+Contract v5 instead derives the mode from `decode_execution_profile`; the
+context profile no longer controls decode execution.
 
 For a CPU-only DeepSeek-R1 smoke against the MI350X TP4/EP2 silicon slice,
 replace the systems root and provider revision in
@@ -254,8 +293,8 @@ python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py \
 ```
 
 The model path only needs the DeepSeek-R1 `config.json`; weights are loaded in
-dummy mode. This runner disables radix caching and chunked prefill because
-InferCast does not yet model non-zero prefixes.
+dummy mode. This runner remains a no-cache smoke. Use the open-loop runner with
+radix cache enabled to exercise supported prefix-hit and chunked shapes.
 
 ### AgentX open-loop diagnostic
 
@@ -274,10 +313,10 @@ Optional `hash_ids` plus `block_size` fields reconstruct deterministic shared
 token blocks for Radix Cache and HiCache diagnostics. Enable those tiers with
 `--enable-radix-cache` and `--enable-hierarchical-cache --hicache-ratio N`.
 
-InferCast currently rejects a reused non-zero prefix, so an InferCast cache-hit
-run is an expected negative test. Use a replay predictor only to isolate cache
-accounting and transfer behavior; its fallback latency is not model-performance
-evidence.
+InferCast contract v2 accepts only the reviewed bounded request signatures.
+Uncollected cache-hit or chunk combinations remain expected failures without
+fallback latency or logical-time advancement. A replay predictor can isolate
+cache accounting, but its fallback latency is not model-performance evidence.
 
 ```bash
 python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py \

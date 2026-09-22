@@ -258,9 +258,19 @@ class ConfigManager:
                 ),
                 database_mode=predictor_config.get("database_mode", "SILICON"),
                 attn_kernel_impl=predictor_config.get("attn_kernel_impl"),
+                decode_attn_kernel_impl=predictor_config.get(
+                    "decode_attn_kernel_impl"
+                ),
                 attn_dtype=predictor_config.get("attn_dtype"),
                 kv_cache_dtype=predictor_config.get("kv_cache_dtype"),
+                model_revision=predictor_config.get("model_revision"),
                 provider_revision=predictor_config.get("provider_revision"),
+                contract_version=predictor_config.get("contract_version", 1),
+                reduction_policy=predictor_config.get("reduction_policy"),
+                execution_profile=predictor_config.get("execution_profile"),
+                decode_execution_profile=predictor_config.get(
+                    "decode_execution_profile"
+                ),
             )
         else:
             raise ValueError(

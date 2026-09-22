@@ -69,9 +69,11 @@ def test_cpu_bootstrap_masks_rocm_runtime(monkeypatch):
     assert torch.cuda.is_available() is False
     assert torch.cuda.get_device_capability() == (10, 0)
     assert torch.version.hip is None
+    from sglang.srt import utils as sglang_utils
+
+    assert sglang_utils.get_device_capability() == (10, 0)
     assert "sgl_kernel.load_utils" in sys.modules
     assert "sglang.srt.layers.quantization" in sys.modules
-    assert "megatron" in sys.modules
     assert sys.modules["megatron"] is None
 
 
@@ -141,9 +143,13 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
                 "model_id": "model",
                 "systems_root": "systems",
                 "attn_kernel_impl": "eager",
+                "decode_attn_kernel_impl": "cuda_graph",
                 "attn_dtype": "bfloat16",
                 "kv_cache_dtype": "fp8",
+                "model_revision": "b" * 40,
                 "provider_revision": "a" * 40,
+                "contract_version": 2,
+                "reduction_policy": "exact_tokens_ragged_v2",
             },
         },
     )
@@ -161,6 +167,10 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
     assert captured["model_id"] == "model"
     assert captured["system"] == "mi350x"
     assert captured["provider_revision"] == "a" * 40
+    assert captured["model_revision"] == "b" * 40
+    assert captured["contract_version"] == 2
+    assert captured["reduction_policy"] == "exact_tokens_ragged_v2"
+    assert captured["decode_attn_kernel_impl"] == "cuda_graph"
 
 
 def _batch(mode, **fields):
