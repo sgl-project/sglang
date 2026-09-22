@@ -869,12 +869,7 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
-            # A checkpoint may pin a layer's experts individually while SGLang
-            # builds one FusedMoE for them. GLM-5.3-Flash's MXFP4 export does:
-            # 864 entries name the layer's 288 experts as block FP8, and the
-            # module is ...mlp.experts. Without this the whole MoE inherits the
-            # global MXFP4 scheme and the unpacked FP8 weights meet a
-            # half-width packed parameter.
+            # entries may name experts individually, so they resolve the fused module
             if layer_name.endswith(".experts"):
                 expert_prefix = layer_name + "."
                 expert_entries = {
@@ -901,55 +896,39 @@ class QuarkConfig(QuantizationConfig):
     def _fused_expert_config(
         layer_name: str, entries: dict[str, dict[str, Any]]
     ) -> dict[str, Any]:
-        """Collapse per-expert checkpoint entries into the fused module's scheme.
-
-        `entries` is keyed by what follows `...experts.` in the checkpoint name,
-        i.e. `<expert index>.<projection>`. One fused module covers the whole
-        expert bank at once, so a scheme is only well defined when every expert
-        it spans is pinned the same way. Partial coverage has no right answer --
-        picking any of the entries would silently apply one expert's scheme to
-        experts the checkpoint never mentioned -- so it is rejected.
-        """
         projections_by_expert: dict[int, set[str]] = {}
         for suffix in entries:
             index, _, projection = suffix.partition(".")
             if not index.isdigit() or not projection:
                 raise ValueError(
-                    f"{layer_name} has a per-expert entry {suffix!r} that is not "
-                    "<expert index>.<projection>, so SGLang cannot tell which "
-                    "experts the fused module's scheme would come from."
+                    f"Found a per-expert entry {suffix!r} in {layer_name} that is "
+                    "not <expert index>.<projection>."
                 )
             projections_by_expert.setdefault(int(index), set()).add(projection)
 
-        indices = sorted(projections_by_expert)
-        missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+        # one fused module spans the bank, so a gap below the highest pinned index raises
+        pinned = projections_by_expert.keys()
+        missing = sorted(set(range(max(pinned) + 1)) - pinned)
         if missing:
             raise ValueError(
-                f"{layer_name} pins experts up to {indices[-1]} but leaves "
-                f"{len(missing)} of them unpinned (e.g. {missing[:4]}). SGLang "
-                "builds one fused module for the whole bank and cannot give part "
-                "of it a different scheme."
+                f"Found per-expert entries in {layer_name} that skip experts "
+                f"{missing[:4]}. SGLang requires all to use the same scheme."
             )
 
-        projections = projections_by_expert[indices[0]]
-        for index in indices:
-            if projections_by_expert[index] != projections:
-                raise ValueError(
-                    f"{layer_name} pins {sorted(projections)} for expert "
-                    f"{indices[0]} but {sorted(projections_by_expert[index])} for "
-                    f"expert {index}. A fused module needs one scheme covering "
-                    "the same projections of every expert."
-                )
+        projections = next(iter(projections_by_expert.values()))
+        if any(p != projections for p in projections_by_expert.values()):
+            raise ValueError(
+                f"Found different projections pinned per expert in {layer_name}. "
+                "SGLang requires all to use the same scheme."
+            )
 
         configs = list(entries.values())
-        first = configs[0]
-        if not all(deep_compare(cfg, first) for cfg in configs):
+        if not all(deep_compare(cfg, configs[0]) for cfg in configs):
             raise ValueError(
                 f"Found different quantization configurations among the experts "
-                f"of {layer_name}. SGLang builds one fused module for them and "
-                "requires a single scheme."
+                f"of {layer_name}. SGLang requires all to use the same scheme."
             )
-        return first
+        return configs[0]
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):
