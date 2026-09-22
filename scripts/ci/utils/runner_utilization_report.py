@@ -11,6 +11,7 @@ import json
 import os
 import random
 import subprocess
+import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -203,6 +204,16 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
         if page > 20:  # Safety limit (2000 jobs per run)
             break
     return jobs
+
+
+def core_rate_limit_remaining() -> int | None:
+    """Calls left in the token's core quota. /rate_limit itself is free."""
+    try:
+        return run_gh_command(["rate_limit"], max_retries=3)["resources"]["core"][
+            "remaining"
+        ]
+    except Exception:
+        return None
 
 
 def get_runners(repo: str, online_only: bool = True) -> list[dict]:
@@ -556,11 +567,32 @@ def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     return any(h in n for h in _NON_GPU_WORKFLOW_HINTS)
 
 
+def _run_never_used_runner(run: dict, min_run_seconds: float = 60) -> bool:
+    """True when a run's jobs cannot have occupied or waited on a runner.
+
+    Skipped and approval-pending runs never execute a job. First-attempt
+    runs that finished within a minute are almost always a gate job failing
+    on ubuntu-latest: in a 1500-run sample none of the ~900 such runs had a
+    self-hosted job. Re-runs are kept because `filter=all` also returns the
+    earlier attempts' jobs, which may have run for hours.
+    """
+    if run.get("conclusion") in ("skipped", "action_required"):
+        return True
+    if run.get("status") != "completed" or run.get("run_attempt", 1) != 1:
+        return False
+    started = parse_time(run.get("run_started_at"))
+    updated = parse_time(run.get("updated_at"))
+    if started is None or updated is None:
+        return False
+    return (updated - started).total_seconds() < min_run_seconds
+
+
 def calculate_utilization(
     repo: str,
     hours: float = 24,
     runner_filter: str = None,
     lookback_hours: float = None,
+    min_rate_limit_remaining: int = 5000,
 ):
     """Calculate runner utilization metrics.
 
@@ -587,9 +619,13 @@ def calculate_utilization(
     runs = []
     skipped_non_gpu = 0
     skipped_lookback = 0
+    skipped_no_runner = 0
     for r in all_runs:
         if _likely_no_gpu_jobs(r.get("name", "")):
             skipped_non_gpu += 1
+            continue
+        if _run_never_used_runner(r):
+            skipped_no_runner += 1
             continue
         created_at = parse_time(r.get("created_at"))
         if created_at and created_at < window_start_precheck:
@@ -611,6 +647,7 @@ def calculate_utilization(
     print(
         f"Found {len(all_runs)} workflow runs "
         f"({skipped_non_gpu} skipped as non-GPU: docs/lint/release/etc.; "
+        f"{skipped_no_runner} skipped as skipped/unapproved/under 1 min; "
         f"{skipped_lookback} lookback runs skipped as finished pre-window)"
     )
 
@@ -673,17 +710,20 @@ def calculate_utilization(
         dropping previously caused 4-gpu-b200 (and every other label) to
         report wildly different numbers depending on transient API hiccups.
         """
+        if stop_fetching.is_set():
+            return (run["id"], None, "not fetched: rate-limit reserve reached")
         try:
             return (run["id"], get_jobs_for_run(repo, run["id"]), None)
         except Exception as e:
             return (run["id"], None, str(e)[:200])
 
+    # GITHUB_TOKEN's 15k/hr quota is shared with every PR CI job in the repo.
+    # Stop before draining it: a partial report is better than failing PRs.
+    stop_fetching = threading.Event()
     all_jobs = []
     failed_runs = []
     # Concurrency=4 with longer retry budget keeps us well below the GH
-    # API secondary rate-limit threshold (~10 req/s). On a 24h window
-    # with ~1500 GPU-relevant runs (post-filter), this completes in ~5
-    # min and almost never hits the rate limit.
+    # API secondary rate-limit threshold (~10 req/s).
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(fetch_jobs_for_run, run) for run in runs]
         completed = 0
@@ -694,6 +734,18 @@ def calculate_utilization(
                     f"Fetched jobs for {completed}/{total_runs} runs "
                     f"({len(failed_runs)} failed so far)..."
                 )
+                remaining = core_rate_limit_remaining()
+                if (
+                    remaining is not None
+                    and remaining < min_rate_limit_remaining
+                    and not stop_fetching.is_set()
+                ):
+                    print(
+                        f"WARNING: only {remaining} API calls left in the "
+                        f"shared quota (reserve {min_rate_limit_remaining}); "
+                        f"skipping the remaining runs."
+                    )
+                    stop_fetching.set()
             run_id, jobs, err = future.result()
             if err:
                 failed_runs.append((run_id, err))
@@ -1036,6 +1088,12 @@ def main():
     parser.add_argument(
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
+    parser.add_argument(
+        "--min-rate-limit-remaining",
+        type=int,
+        default=5000,
+        help="Stop fetching jobs once the token's API quota drops below this",
+    )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     parser.add_argument(
         "--queue-series-out",
@@ -1045,7 +1103,11 @@ def main():
     args = parser.parse_args()
 
     results, fetch_failure_pct, longest_waits, coverage_hours = calculate_utilization(
-        args.repo, args.hours, args.filter, lookback_hours=args.lookback_hours
+        args.repo,
+        args.hours,
+        args.filter,
+        lookback_hours=args.lookback_hours,
+        min_rate_limit_remaining=args.min_rate_limit_remaining,
     )
     report = format_report(
         results,

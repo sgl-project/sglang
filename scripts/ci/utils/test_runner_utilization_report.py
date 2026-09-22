@@ -413,5 +413,41 @@ class TestCoverageWarning(unittest.TestCase):
         self.assertNotIn("Coverage warning", report)
 
 
+class TestRunNeverUsedRunner(unittest.TestCase):
+    def _run(self, seconds, **kw):
+        base = {
+            "status": "completed",
+            "conclusion": "failure",
+            "run_attempt": 1,
+            "run_started_at": "2026-09-22T08:00:00Z",
+            "updated_at": (
+                datetime(2026, 9, 22, 8, tzinfo=timezone.utc)
+                + timedelta(seconds=seconds)
+            )
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        base.update(kw)
+        return base
+
+    def test_short_first_attempt_skipped(self):
+        self.assertTrue(rur._run_never_used_runner(self._run(20)))
+
+    def test_long_run_kept(self):
+        self.assertFalse(rur._run_never_used_runner(self._run(600)))
+
+    def test_short_rerun_kept(self):
+        # Earlier attempts' jobs may have run for hours.
+        self.assertFalse(rur._run_never_used_runner(self._run(20, run_attempt=2)))
+
+    def test_in_progress_kept(self):
+        run = self._run(20, status="in_progress", conclusion=None)
+        self.assertFalse(rur._run_never_used_runner(run))
+
+    def test_skipped_and_unapproved_skipped(self):
+        for c in ("skipped", "action_required"):
+            self.assertTrue(rur._run_never_used_runner(self._run(600, conclusion=c)))
+
+
 if __name__ == "__main__":
     unittest.main()
