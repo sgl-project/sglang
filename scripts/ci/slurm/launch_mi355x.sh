@@ -1045,7 +1045,7 @@ $PREFILL_WAIT_ROUTER
       [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
       python3 -m sglang.test.few_shot_gsm8k \
         --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
-        --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
+        --max-new-tokens 512 --host 127.0.0.1 --port $LBPORT \
         \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
       ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
       [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
