@@ -644,6 +644,7 @@ def general_mm_embed_routine(
     data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -656,6 +657,7 @@ def general_mm_embed_routine(
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        feature_dtypes: Optional per-modality dtypes for preparing CUDA features before cache lookup.
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -672,6 +674,23 @@ def general_mm_embed_routine(
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
+            if feature_dtypes:
+                for mm_input in mm_inputs_list:
+                    for item in mm_input.mm_items:
+                        dtype = feature_dtypes.get(item.modality)
+                        feature = item.feature
+                        if (
+                            dtype is not None
+                            and isinstance(feature, torch.Tensor)
+                            and feature.is_cuda
+                            and feature.dtype != dtype
+                        ):
+                            # The cast may still read the source after replacing it.
+                            feature.record_stream(
+                                torch.cuda.current_stream(feature.device)
+                            )
+                            item.feature = feature.to(dtype=dtype)
+                        del feature
             extend_prefix_lens = [
                 prefix_len
                 for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
