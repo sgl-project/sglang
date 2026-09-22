@@ -215,6 +215,10 @@ class HybridAttnBackend(AttentionBackend):
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
 
+    def get_kv_write_locations(self, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.get_kv_write_locations(forward_batch)
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> Optional[BaseIndexerMetadata]:

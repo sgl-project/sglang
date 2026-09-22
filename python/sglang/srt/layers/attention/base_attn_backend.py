@@ -341,6 +341,17 @@ class AttentionBackend(ABC):
         """Check if the current backend supports triton."""
         return True
 
+    def get_kv_write_locations(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Resolve locations for a writer that accesses the physical KV buffer.
+
+        Ordinary pools use the batch's output locations directly. Backends
+        with virtual locations translate them or return prepared metadata.
+        Wrappers dispatch to the backend that owns this batch's metadata.
+        """
+        return self.token_to_kv_pool.translate_write_locations(
+            forward_batch.out_cache_loc
+        )
+
     def get_indexer_metadata(
         self,
         layer_id: int,
