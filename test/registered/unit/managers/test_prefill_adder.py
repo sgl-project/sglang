@@ -38,6 +38,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+# No request-slot limit on the interleaving selection.
+ADMIT_ALL = 1 << 20
+
 
 class _RecordingDelayer:
     """Duck-typed stand-in for PrefillDelayerSinglePassExecutor that records
@@ -234,7 +237,7 @@ class TestPrefillAdder(CustomTestCase):
                     enable_hierarchical_cache=True,
                     enable_priority_scheduling=False,
                     schedule_low_priority_values_first=False,
-                    enable_prefill_interleaving=True,
+                    prefill_interleaving=True,
                     prefill_interleaving_min_continuation_tokens=1024,
                 )
                 continuation = self.create_shared_req("continuation")
@@ -248,7 +251,11 @@ class TestPrefillAdder(CustomTestCase):
                     waiting.append(req)
                 expected = [continuation, *waiting[-2:]]
                 adder.chunked_req_limit = policy.prefill_interleaving_chunk_limit(
-                    continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+                    continuation,
+                    waiting,
+                    adder.rem_chunk_tokens,
+                    adder.page_size,
+                    max_reqs=ADMIT_ALL,
                 )
                 self.assertIs(adder.add_chunked_req(continuation), continuation)
                 self.assertEqual(continuation.extend_len, continuation_tokens)
@@ -295,6 +302,7 @@ class TestPrefillAdder(CustomTestCase):
                     AddReqResult.OTHER,
                 )
                 self.mock_tree_cache.init_load_back.assert_called_once()
+                self.mock_tree_cache.init_load_back.reset_mock()
                 self.assertEqual(adder.can_run_list, [])
                 self.assertIsNone(adder.new_chunked_req)
                 self.assertIsNone(req.extend_end)
