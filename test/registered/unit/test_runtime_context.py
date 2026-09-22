@@ -2656,7 +2656,6 @@ class TestTheParallelPhase(CustomTestCase):
             )
             kwargs = dict(
                 server_args=ServerArgs(model_path="dummy"),
-                model_config=None,
                 device="cpu",
                 dist_port=12345,
             )
@@ -2682,13 +2681,16 @@ class TestTheParallelPhase(CustomTestCase):
             )
             if not builds:
                 continue
-            if "init_parallel_runtime(" not in text:
-                offenders.append(str(path))
+            for phase in ("init_parallel_runtime(", "init_layer_runtime("):
+                if phase not in text:
+                    offenders.append(f"{path} ({phase[:-1]})")
         self.assertEqual(
             offenders,
             [],
-            "these publish and then build a ModelRunner without bringing the "
-            "parallel runtime up first:\n  " + "\n  ".join(offenders),
+            "these publish and then build a ModelRunner without running both "
+            "phases first -- the group build derives the topology, and the "
+            "layer phase sizes what the model's shape decides:\n  "
+            + "\n  ".join(offenders),
         )
 
 

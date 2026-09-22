@@ -24,7 +24,10 @@ from sglang.srt.distributed.parallel_state import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -90,7 +93,6 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
 def init_parallel_runtime(
     *,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     device: str,
     dist_port: int,
 ) -> None:
@@ -99,6 +101,9 @@ def init_parallel_runtime(
     Set up CPU thread binding, the current device, and the shared Mooncake
     engine before creating process groups. Draft workers reuse their target's
     groups and must not call this function.
+
+    Builds groups only. Whatever the model's shape decides is
+    ``init_layer_runtime``, which the caller runs once it has a model config.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -150,7 +155,6 @@ def init_parallel_runtime(
         backend=backend,
         dist_init_method=dist_init_method,
         server_args=server_args,
-        model_config=model_config,
         gpu_id=get_device().gpu_id,
     )
 
@@ -292,7 +296,6 @@ def _init_parallel_groups(
     backend: str,
     dist_init_method: str,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     gpu_id: int,
 ) -> None:
     parallel = get_parallel()
@@ -327,13 +330,19 @@ def _init_parallel_groups(
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
-    initialize_dp_attention(
-        server_args=server_args,
-        model_config=model_config,
-    )
-    initialize_layernorm_sp(model_config=model_config)
+    initialize_dp_attention(server_args=server_args)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def init_layer_runtime(*, model_config: ModelConfig) -> None:
+    """Materialize what the model's shape decides, once the groups exist.
+
+    The group build derives the topology without a model; the sizes and flags
+    here need one, so they run after it, from the caller that owns the config.
+    """
+    init_dp_gathered_buffer(model_config)
+    initialize_layernorm_sp(model_config=model_config)
 
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
