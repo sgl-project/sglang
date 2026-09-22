@@ -317,8 +317,6 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
-            extend_start_loc=getattr(forward_batch, "extend_start_loc", None),
-            extend_seq_lens=getattr(forward_batch, "extend_seq_lens", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -507,24 +505,16 @@ class MambaAttnBackendBase(AttentionBackend):
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
         draft_token_num = max_num_tokens // max_bs
-        prev_max_bs = len(self.state_indices_list)
-        if prev_max_bs >= max_bs:
-            return
-
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
-        if prev_max_bs == 0:
-            self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
-            self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
-            self.mamba_track_indices_buf = torch.zeros(
-                (max_bs,), dtype=torch.int64, device=self.device
-            )
-        else:
-            self.mamba_track_indices_buf = torch.zeros(
-                (max_bs,), dtype=torch.int64, device=self.device
-            )
-
-        for i in range(prev_max_bs, max_bs):
+        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
+        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+        # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
+        # kernel's int64 index load. Refreshed in-place by _replay_metadata.
+        self.mamba_track_indices_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
+        for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
@@ -656,8 +646,6 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
-        extend_start_loc: Optional[torch.Tensor] = None,
-        extend_seq_lens: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -811,17 +799,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
                 )
-        elif forward_mode.is_extend_without_speculative():
-            # Full-prefill-backend EXTEND capture/replay: mirror the eager
-            # _forward_metadata EXTEND branch, but write into the static
-            # per-bs buffer (captured graphs read query_start_loc_list by
-            # pointer) instead of allocating a fresh tensor.
-            assert extend_start_loc is not None and extend_seq_lens is not None, (
-                "EXTEND cuda-graph replay requires extend_start_loc/extend_seq_lens"
-            )
-            qsl = self.query_start_loc_list[bs - 1]
-            qsl[:bs].copy_(extend_start_loc)
-            qsl[bs].copy_(extend_start_loc[-1] + extend_seq_lens[-1])
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]

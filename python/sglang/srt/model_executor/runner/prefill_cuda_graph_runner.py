@@ -1202,8 +1202,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
-            padded_view.extend_start_loc = s["extend_start_loc"][:r]
-            padded_view.num_padding = r - bs
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
