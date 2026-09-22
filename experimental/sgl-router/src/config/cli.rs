@@ -16,7 +16,8 @@ use crate::config::{
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    MAX_KV_BOOTSTRAP_TIMEOUT_MS, MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -237,6 +238,15 @@ pub struct CacheArgs {
     #[arg(long)]
     pub kv_bootstrap_timeout_ms: Option<u64>,
 
+    /// Upper bound on one peer-snapshot fetch during bootstrap, in
+    /// milliseconds. The per-fetch timeout is derived as a quarter of
+    /// `--kv-bootstrap-timeout-ms` (raised toward a 5s floor for short
+    /// budgets); this caps that derivation (default 120000). Raise it when the
+    /// fleet's tree is large enough that one transfer + decode no longer fits
+    /// under the derived value.
+    #[arg(long)]
+    pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
+
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -357,6 +367,7 @@ impl Cli {
             .transpose()?;
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
+        let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
         // Peer bootstrap grafts into the router's OWN radix tree. With an
         // external Indexer as the prefix source there is no local tree to graft
@@ -367,20 +378,36 @@ impl Cli {
         // resolved cache config together.
         let has_peer_selector =
             matches!(&discovery, DiscoveryBackend::K8s(k) if k.peer_selector.is_some());
-        if has_peer_selector || kv_bootstrap_timeout_ms.is_some() {
+        if has_peer_selector
+            || kv_bootstrap_timeout_ms.is_some()
+            || kv_bootstrap_fetch_timeout_cap_ms.is_some()
+        {
             ensure!(
                 cache_aware.is_some(),
-                "--kv-peer-selector / --kv-bootstrap-timeout-ms require --policy cache_aware"
+                "--kv-peer-selector / --kv-bootstrap-timeout-ms / \
+                 --kv-bootstrap-fetch-timeout-cap-ms require --policy cache_aware"
             );
             ensure!(
                 cache_aware
                     .as_ref()
                     .is_some_and(|c| c.prefix_provider == CachePrefixProvider::RadixTree),
-                "--kv-peer-selector / --kv-bootstrap-timeout-ms require \
+                "--kv-peer-selector / --kv-bootstrap-timeout-ms / \
+                 --kv-bootstrap-fetch-timeout-cap-ms require \
                  --cache-prefix-provider radix_tree (there is no local tree to \
                  bootstrap when an external Indexer is the prefix source)"
             );
         }
+        // And the selector is what ENABLES bootstrap at all: without it the
+        // tracker is built pre-settled, so these tune a state machine that
+        // never runs, with no error at startup and no effect at runtime.
+        ensure!(
+            has_peer_selector
+                || (kv_bootstrap_timeout_ms.is_none()
+                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()),
+            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms \
+             require --kv-peer-selector, which is what enables peer bootstrap; \
+             without it every replica boots cold and these have no effect"
+        );
         // `Instant::now() + Duration::from_millis(n)` panics on overflow, so an
         // unbounded value would abort the process at startup instead of being
         // rejected here.
@@ -390,6 +417,13 @@ impl Cli {
                 "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms \
                  ceiling; /readyz stays 503 for this long, so a larger value would \
                  outlast any reasonable readinessProbe"
+            );
+        }
+        if let Some(ms) = kv_bootstrap_fetch_timeout_cap_ms {
+            ensure!(
+                (MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS).contains(&ms),
+                "--kv-bootstrap-fetch-timeout-cap-ms {ms} is out of range \
+                 ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
             );
         }
         let fused = self.routing.build_fused()?;
@@ -650,6 +684,9 @@ impl CacheArgs {
             bootstrap_timeout_ms: self
                 .kv_bootstrap_timeout_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
+            bootstrap_fetch_timeout_cap_ms: self
+                .kv_bootstrap_fetch_timeout_cap_ms
+                .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
         }))
     }
 }
@@ -1224,12 +1261,41 @@ mod tests {
             "app=sglang",
             "--policy",
             "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
             "--kv-bootstrap-timeout-ms",
             &u64::MAX.to_string(),
         ]))
         .unwrap_err()
         .to_string();
         assert!(err.contains("ceiling"), "got: {err}");
+    }
+
+    /// Without a selector the tracker is built pre-settled, so these tune a
+    /// state machine that never runs — no error at startup, no effect at
+    /// runtime, and cold boots with no explanation.
+    #[test]
+    fn rejects_bootstrap_tuning_without_a_peer_selector() {
+        for flag in [
+            vec!["--kv-bootstrap-timeout-ms", "20000"],
+            vec!["--kv-bootstrap-fetch-timeout-cap-ms", "60000"],
+        ] {
+            let mut args = vec![
+                "--service-discovery",
+                "--selector",
+                "app=sglang",
+                "--policy",
+                "cache_aware",
+            ];
+            args.extend(flag.iter().copied());
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("require --kv-peer-selector"),
+                "{flag:?} must not be silently ignored; got: {err}",
+            );
+        }
     }
 
     #[test]
