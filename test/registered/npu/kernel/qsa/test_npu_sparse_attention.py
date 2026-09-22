@@ -39,6 +39,8 @@ def test_dispatch_graph(heads, kv_heads, layout, monkeypatch):
     cpu_reference = kernel.qsa_sparse_attention_reference
     calls = []
     def traced(*args):
+        assert args[1].data_ptr() == k.data_ptr()
+        assert args[2].data_ptr() == v.data_ptr()
         calls.append((args[1].shape, args[2].shape))
         return raw(*args)
     def forbidden(*args, **kwargs):
@@ -86,6 +88,32 @@ def test_invalid_metadata_never_falls_back(case, monkeypatch):
     monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
     with pytest.raises(ValueError):
         backend_module._npu_sparse_attention(q, k, v, s)
+
+
+@pytest.mark.parametrize("cache_name", ["k", "v"])
+def test_cache_adapter_rejects_implicit_copy(cache_name, monkeypatch):
+    q, k, v, slots = inputs()
+    # Same [pages, page_size, heads, dim] shape as a valid pool, but the
+    # first two strides cannot be merged into a view. flatten would copy it.
+    incompatible = torch.empty(
+        (16, 4, 1, 256), device=q.device, dtype=q.dtype
+    ).transpose(0, 1)
+    assert incompatible.shape == (4, 16, 1, 256)
+    copied = incompatible.flatten(0, 1)
+    assert copied.data_ptr() != incompatible.data_ptr()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid KV layout must fail before computation")
+
+    monkeypatch.setattr(impl, "sparse_attention", forbidden)
+    monkeypatch.setattr(backend_module, "qsa_sparse_attention", forbidden)
+    monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
+    if cache_name == "k":
+        k = incompatible
+    else:
+        v = incompatible
+    with pytest.raises(RuntimeError, match="view size is not compatible"):
+        backend_module._npu_sparse_attention(q, k, v, slots)
 
 
 def test_kernel_errors_propagate(monkeypatch):
