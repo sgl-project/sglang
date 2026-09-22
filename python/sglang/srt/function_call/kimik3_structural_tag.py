@@ -24,6 +24,7 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    RESPONSE_CLOSE,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -267,6 +268,85 @@ def _restrict_schema_type(
     return _with_root_definitions(result, root_schema)
 
 
+_PROPERTY_NAME_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
+# Definition pools are only reachable through a $ref, which the walk follows, so
+# scanning them directly would let an unreferenced definition speak for the whole
+# schema. Literal keywords hold values, not property names: a non-ASCII enum or
+# const compiles fine (only its \u-escaped spelling is refused, and models emit
+# raw UTF-8), so they are not a source of unsatisfiable grammars.
+_NON_PROPERTY_KEYWORDS = (
+    "$defs",
+    "definitions",
+    "const",
+    "enum",
+    "default",
+    "examples",
+)
+
+
+def _declares_non_ascii_property(
+    schema: Any,
+    root: Optional[Dict[str, Any]] = None,
+    depth: int = 0,
+    seen_refs: Optional[Set[str]] = None,
+) -> bool:
+    """Does this schema declare a property name xgrammar cannot express?
+
+    XGrammar builds a literal matcher for each declared property name and clamps
+    it to ASCII, so an object schema naming a non-ASCII property (an emoji or CJK
+    key) compiles to a grammar that rejects every instance -- a forced tool call
+    on it can only fail. Drop back to the bare type constraint for that argument
+    instead: an unconstrained object still admits the key, raw or escaped.
+
+    Only what this argument can actually reach counts. ``_restrict_schema_type``
+    copies the root ``$defs`` onto every argument, so walking them blindly would
+    strip the constraints off every argument of the tool because of one key in a
+    definition none of them reference.
+    """
+    if depth > 64 or not isinstance(schema, (dict, list)):
+        return False
+    if isinstance(schema, list):
+        return any(
+            _declares_non_ascii_property(item, root, depth + 1, seen_refs)
+            for item in schema
+        )
+    if root is None:
+        root = schema
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        seen_refs = set() if seen_refs is None else seen_refs
+        if ref not in seen_refs:
+            seen_refs.add(ref)
+            target = _resolve_local_ref(ref, root)
+            if target is not None and _declares_non_ascii_property(
+                target, root, depth + 1, seen_refs
+            ):
+                return True
+
+    for keyword in _PROPERTY_NAME_KEYWORDS:
+        names = schema.get(keyword)
+        if isinstance(names, dict) and any(not str(key).isascii() for key in names):
+            return True
+    required = schema.get("required")
+    if isinstance(required, list) and any(
+        isinstance(item, str) and not item.isascii() for item in required
+    ):
+        return True
+    dependent_required = schema.get("dependentRequired")
+    if isinstance(dependent_required, dict) and any(
+        not str(key).isascii()
+        or (isinstance(names, list) and any(not str(n).isascii() for n in names))
+        for key, names in dependent_required.items()
+    ):
+        return True
+    return any(
+        _declares_non_ascii_property(value, root, depth + 1, seen_refs)
+        for key, value in schema.items()
+        if key not in _NON_PROPERTY_KEYWORDS
+    )
+
+
 def _value_format(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -274,6 +354,8 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
+    if _declares_non_ascii_property(schema):
+        schema = {"type": json_type}
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
     # and rejects every valid negative integer. Splitting the range at zero
@@ -602,7 +684,16 @@ def get_kimik3_structural_tag(
     tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
+    response_channel_open: bool = False,
 ) -> StructuralTag:
+    """Build the K3 tool-call constraint.
+
+    ``response_channel_open`` says the generation prompt already opened the
+    response channel, which is what the encoder emits when thinking is off. It
+    decides how a forced call reaches the tools section: from inside an open
+    response channel the model must close it first, otherwise the tools section
+    comes immediately.
+    """
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
         raise ValueError("Kimi K3 structural tags require at least one tool")
@@ -610,10 +701,21 @@ def get_kimik3_structural_tag(
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
+        # Inside an already-open response channel the model must close it before
+        # the tools section, and the close comes first: left free, the model
+        # answers in that channel and never reaches the tools section, and since
+        # the grammar still requires one it cannot stop either -- generation runs
+        # to max_tokens with no tool call at all. With the channel not yet open
+        # (reasoning on, so the model closes think first) a complete response
+        # block before the call is legitimate and stays allowed.
         suffix: Format = SequenceFormat(
             elements=[
-                AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                (
+                    ConstStringFormat(value=RESPONSE_CLOSE)
+                    if response_channel_open
+                    else AnyTextFormat(
+                        excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    )
                 ),
                 tools_tag,
             ]

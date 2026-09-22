@@ -806,5 +806,107 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 
 
+class TestMessageLevelTools(unittest.TestCase):
+    """Dynamic tools may only be declared in a content-less system message."""
+
+    TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    def _request(self, messages, **kwargs):
+        return ChatCompletionRequest(model="m", messages=messages, **kwargs)
+
+    def test_system_and_developer_messages_may_declare_tools(self):
+        for role in ("system", "developer"):
+            with self.subTest(role=role):
+                request = self._request(
+                    [
+                        {"role": role, "content": "", "tools": [self.TOOL]},
+                        {"role": "user", "content": "weather?"},
+                    ]
+                )
+                self.assertEqual(request.tool_choice, "auto")
+
+    def test_tools_outside_system_rejected(self):
+        for role in ("user", "assistant", "tool", "function"):
+            with self.subTest(role=role):
+                message = {"role": role, "content": "hi", "tools": [self.TOOL]}
+                if role == "tool":
+                    message["tool_call_id"] = "call_1"
+                with self.assertRaises(ValidationError) as ctx:
+                    self._request([message, {"role": "user", "content": "weather?"}])
+                self.assertIn("only valid on a system or developer", str(ctx.exception))
+
+    def test_content_alongside_tools_rejected(self):
+        # The encoder renders a tools-carrying system message as a tool
+        # declaration and drops its content, so the content would be lost.
+        with self.assertRaises(ValidationError) as ctx:
+            self._request(
+                [
+                    {"role": "system", "content": "not empty", "tools": [self.TOOL]},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+        self.assertIn("must not also carry content", str(ctx.exception))
+
+    def test_empty_content_alongside_tools_accepted(self):
+        for content in ("", None):
+            with self.subTest(content=content):
+                self._request(
+                    [
+                        {"role": "system", "content": content, "tools": [self.TOOL]},
+                        {"role": "user", "content": "hello"},
+                    ]
+                )
+
+    def test_tool_shape_is_validated(self):
+        cases = {
+            "missing_type": {
+                "function": {"name": "t", "parameters": {"type": "object"}}
+            },
+            "bogus_type": {
+                "type": "retrieval",
+                "function": {"name": "t", "parameters": {"type": "object"}},
+            },
+            "missing_function": {"type": "function"},
+            "missing_name": {"type": "function", "function": {"parameters": {}}},
+        }
+        for label, tool in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValidationError):
+                    self._request(
+                        [
+                            {"role": "system", "content": "", "tools": [tool]},
+                            {"role": "user", "content": "hello"},
+                        ]
+                    )
+
+    def test_tool_names_are_validated(self):
+        def tool(name):
+            return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+        for name in ("1bad_name", "bad@name", "", "a" * 257, "has space", "a.b"):
+            with self.subTest(name=name[:24]):
+                with self.assertRaises(ValidationError):
+                    self._request(
+                        [
+                            {"role": "system", "content": "", "tools": [tool(name)]},
+                            {"role": "user", "content": "hello"},
+                        ]
+                    )
+        for name in ("get_weather", "_private", "a-b_c9", "a" * 256):
+            with self.subTest(name=name[:24]):
+                self._request(
+                    [
+                        {"role": "system", "content": "", "tools": [tool(name)]},
+                        {"role": "user", "content": "hello"},
+                    ]
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -407,3 +407,29 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_without_schema_identifiers_keeps_constraints():
+    """Draft-07 style identifiers fail the 2020-12 metaschema's URI form check
+    while constraining nothing, so validation drops them and keeps the rest."""
+    from jsonschema import Draft202012Validator
+
+    from sglang.srt.function_call.utils import without_schema_identifiers
+
+    schema = {
+        "$id": "#user",
+        "type": "object",
+        "required": ["value"],
+        "additionalProperties": False,
+        "properties": {"value": {"$anchor": "v", "type": "string", "minLength": 2}},
+    }
+    stripped = without_schema_identifiers(schema)
+
+    Draft202012Validator.check_schema(stripped)
+    assert "$id" not in stripped and "$anchor" not in stripped["properties"]["value"]
+    # every constraint survives
+    assert stripped["properties"]["value"] == {"type": "string", "minLength": 2}
+    assert stripped["required"] == ["value"]
+    assert stripped["additionalProperties"] is False
+    # and the input is untouched
+    assert schema["$id"] == "#user"
