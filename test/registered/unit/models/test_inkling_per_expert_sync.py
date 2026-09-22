@@ -11,7 +11,7 @@ against a reference fused stack built directly from the full per-expert weights:
     (lora_compatible_layout_enabled() or inference_moe_w13_interleaved=False)
   - trtllm MoE layouts rejected loudly
 
-Run: python3 test/srt/models/test_inkling_per_expert_sync.py
+Run: python3 test/registered/unit/models/test_inkling_per_expert_sync.py
 """
 
 import types
@@ -21,7 +21,10 @@ import torch
 
 import sglang.srt.models.inkling as inkling_mod
 from sglang.srt.runtime_context import reset_context
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import publish_build_topology
+
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 N_EXPERTS, I_FULL, H = 8, 6, 4
 
