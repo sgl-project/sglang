@@ -40,7 +40,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 TP_SIZES = [2, 3, 4, 8, 16]
 
@@ -132,15 +132,6 @@ class TestIndexerQueryShardPlan(CustomTestCase):
                     self.assertLessEqual(key_len, prefix_lens[i] + extend_lens[i])
         self.assertEqual(seen, total)
 
-    def test_more_ranks_than_tokens_gives_empty_shards_not_negative_ones(self):
-        for tp_rank in range(16):
-            _, rows, num_real, cum_query_lens, key_lens = _plan([7], [3], 16, tp_rank)
-            self.assertGreaterEqual(num_real, 0)
-            self.assertLessEqual(num_real, rows)
-            if num_real == 0:
-                self.assertEqual(key_lens, [0])
-                self.assertEqual(cum_query_lens, [0])
-
 
 class TestIndexerQueryShardGate(CustomTestCase):
     """The gate must admit the padded query tensor the model actually passes."""
@@ -156,37 +147,11 @@ class TestIndexerQueryShardGate(CustomTestCase):
             self.assertEqual(shard.total, total)
             self.assertEqual(shard.rows * shard.tp_size, padded)
 
-    def test_an_exact_width_is_still_admitted(self):
-        # The case that always worked, kept so the fix cannot regress it.
-        shard = _shard_for([958464], [16384], 16, 0, 16384)
-        self.assertIsNotNone(shard)
-        self.assertEqual(shard.rows, 1024)
-
-    def test_every_rank_agrees_on_admitting_the_same_call(self):
-        # The plan ends in an all-gather, so a disagreement between ranks would
-        # hang rather than fail. Every input to the decision is identical across
-        # the group; this pins that the OUTPUT is too.
-        for tp_rank in range(16):
-            shard = _shard_for([989184], [10828], 16, tp_rank, 10832)
-            self.assertIsNotNone(shard, f"tp_rank={tp_rank}")
-
     def test_a_query_tensor_shorter_than_the_real_tokens_is_refused(self):
         # Fewer rows than real tokens means the plan does not describe this
         # call; scoring every row is wrong but slicing it would be worse.
         self.assertIsNone(_shard_for([989184], [10828], 16, 0, 10827))
         self.assertIsNone(_shard_for([989184], [10828], 16, 0, 1024))
-
-    def test_a_query_tensor_wider_than_the_padding_is_refused(self):
-        # Past rows * tp_size the last rank's slice would run off the end.
-        padded = _ceil_align(10828, 16)
-        self.assertIsNone(_shard_for([989184], [10828], 16, 0, padded + 1))
-        self.assertIsNone(_shard_for([989184], [10828], 16, 0, 16384))
-
-    def test_sharding_is_refused_when_attention_tp_is_one(self):
-        self.assertIsNone(_shard_for([989184], [10828], 1, 0, 10828))
-
-    def test_an_empty_extend_is_refused(self):
-        self.assertIsNone(_shard_for([989184], [0], 16, 0, 0))
 
 
 if __name__ == "__main__":

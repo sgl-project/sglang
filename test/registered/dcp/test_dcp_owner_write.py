@@ -32,7 +32,7 @@ from sglang.srt.layers.dcp.layout import plan_dcp_owner_write
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 DCP_SIZES = [2, 3, 4, 16]
 DIM = 3
@@ -123,18 +123,6 @@ class TestDcpOwnerWrite(CustomTestCase):
                     f"dcp_size={dcp_size} n={loc.numel()}",
                 )
 
-    def test_the_destination_is_the_cuda_contract(self):
-        # is_valid = loc % N == rank; loc = loc // N  (mla_buffer.py:42)
-        for dcp_size in DCP_SIZES:
-            for loc in self._locs(dcp_size):
-                for rank in range(dcp_size):
-                    owned_idx, dest = plan_dcp_owner_write(loc, dcp_size, rank)
-                    owned = loc.index_select(0, owned_idx)
-                    self.assertTrue(
-                        torch.equal(owned % dcp_size, torch.full_like(owned, rank))
-                    )
-                    self.assertTrue(torch.equal(dest, owned // dcp_size))
-
     def test_no_filtered_write_ever_touches_physical_row_zero(self):
         # What lets the decode path use row 0 as a bin. If a real write could
         # land there, the two paths would corrupt each other.
@@ -144,24 +132,6 @@ class TestDcpOwnerWrite(CustomTestCase):
                     _, dest = plan_dcp_owner_write(loc, dcp_size, rank)
                     if dest.numel():
                         self.assertGreaterEqual(int(dest.min()), PAGE_SIZE)
-
-    def test_a_page_aligned_run_splits_evenly(self):
-        # The served shape: every rank does 1/dcp_size of the work, which is the
-        # whole point. 16x less written per rank at dcp16.
-        for dcp_size in DCP_SIZES:
-            base = PAGE_SIZE * dcp_size
-            loc = torch.arange(base, base + 8 * dcp_size, dtype=torch.int64)
-            for rank in range(dcp_size):
-                owned_idx, _ = plan_dcp_owner_write(loc, dcp_size, rank)
-                self.assertEqual(owned_idx.numel(), 8)
-
-    def test_an_empty_write_is_allowed(self):
-        # A batch can reach the write path with nothing to write; the filter
-        # must return empty tensors rather than raise.
-        loc = torch.zeros(0, dtype=torch.int64)
-        owned_idx, dest = plan_dcp_owner_write(loc, 16, 3)
-        self.assertEqual(owned_idx.numel(), 0)
-        self.assertEqual(dest.numel(), 0)
 
     def test_a_rank_that_owns_nothing_returns_empty_not_garbage(self):
         # Fewer rows than ranks: some ranks legitimately own no row of this

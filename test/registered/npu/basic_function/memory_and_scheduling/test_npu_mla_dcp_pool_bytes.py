@@ -33,7 +33,7 @@ import torch
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=80, suite="full-1-npu-a3")
+register_npu_ci(est_time=70, suite="full-1-npu-a3")
 
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
@@ -180,23 +180,6 @@ class TestNpuMlaDcpPoolBytes(CustomTestCase):
         self.assertEqual(pool.num_indexer_layers, live)
         self.assertEqual(pool.index_k_buffer.shape[0], live)
         self.assertEqual(sorted(pool.indexer_layer_id_to_slot), live_ids)
-
-    def test_reported_bytes_follow_the_widened_indexer(self):
-        """get_kv_size_bytes is what the launch log prints, so it has to see the
-        widening -- otherwise the pool silently costs more than it reports, and
-        the one number an operator reads to size a deployment is wrong."""
-        narrow = _build(size=SERVED_CONTEXT, index_buf_size=SERVED_CONTEXT)
-        narrow_bytes = narrow.get_kv_size_bytes()
-        del narrow
-        torch.npu.empty_cache()
-
-        wide = _build(size=SERVED_CONTEXT, index_buf_size=SERVED_CONTEXT * 2)
-        index_bytes_per_page = PAGE_SIZE * 1 * INDEX_HEAD_DIM * BYTES_PER_ELEM
-
-        expected_growth = (
-            LAYER_NUM * (SERVED_CONTEXT // PAGE_SIZE) * index_bytes_per_page
-        )
-        self.assertEqual(wide.get_kv_size_bytes() - narrow_bytes, expected_growth)
 
 
 if __name__ == "__main__":

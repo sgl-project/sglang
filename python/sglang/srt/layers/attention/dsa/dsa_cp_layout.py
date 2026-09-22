@@ -85,25 +85,20 @@ def plan_dsa_cp_shard(
     prefix plus extend. The batch's tokens are laid out request-major, exactly
     as ``hidden_states`` arrives, and cut into ``tp_size`` equal slices.
 
-    **The cut is by position, not by request.** A request can straddle a slice
-    boundary, and at a 13,855-token tail over 16 ranks it usually does. So the
-    per-request lengths have to be recomputed against the slice:
+    **The cut is by position, not by request**, so a request can straddle a
+    slice boundary and the per-request lengths are recomputed against it:
 
     - ``query_lens[i]`` is request i's tokens inside ``[local_start,
-      local_end_with_pad)``, clamped at both ends and floored at zero for the
-      requests that miss the slice entirely.
-    - ``key_lens[i]`` is what the slice's last token of request i can see.
-      Request i's tokens end at global position ``end``; the slice truncates
-      them at ``req_local_end``; so the slice's last token is ``end -
-      req_local_end`` positions earlier than the batch's last token for that
-      request, and sees that many fewer keys: ``seq_lens[i] - (end -
-      req_local_end)``.
+      local_end_with_pad)``, clamped at both ends and floored at zero.
+    - ``key_lens[i]`` is what the slice's last token of request i can see:
+      ``seq_lens[i] - (end - req_local_end)``, since the slice truncates the
+      request that many positions early.
 
-    **Padding is never counted in ``query_lens``, and it cannot be.** The padded
-    positions are ``[num_tokens, num_tokens_pad)``, and every request ends at or
-    before ``num_tokens``, so padding always lands past the last request rather
-    than inside one. The rank holding it is handed ``rows`` query rows while its
-    ``query_lens`` sum to fewer; the operator reads the cumulative lengths to
+    Padding is never counted in ``query_lens``: the padded positions are
+    ``[num_tokens, num_tokens_pad)`` and every request ends at or before
+    ``num_tokens``, so padding always lands past the last request. The rank
+    holding it is handed ``rows`` query rows while its ``query_lens`` sum to
+    fewer; the operator reads the cumulative lengths to
     find where requests end and never looks at the rest. That is also how
     vLLM-Ascend leaves it (``sfa_cp.py:243-256``).
 

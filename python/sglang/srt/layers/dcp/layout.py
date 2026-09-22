@@ -20,7 +20,6 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import print_info_once
 
@@ -75,29 +74,17 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
 def dcp_local_kv_block_table(loc_rows: torch.Tensor, page_size: int) -> torch.Tensor:
     """The rank-local KV page table, from the same ``req_to_token`` slice.
 
-    Under DCP the attention backend needs *two* page tables over one allocation,
-    because the indexer and sparse attention read different pools:
+    Under DCP the backend needs two page tables over one allocation: the
+    replicated indexer pages the full virtual span, the sharded latent KV pages
+    this rank's rows. The backend's existing expression already produces the
+    indexer's; this produces the other.
 
-        indexer   replicated, pages of ``page_size`` over the full virtual span
-        latent KV sharded,     pages of ``page_size`` over this rank's rows
-
-    The existing expression in the backend --
-    ``req_to_token[reqs, :n][:, ::page_size] // page_size`` -- already produces
-    the **indexer's** table under DCP and needs no change. This produces the
-    other one.
-
-    The derivation, writing P for page_size and c for dcp_size. The allocator
-    pages in *virtual* space at ``P * c``, so allocator page number k of a
-    request has some physical id q_k and covers virtual locations
-    ``q_k * P * c + i`` for ``i`` in ``[0, P*c)``. Rank r owns the ones with
-    ``v % c == r``; since ``q_k * P * c`` is divisible by c that is ``i % c == r``,
-    and those map under ``// c`` to ``q_k * P + i // c`` -- physical page q_k,
-    offset ``i // c``. So a rank-local page is exactly an allocator page, and
-    reading the location at every ``P * c``-th position and dividing by ``P * c``
-    recovers its physical id.
-
-    At ``c == 1`` this is character-for-character the existing expression, which
-    is what makes it safe to route both through here.
+    The allocator pages virtual space at ``page_size * dcp_size``, and a rank
+    owns the positions with ``v % dcp_size == rank``, which map under
+    ``// dcp_size`` onto the physical page of the same index. So a rank-local
+    page is exactly an allocator page, and reading every
+    ``page_size * dcp_size``-th location recovers its physical id. At
+    ``dcp_size == 1`` this is the existing expression unchanged.
     """
     stride = page_size * get_parallel().attn_dcp_size
     return loc_rows[:, ::stride] // stride
@@ -113,20 +100,15 @@ def remap_dcp_local_topk_indices(
     reads the *sharded* latent KV and needs rank-local ones. This is the
     translation between the two.
 
-    ``filter_dcp_local_kv_indices`` cannot be reused here even though the owner
-    rule is identical, because it *selects* and so returns a shorter tensor. A
-    top-k tensor is ``[..., K]`` with K fixed by ``index_topk``, and each row
-    keeps a different number of entries -- selecting would make it ragged, which
-    no kernel can take. So instead of dropping non-owned entries this marks them
-    ``invalid`` and stably compacts the survivors to the front, leaving the
-    shape untouched and the top-k order intact. Same approach as vLLM-Ascend
-    (``attention/context_parallel/sfa_cp.py:1023-1045``), which is the only
-    working reference for DCP composed with a sparse indexer.
+    ``filter_dcp_local_kv_indices`` cannot be reused despite the identical
+    owner rule: it selects, and a top-k row is ``[..., K]`` with K fixed, so
+    selecting would make it ragged. Non-owned entries are marked ``invalid``
+    and the survivors stably compacted to the front, preserving shape and
+    top-k order, as vLLM-Ascend does (``sfa_cp.py:1023-1045``).
 
-    The ``>= 0`` guard is load-bearing, not defensive: the indexer pads short
-    rows with -1, and ``-1 % dcp_size`` is ``dcp_size - 1`` under torch's
-    Python-style modulo, so on the highest rank every padding entry would
-    otherwise look owned and translate to a real row.
+    The ``>= 0`` guard is load-bearing: the indexer pads short rows with -1,
+    and ``-1 % dcp_size`` is ``dcp_size - 1``, so on the highest rank every pad
+    would otherwise look owned.
     """
     parallel = get_parallel()
     dcp_size = parallel.attn_dcp_size
@@ -150,25 +132,10 @@ def remap_dcp_local_topk_indices(
     )
 
     # Stable compaction without relying on a stable sort: offsetting a
-    # non-owned entry's position by K keeps every key distinct, so the
-    # permutation is unique and the ordering is exact rather than tie-broken.
-    #
-    # The keys are float32 rather than the index dtype because Ascend has no
-    # AiCore ArgSort for int32/int64 -- it silently falls back to AiCpu and says
-    # so at warning level ("please cast dtype to float32",
-    # ArgSortKernelNpuOpApi.cpp:26). This runs once per layer per decode step,
-    # 78 times, and measured on A3 that fallback was the dominant term in the
-    # DCP decode penalty: ~9.6 ms per request per step against dcp1's own
-    # 2.5 ms, flat in dcp_size and flat in context length, which is the
-    # signature of [batch, K] work rather than anything touching the sequence.
-    # vLLM-Ascend sorts float32 keys (sfa_cp.py:1023-1045) for the same reason.
-    #
-    # Exact, not approximate. The keys are the distinct integers [0, 2K) and
-    # float32 represents every integer below 2**24 exactly, so the resulting
-    # permutation is identical to the integer sort's -- the distinctness the
-    # offset was introduced for is what makes the dtype change free. The assert
-    # states the bound rather than leaving it implicit; index_topk is three
-    # orders of magnitude below it, and the bound is asserted above.
+    # non-owned entry's key by K keeps every key distinct, so the permutation
+    # is unique. The keys are float32 because Ascend has no AiCore ArgSort for
+    # int32/int64 and falls back to AiCpu, which dominated the DCP decode cost;
+    # it stays exact because every integer below 2**24 is representable.
     order = torch.arange(k, device=topk_indices.device, dtype=torch.float32)
     keys = order + (~owned).to(torch.float32) * k
     return torch.gather(local, -1, torch.argsort(keys, dim=-1))
@@ -224,11 +191,10 @@ def plan_dcp_owner_write(
     filtered through this covers the same rows as an unfiltered one.
 
     ``torch.nonzero`` makes the output shape data-dependent, which costs a
-    stream synchronisation and **cannot run inside a captured stream**. That is
-    why the NPU decode path does not use this and aims its non-owned rows at a
-    padding row instead (``_resolve_dcp_write``). Extend is not captured, and
-    one forward's write location is shared by every layer, so there the filter
-    is computed once and reused 78 times.
+    stream synchronisation and cannot run inside a captured stream -- so the
+    NPU decode path aims non-owned rows at a padding row instead. Extend is not
+    captured and shares one write location across layers, so there the filter
+    is computed once per forward.
     """
     owned_idx = torch.nonzero((loc % dcp_size) == dcp_rank).squeeze(1)
     return owned_idx, loc[owned_idx] // dcp_size
@@ -242,31 +208,16 @@ _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
     """Return a reusable ``rows``-row buffer shaped and typed like ``ref``.
 
-    The NPU extend gather's context-sized tensors -- the position-ordered latent
-    output, the rope-key output, and the per-piece all-gather scratch -- were
-    allocated fresh on each of the model's 78 layers. The bytes moved are the
-    same either way, but the *peak* was then whatever the allocator happened to
-    hold when a layer asked for another ~1.1 GiB, which is data-dependent and is
-    what OOM'd at ``--mem-fraction-static 0.76``. Reserving them once turns that
-    peak into a budget: the reservation is logged, it is identical on every
-    rank, and everything allocated after it -- the MoE above all -- comes out of
-    a pool whose size no longer moves between layers.
+    The extend gather's context-sized tensors were allocated fresh on each of
+    the model's layers, so the peak depended on what the allocator happened to
+    hold when a layer asked for another ~1.1 GiB. Reserving them once turns
+    that into a budget that no longer moves between layers.
 
-    Grow-only and never shrunk, so a longer context raises the reservation and
-    keeps it. No env var pins it up front because none is needed in practice:
-    warm-up prefills the longest context the deployment serves, so the growth
-    lands there rather than mid-serving.
-
-    ``name`` separates buffers that must not alias. It is part of the key
-    together with dtype, device and row shape, so the latent and the rope key
-    get different buffers even where their row counts agree, and so does a
-    second device or a dtype change. Two callers that pass the same key share
-    one buffer and must not hold their slices across each other's calls.
-
-    This is also what makes overlapping the gather with compute possible at all.
-    Overlap means two layers' outputs are alive at once, and allocating those
-    per layer is exactly the pattern that stalled before -- see
-    ``_dcp_gather_extend_kv_npu`` in the NPU MLA module, which has the history.
+    Grow-only, so a longer context raises the reservation and keeps it; warm-up
+    prefills the longest context a deployment serves, so the growth lands
+    there. ``name`` is part of the key with dtype, device and row shape, so
+    buffers that must not alias do not -- two callers sharing a key share one
+    buffer and must not hold their slices across each other's calls.
     """
     key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
     buf = _dcp_extend_gather_buffers.get(key)
@@ -449,170 +400,14 @@ def _dcp_extend_gather_piece(
     )
 
 
-class DcpPackedReadPlan(NamedTuple):
-    """Where each KV position of a ONE-REQUEST extend lives in the packed buffer.
-
-    ``plan_dcp_extend_gather`` permutes the all-gather's rank-major output back
-    into position order so the sparse operator can read it. That permutation is
-    a context-sized ``index_select`` -- 784 launches x 0.275 ms = 216 ms a
-    forward -- plus the position-ordered output buffer it writes into, ~1.04 GiB
-    a rank at a 972k context. Neither is needed: the operator reads the KV
-    through ``sparse_indices``, so it does not care what order the rows are in,
-    only that the indices point at the right ones. Remapping a ``[tokens, k]``
-    index tensor is arithmetic on a few million integers; permuting the KV is a
-    gigabyte of traffic. Upstream reached the same conclusion for CUDA in
-    ``#39215``'s ``create_packed_dsa_dcp_kv_indices``.
-
-    The packed buffer is exactly what the collective produces, in one piece::
-
-        [ rank 0's send rows | rank 1's | ... | rank C-1's ][ this chunk's KV ]
-          <--- send_rows ---> each                            <-- extend_len -->
-
-    Under the owner rule ``pos % C == rank`` a request's position ``p`` sits in
-    rank ``p % C``'s send at local row ``p // C``, so::
-
-        p <  prefix_len   ->  (p % C) * send_rows + p // C
-        p >= prefix_len   ->  gathered_rows + (p - prefix_len)
-
-    ``send_rows`` is the padded local length, so ranks below ``prefix_len % C``
-    hold one row more than the rest and the spare rows are never addressed.
-
-    **ONE REQUEST ONLY, and the reason is the same one DSA-CP has.** With two
-    requests the all-gather still lays out rank-major over the whole send, so a
-    request's rows land in C separate blocks and the operator's cumulative
-    ``actual_seq_lengths_kv`` -- which needs each request contiguous -- cannot
-    describe them. Multi-request extends keep the permuting path. That covers
-    87% of the tokens in the AISBench run as measured on 2026-09-18.
-    """
-
-    prefix_len: int
-    extend_len: int
-    dcp_size: int
-    send_rows: int
-    gathered_rows: int
-    rows: int
-
-
-def plan_dcp_packed_read(
-    prefix_len: int, extend_len: int, dcp_size: int
-) -> DcpPackedReadPlan:
-    """Sizes of the packed rank-major buffer for a one-request extend."""
-    send_rows = -(-int(prefix_len) // dcp_size)
-    gathered_rows = send_rows * dcp_size
-    return DcpPackedReadPlan(
-        prefix_len=int(prefix_len),
-        extend_len=int(extend_len),
-        dcp_size=dcp_size,
-        send_rows=send_rows,
-        gathered_rows=gathered_rows,
-        rows=gathered_rows + int(extend_len),
-    )
-
-
-def packed_row_of(pos: int, plan: DcpPackedReadPlan) -> int:
-    """Reference implementation of the remap, one position at a time.
-
-    Exists to be the thing ``remap_topk_to_packed`` is checked against on CPU:
-    the tensor version has to fuse the branch into ``where`` and do floor
-    division on a signed tensor, and those are the two places this kind of
-    arithmetic goes wrong.
-    """
-    if pos < 0:
-        return pos
-    if pos < plan.prefix_len:
-        return (pos % plan.dcp_size) * plan.send_rows + pos // plan.dcp_size
-    return plan.gathered_rows + (pos - plan.prefix_len)
-
-
-def remap_topk_to_packed(
-    topk_indices: torch.Tensor, plan: DcpPackedReadPlan
-) -> torch.Tensor:
-    """Top-k positions within a request -> rows of the packed buffer.
-
-    Shape and dtype are preserved, and so are the negatives: ``_pad_topk_indices``
-    fills unused slots with -1 and the operator reads that tail as "no more
-    entries", so mapping them into a real row would silently add keys. Every
-    branch here is elementwise, which is what keeps this ~ a millisecond against
-    the 216 ms it replaces.
-    """
-    c = plan.dcp_size
-    # floor division, not trunc: torch's // on a signed tensor rounds toward
-    # zero for negatives, and the -1 sentinels must come through untouched.
-    local_row = torch.div(topk_indices, c, rounding_mode="floor")
-    prefix_row = (topk_indices % c) * plan.send_rows + local_row
-    extend_row = plan.gathered_rows + (topk_indices - plan.prefix_len)
-    packed = torch.where(topk_indices < plan.prefix_len, prefix_row, extend_row)
-    return torch.where(topk_indices < 0, topk_indices, packed)
-
-
-_enable_dcp_packed_read = envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get()
-
-
-class _PackedMissing:
-    """Distinguishes "not resolved yet" from "resolved, and it is None"."""
-
-
-_PACKED_MISSING = _PackedMissing()
-
-
-def dcp_packed_read_enabled() -> bool:
-    """Whether the packed rank-major read is on for this process."""
-    return _enable_dcp_packed_read
-
-
-def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
-    """Whether the operator's causal crop can be dropped for this chunk.
-
-    THE PACKED READ NEEDS ``sparse_mode = 0``: the crop aligns query i to key
-    ``K - Q + i``, which means nothing once the keys are in rank-major order.
-    The first version of this claimed the top-k is causal by construction, so
-    the crop was redundant. That is false, and a stage-A run measured it --
-    scattered logprob differences up to 2.09 against a 0.354 noise floor,
-    starting at position 2 and confined to a region about ``index_topk`` wide.
-
-    The top-k is causal only where there is something to select FROM. Upstream
-    says it plainly at dsa_indexer.py:402 -- "topk_transform selects every valid
-    page slot when kv_len <= index_topk". At or below that length the top-k is
-    not a selection, it is everything, and the crop is the only thing making the
-    result causal. The NPU indexer itself leans on this: it calls
-    npu_lightning_indexer with sparse_mode=3 (dsa_npu_indexer.py:527), so the
-    indices it hands back are not pre-masked.
-
-    Above it, every query in the chunk has at least ``index_topk`` keys strictly
-    before it, the scores of later keys are -inf, and a top-k of that can only
-    name causal keys. Then, and only then, the crop is dead weight and dropping
-    it changes nothing.
-
-    The bound is on the FIRST query in the chunk, which is the one with the
-    least context: it sees ``prefix_len`` keys before it plus itself. Every
-    later query in the chunk sees more.
-
-    This is also exactly where the packed read pays: it exists for a 16-32k tail
-    on a ~958k cached prefix, where ``prefix_len`` clears 2048 by five hundred
-    times. At ``prefix_len = 0`` it saves nothing anyway -- there is no gathered
-    prefix to permute, and the remap is the identity.
-    """
-    return prefix_len + 1 >= index_topk
-
-
 def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
-    """May this extend forward drop the operator's causal crop?
+    """May this extend forward drop the operator's causal crop (sparse_mode 0)?
 
-    Only if EVERY request in the batch clears the bound, because the crop is set
-    once for the whole call. Decided once per forward and cached, so the model
-    and the backend cannot disagree halfway down a forward.
-
-    Three features want this answer and all three must get the same one:
-      * the packed read, which cannot use the crop at all once rows are
-        rank-major;
-      * the DSA-CP multi-request lift, which drops the crop so it can stop
-        shortening per-request KV lengths;
-      * the DSA-CP single-request path under that lift, which the lift also
-        moves onto sparse_mode 0 on purpose.
-
-    ``index_topk`` of None means the caller had no top-k to measure, which is
-    answered False -- the crop stays, which is always correct and sometimes
-    slower.
+    Only if every request's prefix reaches ``index_topk``: below that the top-k
+    selects every key it is offered, so the crop is what makes the result
+    causal. The crop is set once per call, so the answer is decided once per
+    forward and cached. ``index_topk`` of None answers False -- keeping the
+    crop is always correct.
     """
     cached = getattr(forward_batch, "npu_dcp_crop_free", None)
     if cached is not None:
@@ -621,100 +416,12 @@ def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
     ok = bool(
         index_topk is not None
         and prefix_lens
-        and all(dcp_packed_causal_crop_is_dead(p, index_topk) for p in prefix_lens)
+        and all(p + 1 >= index_topk for p in prefix_lens)
     )
     if not ok and index_topk is not None and prefix_lens:
         print_info_once(
             f"DCP extend keeps the operator's causal crop: a request here has a "
-            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)}), "
-            "and below that the top-k selects every key it is offered, so the "
-            "crop is what makes the result causal"
+            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)})"
         )
     forward_batch.npu_dcp_crop_free = ok
     return ok
-
-
-def dcp_packed_read_plan(
-    forward_batch, index_topk: Optional[int]
-) -> Optional[DcpPackedReadPlan]:
-    """This forward's packed-buffer plan, or None to keep the permuting path.
-
-    Resolved once per forward and cached on the batch. It lives here, beside the
-    arithmetic, rather than in the NPU model module, because BOTH the model (to
-    fill the buffer and remap the top-k) and the attention backend (to set the
-    operator's KV length and drop its causal crop) have to agree on it, and a
-    backend importing a model module inverts the layering -- the same reason
-    ``dsa_cp.py`` sits where it does.
-
-    Every refusal is logged once. A silent refusal here would look exactly like
-    a feature that is on and doing nothing, which is a mistake this port has
-    already paid four weeks for.
-    """
-    if not _enable_dcp_packed_read:
-        return None
-    cached = getattr(forward_batch, "npu_dcp_packed_plan", _PACKED_MISSING)
-    if cached is not _PACKED_MISSING:
-        return cached
-
-    plan = None
-    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-    if index_topk is None:
-        # No top-k to measure, so the causal bound below cannot be checked.
-        # Refuse, and CACHE the refusal: a forward has to take one path the
-        # whole way down. Resolving later would leave earlier layers' top-k
-        # unremapped while later layers read a packed buffer.
-        print_info_once(
-            "DCP packed read is off: this forward reached the extend gather "
-            "with no top-k, so the causal bound cannot be checked"
-        )
-    elif not extend_lens or prefix_lens is None:
-        print_info_once("DCP packed read is off: no CPU length metadata on this extend")
-    elif len(extend_lens) != 1:
-        # ONE REQUEST, for the layout reason in DcpPackedReadPlan: the
-        # all-gather is rank-major over the WHOLE send, so with two requests a
-        # request's rows land in dcp_size separate blocks and the operator's
-        # cumulative actual_seq_lengths_kv cannot describe them. The permuting
-        # path handles those; it is 13% of the tokens in the served benchmark.
-        print_info_once(
-            f"DCP packed read is off for multi-request extends "
-            f"({len(extend_lens)} requests here); the all-gather is rank-major "
-            "over the whole send, so no request is contiguous in it"
-        )
-    elif not dcp_crop_free_extend(forward_batch, index_topk):
-        # Measured, stage A, 2026-09-19: dropping the crop below this bound
-        # moved prefill logprobs by up to 2.09 against a 0.354 noise floor.
-        # dcp_crop_free_extend has already logged which request fell short.
-        print_info_once(
-            "DCP packed read is off: this chunk needs the operator's causal "
-            "crop, and the packed layout cannot use one"
-        )
-    else:
-        plan = plan_dcp_packed_read(
-            prefix_lens[0], extend_lens[0], get_parallel().dcp_size
-        )
-        print_info_once(
-            "DCP packed read is ON: the sparse operator reads the all-gather's "
-            "own rank-major output and the top-k is remapped instead"
-        )
-    forward_batch.npu_dcp_packed_plan = plan
-    return plan
-
-
-def dcp_packed_kv_lens(forward_batch, plan: DcpPackedReadPlan, device) -> torch.Tensor:
-    """The operator's ``actual_seq_lengths_kv`` for a packed read, built once.
-
-    One request, so one entry, and it is the whole buffer: with the causal crop
-    off there is nothing to shorten, and the padding rows the ranks sent to keep
-    their sends equal are never named by any remapped index.
-
-    Cached on the batch rather than built where it is used, because that use is
-    once per layer and ``torch.tensor(list, device=npu)`` is a blocking
-    host-to-device copy -- 78 of them a forward, each draining the queue. The
-    same mistake was already made and fixed once on the DSA-CP path.
-    """
-    cached = getattr(forward_batch, "npu_dcp_packed_kv_lens", None)
-    if cached is None:
-        cached = torch.tensor([plan.rows], dtype=torch.int32, device=device)
-        forward_batch.npu_dcp_packed_kv_lens = cached
-    return cached

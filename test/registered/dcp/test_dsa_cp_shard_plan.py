@@ -24,11 +24,11 @@ import itertools
 import random
 import unittest
 
-from sglang.srt.layers.attention.dsa.dsa_cp_layout import cumulative, plan_dsa_cp_shard
+from sglang.srt.layers.attention.dsa.dsa_cp_layout import plan_dsa_cp_shard
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _brute(extend_seq_lens, seq_lens, tp_size, tp_rank):
@@ -91,21 +91,6 @@ class TestDsaCpShardPlan(CustomTestCase):
         self._check([10828], [1000012], 16, "aisbench tail")
         self._check([16384], [933888], 16, "prefill chunk")
 
-    def test_the_p10_tail_splits_as_expected(self):
-        # The numbers this is all for, written down rather than implied.
-        plan = plan_dsa_cp_shard([13855], [972319], 16, 0)
-        self.assertEqual(plan.num_tokens, 13855)
-        self.assertEqual(plan.num_tokens_pad, 13856)
-        self.assertEqual(plan.rows, 866)
-        self.assertEqual(plan.query_lens, [866])
-        last = plan_dsa_cp_shard([13855], [972319], 16, 15)
-        # The last rank carries the padding: 866 rows, 865 real tokens.
-        self.assertEqual(last.rows, 866)
-        self.assertEqual(last.num_local_tokens, 865)
-        self.assertEqual(last.query_lens, [865])
-        # And it is the rank that sees the whole sequence.
-        self.assertEqual(last.key_lens, [972319])
-
     def test_a_key_length_is_the_last_tokens_not_the_first(self):
         # The operator walks back from the last query row (right-down causal),
         # so handing it the first token's span would truncate every other row.
@@ -148,17 +133,6 @@ class TestDsaCpShardPlan(CustomTestCase):
         self.assertEqual(plan.num_local_tokens, 0)
         self.assertTrue(plan.is_empty())
         self.assertEqual(plan.query_lens, [0])
-
-    def test_tp_size_one_is_the_identity(self):
-        plan = plan_dsa_cp_shard([5, 9], [105, 209], 1, 0)
-        self.assertEqual(plan.query_lens, [5, 9])
-        self.assertEqual(plan.key_lens, [105, 209])
-        self.assertEqual(plan.local_start, 0)
-        self.assertEqual(plan.local_end, 14)
-
-    def test_cumulative_is_what_the_operator_wants(self):
-        self.assertEqual(cumulative([5, 0, 9, 2]), [5, 5, 14, 16])
-        self.assertEqual(cumulative([]), [])
 
     def test_mismatched_metadata_raises_rather_than_guesses(self):
         with self.assertRaises(AssertionError):

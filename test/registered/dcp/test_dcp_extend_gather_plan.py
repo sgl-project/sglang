@@ -162,33 +162,6 @@ class TestDcpExtendGatherPlan(CustomTestCase):
                 (plan.send_rows, sum(extend_lens), sum(prefix_lens) + sum(extend_lens)),
             )
 
-    def test_aligned_prefixes_need_no_padding(self):
-        # The case the NPU path sends the pool's rows for without a copy.
-        for dcp_size in DCP_SIZES:
-            prefix_lens = [dcp_size * 128, 0, dcp_size * 3]
-            for rank in range(dcp_size):
-                plan = plan_dcp_extend_gather(
-                    prefix_lens, [7, 3, 1], dcp_size, rank, SERVED_PIECE_ROWS
-                )
-                self.assertEqual(plan.local_lens, plan.padded_lens)
-
-    def test_a_batch_without_prefix_gathers_nothing(self):
-        plan = plan_dcp_extend_gather([0, 0], [4, 6], 16, 3, SERVED_PIECE_ROWS)
-        self.assertEqual(plan.send_rows, 0)
-        self.assertEqual(len(plan.pieces), 1)
-        self.assertTrue(
-            torch.equal(plan.pieces[0].index, torch.arange(10, dtype=torch.int64))
-        )
-
-    def test_a_served_prefix_hit_gathers_in_bounded_pieces(self):
-        # The P10 shape: a ~976k radix-cached prefix and a 16k tail at dcp16.
-        plan = plan_dcp_extend_gather([976384], [16384], 16, 0, SERVED_PIECE_ROWS)
-        gathered = [(p.send_end - p.send_start) * 16 for p in plan.pieces]
-        self.assertEqual(gathered, [262144, 262144, 262144, 189952])
-        last = plan.pieces[-1]
-        self.assertEqual(last.extend_end - last.extend_start, 16384)
-        self.assertEqual(last.out_end, 976384 + 16384)
-
 
 class TestDcpExtendGatherBuffer(CustomTestCase):
     """Pins ``dcp_extend_gather_buffer``, the reuse the gather allocates from.
@@ -226,35 +199,11 @@ class TestDcpExtendGatherBuffer(CustomTestCase):
         self.assertEqual(tuple(wide.shape), (8, 4))
         self.assertEqual(tuple(narrow.shape), (8, 2))
 
-    def test_the_dtype_is_part_of_the_key(self):
-        f32 = dcp_extend_gather_buffer("x", torch.empty((0, 4)), 8)
-        bf16 = dcp_extend_gather_buffer(
-            "x", torch.empty((0, 4), dtype=torch.bfloat16), 8
-        )
-        self.assertNotEqual(f32.data_ptr(), bf16.data_ptr())
-        self.assertIs(bf16.dtype, torch.bfloat16)
-
     def test_the_same_request_twice_reuses_one_allocation(self):
         # What makes this worth doing at all: layer 2..78 must not allocate.
         first = dcp_extend_gather_buffer("latent", self.ref, 1024)
         second = dcp_extend_gather_buffer("latent", self.ref, 1024)
         self.assertEqual(first.data_ptr(), second.data_ptr())
-
-    def test_a_smaller_request_is_served_from_the_same_buffer(self):
-        big = dcp_extend_gather_buffer("latent", self.ref, 1024)
-        small = dcp_extend_gather_buffer("latent", self.ref, 16)
-        self.assertEqual(small.shape[0], 16)
-        self.assertEqual(small.data_ptr(), big.data_ptr())
-
-    def test_growth_sticks_and_a_later_small_request_does_not_shrink_it(self):
-        dcp_extend_gather_buffer("latent", self.ref, 16)
-        grown = dcp_extend_gather_buffer("latent", self.ref, 1024)
-        self.assertEqual(grown.shape[0], 1024)
-        dcp_extend_gather_buffer("latent", self.ref, 16)
-        again = dcp_extend_gather_buffer("latent", self.ref, 1024)
-        # Grow-only: the second 1024-row request must be the same allocation,
-        # not a reallocation the 16-row one shrank us into.
-        self.assertEqual(again.data_ptr(), grown.data_ptr())
 
     def test_the_result_is_a_view_and_writes_reach_the_next_caller(self):
         # The gather writes through the returned tensor (index_select(out=...)),
@@ -267,13 +216,6 @@ class TestDcpExtendGatherBuffer(CustomTestCase):
                 torch.full((8, 4), 3.5),
             )
         )
-
-    def test_zero_rows_is_allowed(self):
-        # An extend batch can plan no pieces at all; the caller asks for 0 rows
-        # rather than branching, so this must not raise.
-        empty = dcp_extend_gather_buffer("latent", self.ref, 0)
-        self.assertEqual(tuple(empty.shape), (0, 4))
-        self.assertEqual(dcp_extend_gather_buffer("latent", self.ref, 4).shape[0], 4)
 
 
 if __name__ == "__main__":

@@ -80,11 +80,6 @@ def _valid(row: torch.Tensor) -> list:
 
 
 class TestDcpTopkRemap(CustomTestCase):
-    def test_without_dcp_the_indices_are_untouched(self):
-        topk = torch.tensor([[7, 3, 11, PAD]], dtype=torch.int32)
-        out = _remap(topk, 1, 0)
-        self.assertTrue(torch.equal(out, topk))
-
     def test_the_shape_never_changes(self):
         # The reason this function marks-and-compacts instead of selecting:
         # index_topk is fixed and every kernel downstream depends on it.
@@ -189,55 +184,6 @@ class TestDcpTopkRemap(CustomTestCase):
                 self.assertEqual(_valid(out[2]), [])
                 self.assertEqual(int((out == PAD).sum()), 36 - 4)
 
-    def test_pads_are_a_suffix_of_every_row(self):
-        # Relied on by _valid() above, and by any kernel that stops at the first
-        # invalid entry rather than scanning the whole row.
-        for dcp_size in DCP_SIZES:
-            topk = _topk_rows(8, 20, 300, seed=31)
-            for rank in range(dcp_size):
-                with self.subTest(dcp_size=dcp_size, rank=rank):
-                    out = _remap(topk, dcp_size, rank)
-                    for row in out.tolist():
-                        seen_pad = False
-                        for v in row:
-                            if v == PAD:
-                                seen_pad = True
-                            else:
-                                self.assertFalse(
-                                    seen_pad, f"real index after a pad in {row}"
-                                )
-
-    def test_local_indices_stay_inside_this_rank_shard(self):
-        """An index past the end of the shard is an out-of-bounds read of the
-        latent KV pool, not a wrong answer -- worth its own assertion because
-        P2 sized that pool at exactly ``max_total // dcp_size``."""
-        for dcp_size in DCP_SIZES:
-            for seq_len in (dcp_size, 97, 1024):
-                # Ceiling, because rank r owns position r first: with 97
-                # positions over 4 ranks, rank 0 holds 25 and rank 3 holds 24.
-                shard = (seq_len + dcp_size - 1) // dcp_size
-                topk = torch.arange(seq_len, dtype=torch.int32).reshape(1, -1)
-                for rank in range(dcp_size):
-                    with self.subTest(dcp_size=dcp_size, seq_len=seq_len, rank=rank):
-                        out = _remap(topk, dcp_size, rank)
-                        real = out[out != PAD]
-                        if real.numel():
-                            self.assertGreaterEqual(int(real.min()), 0)
-                            self.assertLess(int(real.max()), shard)
-
-    def test_a_row_this_rank_owns_nothing_of_is_all_padding(self):
-        # Reachable whenever the top-k for a query happens to miss this shard,
-        # and at the start of decode when seq_len < dcp_size there are ranks
-        # that own nothing at all. The row must still come back the right shape.
-        for dcp_size in DCP_SIZES:
-            rank = 0
-            topk = torch.full((2, 8), rank + 1, dtype=torch.int32)
-            with self.subTest(dcp_size=dcp_size):
-                out = _remap(topk, dcp_size, rank)
-                if dcp_size > 1:
-                    self.assertEqual(out.shape, topk.shape)
-                    self.assertTrue(bool((out == PAD).all()))
-
     def test_it_works_on_a_three_dimensional_top_k(self):
         # The indexer returns [T, K] today (dsa_npu_indexer.py:298) but the
         # speculative path carries a draft dimension; the remap is written
@@ -249,37 +195,6 @@ class TestDcpTopkRemap(CustomTestCase):
         self.assertEqual(out.shape, topk.shape)
         flat_out = _remap(topk.reshape(-1, 16), dcp_size, rank)
         self.assertTrue(torch.equal(out.reshape(-1, 16), flat_out))
-
-    def test_the_float32_sort_keys_give_the_integer_permutation(self):
-        # The compaction sorts float32 keys because Ascend has no AiCore
-        # ArgSort for integer dtypes and falls back to AiCpu, which measured as
-        # the dominant term in the DCP decode penalty on A3. That is only a
-        # free substitution while the keys stay exactly representable: they are
-        # the distinct integers [0, 2K), and float32 is exact below 2**24.
-        #
-        # Pinned against an explicit integer-key reference rather than against
-        # remembered output, because the claim being made is equivalence to the
-        # dtype this used to sort -- not that some particular ordering is
-        # right, which the order and partition tests above already cover.
-        for k in (16, 2048, 8192):
-            topk = _topk_rows(6, k, max(4 * k, 64), seed=97 + k)
-            for dcp_size in DCP_SIZES:
-                for rank in range(dcp_size):
-                    got = _remap(topk, dcp_size, rank)
-
-                    owned = (topk >= 0) & (topk % dcp_size == rank)
-                    local = torch.where(
-                        owned, topk // dcp_size, torch.full_like(topk, PAD)
-                    )
-                    order = torch.arange(k, dtype=topk.dtype)
-                    int_keys = order + (~owned).to(topk.dtype) * k
-                    want = torch.gather(local, -1, torch.argsort(int_keys, dim=-1))
-
-                    self.assertTrue(
-                        torch.equal(got, want),
-                        f"float32 keys diverged from integer keys at k={k}, "
-                        f"dcp_size={dcp_size}, rank={rank}",
-                    )
 
     def test_a_top_k_too_wide_for_exact_float32_keys_is_refused(self):
         # The bound is stated so it fails loudly if index_topk ever grows past

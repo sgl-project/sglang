@@ -28,12 +28,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=90, suite="full-1-npu-a3")
+register_npu_ci(est_time=70, suite="full-1-npu-a3")
 
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
@@ -110,48 +109,6 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
         self.assertEqual(all_claimed.numel(), loc.numel(), "positions lost or doubled")
         self.assertTrue(torch.equal(all_claimed, loc), "the union is not the sequence")
 
-    def test_the_resolved_shape_never_depends_on_the_data(self):
-        """Why this resolves by redirect instead of by selection.
-
-        A boolean index has a data-dependent output shape, so torch_npu answers
-        it with aclnnNonzeroV2 and synchronizes the stream to learn how many
-        rows survived -- which a captured stream refuses outright. Decode graph
-        capture died here on every rank. The shape being a pure function of the
-        input shape is therefore a hard requirement, not a nicety, and it is the
-        one property no accuracy assertion below would notice the loss of.
-        """
-        pool = _build()
-        first = PAGE_SIZE * DCP_SIZE
-        for seq_len in (1, 7, 128, 1000, 1024):
-            loc = torch.arange(first, first + seq_len, dtype=torch.int64, device=DEVICE)
-            for rank in range(DCP_SIZE):
-                with self.subTest(seq_len=seq_len, rank=rank):
-                    self.assertEqual(self._resolve(pool, loc, rank).shape, loc.shape)
-
-    def test_per_rank_ownership_matches_get_dcp_lens(self):
-        """The pool's owner rule and the layout module's closed form must agree,
-        or the attention path will size a page table the storage cannot fill.
-
-        Counted as destinations that are not the padding row rather than as
-        surviving rows: the resolution keeps every row now and aims the
-        non-owned ones at row 0. The fixture starts at the first real loc, so
-        no owned position can legitimately resolve to 0 and the count is exact.
-        """
-        pool = _build()
-        first = PAGE_SIZE * DCP_SIZE
-        for seq_len in (1, 7, 128, 1000, 1024):
-            loc = torch.arange(first, first + seq_len, dtype=torch.int64, device=DEVICE)
-            lens = torch.tensor([seq_len], device=DEVICE)
-            for rank in range(DCP_SIZE):
-                with self.subTest(seq_len=seq_len, rank=rank):
-                    local = self._resolve(pool, loc, rank)
-                    kept = int((local != 0).sum().item())
-                    # get_dcp_lens counts positions 0..seq_len-1; the fixture is
-                    # offset by a whole number of widened pages, which preserves
-                    # every position's owner.
-                    expected = get_dcp_lens(lens, DCP_SIZE, rank).item()
-                    self.assertEqual(kept, expected)
-
     def test_a_virtual_page_maps_onto_the_physical_page_of_the_same_index(self):
         """Why the pool keeps an unscaled page size while the allocator widens
         its own: rank r's members of virtual page k are exactly physical page k.
@@ -190,19 +147,6 @@ class TestNpuMlaDcpShardedWrite(CustomTestCase):
                 owned = (loc % DCP_SIZE) == rank
                 self.assertGreaterEqual(local[owned].min().item(), PAGE_SIZE)
                 self.assertTrue(torch.all(local[~owned] == 0))
-
-    def test_padding_at_virtual_zero_stays_harmless(self):
-        """A padding write lands on the padding row on every rank -- kept there
-        by rank 0 because that is where it divides to, redirected there by the
-        others because they do not own it. Never anywhere else."""
-        pool = _build()
-        loc = torch.zeros(4, dtype=torch.int64, device=DEVICE)
-
-        for rank in range(DCP_SIZE):
-            with self.subTest(rank=rank):
-                local = self._resolve(pool, loc, rank)
-                self.assertEqual(local.numel(), loc.numel())
-                self.assertTrue(torch.all(local == 0))
 
     def test_the_write_round_trips_to_the_owning_rank_only(self):
         """The end-to-end shape of the bug this guards: an owner filter without

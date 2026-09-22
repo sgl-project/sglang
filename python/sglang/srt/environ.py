@@ -977,63 +977,16 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
-    # queries and the top-k is all-gathered (vLLM-Ascend DSA-CP, indexer only).
-    # ON: measured 1M TTFT 2011 -> 491 s and a 960k warm-up 456 s against ~33
-    # minutes. Set 0 to restore the unsharded indexer for an A/B.
+    # queries and the top-k is all-gathered. Set 0 for the unsharded indexer.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
-    # DSA prefill: shard the whole attention block's TOKENS across the
-    # attention-TP group -- every rank computes every head for its own slice,
-    # instead of its own heads for every token. Consumes no ranks, so it
-    # composes with DCP, and with the indexer-only sharding above rather than
-    # replacing it. No weight is resharded: the query is redistributed across
-    # attention TP by all-to-all and put back after attention. Read at startup
-    # because it decides whether the full-head RadixAttention gets built.
-    # ON: measured a 16k tail on a 958k cached prefix 7.699 -> 4.757 s (-38.2%)
-    # against a same-session control, with prefill logprobs bitwise identical at
-    # all 44,062 paired positions. Set 0 to restore the unsharded attention.
+    # DSA prefill: shard the attention block's tokens across attention-TP, so
+    # every rank computes every head for its own slice, with the query
+    # redistributed by all-to-all. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_CP = EnvBool(True)
-    # DSA-CP: also shard batches that carry more than one request, by passing
-    # full per-request KV lengths and dropping the operator's causal crop. Only
-    # where every request's prefix reaches index_topk -- below that the crop is
-    # load-bearing and the batch keeps the unsharded path. See
-    # dsa_cp.dsa_cp_multi_request_enabled.
-    # ON: measured three ~4k tails on a 958k cached prefix (GLM-5.2, A3, TP16
-    # DCP16) in one forward at 9.21 -> ~6.5 s, with prefill logprobs bitwise
-    # identical to the pre-lift path at all 12,311 tail positions, for the
-    # batch and for the same tails one at a time. AISBench (990k shared prefix,
-    # 16 x ~10.8k at concurrency 16): measured phase 110.2 -> 79.1 s. Set 0 for
-    # the pre-lift path.
+    # DSA-CP: also shard batches carrying more than one request, by passing
+    # full per-request KV lengths and dropping the operator's causal crop.
+    # Only engages where every request's prefix reaches index_topk.
     SGLANG_NPU_ENABLE_DSA_CP_MULTI_REQUEST = EnvBool(True)
-    # DCP extend on NPU: let the sparse operator read the gathered prefix in the
-    # rank-major order the all-gather already produced, remapping the top-k
-    # instead of permuting ~1 GiB of KV back into position order.
-    #
-    # OFF, and measured rather than merely untried. On a 16k tail over a 958k
-    # cached prefix (GLM-5.2, A3, TP16 DCP16) it came out at 4.843 s against
-    # 4.757 s without it: the index_select it deletes costs ~216 ms and the
-    # top-k remap that replaces it costs about the same, ~0.30 s a chunk spread
-    # over eight elementwise passes on a [tokens, index_topk] tensor, 21 layers
-    # a forward. Correct -- prefill logprobs are bitwise identical at all 44,062
-    # paired positions -- just not worth anything on its own. Its value would
-    # grow with context length, since the gather it avoids permuting scales as
-    # N^2, and the remap could be one table lookup instead of eight passes.
-    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(False)
-    # DCP extend on NPU: gather layer l+1's prefix on a side stream while layer
-    # l computes, into the other of two slots. Requires the packed read above.
-    #
-    # OFF. Measured -1.4% on the same tail (4.690 s) and ~5 s on a 62-chunk 1M
-    # warm-up. It recovers only ~19% of the collective it hides (153 ms of the
-    # ~810 ms of hcom_allGather in a forward) even though there is ~6x more
-    # compute than gather per layer to hide under, so the limit is not compute
-    # headroom and a larger chunk will not lift it.
-    #
-    # The cost is worse than the two-slots arithmetic suggests. Gather buffers
-    # are grow-only and keyed by name, so a process that takes BOTH paths keeps
-    # both sets: the two prefetch slots (~2.25 GiB) on single-request extends
-    # plus the permuting path's four buffers (~1.43 GiB) on multi-request ones,
-    # against ~1.43 GiB without either flag. A mixed workload -- which is the
-    # serving case -- pays ~+2.25 GiB and OOM'd at --mem-fraction-static 0.70.
-    SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: gathered rows per prefix-gather collective, which caps

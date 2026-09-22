@@ -654,50 +654,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
 
-        # How many token rows the index-K buffer spans, independent of how many
-        # the latent KV spans. The CUDA pool has had this seam since it was
-        # written -- `DSATokenToKVPool` takes `index_buf_size` and hands it to
-        # `IndexKeyCache` (memory_pool.py:4444, :4496) -- and `hisparse` already
-        # passes something other than `size` through it
-        # (hisparse_memory_pool.py:58). This pool derived both counts from
-        # `self.size`, which is only correct while the two are equal.
-        #
-        # They stop being equal under decode context parallelism. The latent KV
-        # is sharded, so each rank keeps `size` rows and translates writes into
-        # them; the LightningIndexer is replicated and has to address every
-        # global position, so its buffer spans the full virtual range,
-        # `size * dcp_size`, and is written at a raw, unfiltered `loc`. That is
-        # the same division of labour the CUDA DSA pool already has.
-        #
-        # Nothing passes a widened value yet: at dcp_size 1 the two are equal
-        # and this is a pure refactor. The seam lands first, on its own, so that
-        # the write-path translation it enables is a separate diff to bisect.
-        #
-        # One consumer this diverges from: the HiCache host mirror allocates
-        # index-K from the same `base_dims` as k/v (pool_host/mla.py, layout
-        # "page_first_kv_split"), sized from this pool's *sharded* `size` times
-        # hicache_ratio. A DCP-widened index buffer outgrows it whenever
-        # hicache_ratio < dcp_size. HiCache + DCP is permitted for MLA
-        # (hybrid_pool_assembler.py:153), so that combination is reachable and
-        # the host pool now asserts the page counts rather than transferring
-        # into a short buffer.
+        # How many token rows the index-K buffer spans, independent of the
+        # latent KV. The two diverge under DCP: the latent KV is sharded, so a
+        # rank keeps `size` rows, while the replicated LightningIndexer must
+        # address every global position and spans `size * dcp_size`, written at
+        # a raw loc. The CUDA DSA pool draws the same line (memory_pool.py:4444).
+        # The HiCache host mirror sizes index-K from the sharded `size`, so it
+        # asserts the page counts rather than transferring into a short buffer.
         self.index_buf_size = size if index_buf_size is None else index_buf_size
 
         # The DCP extend write's owner filter, opened per forward by
-        # plan_dcp_extend_write and consumed by _resolve_dcp_write. None here
-        # means every write takes the capturable row-0 path, which is what a
-        # pool that never sees a DCP extend should do.
+        # plan_dcp_extend_write. None means every write takes the capturable
+        # row-0 path.
         self._dcp_extend_write_loc: Optional[torch.Tensor] = None
         self._dcp_extend_write_plan = None
 
         # Layers that reuse the previous layer's top-k own no Indexer and cache
-        # no index-K -- 57 of 78 on GLM-5.2. This branch carried that as a
-        # layer-aligned `skip_topk_layers` bool mask (d0d279c97); upstream has
-        # since landed the same elision as `indexer_layer_ids` plus
-        # `indexer_layer_id_to_slot` above, which compacts the buffer instead of
-        # leaving zero-page holes in it. Upstream's is kept and ours is dropped.
-        # Read `self.num_indexer_layers` for the count and
-        # `self.indexer_layer_id_to_slot` to address a layer.
+        # no index-K -- 57 of 78 on GLM-5.2. Upstream's `indexer_layer_ids` /
+        # `indexer_layer_id_to_slot` above carry that elision; read
+        # `self.num_indexer_layers` for the count.
 
         self.custom_mem_pool = None
 
@@ -1002,58 +977,30 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         """Redirect a DCP-widened loc so this rank's tokens land on its rows.
 
-        The allocator hands every rank the same *virtual* locations, spanning
-        the whole sequence. The latent KV is sharded, so a rank keeps only the
-        positions it owns and collapses them into its own rows. The contract is
-        CUDA's, from the Triton kernel at kernels/ops/kvcache/mla_buffer.py:42:
+        The allocator hands every rank the same *virtual* locations. The latent
+        KV is sharded, so a rank keeps the positions it owns and collapses them
+        into its own rows, following CUDA's contract from
+        kernels/ops/kvcache/mla_buffer.py:42::
 
             is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
             loc      = loc // DCP_WORLD_SIZE
 
-        There the filter and the divide happen inside the store. Here they
-        cannot: `npu_scatter_nd_update_` is a fused vendor operator with no body
-        to edit, so both have to run as tensor ops before the call.
+        There the filter runs inside the store; here it cannot, because
+        ``npu_scatter_nd_update_`` is a fused vendor operator with no body.
 
-        **At decode this rewrites the destination rather than dropping rows, and
-        that is load-bearing.** The first version selected -- ``loc[owned]``,
-        ``cache_k[owned]``, ``cache_v[owned]`` -- which is the obvious reading of
-        the contract above and cannot be captured into a graph. A boolean index
-        has a data-dependent output shape, so torch_npu resolves it with
-        ``aclnnNonzeroV2`` and must synchronize the stream to learn how many rows
-        survived; synchronizing a captured stream is refused outright
-        (``rtStreamSynchronize ... reason=stream is captured``), so decode graph
-        capture died here on every rank. Nothing about it degrades gracefully:
-        the shape is genuinely unknown until the data is read.
+        **At decode this rewrites the destination rather than dropping rows.**
+        A boolean index has a data-dependent output shape, so torch_npu
+        resolves it with ``aclnnNonzeroV2`` and must synchronize the stream,
+        which a captured stream refuses. So every row is written and the
+        non-owned ones are aimed at physical row 0. That row is never allocated
+        (the allocator seeds ``free_pages`` from 1), which is what CUDA's
+        ``reserved_skip_index`` reserves it for, and duplicate destinations are
+        fine because nothing reads those values.
 
-        **At extend it drops the rows instead, because none of that applies.**
-        Extend is never captured (NPU and ``dcp_size > 1`` each force prefill
-        capture off), and one forward's write location is a single tensor shared
-        by all 78 layers -- so the filter costs one synchronization per forward
-        rather than one per layer, which is what made it look expensive. The
-        rows it saves are not marginal: a 13,855-token tail wrote 13,855 rows
-        per rank per layer instead of ~866, and 12,989 of them collided on
-        physical row 0. Measured, that scatter ran at 5.2 GB/s while
-        ``aclnnIndexSelect`` moved 868 GB/s in the same forward -- 506 ms of an
-        8,696 ms forward, 5.8%. ``plan_dcp_extend_write`` opens the window; see
-        it for why recognising the forward by tensor identity is sound.
-
-        So every row is written and the non-owned ones are aimed at physical row
-        0 instead. That row is the padding row -- the allocator seeds
-        ``free_pages`` from 1 (allocator/paged.py:339-343), so no real token is
-        ever issued a virtual loc below one page, and with the widened page of
-        ``page_size * dcp_size`` the smallest real virtual loc divides down to
-        ``page_size``. Physical page 0 is therefore never allocated on any rank,
-        which is precisely what CUDA's ``reserved_skip_index`` reserves it for.
-        Duplicate destinations are fine: every colliding write carries a value
-        nothing reads, so last-write-wins is deterministic in the only sense that
-        matters.
-
-        At decode it costs ``dcp_size`` times the write volume -- 5.7 MB per
-        decode step at batch 64, dcp16, 78 layers, against 0.36 MB -- and buys
-        back three boolean gathers per layer, each of which allocated, copied,
-        and launched a NonZero. Eager mode should not be slower for it, and may
-        be faster. That trade is still the right one for a one-row-per-request
-        write; it was only ever wrong for extend's thousands.
+        **At extend it drops the rows instead**: extend is never captured, and
+        one forward's write location is a single tensor shared by all layers,
+        so the filter costs one synchronization per forward rather than one per
+        layer. ``plan_dcp_extend_write`` opens that window.
         """
         dcp_size = get_parallel().attn_dcp_size
         # Bounds are checked against the WIDENED space, matching the CUDA
@@ -1089,29 +1036,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def plan_dcp_extend_write(self, loc: torch.Tensor) -> None:
         """Let this extend forward's KV write drop the rows this rank does not own.
 
-        Called once per DCP extend forward, by the model, before any layer
-        writes -- from the plan-building branch of ``_dcp_gather_extend_kv_npu``,
-        which is the one place that runs exactly once per such forward. ``loc``
-        is ``forward_batch.out_cache_loc``, and the sparse backend hands that
-        same tensor object to ``set_kv_buffer`` on every layer
-        (``ascend_backend.py:1247``), so ``_resolve_dcp_write`` recognises this
-        forward by identity.
+        Called once per DCP extend forward by the model, before any layer
+        writes. ``loc`` is ``forward_batch.out_cache_loc``, the same tensor
+        object the backend hands to ``set_kv_buffer`` on every layer, so
+        ``_resolve_dcp_write`` recognises this forward by identity.
 
-        **Why identity is sound, and what it is guarding against.** A cached
-        filter keyed on a tensor's address can go stale if that address is
-        reused with different contents, and at decode ``out_cache_loc`` really
-        is a persistent buffer written in place for graph replay. Two things
-        rule that out here. Decode's buffer is a different object than any
-        extend's, so identity simply fails and the row-0 path runs. And this
-        method **discards the cached filter** every time it is called, so a
-        forward that did reuse an extend tensor still recomputes from the
-        current contents. The combination that would be wrong -- a DCP extend
-        that writes without planning -- does not exist: the model gates the
-        gather and the backend gates its read on the same condition, by
-        construction (see the cross-reference in ``ascend_backend.py``).
-
-        The filter itself is deferred to the first write, so a forward that
-        plans a gather and writes nothing pays nothing.
+        Identity is sound because decode's buffer is a different object (so
+        identity fails and the capturable row-0 path runs) and because this
+        method discards the cached filter on every call, so even a reused
+        extend tensor recomputes. The filter itself is deferred to the first
+        write.
         """
         self._dcp_extend_write_loc = loc
         self._dcp_extend_write_plan = None

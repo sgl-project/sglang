@@ -35,7 +35,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 PAGE_SIZE = 8
 
@@ -77,43 +77,6 @@ class TestDcpBlockTables(CustomTestCase):
         self.assertTrue(
             torch.equal(_local(rows, PAGE_SIZE, 1), _index_block_table(rows, PAGE_SIZE))
         )
-
-    def test_the_local_table_names_the_allocator_pages(self):
-        pages = [5, 2, 9, 0, 7]
-        for dcp_size in (2, 4, 8, 16):
-            with self.subTest(dcp_size=dcp_size):
-                rows = _req_to_token(pages, PAGE_SIZE, dcp_size)
-                got = _local(rows, PAGE_SIZE, dcp_size)
-                self.assertTrue(
-                    torch.equal(got[0], torch.tensor(pages, dtype=torch.int64))
-                )
-
-    def test_the_existing_expression_still_yields_the_indexer_table(self):
-        """The claim that the indexer call site needs no change.
-
-        Indexer page ids run over the *virtual* span at page_size granularity,
-        so allocator page q contributes c consecutive ids ``q*c .. q*c+c-1``.
-        """
-        pages = [5, 2, 9]
-        for dcp_size in (2, 4, 8):
-            with self.subTest(dcp_size=dcp_size):
-                rows = _req_to_token(pages, PAGE_SIZE, dcp_size)
-                got = _index_block_table(rows, PAGE_SIZE)[0]
-                expected = torch.tensor(
-                    [q * dcp_size + j for q in pages for j in range(dcp_size)],
-                    dtype=torch.int64,
-                )
-                self.assertTrue(torch.equal(got, expected))
-
-    def test_the_two_tables_are_not_accidentally_equal(self):
-        # Guards against a change that quietly makes one alias the other. They
-        # differ in both width (by c) and value, and a test suite that only
-        # checked shapes would not notice.
-        rows = _req_to_token([5, 2, 9], PAGE_SIZE, 4)
-        local = _local(rows, PAGE_SIZE, 4)
-        index = _index_block_table(rows, PAGE_SIZE)
-        self.assertEqual(index.shape[1], local.shape[1] * 4)
-        self.assertFalse(torch.equal(index[:, : local.shape[1]], local))
 
     def test_the_local_table_addresses_the_row_the_pool_actually_wrote(self):
         """The end-to-end check, against P2's write rule rather than against

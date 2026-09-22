@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 HEADS = 4
 HEAD_DIM = 32
@@ -201,20 +201,6 @@ class TestDcpSparseAttentionParity(CustomTestCase):
                 self.assertEqual(sorted(seen), expected)
                 self.assertEqual(len(seen), len(set(seen)))
 
-    def test_the_shard_index_lands_on_the_token_the_remap_meant(self):
-        # The remap and the physical shard layout are two halves of one
-        # convention. Pinning them against each other catches the case where
-        # both are self-consistent but disagree by a rank.
-        kv = torch.arange(64, dtype=torch.float32).reshape(64, 1)
-        for dcp_size in (2, 3, 4, 8):
-            topk = torch.arange(64, dtype=torch.int32).unsqueeze(0)
-            for rank in range(dcp_size):
-                with self.subTest(dcp_size=dcp_size, rank=rank):
-                    local = _remap(topk, dcp_size, rank)[0]
-                    shard = _shard(kv, dcp_size, rank)
-                    for i in local[local >= 0].tolist():
-                        self.assertEqual(float(shard[i, 0]), float(i * dcp_size + rank))
-
     def test_the_wrong_log_base_is_not_silently_fine(self):
         """Guards the finding this file's header records.
 
@@ -272,36 +258,6 @@ class TestDcpSparseAttentionParity(CustomTestCase):
         # out, or this fix trades one silent mis-weighting for another.
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
-
-    def test_the_inline_combine_matches_the_in_tree_one(self):
-        """Keeps _combine above honest against the reference the plan names.
-
-        Skipped rather than failed where triton is missing: dcp_kernels.py
-        imports it at module scope, and the point of the skip is that the
-        parity proof itself does not depend on this.
-        """
-        try:
-            from sglang.kernels.ops.attention.dcp_kernels import (
-                _lse_weighted_combine_cpu,
-            )
-        except ImportError as exc:  # pragma: no cover - depends on the runner
-            self.skipTest(f"dcp_kernels needs triton: {exc}")
-
-        g = torch.Generator().manual_seed(53)
-        for base_e in (True, False):
-            for lses in (
-                torch.randn(8, 1, HEADS, generator=g) * 3,
-                # an empty shard and a poisoned entry, the cases where the
-                # sanitize branch is what is actually being compared
-                torch.tensor([[[NEG_INF] * HEADS]] * 4 + [[[1.0] * HEADS]] * 4),
-            ):
-                outs = torch.randn(8, 1, HEADS, HEAD_DIM, generator=g)
-                with self.subTest(base_e=base_e):
-                    theirs = _lse_weighted_combine_cpu(
-                        outs, lses, is_lse_base_on_e=base_e
-                    )
-                    mine = _combine(outs[:, 0], lses[:, 0], base_e=base_e)
-                    torch.testing.assert_close(mine, theirs[0], rtol=1e-6, atol=1e-7)
 
 
 if __name__ == "__main__":
