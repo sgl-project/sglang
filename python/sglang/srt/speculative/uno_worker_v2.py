@@ -4,7 +4,7 @@ import contextlib
 import copy
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
 
@@ -56,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
+
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        # UNO drafts through the target runner's LoRA -- no independent draft weights.
+        return []
 
     def __init__(
         self,
