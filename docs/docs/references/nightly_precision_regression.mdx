@@ -72,7 +72,7 @@ The layer count is resolved automatically from the model's HuggingFace `config.j
 The dumper filter is built dynamically as a regex matching only the selected layer indices, e.g.:
 
 ```
-match(r'^non_intrusive__model\.layers\.(0|7|15|23)\.inputs\.1$', name)
+match(r'^non_intrusive__model\.layers\.(0|7|15|23)\.(inputs\.1|self_attn\.inputs\.hidden_states)$', name)
 ```
 
 ### Decode-path verification
@@ -81,19 +81,29 @@ The test generates **2 tokens** with `ignore_eos=True` to ensure the model's dec
 
 ### Comparator
 
-The comparator computes **relative differences** (`rel_diff`) for each tensor and checks them against a configurable threshold (default `1e-3`). For tensor-parallel models, the `--override-dims` flag tells the comparator how to reduce across TP ranks before comparing:
+The comparator computes **relative differences** (`rel_diff`) for each tensor and checks them against a configurable threshold (default `1e-3`). The comparison is restricted to the post-fusion attention input, which `--override-dims` declares replicated across TP ranks:
 
 ```
---override-dims ^non_intrusive__model\.layers\.\d+\.inputs\.1$:bs h[tp:partial]
+--filter self_attn\.inputs\.hidden_states
+--override-dims ^non_intrusive__model\.layers\.\d+\.self_attn\.inputs\.hidden_states$:bs h # tp:replicated
 ```
 
-This sums partial TP contributions along the hidden dimension before computing the diff, so the comparison is semantically correct even with TP > 1.
+Declaring the axis replicated makes the comparator check that every rank holds the same value, rather than summing partial contributions across ranks. Layer-entry `inputs.1` tensors are still captured, but they are excluded from the comparison by `--filter` (see below).
 
 If the comparator returns exit code 0 but compared **zero layers** (baseline/target name mismatch), the test fails with a diagnostic message rather than silently passing.
 
 ### Capture signature
 
-A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, and dumper filter) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture shape are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, dumper filter, comparator filter, and fusion backend) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture and comparison contract are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+
+### Fusion and what gets compared
+
+The harness pins FlashInfer all-reduce fusion **on** (`--flashinfer-allreduce-fusion-backend trtllm`; the SM90 auto-enable was dropped in #23402). Two names are captured per layer:
+
+- `inputs.1` — hidden states entering the layer. `LayerCommunicator` defers the cross-layer all-reduce, so with fusion active these are rank-local TP-partial sums. CPU-side reduction of them is not the kernel's semantic output and drifts across self-hosted runners, so they are **not** compared. `_assert_fused_tp_layout()` keeps them only as a guard: if they come back replicated, fusion silently fell back and the test fails.
+- `self_attn.inputs.hidden_states` — the value attention consumes after `prepare_attn()`, i.e. post fused all-reduce and residual RMSNorm. This is replicated across ranks and is what the comparator actually diffs.
+
+This is why a stale baseline captured with fusion *not* initialized is incompatible: it holds replicated layer-entry tensors where the target holds TP-partial ones, which reads as an approximately `tp_size`x mismatch. Fusion initialization failures are tracked in [FlashInfer #3676](https://github.com/flashinfer-ai/flashinfer/issues/3676) and [SGLang #30875](https://github.com/sgl-project/sglang/issues/30875).
 
 ---
 
@@ -108,7 +118,8 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 | `SGLANG_PRECISION_COMMIT` | _(auto-detected from git)_ | Override the sglang commit SHA tagged on push |
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
-| `HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset |
+| `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
+| `SGLANG_PRECISION_HF_READ_ONLY` | `0` | Set to `1` to fetch and compare without updating the shared baseline store |
 
 ---
 
@@ -116,23 +127,28 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 
 ### Workflow job
 
-The nightly job `nightly-test-precision-8-gpu-h200` is defined in `.github/workflows/nightly-test-nvidia.yml` and runs on an 8-GPU H200 runner. It is included in the nightly suite via `test/run_suite.py`.
+The test is registered on the `nightly-8-gpu-h200` stage in `.github/workflows/nightly-test-nvidia.yml`, which runs through `_pr-test-stage.yml` like every other CUDA stage. The baseline env below is exported on every scheduled stage; only this test reads it.
 
 Key CI configuration:
 
 ```yaml
-- name: Run precision regression test
-  timeout-minutes: 120
+- name: Export precision baseline env
+  if: inputs.scheduled
   env:
-    SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
-    SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
-    SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
-    HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
-    SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+    BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
   run: |
-    cd test
-    python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
+    {
+      echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
+      echo "SGLANG_PRECISION_HF_REPO=${{ vars.SGLANG_PRECISION_HF_REPO }}"
+      echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
+      echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
+      echo "SGLANG_PRECISION_HF_TOKEN=${BASELINE_HF_TOKEN}"
+    } >> "$GITHUB_ENV"
 ```
+
+`SGLANG_PRECISION_HF_TOKEN` rather than `HF_TOKEN`: the latter already carries the runner's gated-model read token, and overwriting it would turn every gated model on the job into a 401.
+
+Standalone `/rerun-test` runs fetch the nightly baseline without changing it. Maintainers can refresh it from an in-repo PR with `/rerun-test --refresh-precision-baseline test/registered/debug_utils/test_nightly_precision_regression.py`.
 
 ### Required GitHub secrets/variables
 
@@ -140,7 +156,7 @@ Key CI configuration:
 |------|------|---------|
 | `SGLANG_PRECISION_HF_REPO` | Repository variable | HF dataset repo ID (e.g. `org/sglang-precision-baselines`) — **required**, the test errors if unset |
 | `SGLANG_PRECISION_HF_REVISION` | Repository variable (optional) | Dataset branch (defaults to `main`) |
-| `HF_TOKEN_PRECISION_STORE` | Repository secret | HF token with write access to the dataset |
+| `HF_TOKEN_PRECISION_STORE` | Repository secret | HF token with write access to the dataset; exported to the job as `SGLANG_PRECISION_HF_TOKEN` |
 
 ### GitHub Step Summary
 
@@ -187,7 +203,7 @@ export SGLANG_PRECISION_MODELS="your-org/your-model"
 export SGLANG_PRECISION_BASELINE_DIR="/tmp/my_precision_baselines"
 export SGLANG_PRECISION_DIFF_THRESHOLD="1e-3"
 export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-export HF_TOKEN="hf_..."
+export SGLANG_PRECISION_HF_TOKEN="hf_..."
 
 cd test
 python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
@@ -201,7 +217,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
    export SGLANG_PRECISION_MODELS="your-org/your-model"
    export SGLANG_PRECISION_BASELINE_DIR="/tmp/test_baselines"
    export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-   export HF_TOKEN="hf_..."
+   export SGLANG_PRECISION_HF_TOKEN="hf_..."
    export SGLANG_PRECISION_FORCE_UPDATE="1"  # first run: establish baseline
 
    cd test
@@ -249,7 +265,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 - SGLang installed in development mode
 - GPUs matching the model's requirements
 - `huggingface_hub` installed
-- A **HuggingFace dataset** for baseline storage and a write-capable `HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
+- A **HuggingFace dataset** for baseline storage and a write-capable `SGLANG_PRECISION_HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
 
 ### Quick local test
 
@@ -258,7 +274,7 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 export SGLANG_PRECISION_MODELS="Qwen/Qwen2.5-0.5B-Instruct"
 export SGLANG_PRECISION_BASELINE_DIR="/tmp/precision_baselines"
 export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
-export HF_TOKEN="hf_..."
+export SGLANG_PRECISION_HF_TOKEN="hf_..."
 
 # First run: establish baseline
 cd test
@@ -356,7 +372,7 @@ The framework uses a **rolling baseline**: every successful comparison updates t
 
 ### No local-only mode
 
-The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
+The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `SGLANG_PRECISION_HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
 
 ---
 
@@ -369,4 +385,4 @@ The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write
 | `python/sglang/srt/debug_utils/comparator/` | Tensor comparison engine |
 | `python/sglang/srt/debug_utils/dumper.py` | Runtime hidden-state capture |
 | `.github/workflows/nightly-test-nvidia.yml` | CI workflow definition |
-| `test/run_suite.py` | Test suite registration (includes `nightly-precision-8-gpu-h200`) |
+| `test/run_suite.py` | Test suite registration (includes `nightly-test-8-gpu-h200`) |

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import doctest
 import importlib.util
@@ -19,21 +20,23 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial, wraps
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
+import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -46,7 +49,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback, normalize_base_url
+from sglang.utils import normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -58,7 +61,6 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -147,12 +149,13 @@ DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = (
-    "meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen3-8B,Qwen/Qwen3-4B"
+# Deliberate omission: a model another registered suite already uses as its base
+# model is left out, since a regression there surfaces in that suite instead.
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = (
+    "meta-llama/Llama-3.1-70B-Instruct,Qwen/Qwen2-57B-A14B-Instruct"
 )
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -219,17 +222,10 @@ def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
 
-    ``sglang/srt/server/`` is not in the source tree — it is produced by
-    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
-    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
-    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
-    this at class-definition time, so letting that escape would fail the whole
-    module import instead of skipping the one class.
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
     """
-    try:
-        return importlib.util.find_spec("sglang.srt.server._core") is not None
-    except ModuleNotFoundError:
-        return False
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -264,23 +260,6 @@ if is_in_ci() and is_xpu():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
-def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop_sequences": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    pred = res.json()["generated_text"][0]
-    return pred
-
-
 def find_available_port(base_port: int):
     port = base_port + random.randint(100, 1000)
     while True:
@@ -290,174 +269,6 @@ def find_available_port(base_port: int):
             port += 42
         else:
             port -= 43
-
-
-def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
-):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "regex": regex,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    obj = res.json()
-    pred = obj["text"]
-    return pred
-
-
-def call_generate_guidance(
-    prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
-):
-    assert model is not None
-    from guidance import gen
-
-    rets = []
-    for _ in range(n):
-        out = (
-            model
-            + prompt
-            + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
-        )
-        rets.append(out["answer"])
-    return rets if n > 1 else rets[0]
-
-
-def call_select_lightllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "inputs": context + choices[i],
-            "parameters": {
-                "max_new_tokens": 1,
-            },
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(0)
-    return np.argmax(scores)
-
-
-def call_select_vllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "prompt": context + choices[i],
-            "max_tokens": 1,
-            "prompt_logprobs": 1,
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(res.json().get("prompt_score", 0))
-    return np.argmax(scores)
-
-    """
-    Modify vllm/entrypoints/api_server.py
-
-    if final_output.prompt_logprobs is not None:
-        score = np.mean([prob[t_id] for t_id, prob in zip(final_output.prompt_token_ids[1:], final_output.prompt_logprobs[1:])])
-        ret["prompt_score"] = score
-    """
-
-
-def call_select_guidance(context, choices, model=None):
-    assert model is not None
-    from guidance import select
-
-    out = model + context + select(choices, name="answer")
-    return choices.index(out["answer"])
-
-
-def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
-    parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--backend",
-        type=str,
-        required=True,
-        choices=[
-            "vllm",
-            "outlines",
-            "lightllm",
-            "gserver",
-            "guidance",
-            "srt-raw",
-            "llama.cpp",
-        ],
-    )
-    parser.add_argument("--n-ctx", type=int, default=4096)
-    parser.add_argument(
-        "--model-path", type=str, default="meta-llama/Llama-2-7b-chat-hf"
-    )
-    parser.add_argument("--result-file", type=str, default="result.jsonl")
-    args = parser.parse_args()
-
-    if args.port is None:
-        default_port = {
-            "vllm": 21000,
-            "outlines": 21000,
-            "lightllm": 22000,
-            "srt-raw": 30000,
-            "gserver": 9988,
-        }
-        args.port = default_port.get(args.backend, None)
-    return args
 
 
 def auto_config_device() -> str:
@@ -504,71 +315,6 @@ def select_sglang_backend(args: argparse.Namespace):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
     return backend
-
-
-def _get_call_generate(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{base_url}/generate")
-    elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
-    elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_generate = partial(call_generate_guidance, model=model)
-        call_generate("Hello,", 1.0, 8, ".")
-        return call_generate
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def _get_call_select(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_select = partial(call_select_guidance, model=model)
-
-        call_select("Hello,", ["world", "earth"])
-        return call_select
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def get_call_generate(args: argparse.Namespace):
-    call_generate = _get_call_generate(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_generate(*args, **kwargs)
-        except Exception:
-            print("Exception in call_generate:\n" + get_exception_traceback())
-            raise
-
-    return func
-
-
-def get_call_select(args: argparse.Namespace):
-    call_select = _get_call_select(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_select(*args, **kwargs)
-        except Exception:
-            print("Exception in call_select:\n" + get_exception_traceback())
-            raise
-
-    return func
 
 
 def _get_default_models():
@@ -915,6 +661,18 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def unified_radix_tree_server_env(
+    tree_core_backend: str, **extra_env: str
+) -> dict[str, str]:
+    return {
+        **os.environ,
+        **extra_env,
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
+    }
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -1090,14 +848,17 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
+    pids = collect_process_tree_pids(process.pid)
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
     kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
 
 
 def popen_launch_pd_server(
@@ -1405,6 +1166,29 @@ def run_score_benchmark(
     device="auto",
 ):
     """Score API benchmark function compatible with run_bench_serving pattern"""
+    return run_score_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_score_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size.
+
+    Batch size is a property of the request, not of the server, so the launch
+    is shared rather than repeated per size.
+    """
     if other_server_args is None:
         other_server_args = []
 
@@ -1420,7 +1204,7 @@ def run_score_benchmark(
         other_args=other_server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1443,7 +1227,7 @@ def run_score_benchmark(
                 )
             return text
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "query": generate_text_with_token_count(score_query_tokens),
                 "items": [
@@ -1491,12 +1275,16 @@ def run_score_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_embeddings_benchmark(
@@ -1509,6 +1297,27 @@ def run_embeddings_benchmark(
     device="auto",
 ):
     """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    return run_embeddings_benchmark_multi(
+        model,
+        [batch_size],
+        num_requests=num_requests,
+        input_tokens=input_tokens,
+        other_server_args=other_server_args,
+        need_warmup=need_warmup,
+        device=device,
+    )[0]
+
+
+def run_embeddings_benchmark_multi(
+    model,
+    batch_sizes,
+    num_requests=100,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """One server, one benchmark per batch size. See run_score_benchmark_multi."""
     if other_server_args is None:
         other_server_args = []
 
@@ -1527,7 +1336,7 @@ def run_embeddings_benchmark(
         other_args=server_args,
     )
 
-    async def _run_benchmark():
+    async def _run_benchmark(batch_size, warmup):
 
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
@@ -1538,7 +1347,7 @@ def run_embeddings_benchmark(
         # Generate input text
         input_text = generate_text_with_token_count(input_tokens)
 
-        if need_warmup:
+        if warmup:
             warmup_data = {
                 "input": input_text,
                 "model": model,
@@ -1578,12 +1387,16 @@ def run_embeddings_benchmark(
         )
 
     try:
-        res = asyncio.run(_run_benchmark())
+        results = [
+            asyncio.run(_run_benchmark(bs, need_warmup and i == 0))
+            for i, bs in enumerate(batch_sizes)
+        ]
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == res["successful_requests"]
-    return res
+    for res in results:
+        assert res["completed"] == res["successful_requests"]
+    return results
 
 
 def run_bench_serving_multi(
@@ -2241,9 +2054,59 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+@contextlib.contextmanager
+def published_topology(role: str = "test", *, ranks=None, **server_args_fields):
+    """Publish a test topology, defaulting to WORLD rank zero.
+
+    ``ranks`` overrides the launcher placement. Reset the context before
+    publication and on exit, including when the test fails.
+    """
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    bundle = dict(world_rank=0, dp_rank=None)
+    bundle.update(ranks or {})
+    server_args = ServerArgs(model_path="dummy", **server_args_fields)
+    reset_context()
+    publish(server_args, role=role, ranks=SpawnRanks(**bundle))
+    try:
+        yield server_args
+    finally:
+        reset_context()
+
+
+def publish_build_topology(*, world_rank: int = 0, **server_args_fields):
+    """Publish the topology for a subsequent ``initialize_model_parallel`` call.
+
+    Preserve an existing WORLD group across the context reset. The caller is
+    responsible for tearing down groups and resetting the context afterward.
+    """
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_parallel,
+        publish,
+        reset_context,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(
+        ServerArgs(model_path="dummy", **server_args_fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=world_rank),
+    )
+    # Restore the existing WORLD handle after resetting the context.
+    if parallel_state._WORLD is not None:
+        get_parallel().override_permanently(world_group=parallel_state._WORLD)
+
+
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2345,8 +2208,162 @@ def _wait_for_gpu_idle_in_ci(
             pass
 
 
-class CustomTestCase(unittest.TestCase):
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
 
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+# Names the runner kits stamp onto a record that are not members of it.
+# `ModelRunner` computes `use_mla_backend` on itself; the kits copy that bool
+# onto the record they hand the runner, and `hasattr` cannot see it.
+_RUNNER_WRITTEN_NAMES = frozenset({"use_mla_backend"})
+
+
+def server_args_variant(server_args, **fields):
+    """A modified deep copy of a config, for a test double whose fixture
+    differs from the (possibly published, read-only) config it starts from.
+    The receiver is untouched; the copy keeps its read-only guard.
+
+    A name may also be one the kits stamp on rather than a field (see
+    ``_RUNNER_WRITTEN_NAMES``); names that exist nowhere fail loudly."""
+    variant = copy.deepcopy(server_args)
+    cls = type(variant)
+    unknown = {
+        name
+        for name in fields
+        if name not in cls.__struct_fields__
+        and not hasattr(cls, name)
+        and name not in _RUNNER_WRITTEN_NAMES
+    }
+    if unknown:
+        raise ValueError(f"unknown ServerArgs field(s): {sorted(unknown)}")
+    # Reach the stash as well as the fields (the bags project from raw input
+    # + declarations); through `object` because the copy keeps its read-only
+    # guard.
+    stash = getattr(variant, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        msgspec.Struct.__setattr__(variant, "_resolved_overrides", stash)
+    declared = {
+        name: value for name, value in fields.items() if name in cls.__struct_fields__
+    }
+    if declared:
+        stash.append(("server_args_variant", dict(declared)))
+    for name, value in fields.items():
+        msgspec.Struct.__setattr__(variant, name, value)
+    return variant
+
+
+def enter_override(test_case, override):
+    """Install a scoped context override for the length of one test.
+
+    `unittest.TestCase.enterContext` does exactly this in one call, but it is
+    Python 3.11+ and this package supports 3.10 (`requires-python = ">=3.10"`).
+    On 3.10 it raises `AttributeError: ... has no attribute 'enterContext'` --
+    and only there, so a developer on a newer interpreter sees every test pass
+    while CI does not.
+    """
+    installed = override.install()
+    test_case.addCleanup(override.restore)
+    return installed
+
+
+def enter_scope(test_case, scope):
+    """Enter a context manager for the length of one test.
+
+    The `with`-statement form of `enter_override` above, and 3.10-safe for the
+    same reason: `enterContext` arrived in 3.11.
+    """
+    entered = scope.__enter__()
+    test_case.addCleanup(scope.__exit__, None, None, None)
+    return entered
+
+
+class CustomTestCase(unittest.TestCase):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -2449,12 +2466,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:

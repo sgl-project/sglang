@@ -49,7 +49,7 @@
 #include <cuda_bf16.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 constexpr int kPadSlot = -1;
 constexpr uint32_t kVecElems = 8;  // bf16x8 = 16 B
@@ -161,7 +161,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
   // ---- 1. push: wait for the producer's output (PDL; no-op without a PDL
   // launch or an early-triggering producer), multicast-store this rank's
   // partial row, and issue the residual load (it lands under the barrier). ----
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
   const auto* sh_row =
       p.shared == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(p.shared) + t * p.shared_stride_t;
@@ -393,7 +393,7 @@ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid
   // GPU, so Phase 2's cross-token (neighbor) staging reads are race-free -- the
   // per-block barrier only synchronized the same blockIdx across ranks and did
   // NOT order block t-j's push before block t's read.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   auto* mc = static_cast<__nv_bfloat16*>(p.mc_stage);
   const auto* in = static_cast<const __nv_bfloat16*>(p.in);
   const auto* sh = static_cast<const __nv_bfloat16*>(p.shared);
@@ -627,7 +627,7 @@ struct ArSconvNormKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({T}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({T}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);
@@ -752,7 +752,7 @@ struct ArSconvNormVerifyKernel {
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
     TensorMatcher({D}).with_dtype<DType>().with_device(dev).verify(norm_weight);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({B}).with_device(dev).verify(cache_mask);
     TensorMatcher({D, Wd}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(conv_weight);
@@ -827,4 +827,4 @@ struct ArSconvNormVerifyKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

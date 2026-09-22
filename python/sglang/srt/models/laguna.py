@@ -18,7 +18,6 @@ from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -172,7 +171,8 @@ class LagunaMoE(nn.Module):
             layer_id=layer_id,
             renormalize=True,
             use_grouped_topk=False,
-            scoring_func="sigmoid",
+            # "sigmoid" (default) or "sqrtsoftplus"; the branch lives in topk.py.
+            scoring_func=config.moe_router_score_func,
             correction_bias=self.gate.e_score_correction_bias,
         )
 
@@ -533,7 +533,7 @@ class LagunaModel(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -655,7 +655,7 @@ class LagunaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.model = LagunaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)

@@ -38,14 +38,21 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_flags,
+    get_parallel,
+)
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -82,6 +89,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -92,14 +100,25 @@ def _allocate_decode_buffers(
         out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
         positions = torch.zeros((max_num_token,), dtype=torch.int64)
         mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        # Refreshed at replay only under expert parallelism.
+        num_token_non_padded = (
+            torch.zeros((1,), dtype=torch.int32)
+            if enable_num_token_non_padded()
+            else None
+        )
         custom_mask = torch.ones(
             (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
             dtype=torch.bool,
         )
-        next_token_logits_buffer = torch.zeros(
-            (max_num_token, vocab_size),
-            dtype=torch.float,
+        # (max_num_token, vocab) fp32 is large (>10GB at 16k tokens); callers
+        # whose dummy runs never touch logits (run_lm_head=False autotune) opt out.
+        next_token_logits_buffer = (
+            torch.zeros(
+                (max_num_token, vocab_size),
+                dtype=torch.float,
+            )
+            if allocate_logits_buffer
+            else None
         )
         mamba_track_indices = (
             torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
@@ -112,16 +131,21 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Sized in tokens, not requests: under speculative decoding the
+            # verify forward carries num_tokens_per_req tokens per request and
+            # _dummy_run slices these buffers to num_tokens (same as
+            # topk_indices below). Identical for plain decode where
+            # num_tokens_per_req == 1.
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                # [T, blocks, H]. Other models use [T, H].
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
@@ -203,15 +227,15 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
-        self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.pp_size = get_parallel().pp_size
+        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
@@ -231,17 +255,26 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
 
+        # Model-owned communication resources may depend on the resolved
+        # request pool and must be compiled/allocated before graph capture.
+        prepare_model_resources = getattr(
+            mr.model, "prepare_before_cuda_graph_capture", None
+        )
+        if prepare_model_resources is not None:
+            prepare_model_resources(mr)
+
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
-            assert (
-                buffers is not None
-            ), "_autotune_buffers() must return a reusable buffer set for autotune"
+            assert buffers is not None, (
+                "_autotune_buffers() must return a reusable buffer set for autotune"
+            )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
+            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.ps.pp_size > 1
+            and get_parallel().pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -256,7 +289,7 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        if mr.server_args.flashinfer_allreduce_fusion_backend is None:
+        if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -273,8 +306,10 @@ class BaseRunner(ABC):
         comm backend; must run before CG capture (it syncs the stream + barriers
         cross-rank, uncapturable) and raises early on non-MNNVL platforms.
         """
-        mr = self.model_runner
-        if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "fi_a2a":
+        if (
+            not get_parallel().dcp_enabled
+            or get_parallel().dcp_comm_backend != "fi_a2a"
+        ):
             return
 
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
@@ -303,9 +338,17 @@ class BaseRunner(ABC):
                 run_ctx=canary_run_ctx,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, run_lm_head=False
+        )
 
-    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_req: int = 1):
+    def _alloc_dummy_decode_buffers(
+        self,
+        max_bs: int,
+        *,
+        num_tokens_per_req: int = 1,
+        allocate_logits_buffer: bool = True,
+    ):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_req).
 
@@ -325,9 +368,9 @@ class BaseRunner(ABC):
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
             dp_size=get_parallel().dp_size,
-            pp_size=mr.server_args.pp_size,
+            pp_size=get_parallel().pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
             encoder_len_fill_value=(
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
@@ -345,6 +388,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            allocate_logits_buffer=allocate_logits_buffer,
         )
 
     def _dummy_run(
@@ -354,6 +398,7 @@ class BaseRunner(ABC):
         forward_mode_override: Optional[ForwardMode] = None,
         *,
         buffers,
+        extend_num_tokens_per_req: Optional[int] = None,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -382,16 +427,30 @@ class BaseRunner(ABC):
         capture_hidden_mode = (
             CaptureHiddenMode.NULL
             if mr.is_draft_worker
-            else get_server_return_hidden_states_mode(mr.server_args)
+            else get_server_return_hidden_states_mode()
         )
         num_tokens_per_req = 1
-        if mr.spec_algorithm.is_speculative():
+        # A PD prefill target worker's pool has no SpeculativeState, so a
+        # TARGET_VERIFY dummy forward would trip the linear-attn backend's
+        # pool-type assert. Warm up in plain DECODE instead.
+        _is_pd_prefill_target = (
+            get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
+        )
+        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
-                assert (
-                    mr.spec_algorithm.supports_target_verify_for_draft()
-                ), "This should not happen"
+                assert mr.spec_algorithm.supports_target_verify_for_draft(), (
+                    "This should not happen"
+                )
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
+        if extend_num_tokens_per_req is not None:
+            assert capture_forward_mode == ForwardMode.EXTEND and (
+                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
+            ), (
+                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
+                "target EXTEND dummy"
+            )
+            num_tokens_per_req = extend_num_tokens_per_req
 
         num_tokens = batch_size * num_tokens_per_req
 
@@ -433,7 +492,8 @@ class BaseRunner(ABC):
         positions = buffers.positions[:num_tokens]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        buffers.num_token_non_padded[...] = num_tokens
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
 
         # Batch-axis buffer views.
         req_pool_indices = buffers.req_pool_indices[:batch_size]
@@ -455,12 +515,17 @@ class BaseRunner(ABC):
 
         # For extend mode
         if capture_forward_mode == ForwardMode.EXTEND:
-            seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
+            if extend_num_tokens_per_req is None:
+                per_req_extend_len = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
+            else:
+                per_req_extend_len = extend_num_tokens_per_req
+                seq_lens.fill_(per_req_extend_len)
+                seq_lens_cpu.fill_(per_req_extend_len)
             extend_prefix_lens_cpu = [0] * batch_size
-            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+            extend_seq_lens_cpu = [per_req_extend_len] * batch_size
             extend_num_tokens = num_tokens
             extend_seq_lens = torch.full(
-                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=mr.device
+                (batch_size,), per_req_extend_len, dtype=torch.int32, device=mr.device
             )
             extend_prefix_lens = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=mr.device
@@ -476,23 +541,23 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if mr.server_args.pp_size > 1:
+        if get_parallel().pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
-                and mr.ps.attn_cp_size > 1
+                and get_parallel().pp_rank != 0
+                and mr.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         # TP-gather requirements for global token metadata.
-        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
-        require_attn_tp_gather_ = require_attn_tp_gather(mr.server_args)
-        if require_gathered_buffer(mr.server_args):
+        require_mlp_tp_gather_ = require_mlp_tp_gather()
+        require_attn_tp_gather_ = require_attn_tp_gather()
+        if require_gathered_buffer():
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
@@ -516,7 +581,6 @@ class BaseRunner(ABC):
         # Speculative metadata and hidden-state capture mode.
         spec_info = create_dummy_verify_input(
             mr.spec_algorithm,
-            mr.server_args,
             buffers.custom_mask,
             num_tokens_per_req,
             mr.is_draft_worker,
@@ -537,7 +601,7 @@ class BaseRunner(ABC):
             )
 
         # Optional LoRA metadata.
-        if mr.server_args.enable_lora:
+        if mr.lora_manager is not None:
             lora_ids = [None] * batch_size
         else:
             lora_ids = None
@@ -571,7 +635,11 @@ class BaseRunner(ABC):
             spec_algorithm=mr.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            # Maintained only under expert parallelism; None elsewhere so routing
+            # does not mask every row against a never-filled zero count.
+            num_token_non_padded=(
+                buffers.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
@@ -585,6 +653,8 @@ class BaseRunner(ABC):
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
         def run_once():
             # Reused dummy batches may carry DP-local lazy caches from a prior
@@ -601,7 +671,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                mr.server_args.pp_size > 1
+                get_parallel().pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
@@ -621,7 +691,7 @@ class BaseRunner(ABC):
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            with torch.inference_mode(), run_ctx or empty_context():
+            with run_ctx or empty_context():
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:

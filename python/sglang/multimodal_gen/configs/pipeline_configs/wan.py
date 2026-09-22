@@ -48,12 +48,13 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 @dataclass
 class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         if num_frames % vae_scale_factor_temporal != 1:
-            logger.warning(
-                f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
-            )
+            if log_adjustment:
+                logger.warning(
+                    f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
+                )
             num_frames = (
                 num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
             )
@@ -98,7 +99,9 @@ class WanT2V480PConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit",),
         )
 
     def expand_conditioning_to_sample_batch(self, batch):
@@ -138,9 +141,10 @@ class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=60,
             keep_resident_components=(
+                "dit",
                 "text_encoder",
                 "image_encoder",
                 "vae",
@@ -182,11 +186,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
-        )
-
 
 @dataclass
 class WanI2V720PConfig(WanI2V480PConfig):
@@ -225,9 +224,10 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=60,
             keep_resident_components=(
+                "dit",
                 "text_encoder",
                 "image_encoder",
                 "vae",
@@ -277,6 +277,12 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
         self.dit_config.torch_compile_mode = "default"
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            auto_dit_offload_prefetch_size=2,
+        )
+
 
 @dataclass
 class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
@@ -287,6 +293,12 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.dit_config.boundary_ratio = self.boundary_ratio
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            auto_dit_offload_prefetch_size=2,
+        )
 
 
 # =============================================

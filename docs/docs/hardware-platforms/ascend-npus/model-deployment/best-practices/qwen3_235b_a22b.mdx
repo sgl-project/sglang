@@ -7,20 +7,20 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for Qwen3-235B-A22B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-235B-A22B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+| Qwen3-235B-A22B | Ascend A3 Series Products | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
+| Qwen3-235B-A22B | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
 
 ## Optimal Configuration
 
@@ -30,7 +30,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: Qwen3-235B-A22B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -70,13 +70,14 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+export DEEPEP_HCCL_BUFFSIZE=1600
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=1600
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -100,7 +101,7 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --tp 16 \
     --mem-fraction-static 0.78 \
-    --cuda-graph-bs 1 \
+    --cuda-graph-bs-decode 1 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen25
 ```
@@ -116,17 +117,18 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 1 \
+    --num-prompts 1 \
     --random-input-len 11000 \
     --random-output-len 1500 \
-    --num-prompts 1 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```
 
 ### Qwen3-235B-A22B W8A8 8P IN3K5 OUT1K5 50.1ms
 
 **Model**: Qwen3-235B-A22B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -166,8 +168,8 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+export DEEPEP_HCCL_BUFFSIZE=570
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_BUFFSIZE=570
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -175,6 +177,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -186,6 +189,7 @@ python3 -m sglang.launch_server \
     --node-rank 0 \
     --attention-backend ascend \
     --device npu \
+    --quantization modelslim \
     --max-running-requests 432 \
     --context-length 8192 \
     --dtype bfloat16 \
@@ -195,7 +199,6 @@ python3 -m sglang.launch_server \
     --ep-dispatch-algorithm static \
     --disable-radix-cache \
     --moe-a2a-backend ascend_fuseep \
-    --fuseep-mode 2 \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 \
@@ -207,7 +210,7 @@ python3 -m sglang.launch_server \
     --enable-dp-attention \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 1 2 4 8 16 20 24 26 27 \
+    --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen25
 ```
@@ -223,8 +226,9 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 432 \
+    --num-prompts 1728 \
     --random-input-len 3500 \
     --random-output-len 1500 \
-    --num-prompts 1728 \
-    --random-range-ratio 1
+    --random-range-ratio 1 \
+    --seed 1
 ```

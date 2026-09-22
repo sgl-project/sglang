@@ -20,12 +20,17 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
 
 
 class DmdDenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # a fixed distilled schedule: the same count at any requested step count
+        return len(self.server_args.pipeline_config.dmd_denoising_steps)
+
     """
     Denoising stage for DMD.
     """
@@ -91,7 +96,6 @@ class DmdDenoisingStage(DenoisingStage):
             self.transformer.forward,
             {
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
@@ -136,9 +140,9 @@ class DmdDenoisingStage(DenoisingStage):
                             ],
                             dim=2,
                         ).to(target_dtype)
-                    assert not torch.isnan(
-                        latent_model_input
-                    ).any(), "latent_model_input contains nan"
+                    assert not torch.isnan(latent_model_input).any(), (
+                        "latent_model_input contains nan"
+                    )
 
                     # Prepare inputs for transformer
                     t_expand = t.repeat(latent_model_input.shape[0])

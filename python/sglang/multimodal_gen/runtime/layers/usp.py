@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,11 +9,9 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-    pack_qkv_destination_major,
-)
-from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
@@ -39,7 +38,21 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+_A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+
+
+def drop_a2a_staging_buffers() -> None:
+    """Release the cached all-to-all staging buffers on this rank.
+
+    The cache only ever grows to the largest message seen, so a warmup probe
+    at the full serving shape leaves buffers sized for it behind; the caller
+    releases them at a point every rank reaches together.
+    """
+    if not _A2A_STAGING_BUFFERS:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _A2A_STAGING_BUFFERS.clear()
 
 
 def _a2a_staging_buffer(
@@ -48,8 +61,10 @@ def _a2a_staging_buffer(
     """Reusable staging buffer for a Ulysses collective.
 
     A buffer of a given role is fully consumed (in stream order) before the
-    next collective with the same role overwrites it, so caching by
-    (role, shape, dtype) is exact and removes per-block allocator churn.
+    next collective with the same role overwrites it. Keep one grow-only
+    backing allocation per (role, dtype, device), then return an exact-shape
+    view into that allocation. This removes per-block allocator churn without
+    retaining one CUDA tensor for every request shape seen by the worker.
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
@@ -61,12 +76,22 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    key = (role, tuple(shape), dtype, device.index)
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (role, dtype, device_index)
+    required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=dtype, device=device)
+    if buffer is None or buffer.numel() < required_numel:
+        # The previous same-role collective is fully consumed by contract, so
+        # drop its cache reference before allocating a larger backing buffer.
+        # Any outstanding tensor view still keeps the old storage alive.
+        _A2A_STAGING_BUFFERS.pop(key, None)
+        del buffer
+        buffer = torch.empty(required_numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
-    return buffer
+    return buffer[:required_numel].view(shape)
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
@@ -167,6 +192,11 @@ def _ipc_input_a2a_qkv(q, k, v):
     """The three input A2As of one attention as a single IPC exchange;
     None when unavailable."""
     if get_ulysses_parallel_world_size() != 2:
+        return None
+    # One staging slot is sized from `q` and reused for all three, so unequal
+    # k/v lengths would copy mismatched extents into it. The general exchange
+    # guards the same way and handles them.
+    if q.shape != k.shape or q.shape != v.shape:
         return None
     group = _ipc_ready_group()
     if group is None:
@@ -296,9 +326,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -472,9 +502,9 @@ def _usp_input_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -488,12 +518,12 @@ def _usp_input_all_to_all_varlen(
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        s_local == seq_lens[rank]
-    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert s_local == seq_lens[rank], (
+        f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    )
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local = h_global // world_size
 
@@ -562,9 +592,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
-    assert (
-        s_global % world_size == 0
-    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    assert s_global % world_size == 0, (
+        f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    )
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
@@ -616,9 +646,9 @@ def _usp_output_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -632,9 +662,9 @@ def _usp_output_all_to_all_varlen(
         # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
         permute_order = (2, 0, 1, 3)
 
-    assert s_global == sum(
-        seq_lens
-    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    assert s_global == sum(seq_lens), (
+        f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    )
 
     s_local = seq_lens[rank]
 
@@ -675,6 +705,7 @@ def ring_attn(
     attn_impl: "AttentionImpl",
     is_causal: bool = False,
     dropout_p: float = 0.0,
+    return_softmax_lse: bool = False,
 ):
     """
     Ring Attention implementation.
@@ -748,15 +779,152 @@ def ring_attn(
     if use_segment_id:
         # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
         # as we are not using complex segmentation features.
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             seq_dim=1,  # segment_id
             **attn_kwargs,
         )
     else:
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             **attn_kwargs,
         )
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
+    if return_softmax_lse:
+        return output, lse
     return output
+
+
+def _merge_attention_partials(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> torch.Tensor:
+    """Merge two attention partials computed over disjoint KV sets.
+
+    `out_*` are `[B, S, H, D]`; `lse_*` are the dense-FA LSE layout `[B, H, S]`.
+    Each partial is self-normalized over its own KV, so the exact combine is a
+    two-term logsumexp reweighting; done in fp32 for stability.
+    """
+    lse_a = lse_a.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    lse_b = lse_b.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    new_lse = torch.logaddexp(lse_a, lse_b)
+    return out_a.to(torch.float32) * torch.exp(lse_a - new_lse) + out_b.to(
+        torch.float32
+    ) * torch.exp(lse_b - new_lse)
+
+
+def _ring_merge_attention(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    step_out: torch.Tensor,
+    step_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Online-softmax combine of one more ring step's partial attention.
+
+    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
+    layout `[H, T]`. Both are already self-normalized over their own KV
+    chunk, so combining chunks is the standard two-term logsumexp merge
+    (exact up to float rounding); done in fp32 for stability.
+    """
+    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_out = step_out.to(torch.float32)
+    if out_acc is None:
+        return step_out, step_lse
+    new_lse = torch.logaddexp(lse_acc, step_lse)
+    out_acc = out_acc * torch.exp(lse_acc - new_lse) + step_out * torch.exp(
+        step_lse - new_lse
+    )
+    return out_acc, new_lse
+
+
+def _ring_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attn_impl: "AttentionImpl",
+    real_seq_len: int,
+    ring_ws: int,
+) -> torch.Tensor:
+    """Ring-rotated varlen attention over one rank's local packed chunk.
+
+    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    real rows followed by however many of this chunk's rows are padding).
+    KV is P2P-rotated around the ring one hop per step (send this step's
+    buffer to the next rank, receive the following step's buffer from the
+    previous rank) so the hop for step+1 overlaps this step's attention
+    compute -- unlike a single blocking all_gather, no step waits on the
+    full ring's transfer before its own compute can start. Each hop's
+    *real* prefix is attended locally and merged via online softmax.
+    Padding rows never contribute to any KV chunk (their output is unused
+    downstream, but must not be corrupted by attending across the padding
+    boundary), and a chunk that is entirely padding is skipped outright.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    ring_chunk_len = q.shape[0]
+    _, ring_rank = get_ring_ctx()
+
+    # `isend`/`irecv` (unlike collectives) address peers by global rank even
+    # under a sub-group, so resolve this ring's neighbors once up front.
+    next_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank + 1) % ring_ws
+    )
+    prev_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank - 1) % ring_ws
+    )
+
+    # K and V travel as one stacked buffer so each hop is a single P2P
+    # send/recv pair instead of two; stacking also makes the buffer
+    # contiguous, so no separate .contiguous() call is needed.
+    kv0 = torch.stack((k, v))
+    kv_bufs = [kv0, torch.empty_like(kv0)]
+    cur = 0
+
+    out_acc: torch.Tensor | None = None
+    lse_acc: torch.Tensor | None = None
+    pending_ops = None
+    for step in range(ring_ws):
+        nxt = 1 - cur
+        if step < ring_ws - 1:
+            # kick off next hop before this step's compute so the transfer
+            # overlaps it; wait for completion only after issuing compute.
+            pending_ops = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        kv_bufs[cur],
+                        next_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        kv_bufs[nxt],
+                        prev_global_rank,
+                        group=ring_pg,
+                    ),
+                ]
+            )
+
+        src_rank = (ring_rank - step) % ring_ws
+        remote_used = min(
+            max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
+        )
+        if remote_used > 0:
+            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
+                q,
+                kv_bufs[cur][0, :remote_used],
+                kv_bufs[cur][1, :remote_used],
+            )
+            out_acc, lse_acc = _ring_merge_attention(
+                out_acc, lse_acc, step_out, step_lse
+            )
+
+        if pending_ops is not None:
+            for op in pending_ops:
+                op.wait()
+            pending_ops = None
+            cur = nxt
+    return out_acc.to(q.dtype)
