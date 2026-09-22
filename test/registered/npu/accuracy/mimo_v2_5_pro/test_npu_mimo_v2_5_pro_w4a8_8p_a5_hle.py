@@ -107,10 +107,13 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
         "parallel_tool_calls": True,
         "stream": True,
     }
-    judge_model_args = {
-        "model_id": "MiMo-V2.5-Pro-FP4-DFlash",
-        "api_url": "http://127.0.0.1:8010/v1",
-        "api_key": "EMPTY",
+    judge = {
+        "strategy": "llm",
+        "models": {
+            "model_id": "MiMo-V2.5-Pro-FP4-DFlash",
+            "api_url": "http://127.0.0.1:8010/v1",
+            "api_key": "EMPTY",
+        },
     }
 
     def test_hle(self):
