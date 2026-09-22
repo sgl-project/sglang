@@ -244,9 +244,10 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
         _ => None,
     };
     let bootstrap = Arc::new(match (&config.model.cache_aware, peer_selector) {
-        (Some(cache), Some(_)) => BootstrapTracker::new_with_fetch_cap(
+        (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
             Duration::from_millis(cache.bootstrap_timeout_ms),
             Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+            cache.bootstrap_seed_required,
         ),
         _ => BootstrapTracker::disabled(),
     });
