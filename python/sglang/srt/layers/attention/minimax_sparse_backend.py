@@ -1570,8 +1570,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
-                # K-side host lens (prefix + chunk) for the Gluon prefill path's
-                # scratch-page sizing; None simply disables that path.
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,

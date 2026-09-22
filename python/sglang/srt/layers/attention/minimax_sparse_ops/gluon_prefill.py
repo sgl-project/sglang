@@ -15,6 +15,7 @@ position-ordered page range rounded up to whole sparse blocks.
 
 from __future__ import annotations
 
+from itertools import accumulate
 from typing import Optional
 
 import torch
@@ -27,8 +28,7 @@ from sglang.srt.layers.attention.aiter_utils import (
 )
 
 SPARSE_BLOCK_SIZE = 128
-# Gluon PS kernel supports kv_block_size in {16, 64}; 64 halves the block-table
-# width and page count vs 16 (the source ran page 64: 2 pages per sparse block).
+# The Gluon PS kernel takes kv_block_size 16 or 64; 64 halves the block-table width.
 GLUON_PAGE_SIZE = 64
 PAGES_PER_BLOCK = SPARSE_BLOCK_SIZE // GLUON_PAGE_SIZE
 HEAD_DIM = 128
@@ -36,11 +36,13 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# Hard cap on the gathered context span per forward (K and V buffers each):
-# 512 MiB per buffer at bf16 = 32768 pages = ~2.1M context tokens across the
-# batch; beyond that the entry point raises and the caller falls back to the
-# Triton kernel (which reads the pool in place).
+# 512 MiB per buffer at bf16 (~2.1M context tokens per forward); past it the caller
+# falls back to the Triton kernel, which reads the pool in place.
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
+
+
+class GluonPrefillUnavailableError(RuntimeError):
+    """Raised when the scratch cannot hold this forward; the caller falls back to Triton."""
 
 
 @triton.jit
@@ -98,16 +100,12 @@ def _gather_nhd_to_shuffle_kernel(
         + off_d[None, :] * X
         + (off_t[:, None] % X)
     )
-    # Unmasked stores: tiles are zero-padded past seq_len, so tail pages hold
-    # zeros rather than a previous layer's stale data (never attended anyway --
-    # sparse_ctx stops the walk -- but keeps the buffer well-defined).
+    # Unmasked: tiles are zero past seq_len, so no previous layer's data survives.
     tl.store(k_out_ptr + page_base + k_off, k_tile)
     tl.store(v_out_ptr + page_base + v_off, v_tile)
 
 
-# Persistent, grow-only scratch: (device, dtype) -> (k_flat, v_flat). One pair
-# is shared by all 57 sparse layers (layers run sequentially on one stream) and
-# across forwards; ~16 KiB per page per buffer (128 dims x 64 tokens x 2B).
+# Grow-only (device, dtype) -> (k_flat, v_flat); layers run in sequence and share it.
 _SCRATCH: dict = {}
 
 
@@ -121,17 +119,15 @@ def _get_scratch(
         cap_pages = (
             (total_pages + _SCRATCH_GROW_PAGES - 1) // _SCRATCH_GROW_PAGES
         ) * _SCRATCH_GROW_PAGES
-        # This lands after the KV pool has already claimed its budget, so a grow
-        # can be what tips the device over. Surface it as a normal unsupported
-        # case: the caller catches and runs the Triton kernel, which reads the
-        # pool in place and needs no scratch at all.
+        # Grows after the KV pool claimed its budget; report OOM as unsupported so
+        # the caller falls back to the scratch-free Triton kernel.
         try:
             entry = (
                 torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
                 torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
             )
         except torch.cuda.OutOfMemoryError as exc:
-            raise ValueError(
+            raise GluonPrefillUnavailableError(
                 f"gluon prefill scratch of {cap_pages} pages "
                 f"({cap_pages * _PAGE_ELEMS * dtype.itemsize * 2 >> 20} MiB) "
                 "does not fit; lower --mem-fraction-static"
@@ -214,9 +210,7 @@ def _build_gluon_sparse_bt_prefill_kernel(
     is_full = valid & (blk < self_blk)
     n_full = tl.sum(is_full.to(tl.int32), axis=0)
     n_valid = tl.sum(valid.to(tl.int32), axis=0)
-    # Pack full blocks first (each contributes a whole sparse_block_size span),
-    # the tail/current block last (partial, causal). This keeps the kernel's
-    # sequential page walk aligned with sparse_ctx.
+    # Full blocks first, the partial causal tail last, so the walk matches sparse_ctx.
     earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
     sparse_slot = tl.where(is_full, earlier_full, n_full)
 
@@ -278,18 +272,16 @@ def _build_gluon_prefill_meta(
 
     # Host-side page layout: each request's context span rounds up to whole
     # sparse blocks so every emitted page id stays inside its own span.
-    lens = [int(l) for l in seq_lens_cpu.tolist()]
     pages_per_req = [
-        ((l + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
-        for l in lens
+        ((kv_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
+        for kv_len in seq_lens_cpu.tolist()
     ]
-    total_pages = int(sum(pages_per_req))
-    starts = []
-    acc = 0
-    for p in pages_per_req:
-        starts.append(acc)
-        acc += p
-    page_start = torch.tensor(starts, dtype=torch.int32, device=device)
+    total_pages = sum(pages_per_req)
+    page_start = torch.tensor(
+        list(accumulate(pages_per_req, initial=0))[:-1],
+        dtype=torch.int32,
+        device=device,
+    )
     repeats = torch.tensor(pages_per_req, dtype=torch.int64, device=device)
     page_req = torch.repeat_interleave(
         torch.arange(len(pages_per_req), dtype=torch.int32, device=device),
@@ -372,7 +364,7 @@ def can_use_gluon_prefill(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
 ) -> bool:
-    """Cheap static gate; anything it can't see is caught at runtime and falls back."""
+    """Cheap static gate; the scratch size is checked per forward."""
     if (
         pa_decode_gluon is None
         or get_recommended_splits is None
@@ -418,31 +410,25 @@ def gluon_sparse_prefill(
     block_size_k: int,
     sm_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Run per-page Gluon sparse prefill over the NHD KV pool.
+    """Run Gluon sparse prefill over the NHD KV pool via the SHUFFLE scratch.
 
-    The context span is first gathered into the persistent SHUFFLE 5D scratch
-    (see module docstring); ``num_kv_heads == 1`` is enforced by
-    ``can_use_gluon_prefill``. Raises on unsupported runtime shapes; the caller
-    catches and falls back to the Triton sparse kernel.
+    Raises GluonPrefillUnavailableError when the scratch cannot hold the context.
     """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
 
     q = q.contiguous()
     total_q, num_q_heads, head_dim = q.shape
-    # Guard runtime shapes that the static gate cannot validate.
     if total_q == 0:
         return torch.empty_like(q)
-    if topk_idx.shape[0] != 1 or topk_idx.shape[1] != total_q:
-        raise ValueError(
-            f"gluon prefill expects topk_idx [1, total_q, topk], got {tuple(topk_idx.shape)}"
-        )
+    assert topk_idx.shape[0] == 1 and topk_idx.shape[1] == total_q, (
+        f"gluon prefill expects topk_idx [1, total_q, topk], got {tuple(topk_idx.shape)}"
+    )
     batch = cu_seqlens.shape[0] - 1
-    if seq_lens_cpu.numel() != batch or seq_lens.shape[0] != batch:
-        raise ValueError(
-            f"gluon prefill batch mismatch: cu_seqlens batch {batch}, "
-            f"seq_lens {tuple(seq_lens.shape)}, seq_lens_cpu {seq_lens_cpu.numel()}"
-        )
+    assert seq_lens_cpu.numel() == batch and seq_lens.shape[0] == batch, (
+        f"gluon prefill batch mismatch: cu_seqlens batch {batch}, "
+        f"seq_lens {tuple(seq_lens.shape)}, seq_lens_cpu {seq_lens_cpu.numel()}"
+    )
 
     req_id, abs_pos, page_start, page_req, page_pos, total_pages = (
         _build_gluon_prefill_meta(
@@ -450,7 +436,7 @@ def gluon_sparse_prefill(
         )
     )
     if total_pages > _MAX_SCRATCH_PAGES:
-        raise ValueError(
+        raise GluonPrefillUnavailableError(
             f"gluon prefill context span too large for scratch: {total_pages} pages "
             f"> cap {_MAX_SCRATCH_PAGES}"
         )

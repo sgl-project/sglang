@@ -20,10 +20,9 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-_use_aiter_gfx95 = _use_aiter and is_gfx95_supported()
+_use_aiter_gfx95 = envs.SGLANG_USE_AITER.get() and is_hip() and is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
@@ -46,8 +45,8 @@ def _warn_gluon_fallback(msg: str) -> None:
     if _gluon_fallback_warned:
         return
     logger.warning(
-        "SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL is set, but the Gluon sparse prefill "
-        "path is unavailable (%s); falling back to Triton.",
+        "MiniMax Gluon sparse prefill is unavailable (%s); falling back to Triton "
+        "sparse attention.",
         msg,
     )
     _gluon_fallback_warned = True
@@ -179,20 +178,24 @@ def minimax_sparse_prefill(
         # the scratch gather reads pool slots without the HiSparse remap
         and loc_mapping is None
     ):
-        try:
-            from .gluon_prefill import can_use_gluon_prefill, gluon_sparse_prefill
+        from .gluon_prefill import (
+            GluonPrefillUnavailableError,
+            can_use_gluon_prefill,
+            gluon_sparse_prefill,
+        )
 
-            if can_use_gluon_prefill(
-                q,
-                k_cache,
-                v_cache,
-                sink,
-                block_size_k,
-                seq_lens_cpu,
-                q_scale,
-                k_scale,
-                v_scale,
-            ):
+        if can_use_gluon_prefill(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            block_size_k,
+            seq_lens_cpu,
+            q_scale,
+            k_scale,
+            v_scale,
+        ):
+            try:
                 o = gluon_sparse_prefill(
                     q=q,
                     k_cache=k_cache,
@@ -207,10 +210,10 @@ def minimax_sparse_prefill(
                     block_size_k=block_size_k,
                     sm_scale=sm_scale,
                 )
-            else:
-                _warn_gluon_fallback("unsupported batch/cache layout or dtype")
-        except Exception as exc:
-            _warn_gluon_fallback(repr(exc))
+            except GluonPrefillUnavailableError as err:
+                _warn_gluon_fallback(str(err))
+        else:
+            _warn_gluon_fallback("unsupported batch/cache layout or dtype")
     if o is None and use_msa and sink is None and loc_mapping is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 

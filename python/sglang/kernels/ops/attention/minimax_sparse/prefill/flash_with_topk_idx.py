@@ -488,23 +488,10 @@ def _index_block_score_only_kernel(
     BLOCK_SIZE_KD: tl.constexpr,
     IS_FP8: tl.constexpr,
 ):
-    """Score-only variant of the index attention (per-page addressing).
+    """Causal max index score per query and KV block, without the index-value output.
 
-    Computes the causal maximum index score for each query token and KV block
-    without producing the index-value attention output.
-
-    With ``PER_PAGE_SLOTS`` K addressing is PER-PAGE: a sparse block
-    of ``block_size`` tokens spans ``block_size // page_size`` physical pages, and
-    within a page the paged allocator lays the ``page_size`` slots out
-    contiguously and ascending (slot = base_slot + offset). So instead of a
-    per-token req_to_token lookup for every token in the block (``block_size``
-    loads), we read ONE base slot per page (``block_size // page_size`` loads) and
-    derive every token's slot as ``base_slot + in-page offset``. The resulting
-    slot vector is page-contiguous, so the single wide QK K-load coalesces. That
-    unrolls one load per page, so it is only selected while the page count is
-    small; otherwise the plain per-token gather runs and only the score-only
-    register saving applies. Either way: one BLOCK_SIZE_Q x block_size QK tile per
-    KV block, reduced with tl.max over the block. Only score_type == "max".
+    With PER_PAGE_SLOTS, each token's slot is derived as base_slot + in-page offset
+    from one req_to_token load per page, relying on the allocator's contiguous pages.
     """
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
@@ -544,17 +531,7 @@ def _index_block_score_only_kernel(
         blk = i // block_size
         pos = i + off_k
         pos_mask = pos < seq_len
-        # A sparse block spans `pages_per_block` physical pages. The paged
-        # allocator lays out each page's `page_size` slots contiguously
-        # (slot = base_slot + in-page offset), so ONE base-slot lookup per page
-        # (pages_per_block total) yields every token's slot -- replacing the
-        # per-token req_to_token gather (block_size lookups). We build the full
-        # [block_size] slot vector affinely, then do ONE wide QK dot over the
-        # whole block (a single 128-wide MFMA is far more efficient than
-        # per-page narrow dots).
-        # PER_PAGE_SLOTS is off when a block spans too many pages for the unroll
-        # to pay (notably page_size 1, where it would degenerate into one scalar
-        # load per token); then take the plain wide per-token gather instead.
+        # One base-slot load per page; off when the unroll won't pay (page_size 1).
         if PER_PAGE_SLOTS:
             slots = tl.zeros([block_size], dtype=tl.int64)
             for p in tl.static_range(0, pages_per_block):
@@ -629,8 +606,8 @@ def flash_prefill_with_topk_index(
     all_seqblock_q: Optional[int] = None,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
-    page_size: int = 1,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ):
     assert score_type in (
         "max",
