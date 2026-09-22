@@ -26,9 +26,6 @@ import torch
 from torch import nn
 from transformers import ApertusConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.activation import XIELU
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -298,7 +295,7 @@ class ApertusModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -430,7 +427,7 @@ class ApertusForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))

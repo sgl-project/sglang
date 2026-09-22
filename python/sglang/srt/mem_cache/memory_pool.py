@@ -52,6 +52,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -106,6 +107,7 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -114,6 +116,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+
+if _is_xpu:
+    from sgl_kernel import store_cache_xpu
 
 
 def conv_window_dedup_enabled(
@@ -166,6 +171,15 @@ def _set_kv_buffer_impl(
             row_bytes=row_bytes,
             v_row_bytes=v_row_bytes,
             size_limit=size_limit,
+        )
+
+    if _is_xpu and v_row_dim == row_dim:
+        return store_cache_xpu(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
         )
 
     # store_cache_cpu takes a single row_dim for both K and V, so it only serves
@@ -259,6 +273,10 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Extra pre-allocation headroom (reserved for in-transfer decode requests).
+    # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a
+    # positive value. Declared here so callers can read it without getattr.
+    pre_alloc_size: int = 0
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
@@ -736,15 +754,8 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
                 # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -1913,6 +1924,15 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    # Optional translation from controller IDs to this pool's buffer indices.
+    # L2TransferEngine resolves it on the transfer stream; move gates prevent
+    # relocation until the transfer is acknowledged.
+    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Token capacity for host sizing; `size` may count rows in per-layer views.
+    host_capacity_tokens: Optional[int] = None
+    # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
+    host_capacity_bytes: Optional[int] = None
+
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
@@ -1947,6 +1967,8 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
+    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
     def __init__(
         self,
         size: int,
@@ -2134,6 +2156,8 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_scale_buffer = None
             self.v_scale_buffer = None
+            self.native_k_scale_buffer = None
+            self.native_v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
@@ -2162,6 +2186,8 @@ class MHATokenToKVPool(KVCache):
         self.v_buffer = buf["v_buffer"]
         self.k_scale_buffer = buf.get("k_scale_buffer")
         self.v_scale_buffer = buf.get("v_scale_buffer")
+        self.native_k_scale_buffer = buf.get("native_k_scale_buffer")
+        self.native_v_scale_buffer = buf.get("native_v_scale_buffer")
         self.dq_k_buffer = buf.get("dq_k_buffer")
         self.dq_v_buffer = buf.get("dq_v_buffer")
         self.store_dtype = buf.get("store_dtype", torch.uint8)
@@ -2171,6 +2197,24 @@ class MHATokenToKVPool(KVCache):
         expected_workspace_dtype = self.quant_method.dequant_workspace_dtype()
         has_k_workspace = self.dq_k_buffer is not None
         has_v_workspace = self.dq_v_buffer is not None
+        has_k_native_scales = self.native_k_scale_buffer is not None
+        has_v_native_scales = self.native_v_scale_buffer is not None
+        requires_native_scales = (
+            self.quant_method.needs_native_fp4_scales()
+            if hasattr(self.quant_method, "needs_native_fp4_scales")
+            else False
+        )
+        if has_k_native_scales != has_v_native_scales:
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} created only one "
+                "native FP4 scale buffer."
+            )
+        if requires_native_scales != has_k_native_scales:
+            expectation = "requires" if requires_native_scales else "does not require"
+            raise RuntimeError(
+                f"KV cache method {self.quant_method.name!r} {expectation} native "
+                f"FP4 scales, but buffer presence is {has_k_native_scales}."
+            )
         if has_k_workspace != has_v_workspace:
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} created only one "
@@ -2379,6 +2423,16 @@ class MHATokenToKVPool(KVCache):
             del self.k_scale_buffer
         if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
             del self.v_scale_buffer
+        if (
+            hasattr(self, "native_k_scale_buffer")
+            and self.native_k_scale_buffer is not None
+        ):
+            del self.native_k_scale_buffer
+        if (
+            hasattr(self, "native_v_scale_buffer")
+            and self.native_v_scale_buffer is not None
+        ):
+            del self.native_v_scale_buffer
         if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
             del self.dq_k_buffer
         if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
@@ -2395,6 +2449,9 @@ class MHATokenToKVPool(KVCache):
         if getattr(self, "k_scale_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.k_scale_buffer)
             v_size_bytes += get_tensor_size_bytes(self.v_scale_buffer)
+        if getattr(self, "native_k_scale_buffer", None) is not None:
+            k_size_bytes += get_tensor_size_bytes(self.native_k_scale_buffer)
+            v_size_bytes += get_tensor_size_bytes(self.native_v_scale_buffer)
         if getattr(self, "dq_k_buffer", None) is not None:
             k_size_bytes += get_tensor_size_bytes(self.dq_k_buffer)
             v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
@@ -2675,6 +2732,12 @@ class MHATokenToKVPool(KVCache):
         loc, _, _ = unwrap_write_loc(loc_info)
         local_layer_id = layer_id - self.start_layer
         k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
+        native_scale_kwargs = {}
+        if self.native_k_scale_buffer is not None:
+            native_scale_kwargs = {
+                "native_k_scale_buffer": self.native_k_scale_buffer[local_layer_id],
+                "native_v_scale_buffer": self.native_v_scale_buffer[local_layer_id],
+            }
         self.quant_method.quantize_and_store(
             self.k_buffer[local_layer_id],
             self.v_buffer[local_layer_id],
@@ -2693,6 +2756,7 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
+            **native_scale_kwargs,
         )
 
     def get_raw_kv_buffer(
@@ -3011,6 +3075,7 @@ class MHATokenToKVPool(KVCache):
             for kb, vb in zip(self.k_buffer, self.v_buffer):
                 kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
@@ -3024,6 +3089,7 @@ class MHATokenToKVPool(KVCache):
                 move_kv_cache_native(
                     self.k_scale_buffer, self.v_scale_buffer, tgt_loc, src_loc
                 )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         N = tgt_loc.numel()
@@ -3047,6 +3113,7 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(N),
                 cfg,
             )
+            self._move_native_fp4_scales(tgt_loc, src_loc)
             return
 
         # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
@@ -3062,6 +3129,21 @@ class MHATokenToKVPool(KVCache):
                 next_power_of_2(chunk_len),
                 cfg,
             )
+        self._move_native_fp4_scales(tgt_loc, src_loc)
+
+    def _move_native_fp4_scales(
+        self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    ) -> None:
+        if self.native_k_scale_buffer is None:
+            return
+        from sglang.srt.layers.quantization.nvfp4_kv_cache import (
+            move_nvfp4_native_scales,
+        )
+
+        for k_scale, v_scale in zip(
+            self.native_k_scale_buffer, self.native_v_scale_buffer
+        ):
+            move_nvfp4_native_scales(k_scale, v_scale, tgt_loc, src_loc)
 
 
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
@@ -3579,20 +3661,28 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
             return
 
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if get_is_capture_mode() and self.alt_stream is not None:
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[idx][loc] = cache_k
-            self._write_scales(idx, loc, k_scale, v_scale)
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[idx][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[idx][loc] = cache_k
-            self.v_buffer[idx][loc] = cache_v
-            self._write_scales(idx, loc, k_scale, v_scale)
+        # store_cache and store_sf_interleaved skip the reserved CUDA-graph
+        # padding slot 0 in-kernel, matching the bf16 pool.
+        row_bytes = self.head_num * self.head_dim * self.store_dtype.itemsize
+        v_row_bytes = self.head_num * self.v_head_dim * self.store_dtype.itemsize
+        assert _is_cuda and can_use_store_cache(row_bytes, v_row_bytes), (
+            f"MXFP8 KV cache requires CUDA and store_cache-compatible rows, "
+            f"got _is_cuda={_is_cuda}, {row_bytes=}, {v_row_bytes=}"
+        )
+        assert self.mxfp8_sf_interleaved, (
+            "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        )
+        store_cache(
+            cache_k.reshape(loc.shape[0], -1),
+            cache_v.reshape(loc.shape[0], -1),
+            self.k_buffer[idx].view(-1, row_bytes // self.store_dtype.itemsize),
+            self.v_buffer[idx].view(-1, v_row_bytes // self.store_dtype.itemsize),
+            loc,
+            row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
+            size_limit=self.size + self.page_size,
+        )
+        self._write_scales(idx, loc, k_scale, v_scale)
 
     def _write_scales(self, idx, loc, k_scale, v_scale):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
@@ -3980,6 +4070,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_mla and _is_npu and layer_ids:
+            data_ptrs, _, _ = self.get_contiguous_buf_infos()
+            return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4610,6 +4703,9 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4629,6 +4725,9 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):

@@ -34,8 +34,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -47,7 +45,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
-from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -66,20 +63,17 @@ class TestKVCacheEventQueue(unittest.TestCase):
         medium: StorageMedium = StorageMedium.GPU,
         lora_id: int | None = None,
         cache_salt: str | None = None,
+        session_id: str | None = None,
     ) -> BlockStored:
-        event_args = dict(
+        return BlockStored(
             block_hashes=[block_hash],
             parent_block_hash=parent_block_hash,
             token_ids=[block_hash, block_hash + 1][:block_size],
             block_size=block_size,
             lora_id=lora_id,
             medium=medium,
-        )
-        if cache_salt is None:
-            return BlockStored(**event_args)
-        return BlockStoredWithMetadata(
-            **event_args,
-            metadata=BlockStoredMetadata(cache_salt=cache_salt),
+            cache_salt=cache_salt,
+            session_id=session_id,
         )
 
     def test_enqueue_coalesces_compatible_stores(self):
@@ -131,6 +125,11 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(self._store(1, None, cache_salt="tenant-a"))
         queue.enqueue(self._store(2, 1, cache_salt="tenant-b"))
+        self.assertEqual(len(queue.take()), 2)
+
+        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+        queue.enqueue(self._store(1, None, session_id="session-a"))
+        queue.enqueue(self._store(2, 1, session_id="session-b"))
         self.assertEqual(len(queue.take()), 2)
 
 
@@ -338,7 +337,7 @@ class TestTreeNode(unittest.TestCase):
 
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists."""
-        for node_cls in (TreeNode, MambaTreeNode):
+        for node_cls in (TreeNode,):
             with self.subTest(node_cls=node_cls.__module__):
                 root = node_cls()
                 n1 = node_cls()
@@ -572,7 +571,7 @@ class TestRadixCache(CustomTestCase):
         cache.cache_finished_req(
             req,
             is_insert=True,
-            kv_len_to_handle=len(prompt_ids) + len(output_ids),
+            owned_kv_len=len(prompt_ids) + len(output_ids),
         )
 
         (prompt_node,) = cache.root_node.children.values()
@@ -781,7 +780,7 @@ class TestRadixCache(CustomTestCase):
         removed = [event for event in events if isinstance(event, BlockRemoved)]
 
         self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(stored[0].cache_salt, "tenant-a")
         self.assertEqual(stored[0].parent_block_hash, None)
         self.assertEqual(len(stored[0].block_hashes), 2)
         self.assertEqual(removed[0].block_hashes, stored[0].block_hashes)
