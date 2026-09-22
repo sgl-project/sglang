@@ -170,6 +170,8 @@ benchmark/mmlu/data
 benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
+benchmark/kernels/all_reduce/results/
+/results/
 *.jsonl
 !tools/sglang-simulator/examples/replay/trace.jsonl
 tmp*.txt
