@@ -19,21 +19,19 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import get_bool_env_var, is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
 _AITER_MHC_RUNTIME_DISABLED = False
-_AITER_MHC_IMPORT_WARNED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
 
 def _use_aiter_mhc() -> bool:
     return (
         not _AITER_MHC_RUNTIME_DISABLED
-        and is_hip()
         and is_gfx95_supported()
-        and get_bool_env_var("SGLANG_USE_AITER")
+        and envs.SGLANG_USE_AITER.get()
     )
 
 
@@ -50,15 +48,12 @@ def _try_aiter_mhc_pre(
     norm_weight: torch.Tensor | None,
     norm_eps: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    global _AITER_MHC_RUNTIME_DISABLED, _AITER_MHC_IMPORT_WARNED
-    global _AITER_MHC_ACTIVE_LOGGED
+    global _AITER_MHC_RUNTIME_DISABLED, _AITER_MHC_ACTIVE_LOGGED
 
     try:
         from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
-    except Exception as err:  # noqa: BLE001
-        if not _AITER_MHC_IMPORT_WARNED:
-            logger.warning("AITER mHC pre is unavailable, falling back: %s", err)
-            _AITER_MHC_IMPORT_WARNED = True
+    except Exception as err:
+        logger.warning("AITER mHC pre is unavailable, falling back: %s", err)
         _AITER_MHC_RUNTIME_DISABLED = True
         return None
 
@@ -80,7 +75,7 @@ def _try_aiter_mhc_pre(
             sinkhorn_repeat,
             **kwargs,
         )
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         logger.warning("AITER mHC pre failed, disabling fast path: %s", err)
         _AITER_MHC_RUNTIME_DISABLED = True
         return None
@@ -101,14 +96,19 @@ def _try_aiter_mhc_post(
 
     try:
         from aiter.ops.mhc import mhc_post as aiter_mhc_post
+    except Exception as err:
+        logger.warning("AITER mHC post is unavailable, falling back: %s", err)
+        _AITER_MHC_RUNTIME_DISABLED = True
+        return None
 
-        out = torch.empty_like(residual)
+    out = torch.empty_like(residual)
+    try:
         aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
-        return out
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         logger.warning("AITER mHC post failed, disabling fast path: %s", err)
         _AITER_MHC_RUNTIME_DISABLED = True
         return None
+    return out
 
 
 # This module is imported during model-registry discovery. Do not import the real
