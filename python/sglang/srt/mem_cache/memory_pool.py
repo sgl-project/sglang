@@ -331,6 +331,31 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
     )
 
 
+def _resolve_fused_scale(
+    scale,
+    layer_scale,
+    layer_scale_float,
+) -> Optional[float]:
+    if isinstance(scale, (float, int)):
+        return float(scale)
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.numel() == 1
+        and scale.device.type == "cpu"
+    ):
+        return float(scale.item())
+
+    if (
+        scale is not None
+        and scale is layer_scale
+        and isinstance(layer_scale_float, (float, int))
+    ):
+        return float(layer_scale_float)
+
+    return None
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -3058,7 +3083,6 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-
         if not (_is_cuda or _is_hip):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
@@ -3085,26 +3109,36 @@ class MHATokenToKVPool(KVCache):
                 f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
             )
 
+        fused_k_scale = _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
+        fused_v_scale = _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
         # fuse quantization and writing into the same kernel
-        if (cache_k.dtype != self.dtype 
-            and self.store_dtype == torch.float8_e4m3 
-            and k_scale is not None 
-            and v_scale is not None
+        if (
+            cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and fused_k_scale is not None
+            and fused_v_scale is not None
         ):
             _set_kv_buffer_prefix_valid_impl_fp8(
                 cache_k,
                 cache_v,
-                self.k_buffer[layer_id - self.start_layer],
-                self.v_buffer[layer_id - self.start_layer],
-                k_scale,
-                v_scale,
+                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                fused_k_scale,
+                fused_v_scale,
                 loc_2d,
                 commit_lens,
                 row_dim=self.row_dim,
-                store_dtype=self.store_dtype,
             )
-            return 
-        
+            return
+
         # fallback: eager quantization
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
