@@ -1918,6 +1918,12 @@ class CommonKVReceiver(BaseKVReceiver):
         return sock, lock
 
     def _register_kv_args(self) -> bool:
+        """Register this decode worker's buffers with prefill once per connection.
+
+        Host-capable backends exchange both kv_* and host_kv_* buffer descriptors
+        from KVArgs here. Prefill caches both sets for subsequent send_metadata
+        calls, which select a destination and provide page indices.
+        """
         return True
 
     def send_metadata(

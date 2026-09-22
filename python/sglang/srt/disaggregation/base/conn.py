@@ -222,7 +222,7 @@ class BaseKVSender(ABC):
 class BaseKVReceiver(ABC):
     @property
     def supports_host_destination(self) -> bool:
-        """Whether this receiver's peer and layout support host KV destinations."""
+        """Whether the peer supports this connection's registered host KV buffers."""
         return False
 
     @abstractmethod
@@ -253,9 +253,10 @@ class BaseKVReceiver(ABC):
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         """
-        Notify the prefill server about the kv indices, aux index, and state_indices.
+        Notify prefill of KV page indices, the aux index, and state indices.
 
-        HOST selects the registered host KV buffers and their page indices.
+        destination selects the device or host buffers exchanged at connection
+        setup. Per-request metadata carries indices, not buffer pointers.
         """
         ...
 
