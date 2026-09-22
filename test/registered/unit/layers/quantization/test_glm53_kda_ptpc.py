@@ -423,6 +423,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
     def test_forward_reuses_one_quantized_input_for_qkv_f_and_g(self):
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
         torch.nn.Module.__init__(attention)
+        attention.fuse_bfg = False
         hidden_states = torch.randn(3, 8)
         quantized = (torch.empty(3, 8), torch.ones(3, 1))
         attention.qkv_proj = _RecordingLinear(torch.empty(3, 12))
