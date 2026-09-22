@@ -902,7 +902,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
-        watermark_state = getattr(model_runner, "watermark_state", None)
+        watermark_state = model_runner.watermark_state
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,

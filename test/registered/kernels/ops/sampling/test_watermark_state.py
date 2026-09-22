@@ -37,6 +37,10 @@ def test_repeated_context_and_greedy_bypass():
         top_ps=torch.ones(2, device=device),
         min_ps=torch.zeros(2, device=device),
         max_top_k=64,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        has_watermark_candidates=True,
     )
 
     first_logits = torch.zeros((2, 64), device=device)
@@ -77,6 +81,10 @@ def test_low_entropy_bypass_does_not_consume_context():
         top_ps=torch.ones(1, device="cuda"),
         min_ps=torch.zeros(1, device="cuda"),
         max_top_k=2,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        has_watermark_candidates=True,
     )
 
     low_entropy_logits = torch.full((1, 64), -torch.inf, device="cuda")
@@ -114,6 +122,8 @@ def test_inactive_batch_skips_watermark_state(monkeypatch, enabled, top_k):
         top_ps=torch.ones(1, device="cuda"),
         min_ps=torch.zeros(1, device="cuda"),
         max_top_k=top_k,
+        watermark_keys=None,
+        watermark_context_windows=None,
         watermark_enabled=torch.tensor([enabled], device="cuda"),
         has_watermark_candidates=False,
     )
@@ -182,6 +192,10 @@ def test_retracted_request_restores_context_history():
         top_ps=torch.ones(1, device=device),
         min_ps=torch.zeros(1, device=device),
         max_top_k=64,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        has_watermark_candidates=True,
     )
     logits = torch.zeros((1, 64), device=device)
     state.force(logits, req_pool_indices, sampling_info)

@@ -104,18 +104,21 @@ def test_per_request_batch_config_and_admission():
             sampling_params=SimpleNamespace(
                 watermark=normalize_watermark_request(
                     {"key": secret, "context_window": 2}
-                )
+                ),
+                top_k=2,
             )
         ),
-        SimpleNamespace(sampling_params=SimpleNamespace(watermark=None)),
+        SimpleNamespace(sampling_params=SimpleNamespace(watermark=None, top_k=2)),
         SimpleNamespace(
             sampling_params=SimpleNamespace(
-                watermark=normalize_watermark_request({"enabled": False})
+                watermark=normalize_watermark_request({"enabled": False}),
+                top_k=2,
             )
         ),
         SimpleNamespace(
             sampling_params=SimpleNamespace(
-                watermark=normalize_watermark_request({"enabled": True})
+                watermark=normalize_watermark_request({"enabled": True}),
+                top_k=2,
             )
         ),
     ]

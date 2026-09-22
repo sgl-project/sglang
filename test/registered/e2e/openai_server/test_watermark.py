@@ -121,6 +121,8 @@ def _assert_detected(response, key, *, other_key=None):
 
 
 class TestWatermarkDisabledEndpoint(CustomTestCase):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.process = popen_launch_server(
@@ -131,7 +133,7 @@ class TestWatermarkDisabledEndpoint(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process is not None:
+        if cls.process is not None:
             kill_process_tree(cls.process.pid)
 
     def test_request_requires_server_enablement(self):
@@ -154,6 +156,8 @@ class TestWatermarkDisabledEndpoint(CustomTestCase):
 
 class WatermarkServerTest(CustomTestCase):
     mode_args = []
+    process = None
+    config_file = None
 
     @classmethod
     def setUpClass(cls):
@@ -177,9 +181,9 @@ class WatermarkServerTest(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process is not None:
+        if cls.process is not None:
             kill_process_tree(cls.process.pid)
-        if hasattr(cls, "config_file"):
+        if cls.config_file is not None:
             os.unlink(cls.config_file.name)
 
 

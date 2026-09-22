@@ -338,6 +338,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.watermark_state: Optional[WatermarkState] = None
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -2003,7 +2004,7 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
-        watermark_state = getattr(self, "watermark_state", None)
+        watermark_state = self.watermark_state
         if (
             watermark_state is not None
             and forward_batch.sampling_info.has_watermark_candidates

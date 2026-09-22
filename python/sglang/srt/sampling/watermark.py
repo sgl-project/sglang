@@ -264,9 +264,7 @@ def build_watermark_batch_config(
         keys.append(parse_watermark_key(key) if key is not None else 0)
         context_windows.append(context_window)
         enabled.append(request_enabled)
-        candidates.append(
-            request_enabled and getattr(request.sampling_params, "top_k", 2) > 1
-        )
+        candidates.append(request_enabled and request.sampling_params.top_k > 1)
     return WatermarkBatchConfig(
         keys=torch.tensor(keys, dtype=torch.int64, device=device),
         context_windows=torch.tensor(context_windows, dtype=torch.int32, device=device),
@@ -790,9 +788,9 @@ class WatermarkState:
         self, sampling_info: SamplingBatchInfo
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = sampling_info.top_ks.shape[0]
-        keys = getattr(sampling_info, "watermark_keys", None)
-        context_windows = getattr(sampling_info, "watermark_context_windows", None)
-        enabled = getattr(sampling_info, "watermark_enabled", None)
+        keys = sampling_info.watermark_keys
+        context_windows = sampling_info.watermark_context_windows
+        enabled = sampling_info.watermark_enabled
         if keys is not None and context_windows is not None and enabled is not None:
             return keys, context_windows, enabled
 
@@ -1017,7 +1015,7 @@ class WatermarkState:
             keys=keys,
             keys_b=keys_b,
             mixing_thresholds=mixing_thresholds,
-            max_top_k=getattr(sampling_info, "max_top_k", None),
+            max_top_k=sampling_info.max_top_k,
             partial_scores=partial_scores,
             partial_token_ids=partial_token_ids,
             output_token_ids=output_token_ids,
@@ -1064,12 +1062,12 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> None:
-        if not getattr(sampling_info, "has_watermark_candidates", True):
+        if not sampling_info.has_watermark_candidates:
             return
         keys, context_windows, watermark_enabled = self._watermark_batch_config(
             sampling_info
         )
-        max_top_k = getattr(sampling_info, "max_top_k", None)
+        max_top_k = sampling_info.max_top_k
         if max_top_k == 1:
             return
         partial_scores, partial_token_ids, output_token_ids = (

@@ -677,7 +677,10 @@ class TestFromScheduleBatch(CustomTestCase):
         # (or leaked) process context.
         self._exec_ns = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=False),
+            features=SimpleNamespace(
+                enable_custom_logit_processor=False,
+                enable_watermark=False,
+            ),
         )
         exec_patch = patch(
             "sglang.srt.sampling.sampling_batch_info.get_exec",
