@@ -967,22 +967,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k = self.get_key_buffer(layer_id)
         cache_v = self.get_value_buffer(layer_id)
         if self.use_fia_nz:
+
             def gather(cache: torch.Tensor, head_dim: int) -> torch.Tensor:
                 num_tiles = head_dim // 16
                 indices = _mla_fia_nz_scatter_indices(
                     loc, head_dim, self.page_size
                 ).flatten()
-                src = cache.view(-1, 1, num_tiles, self.page_size, 16).view(
-                    -1, 16
-                )
+                src = cache.view(-1, 1, num_tiles, self.page_size, 16).view(-1, 16)
                 return torch.index_select(src, 0, indices).view(-1, 1, head_dim)
 
             cache_k = gather(cache_k, self.kv_lora_rank)
             cache_v = gather(cache_v, self.qk_rope_head_dim)
         else:
-            cache_k = torch.index_select(
-                cache_k.view(-1, 1, self.kv_lora_rank), 0, loc
-            )
+            cache_k = torch.index_select(cache_k.view(-1, 1, self.kv_lora_rank), 0, loc)
             cache_v = torch.index_select(
                 cache_v.view(-1, 1, self.qk_rope_head_dim), 0, loc
             )
