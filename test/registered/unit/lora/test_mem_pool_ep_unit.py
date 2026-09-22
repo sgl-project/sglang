@@ -220,6 +220,7 @@ class TestDeterministicPoolSlots(unittest.TestCase):
     @staticmethod
     def _prepare(iteration_order):
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.lora_no_cpu_backup = False
         pool.max_loras_per_batch = 4
         pool.uid_to_buffer_id = {}
         pool.buffer_id_to_uid = [EMPTY_SLOT] * 4
@@ -261,6 +262,7 @@ class TestDeterministicPoolSlots(unittest.TestCase):
     @staticmethod
     def _evict_after_touch(iteration_order):
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.lora_no_cpu_backup = False
         pool.max_loras_per_batch = 4
         pool.uid_to_buffer_id = {
             None: 0,

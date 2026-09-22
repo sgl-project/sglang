@@ -45,13 +45,14 @@ class TestLoRARegistryGetLoraId(CustomTestCase):
         self.assertIsNone(asyncio.run(registry.get_lora_id("missing")))
 
 
-def _make_manager() -> LoRAManager:
+def _make_manager(*, lora_no_cpu_backup=False) -> LoRAManager:
     """Create a LoRAManager via __new__ with only the fields the load path reads."""
     manager = LoRAManager.__new__(LoRAManager)
     manager.configs = {}
     manager.loras = {}
     manager.lora_refs = {}
     manager.num_pinned_loras = 0
+    manager.lora_no_cpu_backup = lora_no_cpu_backup
     manager.max_loras_per_batch = 4
     manager.base_hf_config = MagicMock(vocab_size=32000)
     manager.lora_modules = []
