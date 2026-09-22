@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
         DeepGemmCandidateIndexer,
     )
+    from sglang.srt.layers.attention.dsv4.candidate_torch import (
+        TorchCandidateIndexer,
+    )
 
 
 class CandidateMetadata:
@@ -42,7 +45,7 @@ class IndexerInputs:
 
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
-) -> Optional[DeepGemmCandidateIndexer]:
+) -> Optional[Union[DeepGemmCandidateIndexer, TorchCandidateIndexer]]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
     indexer selects through masks inline."""
     if topk_blocks <= 0 or get_platform().device_sm < 100:
@@ -51,16 +54,18 @@ def make_candidate_indexer(
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
     )
 
-    if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+    if DEEPGEMM_PAGED_SPARSE_MQA_LOGITS and block_size == 8:
+        from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+            DeepGemmCandidateIndexer,
         )
-    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-        DeepGemmCandidateIndexer,
+
+        return DeepGemmCandidateIndexer(topk_blocks, block_size)
+
+    from sglang.srt.layers.attention.dsv4.candidate_torch import (
+        TorchCandidateIndexer,
     )
 
-    return DeepGemmCandidateIndexer(topk_blocks, block_size)
+    return TorchCandidateIndexer(topk_blocks, block_size)
 
 
 # TODO(candidate): Hopper decode and prefill still select through these masks

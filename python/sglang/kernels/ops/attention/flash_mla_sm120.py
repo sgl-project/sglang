@@ -247,6 +247,21 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    extra_src_pbs = (
+        extra_k_cache.shape[1]
+        if extra_k_cache is not None and extra_k_cache.ndim >= 3
+        else _PBS_DST
+    )
+    extra_kv_64 = (
+        _split_kv_pages_to_64(
+            extra_kv_u8,
+            extra_src_pbs,
+            touched_indices=extra_idx,
+            buf_key_suffix=":extra",
+        )
+        if extra_kv_u8 is not None and extra_src_pbs != _PBS_DST
+        else extra_kv_u8
+    )
     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
     _sparse_mla_sm120_paged_attention(
@@ -258,7 +273,7 @@ def _flash_mla_sm120_prefill(
         softmax_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
-        extra_kv_cache=extra_kv_u8,
+        extra_kv_cache=extra_kv_64,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
         mid_out=None,
@@ -478,6 +493,7 @@ def _split_kv_pages_to_64(
     kv_u8: torch.Tensor,
     src_pbs: int,
     touched_indices: Optional[torch.Tensor] = None,
+    buf_key_suffix: str = "",
 ) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
@@ -501,7 +517,7 @@ def _split_kv_pages_to_64(
     # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
+    key = f"flash_mla_sm120_split:{dev}{buf_key_suffix}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         # The first allocation can happen under inference mode (autotune), but
@@ -628,12 +644,25 @@ def _flash_mla_flashinfer(
         if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
         else extra_k_cache
     )
-    extra_kv_64 = extra_kv_u8
-
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
+    )
+    extra_src_pbs = (
+        extra_k_cache.shape[1]
+        if extra_k_cache is not None and extra_k_cache.ndim >= 3
+        else _PBS_DST
+    )
+    extra_kv_64 = (
+        _split_kv_pages_to_64(
+            extra_kv_u8,
+            extra_src_pbs,
+            touched_indices=extra_idx,
+            buf_key_suffix=":extra",
+        )
+        if extra_kv_u8 is not None and extra_src_pbs != _PBS_DST
+        else extra_kv_u8
     )
 
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)

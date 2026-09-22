@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention import flash_mla_sm120 as flash_mla_sm120_module
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+    _flash_mla_sm120_prefill,
     _validate_flashinfer_sparse_mla_backend,
     flashinfer_sparse_mla_forward,
 )
@@ -70,6 +72,56 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         self.assertNotIn("backend", captured)
         self.assertEqual(tuple(output.shape), (2, 8, 512))
         self.assertTrue(torch.all(output == 2))
+
+    def test_dsv41_prefill_splits_main_and_extra_pages_independently(self):
+        captured = {}
+
+        def fake_paged_attention(*args, **kwargs):
+            captured.update(kwargs)
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.__path__ = []
+        mla = ModuleType("flashinfer.mla")
+        mla.__path__ = []
+        sparse = ModuleType("flashinfer.mla._sparse_mla_sm120")
+        sparse._sparse_mla_sm120_paged_attention = fake_paged_attention
+        flashinfer.mla = mla
+
+        main_split = torch.empty((8, 64, 1, 584), dtype=torch.uint8)
+        extra_split = torch.empty((4, 64, 1, 584), dtype=torch.uint8)
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer": flashinfer,
+                    "flashinfer.mla": mla,
+                    "flashinfer.mla._sparse_mla_sm120": sparse,
+                },
+            ),
+            patch.object(
+                flash_mla_sm120_module,
+                "_split_kv_pages_to_64",
+                side_effect=(main_split, extra_split),
+            ) as split,
+        ):
+            output, _ = _flash_mla_sm120_prefill(
+                q=torch.zeros((2, 1, 4, 576), dtype=torch.bfloat16),
+                k_cache=torch.zeros((2, 256, 1, 584), dtype=torch.uint8),
+                indices=torch.zeros((2, 1, 8), dtype=torch.int32),
+                topk_length=torch.full((2,), 8, dtype=torch.int32),
+                attn_sink=None,
+                head_dim_v=512,
+                softmax_scale=0.125,
+                extra_k_cache=torch.zeros((2, 128, 1, 584), dtype=torch.uint8),
+                extra_indices=torch.zeros((2, 1, 4), dtype=torch.int32),
+                extra_topk_length=torch.full((2,), 4, dtype=torch.int32),
+            )
+
+        self.assertEqual(tuple(output.shape), (2, 1, 4, 512))
+        self.assertIs(captured["extra_kv_cache"], extra_split)
+        self.assertEqual(split.call_count, 2)
+        self.assertNotIn("buf_key_suffix", split.call_args_list[0].kwargs)
+        self.assertEqual(split.call_args_list[1].kwargs["buf_key_suffix"], ":extra")
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
