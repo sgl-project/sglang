@@ -226,11 +226,11 @@ class SWAComponent(TreeComponent):
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedSWAAllocatorBase,
         )
 
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedSWAAllocatorBase):
             return allocator
         return None
 
@@ -1051,8 +1051,19 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=torch.cat(
-                        [n.component_data[ct].value for n in unbacked_swa_nodes]
+                    device_indices=(
+                        self._translate_full_to_swa(
+                            torch.cat(
+                                [
+                                    n.component_data[BASE_COMPONENT_TYPE].value
+                                    for n in unbacked_swa_nodes
+                                ]
+                            )
+                        )
+                        if self._unified_allocator() is not None
+                        else torch.cat(
+                            [n.component_data[ct].value for n in unbacked_swa_nodes]
+                        )
                     ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
