@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,6 +17,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     BitsAndBytesConfig,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
@@ -337,6 +341,46 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
             merge_index=merge_index,
             num_params_to_merge=num_params_to_merge,
         )
+
+    def test_vocab_embedding_uses_output_dimension_for_tp_sharding(self):
+        embedding = VocabParallelEmbedding(
+            128,
+            64,
+            tp_group=SimpleNamespace(world_size=2, rank_in_group=0),
+        )
+
+        self.assertEqual(
+            rank_local_checkpoint._resolve_tp_shard_dim(embedding.weight),
+            (True, 0),
+        )
+
+    def test_loads_rank_local_vocab_embedding_slice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4)
+            save_file({"embed.weight": weight}, file_path)
+            model = nn.Module()
+            model.embed = VocabParallelEmbedding(
+                128,
+                4,
+                tp_group=SimpleNamespace(world_size=2, rank_in_group=1),
+            )
+
+            with (
+                patch.object(
+                    rank_local_checkpoint, "get_tp_world_size", return_value=2
+                ),
+                patch.object(rank_local_checkpoint, "get_tp_rank", return_value=1),
+            ):
+                loaded = rank_local_checkpoint.try_load_rank_local_tp_state_dict(
+                    model,
+                    [file_path],
+                    lambda name: (name, None, None),
+                )
+
+            self.assertIsNotNone(loaded)
+            state_dict, _ = loaded
+            torch.testing.assert_close(state_dict["embed.weight"].tensor, weight[64:])
 
     def test_reads_rank_local_slice(self):
         with tempfile.TemporaryDirectory() as temp_dir:

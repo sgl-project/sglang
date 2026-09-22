@@ -110,19 +110,48 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return True
 
     @staticmethod
-    def validate_single_gpu_replica(server_args) -> None:
-        """Allow replicated serving while rejecting intra-replica sharding."""
+    def validate_parallelism(server_args) -> None:
+        """Validate DP x TP serving for the supported U1.5 dense checkpoint."""
         num_gpus = int(server_args.num_gpus)
         dp_size = int(getattr(server_args, "dp_size", 1) or 1)
-        if num_gpus % dp_size != 0 or num_gpus // dp_size != 1:
+        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        sp_degree = int(getattr(server_args, "sp_degree", 1) or 1)
+        if tp_size not in (1, 2, 4, 8):
             raise ValueError(
-                "SenseNovaU1Pipeline currently requires one GPU per DP replica. "
-                "Set --num-gpus equal to --dp-size for replicated serving; "
-                "native tensor/pipeline parallelism is not implemented yet."
+                "SenseNova-U1.5-8B-MoT supports --tp-size 1, 2, 4, or 8; "
+                f"got {tp_size}."
+            )
+        if sp_degree != 1:
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT tensor parallelism requires --sp-degree 1."
+            )
+        if (
+            bool(getattr(server_args, "enable_cfg_parallel", False))
+            or int(getattr(server_args, "cfg_parallel_degree", 1) or 1) != 1
+        ):
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT does not support CFG parallelism yet."
+            )
+        if num_gpus != dp_size * tp_size:
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT requires num_gpus == dp_size * tp_size "
+                f"with SP/CFG disabled; got {num_gpus} != {dp_size} * {tp_size}."
             )
 
+    @staticmethod
+    def validate_single_gpu_replica(server_args) -> None:
+        """Backward-compatible entry point for the former DP-only validation."""
+        SenseNovaU1PipelineConfig.validate_parallelism(server_args)
+
     def validate_server_args(self, server_args) -> None:
-        self.validate_single_gpu_replica(server_args)
+        self.validate_parallelism(server_args)
+        if getattr(server_args, "use_fsdp_inference", False):
+            raise ValueError("SenseNova-U1.5-8B-MoT does not support FSDP inference.")
+        if getattr(server_args, "direct_gpu_weight_loading", False):
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT uses rank-local safetensors loading; "
+                "--direct-gpu-weight-loading is unsupported."
+            )
         if getattr(server_args, "enable_torch_compile", False):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support torch.compile yet. "

@@ -2,7 +2,7 @@
 
 import contextlib
 import math
-from typing import List, Optional, Tuple, Union
+from typing import ClassVar, List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
 import transformers
@@ -23,6 +23,7 @@ from .modeling_fm_modules import (
 from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import (
     Qwen3ForCausalLM,
+    Qwen3RotaryEmbedding,
     create_block_causal_mask,
     npu_fia_available,
 )
@@ -285,9 +286,23 @@ class NEOChatModel(PreTrainedModel):
         "language_model.model.embed_tokens",
         "language_model.lm_head",
     )
+    # Native SGLang checkpoint loading contracts. SenseNova does not use FSDP,
+    # but the common loader requires these declarations for meta construction
+    # and rank-local TP materialization.
+    _fsdp_forward_methods: tuple[str, ...] = ()
+    param_names_mapping: ClassVar[dict] = {}
 
     # support transformers 4.51.+
     _tp_plan = ""
+
+    def post_load_weights(self) -> None:
+        """Rebuild derived buffers omitted from the checkpoint after meta loading."""
+        device = next(
+            parameter.device for parameter in self.parameters() if not parameter.is_meta
+        )
+        for module in self.modules():
+            if isinstance(module, Qwen3RotaryEmbedding) and module.inv_freq.is_meta:
+                module._init_inv_freq_buffer(device)
 
     def __init__(
         self,

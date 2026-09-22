@@ -97,26 +97,60 @@ in one batch must use the same resolution, inference steps, guidance settings,
 and output options. Requests with multiple outputs or `think_mode=true` are
 executed sequentially.
 
-### 5.2 Data-parallel serving
+### 5.2 Tensor-parallel serving
 
-Use one complete SenseNova-U1 replica per GPU to increase throughput for
-concurrent requests:
+On Linux with NVIDIA CUDA or Ascend NPU, shard the dense language backbone of
+`sensenova/SenseNova-U1.5-8B-MoT` across one replica when it does not fit on one
+device. This example uses two devices:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 \
+  --dp-size 1 \
+  --tp-size 2 \
+  --sp-degree 1 \
+  --port 30000
+```
+
+The supported TP sizes are `1`, `2`, `4`, and `8`. TP shards the Qwen3 attention
+projections, MLP projections, token embedding, and LM head. The vision encoders
+and flow-matching modules remain replicated on every TP rank. Sequence
+parallelism, CFG parallelism, FSDP inference, and direct GPU weight loading are
+not supported for this checkpoint.
+
+### 5.3 Data-parallel serving
+
+Use one complete replica per GPU to increase throughput for concurrent requests:
 
 ```bash Command
 sglang serve \
   --model-path sensenova/SenseNova-U1.5-8B-MoT \
   --num-gpus 2 \
   --dp-size 2 \
+  --tp-size 1 \
+  --sp-degree 1 \
   --port 30000
 ```
 
-Generation requests are distributed across the replicas. Data parallelism does
-not reduce the latency of one request, and every GPU must have enough memory for
-the complete model and its request-time activations. SenseNova-U1 currently
-requires one GPU per replica; tensor and pipeline parallelism within a replica
-are not supported.
+You can also combine DP and TP. The device count must equal `dp-size * tp-size`;
+for example, two TP2 replicas require four devices:
 
-### 5.3 Ascend NPU optimizations
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 4 \
+  --dp-size 2 \
+  --tp-size 2 \
+  --sp-degree 1 \
+  --port 30000
+```
+
+Generation requests are distributed across DP replicas. DP does not reduce the
+latency of one request, and every replica must have enough aggregate memory for
+the complete model and its request-time activations.
+
+### 5.4 Ascend NPU optimizations
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back

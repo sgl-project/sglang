@@ -49,7 +49,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
             return loaded_modules
 
-        SenseNovaU1PipelineConfig.validate_single_gpu_replica(server_args)
+        SenseNovaU1PipelineConfig.validate_parallelism(server_args)
         modules = load_model_and_tokenizer(self.model_path, server_args)
         logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
         return modules
