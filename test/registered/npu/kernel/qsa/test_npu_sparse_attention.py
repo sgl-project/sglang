@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention import qwen_sparse_attn_backend as backend_module
 from sglang.srt.layers.attention.qsa import kernel
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -45,7 +46,7 @@ def test_dispatch_graph(heads, kv_heads, layout, monkeypatch):
     monkeypatch.setattr(impl, "sparse_attention", traced)
     monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
     def forward():
-        return kernel.qsa_sparse_attention(q, k, v, s)
+        return backend_module._npu_sparse_attention(q, k, v, s)
     for _ in range(2): forward()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
@@ -84,7 +85,7 @@ def test_invalid_metadata_never_falls_back(case, monkeypatch):
         raise AssertionError("unsupported metadata must not fall back")
     monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
     with pytest.raises(ValueError):
-        kernel.qsa_sparse_attention(q, k, v, s)
+        backend_module._npu_sparse_attention(q, k, v, s)
 
 
 def test_kernel_errors_propagate(monkeypatch):
@@ -92,12 +93,16 @@ def test_kernel_errors_propagate(monkeypatch):
         raise RuntimeError("intentional sparse attention failure")
     monkeypatch.setattr(impl, "sparse_attention", fail)
     with pytest.raises(RuntimeError, match="intentional"):
-        kernel.qsa_sparse_attention(*inputs())
+        backend_module._npu_sparse_attention(*inputs())
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2])
 @pytest.mark.parametrize("width", [2051, 2054, 2055])
-def test_backend_kv_write_mapping_and_output_padding(mode, width):
+def test_backend_kv_write_mapping_and_output_padding(mode, width, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("NPU production must not call the Torch reference")
+
+    monkeypatch.setattr(backend_module, "qsa_sparse_attention", forbidden)
     q, k, v, _ = inputs()
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     table = torch.arange(64, device="npu", dtype=torch.int32)[None, :]
@@ -146,8 +151,8 @@ def test_actual_npu_pool_write_and_graph(fia, monkeypatch):
     k, v = pool.get_key_buffer(1), pool.get_value_buffer(1)
     assert k.dtype == v.dtype == torch.bfloat16
     assert k.storage_offset() > 0 and v.storage_offset() > 0
-    flat_k = kernel._flatten_qsa_kv_cache(k, "k")
-    flat_v = kernel._flatten_qsa_kv_cache(v, "v")
+    flat_k = backend_module._flatten_qsa_kv_cache(k, "k")
+    flat_v = backend_module._flatten_qsa_kv_cache(v, "v")
     assert flat_k.data_ptr() == k.data_ptr() and flat_v.data_ptr() == v.data_ptr()
     assert flat_k.stride() == flat_v.stride() == (256, 256, 1)
     q = torch.ones(2, 3, 256, device="npu", dtype=dtype)
@@ -158,7 +163,9 @@ def test_actual_npu_pool_write_and_graph(fia, monkeypatch):
     slots[1, :2] = loc
     def forward():
         pool.set_kv_buffer(layer, loc, new_k, new_v)
-        return kernel.qsa_sparse_attention(q, pool.get_key_buffer(1), pool.get_value_buffer(1), slots)
+        return backend_module._npu_sparse_attention(
+            q, pool.get_key_buffer(1), pool.get_value_buffer(1), slots
+        )
     for _ in range(2): forward()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()

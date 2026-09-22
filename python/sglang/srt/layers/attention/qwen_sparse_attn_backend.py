@@ -46,6 +46,35 @@ _is_npu = is_npu()
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 
 
+def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
+    """Adapt NPU KV cache layouts to rank-3 physical-token pools.
+
+    Sparse attention receives rank-3 [slots, heads, dim] caches.
+    NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
+    """
+    if cache.ndim == 3:
+        return cache
+    if cache.ndim == 4:
+        # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
+        return cache.flatten(0, 1)
+    raise ValueError(f"{name} must be rank 3 or 4, got shape {tuple(cache.shape)}")
+
+
+def _npu_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    token_slots: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Adapt NPU KV pools and call the model-contract sparse attention kernel."""
+    from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import sparse_attention
+
+    k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
+    v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
+    return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
@@ -1321,7 +1350,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
-            output = qsa_sparse_attention(
+            if _is_npu:
+                attention = _npu_sparse_attention
+            else:
+                attention = qsa_sparse_attention
+            output = attention(
                 q,
                 pool.get_key_buffer(layer.layer_id),
                 pool.get_value_buffer(layer.layer_id),
@@ -1555,7 +1588,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            if _is_npu:
+                attention = _npu_sparse_attention
+            else:
+                attention = qsa_sparse_attention
+            output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)

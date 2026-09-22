@@ -708,15 +708,29 @@ def _make_paged_extend_backend():
     return backend, pool, layer
 
 
-def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch, is_npu):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", is_npu)
+    # NPU dispatch must also win when transfer_to_npu reports is_cuda=True.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: is_npu))
     kernel_rows = []
 
     def fake_sparse_attention(q, k, v, slots, scale):
         kernel_rows.append((q.shape[0], slots.shape[0]))
         return q + 1
 
+    def forbidden(*args, **kwargs):
+        raise AssertionError("wrong sparse attention platform path")
+
     monkeypatch.setattr(
-        qsa_backend_module, "qsa_sparse_attention", fake_sparse_attention
+        qsa_backend_module,
+        "_npu_sparse_attention",
+        fake_sparse_attention if is_npu else forbidden,
+    )
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "qsa_sparse_attention",
+        forbidden if is_npu else fake_sparse_attention,
     )
     backend, pool, layer = _make_paged_extend_backend()
     topk = torch.zeros(3, 2, dtype=torch.int32)
@@ -734,14 +748,26 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
 
     # DP attention pads the physical q rows past the semantic draft rows in
     # every speculative paged mode; padding must round-trip through the kernel.
-    for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+    for mode in (
+        ForwardMode.EXTEND,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND_V2,
+    ):
         unpadded = run(3, mode)
         padded = run(5, mode)
         torch.testing.assert_close(padded[:3], unpadded)
         torch.testing.assert_close(padded[3:], torch.zeros(2, 2))
         assert padded.shape == (5, 2)
-    # The reference path (and any kernel behind it) only ever saw valid rows.
-    assert kernel_rows == [(3, 3)] * 4
+    # Both platform paths only see valid rows, before output padding is restored.
+    assert kernel_rows == [(3, 3)] * 6
+
+    values = torch.zeros(3, 2)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    output = backend.forward_decode(
+        values, values, values, layer, batch, save_kv_cache=False, topk_indices=topk
+    )
+    torch.testing.assert_close(output, values + 1)
+    assert kernel_rows == [(3, 3)] * 7
 
     # More semantic rows than physical q rows is a bug and must not silently
     # truncate the top-k table.
@@ -1422,7 +1448,7 @@ def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
     if device == "npu":
         # The legacy generic shape is intentionally outside the model wrapper.
         with pytest.raises(ValueError, match="Unsupported NPU"):
-            qsa_sparse_attention(q, k, v, slots)
+            qsa_backend_module._npu_sparse_attention(q, k, v, slots)
         return
     if device == "cpu" and layout != "flat":
         with pytest.raises(ValueError, match="must be rank-3 tensors"):
@@ -1457,7 +1483,12 @@ def test_qsa_npu_sparse_attention_nonfinite_padding(monkeypatch, device, padding
     expected = torch.zeros_like(q)
     expected[0] = 1
 
-    actual = qsa_sparse_attention(q, k, v, slots)
+    attention = (
+        qsa_backend_module._npu_sparse_attention
+        if device == "npu"
+        else qsa_sparse_attention
+    )
+    actual = attention(q, k, v, slots)
 
     torch.testing.assert_close(actual, expected)
     # Masking the gathered values must not modify the underlying cache.
@@ -1548,7 +1579,7 @@ def test_qsa_npu_operator_chain_graph_replay():
         metadata.sequence_lengths.copy_(lengths * 4)
         logical = expand_qsa_block_indices(blocks, positions, lengths * 4, 4, 2048)
         slots = QwenSparseAttnBackend._logical_to_physical(logical, metadata)
-        return qsa_sparse_attention(q, k, v, slots)
+        return qsa_backend_module._npu_sparse_attention(q, k, v, slots)
 
     for _ in range(2):
         forward()

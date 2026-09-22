@@ -302,11 +302,8 @@ def qsa_sparse_attention(
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Dispatch sparse GQA over physical token slots."""
+    """Torch reference for sparse GQA over physical token slots."""
 
-    if _is_npu:
-        k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
-        v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
     if token_slots.ndim != 2 or token_slots.shape[0] != q.shape[0]:
@@ -318,29 +315,9 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
-    if _is_npu:
-        from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import (
-            sparse_attention,
-        )
-
-        return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )
-
-
-def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
-    """Adapt NPU KV cache layouts to rank-3 physical-token pools.
-
-    Sparse attention receives rank-3 [slots, heads, dim] caches.
-    NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
-    """
-    if cache.ndim == 3:
-        return cache
-    if cache.ndim == 4:
-        # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
-        return cache.flatten(0, 1)
-    raise ValueError(f"{name} must be rank 3 or 4, got shape {tuple(cache.shape)}")
 
 
 def qsa_sparse_attention_reference(
