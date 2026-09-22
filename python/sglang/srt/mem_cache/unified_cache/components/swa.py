@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
+    AuxLRUComponent,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -39,7 +40,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
     LRURefreshPhase,
     PreparePrefetchResult,
-    TreeComponent,
     next_component_uuid,
 )
 
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     )
 
 
-class SWAComponent(TreeComponent):
+class SWAComponent(AuxLRUComponent):
     """Sliding window attention component.
 
     Each SWA node stores translated SWA pool indices as its component
@@ -88,6 +88,19 @@ class SWAComponent(TreeComponent):
         self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
+
+    @property
+    def _host_pool(self):
+        return self._swa_kv_pool_host
+
+    @property
+    def _host_pool_name(self) -> PoolName:
+        return PoolName.SWA
+
+    def _device_free_value(self, node: UnifiedTreeNode) -> Optional[torch.Tensor]:
+        # Unpaired SWA slots all map to one sentinel, so free via the full
+        # indices; freeing the SWA value directly would double free them.
+        return node.component_data[BASE_COMPONENT_TYPE].value
 
     def _collect_unbacked_swa_nodes(
         self, node: UnifiedTreeNode
@@ -651,125 +664,8 @@ class SWAComponent(TreeComponent):
         )
         child.component_data[self.component_type].metadata.pop("host_uuid", None)
 
-    def evict_component(
-        self,
-        node: UnifiedTreeNode,
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-        target: EvictLayer = EvictLayer.DEVICE,
-    ) -> tuple[int, int]:
-        ct = self.component_type
-        cd = node.component_data[ct]
-        freed = 0
-        host_freed = 0
-
-        # Device layer
-        if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
-            device_frees[self.component_type].append(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            freed = len(cd.value)
-            self.tree_core.component_evictable_size_[ct] -= freed
-            cd.value = None
-
-        # Host layer
-        host_lru = self.tree_core.host_lru_lists[ct]
-        if EvictLayer.HOST in target and cd.host_value is not None:
-            host_freed = len(cd.host_value)
-            host_frees[ct].append(cd.host_value)
-            cd.host_value = None
-            if host_lru.in_list(node):
-                host_lru.remove_node(node)
-
-        # After device tombstone: if host_value remains, move into host LRU
-        if (
-            target is EvictLayer.DEVICE
-            and cd.value is None
-            and cd.host_value is not None
-        ):
-            if not host_lru.in_list(node):
-                host_lru.insert_mru(node)
-
-        return freed, host_freed
-
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
-
-    def _evict_device_start(self, request_cnt: int) -> None:
-        """Begin the device-eviction walk from this component's LRU cursor."""
-        self._evict_device_request_cnt = request_cnt
-        if self.tree_core.enable_session_radix_cache:
-            lru = self.tree_core.lru_lists[self.component_type]
-            lru.cursor_begin()
-            self._evict_device_cursor = lru.cursor_next()
-        else:
-            self._evict_device_cursor = self.tree_core.lru_lists[
-                self.component_type
-            ].get_lru_no_lock()
-
-    def _evict_device_next_node(
-        self,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one device-eviction step and return a leaf, if selected.
-
-        An internal tombstone is one complete step so the caller can apply its
-        pending frees and recheck allocator capacity before the next mutation.
-        If the previous node's eviction removed the cursor, the walk resumes
-        from the partition sentinel with session refs on, else it restarts at
-        the LRU tail.
-        """
-        ct = self.component_type
-        lru = self.tree_core.lru_lists[ct]
-        enabled = self.tree_core.enable_session_radix_cache
-        if self._evict_device_cursor is not None and not lru.in_list(
-            self._evict_device_cursor
-        ):
-            self._evict_device_cursor = (
-                lru.cursor_next() if enabled else lru.get_lru_no_lock()
-            )
-        if (
-            tracker[ct] >= self._evict_device_request_cnt
-            or self._evict_device_cursor is None
-            or not lru.in_list(self._evict_device_cursor)
-        ):
-            return None
-
-        x = self._evict_device_cursor
-        assert x.component_data[ct].value is not None
-        if x in self.tree_core.evictable_device_leaves and (
-            not enabled or self._can_evict_leaf_atomically(x)
-        ):
-            self._evict_device_cursor = (
-                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
-            )
-            return x.id
-        if not enabled:
-            x_next = lru.get_prev_no_lock(x)
-        self.tree_core._evict_component_and_detach_lru(
-            x,
-            self,
-            target=EvictLayer.DEVICE,
-            tracker=tracker,
-            device_frees=device_frees,
-            host_frees=host_frees,
-        )
-        self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
-        )
-        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
-        return None
-
-    def _evict_device_end(self) -> None:
-        """Clear the device-eviction walk cursor state."""
-        if self.tree_core.enable_session_radix_cache:
-            self.tree_core.lru_lists[self.component_type].cursor_end()
-        self._evict_device_cursor = None
 
     def acquire_component_lock(
         self,
@@ -1016,14 +912,6 @@ class SWAComponent(TreeComponent):
             # device prefix, which the match validator does not promise.
             return PreparePrefetchResult()
         return PreparePrefetchResult(staging_tokens=num_pages * self.cache.page_size)
-
-    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
-        assert self._swa_kv_pool_host is not None
-        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        return host_indices
 
     def build_hicache_transfers(
         self,
@@ -1403,63 +1291,6 @@ class SWAComponent(TreeComponent):
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
             self._release_swa_host(host_indices[: pos - loaded_start], cache_actions)
-
-    def drive_host_eviction(
-        self,
-        num_tokens: int,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
-        """Evict SWA host resources.
-        Internal nodes: private tombstone (free SWA host only).
-        Host leaves: atomic eviction via _evict_host_leaf."""
-        ct = self.component_type
-        host_lru = self.tree_core.host_lru_lists[ct]
-        enabled = self.tree_core.enable_session_radix_cache
-        if enabled:
-            host_lru.cursor_begin()
-            x = host_lru.cursor_next(host_lock=True)
-        else:
-            x = host_lru.get_lru_no_host_lock()
-        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            if not enabled:
-                x_next = host_lru.get_prev_no_host_lock(x)
-            cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
-            ):
-                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
-            else:
-                assert cd.host_value is not None
-                self.tree_core._evict_component_and_detach_lru(
-                    x,
-                    self,
-                    target=EvictLayer.HOST,
-                    tracker=tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                )
-                self.tree_core._cascade_evict(
-                    x,
-                    self,
-                    tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                    target=EvictLayer.HOST,
-                )
-            if enabled:
-                x = host_lru.cursor_next(host_lock=True)
-            else:
-                x = x_next
-        if enabled:
-            host_lru.cursor_end()
-
-    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
-        if self._swa_kv_pool_host is None:
-            return
-        for host_value in host_values:
-            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
