@@ -2825,13 +2825,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
         self.enable_external_cache_linker = value;
         Ok(())
     }

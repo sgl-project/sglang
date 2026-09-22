@@ -1124,6 +1124,36 @@ class MambaPool:
         }
     )
 
+    def get_direct_linker_buffers(self) -> list[torch.Tensor]:
+        """Return complete checkpoint storage, indexed by physical state slot."""
+        if getattr(self, "_unified_buffer", None) is not None:
+            backing = self._unified_buffer
+            name = self._sub_pool_name
+            entry_bytes = backing.mamba_spec(name).entry_bytes()
+            start = backing.anchor_bytes(name)
+            count = self._max_size + 1
+            return [backing._raw[start : start + count * entry_bytes].view(count, -1)]
+        buffers = []
+        for field, tensor, slice_axis, layer_id in self._iter_transfer_state_entries():
+            if slice_axis != 0 or not tensor.is_contiguous():
+                raise ValueError(
+                    f"Direct linker requires contiguous slot-major {field} "
+                    f"state at layer {layer_id}."
+                )
+            buffers.append(tensor)
+        return buffers
+
+    def get_direct_linker_layer_mapping(self, start_layer: int) -> dict[int, list[int]]:
+        """Map local model layers to their checkpoint transfer buffer indices."""
+        if getattr(self, "_unified_buffer", None) is not None:
+            return {layer - start_layer: [0] for layer in self.mamba_layer_ids}
+        mapping = {}
+        for index, (_, _, _, layer_id) in enumerate(
+            self._iter_transfer_state_entries()
+        ):
+            mapping.setdefault(layer_id - start_layer, []).append(index)
+        return mapping
+
     def _iter_transfer_state_entries(self):
         """Yield ``[slot, ...]`` state entries and their transfer metadata."""
         for field, value in vars(self.mamba_cache).items():

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -650,9 +651,63 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if self.int8_ckpt_pool is not None:
+            raise ValueError("External linker does not support int8 Mamba checkpoints.")
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=[node.hash_value[-1]],
+                device_indices=value,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            # This slot becomes an immutable radix checkpoint. The request
+            # gets a separate mutable slot through deferred copy-on-write.
+            transfer.device_indices = self._alloc_mamba_slot()
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self._free_mamba_value(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+            if req.kv is None:
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            if not req.kv.holds_mamba:
+                req.kv.mamba_pool_idx = self._alloc_mamba_slot()[0]
+            return transfer
+        assert insert_result is not None
+        checkpoint = self.tree_core.get_component_device_value(
+            insert_result.last_device_node, self.component_type
+        )
+        assert checkpoint is not None
+        req.kv.mamba_cow_src_index = checkpoint
+        req.kv.mamba_needs_clear = False
+        return None if insert_result.mamba_exist else transfer
 
     # ---- HiCache Hooks ----
 

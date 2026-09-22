@@ -182,10 +182,10 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.cache_linker is linker
     assert cache.tree_core.enable_external_cache_linker
     assert cache.write_through_threshold == 1
-    assert cache.linker.layer_done_counter is linker.layer_done_counter
+    assert cache.linker.layer_done_counter.counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
@@ -416,6 +416,57 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         )
         self.assertEqual(final_match.device_indices.numel(), len(tokens))
         self.assertEqual(consumer_linker.offload_calls, [])
+        consumer.sanity_check()
+
+    def test_mamba_restore_owns_checkpoint_and_separate_mutable_request_state(self):
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            page_size=1,
+            kv_size=64,
+            max_context_len=64,
+        )
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, allocator, req_pool = build_fixture(cfg)
+        backend = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(backend)
+        tokens = list(range(1, 9))
+        inserted = self._insert(producer, allocator, req_pool, tokens)
+        transfers = backend.offload_calls[-1]
+        by_pool = {t.name: t for t in transfers}
+        self.assertEqual(len(by_pool[PoolName.MAMBA].keys), 1)
+        self.assertEqual(by_pool[PoolName.MAMBA].device_indices.numel(), 1)
+        backend.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        reader = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(reader)
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(match.mamba_host_hit_length, 1)
+        self._apply_match_to_req(req, match)
+        loaded, node = consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        checkpoint = _device_value(consumer, node, ComponentType.MAMBA)
+        self.assertEqual(loaded.numel(), len(tokens))
+        self.assertFalse(torch.equal(checkpoint, req.kv.mamba_pool_idx.view(-1)))
+        self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, checkpoint))
+        pending = {t.name: t for t in reader.queued_loads[req.rid]}
+        self.assertTrue(torch.equal(pending[PoolName.MAMBA].device_indices, checkpoint))
+        self.assertEqual(_device_lock_ref(consumer, node, ComponentType.MAMBA), 1)
+        consumer.ready_to_load_host_cache()
+        reader.complete_started_loads()
+        consumer.check_hicache_events()
+        self.assertEqual(_device_lock_ref(consumer, node, ComponentType.MAMBA), 0)
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
@@ -864,7 +915,7 @@ def test_async_load_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
-def test_release_request_cancels_queued_load():
+def test_release_request_keeps_published_load_pinned_until_dma_completes():
     linker = _FakeLinker()
     lock_params = object()
     unlocks = []
@@ -879,9 +930,40 @@ def test_release_request_cancels_queued_load():
     wrapper.release_request("rid")
 
     assert wrapper.hit_markers == {}
-    assert wrapper.pending_loads == {}
-    assert "rid" not in linker.queued_loads
+    assert wrapper.pending_loads == {"rid": (7, lock_params)}
+    assert "rid" in linker.queued_loads
+    assert unlocks == []
+    linker.completed_loads.append(["rid"])
+    wrapper.drain_loads(1)
     assert unlocks == [(7, lock_params)]
+
+
+def test_next_forward_waits_for_aborted_requests_published_load():
+    waits = []
+
+    class Counter:
+        consumer_index = -1
+
+        def set_consumer(self, index):
+            self.consumer_index = index
+
+        def wait_until(self, layer):
+            waits.append((self.consumer_index, layer))
+
+    linker = _FakeLinker()
+    linker.layer_done_counter = Counter()
+    cache = _cache_for_wrapper(dec_lock_ref=lambda node, params: None)
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper.pending_loads["aborted"] = (7, object())
+    wrapper.release_request("aborted")
+    counter = wrapper.layer_done_counter
+    counter.set_consumer(-1)  # Next request needs no new remote transfer.
+    assert counter.consumer_index == 3
+    counter.wait_until(2)
+    assert waits == [(3, 2)]
+    linker.completed_loads.append(["aborted"])
+    wrapper.drain_loads(1)
+    assert counter.consumer_index == -1
 
 
 def test_failed_offload_rolls_back_split_fragments():

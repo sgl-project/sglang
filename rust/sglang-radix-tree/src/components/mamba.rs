@@ -485,6 +485,23 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     }
 
     /// Build the mamba transfer descriptors for the given phase.
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hash = node.hash_value.as_ref()?.last()?.clone();
+        let value = node.try_device_value(MAMBA)?;
+        Some(PoolTransfer {
+            name: PoolName::Mamba,
+            device_indices: Some(value.shallow_clone()),
+            keys: Some(vec![hash]),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
+        })
+    }
+
     fn build_hicache_transfers(
         &self,
         tree_core: &UnifiedTreeCore<K>,

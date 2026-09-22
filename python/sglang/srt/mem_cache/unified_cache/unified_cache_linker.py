@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -106,6 +107,13 @@ class UnifiedCacheLinker(ABC):
     def cancel_queued_load(self, rid: str) -> bool:
         """Cancel a load that has not started yet."""
 
+    def release_request(self, rid: str) -> None:
+        """Release unused lookup reservations for a finished/bypassed request.
+
+        Already queued or executing loads retain their transfer resources
+        until completion. The wrapper keeps their destination tree slots.
+        """
+
     @abstractmethod
     def num_completed_loads(self) -> int:
         """Return the number of completed load batches waiting to be consumed."""
@@ -154,6 +162,31 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _LinkerLoadCounter:
+    """Keep detached requests' published loads visible to later forwards."""
+
+    def __init__(self, counter):
+        self.counter = counter
+        self.active_index = -1
+        self.detached_indices: set[int] = set()
+
+    @property
+    def consumer_index(self):
+        return max(self.active_index, max(self.detached_indices, default=-1))
+
+    def set_consumer(self, index):
+        self.active_index = index
+        self.counter.set_consumer(index)
+
+    def wait_until(self, layer):
+        indices = self.detached_indices | {self.active_index}
+        for index in sorted(indices):
+            if index >= 0:
+                self.counter.set_consumer(index)
+                self.counter.wait_until(layer)
+        self.counter.set_consumer(self.active_index)
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -168,12 +201,13 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
+        self.load_counter = _LinkerLoadCounter(cache_linker.layer_done_counter)
         swa = cache.components.get(ComponentType.SWA)
         self._skip_swa = swa is not None and is_swa_req_ring(
             cache.token_to_kv_pool_allocator
@@ -195,7 +229,7 @@ class UnifiedCacheLinkerWrapper:
 
     @property
     def layer_done_counter(self) -> object:
-        return self.cache_linker.layer_done_counter
+        return self.load_counter
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
@@ -204,6 +238,8 @@ class UnifiedCacheLinkerWrapper:
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
+        self.cache_linker.release_request(req.rid)
+        self.hit_markers.pop(req.rid, None)
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
@@ -231,6 +267,7 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            self.cache_linker.release_request(req.rid)
             return result
         hit_tokens = hit_pages * page
 
@@ -443,7 +480,10 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if (
+                phase == ExternalLinkerLoadPhase.COMMIT
+                and component.component_type != ComponentType.MAMBA
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
@@ -570,6 +610,8 @@ class UnifiedCacheLinkerWrapper:
             for rid in self.cache_linker.pop_completed_load():
                 node_id, lock_params = self.pending_loads.pop(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
+        if not self.pending_loads:
+            self.load_counter.detached_indices.clear()
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -593,11 +635,13 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
+        self.load_counter.active_index = -1
 
     def _release_pending_locks(self) -> None:
         for node_id, lock_params in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
+        self.load_counter.detached_indices.clear()
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False
@@ -607,11 +651,15 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
-        # TODO: Roll back the published tree and component state atomically before
-        # canceling; otherwise the tree may retain device slots that were never loaded.
-        if self.cache_linker.cancel_queued_load(rid):
-            node_id, lock_params = self.pending_loads.pop(rid)
-            self.cache.dec_lock_ref(node_id, lock_params)
+        self.cache_linker.release_request(rid)
+        # The tree already owns these slots. Complete queued work even when
+        # its original request is aborted; cancelling would expose empty KV
+        # to another request matching the published prefix. Keep the node
+        # lock until drain_loads() observes actual transfer completion.
+        if rid in self.pending_loads:
+            index = self.cache_linker.start_layer_wise_loading()
+            if index >= 0:
+                self.load_counter.detached_indices.add(index)
 
     def close(self) -> None:
         self.cache_linker.close()

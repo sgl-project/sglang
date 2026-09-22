@@ -2307,21 +2307,38 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_rejects_mamba_trees() {
+fn external_linker_offloads_mamba_checkpoint_at_endpoint() {
     let params = CacheInitParams {
         mamba_cache_chunk_size: Some(1),
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
+    tc.set_enable_external_cache_linker(true).unwrap();
+    let tokens = vec![1, 2, 3, 4];
+    let mut params = insert_params(&tokens, &[11, 12, 13, 14]);
+    params.mamba_value = Some(Tensor::from_slice(&[7i64]));
+    let inserted = tc.insert(&params);
+    let transfers = tc
+        .build_external_linker_offload_transfers(inserted.last_device_node_id.unwrap())
+        .unwrap()
+        .unwrap();
+    let state = transfers
+        .iter()
+        .find(|t| t.name == PoolName::Mamba)
+        .unwrap();
+    assert_eq!(state.hit_policy, PoolHitPolicy::TrailingPages);
+    assert_eq!(state.keys.as_ref().unwrap().len(), 1);
+    assert!(
+        state
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[7i64]))
+    );
+    assert_eq!(
+        state.keys.as_ref().unwrap().last(),
+        transfers[0].keys.as_ref().unwrap().last()
+    );
 }
 
 #[test]

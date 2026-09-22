@@ -455,20 +455,41 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-        kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _MambaStrategy",
-        ):
-            resolve_hybrid_device_pool_group(
-                kvcache=kvcache,
-                page_size=2,
-                params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
-            )
+    def test_standard_full_and_mamba_expose_independent_page_spaces(self):
+        full = SimpleNamespace(
+            k_buffer=[torch.zeros(16, 2, 4)],
+            v_buffer=[torch.ones(16, 2, 4)],
+        )
+        states = [torch.zeros(12, 8), torch.ones(12, 16)]
+        params = SimpleNamespace(
+            page_size=2,
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(
+                    get_direct_linker_buffers=lambda: states,
+                    get_direct_linker_layer_mapping=lambda start: {1: [0, 1]},
+                ),
+                translate_mamba_indices=lambda x: x + 1,
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                translate_kv_indices_for_transfer=lambda x: x,
+            ),
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=SimpleNamespace(full_kv_pool=full),
+            page_size=2,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        kv = group.entry_map[PoolName.KV]
+        state = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(kv.get_page_indices(torch.tensor([2, 3, 6, 7])), [1, 3])
+        self.assertEqual(state.get_page_indices(torch.tensor([3])), [3])
+        views = kv.get_page_tensors()
+        views[0][1].fill_(0)
+        self.assertEqual(
+            views[0].untyped_storage().data_ptr(), full.k_buffer[0].data_ptr()
+        )
+        self.assertEqual(tuple(state.get_page_tensors()[1].shape), (12, 1, 64))
 
 
 if __name__ == "__main__":

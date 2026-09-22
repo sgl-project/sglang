@@ -74,6 +74,34 @@ class DevicePoolEntry:
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
 
+    def get_page_tensors(self) -> list[torch.Tensor]:
+        """Expose zero-copy byte views shaped [page, 1, bytes_per_page].
+
+        Linkers can register these views with an external transfer engine
+        without depending on each model's K/V, indexer, or state layout.
+        Strided layouts require a backend-specific transfer implementation.
+        """
+        pages = self._row_count // self._row_span
+        result = []
+        for buffer in self.kv_buffer:
+            if not buffer.is_contiguous():
+                raise ValueError(f"Pool {self.name} needs contiguous transfer buffers.")
+            result.append(
+                buffer[: pages * self._row_span].view(torch.uint8).view(pages, 1, -1)
+            )
+        return result
+
+    def get_page_indices(self, indices: torch.Tensor) -> list[int]:
+        """Translate physical transfer indices into get_page_tensors() rows."""
+        return [row // self._row_span for row in self._rows(indices)]
+
+    def get_page_layout(self) -> list[tuple[str, tuple[int, ...], int]]:
+        """Describe byte interpretation for persistent cache namespace isolation."""
+        return [
+            (str(buffer.dtype), tuple(buffer.shape[1:]), self._row_span)
+            for buffer in self.kv_buffer
+        ]
+
     def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return self._index_mapper(indices) if self._index_mapper else indices
 
@@ -437,8 +465,104 @@ def resolve_hybrid_device_pool_group(
         _select_strategy,
     )
 
+    if components <= {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}:
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        full = getattr(kvcache, "full_kv_pool", kvcache)
+        if not isinstance(kvcache, DeepSeekV4TokenToKVPool) and not isinstance(
+            full, DSATokenToKVPool
+        ):
+            return _build_standard_device_pool_group(kvcache, params, components)
+
     return _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
         params=params,
         page_size=page_size,
+    )
+
+
+def _build_standard_device_pool_group(kvcache, params, components):
+    """Materialize FULL/SWA/recurrent pools without allocating host KV memory."""
+    if getattr(params, "mtp_draft_device_pools", ()):
+        raise ValueError("Standard direct linker pools do not support MTP draft pools.")
+    entries = []
+    page_size = params.page_size
+    num_layers = 0
+    start_layer = getattr(kvcache, "start_layer", 0)
+    for component, name, pool in (
+        (ComponentType.FULL, PoolName.KV, getattr(kvcache, "full_kv_pool", kvcache)),
+        (ComponentType.SWA, PoolName.SWA, getattr(kvcache, "swa_kv_pool", None)),
+    ):
+        if component not in components:
+            continue
+        if pool is None:
+            raise ValueError(f"Missing device pool for {component.name}.")
+        buffers = getattr(pool, "kv_buffer", None)
+        groups = [buffers] if buffers is not None else [pool.k_buffer, pool.v_buffer]
+        if getattr(pool, "kv_cache_layout", "nhd") != "nhd":
+            raise ValueError("Direct linker tensor views require NHD KV layout.")
+        if any(not group for group in groups):
+            raise ValueError(f"Empty {name} device buffers.")
+        if hasattr(kvcache, "layers_mapping"):
+            layer_mapping = {
+                layer - start_layer: index
+                for layer, (index, is_swa) in kvcache.layers_mapping.items()
+                if is_swa == (name == PoolName.SWA)
+            }
+        elif hasattr(kvcache, "full_attention_layer_id_mapping"):
+            layer_mapping = {
+                layer - start_layer: index
+                for layer, index in kvcache.full_attention_layer_id_mapping.items()
+            }
+        else:
+            layer_mapping = {i: i for i in range(len(groups[0]))}
+        num_layers = max(num_layers, max(layer_mapping, default=-1) + 1)
+        entries.append(
+            DevicePoolEntry(
+                name=name,
+                indices_from_pool=name,
+                device_pool=pool,
+                components=groups,
+                layer_mapping=layer_mapping,
+                page_size=page_size,
+                rows_are_pages=False,
+                index_mapper=(
+                    params.token_to_kv_pool_allocator.translate_kv_indices_for_transfer
+                    if name == PoolName.KV
+                    else None
+                ),
+            )
+        )
+    if ComponentType.MAMBA in components:
+        req_pool = params.req_to_token_pool
+        if getattr(req_pool, "mamba_ckpt_pool", None) is not None:
+            raise ValueError(
+                "Direct linker does not support quantized Mamba checkpoints."
+            )
+        state_pool = req_pool.mamba_pool
+        buffers = state_pool.get_direct_linker_buffers()
+        mapping = state_pool.get_direct_linker_layer_mapping(start_layer)
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.MAMBA,
+                indices_from_pool=PoolName.MAMBA,
+                device_pool=state_pool,
+                components=[buffers],
+                layer_mapping=mapping,
+                page_size=1,
+                rows_are_pages=True,
+                index_mapper=req_pool.translate_mamba_indices,
+            )
+        )
+        num_layers = max(num_layers, max(mapping, default=-1) + 1)
+    full_pool = getattr(kvcache, "full_kv_pool", kvcache)
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=(
+            getattr(full_pool, "kv_buffer", None) is not None
+            and ComponentType.MAMBA not in components
+        ),
     )
