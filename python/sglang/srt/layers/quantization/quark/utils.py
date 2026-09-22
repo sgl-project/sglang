@@ -51,6 +51,10 @@ def should_ignore_layer(
     if layer_name is None:
         return False
 
+    # `ignore` is typed Iterable and is scanned several times below, so a
+    # one-shot iterator would silently test empty after the first pass.
+    ignore = tuple(ignore)
+
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]

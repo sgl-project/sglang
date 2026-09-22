@@ -231,19 +231,26 @@ class TestPrequantizedBlockFp8(CustomTestCase):
                 self.assertEqual(method.quant_config.weight_block_size, [128, 128])
 
     def test_missing_mixed_or_excluded_expert_projection_rejected(self):
-        for change in ("missing", "mixed", "excluded"):
+        for change in ("missing", "mixed"):
             with self.subTest(change=change):
                 config, layer, prefix = self._expert_config()
                 name = f"{prefix}.1.down_proj"
                 entries = config.quant_config["layer_quant_config"]
                 if change == "missing":
                     del entries[name]
-                elif change == "mixed":
-                    entries[name]["weight"]["block_size"] = [64, 128]
                 else:
-                    config.exclude_layers.append(name)
+                    entries[name]["weight"]["block_size"] = [64, 128]
                 with self.assertRaisesRegex(ValueError, "same quantization"):
                     config.get_quant_method(layer, prefix)
+
+    def test_excluded_expert_projection_excludes_fused_module(self):
+        # An `exclude` entry naming one expert excludes the whole fused module:
+        # SGLang cannot mix schemes among experts inside one FusedMoE. See
+        # should_ignore_layer() and sgl-project/sglang#39317.
+        config, layer, prefix = self._expert_config()
+        config.exclude_layers.append(f"{prefix}.1.down_proj")
+
+        self.assertNotIsInstance(config.get_quant_method(layer, prefix), Fp8MoEMethod)
 
     def test_fused_shared_expert_must_match_routed_precision(self):
         for change in ("missing", "excluded"):
