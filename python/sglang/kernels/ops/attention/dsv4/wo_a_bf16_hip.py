@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import _wo_a_partial
+from sglang.kernels.ops.attention.dsv4.wo_a import _wo_a_partial
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Mxfp8Activation,
     fp8_grid_quant,

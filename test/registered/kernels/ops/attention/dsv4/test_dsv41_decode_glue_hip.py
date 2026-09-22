@@ -18,8 +18,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     sort_selection_rows,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import (
-    _expand_index_page_table,
     _low_ratio_compression_metadata,
+)
+from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    expand_index_page_table as _expand_index_page_table,
 )
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
