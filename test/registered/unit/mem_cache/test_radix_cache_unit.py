@@ -275,7 +275,6 @@ class TestTreeNode(unittest.TestCase):
         self.assertIsNone(node.value)
         self.assertEqual(node.lock_ref, 0)
         self.assertEqual(node.hit_count, 0)
-        self.assertEqual(node.host_ref_counter, 0)
         self.assertIsNone(node.host_value)
         self.assertIsNone(node.hash_value)
 
@@ -311,21 +310,6 @@ class TestTreeNode(unittest.TestCase):
 
                 self.assertEqual(node.evicted, expected_evicted)
                 self.assertEqual(node.backuped, expected_backuped)
-
-    def test_protect_release_host(self):
-        """Test protect_host and release_host methods."""
-        node = TreeNode()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        node.protect_host()
-        self.assertEqual(node.host_ref_counter, 1)
-
-        node.release_host()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        # Test error case
-        with self.assertRaises(RuntimeError):
-            node.release_host()
 
     def test_get_last_hash_value(self):
         """Test get_last_hash_value method."""

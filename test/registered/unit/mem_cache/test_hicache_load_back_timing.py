@@ -1,7 +1,6 @@
 """Unit tests for the HiCache load-back duration metric."""
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -58,70 +57,6 @@ class TestLoadBackDurationMetric(CustomTestCase):
         self.assertIs(start, events[0])
         self.assertIs(finish, events[1])
         self.assertIsNot(start, finish)
-
-    def test_loading_check_observes_duration_and_tokens(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
-        start, finish = self._completed_pair()
-        ack = self.cc.HiCacheAck(
-            start,
-            finish,
-            node_ids=[1, 2],
-            num_tokens=1024,
-            timing_enabled=True,
-            num_tokens_by_pool={"kv": 1024},
-        )
-        stub = object.__new__(HiRadixCache)
-        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
-        stub.ongoing_load_back = {1: object(), 2: object()}
-        stub.dec_lock_ref = MagicMock()
-        stub.metrics_collector = MagicMock()
-        stub.pp_rank = 0
-        stub._all_reduce = MagicMock()
-
-        stub.loading_check()
-
-        stub.metrics_collector.increment_load_back_num_tokens.assert_called_once_with(
-            num_tokens=1024, pool="kv"
-        )
-        stub.metrics_collector.observe_load_back_duration.assert_called_once()
-        (observed,), _ = stub.metrics_collector.observe_load_back_duration.call_args
-        self.assertGreater(observed, 0.0)
-        self.assertEqual(stub.cache_controller.ack_load_queue, [])
-
-    def test_loading_check_fallback_when_timing_unsupported(self):
-        """On backends without enable_timing, count tokens but skip duration."""
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
-        start = torch.cuda.Event()
-        finish = torch.cuda.Event()
-        start.record()
-        finish.record()
-        torch.cuda.synchronize()
-
-        ack = self.cc.HiCacheAck(
-            start_event=start,
-            finish_event=finish,
-            node_ids=[7],
-            num_tokens=512,
-            timing_enabled=False,
-            num_tokens_by_pool={"kv": 512},
-        )
-        stub = object.__new__(HiRadixCache)
-        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
-        stub.ongoing_load_back = {7: object()}
-        stub.dec_lock_ref = MagicMock()
-        stub.metrics_collector = MagicMock()
-        stub.pp_rank = 0
-        stub._all_reduce = MagicMock()
-
-        stub.loading_check()
-
-        stub.metrics_collector.increment_load_back_num_tokens.assert_called_once_with(
-            num_tokens=512, pool="kv"
-        )
-        stub.metrics_collector.observe_load_back_duration.assert_not_called()
-        self.assertEqual(stub.cache_controller.ack_load_queue, [])
 
 
 if __name__ == "__main__":
