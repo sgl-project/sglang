@@ -245,7 +245,20 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "override_permanently"
         )
-        self.assertIn("is not None", ast.unparse(stamp))
+        # The whole stamp is one ** mapping, so every name goes through the
+        # guard below; a keyword beside it would bypass it.
+        self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
+        mapping = stamp.keywords[0].value
+        self.assertIsInstance(mapping, ast.DictComp)
+        self.assertEqual(len(mapping.generators), 1)
+        guards = mapping.generators[0].ifs
+        self.assertEqual(len(guards), 1)
+        guard = guards[0]
+        self.assertIsInstance(guard, ast.Compare)
+        self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
+        self.assertEqual([c.value for c in guard.comparators], [None])
+        # It is the stamped value that is tested, not some other name.
+        self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
 
 
 class TestParallelDelegation(_IsolatedOverrides):
@@ -2585,27 +2598,40 @@ class TestTheTopologyIdentities(CustomTestCase):
 
     def test_a_refused_write_leaves_nothing_behind(self):
         self._publish_square()
+        written = dict(tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1)
+        before = {name: getattr(get_parallel(), name) for name in written}
         with self.assertRaises(ValueError):
-            with get_parallel().override(
-                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
-            ):
+            with get_parallel().override(**written):
                 pass
-        self.assertEqual(get_parallel().attn_tp_size, 2)
+        # Every name the write touched, not just the one that failed the check.
+        self.assertEqual(
+            {name: getattr(get_parallel(), name) for name in written}, before
+        )
+        self.assertEqual(before["attn_tp_size"], 2)
 
     def test_a_group_built_at_another_width_is_refused(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
+        from sglang.srt.runtime_context import _WIDTH_AND_GROUP
 
-        self._publish_square()
-        wrong = GroupCoordinator.__new__(GroupCoordinator)
-        wrong.world_size = 8
-        wrong.rank_in_group = 0
-        with self.assertRaises(ValueError) as caught:
-            get_parallel().override_permanently(tp_group=wrong)
-        message = str(caught.exception)
-        self.assertIn("tp_group.world_size == tp_size", message)
-        self.assertIn("built 8, configured 4", message)
-        with self.assertRaises(RuntimeError):
-            get_parallel().tp_group
+        exercised = set()
+        for size_name, group_name in _WIDTH_AND_GROUP:
+            with self.subTest(group=group_name):
+                self._publish_square()
+                configured = getattr(get_parallel(), size_name)
+                wrong = GroupCoordinator.__new__(GroupCoordinator)
+                wrong.world_size = configured + 4
+                wrong.rank_in_group = 0
+                with self.assertRaises(ValueError) as caught:
+                    get_parallel().override_permanently(**{group_name: wrong})
+                message = str(caught.exception)
+                self.assertIn(f"{group_name}.world_size == {size_name}", message)
+                self.assertIn(
+                    f"built {configured + 4}, configured {configured}", message
+                )
+                with self.assertRaises(RuntimeError):
+                    getattr(get_parallel(), group_name)
+                exercised.add((size_name, group_name))
+        self.assertEqual(exercised, set(_WIDTH_AND_GROUP))
 
     def test_a_group_built_at_the_configured_width_is_quiet(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -2930,10 +2956,70 @@ class TestTheRecordIsNeverWrittenTo(CustomTestCase):
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
     """Reject retired getter imports and group-initialization width arguments."""
 
+    #: Getters that answer something other than a place in the topology.
+    NOT_A_PLACEMENT = {
+        "get_default_distributed_backend",
+        "get_mooncake_transfer_engine",
+        "get_torch_distributed_pg_options",
+    }
+    #: Widths whose group is not in ``_WIDTH_AND_GROUP``, so the context cannot
+    #: check what it would answer against the group that was built.
+    WIDTH_WITHOUT_A_CHECKED_GROUP = {
+        "get_dcp_world_size",
+        "get_moe_data_parallel_world_size",
+        "get_moe_tensor_parallel_world_size",
+    }
+    #: Variants that answer a group the map already covers.
+    VARIANT_OF_A_MAPPED_GROUP = {
+        "get_dcp_group_no_assert",
+        "get_self_pp_group",
+    }
+
     def _retired(self):
         from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
 
         return set(_CONTEXT_NAME_OF)
+
+    def test_every_getter_the_module_defines_is_classified(self):
+        """The deprecation map is what this checks, not what it checks against.
+
+        Deriving the watched set from the map would let a getter added later
+        stay outside it and never be looked at; deriving it from the module
+        means a new one has to be named here or deprecated.
+        """
+        from sglang.srt.distributed import parallel_state
+
+        defined = {
+            name
+            for name in dir(parallel_state)
+            if name.startswith("get_")
+            and callable(getattr(parallel_state, name))
+            and getattr(getattr(parallel_state, name), "__module__", None)
+            == parallel_state.__name__
+        }
+        self.assertTrue(defined, "no getters found; this proves nothing")
+        unclassified = (
+            defined
+            - self._retired()
+            - self.NOT_A_PLACEMENT
+            - self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            - self.VARIANT_OF_A_MAPPED_GROUP
+        )
+        self.assertEqual(
+            unclassified,
+            set(),
+            "these getters are neither deprecated nor classified; say which "
+            "kind each one is, or route it through get_parallel():\n  "
+            + "\n  ".join(sorted(unclassified)),
+        )
+        stale = (
+            self.NOT_A_PLACEMENT
+            | self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            | self.VARIANT_OF_A_MAPPED_GROUP
+        ) - defined
+        self.assertEqual(
+            stale, set(), f"these are named here but no longer defined: {stale}"
+        )
 
     def test_nothing_imports_a_retired_name_from_the_package(self):
         import ast as _ast
