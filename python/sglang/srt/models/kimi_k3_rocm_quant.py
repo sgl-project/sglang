@@ -130,13 +130,16 @@ def _k3_prepare_f_b_tiny_gemm(self_attn: nn.Module) -> None:
         return
     weight = self_attn.f_b_proj.weight
     scale = getattr(self_attn.f_b_proj, "weight_scale", None)
-    if (
-        not isinstance(weight, torch.Tensor)
-        or weight.dim() != 2
-        or weight.dtype != torch.float8_e4m3fn
-        or not isinstance(scale, torch.Tensor)
-        or scale.numel() != weight.shape[0]
-    ):
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        return
+    # Online quantization leaves f_b dense (the fused KDA decode kernel wants a
+    # bf16 weight), so the merged FP8 in-projection can reach here with nothing
+    # to dequantize; the tiny GEMM takes that weight as is.
+    is_prequantized = weight.dtype == torch.float8_e4m3fn
+    if is_prequantized:
+        if not isinstance(scale, torch.Tensor) or scale.numel() != weight.shape[0]:
+            return
+    elif weight.dtype != torch.bfloat16:
         return
     n, k = int(weight.shape[0]), int(weight.shape[1])
     from sglang.kernels.ops.gemm.kimi_k3 import _K3_TINY_GEMM_MAX_TOKENS
@@ -147,6 +150,8 @@ def _k3_prepare_f_b_tiny_gemm(self_attn: nn.Module) -> None:
         (weight.data.float() * scale.data.reshape(-1, 1).float())
         .to(torch.bfloat16)
         .contiguous()
+        if is_prequantized
+        else weight.data.contiguous()
     )
     _k3_log_once(
         "kda_f_b_tiny_gemm", "K3 KDA f_b BF16 tiny-GEMM enabled (N=%d K=%d)", n, k
