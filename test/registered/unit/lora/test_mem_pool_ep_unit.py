@@ -193,6 +193,7 @@ def _make_pool(
     helpers under test.
     """
     pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+    pool.invalid_uids = set()
     pool.moe_ep_size = moe_ep_size
     pool.moe_ep_rank = moe_ep_rank
     pool.moe_use_local_expert_ids = moe_use_local_expert_ids
@@ -220,6 +221,7 @@ class TestDeterministicPoolSlots(unittest.TestCase):
     @staticmethod
     def _prepare(iteration_order):
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.lora_no_cpu_backup = False
         pool.max_loras_per_batch = 4
         pool.uid_to_buffer_id = {}
@@ -262,6 +264,7 @@ class TestDeterministicPoolSlots(unittest.TestCase):
     @staticmethod
     def _evict_after_touch(iteration_order):
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.lora_no_cpu_backup = False
         pool.max_loras_per_batch = 4
         pool.uid_to_buffer_id = {
@@ -328,6 +331,7 @@ class TestBufferSlotClearing(unittest.TestCase):
     @classmethod
     def _make_pool(cls):
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.num_layer = 2
         pool.A_buffer = {"a": [torch.ones(2, 1, 2) for _ in range(2)]}
         pool.B_buffer = {"b": [torch.full((2, 1, 2), float("nan")) for _ in range(2)]}
@@ -638,6 +642,131 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         # Note: this is 2D, not 3D -> should raise (sanity check).
         with self.assertRaises(TypeError):
             list(pool._iter_local_expert_weights(weights, "weights"))
+
+
+class TestStreamedInstall(unittest.TestCase):
+    def setUp(self):
+        self.pool = pool = _make_pool(
+            num_experts_global=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.num_layer = 2
+        pool.tp_rank = 0
+        pool.max_lora_rank = 2
+        pool.max_loras_per_batch = 1
+        pool.target_modules = {"down_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = True
+        pool.lora_no_cpu_backup = True
+        pool.lora_added_tokens_size = 0
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.base_model = torch.nn.Linear(3, 5)
+        pool.A_buffer = {"down_proj": [torch.full((1, 2, 3), -1.0) for _ in range(2)]}
+        pool.B_buffer = {"down_proj": [torch.full((1, 5, 2), -1.0) for _ in range(2)]}
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+        pool.uid_to_buffer_id = {"adapter": 0}
+        pool.buffer_id_to_uid = ["adapter"]
+        pool.eviction_policy = get_eviction_policy("lru")
+        pool.eviction_policy.mark_used("adapter")
+        self.modules = [
+            {f"model.layers.{i}.mlp.down_proj": _FakeDenseLayer()} for i in range(2)
+        ]
+        self.adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=2),
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        f"model.layers.{i}.mlp.down_proj.lora_A.weight": torch.full((2, 3), 2.0),
+                        f"model.layers.{i}.mlp.down_proj.lora_B.weight": torch.full((5, 2), 3.0),
+                    },
+                    pinned_weights={},
+                )
+                for i in range(2)
+            ],
+            embedding_layers={},
+            added_tokens_embeddings={},
+            release_staged_weights=mock.Mock(),
+        )
+
+    def install(self, uid="adapter"):
+        with mock.patch.dict("sys.modules", {"sglang.srt.lora.layers": _LORA_LAYERS_STUB}):
+            self.pool.install_streamed_adapter(uid, self.adapter, self.modules, None, None)
+
+    def test_later_shape_error_preserves_all_resident_weights(self):
+        self.adapter.layers[1].weights[
+            "model.layers.1.mlp.down_proj.lora_B.weight"
+        ] = torch.zeros(4, 2)
+        with self.assertRaisesRegex(AssertionError, "LoRA buffer shape"):
+            self.install()
+        for buffer in (self.pool.A_buffer, self.pool.B_buffer):
+            for tensor in buffer["down_proj"]:
+                self.assertTrue(torch.all(tensor == -1))
+        self.assertEqual(self.pool.invalid_uids, set())
+        self.assertEqual(self.pool.uid_to_buffer_id, {"adapter": 0})
+        self.adapter.release_staged_weights.assert_not_called()
+
+    def test_full_pool_preserves_resident_adapter(self):
+        with self.assertRaisesRegex(RuntimeError, "No free LoRA memory pool slot"):
+            self.install("another-adapter")
+        self.assertEqual(self.pool.uid_to_buffer_id, {"adapter": 0})
+        self.assertEqual(self.pool.buffer_id_to_uid, ["adapter"])
+        self.assertEqual(self.pool.invalid_uids, set())
+        self.adapter.release_staged_weights.assert_not_called()
+
+    def test_invalid_weights_preserve_base_placeholder(self):
+        self.pool.uid_to_buffer_id = {None: 0}
+        self.pool.buffer_id_to_uid = [None]
+        self.adapter.layers[1].weights[
+            "model.layers.1.mlp.down_proj.lora_B.weight"
+        ] = torch.zeros(4, 2)
+        with self.assertRaisesRegex(AssertionError, "LoRA buffer shape"):
+            self.install()
+        self.assertEqual(self.pool.uid_to_buffer_id, {None: 0})
+        self.assertEqual(self.pool.buffer_id_to_uid, [None])
+
+    def test_failed_write_blocks_inference_until_reload(self):
+        copy_weight = mem_pool_module.copy_weight_into_buffer
+        copies = 0
+
+        def fail_on_third_copy(buffer, weight):
+            nonlocal copies
+            copies += 1
+            if copies == 3:
+                raise RuntimeError("injected copy failure")
+            copy_weight(buffer, weight)
+
+        with mock.patch.object(mem_pool_module, "copy_weight_into_buffer", fail_on_third_copy):
+            with self.assertRaisesRegex(RuntimeError, "injected copy failure"):
+                self.install()
+        self.assertTrue(torch.all(self.pool.A_buffer["down_proj"][0] == 2))
+        self.assertTrue(torch.all(self.pool.A_buffer["down_proj"][1] == -1))
+        self.assertEqual(self.pool.invalid_uids, {"adapter"})
+        self.adapter.release_staged_weights.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "incomplete GPU installs"):
+            self.pool.prepare_lora_batch({"adapter"}, {}, [], {}, None, None)
+
+        self.install()
+        self.pool.check_valid()
+        for a, b in zip(self.pool.A_buffer["down_proj"], self.pool.B_buffer["down_proj"]):
+            self.assertTrue(torch.all(a == 2))
+            self.assertTrue(torch.all(b == 3))
+        self.adapter.release_staged_weights.assert_called_once()
+
+    def test_unload_clears_invalid_slot(self):
+        self.pool.invalid_uids.add("adapter")
+        self.assertEqual(self.pool.remove_lora("adapter"), 0)
+        self.pool.check_valid()
+        self.assertEqual(self.pool.buffer_id_to_uid, [EMPTY_SLOT])
+        for buffer in (self.pool.A_buffer, self.pool.B_buffer):
+            for tensor in buffer["down_proj"]:
+                self.assertTrue(torch.all(tensor == 0))
 
 
 class TestSharedMoeProductionLoad(unittest.TestCase):
@@ -1126,6 +1255,7 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         ep_rank: int = 0,
     ) -> LoRAMemoryPool:
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
@@ -1245,6 +1375,7 @@ class TestAttnModulesShardByAttnTp(unittest.TestCase):
 
     def _pool(self, *, tp_size: int, attn_tp_size: int) -> LoRAMemoryPool:
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
@@ -1330,6 +1461,7 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         # tp=4 ep=2 → moe_tp_size=2. Pick OUTER rank 3 so moe_tp_rank=1.
         # The two values differ; the bug would surface on this exact rank.
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.invalid_uids = set()
         pool.tp_size = 4
         pool.tp_rank = 3
         pool.moe_tp_size = 2

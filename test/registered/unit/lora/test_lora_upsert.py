@@ -259,6 +259,69 @@ class TestUpsertRollback(CustomTestCase):
         self.assertIs(calls[1].args[2], old_lora)
 
 
+class TestStreamedUpsert(CustomTestCase):
+    def test_failed_install_keeps_previous_metadata(self):
+        manager = _make_manager(lora_no_cpu_backup=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__", pinned=False)
+        manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+        old_config, old_lora = manager.configs[ref.lora_id], manager.loras[ref.lora_id]
+        manager.memory_pool.install_streamed_adapter.side_effect = ValueError("bad shape")
+        result = manager.load_lora_adapter_from_tensors(
+            ref, {"weight": torch.ones(1)}, dict(CONFIG_DICT, lora_alpha=32), upsert=True
+        )
+        self.assertFalse(result.success)
+        self.assertIn("bad shape", result.error_message)
+        self.assertIs(manager.configs[ref.lora_id], old_config)
+        self.assertIs(manager.loras[ref.lora_id], old_lora)
+        self.assertIs(manager.lora_refs[ref.lora_id], ref)
+        self.assertEqual(manager.num_pinned_loras, 0)
+
+    def test_failed_fresh_install_publishes_no_metadata(self):
+        manager = _make_manager(lora_no_cpu_backup=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
+        manager.memory_pool.install_streamed_adapter.side_effect = RuntimeError("No free slot")
+        result = manager.load_lora_adapter_from_tensors(
+            ref, {"weight": torch.ones(1)}, CONFIG_DICT
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(manager.configs, {})
+        self.assertEqual(manager.loras, {})
+        self.assertEqual(manager.lora_refs, {})
+
+    def test_install_precedes_metadata_publication(self):
+        manager = _make_manager(lora_no_cpu_backup=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
+        manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+        old_lora = manager.loras[ref.lora_id]
+
+        def install(uid, adapter, *_args):
+            self.assertIs(manager.loras[uid], old_lora)
+            self.assertIsNot(adapter, old_lora)
+
+        manager.memory_pool.install_streamed_adapter.side_effect = install
+        result = manager.load_lora_adapter_from_tensors(
+            ref, {"weight": torch.ones(1)}, CONFIG_DICT, upsert=True
+        )
+        self.assertTrue(result.success)
+        self.assertIsNot(manager.loras[ref.lora_id], old_lora)
+
+    def test_re_registration_installs_zero_weights_into_resident_slot(self):
+        manager = _make_manager(lora_no_cpu_backup=True)
+        ref = LoRARef(lora_name="a", lora_path="__stream__")
+        manager.register_lora_adapter(ref, CONFIG_DICT)
+        manager.memory_pool.uid_to_buffer_id = {ref.lora_id: 0}
+        result = manager.register_lora_adapter(ref, CONFIG_DICT)
+        self.assertTrue(result.success)
+        manager.memory_pool.install_streamed_adapter.assert_called_once()
+        manager.memory_pool.load_lora_weight_to_buffer.assert_not_called()
+
+    def test_invalid_pool_blocks_batch_preparation(self):
+        manager = _make_manager(lora_no_cpu_backup=True)
+        manager.memory_pool.check_valid.side_effect = RuntimeError("incomplete GPU installs")
+        with self.assertRaisesRegex(RuntimeError, "incomplete GPU installs"):
+            manager.prepare_lora_batch(Mock())
+
+
 class TestUpsertPinnedAccounting(CustomTestCase):
     def test_pinned_flip_updates_counter_both_ways(self):
         manager = _make_manager()
