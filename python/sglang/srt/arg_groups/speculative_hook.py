@@ -570,11 +570,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "none",
             "megamoe",
             "mori",
-            "mori-epv2",
         ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', 'mori', or 'mori-epv2', got "
+                "(built-in TP MoE), 'megamoe', or 'mori', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":

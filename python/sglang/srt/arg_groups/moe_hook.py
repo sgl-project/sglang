@@ -454,6 +454,12 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "mori":
+        ep_version = envs.SGLANG_MORI_EP_VERSION.get()
+        if ep_version not in ("epv1", "epv2"):
+            raise ValueError(
+                f"SGLANG_MORI_EP_VERSION must be epv1 or epv2; got {ep_version!r}"
+            )
+        is_epv2 = ep_version == "epv2"
         if cfg.deepep_mode == "auto":
             declare_resolution(
                 server_args,
@@ -461,50 +467,27 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="normal",
             )
             logger.warning("auto set deepep_mode=`normal` for MORI EP")
-
-        # Check chunked prefill for mori
-        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        # Skip validation if disaggregation mode is decode.
-        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-            assert (
-                required_mori_dispatch_tokens_per_rank(server_args)
-            ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
-                "must be >= the per-rank MoRI dispatch tokens "
-                "(chunked_prefill_size by default)"
-            )
-
-    if a2a_backend == "mori-epv2":
-        if cfg.deepep_mode == "auto":
-            declare_resolution(
-                server_args,
-                "_handle_a2a_moe",
-                deepep_mode="normal",
-            )
-            logger.warning("auto set deepep_mode=`normal` for MORI EPv2")
-        elif cfg.deepep_mode != "normal":
+        elif is_epv2 and cfg.deepep_mode != "normal":
             raise ValueError("MORI EPv2 currently supports deepep_mode=`normal` only")
 
-        logger.warning(
-            "MORI EPv2 MoE A2A is enabled (cco-LSA, intranode, "
-            "world_size<=8). Expert parallel size follows TP[%s].",
-            cfg.tp_size,
-        )
-        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-            current = int(
-                os.environ.get(
-                    "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "4096"
-                )
+        if is_epv2:
+            logger.warning(
+                "MORI EPv2 MoE A2A is enabled (cco-LSA, intranode, "
+                "world_size<=8). Expert parallel size follows TP[%s].",
+                cfg.tp_size,
             )
-            if current < cfg.chunked_prefill_size:
-                os.environ["SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
-                    cfg.chunked_prefill_size
-                )
+
+        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
+            current = envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            required = required_mori_dispatch_tokens_per_rank(server_args)
+            if current < required:
+                envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.set(required)
                 logger.warning(
-                    "auto set SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                    "%s (was %s)",
-                    cfg.chunked_prefill_size,
+                    "auto set SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                    "%s (was %s) for %s",
+                    required,
                     current,
+                    a2a_backend,
                 )
 
     if a2a_backend == "pplx":

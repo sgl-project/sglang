@@ -10,6 +10,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -294,8 +295,8 @@ class MoriEPv2Dispatcher(BaseDispatcher):
                 "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK", 4
             ),
         )
-        self.max_tokens_per_rank = get_int_env_var(
-            "SGLANG_MORI_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+        self.max_tokens_per_rank = (
+            envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         self._op = None
         self._stage = _Stage.INITIAL

@@ -37,7 +37,6 @@ class MoeA2ABackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
-    MORI_EPV2 = "mori-epv2"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
@@ -81,10 +80,7 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.MORI
 
     def is_mori_epv2(self):
-        return self == MoeA2ABackend.MORI_EPV2
-
-    def is_mori_family(self):
-        return self.is_mori() or self.is_mori_epv2()
+        return self.is_mori() and envs.SGLANG_MORI_EP_VERSION.get() == "epv2"
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
@@ -108,7 +104,6 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
-            MoeA2ABackend.MORI_EPV2,
         )
 
 
@@ -641,7 +636,7 @@ def is_deepep_class_backend() -> bool:
         b.is_deepep()
         or b.is_deepep_v2()
         or b.is_mooncake()
-        or b.is_mori_family()
+        or b.is_mori()
         or b.is_pplx()
     )
 

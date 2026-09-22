@@ -328,7 +328,10 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
-        if get_exec().moe.moe_a2a_backend == "mori":
+        if (
+            get_exec().moe.moe_a2a_backend == "mori"
+            and envs.SGLANG_MORI_EP_VERSION.get() == "epv1"
+        ):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if get_exec().moe.expert_distribution_recorder_mode == "stat_approx":
