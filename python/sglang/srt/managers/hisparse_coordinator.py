@@ -233,6 +233,18 @@ class HiSparseCoordinator:
                 "disable SGLANG_DEBUG_HISPARSE_SKIP_IO."
             )
 
+        # Batched prefixes are qualified only for the linear gfx95 metadata
+        # planner. The separate real copy still immediately follows planning.
+        self.enable_batched_prefix = (
+            envs.SGLANG_HISPARSE_ROCM_BATCHED_PREFIX.get()
+            and _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and is_gfx95_supported()
+            and not self.is_dsv4_hisparse
+            and (self.swap_in_block_size, self.top_k, self.device_buffer_size)
+            == (1024, 2048, 4096)
+        )
+
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
         max_compressed_context_len = (
@@ -1055,6 +1067,8 @@ class HiSparseCoordinator:
         skip_io_kwargs = (
             {} if _is_xpu else dict(skip_io=self.skip_io or separate_copy)
         )
+        if self.enable_batched_prefix:
+            plan["batched_prefix"] = True
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],

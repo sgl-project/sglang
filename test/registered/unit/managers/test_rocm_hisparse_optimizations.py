@@ -92,6 +92,7 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.resolve = scope["resolve_shared_index_layers"]
 
     def plan(self, **kw):
+        self.last_plan_kwargs = kw
         self.events.append(("plan", kw["skip_io"]))
         kw["top_k_device_locs"].fill_(1)
         if "miss_count" in kw:
@@ -120,6 +121,7 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.aiter.return_value = aiter
         self.gfx95.return_value = gfx95
         c = self.cls()
+        c.enable_batched_prefix = False
         c.is_dsv4_hisparse = dsv4
         c._separate_copy = hip and aiter and gfx95 and not dsv4
         c.skip_io = False
@@ -162,6 +164,17 @@ class TestRocmHiSparseOptimizations(CustomTestCase):
         self.run_layer(c, 0)
         self.assertEqual(self.events, [("plan", True), ("copy", False)])
         self.assertEqual(self.copy_blocks, [16])
+        self.assertFalse(c.skip_io)
+        torch.testing.assert_close(
+            c.mem_pool_device.kv_buffer[0, 1], c.mem_pool_host.kv_buffer[0, 2]
+        )
+
+    def test_batched_prefix_keeps_real_copy_after_planning(self):
+        c = self.fixture(shared=None)
+        c.enable_batched_prefix = True
+        self.run_layer(c, 0)
+        self.assertTrue(self.last_plan_kwargs["batched_prefix"])
+        self.assertEqual(self.events, [("plan", True), ("copy", False)])
         self.assertFalse(c.skip_io)
         torch.testing.assert_close(
             c.mem_pool_device.kv_buffer[0, 1], c.mem_pool_host.kv_buffer[0, 2]
