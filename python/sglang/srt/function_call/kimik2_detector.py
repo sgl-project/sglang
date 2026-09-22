@@ -57,12 +57,7 @@ class KimiK2Detector(BaseFormatDetector):
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
 
-    Format Structure (client-style id — model copies an id shape it saw in the
-    conversation history, e.g. ``call_3``, ``call_<hex>``, ``toolu_01...``):
-    ```
-    <|tool_call_begin|>{client_id}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
-    ```
-    In the last two cases the function name is inferred from the arguments.
+    Client-style IDs (``call_3``, ``toolu_...``, UUIDs) also infer the name.
 
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
@@ -102,27 +97,17 @@ class KimiK2Detector(BaseFormatDetector):
     def _parse_tool_call_id(
         self, function_id: str, tools: List[Tool], function_args: str = None
     ):
-        """Parse a tool call ID into (function_name, call_index).
-
-        Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
-        Bare counter:    "3" → call_index=3, infer name from arguments.
-        Anything else:   "call_3", "toolu_01..." → call_index=0, infer name
-                         from arguments (see ``_resolve_function_name``).
-
-        The bare counter is a conversation-level auto-increment, NOT an index
-        into the tools list. The function name is inferred by matching argument
-        keys against tool parameter schemas.
-        """
         m = self.tool_call_id_regex.match(function_id)
         if m:
             return m.group("name"), int(m.group("index"))
 
+        # Numeric IDs count conversation calls, not positions in the tool list.
         call_index = (
             int(function_id)
             if self.tool_call_id_counter_regex.match(function_id)
             else 0
         )
-        name = self._resolve_function_name(function_id, tools, function_args)
+        name = self._infer_tool_name(tools, function_args)
         if name is None:
             logger.warning(
                 "Could not resolve a tool name for tool_call_id %r; dropping the call",
@@ -131,20 +116,6 @@ class KimiK2Detector(BaseFormatDetector):
         return name, call_index
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
-        """Infer the function name when the tool_call_id does not carry one
-        (bare counter or client-style id).
-
-        With a single tool the answer is unambiguous. Otherwise the arguments
-        must be a JSON object that exactly one tool accepts, where "accepts"
-        means: the object validates against the tool's ``parameters`` schema
-        with unevaluated properties forbidden unless the schema explicitly
-        allows them. This extra-property rule is an inference policy on top of
-        JSON Schema's permissive default, not a change to the supplied schema.
-
-        Zero or several candidates, or an unevaluable schema, return ``None``.
-        Without an explicit name, a wrong guess could select an executable
-        tool the model did not choose.
-        """
         if not tools:
             return None
         if len(tools) == 1:
@@ -169,7 +140,17 @@ class KimiK2Detector(BaseFormatDetector):
         candidates = []
         try:
             for tool in tools:
-                if self._schema_accepts_arguments(tool.function.parameters, args):
+                schema = tool.function.parameters
+                if schema is None or schema is True:
+                    schema = {}
+                if not isinstance(schema, dict):
+                    continue
+                schema = copy.deepcopy(schema)
+                normalize_json_schema_types(schema)
+                # Inference requires declared keys unless the schema allows extras.
+                schema.setdefault("unevaluatedProperties", False)
+                # Resolve local references without allowing network retrieval.
+                if Draft202012Validator(schema, registry=Registry()).is_valid(args):
                     candidates.append(tool.function.name)
         except Exception:
             # An unevaluable candidate cannot be ruled out as a second match.
@@ -188,24 +169,6 @@ class KimiK2Detector(BaseFormatDetector):
                 candidates,
             )
         return None
-
-    @staticmethod
-    def _schema_accepts_arguments(schema, args: dict) -> bool:
-        """Whether ``args`` is a plausible argument object for ``schema``.
-
-        Missing and true schemas accept only an empty object under the
-        inference policy. False schemas accept nothing.
-        """
-        if schema is None or schema is True:
-            schema = {}
-        if schema is False or not isinstance(schema, dict):
-            return False
-
-        schema = copy.deepcopy(schema)
-        normalize_json_schema_types(schema)
-        schema.setdefault("unevaluatedProperties", False)
-        # Local references resolve normally; untrusted schemas cannot fetch URLs.
-        return Draft202012Validator(schema, registry=Registry()).is_valid(args)
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -324,9 +287,7 @@ class KimiK2Detector(BaseFormatDetector):
                 # Resolve function name (cached across chunks within a section).
                 name_just_resolved = False
                 if self._current_stream_function_name is None:
-                    # Name inference needs the complete argument object, so
-                    # until the end marker arrives only ids that carry a name
-                    # (or a single-tool request) can resolve.
+                    # Multi-tool inference must wait for complete arguments.
                     args_for_inference = (
                         buffer[args_start:end_idx] if end_idx != -1 else None
                     )
@@ -444,7 +405,6 @@ class KimiK2Detector(BaseFormatDetector):
     def _split_pending_marker(
         self, text: str, markers: tuple[str, ...]
     ) -> tuple[str, str]:
-        """Hold a suffix that could become a special token on the next chunk."""
         start = text.rfind("<")
         if start != -1:
             tail = text[start:]
@@ -455,8 +415,7 @@ class KimiK2Detector(BaseFormatDetector):
         return text, ""
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        # A recognized but incomplete call is not normal text. An unmatched
-        # prefix (including a literal trailing '<') must not be lost at EOF.
+        # Incomplete calls are not text; unmatched marker prefixes may be literal.
         text = "" if self.tool_call_start_token in self._buffer else self._buffer
         self._buffer = ""
         self._reset_inflight_call_state()
@@ -465,16 +424,7 @@ class KimiK2Detector(BaseFormatDetector):
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
     ) -> Optional[str]:
-        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown.
-
-        Only the standard ``functions.{name}:{index}`` form carries the name.
-        Every other id shape falls back to inferring the name from the
-        arguments. Besides the bare counter, this covers client-style ids
-        (``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs): the chat template
-        renders history ``tool_call.id`` values verbatim, so when a client
-        rewrites the ids SGLang returned, the model copies that style on its
-        next call. The call itself is well-formed; only the id is foreign.
-        """
+        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown."""
         if not function_id:
             return self._infer_tool_name(tools, function_args)
 
