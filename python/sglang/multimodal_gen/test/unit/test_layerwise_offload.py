@@ -1242,9 +1242,11 @@ def test_configure_logs_component_start_and_completion(monkeypatch):
         "Configuring layerwise offload for transformer (_ResidentComponent): "
         "blocks (8 layers)"
     )
+    # "(per request)" is the point of this line: the set is re-established every
+    # request, not pinned for the server's lifetime.
     assert logs[-1] == (
         "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
-        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
+        "groups=1, layers=8, prefetch/group=2, resident=3/8 (per request), policy=leading"
     )
 
 
@@ -1379,6 +1381,60 @@ def test_disable_offload_short_circuits_residency_release(monkeypatch):
     model.prepare_for_next_req()
     for name, param in model.named_parameters():
         assert tuple(param.shape) != (1,), name
+
+
+def test_finish_use_drops_residents_unless_the_use_says_otherwise(monkeypatch):
+    """`retain_resident_layers` defaults off, so finish_use behaves as before.
+
+    Every existing pipeline builds its uses without the flag, so this is the
+    path they all take and it must keep releasing the resident set.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(stage_name="test", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is False for keep in released)
+    assert parked == [True]
+
+
+def test_finish_use_keeps_residents_when_the_use_declares_it(monkeypatch):
+    """The declaration reaches the manager, and parking is skipped with it.
+
+    Parking pushes the component's non-layer weights to host; doing that right
+    after deciding the room is available would undo the transfer being kept.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(
+            stage_name="test",
+            component_name="transformer",
+            retain_resident_layers=True,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is True for keep in released)
+    assert parked == []
 
 
 def test_enable_offload_rearms_after_disable(monkeypatch):
