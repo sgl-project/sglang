@@ -38,10 +38,13 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -53,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -60,11 +64,58 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def prepare_hicache_staging(
+    *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
+) -> None:
+    """Materialize MHA transfer buffers before the final KV budget is measured."""
+    memory = get_memory()
+    page_size = get_schedule().page_size
+    if memory.hicache_mem_layout != "page_first" or not (
+        memory.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        return
+
+    def prepare(pool, packed_drafts=(), *, sidecar=False):
+        if isinstance(pool, SWAKVPool):
+            prepare(pool.full_kv_pool)
+            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
+        elif isinstance(pool, HybridLinearKVPool):
+            prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
+        elif isinstance(pool, MHATokenToKVPool):
+            # Ratio-based host pools can only shrink with post-capture KV sizing.
+            # Sidecars instead inherit their target host pool's capacity.
+            page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
+            if memory.hicache_size <= 0 and not sidecar:
+                page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
+            staging = prepare_mha_write_back_staging(
+                pool,
+                layer_num=pool.layer_num + len(packed_drafts),
+                page_size=page_size,
+                page_capacity=page_capacity,
+            )
+            if staging is not None:
+                logger.info(
+                    "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
+                    sum(buffer.nbytes for buffer in staging) / (1 << 20),
+                    pool.layer_num + len(packed_drafts),
+                )
+
+    runner = tp_worker.model_runner
+    prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
+    if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
+        for pool in draft_plan.device_pools:
+            # SWA sidecars follow only the draft's SWA component.
+            prepare(
+                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
+                sidecar=True,
+            )
 
 
 def get_draft_kv_pool(
@@ -95,8 +146,6 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
-    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
@@ -213,12 +262,12 @@ def build_kv_cache(
     attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: ParallelState,
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
+    parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -319,10 +368,10 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-        pp_rank=ps.pp_rank,
-        pp_size=ps.pp_size,
-        attn_cp_rank=ps.attn_cp_rank,
-        attn_cp_size=ps.attn_cp_size,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        attn_cp_rank=parallel.attn_cp_rank,
+        attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -340,8 +389,8 @@ def build_kv_cache(
         effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=tp_worker,
         model_config=model_config,
-        tp_size=ps.tp_size,
-        tp_rank=ps.tp_rank,
+        tp_size=parallel.tp_size,
+        tp_rank=parallel.tp_rank,
         tp_group=tp_group,
     )
     with auto_size_hicache(

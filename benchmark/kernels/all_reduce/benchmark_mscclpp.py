@@ -28,13 +28,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
-    get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
     set_mscclpp_all_reduce,
 )
-from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.test_utils import publish_build_topology
 
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
@@ -197,15 +196,13 @@ if __name__ == "__main__":
         rank=rank,
         local_rank=local_rank,
     )
-    publish(
-        ServerArgs(model_path="dummy", enable_symm_mem=args.enable_symm_mem),
-        role="scheduler",
-    )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world_size,
+    publish_build_topology(
+        world_rank=rank,
+        tp_size=world_size,
         enable_symm_mem=args.enable_symm_mem,
     )
-    tp_group = get_tensor_model_parallel_group()
+    initialize_model_parallel(enable_symm_mem=args.enable_symm_mem)
+    tp_group = get_parallel().tp_group
     group = tp_group.device_group
     pynccl_comm = tp_group.pynccl_comm
     pymscclpp_comm = tp_group.pymscclpp_comm
