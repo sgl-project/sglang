@@ -14,7 +14,7 @@ from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -27,7 +27,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_size,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -505,24 +504,36 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.use_attn_tp_ngram = _use_attn_tp_ngram()
         self.gather_dp_tokens = (
             is_dp_attention_enabled()
-            and get_attention_dp_size() > 1
+            and get_parallel().attn_dp_size > 1
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
-        )
-        self.ngram_embedding.register_buffer(
+        offload_embedding = bool(config.ple_offload_embedding)
+        # Offload only needs this embedding's metadata: build it on meta so the
+        # shard is never allocated on the device.
+        with torch.device("meta") if offload_embedding else nullcontext():
+            ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
+        # weight_scale stays a real device tensor.
+        ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
+        if offload_embedding:
+            ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                ngram_embedding,
+                backend=getattr(config, "ple_offload_backend", "pinned"),
+                table_dir=getattr(config, "ple_offload_dir", None),
+            )
+        self.ngram_embedding = ngram_embedding
 
     @classmethod
     def _splitmix64(cls, x: int) -> int:
@@ -772,6 +783,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
+
+    The source weight may be on the meta device; only its metadata is used.
     """
 
     _COPIED_ATTRIBUTES = (
@@ -854,7 +867,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         allocation_context = nullcontext()
         if self.tp_size > 1:
             allocation_context = use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with allocation_context, torch.inference_mode(False):
             # The gather kernel emits bf16 rows regardless of the table dtype.
@@ -932,12 +945,6 @@ class Qwen4ExpPLELayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
-        if config.ple_offload_embedding:
-            self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding,
-                backend=getattr(config, "ple_offload_backend", "pinned"),
-                table_dir=getattr(config, "ple_offload_dir", None),
-            )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
             self.conv_kernel_size - 1
@@ -1360,7 +1367,7 @@ class Qwen4ExpLayerExtensionMixin:
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
-        return get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
+        return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
 
     def _qwen4_exp_use_attn_tp_a2a_scatter(self) -> bool:
         return get_parallel().attn_tp_size > 1 and not get_moe_a2a_backend().is_none()
@@ -1378,7 +1385,7 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
+                get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -1397,11 +1404,11 @@ class Qwen4ExpLayerExtensionMixin:
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
             if should_use_dp_reduce_scatterv():
-                get_tp_group().reduce_scatterv(
+                get_parallel().tp_group.reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),

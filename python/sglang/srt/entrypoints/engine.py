@@ -1784,12 +1784,13 @@ def _log_legacy_kernel_cache_dirs():
             os.path.expanduser("~/.triton"),
             os.path.expanduser("~/.cache/flashinfer"),
             os.path.expanduser("~/.cache/deep_gemm"),
+            os.path.expanduser("~/.tilelang/cache"),
         )
         if os.path.isdir(d)
     ]
     if not legacy_dirs:
         return
-    logger.info(
+    logger.debug(
         "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
         "older directories are no longer used by sglang, but may still be "
         "used by other frameworks on this machine, so they were left alone: "

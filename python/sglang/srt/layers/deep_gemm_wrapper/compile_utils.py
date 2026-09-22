@@ -509,8 +509,8 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup start "
         "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
-        model_runner.ps.pp_rank,
-        model_runner.ps.tp_rank,
+        get_parallel().pp_rank,
+        model_runner.tp_rank,
         batch_sizes,
         disagg_mode,
     )
@@ -538,5 +538,5 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
         time.perf_counter() - t0,
-        model_runner.ps.pp_rank,
+        get_parallel().pp_rank,
     )
