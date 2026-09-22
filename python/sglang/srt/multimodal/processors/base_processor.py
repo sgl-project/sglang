@@ -243,8 +243,6 @@ class BaseMultimodalProcessor(ABC):
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
-        self.hf_config = hf_config
-        self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
         configured_mm_feature_transport = get_mm().mm_feature_transport
@@ -257,6 +255,8 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
+
         cpu_process_start_method = (
             "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
         )
@@ -271,6 +271,8 @@ class BaseMultimodalProcessor(ABC):
             allowed_media_domains=get_mm().allowed_media_domains,
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
         )
+        self.hf_config = hf_config
+        self._processor = _processor
         self.cpu_process_start_method = processor_config.cpu_process_start_method
         self.cpu_worker_num = processor_config.cpu_worker_num
 
@@ -283,47 +285,11 @@ class BaseMultimodalProcessor(ABC):
         if processor_config.disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
-        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = processor_config.mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
-
-        # Each tokenizer worker is a separate process with its own CPU cache.
-        # Split the requested service-wide budget so increasing worker count
-        # does not silently multiply host-memory usage.
-        requested_cache_mb = get_mm().mm_preprocess_cache_size_mb
-        total_cache_mb = (
-            self.auto_mm_preprocess_cache_size_mb
-            if requested_cache_mb is None
-            else requested_cache_mb
-        )
-        tokenizer_worker_num = max(int(get_serving().tokenizer_worker_num), 1)
-        worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
-        self.mm_preprocess_cache = MultimodalPreprocessCache(
-            max_size_bytes=worker_cache_bytes,
-            max_entries=8192,
-        )
-        self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
-        # The fingerprint is needed only to build artifact keys. Avoid inspecting
-        # processor state when this processor will never retain artifacts.
-        self.processor_fingerprint = (
-            build_processor_fingerprint(self, hf_config)
-            if self.mm_preprocess_cache.enabled
-            or self.uses_media_artifacts_without_cache
-            else None
-        )
-        if self.mm_preprocess_cache.enabled:
-            logger.info(
-                "Multimodal preprocess cache enabled for %s: %d MiB total "
-                "(%d MiB per tokenizer worker), at most 8192 entries; "
-                "caller content hashes are %s.",
-                type(self).__name__,
-                total_cache_mb,
-                worker_cache_bytes // (1024 * 1024),
-                "trusted" if self.trust_mm_content_hashes else "verified",
-            )
 
         self._tokenizer = _tokenizer_of(self._processor)
 
@@ -332,9 +298,6 @@ class BaseMultimodalProcessor(ABC):
             self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
         except Exception:
             self._tokenizer_auto_adds_specials = False
-
-        # FIXME: not accurate, model and image specific
-        self.NUM_TOKEN_PER_FRAME = 330
 
         requested_mm_io_worker_num = processor_config.mm_io_worker_num
         env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
@@ -402,6 +365,44 @@ class BaseMultimodalProcessor(ABC):
         self._cpu_executor_lock = threading.Lock()
         self.cpu_executor = self._create_cpu_executor()
 
+        # Each tokenizer worker is a separate process with its own CPU cache.
+        # Split the requested service-wide budget so increasing worker count
+        # does not silently multiply host-memory usage.
+        requested_cache_mb = get_mm().mm_preprocess_cache_size_mb
+        total_cache_mb = (
+            self.auto_mm_preprocess_cache_size_mb
+            if requested_cache_mb is None
+            else requested_cache_mb
+        )
+        tokenizer_worker_num = max(int(get_serving().tokenizer_worker_num), 1)
+        worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
+        self.mm_preprocess_cache = MultimodalPreprocessCache(
+            max_size_bytes=worker_cache_bytes,
+            max_entries=8192,
+        )
+        self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
+        # The fingerprint is needed only to build artifact keys. Avoid inspecting
+        # processor state when this processor will never retain artifacts.
+        self.processor_fingerprint = (
+            build_processor_fingerprint(self, hf_config)
+            if self.mm_preprocess_cache.enabled
+            or self.uses_media_artifacts_without_cache
+            else None
+        )
+        if self.mm_preprocess_cache.enabled:
+            logger.info(
+                "Multimodal preprocess cache enabled for %s: %d MiB total "
+                "(%d MiB per tokenizer worker), at most 8192 entries; "
+                "caller content hashes are %s.",
+                type(self).__name__,
+                total_cache_mb,
+                worker_cache_bytes // (1024 * 1024),
+                "trusted" if self.trust_mm_content_hashes else "verified",
+            )
+
+        # FIXME: not accurate, model and image specific
+        self.NUM_TOKEN_PER_FRAME = 330
+
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
             # Image-related attributes
@@ -446,7 +447,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
