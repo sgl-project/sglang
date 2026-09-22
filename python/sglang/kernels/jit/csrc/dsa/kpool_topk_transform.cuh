@@ -11,10 +11,10 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#if defined(__HIP_PLATFORM_AMD__)
-#include <hip/hip_fp16.h>
-#else
+#ifndef USE_ROCM
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>
 #endif
 
 namespace sglang {

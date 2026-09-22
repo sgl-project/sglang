@@ -283,6 +283,8 @@ class DeepseekMHARocmForwardMixin:
     ):
         if self.qk_rope_head_dim == 0:
             assert k_pe is None or k_pe.shape[-1] == 0
+            # No RoPE tail to append, so k is k_nope as-is. The concat branch
+            # below keeps k_nope's dtype, so no cast is needed here either.
             return k_nope.contiguous()
 
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)

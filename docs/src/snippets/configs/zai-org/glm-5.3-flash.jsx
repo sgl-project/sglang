@@ -148,6 +148,32 @@ export const config = {
         },
       ],
     },
+    // Parser flags live in one overlay dim so every generated command gets
+    // them without per-cell duplication; the Parsers card toggles derive
+    // on/off from the composed flags. `auto` needs the GLM-5.3 template
+    // detection (v0.5.20+).
+    {
+      id: "parsers",
+      title: "Parsers",
+      default: "auto",
+      options: [
+        {
+          id: "auto",
+          label: "Auto (glm45 + glm47)",
+          stripPrefixes: ["--reasoning-parser", "--tool-call-parser"],
+          flags: [
+            "--reasoning-parser auto",
+            "--tool-call-parser auto",
+          ],
+        },
+        {
+          id: "off",
+          label: "Off",
+          stripPrefixes: ["--reasoning-parser", "--tool-call-parser"],
+          flags: [],
+        },
+      ],
+    },
   ],
 
   modelNames: {
@@ -207,15 +233,16 @@ sgl-eval run gsm8k \\
     ["aime2026_pct", "AIME 2026", "%"],
   ],
 
-  // Support is not in a public sglang release yet, so the nightly images do
-  // not work; every NVIDIA lane uses the purpose-built CUDA 13 image.
+  // v0.5.20 (= latest) carries GLM-5.3-Flash support (#36507) and the GLM-5.3
+  // template parser detection (#38297) that `--*-parser auto` needs; the old
+  // glm-5.3-flash dev image (2026-09-03) predates #38297 and misdetects.
   dockerImages: {
-    gb300: "lmsysorg/sglang:glm-5.3-flash",
-    h100: "lmsysorg/sglang:glm-5.3-flash",
-    h200: "lmsysorg/sglang:glm-5.3-flash",
-    b200: "lmsysorg/sglang:glm-5.3-flash",
-    b300: "lmsysorg/sglang:glm-5.3-flash",
-    gb200: "lmsysorg/sglang:glm-5.3-flash",
+    gb300: "lmsysorg/sglang:latest",
+    h100: "lmsysorg/sglang:latest",
+    h200: "lmsysorg/sglang:latest",
+    b200: "lmsysorg/sglang:latest",
+    b300: "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -299,8 +326,8 @@ sgl-eval run gsm8k \\
 
     parsers: {
       items: [
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser glm45" },
-        { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser glm47" },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
+        { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser auto" },
       ],
     },
 
@@ -345,12 +372,7 @@ sgl-eval run gsm8k \\
             "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
             "--speculative-draft-attention-backend fa4",
           ],
-          // DFLASH needs this model's hidden-state capture, which landed on the
-          // GLM-5.3-Flash support branch (PR #36708 into #36507's
-          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
-          // image the Install accordion pins. Drop this note once #36507 merges
-          // and a published image carries it.
-          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          note: "⚠️ The draft checkpoint incoai/GLM-5.3-Flash-DFlash2 is access-gated: request access on its Hugging Face page, then download it alongside the target before serving.",
           disable: [
             { when: { hw: ["mi355x"] }, reason: "The FA4 draft-attention path is CUDA-only." },
             {
@@ -490,8 +512,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -515,8 +535,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -550,8 +568,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
@@ -578,8 +594,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -605,8 +619,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
@@ -626,8 +638,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -650,8 +660,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
@@ -671,8 +679,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -695,8 +701,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
@@ -716,8 +720,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend flashinfer_cutlass",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -747,8 +749,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -770,8 +770,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -799,8 +797,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -821,8 +817,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -845,8 +839,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -866,8 +858,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -890,8 +880,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -911,8 +899,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -933,8 +919,6 @@ sgl-eval run gsm8k \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -951,8 +935,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

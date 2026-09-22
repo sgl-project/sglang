@@ -235,7 +235,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
         rings_fus = {name: buf.clone() for name, buf in template.items()}
     else:
         rings_ref = rings_fus = None
-    o_ref, conv_ref, win_ref, ic_ref = _run_reference(
+    o_ref, _, win_ref, ic_ref = _run_reference(
         inp, B, T, H, HV, K, V, lower_bound, rings=rings_ref
     )
     o_fus, conv_fus, win_fus, ic_fus = _run_fused(
@@ -244,6 +244,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
 
     idx_vals = inp["idx_vals"]
     valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
+
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
     _assert_output_matches_reference(o_fus_v, o_ref_v)

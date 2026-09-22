@@ -1237,12 +1237,13 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.language_model.": "model.",
             "model.visual": "visual",
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
         },
         orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         **Glm5NextLinearAttention._PACKED_MODULES_MAPPING,
