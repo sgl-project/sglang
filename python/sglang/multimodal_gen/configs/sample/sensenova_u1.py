@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,
+    DEFAULT_MAX_THINK_TOKENS,
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
@@ -33,6 +34,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_quality",
     "output_compression",
     "quality",
+    "think_mode",
+    "max_think_tokens",
 }
 
 
@@ -51,11 +54,16 @@ class SenseNovaU1SamplingParams(SamplingParams):
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    max_think_tokens: int = DEFAULT_MAX_THINK_TOKENS
     negative_prompt: None = field(default=None, init=False)
 
     @classmethod
     def supported_override_fields(cls) -> set[str]:
         return set(_PUBLIC_OVERRIDE_FIELDS)
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"think_mode", "max_think_tokens"})
 
     @classmethod
     def get_cli_args(cls, args):
@@ -98,6 +106,19 @@ class SenseNovaU1SamplingParams(SamplingParams):
             raise ValueError(
                 f"cfg_interval must satisfy 0 <= start <= end <= 1, got {self.cfg_interval!r}"
             )
+        if not isinstance(self.think_mode, bool):
+            raise TypeError(f"think_mode must be a bool, got {self.think_mode!r}")
+        if isinstance(self.max_think_tokens, bool) or not isinstance(
+            self.max_think_tokens, int
+        ):
+            raise TypeError(
+                f"max_think_tokens must be an int, got {self.max_think_tokens!r}"
+            )
+        if not 1 <= self.max_think_tokens <= DEFAULT_MAX_THINK_TOKENS:
+            raise ValueError(
+                "max_think_tokens must be an int between 1 and "
+                f"{DEFAULT_MAX_THINK_TOKENS}, got {self.max_think_tokens!r}"
+            )
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
@@ -108,5 +129,6 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_interval": tuple(self.cfg_interval),
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
+            "max_think_tokens": self.max_think_tokens,
         }
         return extra

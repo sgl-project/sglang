@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,
+    DEFAULT_MAX_THINK_TOKENS,
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
@@ -37,6 +38,7 @@ class SenseNovaU1GenerationOptions:
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    max_think_tokens: int = DEFAULT_MAX_THINK_TOKENS
 
     @classmethod
     def from_batch(cls, batch: Req) -> SenseNovaU1GenerationOptions:
@@ -50,6 +52,9 @@ class SenseNovaU1GenerationOptions:
             cfg_interval=tuple(extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)),
             t_eps=float(extra.get("t_eps", DEFAULT_T_EPS)),
             think_mode=bool(extra.get("think_mode", DEFAULT_THINK_MODE)),
+            max_think_tokens=int(
+                extra.get("max_think_tokens", DEFAULT_MAX_THINK_TOKENS)
+            ),
         )
 
 
@@ -116,6 +121,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             batch_size=batch_size,
             t_eps=options.t_eps,
             think_mode=options.think_mode,
+            max_think_tokens=options.max_think_tokens,
             seed=seed,
         )
         think_text = None
@@ -126,7 +132,14 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
         images = _denorm_sensenova_output(images)
         samples = [sample.contiguous() for sample in images]
-        usage = {"think_text": think_text} if think_text is not None else None
+        usage = None
+        if think_text is not None:
+            usage = {
+                "think_text": think_text,
+                "reasoning_tokens": int(
+                    getattr(self.model, "last_think_token_count", 0)
+                ),
+            }
         return OutputBatch(
             output=samples,
             metrics=batch.metrics,

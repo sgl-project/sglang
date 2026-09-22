@@ -78,6 +78,28 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Enable Thinking Mode
+
+Thinking mode is disabled by default. Enable it per request with the
+SenseNova-specific `think_mode` field. `max_think_tokens` controls the reasoning
+budget and accepts values from 1 to 1024.
+
+```bash Command
+curl http://localhost:30000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sensenova/SenseNova-U1.5-8B-MoT",
+    "prompt": "A clean technology poster with structured layout and clear typography.",
+    "response_format": "b64_json",
+    "think_mode": true,
+    "max_think_tokens": 256
+  }'
+```
+
+The response includes the generated reasoning text and its token count under
+`usage.think_text` and `usage.reasoning_tokens`. Thinking adds an autoregressive
+reasoning pass before image denoising, so it also increases request latency.
+
 ## 5. Advanced usage
 
 ### 5.1 Dynamic request batching
