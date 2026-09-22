@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 import unittest
 from functools import partial
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
@@ -372,6 +372,9 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             disaggregation_mode=DisaggregationMode(role),
             enable_priority_scheduling=False,
             _request_has_grammar=lambda obj: False,
+        )
+        manager._request_metric_labels = MethodType(
+            TokenizerManager._request_metric_labels, manager
         )
         state = SimpleNamespace(
             obj=SimpleNamespace(stream=False),

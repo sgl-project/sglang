@@ -452,27 +452,36 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+def _run_with_metrics(case, batches, disaggregation_mode=DisaggregationMode.NULL):
+    """Feed (completion_tokens, finished_reason) batches for one request through
+    _handle_batch_output with metrics on; returns the mocked collector."""
+    tm = _make_tokenizer_manager(case)
+    tm.enable_metrics = True
+    tm.enable_priority_scheduling = False
+    tm.disaggregation_mode = disaggregation_mode
+    tm.metrics_collector = MagicMock(labels={})
+    rid = "metrics_rid"
+    state = _make_req_state(rid)
+    state.obj.log_metrics = True
+    state.obj.sampling_params = {}
+    state.obj.custom_labels = None
+    tm.rid_to_state[rid] = state
+    for completion_tokens, finished_reason in batches:
+        batch_output = _make_batch_str_output(rid, finished_reason)
+        batch_output.completion_tokens = [completion_tokens]
+        batch_output.prompt_tokens = [100]
+        batch_output.cached_tokens = [60]
+        asyncio.run(tm._handle_batch_output(batch_output))
+    return tm.metrics_collector
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
 
     def _run(self, batches, disaggregation_mode=DisaggregationMode.NULL):
-        tm = _make_tokenizer_manager(self)
-        tm.enable_metrics = True
-        tm.enable_priority_scheduling = False
-        tm.disaggregation_mode = disaggregation_mode
-        tm.metrics_collector = MagicMock(labels={})
-        rid = "tpot_rid"
-        state = _make_req_state(rid)
-        state.obj.log_metrics = True
-        state.obj.sampling_params = {}
-        state.obj.custom_labels = None
-        tm.rid_to_state[rid] = state
-        for completion_tokens, finished_reason in batches:
-            batch_output = _make_batch_str_output(rid, finished_reason)
-            batch_output.completion_tokens = [completion_tokens]
-            asyncio.run(tm._handle_batch_output(batch_output))
-        (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
+        collector = _run_with_metrics(self, batches, disaggregation_mode)
+        (call,) = collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
 
     def test_single_batch_finish_records_nothing(self):
@@ -495,6 +504,58 @@ class TestRequestTpotGating(CustomTestCase):
                     self.assertGreater(tpot, 0.0)
                 else:
                     self.assertIsNone(tpot)
+
+
+class TestFinishedOutcomeMetrics(CustomTestCase):
+    """Every terminal request is counted by outcome exactly once."""
+
+    def test_batch_output_outcomes(self):
+        cases = [
+            ("stop", {"type": "stop"}, "success"),
+            ("length", {"type": "length"}, "success"),
+            ("abort", {"type": "abort"}, "abort"),
+            ("unfinished", _NOT_FINISHED, None),
+        ]
+        for name, finished_reason, outcome in cases:
+            with self.subTest(name):
+                collector = _run_with_metrics(self, [(8, finished_reason)])
+                calls = collector.observe_finished_outcome.call_args_list
+                if outcome is None:
+                    self.assertEqual(calls, [])
+                    continue
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    calls[0].kwargs,
+                    dict(
+                        labels={}, outcome=outcome, prompt_tokens=100, cached_tokens=60
+                    ),
+                )
+
+    def test_scheduler_side_abort_is_counted_once(self):
+        """Waiting-queue, timeout, preemption and PD bootstrap aborts reach the
+        tokenizer as AbortReq, not a batch output, so collect_metrics never saw
+        them and outcome="abort" undercounted."""
+        tm = _make_tokenizer_manager(self)
+        tm.enable_metrics = True
+        tm.enable_priority_scheduling = False
+        tm.metrics_collector = MagicMock(labels={})
+        rid = "scheduler_abort_rid"
+        state = _make_req_state(rid)
+        state.obj.log_metrics = True
+        state.obj.custom_labels = None
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid, "Abort in waiting queue"))
+        # A late echo for the same rid finds no state and must not recount.
+        tm._handle_abort_req(_make_abort_req(rid, "Abort in waiting queue"))
+
+        self.assertEqual(
+            [
+                c.kwargs
+                for c in tm.metrics_collector.observe_finished_outcome.call_args_list
+            ],
+            [dict(labels={}, outcome="abort")],
+        )
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

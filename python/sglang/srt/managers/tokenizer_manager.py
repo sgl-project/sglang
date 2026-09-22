@@ -3022,13 +3022,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
-        completion_tokens = (
-            recv_obj.completion_tokens[i]
-            if getattr(recv_obj, "completion_tokens", None)
-            else 0
-        )
-
+    def _request_metric_labels(self, state: ReqState) -> Dict[str, str]:
         custom_labels = getattr(state.obj, "custom_labels", None)
         labels = dict(self.metrics_collector.labels)
         if custom_labels:
@@ -3037,6 +3031,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
+        return labels
+
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
+        completion_tokens = (
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None)
+            else 0
+        )
+
+        labels = self._request_metric_labels(state)
         finish_type = (recv_obj.finished_reasons[i] or {}).get("type")
         if (
             not state.ttft_observed
@@ -3088,16 +3092,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
-            reason_type = (recv_obj.finished_reasons[i] or {}).get("type")
-            if reason_type in ("stop", "length"):
-                outcome = "success"
-            elif reason_type == "abort":
-                outcome = "abort"
-            else:
-                outcome = "other"
             self.metrics_collector.observe_finished_outcome(
                 labels=labels,
-                outcome=outcome,
+                outcome="abort" if finish_type == "abort" else "success",
                 prompt_tokens=recv_obj.prompt_tokens[i],
                 cached_tokens=recv_obj.cached_tokens[i],
             )
@@ -3405,6 +3402,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         state.finished = True
         state.time_stats.set_finished_time()
+        if self.enable_metrics and state.obj.log_metrics:
+            # Scheduler-side aborts end here instead of in collect_metrics, and
+            # carry no token counts; rid_to_state removal keeps this single-shot.
+            self.metrics_collector.observe_finished_outcome(
+                labels=self._request_metric_labels(state), outcome="abort"
+            )
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {

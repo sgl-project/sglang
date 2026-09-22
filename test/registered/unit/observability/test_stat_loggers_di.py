@@ -299,5 +299,33 @@ class TestRequestTimePerOutputToken(CustomTestCase):
         )
 
 
+class TestFinishedOutcomeCounters(CustomTestCase):
+    def test_token_counters_skip_requests_without_token_counts(self):
+        """Scheduler-side aborts report no token counts: only the request
+        counter moves, so token ratios by outcome are not skewed by zeros."""
+        labels = {"model_name": "test"}
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            collector = _RecordingTokenizerMetricsCollector(labels=labels)
+        collector.observe_finished_outcome(
+            labels=labels, outcome="success", prompt_tokens=100, cached_tokens=60
+        )
+        collector.observe_finished_outcome(labels=labels, outcome="abort")
+
+        success = {**labels, "outcome": "success"}
+        abort = {**labels, "outcome": "abort"}
+        self.assertEqual(
+            collector.finished_requests_by_outcome.increments,
+            [(success, 1), (abort, 1)],
+        )
+        self.assertEqual(
+            collector.finished_prompt_tokens_by_outcome.increments, [(success, 100)]
+        )
+        self.assertEqual(
+            collector.finished_cached_tokens_by_outcome.increments, [(success, 60)]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

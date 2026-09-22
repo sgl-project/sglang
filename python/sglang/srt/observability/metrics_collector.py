@@ -1561,17 +1561,26 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
         self.finished_requests_by_outcome = Counter(
             name="sglang:finished_requests_by_outcome_total",
-            documentation="Terminal request outcomes, including aborts with no output.",
+            documentation=(
+                "Finished requests by outcome (success = stop or length), "
+                "including scheduler-side aborts."
+            ),
             labelnames=[*labels.keys(), "outcome"],
         )
         self.finished_prompt_tokens_by_outcome = Counter(
             name="sglang:finished_prompt_tokens_by_outcome_total",
-            documentation="Reported prompt tokens at completion by outcome; not executed prefill work.",
+            documentation=(
+                "Reported prompt tokens of finished requests by outcome, not "
+                "executed prefill work; excludes scheduler-side aborts."
+            ),
             labelnames=[*labels.keys(), "outcome"],
         )
         self.finished_cached_tokens_by_outcome = Counter(
             name="sglang:finished_cached_tokens_by_outcome_total",
-            documentation="Reported cached prompt tokens at completion by outcome.",
+            documentation=(
+                "Reported cached prompt tokens of finished requests by outcome; "
+                "excludes scheduler-side aborts."
+            ),
             labelnames=[*labels.keys(), "outcome"],
         )
         self.prompt_tokens_total = Counter(
@@ -1816,11 +1825,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         *,
         labels: Dict[str, str],
         outcome: str,
-        prompt_tokens: int,
-        cached_tokens: int,
+        prompt_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
     ) -> None:
         outcome_labels = {**labels, "outcome": outcome}
         self.finished_requests_by_outcome.labels(**outcome_labels).inc()
+        if prompt_tokens is None:
+            return
         self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(
             prompt_tokens
         )
