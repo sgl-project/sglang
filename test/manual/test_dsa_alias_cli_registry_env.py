@@ -1,14 +1,4 @@
-"""
-Manual test for step 01: NSA → DSA user-facing alias layer.
-
-Tests:
-  1. CLI: --dsa-* non-CP canonical flags write to dsa_* attrs
-  2. Registry: "dsa" key creates the backend; "nsa" key triggers DeprecationWarning
-  3. Env: SGLANG_DSA_* canonical vars work
-
-Run:
-    python test/manual/test_dsa_alias_cli_registry_env.py
-"""
+"""DSA canonical CLI flags, env vars, and the deprecated "nsa" registry key."""
 
 import argparse
 import os

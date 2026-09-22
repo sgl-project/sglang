@@ -1,13 +1,4 @@
-"""
-Test weight version functionality.
-
-This test suite verifies the weight_version feature implementation including:
-1. Default weight_version setting
-2. /model_info reports weight_version
-3. /update_weight_version endpoint
-4. /generate request meta_info contains weight_version
-5. OpenAI API response metadata contains weight_version
-"""
+"""weight_version: /model_info, /update_weight_version, and generate/OpenAI metadata."""
 
 import unittest
 
