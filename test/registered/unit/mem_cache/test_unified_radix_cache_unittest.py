@@ -9664,6 +9664,62 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         cache.sanity_check()
 
 
+class TestBufferPrefetchAttribution(unittest.TestCase):
+    def test_prepare_preserves_completed_span(self):
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        for prefix, staged, expected in (
+            (512, True, 768),  # A peer supplied only the head; stage the tail.
+            (1024, True, 768),  # A peer supplied the entire completed span.
+            (512, False, 256),  # A dropped tail must not erase the covered head.
+            (128, False, 0),  # No completed L3 tokens remain in the prefix.
+        ):
+            with self.subTest(prefix=prefix, staged=staged):
+                req = mock.Mock(spec=Req)
+                req.rid = "req"
+                req.cache_request_handle = CacheRequestHandle("req", 0)
+                req.prefix_indices = torch.arange(prefix)
+                req.kv = SimpleNamespace(cache_protected_len=prefix)
+                req.storage_hit_start = 256
+                req.storage_hit_length = 768
+                req.host_hit_is_storage = False
+                req.host_loaded_length = 0
+                req.fulfilled_storage_hit_len.side_effect = lambda length: (
+                    Req.fulfilled_storage_hit_len(req, length)
+                )
+                f = SimpleNamespace(
+                    matched_len=256,
+                    num_tokens=768,
+                    key_tokens=array("q", range(1024)),
+                    extra_key=None,
+                    cache_salt=None,
+                    aux_xfers=[],
+                    operation_id=1,
+                )
+                pipeline = BufferModePipeline.__new__(BufferModePipeline)
+                pipeline._cache = mock.Mock()
+                pipeline._cache.tree_core.is_eagle = False
+                pipeline._cache.tree_core.match_full_device_prefix.return_value = (
+                    prefix,
+                    1,
+                    None,
+                )
+                pipeline._cache.tree_core.collect_full_device_indices.return_value = (
+                    torch.arange(prefix)
+                )
+                pipeline.staged_prefetches = (
+                    {req.cache_request_handle: f} if staged else {}
+                )
+                pipeline.release_staged_hold = mock.Mock()
+                self.assertTrue(pipeline.prepare_staged_prefetch(req))
+                self.assertEqual(req.storage_hit_start, 256)
+                self.assertEqual(req.storage_hit_length, expected)
+                if staged and prefix == 512:
+                    self.assertEqual(req.host_hit_length, 512)
+                if staged and prefix == 1024:
+                    pipeline.release_staged_hold.assert_called_once()
+
+
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
@@ -9685,6 +9741,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.storage_start = 16
         cache.ongoing_prefetch = {
             operation.handle: _OngoingPrefetch(
                 7,
@@ -9702,6 +9759,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
         cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
@@ -9733,6 +9791,12 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+        # Dedup changes ownership, not the source of this request's cache hit.
+        self.assertEqual(cache.prefetch_loaded_tokens_by_reqid[operation.handle], 8)
+        self.assertEqual(
+            cache.prefetch_loaded_storage_start_by_reqid[operation.handle], 16
+        )
+        cache._resolve_storage_prefetch_tokens.assert_not_called()
 
 
 class TestUnifiedRadixPrefetchCorruption(CustomTestCase):

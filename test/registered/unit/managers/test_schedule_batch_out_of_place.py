@@ -82,6 +82,31 @@ class TestCachedPrefixTierAttribution(unittest.TestCase):
             with self.subTest(**kwargs):
                 self.assertEqual(split_cached_prefix_by_tier(**kwargs), expected)
 
+    def test_loaded_spans_survive_rematch(self):
+        # Retry, clipped L3 tail, overlapping/disjoint loads, and declined H2D.
+        for prefix, spans, expected in [
+            (1024, [(256, 1024)], (256, 512, 256)),
+            (640, [(256, 1024)], (256, 384, 0)),
+            (896, [(256, 1024)], (256, 512, 128)),
+            (1024, [(512, 1024), (256, 768)], (256, 512, 256)),
+            (1024, [(256, 512), (768, 1024)], (512, 256, 256)),
+            (256, [], (256, 0, 0)),
+            (1024, [], (768, 0, 256)),  # Entire L3 span supplied by a peer.
+        ]:
+            with self.subTest(prefix=prefix, spans=spans):
+                self.assertEqual(
+                    split_cached_prefix_by_tier(
+                        prefix, 0, 256, 768, host_loaded_spans=spans
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            split_cached_prefix_by_tier(
+                1024, 0, 768, 256, True, host_loaded_spans=[(256, 1024)]
+            ),
+            (256, 0, 768),
+        )
+
 
 def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:
     batch = ScheduleBatch(reqs=overrides.pop("reqs"))

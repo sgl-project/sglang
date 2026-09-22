@@ -922,6 +922,7 @@ class PrefillAdder:
                 storage_hit_len=req.storage_hit_length,
                 storage_hit_start=req.storage_hit_start,
                 host_hit_is_storage=req.host_hit_is_storage,
+                host_loaded_spans=req.host_loaded_spans,
             )
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
@@ -1295,6 +1296,9 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 new_indices, req.last_node = loaded
                 req.host_loaded_length = len(new_indices)
+                if len(new_indices):
+                    start = len(req.prefix_indices)
+                    req.host_loaded_spans.append((start, start + len(new_indices)))
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "

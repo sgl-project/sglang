@@ -203,6 +203,7 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_loaded_start_by_reqid: dict[str, int] = {}
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -796,6 +797,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_loaded_start_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1391,7 +1393,6 @@ class HiRadixCache(RadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -1693,9 +1694,16 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        # Track tokens actually loaded from storage for this request (L3 hits)
+        # Attribute the completed L3 span, including concurrent insert dedup.
         loaded_from_storage = min_completed_tokens - matched_length
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self.prefetch_loaded_tokens_by_reqid[req_id] = min_completed_tokens
+        if min_completed_tokens > 0:
+            storage_start = 0
+            node = last_host_node
+            while node.parent is not None:
+                storage_start += len(node.key)
+                node = node.parent
+            self.prefetch_loaded_start_by_reqid[req_id] = storage_start
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -1736,7 +1744,16 @@ class HiRadixCache(RadixCache):
         Returns 0 if no prefetch was done or was revoked.
         This should be called after check_prefetch_progress() returns True.
         """
-        return self.prefetch_loaded_tokens_by_reqid.pop(handle.rid, 0)
+        return self.pop_prefetch_loaded_span(handle)[0]
+
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
+        req_id = handle.rid
+        return (
+            self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0),
+            self.prefetch_loaded_start_by_reqid.pop(req_id, None),
+        )
 
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
@@ -2015,6 +2032,7 @@ class HiRadixCache(RadixCache):
         rid = handle.rid
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_loaded_start_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return
