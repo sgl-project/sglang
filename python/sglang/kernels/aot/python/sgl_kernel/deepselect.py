@@ -80,23 +80,8 @@ def topk(
     per-row exclusive valid length and is the ``topk_lengths`` input used by
     variable-length decode.
     """
-    if input.dim() != 2 or input.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("input must be a 2D bfloat16 or float32 tensor")
-    if not input.is_cuda:
-        raise ValueError("input must be a CUDA tensor")
-    if not 0 < topk <= 4096:
-        raise ValueError("topk must be in [1, 4096]")
-    if not is_deepselect_supported(input.device):
-        raise RuntimeError(
-            f"DeepSelect does not support CUDA device {input.device}; "
-            f"compiled architectures: {get_deepselect_supported_architectures()}"
-        )
-    if begin is not None:
-        raise ValueError("begin is not supported currently")
     if hint is not None:
         raise ValueError("hint is not supported currently")
-    if indices_type not in (torch.int32, torch.int64):
-        raise ValueError("indices_type must be torch.int32 or torch.int64")
 
     values = (
         _aligned_empty(
@@ -120,8 +105,6 @@ def topk(
     elif output_idx.dtype != indices_type:
         raise ValueError("output_idx dtype must match indices_type")
 
-    if input.shape[0] == 0:
-        return values, output_idx
     torch.ops.sgl_kernel.deepselect_topk(
         input,
         topk,

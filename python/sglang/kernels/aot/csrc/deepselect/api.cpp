@@ -130,6 +130,7 @@ void deepselect_topk(
       "DeepSelect was not compiled for SM",
       device_prop->major,
       device_prop->minor);
+  if (input.size(0) == 0) return;
 
   TopkSelectArgs args{
       static_cast<uint32_t>(input.size(0)),

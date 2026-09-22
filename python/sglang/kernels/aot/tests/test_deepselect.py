@@ -65,6 +65,36 @@ def test_deepselect_topk_matches_official_signature():
 
 
 @pytest.mark.parametrize(
+    "case,error",
+    [
+        pytest.param("dtype", "input dtype must be", id="dtype"),
+        pytest.param("dimension", "input must be a 2D tensor", id="dimension"),
+        pytest.param("topk", "topk must be in", id="topk"),
+        pytest.param("begin", "`begin` is not supported", id="begin"),
+        pytest.param("index-dtype", "output_index dtype must be", id="index-dtype"),
+    ],
+)
+def test_deepselect_validation_is_owned_by_cpp(case, error):
+    from sgl_kernel.deepselect import topk
+
+    input = _aligned_input(1, 1024, torch.float32)
+    kwargs = {}
+    if case == "dtype":
+        input = _aligned_input(1, 1024, torch.float16)
+    elif case == "dimension":
+        input = input[0]
+    elif case == "topk":
+        kwargs["topk"] = 0
+    elif case == "begin":
+        kwargs["begin"] = torch.zeros(1, dtype=torch.int32, device="cuda")
+    elif case == "index-dtype":
+        kwargs["indices_type"] = torch.float16
+
+    with pytest.raises(RuntimeError, match=error):
+        topk(input, kwargs.pop("topk", 512), **kwargs)
+
+
+@pytest.mark.parametrize(
     "dtype,index_dtype,rows,width,topk",
     [
         pytest.param(torch.float32, torch.int32, 3, 16385, 512, id="fp32-i32-512"),
