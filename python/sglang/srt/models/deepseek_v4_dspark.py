@@ -20,10 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -118,6 +115,7 @@ class DSparkAttention(MqaAttentionBase):
             fuse_wqa_wkv=False,
             wo_a_fp8=False,
             wo_a_keeps_quant_config=False,
+            wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
         assert self.compress_ratio == 0, (
@@ -366,8 +364,6 @@ class DSparkAttention(MqaAttentionBase):
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
-        if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
-            out = attn_tp_all_reduce(out)
         return out
 
 
