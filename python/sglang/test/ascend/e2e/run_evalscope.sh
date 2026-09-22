@@ -8,32 +8,30 @@ PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
 EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope
 pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 
-# Bounds on key dependencies to prevent the pip resolver from degrading to ancient, incompatible versions (e.g. aiohttp 1.0.5).
+# Bound key deps so the resolver cannot fall back to ancient versions.
 EVALSCOPE_CONSTRAINTS=(
     "aiohttp>=3.11,<4"
     "httpx>=0.28,<1"
 )
 
-# Upper bound (seconds) for the pip install step. If any other component triggers
-# resolver backtracking and the install hangs, fail fast instead of timing out the
-# whole job.
+# Fail fast when the pip install hangs instead of timing out the whole job.
 EVALSCOPE_INSTALL_TIMEOUT=1200
 
 # Highest priority: reuse a system-wide evalscope (e.g. pre-installed in the
-# image). The test suite always runs ${PYTHON_FOR_EVALSCOPE}/bin/python, so make
-# sure the virtual env exists and can see the system site-packages, then skip the
-# installation.
+# image); create ${PYTHON_FOR_EVALSCOPE} with --system-site-packages when needed.
 if python -c "import evalscope" >/dev/null 2>&1; then
     echo "evalscope found in the system python, reuse it instead of installing."
     if ! ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
         python -m venv --system-site-packages ${PYTHON_ENV_FOR_EVALSCOPE}
     fi
-    exit 0
+    # Only skip the install when the env really imports evalscope.
+    if ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
+        exit 0
+    fi
+    echo "The env cannot provide evalscope, install it instead."
 fi
 
-# Otherwise reuse the virtual env when it already provides evalscope.
-# Importability is validated instead of the bare directory existence, so a broken
-# or partially populated env still gets installed.
+# Otherwise reuse the virtual env when it already imports evalscope.
 if [ -x "${PYTHON_FOR_EVALSCOPE}" ] && ${PYTHON_FOR_EVALSCOPE} -c "import evalscope" >/dev/null 2>&1; then
     echo "evalscope already exists in ${PYTHON_ENV_FOR_EVALSCOPE}, skip installation."
     exit 0
