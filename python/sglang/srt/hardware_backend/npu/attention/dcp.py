@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
-import torch_npu
 
+from sglang.srt.layers.dcp.comm import dcp_a2a_lse_reduce
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -60,12 +59,14 @@ def merge_mla_dcp_output_npu(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
 ) -> torch.Tensor:
-    """Exchange DCP partial states and merge them with Ascend's LSE operator.
+    """Compactly exchange and merge DCP partial attention states.
 
     ``partial_output`` is ``[B, H_local * N, D]``.  AllToAll routes the same
     ``H_local`` head slice from every KV-shard rank to its owner.  The local
-    update then combines those ``N`` independently normalized attention states
-    and returns ``[B, H_local, D]``.
+    Triton combine kernel then reads BF16/FP16 output and FP32 LSE directly from
+    the packed receive buffer and returns ``[B, H_local, D]``.  This reuses the
+    common DCP A2A path, avoids expanding every output element to FP32 for HCCL,
+    and does not materialize an unpacked intermediate tensor.
     """
     parallel = get_parallel()
     if not parallel.dcp_enabled:
@@ -85,37 +86,15 @@ def merge_mla_dcp_output_npu(
         # ambiguous empty LSE reshape and a zero-sized HCCL all-to-all.
         return partial_output.new_empty((0, local_heads, head_dim))
 
-    group = parallel.dcp_group
-    partial_lse = partial_lse.reshape(batch_size, total_heads, -1)[..., :1]
-    out_lse = torch.cat(
-        [partial_output.to(torch.float32), partial_lse.to(torch.float32)], dim=-1
-    )
-    # Split dimension 0 into equal head chunks for all_to_all_single.
-    send = out_lse.permute(1, 2, 0).contiguous()
-    recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send, group=group.device_group)
-    received = recv.permute(2, 0, 1).contiguous()
-
-    # [B, source_rank, H_local, D+1] -> [source_rank, B, H_local, D+1]
-    received = (
-        received.view(batch_size, dcp_size, local_heads, head_dim + 1)
-        .permute(1, 0, 2, 3)
+    partial_lse = (
+        partial_lse.reshape(batch_size, total_heads, -1)[..., 0]
+        .to(torch.float32)
         .contiguous()
     )
-    output_states = received[..., :head_dim].flatten(1, 2)
-    lse_states = received[..., head_dim].flatten(1, 2)
-    # npu_attention_update is undefined when every source state is empty (the
-    # normal case for NPUGraph padding rows).  Give those columns a harmless
-    # finite identity for the operator, then force their final output to zero.
-    all_empty = torch.isneginf(lse_states).all(dim=0)
-    safe_lse_states = torch.where(
-        all_empty.unsqueeze(0), torch.zeros_like(lse_states), lse_states
+    return dcp_a2a_lse_reduce(
+        partial_output,
+        partial_lse,
+        parallel.dcp_group,
+        is_lse_base_on_e=True,
+        comm_backend="a2a",
     )
-    safe_output_states = torch.where(
-        all_empty.view(1, -1, 1), torch.zeros_like(output_states), output_states
-    )
-    merged, _ = torch_npu.npu_attention_update(
-        safe_lse_states.unbind(0), safe_output_states.unbind(0), 0
-    )
-    merged = torch.where(all_empty.unsqueeze(-1), torch.zeros_like(merged), merged)
-    return merged.view(batch_size, local_heads, head_dim).to(partial_output.dtype)

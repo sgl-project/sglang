@@ -530,6 +530,31 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
 
         self.assertEqual(output.shape, (0, 4, 16))
 
+    @patch("sglang.srt.hardware_backend.npu.attention.dcp.dcp_a2a_lse_reduce")
+    def test_merge_reuses_compact_common_a2a(self, compact_a2a):
+        partial_output = torch.randn(2, 8, 16, dtype=torch.bfloat16)
+        partial_lse = torch.randn(2, 8, 1, dtype=torch.bfloat16)
+        expected = torch.randn(2, 4, 16, dtype=torch.bfloat16)
+        compact_a2a.return_value = expected
+        dcp_group = MagicMock()
+
+        with rc.get_parallel().override(
+            dcp_enabled=True,
+            dcp_size=2,
+            dcp_rank=0,
+            dcp_group=dcp_group,
+        ):
+            output = merge_mla_dcp_output_npu(partial_output, partial_lse)
+
+        self.assertIs(output, expected)
+        args, kwargs = compact_a2a.call_args
+        self.assertIs(args[0], partial_output)
+        self.assertEqual(args[1].shape, (2, 8))
+        self.assertEqual(args[1].dtype, torch.float32)
+        self.assertIs(args[2], dcp_group)
+        self.assertTrue(kwargs["is_lse_base_on_e"])
+        self.assertEqual(kwargs["comm_backend"], "a2a")
+
 
 class TestGenerateMaskFlag(unittest.TestCase):
     def test_shape(self):
