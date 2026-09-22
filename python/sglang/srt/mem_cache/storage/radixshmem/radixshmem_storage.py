@@ -11,6 +11,10 @@ radix path per page (prefix query, run pull); a TRAILING_PAGES pool keeps
 each page as its own one-block path, since only a window at the end of the
 sequence exists. A pool without bytes (DeepSeek-V4's logical KV anchor) is
 never stored.
+
+With rank-replicated pools only TP rank 0 drives the index. The other ranks
+attach read-only, report every page as present (sglang takes the minimum
+over ranks) and copy pages once rank 0 has pulled them.
 """
 
 from __future__ import annotations
@@ -19,7 +23,8 @@ import ctypes
 import hashlib
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -36,6 +41,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 logger = logging.getLogger(__name__)
 
+
 def _salt(*parts: object) -> int:
     digest = hashlib.blake2b("|".join(map(str, parts)).encode(), digest_size=8)
     return int.from_bytes(digest.digest(), "little")
@@ -44,6 +50,10 @@ def _salt(*parts: object) -> int:
 def _page_bytes(host_pool: Any) -> int:
     meta = host_pool.get_page_buffer_meta(torch.arange(host_pool.page_size))
     return sum(meta[1]) if meta else 0
+
+
+def _no_slots() -> np.ndarray:
+    return np.empty(0, dtype=np.int32)
 
 
 class _Pool:
@@ -59,10 +69,12 @@ class RadixShmemStorage(HiCacheStorage):
 
         self.shmradix = shmradix
         cfg = storage_config.extra_config or {}
+        self.leader = storage_config.tp_rank == 0 or not storage_config.is_mla_model
         self.client = shmradix.RadixClient(
             cfg.get("radixshmem_name", "/shmradix"),
             endpoint=cfg.get("radixshmem_endpoint"),
             max_outstanding=int(cfg.get("radixshmem_max_outstanding", 256)),
+            local_read_only=not self.leader,
         )
         self.ready_timeout_s = float(cfg.get("radixshmem_timeout_s", 300))
         self.pull_timeout_ms = int(cfg.get("radixshmem_pull_timeout_ms", 30000))
@@ -117,11 +129,12 @@ class RadixShmemStorage(HiCacheStorage):
             self.store = self.client.store
             self._data_view = self.store.data_view()
             self._data_base = np.frombuffer(self._data_view, dtype=np.uint8).ctypes.data
-            self.distributed = bool(self.client.is_distributed())
+            self.distributed = self.leader and bool(self.client.is_distributed())
             self.slot_bytes = slot_bytes
             logger.info(
-                "RadixShmemStorage ready: block_size=%d slot_bytes=%d slots=%d "
-                "distributed=%s pools=%s",
+                "RadixShmemStorage ready: leader=%s block_size=%d slot_bytes=%d "
+                "slots=%d distributed=%s pools=%s",
+                self.leader,
                 self.block_size,
                 slot_bytes,
                 info.geometry["pools"]["full"]["num_slots"],
@@ -221,16 +234,33 @@ class RadixShmemStorage(HiCacheStorage):
             q.finalize()
         return hit
 
-    def _pull(self, chain: np.ndarray):
-        """Pull the chain's remote run into local slots; None on timeout."""
-        job = self.client.pull_async(
-            chain, self.full_mask, lock=True, timeout_ms=self.pull_timeout_ms
-        )
-        try:
-            return job.wait(self.pull_timeout_ms / 1000 + 5)
-        except TimeoutError:
-            job.cancel()
-            return None
+    def _fetch(self, chain: np.ndarray, need: int) -> tuple[np.ndarray, Callable]:
+        """Local slots of the chain's present prefix, pinned until the returned
+        callable runs. The leader pulls the remote run; a follower waits for
+        the leader's promotion of ``need`` blocks, then settles for less."""
+        if self.leader:
+            job = self.client.pull_async(
+                chain, self.full_mask, lock=True, timeout_ms=self.pull_timeout_ms
+            )
+            try:
+                result = job.wait(self.pull_timeout_ms / 1000 + 5)
+            except TimeoutError:
+                job.cancel()
+                return _no_slots(), lambda: None
+            return result.full_slots, result.finalize
+        deadline = time.monotonic() + self.pull_timeout_ms / 1000
+        while True:
+            q = self.index.query(
+                chain, self.full_mask, local_only=True, lock=True, update_meta=False
+            )
+            hit = int(q.common_hit) if int(q.status) == 0 else 0
+            finalize = q.finalize or (lambda: None)
+            if hit >= need or time.monotonic() >= deadline:
+                runs = [np.asarray(s, np.int32) for _, _, s in q.full_fragments]
+                slots = np.concatenate(runs)[:hit] if runs else _no_slots()
+                return slots, finalize
+            finalize()
+            time.sleep(0.005)
 
     def _allocate(self, n: int) -> Optional[np.ndarray]:
         slots = np.asarray(self.index.allocate_slots(n, self.full), dtype=np.int32)
@@ -252,19 +282,24 @@ class RadixShmemStorage(HiCacheStorage):
                     ctypes.memmove(ptrs[j], dst, sizes[j])
                 dst += sizes[j]
 
+    def _writable(self) -> None:
+        self._attach()
+        if not self.leader:
+            raise RuntimeError("radixshmem: only TP rank 0 writes replicated pools")
+
     # ---- ALL_PAGES pools: one radix path ----
 
     def _hit(self, pool: _Pool, keys, extra_info) -> int:
         self._attach()
         if not keys:
             return 0
-        if pool.page_bytes == 0:
+        if pool.page_bytes == 0 or not self.leader:
             return len(keys)
         chain, start = self._chain(pool, keys, extra_info)
         return max(0, min(self._query(chain) - start, len(keys)))
 
     def _store(self, pool: _Pool, keys, host_indices, extra_info) -> List[bool]:
-        self._attach()
+        self._writable()
         n = len(keys)
         if n == 0:
             return []
@@ -289,31 +324,31 @@ class RadixShmemStorage(HiCacheStorage):
         if pool.page_bytes == 0:
             return [True] * n
         chain, start = self._chain(pool, keys, extra_info)
-        result = self._pull(chain)
-        if result is None:
-            return [False] * n
+        slots, finalize = self._fetch(chain, start + n)
         try:
-            hit = max(0, min(int(result.common_hit) - start, n))
+            hit = max(0, min(len(slots) - start, n))
             if hit:
                 page_size = pool.host_pool.page_size
                 self._copy(
                     pool.host_pool,
                     host_indices[: hit * page_size],
-                    result.full_slots[start : start + hit],
+                    slots[start : start + hit],
                     to_slot=False,
                 )
         finally:
-            result.finalize()
+            finalize()
         return [True] * hit + [False] * (n - hit)
 
     # ---- TRAILING_PAGES pools: one-block path per page ----
 
     def _present(self, pool: _Pool, keys) -> List[bool]:
         self._attach()
+        if not self.leader:
+            return [True] * len(keys)
         return [self._query(self._single(pool, key)) == 1 for key in keys]
 
     def _store_pages(self, pool: _Pool, keys, host_indices) -> List[bool]:
-        self._attach()
+        self._writable()
         n = len(keys)
         if n == 0:
             return []
@@ -337,17 +372,16 @@ class RadixShmemStorage(HiCacheStorage):
         page_size = pool.host_pool.page_size
         ok = []
         for i, key in enumerate(keys):
-            result = self._pull(self._single(pool, key))
-            hit = result is not None and int(result.common_hit) == 1
+            slots, finalize = self._fetch(self._single(pool, key), 1)
+            hit = len(slots) >= 1
             if hit:
                 self._copy(
                     pool.host_pool,
                     host_indices[i * page_size : (i + 1) * page_size],
-                    result.full_slots[:1],
+                    slots[:1],
                     to_slot=False,
                 )
-            if result is not None:
-                result.finalize()
+            finalize()
             ok.append(hit)
         return ok
 
@@ -355,7 +389,8 @@ class RadixShmemStorage(HiCacheStorage):
 
     def clear(self) -> bool:
         self._attach()
-        self.index.reset()
+        if self.leader:
+            self.index.reset()
         return True
 
     def close(self) -> None:

@@ -79,13 +79,15 @@ class _FakeIndex:
 
     def query(self, chain, mask, local_only, lock, update_meta):
         hit = self._hit(chain)
+        slots = np.array(
+            [self.paths[tuple(chain[: i + 1].tolist())] for i in range(hit)],
+            dtype=np.int32,
+        )
         return SimpleNamespace(
             status=0,
             common_hit=hit,
-            full_slots=np.array(
-                [self.paths[tuple(chain[: i + 1].tolist())] for i in range(hit)],
-                dtype=np.int32,
-            ),
+            full_slots=slots,
+            full_fragments=[(0, 0, slots)],
             finalize=lambda: None,
         )
 
@@ -137,11 +139,25 @@ class _FakeServer:
             raise _GeometryMismatch(f"{self.geometry} != {geometry.key}")
 
 
+class _ReadOnlyIndex:
+    """What a local_read_only client may do: query only."""
+
+    def __init__(self, index):
+        self.query = index.query
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"local_read_only client: {name} not allowed")
+
+
 class _FakeClient:
     servers = {}
 
-    def __init__(self, name, geometry=None, *, endpoint=None, max_outstanding=256):
+    def __init__(
+        self, name, geometry=None, *, endpoint=None, max_outstanding=256,
+        local_read_only=False,
+    ):
         self.server = _FakeClient.servers.setdefault(name, _FakeServer())
+        self.local_read_only = local_read_only
         if geometry is not None:
             self.configure(geometry)
 
@@ -161,6 +177,8 @@ class _FakeClient:
 
     @property
     def index(self):
+        if self.local_read_only:
+            return _ReadOnlyIndex(self.server.index)
         return self.server.index
 
     @property
@@ -171,6 +189,8 @@ class _FakeClient:
         return False
 
     def pull_async(self, chain, mask, lock=True, timeout_ms=0, block=True):
+        if self.local_read_only:
+            raise RuntimeError("local_read_only client: pull_async not allowed")
         result = self.index.query(chain, mask, False, lock, True)
         return SimpleNamespace(wait=lambda timeout=None: result, cancel=lambda: None)
 
@@ -214,7 +234,7 @@ class _LogicalPool:
         return None
 
 
-def _config(tp_rank=0, is_mla=False):
+def _config(tp_rank=0, is_mla=False, pull_timeout_ms=30000):
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=2,
@@ -226,7 +246,10 @@ def _config(tp_rank=0, is_mla=False):
         enable_storage_metrics=False,
         is_page_first_layout=True,
         model_name="m",
-        extra_config={"radixshmem_name": "test"},
+        extra_config={
+            "radixshmem_name": "test",
+            "radixshmem_pull_timeout_ms": pull_timeout_ms,
+        },
     )
 
 
@@ -327,6 +350,27 @@ class TestRadixShmemStorage(CustomTestCase):
         m1, _ = self._backend(tp_rank=1, is_mla=True)
         m0.batch_set_v1(keys, _indices(2), _info([]))
         self.assertEqual(m1.batch_exists(keys, _info([])), 2)
+
+    def test_follower_rank(self):
+        keys = _keys(3)
+        leader, src = self._backend(tp_rank=0, is_mla=True)
+        follower, dst = self._backend(tp_rank=1, is_mla=True, pull_timeout_ms=50)
+        for p in range(3):
+            src.page(p).fill_(p + 1)
+        # A follower never asks the index: every page counts as present and
+        # sglang keeps the minimum over ranks.
+        unknown = _keys(2, "unknown")
+        self.assertEqual(follower.batch_exists(unknown, _info([])), 2)
+        # Nothing stored yet: the follower waits for the leader, then gives up.
+        got = follower.batch_get_v1(keys, _indices(3), _info([]))
+        self.assertEqual(got, [False] * 3)
+        leader.batch_set_v1(keys, _indices(3), _info([]))
+        got = follower.batch_get_v1(keys, _indices(3), _info([]))
+        self.assertEqual(got, [True] * 3)
+        for p in range(3):
+            self.assertTrue(torch.equal(dst.page(p), src.page(p)))
+        with self.assertRaises(RuntimeError):
+            follower.batch_set_v1(keys, _indices(3), _info([]))
 
     def test_kv_derived_sidecar(self):
         storage, pool = self._backend()
