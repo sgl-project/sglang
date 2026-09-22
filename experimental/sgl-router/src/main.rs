@@ -50,14 +50,10 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
-    install_bootstrap_subscriber();
+    init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
-    init_tracing(
-        &config.observability.log_level,
-        config.observability.log_format,
-    )?;
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
@@ -148,16 +144,6 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
         );
     }
     Ok(())
-}
-
-// Provide startup logging before configuration resolution; later installs are no-ops.
-fn install_bootstrap_subscriber() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .try_init();
 }
 
 fn install_signal_handlers() -> Result<(Signal, Signal)> {
