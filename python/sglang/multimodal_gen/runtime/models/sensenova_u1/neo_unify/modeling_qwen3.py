@@ -341,6 +341,47 @@ def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
         print(" ".join(map(str, row)))
 
 
+def cache_dit_decoder_layers(
+    model: nn.Module,
+    *,
+    update_cache: bool,
+    exist_non_image_gen_tokens: bool,
+    exist_image_gen_tokens: bool,
+) -> nn.Module:
+    """Return the decoder layers this forward must run.
+
+    Cache-DiT replaces ``model.layers`` with a single unified wrapper while it
+    is mounted, which only suits the pure image denoising forwards.  The
+    genuine ModuleList is kept under ``_sensenova_cache_dit_native_layers`` by
+    the SenseNova generation stage before mounting, and every text, prefix, or
+    think forward has to select it back.
+    """
+    native_layers = getattr(model, "_sensenova_cache_dit_native_layers", None)
+    if native_layers is None:
+        return model.layers
+    if update_cache or exist_non_image_gen_tokens or not exist_image_gen_tokens:
+        return native_layers
+    return model.layers
+
+
+def cache_dit_attention_type(
+    model: nn.Module,
+    decoder_layer: nn.Module,
+) -> str:
+    """Attention type of one decoder layer, resolved under the Cache-DiT wrapper.
+
+    The wrapper forwards keyword arguments to every native block but exposes no
+    per-block attributes, so blocks running under it fall back to the type the
+    generation stage validated when it mounted the cache.
+    """
+    attention_type = getattr(decoder_layer, "attention_type", None)
+    if attention_type is not None:
+        return attention_type
+    if getattr(model, "_sensenova_cache_dit_native_layers", None) is None:
+        raise AttributeError("Decoder layer does not expose an attention_type.")
+    return model._sensenova_cache_dit_attention_type
+
+
 def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
     return RMSNorm(
         hidden_size,
@@ -1659,14 +1700,22 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        layers = cache_dit_decoder_layers(
+            self,
+            update_cache=kwargs.get("update_cache", True),
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+        )
+
+        for decoder_layer in layers[: self.config.num_hidden_layers]:
+            attention_type = cache_dit_attention_type(self, decoder_layer)
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,

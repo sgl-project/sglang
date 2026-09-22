@@ -3,6 +3,7 @@
 
 import json
 import os
+from enum import Enum
 
 from PIL import Image
 
@@ -31,6 +32,7 @@ DEFAULT_CFG_NORM = "none"
 DEFAULT_TIMESTEP_SHIFT = 3.0
 DEFAULT_ENABLE_TIMESTEP_SHIFT = True
 DEFAULT_CFG_INTERVAL = (0.0, 1.0)
+DEFAULT_IMG_CFG_SCALE = 1.0
 DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
 
@@ -74,6 +76,60 @@ def resolve_sensenova_u1_edit_auto_size(width: int, height: int) -> tuple[int, i
         )
         resized_height = DEFAULT_EDIT_LONG_SIDE
     return resized_width, resized_height
+
+
+class SenseNovaGuidanceProfile(Enum):
+    """Request-level conditioning branches used while guidance is active."""
+
+    CONDITION = ("condition",)
+    CONDITION_IMAGE = ("condition", "image_condition")
+    CONDITION_UNCONDITIONAL = ("condition", "uncondition")
+    CONDITION_IMAGE_UNCONDITIONAL = (
+        "condition",
+        "image_condition",
+        "uncondition",
+    )
+
+    @property
+    def branch_count(self) -> int:
+        return len(self.value)
+
+    @property
+    def needs_image_condition(self) -> bool:
+        return "image_condition" in self.value
+
+    @property
+    def needs_uncondition(self) -> bool:
+        return "uncondition" in self.value
+
+    @property
+    def has_separate_cfg(self) -> bool:
+        return self.branch_count == 2
+
+
+def derive_guidance_profile(
+    *, is_edit: bool, cfg_scale: float, img_cfg_scale: float
+) -> SenseNovaGuidanceProfile:
+    """Derive the branch profile shared by generation and Cache-DiT.
+
+    Exact comparisons intentionally match the native denoising loops. A
+    tolerance could select a cache profile that advances residual state on the
+    wrong conditioning branch.
+    """
+    if not is_edit:
+        return (
+            SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL
+            if cfg_scale > 1
+            else SenseNovaGuidanceProfile.CONDITION
+        )
+
+    if cfg_scale == 1 and img_cfg_scale == 1:
+        return SenseNovaGuidanceProfile.CONDITION
+    if img_cfg_scale == 1:
+        return SenseNovaGuidanceProfile.CONDITION_IMAGE
+    if cfg_scale == img_cfg_scale:
+        return SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL
+    return SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:

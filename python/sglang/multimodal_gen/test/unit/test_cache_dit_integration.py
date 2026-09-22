@@ -13,7 +13,8 @@ class _FakeDBCacheConfig:
         self.kwargs = kwargs
 
     def reset(self, **kwargs):
-        return kwargs
+        self.kwargs.update(kwargs)
+        return self.kwargs
 
 
 class _FakeForwardPattern:
@@ -103,6 +104,7 @@ def _install_cache_dit_stub():
 def _install_sglang_dependency_stubs():
     sglang = types.ModuleType("sglang")
     multimodal_gen = types.ModuleType("sglang.multimodal_gen")
+    envs = types.ModuleType("sglang.multimodal_gen.envs")
     runtime = types.ModuleType("sglang.multimodal_gen.runtime")
     distributed = types.ModuleType("sglang.multimodal_gen.runtime.distributed")
     parallel_state = types.ModuleType(
@@ -118,6 +120,13 @@ def _install_sglang_dependency_stubs():
     parallel_state.get_ulysses_parallel_world_size = lambda: 1
     parallel_state.get_dit_group = lambda: None
 
+    envs.SGLANG_CACHE_DIT_FN = 1
+    envs.SGLANG_CACHE_DIT_BN = 0
+    envs.SGLANG_CACHE_DIT_WARMUP = 4
+    envs.SGLANG_CACHE_DIT_RDT = 0.24
+    envs.SGLANG_CACHE_DIT_MC = 3
+    multimodal_gen.envs = envs
+
     class _FakeLogger:
         def debug(self, *_args, **_kwargs):
             pass
@@ -130,6 +139,7 @@ def _install_sglang_dependency_stubs():
     return {
         "sglang": sglang,
         "sglang.multimodal_gen": multimodal_gen,
+        "sglang.multimodal_gen.envs": envs,
         "sglang.multimodal_gen.runtime": runtime,
         "sglang.multimodal_gen.runtime.distributed": distributed,
         "sglang.multimodal_gen.runtime.distributed.parallel_state": parallel_state,
@@ -219,6 +229,20 @@ def _import_module_with_legacy_stub():
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
+    def test_cache_dit_env_defaults_read_all_dbcache_knobs(self):
+        module = _import_module_with_stub()
+
+        self.assertEqual(
+            module.cache_dit_env_defaults(),
+            {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+            },
+        )
+
     def test_refresh_context_without_scm_preset_skips_steps_mask(self):
         module = _import_module_with_stub()
         module.refresh_context_on_transformer(
@@ -260,6 +284,65 @@ class TestCacheDitRefreshContext(unittest.TestCase):
             },
         )
 
+    def test_refresh_context_preserves_mounted_db_cache_config(self):
+        module = _import_module_with_stub()
+        config = module.CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=4,
+            Bn_compute_blocks=2,
+            max_warmup_steps=3,
+            residual_diff_threshold=0.1,
+            max_continuous_cached_steps=5,
+            num_inference_steps=8,
+        )
+
+        module.refresh_context_on_transformer(
+            transformer="transformer",
+            num_inference_steps=8,
+            config=config,
+        )
+
+        self.assertEqual(
+            module.cache_dit.refresh_calls[0]["cache_config"].kwargs,
+            {
+                "Fn_compute_blocks": 4,
+                "Bn_compute_blocks": 2,
+                "max_warmup_steps": 3,
+                "residual_diff_threshold": 0.1,
+                "max_continuous_cached_steps": 5,
+                "num_inference_steps": 8,
+                "steps_computation_mask": None,
+                "steps_computation_policy": "dynamic",
+            },
+        )
+
+    def test_refresh_context_config_allows_scm_preset_override(self):
+        module = _import_module_with_stub()
+        config = module.CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=4,
+            steps_computation_mask=[0, 1],
+            steps_computation_policy="dynamic",
+            num_inference_steps=2,
+        )
+
+        module.refresh_context_on_transformer(
+            transformer="transformer",
+            num_inference_steps=3,
+            scm_preset="fast",
+            config=config,
+        )
+
+        self.assertEqual(
+            module.cache_dit.steps_mask_calls,
+            [{"mask_policy": "fast", "total_steps": 3}],
+        )
+        refreshed = module.cache_dit.refresh_calls[0]["cache_config"].kwargs
+        self.assertEqual(refreshed["Fn_compute_blocks"], 4)
+        self.assertEqual(refreshed["num_inference_steps"], 3)
+        self.assertEqual(refreshed["steps_computation_mask"], [1, 1, 1])
+        self.assertEqual(refreshed["steps_computation_policy"], "fast")
+
     def test_dual_refresh_without_scm_preset_skips_steps_mask(self):
         module = _import_module_with_stub()
         module.refresh_context_on_dual_transformer(
@@ -290,8 +373,9 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
 
-def _make_transformer(class_name, layers=None):
-    transformer = type(class_name, (), {})()
+def _make_transformer(class_name, layers=None, module_name=None):
+    namespace = {"__module__": module_name} if module_name is not None else {}
+    transformer = type(class_name, (), namespace)()
     if layers is not None:
         transformer.layers = layers
     return transformer
@@ -307,6 +391,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
         self.assertIsNotNone(adapter)
         self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.blocks_name, "layers")
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertTrue(adapter.has_separate_cfg)
 
@@ -335,6 +420,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             transformer_raw, has_separate_cfg=True
         )
         self.assertEqual(adapter_raw.blocks, blocks)
+        self.assertEqual(adapter_raw.blocks_name, "transformer_blocks")
         self.assertEqual(adapter_raw.forward_pattern, "Pattern_3")
         self.assertTrue(adapter_raw.has_separate_cfg)
 
@@ -354,8 +440,39 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         adapter = module._build_custom_block_adapter(transformer)
 
         self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.blocks_name, "blocks")
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
+
+    def test_sensenova_dense_and_moe_adapters_pin_the_layers_attribute(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0"]
+
+        for class_name in ("Qwen3Model", "Qwen3MoeModel"):
+            transformer = _make_transformer(
+                class_name,
+                blocks,
+                module_name=(
+                    "sglang.multimodal_gen.runtime.models.sensenova_u1."
+                    "neo_unify.modeling_qwen3"
+                ),
+            )
+            transformer._sensenova_cache_dit_native_layers = blocks
+
+            adapter = module._build_custom_block_adapter(transformer)
+
+            self.assertEqual(adapter.blocks_name, "layers")
+            self.assertIs(adapter.blocks, transformer.layers)
+
+    def test_rejects_same_named_qwen_outside_sensenova(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer(
+            "Qwen3Model",
+            ["block_0"],
+            module_name="transformers.models.qwen3.modeling_qwen3",
+        )
+
+        self.assertIsNone(module._build_custom_block_adapter(transformer))
 
     def test_native_qwen21_adapter_overrides_generic_family_match(self):
         module = _import_module_with_stub()
@@ -385,6 +502,56 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
         self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+    def test_partial_custom_mount_is_rolled_back_through_adapter(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+        mounted_adapter = None
+
+        def fail_after_pipeline_context(target, **_kwargs):
+            nonlocal mounted_adapter
+            mounted_adapter = target
+            target._is_normalized = True
+            target.pipe = types.SimpleNamespace()
+            target.pipe._is_cached = True
+            raise RuntimeError("block wrapper failed")
+
+        def disable_cache(target):
+            module.cache_dit.disable_calls.append(target)
+            if hasattr(target.pipe, "_is_cached"):
+                del target.pipe._is_cached
+
+        module.cache_dit.enable_cache = fail_after_pipeline_context
+        module.cache_dit.disable_cache = disable_cache
+
+        with self.assertRaisesRegex(RuntimeError, "block wrapper failed"):
+            module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(transformer._sglang_cache_dit_adapter, mounted_adapter)
+        module.disable_cache_on_transformer(transformer)
+        self.assertEqual(module.cache_dit.disable_calls, [mounted_adapter])
+        self.assertFalse(hasattr(mounted_adapter.pipe, "_is_cached"))
+        self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+
+    def test_failed_custom_adapter_normalization_does_not_retain_adapter(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        def fail_before_normalization(_target, **_kwargs):
+            raise RuntimeError("normalization failed")
+
+        module.cache_dit.enable_cache = fail_before_normalization
+
+        with self.assertRaisesRegex(RuntimeError, "normalization failed"):
+            module.enable_cache_on_transformer(transformer, config)
+
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
 

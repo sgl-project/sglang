@@ -43,6 +43,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "profile_all_stages",
     "num_profiled_timesteps",
     "perf_dump_path",
+    "enable_cache_dit",
+    "cache_dit_params",
 }
 
 
