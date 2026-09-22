@@ -39,10 +39,8 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
-    # Optional independent draft storage sharing this allocator's token ids.
-    # PD CPU retraction must preserve it before those ids can be reused.
     # Class-level: SWA and HiSparse allocators do not call this __init__.
-    cpu_retraction_draft_pool: KVCache | None = None
+    full_draft_kv_pool: KVCache | None = None
 
     @abc.abstractmethod
     def __init__(
@@ -69,6 +67,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @property
     def size_full(self):
         return self.size
+
+    def register_full_draft_kv_pool(self, pool: KVCache) -> None:
+        """Declare a draft KV pool with its own tensors indexed by this allocator's
+        token ids; PD CPU retraction and PD transfer carry it with the target KV."""
+        self.full_draft_kv_pool = pool
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
