@@ -2,16 +2,18 @@
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::LazyLock;
 
 use bytes::Bytes;
 use itertools::izip;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::{MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use sglang_types::{CustomParamValue, SamplingParams};
 
-use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
+use super::io_struct::{ControlRequest, SchedulerSamplingParams, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
-use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
@@ -100,9 +102,8 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
-    /// One params object (broadcast) or a list of them (per item); see
-    /// [`SamplingParamsInput`].
-    pub sampling_params: Option<SamplingParamsInput>,
+    /// One typed params object (broadcast) or a list of them (per item).
+    pub sampling_params: Option<SamplingParamsBatch>,
     /// Logprob / hidden-state options: a scalar broadcasts to every prompt, a
     /// list is per-prompt (Python `_normalize_logprob_params`).
     pub return_logprob: Option<OneOrMany<bool>>,
@@ -146,26 +147,363 @@ pub struct GenerateBody {
     processor_extensions: ProcessorExtensions,
 }
 
-impl GenerateBody {
-    /// Merge operator-provided sampling defaults beneath request values,
-    /// matching Python TokenizerManager's preferred/request precedence.
-    pub fn apply_preferred_sampling(&mut self, preferred: &serde_json::Value) -> Result<(), Error> {
-        match &mut self.sampling_params {
-            Some(params) => params.apply_preferred(preferred),
-            None => SamplingParamsInput::from_preferred(preferred).map(|params| {
-                self.sampling_params = Some(params);
-            }),
-        }
-        .map_err(|e| Error::Validation(format!("invalid preferred_sampling_params: {e}")))
-    }
+/// The `/generate` sampling request DTO, before defaults are applied.
+///
+/// Each field preserves three states: `None` is omitted, `Some(None)` is an
+/// explicit null, and `Some(Some(value))` is an explicit value. Null overrides
+/// preferred defaults; resolution maps it to the field's built-in null behavior.
+/// Pipeline-owned fields are deliberately absent from this request type.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateSamplingParams {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub max_new_tokens: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub stop: Option<Option<OneOrMany<String>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub stop_token_ids: Option<Option<Vec<i64>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub stop_regex: Option<Option<OneOrMany<String>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub temperature: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub top_p: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub top_k: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub min_p: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub frequency_penalty: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub presence_penalty: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub repetition_penalty: Option<Option<f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub min_new_tokens: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub n: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub beam_width: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub json_schema: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub regex: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub ebnf: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub structural_tag: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub ignore_eos: Option<Option<bool>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub skip_special_tokens: Option<Option<bool>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub spaces_between_special_tokens: Option<Option<bool>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub no_stop_trim: Option<Option<bool>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub stream_interval: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub logit_bias: Option<Option<BTreeMap<String, f64>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub sampling_seed: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub custom_params: Option<Option<BTreeMap<String, CustomParamValue>>>,
+}
 
+// Serde calls this only for a present key; an absent key uses Option::default.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl GenerateSamplingParams {
+    /// Convert request fields to renderer parameters using preferred and built-in
+    /// defaults. An explicit null never inherits the preferred value.
+    fn into_sampling_params(self, preferred: Option<&Self>) -> SamplingParams {
+        let defaults = SamplingParams::default();
+        SamplingParams {
+            max_new_tokens: self
+                .max_new_tokens
+                .or(preferred.and_then(|p| p.max_new_tokens))
+                .unwrap_or(defaults.max_new_tokens),
+            stop: self
+                .stop
+                .or_else(|| preferred.and_then(|p| p.stop.clone()))
+                .flatten(),
+            stop_token_ids: self
+                .stop_token_ids
+                .or_else(|| preferred.and_then(|p| p.stop_token_ids.clone()))
+                .flatten(),
+            stop_regex: self
+                .stop_regex
+                .or_else(|| preferred.and_then(|p| p.stop_regex.clone()))
+                .flatten(),
+            temperature: self
+                .temperature
+                .or(preferred.and_then(|p| p.temperature))
+                .flatten()
+                .unwrap_or(defaults.temperature),
+            top_p: self
+                .top_p
+                .or(preferred.and_then(|p| p.top_p))
+                .flatten()
+                .unwrap_or(defaults.top_p),
+            top_k: self
+                .top_k
+                .or(preferred.and_then(|p| p.top_k))
+                .flatten()
+                .unwrap_or(defaults.top_k),
+            min_p: self
+                .min_p
+                .or(preferred.and_then(|p| p.min_p))
+                .flatten()
+                .unwrap_or(defaults.min_p),
+            frequency_penalty: self
+                .frequency_penalty
+                .or(preferred.and_then(|p| p.frequency_penalty))
+                .flatten()
+                .unwrap_or(defaults.frequency_penalty),
+            presence_penalty: self
+                .presence_penalty
+                .or(preferred.and_then(|p| p.presence_penalty))
+                .flatten()
+                .unwrap_or(defaults.presence_penalty),
+            repetition_penalty: self
+                .repetition_penalty
+                .or(preferred.and_then(|p| p.repetition_penalty))
+                .flatten()
+                .unwrap_or(defaults.repetition_penalty),
+            min_new_tokens: self
+                .min_new_tokens
+                .or(preferred.and_then(|p| p.min_new_tokens))
+                .flatten()
+                .unwrap_or(defaults.min_new_tokens),
+            n: self
+                .n
+                .or(preferred.and_then(|p| p.n))
+                .flatten()
+                .unwrap_or(defaults.n),
+            beam_width: self
+                .beam_width
+                .or(preferred.and_then(|p| p.beam_width))
+                .flatten(),
+            json_schema: self
+                .json_schema
+                .or_else(|| preferred.and_then(|p| p.json_schema.clone()))
+                .flatten(),
+            regex: self
+                .regex
+                .or_else(|| preferred.and_then(|p| p.regex.clone()))
+                .flatten(),
+            ebnf: self
+                .ebnf
+                .or_else(|| preferred.and_then(|p| p.ebnf.clone()))
+                .flatten(),
+            structural_tag: self
+                .structural_tag
+                .or_else(|| preferred.and_then(|p| p.structural_tag.clone()))
+                .flatten(),
+            ignore_eos: self
+                .ignore_eos
+                .or(preferred.and_then(|p| p.ignore_eos))
+                .flatten()
+                .unwrap_or(defaults.ignore_eos),
+            skip_special_tokens: self
+                .skip_special_tokens
+                .or(preferred.and_then(|p| p.skip_special_tokens))
+                .flatten()
+                .unwrap_or(defaults.skip_special_tokens),
+            spaces_between_special_tokens: self
+                .spaces_between_special_tokens
+                .or(preferred.and_then(|p| p.spaces_between_special_tokens))
+                .flatten()
+                .unwrap_or(defaults.spaces_between_special_tokens),
+            no_stop_trim: self
+                .no_stop_trim
+                .or(preferred.and_then(|p| p.no_stop_trim))
+                .flatten()
+                .unwrap_or(defaults.no_stop_trim),
+            stream_interval: self
+                .stream_interval
+                .or(preferred.and_then(|p| p.stream_interval))
+                .flatten(),
+            logit_bias: self
+                .logit_bias
+                .or_else(|| preferred.and_then(|p| p.logit_bias.clone()))
+                .flatten(),
+            sampling_seed: self
+                .sampling_seed
+                .or(preferred.and_then(|p| p.sampling_seed))
+                .flatten(),
+            custom_params: self
+                .custom_params
+                .or_else(|| preferred.and_then(|p| p.custom_params.clone()))
+                .flatten(),
+            ..defaults
+        }
+    }
+}
+
+/// The `/generate` sampling field: one object to broadcast or one per prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SamplingParamsBatch {
+    One(Box<GenerateSamplingParams>),
+    Many(Vec<GenerateSamplingParams>),
+}
+
+// Dispatch by shape rather than using untagged, which loses field-level errors.
+impl<'de> Deserialize<'de> for SamplingParamsBatch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+
+        impl<'de> Visitor<'de> for InputVisitor {
+            type Value = SamplingParamsBatch;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a sampling_params object or a list of objects")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                GenerateSamplingParams::deserialize(MapAccessDeserializer::new(map))
+                    .map(|params| SamplingParamsBatch::One(Box::new(params)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut params = Vec::new();
+                while let Some(input) = seq.next_element::<SamplingParamsBatch>()? {
+                    let SamplingParamsBatch::One(input) = input else {
+                        return Err(serde::de::Error::custom(
+                            "sampling_params entries must be objects",
+                        ));
+                    };
+                    params.push(*input);
+                }
+                Ok(SamplingParamsBatch::Many(params))
+            }
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
+impl GenerateBody {
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python
     /// `GenerateReqInput.normalize_batch_and_arguments`; an invalid/inconsistent
     /// batch is [`Error::Validation`], which the handler surfaces with the
     /// variant's own status (400).
-    pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+    pub fn into_requests(
+        self,
+        preferred: Option<&GenerateSamplingParams>,
+    ) -> Result<(Vec<GenerateRequest>, bool), Error> {
         let GenerateBody {
             rid,
             text,
@@ -255,42 +593,46 @@ impl GenerateBody {
         }
 
         // A list is per-item; a single object broadcasts to every item.
-        let sps: Vec<SamplingParams> = match sampling_params {
-            None => vec![SamplingParams::default(); n],
-            Some(SamplingParamsInput::Many(v)) => {
-                if v.len() != n {
-                    return Err(Error::Validation(format!(
-                        "sampling_params list length {} does not match batch size {n}",
-                        v.len()
-                    )));
+        let has_sampling_params = sampling_params.is_some() || preferred.is_some();
+        let sps: Vec<SamplingParams> =
+            match sampling_params.unwrap_or_else(|| SamplingParamsBatch::One(Box::default())) {
+                SamplingParamsBatch::Many(v) => {
+                    if v.len() != n {
+                        return Err(Error::Validation(format!(
+                            "sampling_params list length {} does not match batch size {n}",
+                            v.len()
+                        )));
+                    }
+                    v.into_iter()
+                        .map(|params| params.into_sampling_params(preferred))
+                        .collect()
                 }
-                v
-            }
-            Some(SamplingParamsInput::One(sp)) => {
-                // Broadcasting deep-clones the client's params once per prompt,
-                // heap and all — `stop`, `logit_bias` and `custom_params` (arbitrary
-                // JSON) are still unnormalized client data here. The blow-up is
-                // quadratic in the body: ~1 MB of `custom_params` broadcast to 200k
-                // prompts is ~200 GB of clones, and a Rust allocation failure calls
-                // `abort()`, which is uncatchable and takes the scheduler process
-                // with it. Bound the product, not just `n`.
-                // `n == 1` is not a broadcast, so skip the sizing entirely: measuring
-                // it means serializing the client's whole `custom_params` to a
-                // throwaway `String` on every single request. The callee's own
-                // `n > 1` guard cannot prevent that — the cost is in the argument.
-                if n > 1 {
-                    // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
-                    // JSON became ~1008 MiB of live heap once parsed into `Value`
-                    // nodes, `String`s and map entries. Scale by that measured factor
-                    // so the budget bounds memory rather than wire size.
-                    let per_clone = serde_json::to_string(&*sp)
-                        .map_or(0, |s| s.len())
-                        .saturating_mul(JSON_TO_HEAP_FACTOR);
-                    check_broadcast_budget(per_clone, n, "sampling_params")?;
+                SamplingParamsBatch::One(params) => {
+                    let sp = params.into_sampling_params(preferred);
+                    // Broadcasting deep-clones the client's params once per prompt,
+                    // heap and all — `stop`, `logit_bias` and `custom_params` (arbitrary
+                    // JSON) are still unnormalized client data here. The blow-up is
+                    // quadratic in the body: ~1 MB of `custom_params` broadcast to 200k
+                    // prompts is ~200 GB of clones, and a Rust allocation failure calls
+                    // `abort()`, which is uncatchable and takes the scheduler process
+                    // with it. Bound the product, not just `n`.
+                    // `n == 1` is not a broadcast, so skip the sizing entirely: measuring
+                    // it means serializing the client's whole `custom_params` to a
+                    // throwaway `String` on every single request. The callee's own
+                    // `n > 1` guard cannot prevent that — the cost is in the argument.
+                    if n > 1 && has_sampling_params {
+                        // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
+                        // JSON became ~1008 MiB of live heap once parsed into `Value`
+                        // nodes, `String`s and map entries. Scale by that measured factor
+                        // so the budget bounds memory rather than wire size.
+                        let per_clone = serde_json::to_string(&SchedulerSamplingParams(&sp))
+                            .map_or(0, |s| s.len())
+                            .saturating_mul(JSON_TO_HEAP_FACTOR);
+                        check_broadcast_budget(per_clone, n, "sampling_params")?;
+                    }
+                    vec![sp; n]
                 }
-                vec![*sp; n]
-            }
-        };
+            };
 
         // rid: absent → mint one uuid per item here, so every request carries its
         // final rid from this point on; a single string fans out as `{rid}_{i}`
@@ -852,6 +1194,192 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
 
 #[cfg(test)]
 mod tests {
+
+    fn norm(json: &str) -> SamplingParams {
+        let mut params = serde_json::from_str::<GenerateSamplingParams>(json)
+            .expect("parses")
+            .into_sampling_params(None);
+        params.normalize(false, 1000).expect("normalizes");
+        params
+    }
+
+    #[test]
+    fn typed_input_preserves_presence_and_resolves_every_sampling_field() {
+        let values = serde_json::json!({
+            "max_new_tokens": 4096,
+            "stop": ["END"],
+            "stop_token_ids": [42],
+            "stop_regex": "END",
+            "temperature": 0.25,
+            "top_p": 0.75,
+            "top_k": 8,
+            "min_p": 0.1,
+            "frequency_penalty": 0.2,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.2,
+            "min_new_tokens": 4,
+            "n": 2,
+            "beam_width": 3,
+            "json_schema": "{}",
+            "regex": "a",
+            "ebnf": "root ::= 'a'",
+            "structural_tag": "tag",
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "spaces_between_special_tokens": false,
+            "no_stop_trim": true,
+            "stream_interval": 5,
+            "logit_bias": {"7": 0.4},
+            "sampling_seed": 6,
+            "custom_params": {"tenant": "preferred"}
+        });
+        let preferred: GenerateSamplingParams = serde_json::from_value(values.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&preferred).unwrap(), values);
+        assert_eq!(
+            serde_json::to_value(GenerateSamplingParams::default()).unwrap(),
+            serde_json::json!({})
+        );
+
+        // Resolution fills every omitted field; validation remains a later step.
+        let resolved = GenerateSamplingParams::default().into_sampling_params(Some(&preferred));
+        assert_eq!(
+            resolved,
+            SamplingParams {
+                max_new_tokens: Some(4096),
+                stop: Some(OneOrMany::Many(vec!["END".into()])),
+                stop_token_ids: Some(vec![42]),
+                stop_regex: Some(OneOrMany::One("END".into())),
+                temperature: 0.25,
+                top_p: 0.75,
+                top_k: 8,
+                min_p: 0.1,
+                frequency_penalty: 0.2,
+                presence_penalty: 0.3,
+                repetition_penalty: 1.2,
+                min_new_tokens: 4,
+                n: 2,
+                beam_width: Some(3),
+                json_schema: Some("{}".into()),
+                regex: Some("a".into()),
+                ebnf: Some("root ::= 'a'".into()),
+                structural_tag: Some("tag".into()),
+                ignore_eos: true,
+                skip_special_tokens: false,
+                spaces_between_special_tokens: false,
+                no_stop_trim: true,
+                stream_interval: Some(5),
+                logit_bias: Some(BTreeMap::from([("7".into(), 0.4)])),
+                sampling_seed: Some(6),
+                custom_params: Some(BTreeMap::from([(
+                    "tenant".into(),
+                    CustomParamValue::String("preferred".into())
+                )])),
+                ..Default::default()
+            }
+        );
+
+        // Explicit null resets all scalar defaults and clears nullable fields,
+        // including the output limit, rather than inheriting preferred values.
+        let nulls: serde_json::Map<_, _> = values
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), serde_json::Value::Null))
+            .collect();
+        let nulls = serde_json::Value::Object(nulls);
+        let input: GenerateSamplingParams = serde_json::from_value(nulls.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&input).unwrap(), nulls);
+        assert_eq!(
+            input.into_sampling_params(Some(&preferred)),
+            SamplingParams {
+                max_new_tokens: None,
+                ..Default::default()
+            }
+        );
+
+        let input: GenerateSamplingParams = serde_json::from_value(serde_json::json!({
+            "temperature": 1.0, "ignore_eos": false, "custom_params": {}
+        }))
+        .unwrap();
+        let resolved = input.into_sampling_params(Some(&preferred));
+        assert_eq!(resolved.temperature, 1.0);
+        assert!(!resolved.ignore_eos);
+        assert_eq!(resolved.custom_params, Some(BTreeMap::new()));
+    }
+
+    /// `max_new_tokens` is the one field where absent and null differ: absent =
+    /// 128 (the Python field default), explicit null = None (no limit).
+    #[test]
+    fn max_new_tokens_null_is_unlimited_absent_is_default() {
+        assert_eq!(norm("{}").max_new_tokens, Some(128));
+        assert_eq!(norm(r#"{"max_new_tokens": null}"#).max_new_tokens, None);
+        // None = no limit, so a large min_new_tokens is not a range error.
+        let sp = norm(r#"{"max_new_tokens": null, "min_new_tokens": 4096}"#);
+        assert_eq!(sp.min_new_tokens, 4096);
+    }
+
+    /// A wrong JSON type for a numeric field is rejected at parse time — it must
+    /// NOT silently fall back to the default (`temperature: "bad"` has different
+    /// semantics than an unset temperature).
+    #[test]
+    fn wrong_typed_field_is_rejected() {
+        for json in [
+            r#"{"temperature": "bad"}"#,
+            r#"{"top_k": "bad"}"#,
+            r#"{"max_new_tokens": "bad"}"#,
+            r#"{"stop": 3}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GenerateSamplingParams>(json).is_err(),
+                "{json} must not parse"
+            );
+        }
+    }
+
+    /// An unknown key is a 400, mirroring Python's `SamplingParams(**kwargs)`
+    /// TypeError — a typo must not be silently ignored. (The bogus key is
+    /// deliberately not a near-miss of a real field: an editor spell-checker
+    /// kept "correcting" a misspelling here into a valid name, which silently
+    /// turned this assertion into a tautology.)
+    #[test]
+    fn unknown_field_is_rejected() {
+        assert!(
+            serde_json::from_str::<GenerateSamplingParams>(r#"{"zzz_not_a_field": 1}"#).is_err()
+        );
+        // ...while every declared field still parses.
+        assert!(serde_json::from_str::<GenerateSamplingParams>(r#"{"temperature": 0.7}"#).is_ok());
+    }
+
+    /// A present-but-null scalar resolves to the built-in default (Python's
+    /// `x if x is not None`).
+    #[test]
+    fn null_field_keeps_default() {
+        let sp = norm(r#"{"temperature": null, "top_k": null, "skip_special_tokens": null}"#);
+        assert_eq!(sp.temperature, 1.0);
+        assert_eq!(sp.top_k, SamplingParams::default().top_k);
+        assert!(sp.skip_special_tokens);
+    }
+
+    #[test]
+    fn custom_params_matches_python_shape() {
+        assert!(
+            norm(r#"{"custom_params":{"null":null,"bool":true,"int":1,"float":1.5,"str":"x","list":[1,"x",null],"object":{"x":1}}}"#)
+                .custom_params
+                .is_some()
+        );
+
+        for json in [
+            r#"{"custom_params":[]}"#,
+            r#"{"custom_params":{"nested_list":[[1]]}}"#,
+            r#"{"custom_params":{"nested_object":{"x":{"y":1}}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GenerateSamplingParams>(json).is_err(),
+                "{json} must not parse"
+            );
+        }
+    }
+
     use super::*;
 
     #[derive(Debug, Deserialize, PartialEq)]
@@ -865,14 +1393,126 @@ mod tests {
         value: i64,
     }
 
-    /// Vocab size for tests that aren't about the vocab bound (see
-    /// `sampling::tests::TEST_VOCAB`).
+    /// Vocab size for tests that aren't about the vocab bound.
     const TEST_VOCAB: u64 = 1000;
 
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
         serde_json::from_str::<GenerateBody>(body)
             .unwrap()
-            .into_requests()
+            .into_requests(None)
+    }
+
+    #[test]
+    fn preferred_params_fill_only_omitted_request_fields() {
+        let preferred: GenerateSamplingParams = serde_json::from_value(serde_json::json!({
+            "temperature": 0.25,
+            "top_p": 0.75,
+            "max_new_tokens": 4096
+        }))
+        .unwrap();
+        for (input, expected) in [
+            (serde_json::json!({"text": "a"}), (0.25, 0.75, Some(4096))),
+            (
+                serde_json::json!({"text": "a", "sampling_params": null}),
+                (0.25, 0.75, Some(4096)),
+            ),
+            (
+                serde_json::json!({"text": "a", "sampling_params": {}}),
+                (0.25, 0.75, Some(4096)),
+            ),
+            (
+                serde_json::json!({"text": "a", "sampling_params": {"temperature": 1.0, "top_p": null}}),
+                (1.0, 1.0, Some(4096)),
+            ),
+            (
+                serde_json::json!({"text": "a", "sampling_params": {"max_new_tokens": null}}),
+                (0.25, 0.75, None),
+            ),
+        ] {
+            let body: GenerateBody = serde_json::from_value(input).unwrap();
+            let (requests, _) = body.into_requests(Some(&preferred)).unwrap();
+            let params = &requests[0].sampling_params;
+            assert_eq!(
+                (params.temperature, params.top_p, params.max_new_tokens),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_params_apply_to_every_batched_object() {
+        let preferred: GenerateSamplingParams =
+            serde_json::from_value(serde_json::json!({"temperature": 0.25, "top_p": 0.75}))
+                .unwrap();
+        let body: GenerateBody = serde_json::from_value(serde_json::json!({
+            "text": ["a", "b"],
+            "sampling_params": [{"temperature": 0.5}, {"top_p": null}]
+        }))
+        .unwrap();
+        let (requests, _) = body.into_requests(Some(&preferred)).unwrap();
+        let params: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.sampling_params.temperature,
+                    request.sampling_params.top_p,
+                )
+            })
+            .collect();
+        assert_eq!(params, [(0.5, 0.75), (0.25, 1.0)]);
+    }
+
+    #[test]
+    fn renderer_sampling_survives_generate_http_boundary() {
+        let mut sampling = serde_json::from_value::<GenerateSamplingParams>(serde_json::json!({
+            "max_new_tokens": null,
+            "temperature": 0.0,
+            "stop": ["END", "STOP"],
+            "stop_regex": "\\d{3}",
+            "stop_token_ids": [42],
+            "custom_params": {"tenant": "a", "options": [1, true, null]}
+        }))
+        .unwrap()
+        .into_sampling_params(None);
+        sampling.normalize(false, TEST_VOCAB).unwrap();
+
+        let rendered =
+            sglang_renderer::GenerateRequest::from(sglang_renderer::TokenIdsRequest::new(
+                "rendered",
+                vec![7, 8],
+                sglang_renderer::GenerationOptions {
+                    sampling_params: sampling.clone(),
+                    ..Default::default()
+                },
+            ));
+        let body = serde_json::to_value(rendered).unwrap();
+        assert_eq!(
+            body["sampling_params"]["stop"],
+            serde_json::json!(["END", "STOP"])
+        );
+        assert_eq!(
+            body["sampling_params"]["stop_regex"],
+            serde_json::json!(["\\d{3}"])
+        );
+        for field in [
+            "is_normalized",
+            "stop_strs",
+            "stop_str_max_len",
+            "ebnf_full_assistant",
+        ] {
+            assert!(body["sampling_params"].get(field).is_none(), "{field}");
+        }
+
+        let body = serde_json::from_value::<GenerateBody>(body).unwrap();
+        let (mut requests, is_batch) = body.into_requests(None).unwrap();
+        assert!(!is_batch);
+        assert_eq!(requests.len(), 1);
+        let request = requests.pop().unwrap();
+        assert_eq!(request.input_ids, Some(vec![7, 8]));
+        let mut received = request.sampling_params;
+        assert!(!received.is_normalized);
+        received.normalize(false, TEST_VOCAB).unwrap();
+        assert_eq!(received, sampling);
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).
@@ -1264,6 +1904,22 @@ mod tests {
         })
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("would allocate more than"), "{err}");
+
+        // Preferred defaults have the same clone cost when the request omits
+        // sampling_params entirely.
+        let preferred: GenerateSamplingParams = serde_json::from_value(serde_json::json!({
+            "custom_params": {"k": blob}
+        }))
+        .unwrap();
+        let body: GenerateBody = serde_json::from_value(serde_json::json!({
+            "text": vec!["hi"; 200]
+        }))
+        .unwrap();
+        let err = body
+            .into_requests(Some(&preferred))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("would allocate more than"), "{err}");
     }
 

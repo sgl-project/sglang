@@ -127,7 +127,7 @@ impl RendererService {
         request
             .options
             .sampling_params
-            .normalize(self.config.limits.vocab_size)?;
+            .normalize(false, self.config.limits.vocab_size)?;
         let mut request = self.tokenizer.tokenize(request).await?;
         check_total_tokens(&mut request, &self.config.limits)?;
         Ok(request)
@@ -183,7 +183,7 @@ impl RendererService {
         request
             .options
             .sampling_params
-            .normalize(self.config.limits.vocab_size)?;
+            .normalize(false, self.config.limits.vocab_size)?;
         check_total_tokens(&mut request, &self.config.limits)?;
         Ok(request)
     }

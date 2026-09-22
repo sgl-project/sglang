@@ -3,9 +3,9 @@
 use super::*;
 use crate::message::request::GenerateRequest;
 use crate::message::response::ResponseSink;
-use crate::message::sampling::SamplingParams;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::RequestState;
+use sglang_types::SamplingParams;
 use tokio::sync::mpsc;
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —

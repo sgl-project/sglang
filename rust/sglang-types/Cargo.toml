@@ -1,0 +1,12 @@
+[package]
+name = "sglang-types"
+description = "Shared SGLang request DTOs and validation (sampling params, wire primitives)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex-syntax = "=0.8.11"

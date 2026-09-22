@@ -22,6 +22,7 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 pyo3 = { workspace = true }
+sglang-types = { path = "../sglang-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 socket2 = { workspace = true }

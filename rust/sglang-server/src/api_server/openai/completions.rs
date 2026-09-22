@@ -31,9 +31,9 @@ use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
-use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
+use sglang_types::SamplingParams;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))

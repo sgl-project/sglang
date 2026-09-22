@@ -39,6 +39,14 @@ impl From<&str> for RendererError {
     }
 }
 
+impl From<sglang_types::ValidationError> for RendererError {
+    fn from(error: sglang_types::ValidationError) -> Self {
+        match error {
+            sglang_types::ValidationError::Validation(message) => Self::Validation(message),
+        }
+    }
+}
+
 impl RendererError {
     pub fn kind(&self) -> RendererErrorKind {
         match self {

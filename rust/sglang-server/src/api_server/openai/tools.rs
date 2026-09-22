@@ -37,7 +37,7 @@ use dynamo_protocols::types::{
 };
 
 use crate::message::response::ChunkEvent;
-use crate::message::sampling::SamplingParams;
+use sglang_types::SamplingParams;
 
 /// Canonicalize a tool-call parser name onto the dynamo-parsers registry keys.
 ///
@@ -265,7 +265,6 @@ mod tests {
         dynamo_tool_choice, parse_chat_tool_calls,
     };
     use crate::message::response::ChunkEvent;
-    use crate::message::sampling::SamplingParams;
     use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
     use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
     use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
@@ -275,6 +274,7 @@ mod tests {
         FinishReason as OpenAIFinishReason, FunctionCallStream, FunctionName, FunctionType, Role,
     };
     use futures::{StreamExt, stream};
+    use sglang_types::SamplingParams;
 
     fn tool(name: &str, strict: bool) -> ToolDefinition {
         ToolDefinition {

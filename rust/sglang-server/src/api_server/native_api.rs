@@ -33,11 +33,11 @@ use super::submit::submit;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::message::sampling::SamplingParams;
 use crate::utils::{
     environ,
     response::{error_response, error_value},
 };
+use sglang_types::SamplingParams;
 
 /// API-local timing for one request.
 ///
@@ -209,7 +209,7 @@ async fn generate(
     State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
-    let mut body = match body {
+    let body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
@@ -219,18 +219,15 @@ async fn generate(
         }
     };
     let stream = body.stream;
-    if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = body.apply_preferred_sampling(&preferred.0)
-    {
-        return native_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error.to_string(),
-            stream,
-        );
-    }
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (mut payloads, is_batch) = match body.into_requests() {
+    let (mut payloads, is_batch) = match body.into_requests(
+        state
+            .server_args
+            .preferred_sampling_params
+            .as_ref()
+            .map(|params| &params.0),
+    ) {
         Ok(v) => v,
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
@@ -579,6 +576,79 @@ mod tests {
             abort_tx: flume::unbounded().0,
             tokenizer_tx: flume::unbounded().0,
             detokenizer_tx: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_sampling_returns_unary_400() {
+        use crate::message::config::{PreferredSamplingParams, ServerArgs};
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for preferred in [
+            None,
+            Some(PreferredSamplingParams(
+                serde_json::from_value(serde_json::json!({"temperature": 0.25})).unwrap(),
+            )),
+        ] {
+            let server_args = ServerArgs {
+                served_model_name: "test".into(),
+                preferred_sampling_params: preferred,
+                ..Default::default()
+            };
+            server_args.validate().unwrap();
+            let state = Arc::new(AppState {
+                senders: senders(),
+                response_buf: 8,
+                server_args: Arc::new(server_args),
+                chat_formatter: None,
+                response_activity: Default::default(),
+                startup_readiness: Default::default(),
+            });
+            let app = routes().with_state(state);
+            for stream in [false, true] {
+                for (sampling, message) in [
+                    (serde_json::json!(42), "expected a sampling_params object"),
+                    (
+                        serde_json::json!([{}, null]),
+                        "expected a sampling_params object",
+                    ),
+                    (serde_json::json!([[]]), "entries must be objects"),
+                    (
+                        serde_json::json!({"unknown_sampling_field": 1}),
+                        "unknown field `unknown_sampling_field`",
+                    ),
+                    (
+                        serde_json::json!({"is_normalized": true}),
+                        "unknown field `is_normalized`",
+                    ),
+                    (serde_json::json!({"temperature": "bad"}), "invalid type"),
+                ] {
+                    let request = Request::builder()
+                        .method("POST")
+                        .uri("/generate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "text": "a", "stream": stream, "sampling_params": sampling
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                    let response = app.clone().oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    assert_eq!(response.headers()["content-type"], "application/json");
+                    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(error["error"]["code"], 400);
+                    let actual = error["error"]["message"].as_str().unwrap();
+                    assert!(
+                        actual.contains("sampling_params") && actual.contains(message),
+                        "{actual}"
+                    );
+                }
+            }
         }
     }
 
