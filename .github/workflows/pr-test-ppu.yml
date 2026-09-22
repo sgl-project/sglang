@@ -88,7 +88,7 @@ jobs:
   ppu-preflight:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu == 'true'
-    runs-on: ppu-1-gpu-runner
+    runs-on: 1-ppu-m890p
     timeout-minutes: 60
     env:
       SGLANG_IS_IN_CI: true
