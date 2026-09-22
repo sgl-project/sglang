@@ -1746,6 +1746,7 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
         )
         return o
 
