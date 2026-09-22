@@ -514,15 +514,6 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.fp8_direct_cast
                 elif combine_dtype == "fp4":
                     self.combine_dtype = CombineDtype.fp4
-        elif "SGLANG_MORI_FP8_COMB" in os.environ:
-            # Deprecated: will be removed in a future release
-            logger.warning_once(
-                "SGLANG_MORI_FP8_COMB is deprecated "
-                "and will be removed in a future release. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp4|fp8_direct_cast instead."
-            )
-            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
-                self.combine_dtype = CombineDtype.fp8
 
     def dispatch_a(
         self,

@@ -626,13 +626,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
