@@ -162,6 +162,10 @@ class BaseSpecWorker(ABC):
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
 
+    @abstractmethod
+    def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
+
     def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
         spec_algorithm = self.target_worker.model_runner.spec_algorithm
         draft_worker = self.draft_worker
