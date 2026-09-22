@@ -245,7 +245,10 @@ def _kpool_cpu_plan(
     if isinstance(extend_seq_lens_cpu, torch.Tensor):
         extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
     seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
-    req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
+    req_pool_indices_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+    if req_pool_indices_cpu is None:
+        req_pool_indices_cpu = forward_batch.req_pool_indices
+    req_pool_indices_cpu = req_pool_indices_cpu.tolist()
 
     _append_compress_rows(
         plan,
@@ -411,7 +414,9 @@ def _kpool_plan_to_gpu(
     if need_paged:
         req_to_token = get_req_to_token_pool().req_to_token
         ragged_paged_page_table_row_index = torch.repeat_interleave(
-            local_req_pool_indices.to(torch.int32), ragged_q_len_t
+            local_req_pool_indices.to(torch.int32),
+            ragged_q_len_t,
+            output_size=sum(cpu.ragged_q_len),
         )
         ragged_paged_page_table = req_to_token
 

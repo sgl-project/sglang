@@ -220,7 +220,8 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    assert topk_indices.ndim == 2
+    assert topk_indices.shape[1] > 0
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
