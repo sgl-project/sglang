@@ -170,7 +170,7 @@ test = [
   "diff-cover",
   "expecttest",
   "granian>=2.6.0",
-  "instanttensor>=0.1.5",
+  "instanttensor>=0.1.9",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
