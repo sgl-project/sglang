@@ -47,9 +47,9 @@ class TestDeepseekV4FlashW8a8Int8Ppu(GSM8KMixin, CustomTestCase):
             SERVED_MODEL_NAME,
             "--disable-custom-all-reduce",
             "--disable-shared-experts-fusion",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         cls.process = popen_launch_server(
             MODEL_PATH,

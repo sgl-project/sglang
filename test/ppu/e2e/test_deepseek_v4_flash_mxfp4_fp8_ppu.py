@@ -39,9 +39,9 @@ class TestDeepseekV4FlashMxfp4Fp8Ppu(GSM8KMixin, CustomTestCase):
             "600",
             "--served-model-name",
             SERVED_MODEL_NAME,
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         cls.process = popen_launch_server(
             MODEL_PATH,

@@ -86,9 +86,9 @@ class TestDsaTopkBf16PrefillCrash(CustomTestCase):
             "3600",
             "--attn-cp-size",
             "8",
-            "--enable-dsa-prefill-context-parallel",
-            "--dsa-prefill-cp-mode",
-            "round-robin-split",
+            "--enable-prefill-cp",
+            "--cp-strategy",
+            "interleave",
             "--watchdog-timeout",
             "3600",
             "--dsa-prefill-backend",
@@ -98,9 +98,9 @@ class TestDsaTopkBf16PrefillCrash(CustomTestCase):
             "--disable-custom-all-reduce",
             "--enforce-disable-flashinfer-allreduce-fusion",
             "--disable-shared-experts-fusion",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "4",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
 
         env = os.environ.copy()

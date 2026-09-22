@@ -57,7 +57,7 @@ class TestDeepseekV32W8a8Int8PpuFlashmlaFa3Eagle(GSM8KMixin, CustomTestCase):
             "fa3",
             "--speculative-attention-mode",
             "decode",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
             "--disable-shared-experts-fusion",
         ]

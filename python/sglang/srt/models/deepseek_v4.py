@@ -63,8 +63,10 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
@@ -128,6 +130,7 @@ from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -5078,6 +5081,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
 
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+
         # update_weights_from_disk/_tensor/_distributed re-enter load_weights
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
@@ -5249,6 +5257,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.dsa_enable_prefill_cp:
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                )
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related(is_prefill=True)
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            attn_backend.init_forward_metadata_indexer(core_meta)
+                        )
+
         if (
             self.vision is not None
             and not forward_batch.forward_mode.is_decode()

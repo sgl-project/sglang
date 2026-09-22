@@ -1,9 +1,10 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import triton
 
+from sglang.kernels.ops.attention.dsa.cp_split import dsa_cp_interleave_q_seqs_kernel
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -135,6 +136,115 @@ def is_dsa_prefill_cp_interleave():
 is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
 
+def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+
+    if is_dsa_prefill_cp_round_robin_split():
+        cur_cp_seq_len = seq_len // cp_size
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
+    else:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+        # the seq data needs to be divided and recombined at twice the size of cp_size.
+        cur_cp_seq_len = seq_len // (cp_size * 2)
+    return cur_cp_seq_len != 0
+
+
+def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+    """
+    # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
+    |   +-----------before split------------+|
+    | token0, token1, token2, token3, token4, token5, token6, token7, ...
+    |
+    |   +--------------result-------------------+
+    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
+    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
+    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
+    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
+    |   +-------------------------+
+    """
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    if isinstance(input_, (tuple, list)):
+        indices = range(cp_rank, len(input_), cp_size)
+        return input_[indices]
+
+    tokens = len(input_)
+    if tokens % cp_size != 0:
+        cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
+        if cur_len == 0:
+            return input_.new_empty(0, *input_.shape[1:])
+        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
+        return input_[indices]
+
+    # for torch device tensor
+    shard = input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank]
+    # .contiguous() is not sufficient here. When tokens == cp_size every rank's
+    # shard has a single row, and a size-1 outer dimension imposes no contiguity
+    # constraint, so is_contiguous() is True whatever stride(0) is and
+    # .contiguous() becomes a no-op. The shard then keeps the cp_size-inflated
+    # row pitch (cp_size * row_numel instead of row_numel), which any kernel that
+    # takes its row pitch from stride(0) will read as an oversized tensor.
+    # Compare the pitch against the parent's explicitly, so the copy happens
+    # exactly when the shard really is strided -- and not at all for cp_size == 1.
+    if shard.stride(0) != input_.stride(0):
+        shard = shard.clone(memory_format=torch.contiguous_format)
+    return shard
+
+
+def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    extra_seq = 0
+    q_seqs = []
+    for bs, cur_len in enumerate(extend_seqs):
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
+        q_seqs.append(cur_seq)
+        extra_seq = cur_len - cur_seq * cp_size
+    bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
+    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+    return q_seqs, bs_idx
+
+
+def dsa_cp_round_robin_split_q_seqs(
+    extend_seqs_cpu, extend_seqs
+) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
+    """
+    round-robin-split distributes tokens across ranks based on token_idx % cp_size.
+
+    Return:
+    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length (excluding zeros) on the current cp rank
+        for each sequence after distribution across cp ranks.
+    bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
+        i.e., those with a partitioned length greater than zero.
+    """
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    # len(ret_q_lens_cpu) == len(bs_idx_cpu)
+    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    ret_q_lens = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
+    )
+    bs_idx = torch.empty(
+        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
+    )
+    grid = (1,)
+    dsa_cp_interleave_q_seqs_kernel[grid](
+        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+    )
+    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
+
+
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
 # MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
 # inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
@@ -159,6 +269,10 @@ def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
         and seq_len >= cp_size
         and cp_size > 1
     )
+
+
+# Retain the name imported by the unchanged dsv4 attention backend.
+can_dsa_prefill_cp_round_robin_split = can_dsa_prefill_cp_interleave
 
 
 def cal_padded_tokens(forward_batch: "ForwardBatch"):

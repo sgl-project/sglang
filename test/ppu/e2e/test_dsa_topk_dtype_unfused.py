@@ -95,7 +95,7 @@ class TestDsaTopkDtypeUnfused(CustomTestCase):
             "3",
             "--speculative-attention-mode",
             "decode",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--disable-custom-all-reduce",
             "--disable-shared-experts-fusion",
             "--trust-remote-code",

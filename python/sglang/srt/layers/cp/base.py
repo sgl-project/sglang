@@ -30,6 +30,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -251,6 +252,12 @@ def init_cp_strategy(
     source it has.
     """
     global _STRATEGY
+
+    if is_ppu():
+        # PPU has no CP v2 implementation; its prefill CP runs on the legacy
+        # shared V1 path, which requires the V2 strategy to stay dormant.
+        _STRATEGY = None
+        return
 
     if not enable_prefill_cp:
         _STRATEGY = None

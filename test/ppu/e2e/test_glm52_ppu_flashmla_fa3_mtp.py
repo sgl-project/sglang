@@ -97,9 +97,9 @@ class TestGlm52PpuFlashmlaFa3DpAttnMtp(GSM8KMixin, CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--disable-shared-experts-fusion",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "40",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         cls.process = popen_launch_server(
             MODEL_PATH,

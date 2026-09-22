@@ -58,7 +58,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs,
+    dsa_use_prefill_cp,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -2406,41 +2410,95 @@ class DeepseekV4AttnBackend(
         extend_seq_lens = forward_batch.extend_seq_lens
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        # Global (pre-CP-split) CPU views, retained for the CP-aware total_swa
+        # loop below which indexes requests by their original position.
         seq_lens_cpu_list = seq_lens_cpu.tolist()
-        total_swa = sum(
-            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-            for seq_len, extend_len in zip(
-                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
-            )
+        extend_seq_lens_cpu_list = (
+            [int(x) for x in extend_seq_lens_cpu.tolist()]
+            if isinstance(extend_seq_lens_cpu, torch.Tensor)
+            else list(extend_seq_lens_cpu)
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+        max_seq_len = max(seq_lens_cpu_list)
+        if can_dsa_prefill_cp_round_robin_split(forward_batch):
+            # Legacy V1 prefill CP round-robin path (PPU keeps the V2 interleave
+            # strategy dormant, see init_cp_strategy). Restrict the chunk cache
+            # to this CP rank's locally-owned requests and size total_swa with
+            # the carry-propagated round-robin offsets so it stays sync-free.
+            (
+                cp_extend_seq_lens_cpu,
+                extend_seq_lens,
+                cp_bs_idx_cpu,
+                cp_bs_idx,
+            ) = dsa_cp_round_robin_split_q_seqs(
+                extend_seq_lens_cpu_list,
+                extend_seq_lens,
             )
-        else:
+            seq_lens = seq_lens[cp_bs_idx].contiguous()
+            req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+            max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
+            assert core_attn_metadata is not None, (
+                "CP round-robin split sparse prefill requires core_attn_metadata"
+            )
+            assert sum(cp_extend_seq_lens_cpu) <= num_qo_tokens, (
+                f"CP-local extend sum {sum(cp_extend_seq_lens_cpu)} exceeds "
+                f"q token count {num_qo_tokens}"
+            )
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            first_tok_off = []
+            stream_off = 0
+            for e in extend_seq_lens_cpu_list:
+                first_tok_off.append((cp_rank - stream_off) % cp_size)
+                stream_off += e
+            total_swa = 0
+            for j in cp_bs_idx_cpu:
+                first_pos = (
+                    seq_lens_cpu_list[j]
+                    - extend_seq_lens_cpu_list[j]
+                    + first_tok_off[j]
+                )
+                swa_first = max(0, first_pos - SWA_WINDOW + 1)
+                total_swa += seq_lens_cpu_list[j] - swa_first
+            # Under round-robin split the per-request query rows are exactly the
+            # CP-local partitioned lengths returned above.
             query_lens = extend_seq_lens.to(torch.int32)
+        else:
+            total_swa = sum(
+                min(int(seq_len_i), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len_i, extend_len in zip(
+                    seq_lens_cpu_list, extend_seq_lens_cpu_list, strict=True
+                )
+            )
+            if is_cp_active(forward_batch):
+                query_lens = torch.tensor(
+                    interleave_rows_per_request(
+                        _as_int_list(extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    ),
+                    dtype=torch.int32,
+                    device=extend_seq_lens.device,
+                )
+            else:
+                query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens.to(torch.int32),
             query_lens=query_lens,
             query_pos=query_pos,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
             swa_page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
             num_qo_tokens=num_qo_tokens,
-            max_seq_len=max(seq_lens_cpu_list),
+            max_seq_len=max_seq_len,
             total_swa=total_swa,
         )
 

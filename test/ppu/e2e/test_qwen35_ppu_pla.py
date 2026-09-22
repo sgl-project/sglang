@@ -63,7 +63,7 @@ class TestQwen35PpuPla(CustomTestCase):
                 "24000",
                 "--dist-timeout",
                 "24000",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-running-requests",
                 "32",
@@ -71,7 +71,7 @@ class TestQwen35PpuPla(CustomTestCase):
                 "--mamba-scheduler-strategy",
                 "extra_buffer_lazy",
                 "--disable-shared-experts-fusion",
-                "--disable-piecewise-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 

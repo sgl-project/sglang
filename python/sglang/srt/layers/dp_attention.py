@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_attn_cp_overlap_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1149,6 +1150,10 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:
