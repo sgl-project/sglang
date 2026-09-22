@@ -24,7 +24,10 @@ from sglang.srt.distributed.parallel_state import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -59,23 +62,18 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
-#: Set by `init_parallel`; `destroy_model_parallel` clears it, so a test that
-#: tears the groups down can build them again.
+#: Cleared by `destroy_model_parallel`.
 _PARALLEL_INITIALISED = False
 
 
 def reset_parallel_initialised() -> None:
-    """Forget that the groups were built. Paired with tearing them down."""
+    """Reset the initialization guard when model-parallel groups are destroyed."""
     global _PARALLEL_INITIALISED
     _PARALLEL_INITIALISED = False
 
 
 def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
-    """Pin OpenMP threads to this process's NUMA node, on CPU.
-
-    A precondition of the CPU group build, which reads the binding, so it is
-    done here rather than left for a caller to remember.
-    """
+    """Bind OpenMP threads to the NUMA node before CPU group initialization."""
     if device != "cpu":
         return None
     from sglang.srt.utils import numa_utils
@@ -95,27 +93,14 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
 def init_parallel_runtime(
     *,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     device: str,
     dist_port: int,
 ) -> None:
-    """Phase two of startup: bring the parallel runtime up, once.
+    """Initialize the parallel runtime once, after publishing configuration.
 
-    Publish says what the topology is; this makes it exist. Nothing returns,
-    because the groups are read through the runtime context -- a caller that
-    wants one asks `get_parallel()`, in this process or any later phase.
-
-    "Runtime" rather than "groups": two things have to be in place before the
-    groups can be built, and they are done here rather than left for every
-    entry to remember. The OpenMP/NUMA binding is what the CPU group build
-    reads, and the shared Mooncake transfer engine is what the Mooncake
-    process-group backend asks for -- create that one late and a second engine
-    appears. Both are preconditions of the build, not separate work.
-
-    Runs on the target worker only. A draft worker shares its target's groups,
-    which is why this is a phase the entry runs rather than something a runner
-    does on its way up: whether the groups exist must not depend on which
-    runner happened to be constructed first.
+    Set up CPU thread binding, the current device, and the shared Mooncake
+    engine before creating process groups. Draft workers reuse their target's
+    groups and must not call this function.
     """
     global _PARALLEL_INITIALISED
     if _PARALLEL_INITIALISED:
@@ -140,9 +125,7 @@ def init_parallel_runtime(
     _set_all_reduce_flags()
 
     local_omp_cpuid = _bind_threads_if_cpu(device=device)
-    # Everything below allocates on the current device -- the NCCL warm-up, the
-    # mooncake all-reduce buffer -- and without this every rank on a node would
-    # pick device 0, because the default is not to reindex the visible set.
+    # Select the local device before communicator allocation and warmup.
     try:
         torch.get_device_module(device).set_device(get_device().gpu_id)
     except Exception:
@@ -169,7 +152,6 @@ def init_parallel_runtime(
         backend=backend,
         dist_init_method=dist_init_method,
         server_args=server_args,
-        model_config=model_config,
         gpu_id=get_device().gpu_id,
     )
 
@@ -199,11 +181,9 @@ def init_parallel_runtime(
 
 
 def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> float:
-    """Available memory after the groups exist and before the model loads.
+    """Measure available memory for KV-cache sizing before this runner loads.
 
-    Sized into the KV cache later, so it has to be taken at exactly this point
-    -- which is why it stays with the runner rather than moving into the
-    parallel phase.
+    Call after parallel initialization and before allocating model weights.
     """
     before_avail_memory = get_available_gpu_memory(device, get_device().gpu_id)
 
@@ -313,7 +293,6 @@ def _init_parallel_groups(
     backend: str,
     dist_init_method: str,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     gpu_id: int,
 ) -> None:
     parallel = get_parallel()
@@ -348,13 +327,15 @@ def _init_parallel_groups(
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
-    initialize_dp_attention(
-        server_args=server_args,
-        model_config=model_config,
-    )
-    initialize_layernorm_sp(model_config=model_config)
+    initialize_dp_attention(server_args=server_args)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def init_layer_runtime(*, model_config: ModelConfig) -> None:
+    """Size the DP gathered buffer and resolve layernorm SP from the model."""
+    init_dp_gathered_buffer(model_config)
+    initialize_layernorm_sp(model_config=model_config)
 
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:

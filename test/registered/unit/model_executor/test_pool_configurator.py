@@ -35,8 +35,6 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        # The whole attention triple, not just one leaf: a width that does not
-        # factor describes no layout.
         get_parallel().override(
             tp_size=tp_size,
             attn_tp_size=tp_size,

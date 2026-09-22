@@ -55,6 +55,39 @@ Serving-side capability enforcement is tracked in [#39122](https://github.com/sg
 uv pip install mooncake-transfer-engine
 ```
 
+### AWS EFA
+
+On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
+
+The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:
+
+```bash
+python3 -m pip uninstall -y \
+  mooncake-transfer-engine-cuda13 \
+  mooncake-transfer-engine-efa-cuda13
+python3 -m pip install --no-deps \
+  mooncake-transfer-engine-efa-cuda13==0.3.13.post1
+
+export LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/efa/lib64:${LD_LIBRARY_PATH:-}"
+export MOONCAKE_PROTOCOL=efa
+
+python3 -c 'from mooncake import engine; assert engine.SUPPORT_EFA'
+fi_info -p efa -t FI_EP_RDM
+```
+
+The EFA wheel expects a compatible AWS EFA userspace installation on the host and does not bundle `libfabric` or `libefa`. The current wheel is available only for x86_64. It is built without Mooncake EP/PG and the NVLink/MNNVL components, so use the standard Mooncake CUDA package for those features.
+
+The current libfabric EFA provider cannot transfer CUDA VMM-backed buffers. Until [libfabric issue #12853](https://github.com/ofiwg/libfabric/issues/12853) is resolved, apply these settings to both prefill and decode workers:
+
+- Do not set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` to `NVLINK` or `BAREX`.
+  `INTRA_NODE_NVLINK` is supported because it uses the default CUDA allocator.
+- Do not enable `expandable_segments:True` in `PYTORCH_CUDA_ALLOC_CONF` or `PYTORCH_ALLOC_CONF`.
+- Post-capture KV sizing is automatically disabled for the EFA protocol because
+  its KV cache uses CUDA VMM allocations.
+- Do not set `MC_FORCE_MNNVL` or `NCCL_MNNVL_ENABLE`; EFA is not an MNNVL transport.
+
+SGLang validates the first two constraints at startup to avoid a later `fi_read` or `fi_write` failure from libfabric.
+
 ### IB Device Configuration
 
 `--disaggregation-ib-device` supports the following formats when using the Mooncake backend:

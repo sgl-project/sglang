@@ -45,12 +45,10 @@ if TYPE_CHECKING:
 
 
 def deployment_attn_dp_size() -> int:
-    """Attention-DP replicas in the deployment, which no draft scope narrows.
+    """Return the deployment's attention-DP replica count.
 
-    A draft runs on one attention-DP replica and its scope says so, but the
-    metadata a draft gathers is shaped by the replicas it gathers *with* --
-    the target's. Those come from the configuration, which the scope leaves
-    alone, so this answers the same number inside the scope and outside it.
+    Draft scopes retain this count because their metadata gathers include
+    the target's replicas.
     """
     parallel = get_parallel()
     attn_dp_size, _ = derive_attention_widths(
@@ -63,25 +61,20 @@ def deployment_attn_dp_size() -> int:
 
 
 def dp_gather_width() -> int:
-    """How many replicas the DP sync gathers over.
+    """Return the DP gather width.
 
-    The attention-DP replicas, except after an elastic-EP scale-up, when the
-    gather spans the expanded WORLD -- whose width is the `dp_size` the
-    scale-up published. Read from the context either way: a scoped width has
-    to reach this, which is the whole reason the name has one home.
+    After elastic scale-up, the gather spans the expanded WORLD; otherwise
+    it spans the attention-DP replicas.
     """
     parallel = get_parallel()
     return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
 
 
 def dp_gather_slot() -> int:
-    """This process's index in the list the DP sync just gathered.
+    """Return this process's index in the DP gather.
 
-    The gather spans the attention-DP replicas, except after an elastic-EP
-    scale-up, when it spans the expanded WORLD and the joining cohort is
-    numbered from its offset. Which list was gathered is what the flag below
-    says, so the index is read from there rather than kept as a second name on
-    the topology.
+    After elastic scale-up, use the TP rank plus the join offset; otherwise
+    use the attention-DP rank.
     """
     parallel = get_parallel()
     if world_dp_gather_enabled():
@@ -100,12 +93,10 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    """Point the DP gather at the expanded WORLD.
+    """Switch DP gathers to the expanded WORLD.
 
-    The widths themselves are not written here: the caller scales `dp_size` on
-    the published bag, and the gather reads its width and this process's slot
-    from there. The arguments are the values the caller is about to publish,
-    kept so the log says which scale-up this was.
+    The caller updates the configured widths; these arguments identify the
+    scale-up in the log.
     """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
@@ -403,43 +394,35 @@ def compute_dp_attention_world_info(
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
-def initialize_dp_attention(
-    server_args: ServerArgs,
-    model_config: ModelConfig,
-):
+def initialize_dp_attention_flags(server_args: ServerArgs):
+    """Initialize DP runtime flags without changing the worker's placement."""
     dp = get_flags().dp
-    dp.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
-    enable_dp_attention = get_parallel().enable_dp_attention
-    dp_size = get_parallel().dp_size
-    attn_cp_size = get_parallel().attn_cp_size
-
-    dp.enabled = enable_dp_attention
-
-    tp_rank = get_parallel().tp_rank
-    tp_size = get_parallel().tp_size
-
-    _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )
+    dp.enabled = get_parallel().enable_dp_attention
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        # Reads the resolution, not a bag: this runs under
-        # `initialize_dp_attention`, which the weight-cache daemon calls from
-        # `_init_distributed` -- and other callers reach it from processes
-        # whose publish is not guaranteed to have happened yet. (The daemon
-        # itself publishes first, at `daemon.py:284`, before `:320`.)
         if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
-    # Stamped together, after the elastic adjustment: the width and the rank
-    # describe one topology, and a reader that caught them mid-update would
-    # see this process placed in a group it is not in.
-    get_parallel().override_permanently(
-        attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
-    )
 
+def initialize_dp_attention(server_args: ServerArgs):
+    """Initialize DP flags and state placement from the published topology."""
+    initialize_dp_attention_flags(server_args)
+    parallel = get_parallel()
+    _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
+        parallel.enable_dp_attention,
+        parallel.tp_rank,
+        parallel.tp_size,
+        parallel.dp_size,
+        parallel.attn_cp_size,
+    )
+    parallel.override_permanently(attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank)
+
+
+def init_dp_gathered_buffer(model_config: ModelConfig):
+    """Size the gathered buffer from the model this worker is about to run."""
+    get_flags().dp.max_len_with_idle = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
@@ -457,9 +440,6 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    # The slot in the list that was gathered. A scale-up widens that list
-    # to WORLD, and this process's index in it is not its index among the
-    # launch replicas.
     dp_rank = dp_gather_slot()
 
     if forward_batch.dp_local_start_pos is None:
@@ -484,9 +464,6 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    # The slot in the list that was gathered. A scale-up widens that list
-    # to WORLD, and this process's index in it is not its index among the
-    # launch replicas.
     dp_rank = dp_gather_slot()
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:

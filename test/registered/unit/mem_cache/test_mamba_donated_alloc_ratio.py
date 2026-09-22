@@ -297,7 +297,6 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
-            # The runner carries its placement as plain attributes.
             attn_dp_size=1,
             pp_size=pp_size,
             hybrid_gdn_config=None,
