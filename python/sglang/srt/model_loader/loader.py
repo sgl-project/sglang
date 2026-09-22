@@ -313,8 +313,7 @@ def post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
-def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
-    """Run one quant_method hook on every quantized module."""
+def _modules_with_quant_method(model: nn.Module):
     from sglang.srt.lora.layers import BaseLayerWithLoRA
 
     for _, module in model.named_modules():
@@ -322,19 +321,8 @@ def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) ->
         if isinstance(module, BaseLayerWithLoRA):
             continue
         quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None and hasattr(quant_method, hook_name):
-            with device_loading_context(module, target_device):
-                getattr(quant_method, hook_name)(module)
-
-
-def restore_weights_before_loading(model: nn.Module, target_device) -> None:
-    """Undo in-place quant packing so fresh weights can be loaded."""
-    _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
-
-
-def process_weights_after_loading(model: nn.Module, target_device) -> None:
-    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant, ...)."""
-    _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
+        if quant_method is not None:
+            yield module, quant_method
 
 
 class BaseModelLoader(ABC):
@@ -1080,16 +1068,23 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def postprocess_weights(model, target_device):
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
+        for module, quant_method in _modules_with_quant_method(model):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Undo in-place quant packing so fresh weights can be loaded."""
+        for module, quant_method in _modules_with_quant_method(model):
+            # only schemes that repack in place define it
+            if hasattr(quant_method, "restore_weights_before_loading"):
                 with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                    quant_method.restore_weights_before_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
