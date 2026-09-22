@@ -5,6 +5,125 @@ description: "Browse model families and public checkpoints supported by SGLang D
 
 import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
 
+## Qwen-Image 2.1 integration status
+
+Qwen-Image 2.1 has a separate native pipeline for text-to-image and optional
+reference-image conditioning. Full-checkpoint validation on H200 includes
+1024×1024, 40-step generation and editing. Reference comparisons use
+Transformers 4.57.3, BF16 and matching Torch SDPA settings with cuDNN SDPA
+disabled. The native encoder explicitly preserves that version's pre-final-norm
+hidden state and vision position interpolation semantics.
+
+Full-checkpoint functional checks on up to two H200 GPUs cover DiT TP, Ulysses,
+Ring + FA, CFG parallel, DiT layerwise offload, FA/Sage, parallel
+tiled VAE decode, Cache-DiT, breakable CUDA graphs, and multiple reference
+images and outputs. One H200 with resident weights also passed HTTP generation
+and editing, including multiple outputs and reference images. These are
+functional checks, not a broad quality evaluation of lossy optimizations.
+
+Additional full-checkpoint checks on B200 cover native encoder TP, combined
+TP2 × Ulysses2 and TP2 × Ring2 + FA on four GPUs, and
+`--layerwise-offload-components all`. Two-GPU VAE `spatial_shard` decode passed
+with TP2, CFG parallelism, and all-component offload. These use 512px/4-step
+editing, plus a 1024px/4-step comparison of spatial and full VAE decode.
+Single-GPU 1024px/40-step generation, editing, and transparent PNG output also
+passed at source revision `d629d234f1`.
+
+Two-B200 component regressions assert actual encoder weight sharding and compare
+text and image conditioning with a single-rank reference. VAE regressions cover
+both decoder structures and even/odd latent heights in FP32 and FP64. FP64
+spatial decode matches the full decoder; BF16 full-checkpoint output is not
+bit-exact. In the tested image, spatial versus full decode gave RGBA PSNR
+60.69 dB; this is one sample, not a general quality guarantee.
+
+Request-local prefix KV reuse and new-request graph replay have CUDA regression
+tests, including batched targets and independent variable-length prefixes.
+Compatible text-to-image requests support opt-in dynamic batching; image-edit
+requests remain separate, while multiple outputs within one request are supported.
+See the cookbook's [batching guidance](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#batching)
+for deployment settings and floating-point reproducibility limits.
+The deployment picker marks only its exact tested HTTP combinations as
+verified, including H200, B200, RTX PRO 6000 96GB, RTX 5090, and RTX 4090.
+CLI-only combinations remain Unverified in the picker.
+
+On `1eab5de5990`, one RTX PRO 6000 Blackwell Server Edition passed repeated
+1024px/40-step HTTP generation, editing, transparent generation, and transparent
+input editing with resident weights or DiT layerwise offload and Torch SDPA.
+Repeated requests and corresponding outputs across placements matched RGBA
+pixels; transparent outputs retained alpha from 0 to 255. Its SM120
+RoPE, normalization, fusion-gate, and model regressions also passed. This check
+does not establish multi-GPU or quantized-checkpoint coverage on that platform.
+
+Disaggregated encoder, denoiser, and decoder roles passed full-checkpoint HTTP
+generation, variable-length prompts, image editing, and CFG on three B200 GPUs,
+using Mooncake's same-host TCP transport. At 512px/4 steps, their RGBA pixels
+matched the monolithic server exactly. Multi-host RDMA and multi-rank roles
+are not covered by that check.
+
+Online FP8 for the DiT, encoder, and both together passed 1024px/40-step HTTP
+generation and editing on one B200; both together also passed transparent PNG
+generation. Serialized E4M3FN FP8 component folders with scalar weight scales
+and dynamic activations passed generation, editing, and transparent output for
+each component and both together. The combined export also passed separate
+checks with TP2 plus encoder folding and with single-GPU all-component
+layerwise offload. The 476 loaded quantized matrices and
+scales matched their checkpoint values. Quantization and TP change numerical
+results. Revision `f1f3366c7c` fixes vision rotary initialization rounding during
+CPU/GPU transfer. In 1024px/40-step B200 checks, all-component layerwise offload
+matched resident generation, editing, and transparent RGBA pixels exactly
+for both native precision and the combined serialized export. Revision
+`81c8c550fa` additionally preserves FP8 weights and FP32 buffers during
+whole-encoder CPU offload; separate checks of that mode also matched resident
+pixels. Resident output was unchanged by these fixes. See the cookbook for
+sample quality metrics.
+
+Native-name Q4_0 GGUF files passed 1024px/40-step B200 HTTP generation,
+editing, and transparent output for DiT-only, encoder-only, and both together.
+The 476 packed matrices matched their exported bytes. The combined export also
+passed TP2 with encoder folding; separate all-component layerwise and
+whole-encoder CPU offload checks matched resident RGBA pixels exactly.
+Quantization and TP change output pixels, including alpha. These checks cover
+the documented private exports, not arbitrary community checkpoints. Other
+GGUF types and hardware remain unverified for this model.
+
+Calibrated ModelOpt-format NVFP4 component directories also passed the same
+six-configuration B200 HTTP matrix: each component, both together, two offload
+modes, and TP2 with encoder folding. All 476 packed matrices and their scales
+matched the exports after runtime layout transforms. Both offload modes
+matched resident RGBA pixels exactly. NVFP4 and TP2 change image and alpha
+values; this private export uses max calibration on only six requests, without
+SVDQuant or AWQ. See the cookbook for measured errors. Native FP4 requires
+Blackwell, and this model's NVFP4 exports remain unverified on RTX PRO 6000 and
+RTX 5090.
+
+Synthetic Diffusers-format LoRA passed dynamic loading, merging,
+and removal on one B200 and TP2 with encoder folding; both removal paths
+restored the base image exactly. Trained-adapter quality remains unverified.
+Platform latency measurements
+and their exact workloads are in the cookbook. Breakable graphs
+replay only matching warmup signatures, including condition-prefix length;
+other shapes run eagerly. VAE tiling is opt-in and can change numerical results.
+Do not infer compatibility from the older Qwen-Image row.
+
+Use the public `Qwen/Qwen-Image-2.1` checkpoint; no Hugging Face token is required.
+See the [Qwen-Image 2.1 cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1)
+for checkpoint layout and usage. The standard two-GPU E2E suite includes `qwen_image21_t2i_tp2`
+with TP2, 1024px/40-step generation, two requests, and image consistency checks.
+
+The additional opt-in HTTP cases check repeated generation, editing, and real
+RGBA alpha output from a local checkpoint:
+
+```bash
+export SGLANG_QWEN_IMAGE21_TEST_MODEL=/models/Qwen-Image-2.1
+export SGLANG_QWEN_IMAGE21_TEST_IMAGE=/path/to/reference.png
+python -m pytest -q python/sglang/multimodal_gen/test/server/test_server_qwen_image21.py
+```
+
+The module skips without the model variable; only editing skips when the image
+variable is absent. Credentials stay in the runner environment.
+
+## Supported model inventory
+
 Use a listed checkpoint as `--model-path` with `sglang generate` or
 `sglang serve`. This registry-backed list contains known public entry points;
 family detection may also support compatible local directories. Open the linked
