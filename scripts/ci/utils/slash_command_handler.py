@@ -8,6 +8,7 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from github import Auth, Github
@@ -15,7 +16,16 @@ from github import Auth, Github
 # Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import runner_configs as _runner_configs  # noqa: E402
-from multimodal_test_launcher import (  # noqa: E402
+
+# The shared launcher is stdlib-only; load it without importing SGLang in the
+# lightweight slash-command workflow.
+sys.path.insert(
+    0,
+    str(
+        Path(__file__).resolve().parents[3] / "python/sglang/multimodal_gen/test/runner"
+    ),
+)
+from pytest_launcher import (  # noqa: E402
     build_pytest_command,
     torchrun_processes,
 )

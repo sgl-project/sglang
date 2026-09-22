@@ -3,22 +3,27 @@
 import shlex
 import subprocess
 import sys
-from pathlib import PurePosixPath
+from pathlib import PurePath
+from typing import Sequence
 
 # Most multi-GPU tests launch their own workers. Only these files expect the
 # pytest process itself to run under torchrun.
 _TORCHRUN_PROCESSES = {
-    "python/sglang/multimodal_gen/test/single_test_file/component_accuracy/test_component_accuracy_2_gpu.py": 2,
-    "python/sglang/multimodal_gen/test/unit/test_qwen_image21_distributed.py": 2,
+    "test_component_accuracy_2_gpu.py": 2,
+    "test_qwen_image21_distributed.py": 2,
 }
 
 
 def torchrun_processes(test_spec: str) -> int:
     test_file = shlex.split(test_spec)[0].split("::", 1)[0]
-    return _TORCHRUN_PROCESSES.get(str(PurePosixPath(test_file)), 1)
+    return _TORCHRUN_PROCESSES.get(PurePath(test_file).name, 1)
 
 
-def build_pytest_command(test_spec: str, python: str = "python3") -> list[str]:
+def build_pytest_command(
+    test_spec: str,
+    python: str = "python3",
+    pytest_args: Sequence[str] = ("-x",),
+) -> list[str]:
     command = [python]
     num_processes = torchrun_processes(test_spec)
     if num_processes > 1:
@@ -30,7 +35,7 @@ def build_pytest_command(test_spec: str, python: str = "python3") -> list[str]:
                 f"--nproc_per_node={num_processes}",
             ]
         )
-    return [*command, "-m", "pytest", *shlex.split(test_spec), "-x"]
+    return [*command, "-m", "pytest", *shlex.split(test_spec), *pytest_args]
 
 
 if __name__ == "__main__":

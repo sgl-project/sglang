@@ -1,4 +1,4 @@
-"""Shard assignment invariants for the diffusion suites.
+"""Scheduling and launch invariants for the diffusion suites.
 
 Lanes that hardcode ``--total-partitions`` (AMD) must still schedule the whole
 suite when standalone files outnumber the shards, and the shards must agree on
@@ -6,6 +6,7 @@ who runs what without talking to each other.
 """
 
 import json
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     PartitionAssignment,
     build_local_partition_assignment,
 )
+from sglang.multimodal_gen.test.runner.pytest_launcher import build_pytest_command
 from sglang.multimodal_gen.test.server.gpu_cases import (
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
@@ -145,3 +147,64 @@ def test_qwen_quality_variants_use_the_same_generation_request():
     for case_id in ("qwen_image_t2i_2_gpus", "qwen_image_t2i_2_gpus_extra_high"):
         assert cases[case_id].run_perf_check
         assert scenarios[case_id]["expected_e2e_ms"] > 0
+
+
+@pytest.mark.parametrize("num_gpus", [1, 2])
+def test_component_ci_and_rerun_share_the_launcher(monkeypatch, num_gpus):
+    relative_path = (
+        "python/sglang/multimodal_gen/test/single_test_file/component_accuracy/"
+        f"test_component_accuracy_{num_gpus}_gpu.py"
+    )
+    # Commit CI passes absolute paths; slash commands pass repo-relative node IDs.
+    absolute_path = str(Path(__file__).resolve().parents[5] / relative_path)
+    selector = "::TestComponentAccuracy2GPU::test_encoder_accuracy[ltx_2_two_stage_t2v]"
+    commands = []
+    monkeypatch.setattr(
+        run_suite.subprocess, "call", lambda cmd: commands.append(cmd) or 0
+    )
+    assert (
+        run_suite.run_component_accuracy_files(
+            [absolute_path], filter_expr="ltx_2 or wan2"
+        )
+        == 0
+    )
+    commit_command = commands[0]
+    rerun_command = build_pytest_command(
+        shlex.quote(relative_path + selector), python=run_suite.sys.executable
+    )
+    pytest_index = commit_command.index("pytest")
+    assert commit_command[: pytest_index + 1] == rerun_command[: pytest_index + 1]
+    assert ("torch.distributed.run" in commit_command) == (num_gpus > 1)
+    assert commit_command[pytest_index + 1 :] == [
+        absolute_path,
+        "-s",
+        "-v",
+        "-k",
+        "ltx_2 or wan2",
+    ]
+    assert rerun_command[pytest_index + 1 :] == [relative_path + selector, "-x"]
+
+
+@pytest.mark.parametrize(
+    "results,continue_on_error,expected",
+    [([5, 0], False, 0), ([1], False, 1), ([1, 0], True, 1), ([0, 2], False, 2)],
+)
+def test_component_launcher_preserves_suite_exit_policy(
+    monkeypatch, results, continue_on_error, expected
+):
+    commands = []
+    outcomes = iter(results)
+
+    def run(command):
+        commands.append(command)
+        return next(outcomes)
+
+    monkeypatch.setattr(run_suite.subprocess, "call", run)
+    assert (
+        run_suite.run_component_accuracy_files(
+            ["test_component_accuracy_1_gpu.py", "test_component_accuracy_2_gpu.py"],
+            continue_on_error=continue_on_error,
+        )
+        == expected
+    )
+    assert len(commands) == len(results)

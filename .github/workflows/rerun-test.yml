@@ -262,7 +262,7 @@ jobs:
             echo "Begin ($i/$total): $cmd"
             echo "."
             file_start=$SECONDS
-            python3 scripts/ci/multimodal_test_launcher.py "$cmd" || exit 1
+            python3 python/sglang/multimodal_gen/test/runner/pytest_launcher.py "$cmd" || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
