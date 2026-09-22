@@ -3525,7 +3525,7 @@ class DeepseekV4AttnBackend(
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        use_grouped = (
+        use_mapped = (
             envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
             and group_size > 1
             and ratio in (1, 2)
@@ -3543,7 +3543,7 @@ class DeepseekV4AttnBackend(
             and table.stride(1) == 1
         )
         use_length_aware = (
-            use_grouped
+            use_mapped
             and envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.get()
             and q.shape[1] == 32
             and 0 < indexer.index_topk <= 2048
@@ -3640,7 +3640,7 @@ class DeepseekV4AttnBackend(
             return
         lens = (pos + 1) // ratio
         slots = None
-        if use_grouped:
+        if use_mapped:
             from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
                 fp4_index_logits_mapped_sm90,
             )
@@ -3687,7 +3687,7 @@ class DeepseekV4AttnBackend(
         if indexer.uses_candidates and not indexer.is_candidate_source:
             idx = mask_topk_scores(s, idx)
             idx = idx.masked_fill(idx < 0, lmax)
-        if use_grouped and 0 < k <= 1024:
+        if use_mapped and 0 < k <= 1024:
             from sglang.kernels.ops.attention.dsv4.sm90_fp4_topk import sort_map_topk
 
             # Keep TopK selection unchanged, but combine the selected-position

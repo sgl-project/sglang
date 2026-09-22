@@ -1,14 +1,4 @@
-"""Decode-time low-ratio indexer logits for Hopper.
-
-DeepGEMM's fp8_fp4 mqa-logits kernels need SM100/SM120. This Triton kernel covers
-the same decode step on SM90: one query token per request, scored against the
-request's visible compressed positions read straight out of the fp4 indexer
-pool (e2m1 payload + e8m0 per-32 block scales, page layout of
-store_fp4_index_k_cache), summed over heads with relu and the per-head weights.
-
-Numerics follow the torch reference path: bf16 dot, bf16 relu/weight product,
-bf16 head reduction, fp32 logits out.
-"""
+"""Fused request-to-KV mapping for opt-in SM90 32-head static verification."""
 
 import torch
 import triton
@@ -35,7 +25,7 @@ def _e2m1_decode(code):
 def _fp4_index_logits_kernel(
     q_ptr,  # [B, H, D] bf16, fq4 queries (already rope'd)
     w_ptr,  # [B, H] bf16 head weights (softmax scale folded in)
-    slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
+    slots_ptr,  # [requests, capacity * ratio] int32 request-to-token mapping
     lens_ptr,  # [B] int64 visible compressed positions per request
     table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
     out_ptr,  # [B, L] fp32 logits, -inf beyond lens
@@ -48,10 +38,9 @@ def _fp4_index_logits_kernel(
     H: tl.constexpr,
     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
     BLOCK_L: tl.constexpr,
-    req_ptr=None,
-    req_stride: tl.constexpr = 0,
-    ratio: tl.constexpr = 1,
-    MAPPED: tl.constexpr = False,
+    req_ptr,
+    req_stride: tl.constexpr,
+    ratio: tl.constexpr,
 ):
     b = tl.program_id(0)
     lb = tl.program_id(1)
@@ -68,20 +57,15 @@ def _fp4_index_logits_kernel(
         tl.store(out_ptr + b * L + offs_l, float("-inf"), mask=offs_l < L)
     else:
         valid = offs_l < tl.minimum(n_vis, L)
-        if MAPPED:
-            request = tl.load(req_ptr + b).to(tl.int64)
-            slot = (
-                tl.load(
-                    slots_ptr + request * req_stride + offs_l * ratio,
-                    mask=valid,
-                    other=0,
-                ).to(tl.int64)
-                // ratio
-            )
-        else:
-            slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
-                tl.int64
-            )
+        request = tl.load(req_ptr + b).to(tl.int64)
+        slot = (
+            tl.load(
+                slots_ptr + request * req_stride + offs_l * ratio,
+                mask=valid,
+                other=0,
+            ).to(tl.int64)
+            // ratio
+        )
         page = slot // page_size
         off = slot % page_size
         row_base = page * row_stride
@@ -142,50 +126,6 @@ def _fp4_index_logits_kernel(
         tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
 
 
-def fp4_index_logits_decode(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    slots: torch.Tensor,
-    lens: torch.Tensor,
-    table: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    """q [B, H, 128] bf16, weights [B, H], slots [B, L] int64, lens [B] int64,
-    table = the layer's fp4 index-K page buffer (uint8, 2D). Returns [B, L] fp32
-    logits with -inf at positions >= lens."""
-    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
-    B, H, _ = q.shape
-    L = slots.shape[1]
-    assert table.dtype == torch.uint8 and table.dim() == 2
-    q = q.contiguous()
-    weights = weights.to(torch.bfloat16).contiguous()
-    slots = slots.contiguous()
-    out = torch.empty((B, L), dtype=torch.float32, device=q.device)
-    if L == 0:
-        return out
-    BLOCK_L = 64
-    grid = (B, triton.cdiv(L, BLOCK_L))
-    _fp4_index_logits_kernel[grid](
-        q,
-        weights,
-        slots,
-        lens.to(torch.int64).contiguous(),
-        table,
-        out,
-        L,
-        page_size,
-        table.stride(0),
-        q.stride(0),
-        q.stride(1),
-        weights.stride(0),
-        H=H,
-        HALF_D=INDEX_HEAD_DIM // 2,
-        BLOCK_L=BLOCK_L,
-        num_warps=4,
-    )
-    return out
-
-
 def fp4_index_logits_mapped_sm90(
     q,
     weights,
@@ -197,7 +137,7 @@ def fp4_index_logits_mapped_sm90(
     ratio,
     width,
 ):
-    """Grouped-entry fallback with mapping fused into the Triton score kernel.
+    """Score with request mapping fused into the Triton kernel.
 
     The caller validates the common tensor/device contract. No dense slots
     tensor or host read of dynamic lengths is needed during graph replay.
@@ -225,7 +165,6 @@ def fp4_index_logits_mapped_sm90(
         req_ptr=req,
         req_stride=req_to_token.stride(0),
         ratio=ratio,
-        MAPPED=True,
         num_warps=4,
     )
     return out
