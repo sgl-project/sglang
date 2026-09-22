@@ -24,6 +24,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+# needs no GPU, but base-a-test-cpu installs python[dev], which omits the
+# diffusion extra this imports; the diffusion lane is the only one that has it
 register_cuda_ci(est_time=20, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 SERVER_LOAD_TIME_MS = 44977.73
