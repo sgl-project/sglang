@@ -46,6 +46,10 @@ from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
+from sglang.srt.disaggregation.prefill_complete import HEADER as PREFILL_COMPLETE_HEADER
+from sglang.srt.disaggregation.prefill_complete import (
+    PrefillCompleteManager,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
@@ -68,6 +72,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
     get_observability,
     get_schedule,
@@ -231,7 +236,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         _validate_efa_allocator_compatibility(
             enable_custom_mem_pool, custom_mem_pool_type
         )
+        self.prefill_complete = None
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
+            if any(state != StateType.DSA for state in args.state_types):
+                raise ValueError(
+                    "prefill_complete currently supports full-attention and DSA KV pools only"
+                )
+            self.prefill_complete = PrefillCompleteManager(
+                send=self._send_prefill_complete_message,
+                on_cancel=self._cancel_before_decode_allocation,
+            )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -319,6 +334,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def _send_prefill_complete_message(self, endpoint, frames) -> None:
+        address = NetworkAddress(endpoint[0], endpoint[1])
+        self._send_multipart_locked(address.to_tcp(), frames, is_ipv6=address.is_ipv6)
+
+    def _cancel_before_decode_allocation(self, room: int) -> None:
+        self.record_failure(room, "Decode request cancelled before KV allocation")
+        self.update_status(room, KVPoll.Failed)
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        if status == KVPoll.Failed and self.prefill_complete is not None:
+            self.prefill_complete.fail_source(
+                room=bootstrap_room, reason="Prefill request failed before KV transfer"
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -2445,6 +2475,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                if (
+                    self.prefill_complete is not None
+                    and self.prefill_complete.handle_message(waiting_req_bytes)
+                ):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2588,6 +2623,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             while not self._stopped:
                 msg = recv()
                 if msg is None:
+                    continue
+                if (
+                    self.prefill_complete is not None
+                    and self.prefill_complete.handle_message(msg)
+                ):
                     continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
@@ -2788,6 +2828,31 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
+        self._source_readiness = None
+        if (
+            mgr.prefill_complete is not None
+            and mgr.check_status(bootstrap_room) != KVPoll.Failed
+        ):
+            self._source_readiness = mgr.prefill_complete.add_source(
+                room=bootstrap_room
+            )
+
+    def mark_prefill_complete(self) -> None:
+        if self._source_readiness is not None:
+            self.kv_mgr.prefill_complete.mark_ready(
+                room=self.bootstrap_room, state=self._source_readiness
+            )
+
+    def _clear_readiness(self) -> None:
+        if self._source_readiness is not None:
+            self.kv_mgr.prefill_complete.remove_source(
+                room=self.bootstrap_room, state=self._source_readiness
+            )
+            self._source_readiness = None
+
+    def clear(self) -> None:
+        self._clear_readiness()
+        super().clear()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2863,6 +2928,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
     def abort(self):
         super().abort()
+        self._clear_readiness()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -2876,7 +2942,75 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self._destination_readiness = None
+        self._metadata_sent = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def init(self, prefill_dp_rank: int):
+        super().init(prefill_dp_rank)
+        if self.conclude_state == KVPoll.Failed or self.kv_mgr.prefill_complete is None:
+            return
+        if (
+            len(self.bootstrap_infos) != 1
+            or self.bootstrap_infos[0]["is_dummy"]
+            or self.required_prefill_response_num != 1
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room, "Unsupported readiness fanout"
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return
+        source = self.bootstrap_infos[0]
+        self._destination_readiness = self.kv_mgr.prefill_complete.add_destination(
+            room=self.bootstrap_room,
+            endpoint=(source["rank_ip"], int(source["rank_port"])),
+            timeout=self.kv_mgr.waiting_timeout,
+        )
+        # Include both source compute and ready-but-not-yet-admitted time. The
+        # normal transfer timeout starts afresh when metadata is published.
+        self.init_time = time.time()
+
+    def _clear_readiness(self) -> None:
+        if self._destination_readiness is not None:
+            self.kv_mgr.prefill_complete.remove_destination(
+                room=self.bootstrap_room, state=self._destination_readiness
+            )
+            self._destination_readiness = None
+
+    def _send_abort_notification(self):
+        if self._destination_readiness is not None and not self._metadata_sent:
+            state = self._destination_readiness
+            try:
+                self.kv_mgr._send_prefill_complete_message(
+                    state.endpoint,
+                    [
+                        PREFILL_COMPLETE_HEADER,
+                        b"CANCEL",
+                        str(self.bootstrap_room).encode(),
+                        state.nonce,
+                        b"",
+                        b"",
+                    ],
+                )
+            except Exception:
+                logger.exception(
+                    "Could not cancel pre-allocation room %s", self.bootstrap_room
+                )
+        else:
+            # Once pointers have been published, preserve the normal abort ACK
+            # and deferred KV release until remote writes have drained.
+            super()._send_abort_notification()
+
+    def abort(self):
+        super().abort()
+        self._clear_readiness()
+
+    def clear(self):
+        if self._destination_readiness is not None and not self._metadata_sent:
+            self._send_abort_notification()
+        self._clear_readiness()
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2997,6 +3131,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        self._metadata_sent = True
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
             try:
@@ -3043,6 +3178,19 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         elif status == KVPoll.WaitingForInput:
+            if self._destination_readiness is not None:
+                ready, failure = self.kv_mgr.prefill_complete.poll(
+                    room=self.bootstrap_room,
+                    state=self._destination_readiness,
+                    local_endpoint=(self.kv_mgr.local_ip, self.kv_mgr.rank_port),
+                    awaiting_completion=not self._metadata_sent,
+                )
+                if failure is not None:
+                    self.abort()
+                    self.kv_mgr.record_failure(self.bootstrap_room, failure)
+                    return KVPoll.Failed
+                if not ready:
+                    return KVPoll.Bootstrapping
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
