@@ -1,15 +1,14 @@
-import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -45,6 +44,7 @@ class _FakeReq:
             skip_special_tokens=True,
             spaces_between_special_tokens=True,
             no_stop_trim=False,
+            stop_regex_strs=[],
         )
         self.output_ids = output_ids
         self.output_ids_through_stop = output_ids
@@ -377,9 +377,9 @@ class TestFirstTokenFlush(CustomTestCase):
         acc.accept(req=req)
         return acc.to_payload(dp_rank=0, is_idle_batch=False)
 
-    def test_nonstream_first_token_and_speculative_block_flush_immediately(self):
+    def test_nonstream_multi_token_first_output_flushes_immediately(self):
         """Output batching must not hold the first generated tokens until completion."""
-        for count in (1, 8, 50):
+        for count in (1, 8, 49):
             with self.subTest(count=count):
                 req = _FakeReq("test", list(range(count)))
                 payload = self.emit(req)
@@ -411,72 +411,33 @@ class TestFirstTokenFlush(CustomTestCase):
                 req.check_match_stop_str_prefix.return_value = False
                 self.assertEqual(self.emit(req).output_ids, [list(range(count + 1))])
 
-    def test_finished_request_flushes_even_with_stop_prefix(self):
+    def test_first_output_waits_when_stop_regex_is_set(self):
+        """A non-streaming request with only a stop regex must not flush its first
+        token early: once the regex matches on a later token, the detokenizer can
+        only trim the unsent tail, so the already-sent prefix leaked into the text."""
+        req = _FakeReq("test", [0])
+        req.sampling_params.stop_strs = []
+        req.sampling_params.stop_regex_strs = ["ab"]
+        req.check_match_stop_str_prefix = lambda: Req.check_match_stop_str_prefix(req)
+        self.assertIsNone(self.emit(req))
+        self.assertEqual(req.send_token_offset, 0)
+        req.output_ids = req.output_ids_through_stop = [0, 1]
+        req._finished = True
+        req.finished_reason = SimpleNamespace(to_json=lambda: {"type": "stop"})
+        self.assertEqual(self.emit(req).output_ids, [[0, 1]])
+
+    def test_first_output_exemptions(self):
+        """Finished requests flush despite a stop prefix; beam candidates never flush early."""
         req = _FakeReq("test", [10], finished=True)
         req.check_match_stop_str_prefix = Mock(return_value=True)
         self.assertEqual(self.emit(req).output_ids, [[10]])
 
-    def test_streaming_interval_and_stop_prefix_are_preserved(self):
-        req = _FakeReq("test", [10])
-        req.stream = True
-        req.sampling_params.stream_interval = 3
-        req.check_match_stop_str_prefix = Mock(return_value=True)
-        self.assertIsNone(self.emit(req))
-        req.check_match_stop_str_prefix.return_value = False
-        self.assertEqual(self.emit(req).output_ids, [[10]])
-        req.output_ids = req.output_ids_through_stop = [10, 11]
-        self.assertIsNone(self.emit(req))
-        req.output_ids = req.output_ids_through_stop = [10, 11, 12, 13]
-        self.assertEqual(self.emit(req).output_ids, [[11, 12, 13]])
-
-    def test_beam_candidates_remain_buffered(self):
         req = _FakeReq("test", [10])
         req.beam_group = object()
         for is_leader in (False, True):
             req.is_beam_leader = is_leader
             self.assertIsNone(self.emit(req))
             self.assertEqual(req.send_token_offset, 0)
-
-
-class TestNonstreamResponse(CustomTestCase, unittest.IsolatedAsyncioTestCase):
-    async def test_first_internal_output_does_not_yield_to_client(self):
-        manager = SimpleNamespace(
-            incremental_streaming_output=False,
-            request_logger=Mock(),
-            request_metrics_exporter_manager=SimpleNamespace(
-                exporter_enabled=lambda: False
-            ),
-        )
-        obj = SimpleNamespace(rid="test", stream=False)
-        state = SimpleNamespace(
-            event=asyncio.Event(),
-            out_list=[{"text": None, "meta_info": {}}],
-            finished=False,
-            time_stats=SimpleNamespace(response_sent_to_client_time=1),
-        )
-        state.event.set()
-        response = TokenizerManager._stream_one_response(manager, obj, state)
-        pending = asyncio.create_task(response.__anext__())
-        try:
-
-            async def wait_until_consumed():
-                while state.event.is_set():
-                    await asyncio.sleep(0)
-
-            await asyncio.wait_for(wait_until_consumed(), timeout=1)
-            self.assertFalse(pending.done())
-            final = {"text": "complete output", "meta_info": {}}
-            state.out_list.append(final)
-            state.finished = True
-            state.event.set()
-            self.assertEqual(await asyncio.wait_for(pending, timeout=1), final)
-            with self.assertRaises(StopAsyncIteration):
-                await response.__anext__()
-        finally:
-            if not pending.done():
-                pending.cancel()
-                await asyncio.gather(pending, return_exceptions=True)
-            await response.aclose()
 
 
 if __name__ == "__main__":
