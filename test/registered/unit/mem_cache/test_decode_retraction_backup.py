@@ -3,15 +3,16 @@ import unittest
 from array import array
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.arg_groups.hicache_hook import handle_hicache
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
-from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
+from sglang.srt.disaggregation.base.conn import KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.disaggregation.fake.conn import FakeKVManager
+from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -276,29 +277,40 @@ class TestDecodeRetractionBackup(CustomTestCase):
         queue.__dict__.update(
             tree_cache=env.cache,
             token_to_kv_pool=env.target_pool,
+            draft_token_to_kv_pool=env.draft_pool,
             token_to_kv_pool_allocator=env.allocator,
             req_to_token_pool=env.req_to_token_pool,
             req_to_metadata_buffer_idx_allocator=ReqToMetadataIdxAllocator(2),
+            metadata_buffers=SimpleNamespace(get_buf_infos=lambda: ([], [], [])),
+            tp_rank=0,
+            pp_rank=0,
+            transfer_backend=TransferBackend.FAKE,
+            is_mla_backend=False,
+            enable_staging=False,
+            transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
+            retracted_queue=[],
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
             scheduler=SimpleNamespace(
+                server_args=env.server_args,
+                ps=SimpleNamespace(dp_rank=0, gpu_id=0),
+                model_config=SimpleNamespace(
+                    num_hidden_layers=env.target_pool.layer_num
+                ),
+                running_batch=SimpleNamespace(reqs=[]),
+                waiting_queue=[],
+                last_batch=None,
                 enable_hisparse=False,
                 enable_decode_hicache=False,
-                tp_worker=SimpleNamespace(is_hybrid_swa=False),
+                tp_worker=SimpleNamespace(
+                    is_hybrid_swa=False,
+                    model_runner=SimpleNamespace(kv_cache_dtype_str="bfloat16"),
+                ),
             ),
         )
-        kv_args = KVArgs()
-        device_infos = ([], [], [])
-        for pool in (env.target_pool, env.draft_pool):
-            if pool is not None:
-                for combined, values in zip(
-                    device_infos, pool.get_contiguous_buf_infos()
-                ):
-                    combined.extend(values)
-        kv_args.kv_data_ptrs, kv_args.kv_data_lens, kv_args.kv_item_lens = device_infos
-        kv_args.state_types = []
-        queue._init_host_receive(kv_args)
-        return queue, kv_args
+        with patch.object(FakeKVManager, "supports_host_destination", True):
+            queue.kv_manager = queue._init_kv_manager()
+        return queue, queue.kv_manager.kv_args
 
     def test_host_receive_restores_target_and_draft_kv(self):
         """Wire-order writes must restore both pools, including packed MHA K/V.
@@ -323,13 +335,12 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 cache = env.cache
                 queue, kv_args = self._receive_queue(env)
 
-                req = SimpleNamespace(
+                req = Req(
                     rid="host-receive",
-                    kv=ReqKvInfo(),
+                    origin_input_text="",
                     bootstrap_host="localhost",
-                    origin_input_ids=[1] * num_tokens,
-                    seqlen=num_tokens + 1,
-                    time_stats=Mock(),
+                    origin_input_ids=array("q", [1] * num_tokens),
+                    sampling_params=SamplingParams(max_new_tokens=1),
                 )
                 receiver = Mock(supports_host_destination=False)
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
@@ -408,12 +419,17 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.req_to_token_pool.free(retracted)
 
                 # Device slots are assigned only after the host transfer.
-                self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
-                received_indices = env.allocator.alloc(num_slots)
-                env.req_to_token_pool.write(
-                    (req.kv.req_pool_idx, slice(0, num_tokens)),
-                    received_indices[:num_tokens],
-                )
+                blocker = env.allocator.alloc(self.pool_size)
+                self.assertFalse(queue.allocate_host_staged(decode_req))
+                self.assertIsNone(req.kv.req_pool_idx)
+                self.assertIs(req.kv.retraction_backup, backup)
+                env.allocator.free(blocker)
+                self.assertTrue(queue.allocate_host_staged(decode_req))
+                self.assertFalse(decode_req.host_staged)
+                received_indices = env.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :num_tokens
+                ].to(torch.int64)
+                req.output_ids.append(99)
                 cache.restore_kv_cache(req, backup)
                 for buffer, values in zip(device_buffers, expected, strict=True):
                     self.assertTrue(
@@ -469,7 +485,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
         for buffer in queue.host_pool.host_kv_data_refs:
             buffer[backup.host_indices] = 7
 
-        received_indices = queue._pre_alloc(req)
+        self.assertTrue(queue.allocate_host_staged(decode_req))
+        received_indices = env.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :8
+        ].clone()
         req.output_ids.append(99)
         # Prebuilt preparation retains the full-transfer/root state, then
         # restores before normal cache insertion deduplicates the prefix.

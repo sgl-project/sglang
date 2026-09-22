@@ -467,6 +467,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             or self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim()
         )
 
+    def _required_admission_tokens(
+        self, req: Req, allocated_tokens: int, prefix_len: int, retractable_tokens: int
+    ) -> int:
+        return max(
+            allocated_tokens + self.num_reserved_decode_tokens,
+            self._rebootstrap_prefill_len(req)
+            - prefix_len
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+            - retractable_tokens,
+        )
+
     def _prealloc_reservation_fits(
         self,
         full_tokens: int,
@@ -638,7 +649,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
         if get_disagg().disaggregation_decode_enable_host_receive:
-            self._init_host_receive(kv_args)
+            pool = self.token_to_kv_pool
+            group = self.tree_cache.host_pool_group
+            if kv_args.state_types or any(
+                spec.indices_from_pool != PoolName.KV
+                for spec in self.tree_cache.sidecar_pool_specs
+            ):
+                raise ValueError(
+                    "Host receive requires KV pools sharing the primary indices"
+                )
+            self.host_pool = group.get_pool(PoolName.KV)
+            self.host_reserved_tokens = decode_retraction_max_tokens(
+                self.req_to_token_pool, pool
+            )
+            if self.host_pool.logical_size < self.host_reserved_tokens + pool.page_size:
+                raise ValueError(
+                    "Host pool must hold a retraction and a receive page; "
+                    "increase --hicache-size or --hicache-ratio"
+                )
+            device_buffers, host_buffers = group.get_contiguous_buf_infos()
+            if device_buffers != (
+                kv_args.kv_data_ptrs,
+                kv_args.kv_data_lens,
+                kv_args.kv_item_lens,
+            ):
+                raise ValueError(
+                    "Host pool group must match the transferred target and draft KV"
+                )
+            (
+                kv_args.host_kv_data_ptrs,
+                kv_args.host_kv_data_lens,
+                kv_args.host_kv_item_lens,
+            ) = host_buffers
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
@@ -1408,19 +1450,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = 0
                 required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
 
-            required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
-            )
-
-            full_required_for_admission = max(
-                required_tokens_for_request,
-                origin_input_len
-                - prefix_len
-                + min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
-                - retractable_tokens,
+            full_required_for_admission = self._required_admission_tokens(
+                decode_req.req, required_alloc_tokens, prefix_len, retractable_tokens
             )
             swa_required_for_admission = 0
             swa_len = required_alloc_tokens
@@ -1629,14 +1660,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
-            decode_req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert decode_req.metadata_buffer_index is not None
-            # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1663,34 +1686,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                # Register before send_metadata, which triggers the STAGING_REQ
-                # prefetch (dropped for an unregistered room); tiny race, correct order.
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
-                )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
+            self._send_kv_metadata(
+                decode_req,
+                kv_indices,
+                kv_transfer_page_size,
                 state_indices,
                 **metadata_kwargs,
             )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
-                )
-            self._num_published_destinations += 1
             num_device_preallocated += 1
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
-            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}
@@ -1704,39 +1711,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return preallocated_reqs, failed_reqs
 
-    def _init_host_receive(self, kv_args) -> None:
-        pool = self.token_to_kv_pool
-        group = self.tree_cache.host_pool_group
-        if kv_args.state_types or any(
-            spec.indices_from_pool != PoolName.KV
-            for spec in self.tree_cache.sidecar_pool_specs
-        ):
-            raise ValueError(
-                "Host receive requires KV pools sharing the primary indices"
-            )
-        self.host_pool = group.get_pool(PoolName.KV)
-        self.host_reserved_tokens = decode_retraction_max_tokens(
-            self.req_to_token_pool, pool
+    def _send_kv_metadata(
+        self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
+    ) -> None:
+        decode_req.metadata_buffer_index = (
+            self.req_to_metadata_buffer_idx_allocator.alloc()
         )
-        if self.host_pool.logical_size < self.host_reserved_tokens + pool.page_size:
-            raise ValueError(
-                "Host pool must hold a retraction and a receive page; "
-                "increase --hicache-size or --hicache-ratio"
-            )
-        device_buffers, host_buffers = group.get_contiguous_buf_infos()
-        if device_buffers != (
-            kv_args.kv_data_ptrs,
-            kv_args.kv_data_lens,
-            kv_args.kv_item_lens,
+        assert decode_req.metadata_buffer_index is not None
+        page_indices = kv_to_page_indices(kv_indices, page_size).astype(np.int32)
+        if (
+            metadata_kwargs.get("destination") != KVTransferDestination.HOST
+            and self.transfer_queue.enable_staging
+            and hasattr(decode_req.kv_receiver, "require_staging")
+            and decode_req.kv_receiver.require_staging
         ):
-            raise ValueError(
-                "Host pool group must match the transferred target and draft KV"
+            # Register before send_metadata, which triggers the STAGING_REQ
+            # prefetch (dropped for an unregistered room); tiny race, correct order.
+            self.transfer_queue.staging_handler.register_decode_req(
+                decode_req.req.bootstrap_room, decode_req
             )
-        (
-            kv_args.host_kv_data_ptrs,
-            kv_args.host_kv_data_lens,
-            kv_args.host_kv_item_lens,
-        ) = host_buffers
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            decode_req.metadata_buffer_index,
+            state_indices,
+            **metadata_kwargs,
+        )
+        if decode_req.is_rebootstrap:
+            self.kv_manager.submit_prefill_recompute(
+                decode_req.kv_receiver,
+                decode_req.req.build_rebootstrap_payload(),
+            )
+        self._num_published_destinations += 1
+        decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         if (
@@ -1762,7 +1768,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if host_indices is None:
             return False
         assert decode_req.req.kv.retraction_backup is None
-        # _init_host_receive requires every sidecar to share the primary KV indices.
+        # All sidecars share the primary KV indices.
         decode_req.req.kv.retraction_backup = RetractionBackup(
             host_indices=host_indices,
             pool_transfers=[
@@ -1790,22 +1796,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.kv.cache_protected_len = 0
             req.num_matched_prefix_tokens = 0
             req.host_hit_length = 0
-        decode_req.metadata_buffer_index = (
-            self.req_to_metadata_buffer_idx_allocator.alloc()
-        )
-        assert decode_req.metadata_buffer_index is not None
-        page_indices = kv_to_page_indices(
-            host_indices, self.token_to_kv_pool_allocator.page_size
-        ).astype(np.int32)
-        decode_req.kv_receiver.send_metadata(
-            page_indices,
-            decode_req.metadata_buffer_index,
+        self._send_kv_metadata(
+            decode_req,
+            host_indices,
+            self.token_to_kv_pool_allocator.page_size,
             decode_prefix_len=0,
             destination=KVTransferDestination.HOST,
         )
         decode_req.host_staged = True
-        self._num_published_destinations += 1
-        decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
         return True
 
     def allocate_host_staged(self, decode_req: DecodeRequest) -> bool:
@@ -1816,17 +1814,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
-        required_tokens = max(
-            ceil_align(
-                len(req.origin_input_ids), self.token_to_kv_pool_allocator.page_size
-            )
-            + self.num_reserved_decode_tokens,
-            len(req.origin_input_ids)
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-            - retractable_tokens,
+        required_tokens = self._required_admission_tokens(
+            req,
+            self._required_alloc_tokens(
+                fill_len=len(req.origin_input_ids), prefix_len=0
+            ),
+            0,
+            retractable_tokens,
         )
-        if required_tokens > self._allocatable_token_budgets(
-            retractable_tokens=retractable_tokens, count_retracted=True
+        if not self._prealloc_reservation_fits(
+            required_tokens,
+            0,
+            full_allocatable_tokens=self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            ),
+            swa_allocatable_tokens=None,
         ):
             return False
         self._pre_alloc(req)
