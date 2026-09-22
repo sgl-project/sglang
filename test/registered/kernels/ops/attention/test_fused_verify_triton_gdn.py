@@ -25,6 +25,11 @@ try:
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         _select_recurrent_launch_config,
+    )
+
+    # Import through the dispatcher so each platform tests the wrapper it
+    # actually runs: the shared kernel on CUDA/AMD, the fork on XPU.
+    from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
         fused_sigmoid_gating_delta_rule_update,
     )
 

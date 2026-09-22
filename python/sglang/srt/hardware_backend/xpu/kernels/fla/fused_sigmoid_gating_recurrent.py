@@ -81,6 +81,15 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    # Adaptive spec changes the runtime draft count without changing the
+    # allocated per-request pitch, which is preserved in stride(0).
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif cache_steps is not None and cache_steps > 0:
+        cache_stride_steps = cache_steps
+    else:
+        cache_stride_steps = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -101,7 +110,7 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
+        cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
