@@ -8,6 +8,7 @@ reaches their summaries: every case then fails with "Load duration missing or
 invalid: None" while the server did measure one.
 """
 
+import ast
 import importlib.util
 import unittest
 from dataclasses import replace
@@ -44,6 +45,20 @@ def _load_module(relative_path: str):
     return module
 
 
+def _calls_validate_and_record(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return False
+    return any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "_validate_and_record"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        for node in ast.walk(tree)
+    )
+
+
 def _perf_record() -> RequestPerfRecord:
     return RequestPerfRecord(
         request_id="load-time-guard",
@@ -56,6 +71,15 @@ def _perf_record() -> RequestPerfRecord:
 
 
 class TestDiffusionServerLoadTimeRecording(CustomTestCase):
+    def test_every_override_is_covered(self):
+        """A new override must join OVERRIDING_TESTS instead of going unguarded."""
+        found = {
+            str(path.relative_to(REGISTERED_DIR))
+            for path in REGISTERED_DIR.rglob("test_*.py")
+            if _calls_validate_and_record(path)
+        }
+        self.assertEqual(found, {entry[0] for entry in OVERRIDING_TESTS})
+
     def test_overriding_tests_record_the_measured_load_time(self):
         """Each override must reach _record_performance_result with the server's load time."""
         # thresholds are not the subject here, so keep them off the runner's speed
