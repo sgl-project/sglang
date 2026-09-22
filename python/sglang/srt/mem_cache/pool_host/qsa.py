@@ -39,6 +39,19 @@ def qsa_indexer_bytes_per_token_per_layer(
 
 
 class QSAIndexerHostPoolBuilder:
+    def validate(
+        self,
+        *,
+        decl: HostPoolDecl,
+        page_size: int,
+        packed_draft_device_pools: tuple[QSATokenToKVPool, ...],
+    ) -> None:
+        _qsa_device_page_buffers(
+            decl=decl,
+            page_size=page_size,
+            packed_draft_device_pools=packed_draft_device_pools,
+        )
+
     def build(
         self,
         *,
@@ -77,6 +90,38 @@ def make_qsa_indexer_pool_decl(
     )
 
 
+def _qsa_device_page_buffers(
+    *,
+    decl: HostPoolDecl,
+    page_size: int,
+    packed_draft_device_pools: tuple[QSATokenToKVPool, ...],
+) -> list[torch.Tensor]:
+    item_bytes = decl.storage_info.page_bytes(page_size)
+    rows = []
+    for pool in (decl.device_pool, *packed_draft_device_pools):
+        if page_size % pool.qsa_compress_ratio:
+            raise ValueError(
+                f"HiCache page {page_size} is not a multiple of the QSA "
+                f"compress ratio {pool.qsa_compress_ratio}"
+            )
+        groups_per_page = page_size // pool.qsa_compress_ratio
+        for buffer in pool.qsa_compressed_k_buffer_pool:
+            if buffer.dtype != decl.storage_info.dtype or not buffer.is_contiguous():
+                raise ValueError(
+                    f"{decl.pool_name}: compressed keys require matching dtype and contiguous storage"
+                )
+            page_bytes = buffer[0].nbytes * groups_per_page
+            if page_bytes != item_bytes:
+                raise ValueError(
+                    f"{type(pool).__name__} compressed keys take {page_bytes} "
+                    f"bytes per page, declared {item_bytes}"
+                )
+            rows.append(buffer.view(torch.uint8).reshape(-1, item_bytes))
+    if not rows:
+        raise ValueError(f"{decl.pool_name} declared with no compressed key layers")
+    return rows
+
+
 class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
     """Page rows of compressed keys addressed by full-KV token slots; packed
     drafts append their layers after the target's."""
@@ -93,24 +138,11 @@ class QSAIndexerPoolHost(DeepSeekV4PagedHostPool):
         self.device_pool = decl.device_pool
         page_size = anchor_host.page_size
         item_bytes = decl.storage_info.page_bytes(page_size)
-        rows = []
-        for pool in (decl.device_pool, *packed_draft_device_pools):
-            if page_size % pool.qsa_compress_ratio:
-                raise ValueError(
-                    f"HiCache page {page_size} is not a multiple of the QSA "
-                    f"compress ratio {pool.qsa_compress_ratio}"
-                )
-            groups_per_page = page_size // pool.qsa_compress_ratio
-            for buffer in pool.qsa_compressed_k_buffer_pool:
-                page_bytes = buffer[0].nbytes * groups_per_page
-                if page_bytes != item_bytes:
-                    raise ValueError(
-                        f"{type(pool).__name__} compressed keys take {page_bytes} "
-                        f"bytes per page, declared {item_bytes}"
-                    )
-                rows.append(buffer.view(torch.uint8).reshape(-1, item_bytes))
-        if not rows:
-            raise ValueError(f"{decl.pool_name} declared with no compressed key layers")
+        rows = _qsa_device_page_buffers(
+            decl=decl,
+            page_size=page_size,
+            packed_draft_device_pools=packed_draft_device_pools,
+        )
         super().__init__(
             pool_name=decl.pool_name.value,
             device_buffers=rows,

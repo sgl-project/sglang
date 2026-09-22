@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -369,6 +370,9 @@ def _qsa_pool_stub(*, layer_num: int, size: int = 4096, ratio: int = 4):
 
     pool = object.__new__(QSATokenToKVPool)
     pool.full_kv_pool = _kv_pool_stub(layer_num=layer_num, size=size)
+    pool.full_kv_pool.head_num = 1
+    pool.full_kv_pool.head_dim = 128
+    pool.full_kv_pool.v_head_dim = 128
     pool.qsa_index_kv_heads = 1
     pool.qsa_index_head_dim = 128
     pool.qsa_compress_ratio = ratio
@@ -1152,6 +1156,108 @@ class TestDeclaredPoolPlanning(CustomTestCase):
         self.assertEqual(
             [c.decl.pool_name for c in configs], [PoolName.KV, PoolName.INDEXER]
         )
+
+
+class TestHostPoolPreflight(CustomTestCase):
+    """Malformed declarations must fail before reserving host memory."""
+
+    def test_invalid_dependencies_do_not_allocate(self):
+        kv, indexer = _dsa_pool_stub(layer_num=2).host_pool_decls()
+        cyclic_indexer = msgspec.structs.replace(indexer, layout_source=PoolName.SWA)
+        cyclic_swa = msgspec.structs.replace(
+            indexer, pool_name=PoolName.SWA, layout_source=PoolName.INDEXER
+        )
+        cases = [
+            ((kv, msgspec.structs.replace(indexer, host_pool_builder=None)), "builder"),
+            ((kv, msgspec.structs.replace(indexer, storage_info=None)), "storage_info"),
+            ((kv, cyclic_indexer, cyclic_swa), "cyclic"),
+            (
+                (kv, msgspec.structs.replace(indexer, owned_device_layers=(0, 0))),
+                "owned_device_layers",
+            ),
+        ]
+        for decls, error in cases:
+            with (
+                self.subTest(error=error),
+                patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
+            ):
+                with self.assertRaisesRegex(ValueError, error):
+                    assemble_host_pools_from_decls(
+                        params=_target_params(),
+                        decls=decls,
+                        full_layer_mapping={0: 0, 1: 1},
+                        load_cache_event=None,
+                        storage_backend=None,
+                        use_mla=True,
+                    )
+                allocate.assert_not_called()
+
+    def test_draft_declarations_are_collected_once(self):
+        target = _dsa_pool_stub(layer_num=2)
+        draft = _dsa_pool_stub(layer_num=1)
+        draft.host_pool_decls = MagicMock(wraps=draft.host_pool_decls)
+        decls = target.host_pool_decls()
+        drafts = validate_packed_draft_pools(decls, (draft,))
+        configs = prepare_host_pool_configs(
+            decls=decls,
+            full_layer_mapping={0: 0, 4: 1, 5: 2},
+            transfer_layer_id_max=6,
+            packed_draft_decls=drafts,
+        )
+        draft.host_pool_decls.assert_called_once()
+        self.assertIs(configs[1].packed_draft_device_pools[0], draft)
+        self.assertEqual(
+            configs[1].layer_binding.transfer_to_device, {0: 0, 4: 1, 5: 2}
+        )
+
+    def test_packed_draft_rejects_duplicate_pool_names(self):
+        target = _dsa_pool_stub(layer_num=2)
+        draft = _dsa_pool_stub(layer_num=1)
+        declarations = draft.host_pool_decls()
+        draft.host_pool_decls = lambda: (*declarations, declarations[1])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            validate_packed_draft_pools(target.host_pool_decls(), (draft,))
+
+    def test_transfer_range_is_not_the_number_of_entries(self):
+        decls = _dsa_pool_stub(layer_num=2).host_pool_decls()
+        with self.assertRaisesRegex(ValueError, "transfer layer 4"):
+            prepare_host_pool_configs(
+                decls=decls, full_layer_mapping={0: 0, 4: 1}, transfer_layer_id_max=2
+            )
+
+    def test_build_order_resolves_dependencies_before_allocation(self):
+        kv, indexer = _dsa_pool_stub(layer_num=1).host_pool_decls()
+        configs = prepare_host_pool_configs(
+            decls=(indexer, kv), full_layer_mapping={0: 0}, transfer_layer_id_max=1
+        )
+        self.assertEqual(
+            [c.decl.pool_name for c in configs], [PoolName.KV, PoolName.INDEXER]
+        )
+
+    def test_qsa_page_mismatch_does_not_allocate_anchor(self):
+        pool = _qsa_pool_stub(layer_num=1)
+        with patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate:
+            with self.assertRaisesRegex(ValueError, "multiple"):
+                assemble_host_pools_from_decls(
+                    params=SimpleNamespace(page_size=63, mtp_draft_device_pools=()),
+                    decls=pool.host_pool_decls(),
+                    full_layer_mapping={0: 0},
+                    load_cache_event=None,
+                    storage_backend=None,
+                    use_mla=True,
+                )
+            allocate.assert_not_called()
+
+    def test_same_qsa_bytes_do_not_allow_a_different_dtype(self):
+        pool = _qsa_pool_stub(layer_num=1)
+        decl = pool.host_pool_decls()[1]
+        pool.qsa_compressed_k_buffer_pool[0] = pool.qsa_compressed_k_buffer_pool[
+            0
+        ].view(torch.int16)
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            decl.host_pool_builder.validate(
+                decl=decl, page_size=64, packed_draft_device_pools=()
+            )
 
 
 class TestHiRadixExtraPoolsFromDeclaration(CustomTestCase):

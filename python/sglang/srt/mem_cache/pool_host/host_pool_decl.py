@@ -39,6 +39,14 @@ class HostPoolStorageInfo(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class HostPoolBuilder(Protocol):
+    def validate(
+        self,
+        *,
+        decl: HostPoolDecl,
+        page_size: int,
+        packed_draft_device_pools: tuple[Any, ...],
+    ) -> None: ...
+
     def build(
         self,
         *,

@@ -61,6 +61,23 @@ def dsa_indexer_bytes_per_token_per_layer(
 
 
 class DSAIndexerHostPoolBuilder:
+    def validate(
+        self,
+        *,
+        decl: HostPoolDecl,
+        page_size: int,
+        packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
+    ) -> None:
+        target = decl.device_pool
+        target_format = (target.index_head_dim, target.quant_block_size)
+        for draft in packed_draft_device_pools:
+            draft_format = (draft.index_head_dim, draft.quant_block_size)
+            if draft_format != target_format:
+                raise ValueError(
+                    f"{decl.pool_name}: packed index key format {draft_format} "
+                    f"differs from target {target_format}"
+                )
+
     def build(
         self,
         *,

@@ -11,6 +11,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    HostPoolBuildConfig,
+    layout_root,
+    prepare_host_pool_configs,
+    validate_packed_draft_pools,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -152,6 +158,8 @@ def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
 def _check_packed_kv_rows(kv_pool: Any, drafts: tuple[Any, ...], *, use_mla: bool):
     """Packed draft KV layers share the target's host row, so their device
     rows must have the same shape and dtype."""
+    if not drafts:
+        return
     target = _kv_row_signature(kv_pool, use_mla=use_mla)
     for draft in drafts:
         row = _kv_row_signature(draft, use_mla=use_mla)
@@ -1051,8 +1059,9 @@ def build_hybrid_mamba_stack(
         decls=decls,
         full_layer_mapping=full_layer_mapping,
         transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
-        packed_draft_pools=packed_drafts,
+        packed_draft_decls=packed_drafts,
     )
+    _validate_host_pool_buffers(configs, page_size=params.page_size, use_mla=use_mla)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1239,153 +1248,6 @@ def build_hybrid_mamba_swa_stack(
     return host_pool_group, cache_controller
 
 
-class LayerBinding(msgspec.Struct, frozen=True, kw_only=True):
-    """Transfer layer (what the controller iterates) to device pool layer.
-
-    Compact host layer indices stay inside the host pool; packed draft
-    remapping stays inside the controller.
-    """
-
-    transfer_to_device: dict[int, int]
-    transfer_layer_id_max: int
-
-
-class HostPoolBuildConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """A declaration bound to one stack: what the assembler builds an entry from."""
-
-    decl: HostPoolDecl
-    layer_binding: LayerBinding
-    # Draft pools whose same-named buffers are appended as tail layers, in depth order.
-    packed_draft_device_pools: tuple[Any, ...] = ()
-
-
-def validate_packed_draft_pools(
-    target_decls: tuple[HostPoolDecl, ...], draft_pools: tuple[Any, ...]
-) -> tuple[Any, ...]:
-    """Check that every draft can be appended as tail layers of the target host
-    pools: it declares the same pools with the same storage info and every
-    packed layer owns its buffer. The draft plan already chose packing, so a
-    draft that cannot be packed is an error, not a silent skip."""
-    targets = {d.pool_name: d for d in target_decls}
-    for pool in draft_pools:
-        drafts = {d.pool_name: d for d in pool.host_pool_decls()}
-        if set(drafts) != set(targets):
-            raise ValueError(
-                f"packed draft {type(pool).__name__} declares "
-                f"{sorted(d.value for d in drafts)} but the target declares "
-                f"{sorted(d.value for d in targets)}; every target pool needs a "
-                "draft counterpart or the draft buffers are not restored"
-            )
-        for name, target in targets.items():
-            draft = drafts[name]
-            if draft.storage_info != target.storage_info:
-                raise ValueError(
-                    f"packed draft {name.value} storage {draft.storage_info} "
-                    f"differs from target {target.storage_info}"
-                )
-            owned = draft.owned_device_layers
-            if owned is not None and len(owned) != draft.device_pool.layer_num:
-                raise ValueError(
-                    f"packed draft {name.value} owns buffers on {len(owned)} of "
-                    f"{draft.device_pool.layer_num} layers; every packed layer "
-                    "must own its buffer"
-                )
-    return tuple(draft_pools)
-
-
-def layout_root(decls: tuple[HostPoolDecl, ...]) -> HostPoolDecl:
-    """The one declaration whose host pool decides the group's capacity."""
-    roots = [d for d in decls if d.is_layout_root]
-    if len(roots) != 1:
-        raise ValueError(
-            f"expected exactly one layout root, got {[d.pool_name for d in roots]}"
-        )
-    return roots[0]
-
-
-def _find_pool_decl(decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostPoolDecl:
-    return next(d for d in decls if d.pool_name == name)
-
-
-def prepare_host_pool_configs(
-    *,
-    decls: tuple[HostPoolDecl, ...],
-    full_layer_mapping: dict[int, int],
-    transfer_layer_id_max: int,
-    packed_draft_pools: tuple[Any, ...] = (),
-    index_primary: Optional[PoolName] = None,
-) -> tuple[HostPoolBuildConfig, ...]:
-    """Bind declarations to a stack. A target group contains its own primary
-    KV pool; a draft sidecar group reuses an external ``index_primary``. Either
-    way exactly one layout root anchors the others' capacity, and sidecar
-    indices come from one real source (HostPoolGroup resolves no chains).
-
-    ``packed_draft_pools`` have passed validate_packed_draft_pools; each config
-    carries the draft objects that own its same-named buffers."""
-    names = [d.pool_name for d in decls]
-    if len(set(names)) != len(names):
-        raise ValueError(f"duplicate host pool names: {names}")
-    root = layout_root(decls)
-    if index_primary is None:
-        if not root.is_primary or root.pool_name != PoolName.KV:
-            raise ValueError(
-                f"expected the layout root to be the primary KV pool, got {root.pool_name}"
-            )
-        index_primary = root.pool_name
-    elif any(d.is_primary for d in decls):
-        raise ValueError("a sidecar group must take every index from the target")
-    for d in decls:
-        if d.is_primary:
-            continue
-        if d.indices_from_pool != index_primary:
-            raise ValueError(
-                f"{d.pool_name}.indices_from_pool must be {index_primary}, "
-                f"got {d.indices_from_pool}"
-            )
-        if d.is_layout_root:
-            continue
-        if d.layout_source == d.pool_name:
-            raise ValueError(f"{d.pool_name}.layout_source must name another pool")
-        if d.layout_source not in names:
-            raise ValueError(
-                f"{d.pool_name} references undeclared pool {d.layout_source}"
-            )
-    draft_decls = [pool.host_pool_decls() for pool in packed_draft_pools]
-    return tuple(
-        HostPoolBuildConfig(
-            decl=d,
-            layer_binding=LayerBinding(
-                transfer_to_device=_filter_owned_layer_mapping(
-                    full_layer_mapping,
-                    d.owned_device_layers,
-                    root.device_pool.layer_num,
-                ),
-                transfer_layer_id_max=transfer_layer_id_max,
-            ),
-            packed_draft_device_pools=tuple(
-                _find_pool_decl(decls_of_draft, d.pool_name).device_pool
-                for decls_of_draft in draft_decls
-            ),
-        )
-        for d in decls
-    )
-
-
-def _filter_owned_layer_mapping(
-    mapping: dict[int, int],
-    owned_device_layers: Optional[tuple[int, ...]],
-    target_layer_num: int,
-) -> dict[int, int]:
-    """Drop transfer layers whose device layer owns no buffer for this pool.
-    Packed draft tails (device index >= target layer count) are kept."""
-    if owned_device_layers is None:
-        return mapping
-    owned = set(owned_device_layers)
-    return {
-        t: dev for t, dev in mapping.items() if dev >= target_layer_num or dev in owned
-    }
-
-
 class HostPoolAssemblyResult(msgspec.Struct, frozen=True, kw_only=True):
     host_pool_group: HostPoolGroup
     cache_controller: HybridCacheController
@@ -1400,35 +1262,38 @@ def _root_config(configs: tuple[HostPoolBuildConfig, ...]) -> HostPoolBuildConfi
     return next(c for c in configs if c.decl.is_layout_root)
 
 
+def _validate_host_pool_buffers(
+    configs: tuple[HostPoolBuildConfig, ...], *, page_size: int, use_mla: bool
+) -> None:
+    root = _root_config(configs)
+    _check_packed_kv_rows(
+        root.decl.device_pool, root.packed_draft_device_pools, use_mla=use_mla
+    )
+    for config in configs:
+        if not config.decl.is_layout_root:
+            config.decl.host_pool_builder.validate(
+                decl=config.decl,
+                page_size=page_size,
+                packed_draft_device_pools=config.packed_draft_device_pools,
+            )
+
+
 def _build_declared_entries(
     configs: tuple[HostPoolBuildConfig, ...], *, root_host_pool: Any
 ) -> list[PoolEntry]:
-    """Host pools in layout-dependency order from the given root; entries in
-    declaration order."""
+    """Build pools and entries in the validated layout-dependency order."""
     host_pools: dict[PoolName, Any] = {}
-    pending = list(configs)
-    while pending:
-        ready = [
-            c
-            for c in pending
-            if c.decl.is_layout_root or c.decl.layout_source in host_pools
-        ]
-        if not ready:
-            raise ValueError(
-                f"unresolvable layout_source chain: {[c.decl.pool_name for c in pending]}"
+    for config in configs:
+        decl = config.decl
+        if decl.is_layout_root:
+            host_pools[decl.pool_name] = root_host_pool
+        else:
+            host_pools[decl.pool_name] = decl.host_pool_builder.build(
+                decl=decl,
+                anchor_host=host_pools[decl.layout_source],
+                allocator_type=_get_allocator_type(),
+                packed_draft_device_pools=config.packed_draft_device_pools,
             )
-        for config in ready:
-            decl = config.decl
-            if decl.is_layout_root:
-                host_pools[decl.pool_name] = root_host_pool
-            else:
-                host_pools[decl.pool_name] = decl.host_pool_builder.build(
-                    decl=decl,
-                    anchor_host=host_pools[decl.layout_source],
-                    allocator_type=_get_allocator_type(),
-                    packed_draft_device_pools=config.packed_draft_device_pools,
-                )
-            pending.remove(config)
     return [
         build_pool_entry(
             name=config.decl.pool_name,
@@ -1464,7 +1329,7 @@ def assemble_host_pools_from_decls(
     Separate drafts are built by build_hicache_draft_sidecars.
     """
     kv_pool = layout_root(decls).device_pool
-    transfer_layer_id_max = len(full_layer_mapping)
+    transfer_layer_id_max = max(full_layer_mapping, default=-1) + 1
     packed_drafts = validate_packed_draft_pools(decls, params.mtp_draft_device_pools)
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if packed_drafts:
@@ -1478,8 +1343,9 @@ def assemble_host_pools_from_decls(
         decls=decls,
         full_layer_mapping=full_layer_mapping,
         transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
-        packed_draft_pools=packed_drafts,
+        packed_draft_decls=packed_drafts,
     )
+    _validate_host_pool_buffers(configs, page_size=params.page_size, use_mla=use_mla)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1556,6 +1422,8 @@ def build_full_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build the separate draft sidecars declared by a full-attention draft pool;
     their indices follow target KV and their layout roots on the draft KV host pool."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     decls = draft_kv_pool.host_pool_decls()
     # A hybrid draft declares its KV on the full-attention sub-pool.
     pool = layout_root(decls).device_pool
@@ -1565,6 +1433,17 @@ def build_full_draft_pools(
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
 
+    configs = prepare_host_pool_configs(
+        decls=make_draft_sidecar_decls(decls),
+        full_layer_mapping={i: i for i in range(pool.layer_num)},
+        transfer_layer_id_max=pool.layer_num,
+        index_primary=PoolName.KV,
+    )
+    _validate_host_pool_buffers(
+        configs,
+        page_size=controller.page_size,
+        use_mla=isinstance(pool, MLATokenToKVPool),
+    )
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(
@@ -1574,12 +1453,6 @@ def build_full_draft_pools(
         layout=get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
         pool_label="draft",
-    )
-    configs = prepare_host_pool_configs(
-        decls=make_draft_sidecar_decls(decls),
-        full_layer_mapping={i: i for i in range(pool.layer_num)},
-        transfer_layer_id_max=draft_host_pool.layer_num,
-        index_primary=PoolName.KV,
     )
     entries = _build_declared_entries(configs, root_host_pool=draft_host_pool)
     return [c.decl.sidecar_spec() for c in configs], entries
@@ -1682,6 +1555,7 @@ class StackBuildResult:
     # layer_transfer_counter has to be wired separately.
     register_req_to_token_counter: bool = False
     pools_desc: str = ""
+    pool_declarations: Optional[tuple[HostPoolDecl, ...]] = None
 
 
 class StackStrategy:
@@ -1891,6 +1765,7 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.MAMBA: stack.host_pool_group.get_pool(PoolName.MAMBA),
             },
             sidecars=stack.sidecars,
+            pool_declarations=tuple(c.decl for c in stack.configs),
             register_req_to_token_counter=True,
             pools_desc=" + ".join(
                 [c.decl.pool_name.value.upper() for c in stack.configs] + ["MAMBA"]
@@ -2146,6 +2021,7 @@ class _PlainKvStrategy(StackStrategy):
                 ComponentType.FULL: stack.host_pool_group.get_pool(PoolName.KV),
             },
             sidecars=stack.sidecars,
+            pool_declarations=tuple(c.decl for c in stack.configs),
             pools_desc=" + ".join(
                 c.decl.pool_name.value.upper() for c in stack.configs
             ),
@@ -2210,11 +2086,10 @@ def _check_declared_pools_present(
     kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
     entries = result.host_pool_group.entry_map
-    missing = [
-        d.pool_name.value
-        for d in kvcache.host_pool_decls()
-        if d.pool_name not in entries
-    ]
+    decls = result.pool_declarations
+    if decls is None:
+        decls = kvcache.host_pool_decls()
+    missing = [d.pool_name.value for d in decls if d.pool_name not in entries]
     if not missing:
         return
     msg = (
