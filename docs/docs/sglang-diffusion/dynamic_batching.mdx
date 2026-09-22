@@ -77,6 +77,7 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GLM-Image (external AR)</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image 2512</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
+    <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image 2.1</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td></tr>
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td></tr>
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2509</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen Image Edit 2511</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>?</td></tr>
@@ -97,6 +98,11 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
     <tr><td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ERNIE-Image-Turbo</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>?</td><td style={{textAlign: "center", padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td></tr>
   </tbody>
 </table>
+
+Qwen Image 2.1 supports merging compatible text-to-image requests. Image edits
+are not merged across requests; `n > 1` still produces multiple outputs within
+one edit request. See its [cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#batching)
+for deployment settings and batching tradeoffs.
 
 ### Video
 

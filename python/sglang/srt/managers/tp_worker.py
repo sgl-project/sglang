@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
-from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -57,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -88,6 +87,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def last_shared_read_runner(self):
@@ -210,12 +215,12 @@ class BaseTpWorker(ABC):
         return success, message
 
     def _deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index ps.tp_rank);
+        """Each rank deserializes only its own payload (index tp_rank);
         deserializing another rank's copy would break producer-side CUDA-IPC
         refcounting."""
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.ps.tp_rank]
+            serialized_named_tensors[self.model_runner.tp_rank]
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
@@ -284,12 +289,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -316,7 +321,6 @@ class TpModelWorker(BaseTpWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -329,7 +333,6 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
-        self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -381,8 +384,8 @@ class TpModelWorker(BaseTpWorker):
         self.device = self.model_runner.device
 
         # Init nccl groups
-        self.pp_group = get_pp_group()
-        self.world_group = get_world_group()
+        self.pp_group = get_parallel().pp_group
+        self.world_group = get_parallel().world_group
 
         # Sync random seed across TP workers.
         # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
@@ -391,10 +394,29 @@ class TpModelWorker(BaseTpWorker):
             self.random_seed = random_seed
         elif get_exec().moe.is_ep_joiner:
             self.random_seed = get_device().random_seed
+        elif (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and get_parallel().pp_size > 1
+        ):
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead — that is exactly
+            # the set of ranks holding a draft worker. The draft worker is
+            # constructed with pp_rank=0, so derive the caller's global rank
+            # from the TP group rather than tp_size * pp_rank + tp_rank.
+            tp_group = self.model_runner.tp_group
+            self.random_seed = broadcast_pyobj(
+                [get_device().random_seed],
+                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.model_runner.tp_size * get_parallel().pp_rank
+                + self.model_runner.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -427,7 +449,8 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            self.model_runner.effective_max_total_num_tokens
+            * get_parallel().attn_dcp_size
             - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
@@ -445,6 +468,18 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
+        """Idempotently capture decode cuda graphs for all model runners (used
+        for the on-flip capture during a runtime PD role switch)."""
+        self.model_runner.ensure_decode_cuda_graphs(capture_bs)
+        for mr in self.model_runner_list[1:]:
+            mr.ensure_decode_cuda_graphs(capture_bs)
+
+    def get_decode_cuda_graph_bs(self) -> List[int]:
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill,
+        or on a runner that never allocates a KV pool, e.g. the MLX stub)."""
+        return list(getattr(self.model_runner, "decode_cuda_graph_capture_bs", []))
 
     def start_startup_weight_load(self) -> None:
         """Start deferred checkpoint prefetching for all model runners."""
@@ -484,7 +519,6 @@ class TpModelWorker(BaseTpWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -505,7 +539,6 @@ class TpModelWorker(BaseTpWorker):
                     model_config=self.model_config,
                     mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
-                    ps=self.ps,
                     nccl_port=self.nccl_port,
                     server_args=self.server_args,
                     is_draft_worker=self.is_draft_worker,
@@ -542,7 +575,8 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            self.model_runner.effective_max_total_num_tokens
+            * get_parallel().attn_dcp_size
             - 1,
         )
         return (
@@ -604,6 +638,14 @@ class TpModelWorker(BaseTpWorker):
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
+
+            if get_exec().features.enable_encoder_swa_bounded_replay:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    run_encoder_swa_replay,
+                )
+
+                # Replay reads restored main/indexer KV before the normal extend.
+                run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
                 batch,
