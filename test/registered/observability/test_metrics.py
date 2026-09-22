@@ -182,7 +182,6 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:time_to_first_token_seconds",
             "sglang:inter_token_latency_seconds",
             "sglang:e2e_request_latency_seconds",
-            "sglang:request_time_per_output_token_seconds",
             "sglang:http_requests_active",
             "sglang:routing_keys_active",
             "sglang:num_unique_running_routing_keys",
@@ -247,6 +246,10 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
             ("sglang:startup_time_seconds", {"phase": "tokenizer_e2e"}),
             ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
+            (
+                "sglang:request_time_per_output_token_seconds_count",
+                {"is_streaming": "true"},
+            ),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 

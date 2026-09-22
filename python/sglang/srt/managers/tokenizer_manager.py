@@ -3081,11 +3081,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             # Aborts have a truncated decode period; PD prefill workers have none.
-            finish_reason = recv_obj.finished_reasons[i] or {}
             time_per_output_token = (
                 state.time_stats.get_time_per_output_token(completion_tokens)
                 if self.disaggregation_mode != DisaggregationMode.PREFILL
-                and finish_reason.get("type") in ("stop", "length")
+                and finish_type in ("stop", "length")
                 else None
             )
 

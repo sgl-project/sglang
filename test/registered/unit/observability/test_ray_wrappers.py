@@ -382,6 +382,7 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
                 get_first_token_latency=lambda: 0.2,
                 get_interval=lambda: 0.2,
                 get_e2e_latency=lambda: 1.0,
+                get_time_per_output_token=lambda completion_tokens: None,
                 set_last_time=lambda: None,
             ),
         )
