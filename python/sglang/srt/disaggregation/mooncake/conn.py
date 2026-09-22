@@ -2813,6 +2813,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         super().abort()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+        # notify decode side so it can abort the request immediately
+        room = self.bootstrap_room
+        infos = self.kv_mgr.transfer_infos.pop(room, None)
+        if infos:
+            for info in infos.values():
+                try:
+                    self.kv_mgr.sync_status_to_decode_endpoint(
+                        info.endpoint,
+                        info.dst_port,
+                        room,
+                        KVPoll.Failed,
+                        self.kv_mgr.attn_tp_rank,
+                    )
+                except Exception:
+                    pass
 
 
 class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):

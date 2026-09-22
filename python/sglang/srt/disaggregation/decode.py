@@ -62,6 +62,8 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    is_aborted,
+    is_dsv4_c128_online_enabled,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -1229,13 +1231,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+            if is_aborted(decode_req.req):
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver.abort()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -2509,7 +2511,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
-                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                if is_aborted(decode_req.req):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
