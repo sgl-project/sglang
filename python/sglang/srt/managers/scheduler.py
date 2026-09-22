@@ -836,6 +836,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
+                can_empty_cache=lambda: not self._engine_paused,
             )
         else:
             self.idle_sleeper = None
@@ -2296,7 +2297,9 @@ class Scheduler(
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
-        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+        self.idle_sleeper = RustServerIdleSleeper(
+            rust_server, can_empty_cache=lambda: not self._engine_paused
+        )
 
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
@@ -4980,7 +4983,7 @@ class Scheduler(
         else:
             self.metrics_reporter.record_scheduler_active()
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -4997,7 +5000,8 @@ class Scheduler(
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        if not ignore_waiting:
+            idle &= len(self.waiting_queue) == 0
 
         if (
             for_health_check
@@ -5155,7 +5159,7 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle():
+        if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
