@@ -97,7 +97,7 @@ class TestGLM53FlashH200LowLatency(
         "--speculative-adaptive",
         # Leave headroom for additional adaptive EAGLE graph states.
         "--mem-fraction-static",
-        "0.88",
+        "0.86",
     ]
 
 
