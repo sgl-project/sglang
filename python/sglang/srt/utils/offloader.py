@@ -85,6 +85,57 @@ def create_offloader(dp_rank: int):
     return NoopOffloader()
 
 
+def _get_offloaded_device_state(module: torch.nn.Module, device: torch.device):
+    transferred = {}
+    device_state = {}
+    for name, value in module.state_dict(keep_vars=True).items():
+        key = id(value)
+        if key not in transferred:
+            transferred[key] = value.detach().to(device, non_blocking=True)
+        device_state[name] = transferred[key]
+    return device_state
+
+
+def _get_resident_parameter_ids(module: torch.nn.Module):
+    # functional_call only replaces registered parameters and buffers, so cached
+    # tensors held as ordinary attributes need their backing weights to stay put.
+    resident = set()
+    for owner in module.modules():
+        # MLA post_load_weights derives w_kc/w_vc from kv_b_proj weights on
+        # their current device. These attributes already exist before loading.
+        projection = getattr(owner, "kv_b_proj", None)
+        if (
+            isinstance(projection, torch.nn.Module)
+            and hasattr(owner, "w_kc")
+            and hasattr(owner, "w_vc")
+        ):
+            resident.update(id(parameter) for parameter in projection.parameters())
+        # KDA caches a storage-sharing view of qkv_conv1d.weight in conv_weights
+        # during construction. Offloading the weight would leave that view stale.
+        projection = getattr(owner, "qkv_conv1d", None)
+        attention = getattr(owner, "attn", None)
+        if isinstance(projection, torch.nn.Module) and isinstance(
+            attention, torch.nn.Module
+        ):
+            weight = getattr(projection, "weight", None)
+            cached = getattr(attention, "conv_weights", None)
+            if (
+                isinstance(weight, torch.nn.Parameter)
+                and isinstance(cached, torch.Tensor)
+                and cached.device == weight.device
+            ):
+                weight_storage = weight.untyped_storage()
+                cached_storage = cached.untyped_storage()
+                if (
+                    weight_storage.nbytes() > 0
+                    and weight_storage.data_ptr() != 0
+                    and weight_storage.nbytes() == cached_storage.nbytes()
+                    and weight_storage.data_ptr() == cached_storage.data_ptr()
+                ):
+                    resident.add(id(weight))
+    return resident
+
+
 class OffloaderV1(BaseOffloader):
     def __init__(self, cpu_offload_max_bytes: int):
         self._cpu_offload_bytes = 0
@@ -114,7 +165,10 @@ class OffloaderV1(BaseOffloader):
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
+        resident_parameter_ids = _get_resident_parameter_ids(module)
         for p in module.parameters():
+            if id(p) in resident_parameter_ids:
+                continue
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
@@ -139,12 +193,7 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
+                device_state = _get_offloaded_device_state(module, device)
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
                 return output

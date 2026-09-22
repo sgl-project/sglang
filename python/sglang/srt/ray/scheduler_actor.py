@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 import ray
 
 from sglang.srt.arg_groups.overrides import declare_resolution
-from sglang.srt.runtime_context import SpawnRanks, publish, spawn_world_rank
+from sglang.srt.runtime_context import SpawnRanks, get_device, publish, spawn_world_rank
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,7 @@ class SchedulerActor:
                     server_args, tp_rank=tp_rank, pp_rank=pp_rank
                 ),
                 dp_rank=dp_rank,
+                gpu_id=actual_gpu_id,
             ),
         )
 
@@ -124,12 +125,8 @@ class SchedulerActor:
         self.scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=actual_gpu_id,
             tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
             dp_rank=dp_rank,
         )
 
@@ -146,7 +143,7 @@ class SchedulerActor:
             import torch
 
             # Need to set the GPU id for the event loop for nccl to work
-            torch.cuda.set_device(self.scheduler.ps.gpu_id)
+            torch.cuda.set_device(get_device().gpu_id)
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
