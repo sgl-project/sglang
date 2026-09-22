@@ -61,7 +61,7 @@ class DllmAlgorithm:
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]] = None,
-    ) -> DllmRunOutput:
+    ) -> Union["GenerationBatchResult", DllmRunOutput]:
         if self.fdfo:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
@@ -91,7 +91,7 @@ class DllmAlgorithm:
             forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
-            if all(done):
+            if bool(done.all()):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
@@ -106,7 +106,9 @@ class DllmAlgorithm:
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]],
-    ) -> DllmRunOutput:
+    ) -> "GenerationBatchResult":
+        from sglang.srt.managers.utils import GenerationBatchResult
+
         batch_size = forward_batch.batch_size
 
         if algo_states is None:
@@ -123,17 +125,25 @@ class DllmAlgorithm:
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
+        # Clone so a later in-place step cannot race the async D2H of this result.
+        block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
+
+        # LowConfidence returns a device bool. Host lists (other algorithms) stay
+        # on the existing accept-length / algo-state path; overlap is LowConfidence only.
+        if isinstance(done, torch.Tensor):
+            return GenerationBatchResult(
+                logits_output=out.logits_output,
+                next_token_ids=block_tokens,
+                dllm_done=done,
+                can_run_cuda_graph=out.can_run_graph,
+            )
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
-        next_token_ids_list = forward_batch.input_ids.view(
-            batch_size, self.block_size
-        ).tolist()
         states_out = [None if done[i] else states[i] for i in range(batch_size)]
-
-        return (
-            out.logits_output,
-            next_token_ids_list,
-            accept_length_per_req_cpu,
-            states_out,
-            out.can_run_graph,
+        return GenerationBatchResult(
+            logits_output=out.logits_output,
+            next_token_ids=block_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dllm_algo_state=states_out,
+            can_run_cuda_graph=out.can_run_graph,
         )

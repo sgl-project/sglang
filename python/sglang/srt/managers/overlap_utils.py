@@ -114,6 +114,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
+    future_map.resolve_dllm_block_tokens(batch)
+
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
@@ -319,6 +321,34 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+        # FDFO block tokens, [req_pool_size, block_size]. -1 means this row has no future yet.
+        self.dllm_block_tokens_buf: Optional[torch.Tensor] = None
+
+    def stash_dllm_block_tokens(
+        self, indices: torch.Tensor, block_tokens: torch.Tensor
+    ) -> None:
+        block_size = block_tokens.shape[-1]
+        if self.dllm_block_tokens_buf is None:
+            self.dllm_block_tokens_buf = torch.full(
+                (self.req_pool_size, block_size),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        self.dllm_block_tokens_buf[indices.long()] = block_tokens.to(dtype=torch.int64)
+
+    def resolve_dllm_block_tokens(self, batch: ScheduleBatch) -> None:
+        """Overwrite block rows that already have a future. A new block's first step stays on the CPU mask."""
+        buf = self.dllm_block_tokens_buf
+        if buf is None or batch.input_ids is None or not batch.is_dllm():
+            return
+        indices = batch.req_pool_indices
+        block_size = buf.shape[-1]
+        if indices is None or batch.input_ids.numel() != indices.shape[0] * block_size:
+            return
+        rows = buf[indices.long()]
+        flat = batch.input_ids.view(-1, block_size)
+        flat.copy_(torch.where(rows[:, :1] >= 0, rows.to(dtype=flat.dtype), flat))
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
