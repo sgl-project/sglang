@@ -1243,7 +1243,9 @@ def test_ideogram_checkpoint_layout_before_construction(tmp_path, monkeypatch, l
             mock.Mock(side_effect=AssertionError("must preserve bitsandbytes loading")),
         )
     server_args = SimpleNamespace(
-        pipeline_config=None, require_component_resident=mock.Mock()
+        pipeline_config=None,
+        require_component_resident=mock.Mock(),
+        should_start_component_on_cpu=lambda name: False,
     )
     expected = "missing scale" if layout == "missing_scale" else "stop at construction"
     error_type = (
