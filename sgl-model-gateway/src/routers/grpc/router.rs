@@ -167,7 +167,7 @@ impl GrpcRouter {
         let model_id_cloned = model_id.map(|s| s.to_string());
         let components = self.shared_components.clone();
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -184,7 +184,7 @@ impl GrpcRouter {
             // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
             // On backoff: record retry metrics
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_CHAT,
@@ -221,7 +221,7 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -238,7 +238,7 @@ impl GrpcRouter {
             // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
             // On backoff: record retry metrics
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_GENERATE,
