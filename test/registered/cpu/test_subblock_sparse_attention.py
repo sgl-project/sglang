@@ -428,7 +428,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         with (
             patch.object(current_platform, "is_mps", return_value=False),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
@@ -438,7 +438,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 loader,
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ),
         ):
@@ -457,12 +457,12 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
                 return_value=DeviceCapability(10, 0),
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_global_forced_attn_backend",
                 return_value=None,
             ),
             patch(
-                "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+                "sglang.multimodal_gen.runtime.layers.attention.selector."
                 "get_attn_backend"
             ) as get_backend,
             self.assertRaisesRegex(ValueError, "requires SM90.*found 10.0"),
