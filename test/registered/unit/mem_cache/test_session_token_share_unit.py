@@ -23,10 +23,11 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, input_embeds=None):
     return SimpleNamespace(
         rid=rid,
-        input_ids=array("q", input_ids),
+        input_ids=None if input_ids is None else array("q", input_ids),
+        input_embeds=input_embeds,
         mm_inputs=None,
         session_params=SimpleNamespace(
             id="s", rid=None, offset=None, replace=False, drop_previous_output=False
@@ -141,6 +142,26 @@ class TestSessionTokenShare(CustomTestCase):
         self._decode_and_finish(r2, [9])
         r3 = self._create("r3", [6])
         self.assertEqual(list(r3.origin_input_ids), [4, 5, 9, 6])
+
+    def test_first_turn_input_embeds_preserves_embeddings(self):
+        input_embeds = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                session = Session(
+                    capacity_of_str_len=0,
+                    session_id="input-embeds",
+                    streaming=streaming,
+                )
+                req = session.create_req(
+                    _recv("r1", None, input_embeds=input_embeds),
+                    tokenizer=None,
+                    vocab_size=VOCAB,
+                )
+
+                self.assertEqual(list(req.origin_input_ids), [1, 1, 1])
+                self.assertIs(req.input_embeds, input_embeds)
+                self.assertIsNone(req.finished_reason)
 
     def test_max_new_tokens_overshoot_falls_back(self):
         in1 = list(range(300, 310))
