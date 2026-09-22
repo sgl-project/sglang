@@ -69,6 +69,8 @@ def test_cpu_bootstrap_masks_rocm_runtime(monkeypatch):
     assert torch.cuda.is_available() is False
     assert torch.cuda.get_device_capability() == (10, 0)
     assert torch.version.hip is None
+    assert "sgl_kernel.load_utils" in sys.modules
+    assert "sglang.srt.layers.quantization" in sys.modules
 
 
 def test_cpu_bootstrap_stubs_quantization_registry():
@@ -79,6 +81,28 @@ def test_cpu_bootstrap_stubs_quantization_registry():
 
     assert "fp8" in quantization.QUANTIZATION_METHODS
     assert quantization.__path__
+
+
+def test_serving_benchmark_help_bootstraps_cpu_compat():
+    sglang_root = Path(__file__).parents[3]
+    benchmark = sglang_root / "benchmark" / "simulator" / "bench_serving.py"
+    env = os.environ.copy()
+    for name in (
+        "CUDA_VISIBLE_DEVICES",
+        "SGLANG_USE_CPU_ENGINE",
+        "SGLANG_SIMULATOR_BOOTSTRAP",
+    ):
+        env.pop(name, None)
+
+    result = subprocess.run(
+        [sys.executable, str(benchmark), "--help"],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--simulator-mode {offline,blocking}" in result.stdout
 
 
 def test_predictor_paths_resolve_from_config_directory(tmp_path, monkeypatch):

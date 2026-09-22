@@ -20,5 +20,15 @@ def apply_cpu_simulation_compat() -> None:
     torch.cuda.get_device_capability = lambda *_args, **_kwargs: (10, 0)
     torch.version.hip = None
 
+    # SGLang's serving benchmark imports model configuration helpers even
+    # though the simulator client never loads a model.  On ROCm images those
+    # helpers can eagerly import AITER and probe the host with ``rocminfo``.
+    # Install the same lightweight registries used by the simulator server
+    # before any SGLang module is imported.
+    from sglang_simulator.simulation.sglang import sgl_kernel_hook
+
+    sgl_kernel_hook.install_load_utils_stub()
+    sgl_kernel_hook.install_quantization_stub()
+
 
 apply_cpu_simulation_compat()

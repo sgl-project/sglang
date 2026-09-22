@@ -103,7 +103,9 @@ python3 -m sglang_simulator.simulation.sglang.launch_server \
 ```
 
 In the benchmark terminal, export the same output directory before sending
-timestamped traffic with the simulator-aware benchmark adapter:
+timestamped traffic with the simulator-aware benchmark adapter. The adapter
+activates its CPU-only compatibility layer before importing SGLang, so it can
+run in a ROCm image without a visible GPU:
 
 ```bash
 cd /path/to/sglang
