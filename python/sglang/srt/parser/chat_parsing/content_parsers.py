@@ -99,8 +99,7 @@ def _sub_parse(raw: str, value_parser: dict | None) -> Any:
 def _xml_inline(text: str, args: dict) -> dict:
     """Parse shallow XML-ish tags into a dict. `tag_pattern` regex must have named
     groups `key` and `value`. Optional `value_parser` recurses; `merge_duplicates`
-    collects duplicate keys into a list. `strict` rejects unmatched non-whitespace
-    text."""
+    collects duplicate keys into a list."""
     tag_pattern = args.get("tag_pattern")
     if tag_pattern is None:
         raise ValueError("xml-inline: 'tag_pattern' content_arg is required")
@@ -108,11 +107,7 @@ def _xml_inline(text: str, args: dict) -> dict:
     merge = args.get("merge_duplicates", False)
 
     out: dict[str, Any] = {}
-    end = 0
     for m in re.finditer(tag_pattern, text, flags=re.DOTALL):
-        if args.get("strict") and text[end : m.start()].strip():
-            raise ValueError("xml-inline: unmatched non-whitespace content")
-        end = m.end()
         groups = m.groupdict()
         key = groups.get("key")
         if key is None:
@@ -124,8 +119,6 @@ def _xml_inline(text: str, args: dict) -> dict:
             out[key].append(value)
         else:
             out[key] = value
-    if args.get("strict") and text[end:].strip():
-        raise ValueError("xml-inline: unmatched non-whitespace content")
     return out
 
 
