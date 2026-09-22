@@ -27,7 +27,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
         req_pool_indices=torch.empty(2, dtype=torch.int32),
     )
     runner.model_runner = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
         is_draft_worker=False,
         model_config=SimpleNamespace(hf_config=object()),
     )
