@@ -271,6 +271,23 @@ class Serving(msgspec.Struct):
     enable_streaming_session: A[
         bool, "Enable streaming session mode and StreamingSession wrapper."
     ] = False
+    padded_output_tokens: A[
+        Optional[int],
+        "Pad every /v1/completions response out to exactly this many output "
+        "tokens, by appending a run of the model's terminal token after the real "
+        "completion. Closes the side channel where a short structured completion "
+        "leaks its content through its length: on both the streaming and the "
+        "non-streaming path it equalizes the token count, the reported "
+        "completion_tokens, the logprob positions, token_ids, and the finish "
+        "reason; streaming additionally equalizes the content-frame count and the "
+        "terminal frame. The completion text itself is returned verbatim -- pad "
+        "positions contribute no text, so both paths hand back the same "
+        "completion -- which means response byte length is not equalized, and "
+        "neither is timing. The target is a hard limit: a request asking for more "
+        "than this many tokens is rejected with HTTP 400 rather than truncated, "
+        "as are echo=true requests and models exposing no eos_token_id. Unset "
+        "(the default) leaves responses byte-for-byte unchanged.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Constrained decoding
