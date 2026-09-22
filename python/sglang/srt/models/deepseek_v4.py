@@ -476,7 +476,7 @@ def _apply_wo_a_bf16_matmul(
         and envs.SGLANG_OPT_HIP_WO_A_BF16_DECODE.get()
         and (
             (is_decode and o.shape[0] == 1 and o.is_contiguous())
-            or (is_target_verify and (2 <= o.shape[0] <= 8 or 129 <= o.shape[0] <= 384))
+            or (is_target_verify and 2 <= o.shape[0] <= 384)
         )
     )
     if hip_decode_verify:

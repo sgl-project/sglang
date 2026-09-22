@@ -80,7 +80,7 @@ class TestWoABf16Prefill(CustomTestCase):
 
     def test_decode_verify_and_mutable_graph(self):
 
-        for rows in (1, 2, 8, 129):
+        for rows in (1, 2, 8, 64, 129):
             with self.subTest(rows=rows):
                 x, w = self.operands(rows, strided=rows == 8)
                 kwargs = dict(is_decode=True, is_target_verify=rows > 1)
